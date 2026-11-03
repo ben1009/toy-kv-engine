@@ -11,13 +11,13 @@ use std::{
     time::Instant,
 };
 
-#[cfg(all(target_os = "linux", not(test)))]
+#[cfg(target_os = "linux")]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
-#[cfg(all(target_os = "linux", not(test)))]
+#[cfg(target_os = "linux")]
 use std::fs::OpenOptions;
 
-#[cfg(all(target_os = "linux", not(test)))]
+#[cfg(target_os = "linux")]
 use anyhow::ensure;
 use anyhow::{Context, Ok, Result};
 use bytes::Bytes;
@@ -48,6 +48,53 @@ use crate::wal::v7::admission::WalV7RetainedResources;
 /// At 1KB values and 1MB SST target, ~1000 entries. We size generously.
 const BLOOM_EXPECTED_ENTRIES: usize = 4096;
 const BLOOM_FALSE_POSITIVE_RATE: f64 = 0.01;
+
+/// Open the worker on the installed image. Some filesystems reject O_DIRECT;
+/// in that case the existing buffered handle still supports the same
+/// write-completion, FRONTIER, and fdatasync durability ordering.
+#[cfg(target_os = "linux")]
+fn open_v8_worker_file(
+    path: &Path,
+    buffered_file: &File,
+    installed: &crate::wal::v8::install::WalV8InstalledRecovery,
+    open_direct: impl FnOnce(&Path) -> std::io::Result<File>,
+) -> Result<File> {
+    let worker_file = match open_direct(path) {
+        std::result::Result::Ok(file) => file,
+        Err(error)
+            if matches!(
+                error.raw_os_error(),
+                Some(libc::EINVAL | libc::EOPNOTSUPP | libc::ENOSYS)
+            ) =>
+        {
+            log::info!(
+                "direct I/O is unavailable for v8 WAL {}; using buffered worker I/O: {error}",
+                path.display()
+            );
+            buffered_file
+                .try_clone()
+                .context("clone installed v8 Active WAL buffered worker handle")?
+        }
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "open installed v8 Active WAL for direct I/O: {}",
+                    path.display()
+                )
+            });
+        }
+    };
+    let metadata = worker_file
+        .metadata()
+        .context("inspect installed v8 Active WAL worker handle")?;
+    ensure!(
+        metadata.dev() == installed.installed_dev
+            && metadata.ino() == installed.installed_ino
+            && metadata.len() >= installed.image_len,
+        "v8 WAL worker handle does not refer to the installed Active inode"
+    );
+    Ok(worker_file)
+}
 
 /// Cumulative wall-clock timing for write-path phases.
 /// All durations are in nanoseconds, stored as atomics for lock-free updates.
@@ -1768,38 +1815,18 @@ impl MemTable {
             .try_clone()
             .context("clone installed v8 Active WAL sync handle")?;
         let worker_file = if io_mode == WalIoMode::Parallel {
-            #[cfg(test)]
-            {
-                Some(
-                    write_file
-                        .try_clone()
-                        .context("clone installed v8 Active WAL test worker handle")?,
-                )
-            }
-            #[cfg(not(test))]
-            {
-                let worker_file = OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .custom_flags(libc::O_DIRECT)
-                    .open(&path)
-                    .with_context(|| {
-                        format!(
-                            "open installed v8 Active WAL for direct I/O: {}",
-                            path.display()
-                        )
-                    })?;
-                let metadata = worker_file
-                    .metadata()
-                    .context("inspect installed v8 Active WAL worker handle")?;
-                ensure!(
-                    metadata.dev() == installed.installed_dev
-                        && metadata.ino() == installed.installed_ino
-                        && metadata.len() >= installed.image_len,
-                    "v8 WAL worker handle does not refer to the installed Active inode"
-                );
-                Some(worker_file)
-            }
+            Some(open_v8_worker_file(
+                &path,
+                &write_file,
+                &installed,
+                |path| {
+                    OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .custom_flags(libc::O_DIRECT)
+                        .open(path)
+                },
+            )?)
         } else {
             None
         };
@@ -4157,6 +4184,86 @@ mod tests {
             LIVE_WAL_V5_LIMITS,
             TEST_V8_MAX_IMAGE_LEN,
         )
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn v8_parallel_buffered_worker_fallback_preserves_durable_recovery() -> Result<()> {
+        let test_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/wal-v8-tests");
+        fs::create_dir_all(&test_root)?;
+        let directory = tempfile::tempdir_in(&test_root)?;
+        let path = directory.path().join("active.wal");
+        let (header, anchor) = install_empty_v8(&path)?;
+        let installed = recover_v8(&path, header, &[anchor])?;
+        let file = fs::OpenOptions::new().read(true).write(true).open(&path)?;
+
+        for errno in [libc::EINVAL, libc::EOPNOTSUPP, libc::ENOSYS] {
+            let worker = super::open_v8_worker_file(&path, &file, &installed, |_| {
+                Err(std::io::Error::from_raw_os_error(errno))
+            })?;
+            drop(worker);
+        }
+        let denied = super::open_v8_worker_file(&path, &file, &installed, |_| {
+            Err(std::io::Error::from_raw_os_error(libc::EACCES))
+        })
+        .expect_err("permission errors must not use the buffered fallback");
+        assert_eq!(
+            denied
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .raw_os_error(),
+            Some(libc::EACCES)
+        );
+        let foreign_path = directory.path().join("foreign.wal");
+        fs::copy(&path, &foreign_path)?;
+        let foreign = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&foreign_path)?;
+        let wrong_inode = super::open_v8_worker_file(&path, &foreign, &installed, |_| {
+            Err(std::io::Error::from_raw_os_error(libc::EINVAL))
+        })
+        .expect_err("a buffered fallback must belong to the installed image");
+        assert!(wrong_inode.to_string().contains("installed Active inode"));
+        drop(foreign);
+
+        let worker = super::open_v8_worker_file(&path, &file, &installed, |_| {
+            Err(std::io::Error::from_raw_os_error(libc::EINVAL))
+        })?;
+        let leader = crate::wal::v8::leader::WalV8LeaderWriter::new(
+            file.try_clone()?,
+            file.try_clone()?,
+            &installed,
+            TEST_V8_MAX_IMAGE_LEN,
+        )?;
+        let writer = leader.into_parallel_with_worker_file(worker)?;
+        let batch = WalBatch {
+            commit_ts: 1,
+            recorded_at: RecordedAt { secs: 1, nanos: 0 },
+            entries: vec![WalEntry::Put {
+                key: b"key".to_vec(),
+                value: b"buffered worker".to_vec(),
+            }],
+        };
+        let prepared = writer.preflight_batch(&batch, LIVE_WAL_V5_LIMITS)?;
+        let (commit, _) = writer.append_prepared_batch(prepared, 1, batch.recorded_at)?;
+        assert_eq!(commit.frontier.ticket_end, 1);
+        drop(writer);
+        drop(file);
+
+        let recovered = recover_v8(&path, header, &[anchor])?;
+        let mut batches = Vec::new();
+        crate::wal::v8::install::replay_installed_active_batches(
+            &path,
+            &recovered,
+            LIVE_WAL_V5_LIMITS,
+            |replayed| {
+                batches.push(replayed.clone());
+                Ok(())
+            },
+        )?;
+        assert_eq!(batches, vec![batch]);
+        Ok(())
     }
 
     fn recover_v7(path: &Path, anchor: ActiveBoundary) -> Result<WalV7InstalledRecovery> {

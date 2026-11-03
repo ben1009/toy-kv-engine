@@ -3352,8 +3352,9 @@ mod tests {
 
     #[test]
     fn published_cursor_is_readable_while_the_physical_frontier_mutex_is_held() -> Result<()> {
-        let directory =
-            tempfile::tempdir_in(Path::new(env!("CARGO_MANIFEST_DIR")).join("../target"))?;
+        let parent = Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/wal-v8-tests");
+        std::fs::create_dir_all(&parent)?;
+        let directory = tempfile::tempdir_in(parent)?;
         let path = directory.path().join("cursor-v8.wal");
         let installed = install_empty(&path, header())?;
         let writer = Arc::new(open_writer(&path, &installed)?.into_parallel()?);
@@ -3382,8 +3383,9 @@ mod tests {
 
     #[test]
     fn parallel_worker_submits_data_across_an_embedded_frontier_gap() -> Result<()> {
-        let directory =
-            tempfile::tempdir_in(Path::new(env!("CARGO_MANIFEST_DIR")).join("../target"))?;
+        let parent = Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/wal-v8-tests");
+        std::fs::create_dir_all(&parent)?;
+        let directory = tempfile::tempdir_in(parent)?;
         let path = directory.path().join("active-v8.wal");
         let header = header();
         let installed = install_empty(&path, header)?;
