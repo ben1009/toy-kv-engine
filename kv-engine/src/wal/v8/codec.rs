@@ -1,8 +1,8 @@
 //! RFC 026 v8 header, frame, fragment, logical-header and FRONTIER codecs.
 //!
-//! These codecs are staged independently of WAL creation and recovery. In
-//! particular, a valid v8 header does not make the v8 reader or writer
-//! available through the WAL registry.
+//! V8 is registered for creation and recovery. The codecs validate wire bytes;
+//! recovery separately validates covered prefixes and format-specific anchors
+//! before an installed Active image can resume writes.
 
 use anyhow::{Context, Result, ensure};
 use sha2::{Digest, Sha256};

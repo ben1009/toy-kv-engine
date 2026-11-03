@@ -1,4 +1,4 @@
-//! Two-phase canonical batch preparation for the proposed v8 writer.
+//! Two-phase canonical batch preparation for the V8 writer.
 //!
 //! Preflight owns only the canonical operation view and checked sizes. The
 //! caller publishes the assigned ticket through `admit` before `encode` can

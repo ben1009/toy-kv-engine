@@ -6,7 +6,11 @@
 
 > This document preserves the implementation sequence and progress history.
 > All planned implementation and validation slices are complete. Current
-> behavior is specified in RFC 023. Remote archives, encryption, compression,
+> PITR behavior also incorporates [RFC 025](../../rfcs/025-parallel-wal-embedded-frontiers.md)
+> and [RFC 026](../../rfcs/026-composable-wal-prefix-digest.md). New PITR WALs
+> default to V8 Parallel; see the [V8 adoption note](../wal/rfc-026-v8-default-20261103.md)
+> for capacity-checked migration, compatibility and the V7/V8 PITR-disable
+> limitation. Remote archives, encryption, compression,
 > standby tailing, export/import, and timeline continuation remain follow-ups.
 
 ## Purpose

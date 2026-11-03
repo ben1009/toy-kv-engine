@@ -12,11 +12,11 @@ Ordinary v4 WALs now use ticket-ordered parallel I/O by default, including
 native async waits for non-serializable point writes. New PITR WALs default to
 v8 Parallel under RFC 026; v7 remains a supported compatibility format, while
 PITR v5/v6 and older MVCC formats retain leader I/O. Legacy unframed WALs
-retain buffered I/O. Leader remains available as an explicit v4 control. The
+retain buffered I/O. Leader remains available as an explicit V4/V7/V8 control. The
 [default adoption note](../docs/wal/rfc-024-parallel-wal-default-20261005.md)
 records the maintainer decision and its scope. The original performance gate
 remains unqualified; the proposal and benchmark criteria below are retained as
-the historical design, not evidence that the gate passed. The current limits
+the historical design, not evidence that the gate passed. The current V4 limits
 are 32 in-flight groups and 256 ring entries.
 
 [RFC 025](025-parallel-wal-embedded-frontiers.md) defines Parallel as the

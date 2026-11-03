@@ -14,6 +14,11 @@ paired estimates, and failed controls separate.
 
 **Last updated:** 2026-10-06
 
+**Later PITR adoption (2026-11-03):** This plan records the V4 pipeline. RFCs
+025 and 026 subsequently implemented V7/V8, and new PITR WALs now default to V8
+Parallel by maintainer decision. See the [V8 adoption note](rfc-026-v8-default-20261103.md)
+for migration, compatibility and the unqualified performance matrix.
+
 The retained pipeline uses 32 group slots and 256 ring entries. After a sync
 takes at least 100 microseconds, it may coalesce for up to 400 microseconds,
 refreshing the optional cutoff without resetting that deadline. It then

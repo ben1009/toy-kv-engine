@@ -1,7 +1,8 @@
 //! Persisted PITR manifest state and replay reducer.
 //!
-//! This module models versioned PITR crash boundaries without participating in
-//! the live manifest. Later slices will embed these records in `ManifestRecord`.
+//! The live engine manifest embeds these versioned records and snapshots.
+//! Replay validates lifecycle transitions, format-specific logical Active
+//! anchors and immutable Sealing boundaries before recovery resumes admission.
 #![allow(dead_code)]
 
 use std::collections::{BTreeMap, HashSet};
@@ -232,7 +233,7 @@ pub(crate) struct PitrObligation {
     /// snapshot migration; current snapshots must persist an explicit format.
     #[serde(default)]
     pub(crate) wal_format: PitrWalFormat,
-    /// Frozen v7 image authority captured before successor installation.
+    /// Frozen v7/v8 image authority captured before successor installation.
     /// Legacy v5/v6 obligations do not have this boundary.
     #[serde(default)]
     pub(crate) immutable_boundary: Option<ImmutableBoundary>,
@@ -746,7 +747,7 @@ pub(crate) enum PitrManifestRecord {
     EnableComplete {
         active_segment_id: u64,
     },
-    /// Durably advance the logical recovery floor for the current Active v7
+    /// Durably advance the logical recovery floor for the current Active v7/v8
     /// WAL. The first boundary for a segment must be its empty header prefix.
     ActiveBoundaryAdvanced {
         boundary: ActiveBoundary,
@@ -755,7 +756,7 @@ pub(crate) enum PitrManifestRecord {
         segment_id: u64,
         successor_segment_id: u64,
         logical_length: u64,
-        /// Present for v7 and absent for legacy v5/v6 seals.
+        /// Present for v7/v8 and absent for legacy v5/v6 seals.
         #[serde(default)]
         immutable_boundary: Option<ImmutableBoundary>,
     },

@@ -1,8 +1,8 @@
 //! Public PITR contracts and validation.
 //!
-//! The state-machine implementations remain crate-private until the synchronous
-//! lifecycle is wired into the engine. Keeping the public contracts here makes
-//! their validation independently testable without exposing a partially live API.
+//! Public configuration, status and result types support the engine's PITR
+//! lifecycle and repository operations. Persistence and replay state machines
+//! remain crate-private; V8 is the default writer format for newly enabled PITR.
 
 use std::{
     future::Future,
@@ -28,12 +28,15 @@ pub const DEFAULT_PITR_ARCHIVE_BURST_BYTES: NonZeroU64 = NonZeroU64::new(1024 * 
 
 /// Preferred format for newly enabled PITR and eligible format migrations.
 ///
-/// Existing segments retain their encoded format. Older formats remain
+/// Defaults to V8. Existing segments retain their encoded format. Older formats remain
 /// selectable for comparisons; selecting them never downgrades an Active WAL.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum PitrWriterFormat {
+    /// Legacy Leader writer and lifecycle compatibility control.
     V6,
+    /// Embedded-frontier format with a rolling SHA-256 logical prefix.
     V7,
+    /// Default format with encode-time BLAKE3 and composable prefix links.
     #[default]
     V8,
 }

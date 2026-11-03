@@ -14,13 +14,18 @@ in the [RFC directory](../rfcs/).
 | [Assets](assets/) | Documentation images. |
 
 Start with the [WAL documentation index](wal/README.md) for the current
-parallel WAL policy and its measured results.
+parallel WAL policy and its measured results. Ordinary WALs use V4 Parallel;
+new PITR WALs use V8 Parallel, with V6/V7 available as explicit compatibility
+preferences. The V8 default is a maintainer adoption decision while performance
+qualification remains open. Dated reports preserve their measured revisions
+and do not define the current writer selection.
 
 ## WAL implementation
 
 - [V8 PITR WAL default adoption](wal/rfc-026-v8-default-20261103.md)
 - [RFC 024: Parallel WAL Implementation Plan](wal/rfc-024-parallel-wal-implementation-plan.md)
 - [RFC 025 Implementation Plan: Parallel WAL with Embedded Frontiers and One Sync](wal/rfc-025-parallel-wal-embedded-frontiers-implementation-plan.md)
+- [RFC 026 Implementation Plan: Composable WAL Prefix Digests](wal/rfc-026-implementation-plan.md)
 
 ## Benchmark reports
 

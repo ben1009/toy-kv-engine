@@ -18,6 +18,8 @@ Key dependencies:
 - `tinyufo` — block cache and vLog reader cache (lock-free S3-FIFO)
 - `bytes` — zero-copy byte buffers
 - `crc32fast` — checksums
+- `blake3` — V8 encode-time entry digests and ordered logical prefix links
+- `sha2` — physical WAL, archive and object digests, plus legacy WAL digest rules
 - `ahash` — bloom filter hashing (AES-NI accelerated)
 - `logforth` — structured JSON logging on stderr
 - `log` — logging facade (bridged by logforth)
@@ -45,7 +47,7 @@ Key dependencies:
 │       ├── benchmarks/     # WAL comparisons and qualification
 │       ├── environment/    # Storage stalls and environment mitigations
 │       └── experiments/    # WAL optimization reports
-├── rfcs/                   # RFCs 001–025
+├── rfcs/                   # RFCs 001–026
 └── kv-engine/
     ├── Cargo.toml
     ├── README.md

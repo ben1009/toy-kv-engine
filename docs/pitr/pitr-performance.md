@@ -3,7 +3,14 @@
 Measured on 2026-09-17 with commit `4dce423d` and the in-tree `pitr-perf`
 harness.
 
-## Method (the current harness)
+This report preserves the V5/V6 measurements and harness behavior at the
+revisions named below. New PITR WALs now default to V8 Parallel under the
+[2026-11-03 adoption decision](../wal/rfc-026-v8-default-20261103.md). These
+historical tables do not measure V8 or qualify its performance. For current
+V7/V8 comparison rules and results, start with the
+[WAL documentation](../wal/README.md#benchmarks-and-qualification).
+
+## Method at the measured revision
 
 ```bash
 cargo run --release --bin pitr-perf -- --operations 10000

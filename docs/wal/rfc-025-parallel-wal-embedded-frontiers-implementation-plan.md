@@ -594,12 +594,13 @@ durable anchors or the strict immutable-object rules.
 
 ## Stage dependencies
 
-Stages 1–6 are implemented for the production v7 Active path. Stage 7 migration
-and constructor coverage remain in progress; Stage 8 completes crash/performance
-qualification and default adoption. Each stage adds its own regression coverage,
-and stage 8 assembles the complete qualification evidence.
+Stages 1–7 are implemented for the supported v7 Active path, including migration
+and constructor coverage. Stage 8 records correctness and process-crash coverage;
+the full performance matrix remains unqualified. RFC 026 subsequently adopted
+V8 as the PITR default. The table describes the original staged rollout, not
+the current writer selection.
 
-| Stage | Depends on | Reviewable result | Production writer |
+| Stage | Depends on | Reviewable result | Writer at planned stage |
 | --- | --- | --- | --- |
 | 1. Format and persisted contracts | Existing baseline | Explicit format registry, anchor types, compatibility fixtures | v6 |
 | 2. Codec and persistence model | 1 | Byte-exact v7 fixtures and serial protocol driver | v6 |
@@ -1639,9 +1640,9 @@ frame in a DATA value. Discovery must report only the actual aligned
 generation-zero and tail FRONTIER frames, and Active recovery must return the
 value byte-for-byte unchanged.
 
-The thirty-third Stage 8 slice extends `write-perf` for the qualification
-matrix. With `--pitr`, the harness requests v7 by default, seeds the initial v6
-Active WAL outside the timer, and invokes the existing capacity-checked
+The thirty-third Stage 8 slice extended `write-perf` for the qualification
+matrix. At that revision, `--pitr` requested v7 by default, seeded the initial v6
+Active WAL outside the timer, and invoked the existing capacity-checked
 migration; `--pitr-format v6` keeps the isolated v6 Leader control unmigrated.
 PITR rows report the Active format version and I/O mode read from `pitr_status`,
 and fail if the requested format was deferred or the selected mode was not
@@ -1655,6 +1656,10 @@ legs, tmpfs and named-device requirements, coalescing controls, and reopen
 metrics below remain qualification requirements; this harness change records
 controls and metadata, not performance results. V7 pipeline diagnostics were
 added by the eighty-seventh Stage 8 slice below.
+
+The later V8 adoption changed `--pitr` to the public default-V8 bootstrap.
+Current V7 comparisons must select `--pitr-format v7` explicitly; see the
+[V8 adoption note](rfc-026-v8-default-20261103.md).
 
 The thirty-fourth Stage 8 slice verifies that a recovered Sealed v7 source
 remains read-only and has no attached WAL writer, scheduler, ring, or reservation
@@ -2849,18 +2854,20 @@ tests, with 49 focused candidate tests. The exact retained source and executable
 are restored. Thirty-seven new completed IDs bring this lineage to 665;
 the two reused diagnostics and prior interrupted run are not double-counted.
 
-## Delivery checklist
+## Delivery status (2026-11-03)
 
-- [ ] Stages 1–3: legacy compatibility, byte-exact codec, independent validation,
+- [x] Stages 1–3: legacy compatibility, byte-exact codec, independent validation,
   and serial-model crash qualification.
-- [ ] Stages 4–5: reservations, dual hashes/index snapshots, Parallel and Leader,
+- [x] Stages 4–5: reservations, dual hashes/index snapshots, Parallel and Leader,
   fixed API barriers, and complete ownership/failure handling.
-- [ ] Stages 6–7: strict PITR lifecycle/capture, versioned manifests/references,
+- [x] Stages 6–7: strict PITR lifecycle/capture, versioned manifests/references,
   mixed restore, capacity preflight, writable deferral, and migration recovery.
 - [ ] Stage 8: full correctness and sanitizer/process evidence, all five
-  benchmark comparisons, operational recovery measurements, and adoption record.
-- [ ] Activate eligible v7 Parallel constructors/successors and update all
-  current-behavior documentation together.
+  benchmark comparisons, and operational recovery measurements. Recorded
+  correctness slices do not qualify the outstanding performance matrix.
+- [x] Support eligible v7 Parallel constructors/successors and explicit
+  compatibility selection. RFC 026's V8 adoption supersedes the original v7
+  default target; current behavior is in the linked adoption note.
 
 [WAL documentation](README.md) · [All documentation](../README.md).
 

@@ -1,8 +1,8 @@
-//! Crate-private contracts and codec primitives for PITR WAL v5.
+//! PITR lifecycle, archive, restore and shared canonical WAL contracts.
 //!
-//! This module is deliberately dormant: the existing WAL writer and recovery
-//! paths do not select v5 yet. The types here provide one canonical envelope
-//! for the later sequencer, segment manager, and PITR replay implementation.
+//! The entry codec is shared by V5/V6 and the V7/V8 embedded-frontier formats.
+//! New PITR epochs default to V8; version-specific readers preserve existing
+//! segment identities and digest rules through recovery and mixed-chain replay.
 #![allow(dead_code)]
 
 pub mod api;
@@ -30,7 +30,7 @@ use anyhow::{Context, Result, bail, ensure};
 use sha2::{Digest, Sha256};
 
 pub(crate) const WAL_V5_MAGIC: [u8; 4] = *b"WAL2";
-/// The v5-family version new segments claim: the v5 batch layout, with a digest
+/// The version new v5-family segments claim: the v5 batch layout, with a digest
 /// that covers only each batch's own bytes. See [`WalDigestRule`].
 pub(crate) const WAL_V5_VERSION: u16 = 6;
 /// Segments written before the logical-batch digest existed. Read and verified
@@ -256,8 +256,8 @@ pub(crate) struct WalBatch {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct WalV5Header {
-    /// The v5-family version on the wire: [`WAL_V5_VERSION`] for segments written
-    /// now, [`WAL_V5_VERSION_LEGACY`] for one written before the logical-batch
+    /// The v5-family version on the wire: [`WAL_V5_VERSION`] for new v5-family
+    /// segments, [`WAL_V5_VERSION_LEGACY`] for one written before the logical-batch
     /// digest existed. Carried on the header rather than read from the code so that
     /// every path holding a header - including a resume of an older segment - has
     /// the segment's own version, and so the seal can echo it.
@@ -757,8 +757,8 @@ fn write_entry_into(
 /// it builds the batch in a `Vec` and does not canonicalise, so it is the only
 /// way to encode an uncanonicalised batch.
 ///
-/// Production has exactly one encoder - [`encode_v5_batch_into`], called directly
-/// from the WAL's `put_v5_batch` - and neither this function nor the
+/// The v5-family production path uses [`encode_v5_batch_into`], called directly
+/// from the WAL's `put_v5_batch`. Neither this function nor the
 /// [`encode_v5_batch`] wrapper above it is on the write path any more: every
 /// caller of the wrapper is a test. Both are kept as fixtures for the crate's
 /// tests - the wrapper is called from `pitr::tests`, `pitr::seal::tests`,

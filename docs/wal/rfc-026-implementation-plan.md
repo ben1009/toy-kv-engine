@@ -172,7 +172,13 @@ outstanding. The maintainer selected V8 as the default on 2026-11-03
 without declaring that gate qualified; see the [adoption note](rfc-026-v8-default-20261103.md).
 Public enable and eligible resume now initiate the capacity-checked transitions.
 
-## Slices
+## Implemented slice history
+
+The functional implementation is complete. The slices below also record
+intermediate development states and qualification work. Instructions to leave
+V8 unselected or unavailable describe those intermediate commits. Current
+default and migration behavior follows the adoption decision above; performance
+qualification remains open.
 
 1. **Digest primitives:** add the BLAKE3 dependency and a standalone v8 digest
    module for header seed, bounded incremental entry hashing, batch digest and
@@ -312,7 +318,15 @@ head stranded. The [DATA-group screen](benchmarks/rfc-026-v8-admitted-data-group
 records correctness coverage, rejected policies, and the remaining performance
 uncertainty. Its retained binary is not yet qualified against v7 or v4.
 
+Preparation/admission, durability progress and durable publication have
+separate notification streams. A single durability driver owns FRONTIER
+formation; followers await durable publication and use the coordinator's
+published cursor instead of reacquiring the physical FRONTIER mutex. The
+[notification retention and rerun](benchmarks/rfc-026-v8-notification-rerun-20261102.md)
+records the retained combination and its measurement limits. Affinity and
+allocator probes remain diagnostic experiments.
+
 Each slice must leave existing v2-v7 reads, writes, recovery and digest
 interpretation unchanged. The non-performance workspace and historical-reader
-test gates have passed; performance qualification remains the final gate before
-the documented default-adoption decision.
+test gates have passed. The performance matrix remains open after the documented
+default-adoption decision; adoption does not establish V4/V7 parity.

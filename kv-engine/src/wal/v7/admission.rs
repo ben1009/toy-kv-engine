@@ -1,6 +1,6 @@
-//! Owned v7 resource reservations for admission and maintenance work.
+//! Shared V7/V8 resource reservations for admission and maintenance work.
 //!
-//! The ledger is the accounting primitive for later WAL/runtime integration.
+//! The ledger accounts for live WAL admission, recovery and lifecycle work.
 //! Callers reserve all required resources before assigning a ticket or offset,
 //! then retain the token until the corresponding work is canceled or durably
 //! released. `logical_wal_bytes` includes the worst-case embedded FRONTIER

@@ -1,18 +1,22 @@
 # RFC 024: parallel WAL default adoption
 
-**Decision:** 2026-10-05. **Last updated:** 2026-10-08.
+**Decision:** 2026-10-05. **Last updated:** 2026-11-03.
 
 Ordinary v4 MVCC WALs now use the parallel pipeline by default. This applies
 when WAL is enabled; it does not enable WAL for configurations that disable it.
 The change follows the maintainer's explicit adoption decision on 2026-10-05.
 It is not a claim that the original RFC performance gate passed.
 
-The proposed [RFC 025](../../rfcs/025-parallel-wal-embedded-frontiers.md) extends
+[RFC 025](../../rfcs/025-parallel-wal-embedded-frontiers.md) extends
 the default policy to future formats, with narrowly documented exceptions.
 PITR v7 embeds DATA/FRONTIER frames, with one WAL sync per advance and an
 explicit Active candidate-validation/fallback contract. Durable manifest and
-sealed archive boundaries remain strict. The proposal requires implementation
-and qualification; the runtime selection below remains the shipped behavior.
+sealed archive boundaries remain strict. RFC 025 is implemented; [RFC
+026](../../rfcs/026-composable-wal-prefix-digest.md) adds V8's composable BLAKE3
+prefix digest. The maintainer selected V8 as the PITR default on 2026-11-03
+while its performance matrix remains unqualified. This note records V4
+adoption; the [V8 adoption note](rfc-026-v8-default-20261103.md) defines current
+PITR selection and migration.
 
 ## Runtime selection
 
@@ -21,7 +25,7 @@ and qualification; the runtime selection below remains the shipped behavior.
 `MemTable` create/recovery entry points do likewise. Ordinary v4 successor
 WALs retain the engine's selected mode through rotation and reopen.
 
-The default pipeline uses a dedicated ordered packer, one io_uring worker,
+The V4 pipeline uses a dedicated ordered packer, one io_uring worker,
 and an independent durability coordinator, with 32 in-flight group slots and
 256 ring entries. Ext-family filesystems also use an extent-initialization
 thread to prepare allocation ahead of writes. Ticket order, physical offset
@@ -54,15 +58,18 @@ decision](rfc-026-v8-default-20261103.md). V7 remains a supported compatibility
 format with the embedded-frontier protocol; PITR v5/v6 WALs and older MVCC
 formats retain the leader path. Legacy unframed WALs retain buffered I/O.
 Format detection selects the compatible path on recovery; default changes do
-not rewrite existing WAL formats. There is no automatic fallback when io_uring
-or O_DIRECT initialization fails.
+not rewrite existing WAL formats. V4 initialization fails when io_uring or
+`O_DIRECT` is unavailable. V8 Parallel supports buffered worker I/O when the
+filesystem rejects direct I/O, with its single-sync durability ordering intact.
 
 Leader remains available through `KvEngine::open_with_wal_io_mode(...,
 WalIoMode::Leader)` for controls and explicit rollback. This existing selector
 is public but hidden from generated API documentation. `write-perf` defaults
 to parallel for its v4 WAL comparisons; use `--wal-io-mode leader` for an
-explicit leader control. PITR benchmark configuration selects and reports
-leader regardless of the v4 selector.
+explicit leader control. `write-perf --pitr` now selects V8 Parallel by default;
+`--pitr-format v6|v7|v8` selects the format explicitly. V6 always reports Leader,
+while V7/V8 honor the selected I/O mode. Historical V5/V6 PITR benchmark rows
+predate these controls and retain their recorded modes.
 
 ## Evidence and limits
 
@@ -104,7 +111,7 @@ Earlier RFC 024 experiment reports retain their original measurements and
 recommendations. Their leader-default and opt-in statements describe the
 revision measured at the time; this document records the current default.
 
-## Validation
+## Validation at V4 adoption
 
 `cargo make check` passes on the final default-selection revision: default
 and all-feature Clippy under `-D warnings`, formatting, dependency order,

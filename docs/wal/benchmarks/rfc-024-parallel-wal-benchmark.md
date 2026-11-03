@@ -11,10 +11,21 @@ remains **UNQUALIFIED**.
 Current PITR defaults have since changed: new PITR WALs use V8 Parallel by
 maintainer decision, while ordinary WALs remain V4 Parallel. The
 [V8 adoption note](../rfc-026-v8-default-20261103.md) records the change and
-the still-unqualified performance matrix. The results below remain historical
-V4/V7 measurements.
+the still-unqualified performance matrix. The results below preserve the
+V4/V7/V8 implementations and defaults measured in each report.
 
-## Latest direct comparisons
+## Current V8 evidence
+
+The [notification retention and rerun](rfc-026-v8-notification-rerun-20261102.md)
+records the retained notification separation, single durability driver and
+published-cursor combination. The
+[held-out calibration report](rfc-026-v8-calibrated-states-20261103.md) is the
+latest storage-state assessment: no path class passed the frozen calibration
+gate, so it reports no qualified V8/V7 ratio. Historical best scores are
+descriptive results for their source, CPU mask and device state; they do not
+establish current parity.
+
+## V4 Leader/Parallel direct comparisons
 
 The [October 5 matrix](rfc-024-native-async-vs-leader-20261005.md) measures
 revision `d7d124b8` on ext4 at 1, 4, 8, and 16 writers, for one put and batch64.

@@ -30,9 +30,13 @@ Existing segments retain their original format.
 persistent batch tickets and in-WAL DATA/FRONTIER frames. RFC 026 builds on that
 protocol with v8's composable prefix digest; new PITR WALs now default to v8
 Parallel under the adoption decision above. V7 remains a supported format.
-Active v7 validates candidate prefixes and may fall back above durable manifest
+Active v7/v8 validates candidate prefixes and may fall back above durable manifest
 boundaries; sealing and archive validation stay strict. Existing v5/v6
 recovery and digest rules remain as implemented.
+
+The lifecycle and wire-format sections below record the original RFC 023
+V5/V6 design. RFCs 025/026 and the V8 adoption note specify the subsequent
+formats, capacity-checked migrations and current V7/V8 PITR-disable limitation.
 
 ## 1. Summary
 
