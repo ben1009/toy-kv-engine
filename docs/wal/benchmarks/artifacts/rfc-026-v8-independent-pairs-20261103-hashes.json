@@ -1,0 +1,82 @@
+{
+  "algorithm": "SHA-256",
+  "excluded": "This manifest excludes itself.",
+  "files": {
+    "docs/wal/README.md": {
+      "sha256": "573cbd132738c84fb968f0fbfe5f2ea5539e0a5a3785eb7b88661517c49ba75e",
+      "bytes": 17631
+    },
+    "docs/wal/benchmarks/paired_v7_v8.py": {
+      "sha256": "58eb9263935a0dc8a7e6f9c1a629f8e6896ebb24d4cfc238006d019b46dd5074",
+      "bytes": 28066
+    },
+    "docs/wal/benchmarks/test_paired_v7_v8.py": {
+      "sha256": "89f3ccbc2159a240849212d6bd5abe9f2433db22950560ae4eb4a89b3c283a2e",
+      "bytes": 18326
+    },
+    "docs/wal/benchmarks/paired-v7-v8-method.md": {
+      "sha256": "84f03600a6df7fcb902190386ecc406b86a8f0fa4ba7049f3b0ddf863aaa10bd",
+      "bytes": 8440
+    },
+    "docs/wal/benchmarks/rfc-026-v8-independent-pairs-20261103.md": {
+      "sha256": "7aac9a417f5794bf636e703862e66ed94ffb51e7fa7b2ce296bf3e1ca98cf2e1",
+      "bytes": 6648
+    },
+    "docs/wal/benchmarks/artifacts/rfc-026-v8-independent-pairs-20261103-checks.json": {
+      "sha256": "de4faf497bb7dcb5de577b9c942f81d4487598e1c5ed53a5cf1db90a7992143a",
+      "bytes": 1102
+    },
+    "docs/wal/benchmarks/artifacts/rfc-026-v8-independent-pairs-20261103-pair0.json": {
+      "sha256": "1b50113bad589ff7456155326f1bb90eda06c414c82bdbb1c71bf1b26be987c7",
+      "bytes": 124716
+    },
+    "docs/wal/benchmarks/artifacts/rfc-026-v8-independent-pairs-20261103-pair1.json": {
+      "sha256": "5dda81c5e31f04360b811bf337dfdbbb10ae4e0ac6dc0502a0a2fa1cbe3ef4a2",
+      "bytes": 124950
+    },
+    "docs/wal/benchmarks/artifacts/rfc-026-v8-independent-pairs-20261103-pair2.json": {
+      "sha256": "b5f7a322603465cdd051b621784092751c32203264af8edbaab5a4b5f0833770",
+      "bytes": 351484
+    },
+    "docs/wal/benchmarks/artifacts/rfc-026-v8-independent-pairs-20261103-pair3.json": {
+      "sha256": "55b344c6cea449e9d9eadf0c6cb241a47fbd8d22c2802b77bb85f0d55b7ba868",
+      "bytes": 123302
+    },
+    "docs/wal/benchmarks/artifacts/rfc-026-v8-independent-pairs-20261103-plan.json": {
+      "sha256": "6b25e4b5eec64ca9dc0e88e0bd4f334b30ad8aa6ccc434e4cd51495340c0ff8d",
+      "bytes": 2210
+    },
+    "docs/wal/benchmarks/artifacts/rfc-026-v8-independent-pairs-20261103-runner-as-executed.py": {
+      "sha256": "58eb9263935a0dc8a7e6f9c1a629f8e6896ebb24d4cfc238006d019b46dd5074",
+      "bytes": 28066
+    },
+    "docs/wal/benchmarks/artifacts/rfc-026-v8-independent-pairs-20261103-smoke-pair0.json": {
+      "sha256": "eb14f4c555889e892cb9af15d9db11746d5e5ffecb2316456ca483c6bd0fc522",
+      "bytes": 124897
+    },
+    "docs/wal/benchmarks/artifacts/rfc-026-v8-independent-pairs-20261103-smoke-pair1.json": {
+      "sha256": "1ff32077536e2c3db55feb1bd2a6fe6af39c056c83d270db19ab6104df70dab7",
+      "bytes": 124951
+    },
+    "docs/wal/benchmarks/artifacts/rfc-026-v8-independent-pairs-20261103-smoke-pair2.json": {
+      "sha256": "0968411c797c11f0aa458cd54e5d81a4b339b05667de5fa46b0b62ce2917c8ca",
+      "bytes": 350579
+    },
+    "docs/wal/benchmarks/artifacts/rfc-026-v8-independent-pairs-20261103-smoke-pair3.json": {
+      "sha256": "a1b4ec9aca6978079ddb926afe7318d587b9f5a05a6e9dd6bba6e219f855efd4",
+      "bytes": 350339
+    },
+    "docs/wal/benchmarks/artifacts/rfc-026-v8-independent-pairs-20261103-smoke-plan.json": {
+      "sha256": "1ec090b958edfc84aeeeeaea647061007fabbaffd793c9947fd8acc079bca39e",
+      "bytes": 2208
+    },
+    "docs/wal/benchmarks/artifacts/rfc-026-v8-independent-pairs-20261103-smoke-summary.json": {
+      "sha256": "657cdbc468a250cf2166ee2c866a3092ef7e1dd2814aade75ca6998c0746b9d4",
+      "bytes": 2524
+    },
+    "docs/wal/benchmarks/artifacts/rfc-026-v8-independent-pairs-20261103-summary.json": {
+      "sha256": "593e403605af48df47aa4fce57aac7c7bd20e940d2ad13a1084156b892dbd455",
+      "bytes": 2559
+    }
+  }
+}

@@ -28,12 +28,39 @@ writers, batch64, 1 KiB values, no compaction and a 2 GiB SST target. The same
 whole-process CPU mask, `0-15`, applies to every workload child. This is a
 placement control, not a production affinity policy. The probe uses CPU 8.
 
-The runner executes two fixed blocks:
+The current protocol is `kv-engine.wal-paired-diagnostic.v2`. It declares
+four independent attempts, in this order, before any probe runs:
+
+| Attempt | Required storage state | Order |
+|---|---|---|
+| 0 | fast | V7 → V8 |
+| 1 | fast | V8 → V7 |
+| 2 | slow | V7 → V8 |
+| 3 | slow | V8 → V7 |
+
+Each attempt requires **two consecutive compatible admission probes** in its
+required state, with a maximum of six admission probes. The first successful
+window immediately admits the pair. An unavailable state produces a skipped
+attempt, with all its probes preserved and no benchmark runs. A rejected pair
+is never retried. There is no unbounded wait, forced state change or selection
+based on throughput.
+
+Once admitted, the last admission probe is the pair's first boundary:
 
 ```text
-probe → V7 → probe → V8 → probe → V8 → probe → V7 → probe
-probe → V8 → probe → V7 → probe → V7 → probe → V8 → probe
+admission probe → A → probe → B → probe
 ```
+
+Only these three measurement probes determine that pair's storage comparison.
+They must agree in state and satisfy every drift threshold **pairwise**.
+A preceding or following rejected pair does not discard this pair. Both
+orders are assessed independently. Fast and slow comparisons stay separate;
+a state-level combined ratio requires valid pairs in both orders.
+
+The prior whole-block protocol and its archived results remain unchanged.
+Their analyzer still rejects both historical blocks. They are not processed
+with the new pair gate, so the new policy does not retrospectively select
+favorable windows from the old experiment.
 
 Each probe overwrites the first 4 MiB of the existing initialized disposable
 8 MiB file using 1,024 aligned 4 KiB O_DIRECT writes and fdatasync every four
@@ -44,8 +71,8 @@ perform durable I/O and may affect the device; they are identical across
 positions, rather than assumed to be passive observations.
 
 Binary SHA256, boot ID, masks and the policy are saved before measurement.
-Benchmark JSON, stderr and sampled attribution JSON stay in RAM until a
-whole block finishes; attribution writes into an inherited memfd. Database
+Benchmark JSON, stderr and sampled attribution JSON stay in RAM until an
+individual pair attempt finishes; attribution writes into an inherited memfd. Database
 setup/close remains outside the benchmark's timed interval. No build, test,
 admin query or separate profiling job runs alongside the captures.
 
@@ -55,7 +82,7 @@ An example using the current preserved executable is:
 python3 -B docs/wal/benchmarks/paired_v7_v8.py \
   --binary target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution \
   --scratch-file target/rfc-026-v8-background-affinity-20261102/standalone-direct-probe.data \
-  --output-dir target/rfc-026-v8-state-paired-20261103
+  --output-dir target/rfc-026-v8-independent-pairs-20261103
 ```
 
 The scratch file must already exist, belong to the current user, and contain
@@ -78,8 +105,9 @@ These empirical thresholds describe this P41 Plus, not other SSDs:
 
 A probe is `transitioning` if the four consecutive quarters disagree on
 state, or their medians differ by more than both 50 µs and 25% of the lower
-median. A block is rejected if any probe transitions, if states differ, or
-if any later probe drifts from the first beyond these predeclared limits:
+median. A pair is rejected if any measurement probe transitions, if states differ
+from the admitted target, or if any pair of its three measurement probes
+exceeds these predeclared limits:
 
 | Metric | Absolute allowance | Relative allowance |
 |---|---:|---:|
@@ -90,26 +118,29 @@ if any later probe drifts from the first beyond these predeclared limits:
 | Writes over 5 ms | 8 writes | 50% |
 
 Reject only when the difference exceeds **both** allowances; relative
-differences use the lower endpoint. An incomplete block, a binary/boot/mask
-mismatch or an incorrect format order also rejects its comparisons. Raw
-measurements remain available for every rejected block.
+differences use the lower endpoint. An incomplete pair, a binary/boot/mask/workload mismatch against the saved
+plan, or an incorrect format order also rejects its comparison. Raw probe
+samples and capture metrics are validated before ratios are computed. The
+recorded summaries cannot override those raw values. All admission samples,
+skipped attempts and rejected measurements remain available.
 
-All probes in a compatible block have the same observed state. This is
+All measurement probes in a compatible pair have the same observed state. This is
 weaker than proving identical internal controller state: a transition and
 recovery entirely inside one workload can escape endpoint probes. Whole-run
 sync/frontier timings and the existing storage flags remain visible. Neither
-a compatible slow block nor this instrumented runner establishes RFC
+a compatible slow pair nor this instrumented runner establishes RFC
 performance qualification. The existing p99 >10 ms or mean fdatasync >1 ms
 filter remains an independent field on every run.
 
 ## Reading results
 
-Only a compatible block gets V8/V7 ratios. Compare adjacent pairs in both
-directions, retaining their individual ratios and their geometric mean.
-Never select an unrelated V7 winner and V8 winner to infer a code effect.
-Historical best scores remain context and are kept outside this comparison.
-Do not merge different storage states. Agreement across the two reversed
-blocks matters more than one attractive run.
+Only a compatible pair gets a V8/V7 ratio. Keep the individual pair ratios;
+compute their geometric mean within one state only when both format orders
+have valid pairs. A single valid direction remains a diagnostic observation,
+with no combined estimate. Never select unrelated V7 and V8 winners to infer
+a code effect. Historical best scores remain context outside this comparison.
+Do not merge different storage states. Missing or skipped states remain
+explicitly missing rather than being filled from earlier cohorts.
 
 Reports include process CPU, context switches, reported commit/solo groups,
 buffers/reported group, worker notification requests, eventfd writes, syncs
@@ -129,6 +160,6 @@ Recompute saved summaries without any benchmark or device probe:
 
 ```bash
 python3 -B docs/wal/benchmarks/paired_v7_v8.py \
-  --analyze-dir target/rfc-026-v8-state-paired-20261103
+  --analyze-dir target/rfc-026-v8-independent-pairs-20261103
 python3 -B -m unittest discover -s docs/wal/benchmarks -p test_paired_v7_v8.py
 ```

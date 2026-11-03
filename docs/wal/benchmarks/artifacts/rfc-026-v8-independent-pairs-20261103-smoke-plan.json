@@ -1,0 +1,97 @@
+{
+  "protocol": "kv-engine.wal-paired-diagnostic.v2",
+  "pair_schedule": [
+    {
+      "target_state": "fast",
+      "order": [
+        "v7",
+        "v8"
+      ]
+    },
+    {
+      "target_state": "fast",
+      "order": [
+        "v8",
+        "v7"
+      ]
+    },
+    {
+      "target_state": "slow",
+      "order": [
+        "v7",
+        "v8"
+      ]
+    },
+    {
+      "target_state": "slow",
+      "order": [
+        "v8",
+        "v7"
+      ]
+    }
+  ],
+  "admission_max_probes": 6,
+  "admission_consecutive_probes": 2,
+  "attempts_per_scheduled_pair": 1,
+  "binary": "/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution",
+  "binary_sha256": "fbb90ea8a6f20bf476760e79ae60e04cda3edae04138d45ae5a9e6346da299f1",
+  "boot_id": "b801063f-4f4d-427b-8842-8d2809a4776e",
+  "kernel": "6.12.71-1-lts",
+  "filesystem": "ext4 /dev/nvme0n1p3 /home",
+  "cpu_mask": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15
+  ],
+  "scratch_file": "/home/liu/proj/toy-kv-engine/target/rfc-026-v8-background-affinity-20261102/standalone-direct-probe.data",
+  "scratch_inode": 49551156,
+  "num": 4096,
+  "writers": 16,
+  "batch_entries": 64,
+  "value_bytes": 1024,
+  "probe_writes": 1024,
+  "probe_fdatasync_every": 4,
+  "policy": {
+    "fast_below_us": 100,
+    "slow_at_or_above_us": 500,
+    "post_flush_p50_drift": [
+      50,
+      0.25
+    ],
+    "post_flush_p99_drift": [
+      150,
+      0.5
+    ],
+    "sync_p50_drift": [
+      50,
+      0.35
+    ],
+    "sync_p99_drift": [
+      250,
+      0.5
+    ],
+    "long_write_count_drift": [
+      8,
+      0.5
+    ]
+  },
+  "script_sha256": "58eb9263935a0dc8a7e6f9c1a629f8e6896ebb24d4cfc238006d019b46dd5074",
+  "runtime_changed": false,
+  "device_settings_changed": false,
+  "qualifies_RFC_performance": false,
+  "diagnostic_instrumentation": true,
+  "scope": "Prespecified pair-level gate and bounded stable-state admission; no retrospective reuse of v1 data. Three measurement probes must agree pairwise. Preserve skipped/rejected attempts and separate fast/slow ratios. Diagnostic only, no within-run state or identical completion-pattern claim."
+}

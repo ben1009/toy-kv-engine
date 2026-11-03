@@ -1,0 +1,99 @@
+{
+  "protocol": "kv-engine.wal-paired-diagnostic.v2",
+  "pairs": [
+    {
+      "target_state": "fast",
+      "order": [
+        "v7",
+        "v8"
+      ],
+      "status": "not_admitted",
+      "probe_compatible_diagnostic_pair": false,
+      "rejection_reasons": [
+        "stable_state_not_admitted",
+        "incomplete_pair",
+        "order_mismatch"
+      ],
+      "v8_over_v7": null,
+      "both_runs_pass_existing_storage_filter": false,
+      "RFC_performance_qualified": false
+    },
+    {
+      "target_state": "fast",
+      "order": [
+        "v8",
+        "v7"
+      ],
+      "status": "not_admitted",
+      "probe_compatible_diagnostic_pair": false,
+      "rejection_reasons": [
+        "stable_state_not_admitted",
+        "incomplete_pair",
+        "order_mismatch"
+      ],
+      "v8_over_v7": null,
+      "both_runs_pass_existing_storage_filter": false,
+      "RFC_performance_qualified": false
+    },
+    {
+      "target_state": "slow",
+      "order": [
+        "v7",
+        "v8"
+      ],
+      "status": "accepted",
+      "probe_compatible_diagnostic_pair": true,
+      "rejection_reasons": [],
+      "v8_over_v7": {
+        "puts_s": 0.8729077125115957,
+        "p99_ms": 1.3140346611512512,
+        "cpu_s": 1.199106153643926,
+        "syncs": 1.0,
+        "voluntary": 1.6822222222222223
+      },
+      "both_runs_pass_existing_storage_filter": false,
+      "RFC_performance_qualified": false
+    },
+    {
+      "target_state": "slow",
+      "order": [
+        "v8",
+        "v7"
+      ],
+      "status": "accepted",
+      "probe_compatible_diagnostic_pair": true,
+      "rejection_reasons": [],
+      "v8_over_v7": {
+        "puts_s": 1.4640533278462295,
+        "p99_ms": 0.5544497043321426,
+        "cpu_s": 1.1121086936564766,
+        "syncs": 1.25,
+        "voluntary": 1.7053571428571428
+      },
+      "both_runs_pass_existing_storage_filter": false,
+      "RFC_performance_qualified": false
+    }
+  ],
+  "by_storage_state": {
+    "fast": {
+      "accepted_pairs": 0,
+      "both_orders_observed": false,
+      "geomean_v8_over_v7": null
+    },
+    "slow": {
+      "accepted_pairs": 2,
+      "both_orders_observed": true,
+      "geomean_v8_over_v7": {
+        "puts_s": 1.1304792972032887,
+        "p99_ms": 0.8535608527559698,
+        "cpu_s": 1.1547884559885369,
+        "syncs": 1.118033988749895,
+        "voluntary": 1.6937501830375348
+      }
+    }
+  },
+  "compatible_pairs": 2,
+  "all_scheduled_attempts_present": true,
+  "RFC_performance_qualified": false,
+  "runtime_changes": false
+}

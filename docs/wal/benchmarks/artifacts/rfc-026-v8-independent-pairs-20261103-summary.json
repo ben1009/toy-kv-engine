@@ -1,0 +1,96 @@
+{
+  "protocol": "kv-engine.wal-paired-diagnostic.v2",
+  "pairs": [
+    {
+      "target_state": "fast",
+      "order": [
+        "v7",
+        "v8"
+      ],
+      "status": "not_admitted",
+      "probe_compatible_diagnostic_pair": false,
+      "rejection_reasons": [
+        "stable_state_not_admitted",
+        "incomplete_pair",
+        "order_mismatch"
+      ],
+      "v8_over_v7": null,
+      "both_runs_pass_existing_storage_filter": false,
+      "RFC_performance_qualified": false
+    },
+    {
+      "target_state": "fast",
+      "order": [
+        "v8",
+        "v7"
+      ],
+      "status": "not_admitted",
+      "probe_compatible_diagnostic_pair": false,
+      "rejection_reasons": [
+        "stable_state_not_admitted",
+        "incomplete_pair",
+        "order_mismatch"
+      ],
+      "v8_over_v7": null,
+      "both_runs_pass_existing_storage_filter": false,
+      "RFC_performance_qualified": false
+    },
+    {
+      "target_state": "slow",
+      "order": [
+        "v7",
+        "v8"
+      ],
+      "status": "rejected",
+      "probe_compatible_diagnostic_pair": false,
+      "rejection_reasons": [
+        "probe_1:wrong_or_transitioning_state",
+        "probes_0_1:storage_state_changed_or_transitioning",
+        "probes_0_1:post_flush_p50_drift",
+        "probes_0_1:post_flush_p99_drift",
+        "probes_0_1:long_write_count_drift",
+        "probe_2:wrong_or_transitioning_state",
+        "probes_0_2:storage_state_changed_or_transitioning",
+        "probes_0_2:post_flush_p50_drift",
+        "probes_0_2:post_flush_p99_drift",
+        "probes_0_2:long_write_count_drift"
+      ],
+      "v8_over_v7": null,
+      "both_runs_pass_existing_storage_filter": false,
+      "RFC_performance_qualified": false
+    },
+    {
+      "target_state": "slow",
+      "order": [
+        "v8",
+        "v7"
+      ],
+      "status": "not_admitted",
+      "probe_compatible_diagnostic_pair": false,
+      "rejection_reasons": [
+        "stable_state_not_admitted",
+        "incomplete_pair",
+        "order_mismatch"
+      ],
+      "v8_over_v7": null,
+      "both_runs_pass_existing_storage_filter": false,
+      "RFC_performance_qualified": false
+    }
+  ],
+  "by_storage_state": {
+    "fast": {
+      "accepted_pairs": 0,
+      "both_orders_observed": false,
+      "geomean_v8_over_v7": null
+    },
+    "slow": {
+      "accepted_pairs": 0,
+      "both_orders_observed": false,
+      "geomean_v8_over_v7": null
+    }
+  },
+  "compatible_pairs": 0,
+  "all_scheduled_attempts_present": true,
+  "RFC_performance_qualified": false,
+  "runtime_changes": false
+}

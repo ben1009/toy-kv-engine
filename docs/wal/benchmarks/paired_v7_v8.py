@@ -1,4 +1,4 @@
-"""Run bounded V7/V8 diagnostic blocks with independent storage probes.
+"""Run bounded V7/V8 diagnostic pairs with independent storage probes.
 
 Uses the same instrumented write-perf binary for both formats. No device
 features, scheduler settings, or runtime sources are changed. See
@@ -29,6 +29,15 @@ POLICY = {
     "long_write_count_drift": [8, 0.50],
 }
 ORDERS = (("v7", "v8", "v8", "v7"), ("v8", "v7", "v7", "v8"))
+PAIR_PROTOCOL = "kv-engine.wal-paired-diagnostic.v2"
+PAIR_SCHEDULE = (
+    {"target_state": "fast", "order": ["v7", "v8"]},
+    {"target_state": "fast", "order": ["v8", "v7"]},
+    {"target_state": "slow", "order": ["v7", "v8"]},
+    {"target_state": "slow", "order": ["v8", "v7"]},
+)
+ADMISSION_MAX_PROBES = 6
+RATIO_FIELDS = ("puts_s", "p99_ms", "cpu_s", "syncs", "voluntary")
 
 
 def stats(values):
@@ -130,6 +139,159 @@ def summarize_block(block, policy=POLICY):
     }
 
 
+def checked_probe(probe, policy=POLICY):
+    """Reject inconsistent saved summaries instead of trusting state labels."""
+    writes, syncs = probe["write_ns"], probe["sync_ns"]
+    if len(writes) != 1024 or len(syncs) != 256 or any(
+        type(value) is not int or value <= 0 for value in [*writes, *syncs]
+    ):
+        raise ValueError("Invalid raw probe samples")
+    expected = {"write": stats(writes), "first_after_sync": stats(writes[::4]), "sync": stats(syncs),
+                "storage_state": probe_state(probe, policy)}
+    if any(probe[key] != value for key, value in expected.items()):
+        raise ValueError("Probe summaries differ from raw samples")
+    return probe
+
+
+def admission_ready(probes, target, policy=POLICY):
+    if len(probes) < 2:
+        return False
+    a, b = (checked_probe(p, policy) for p in probes[-2:])
+    return a["storage_state"] == b["storage_state"] == target and not compare_probes(a, b, policy)
+
+
+def acquire_stable_probes(probe_fn, target, limit=ADMISSION_MAX_PROBES, policy=POLICY, probes=None):
+    probes = [] if probes is None else probes
+    for _ in range(limit):
+        probes.append(probe_fn())
+        if admission_ready(probes, target, policy):
+            return probes, True
+    return probes, False
+
+
+def run_pair(spec, probe_fn, capture_fn, limit=ADMISSION_MAX_PROBES, policy=POLICY, result=None):
+    result = {} if result is None else result
+    result.update({"target_state": spec["target_state"], "order": spec["order"],
+                   "admission_probes": [], "admitted": False, "runs": [], "probes": []})
+    probes, admitted = acquire_stable_probes(probe_fn, spec["target_state"], limit, policy,
+                                           probes=result["admission_probes"])
+    result.update({"admission_probes": probes, "admitted": admitted})
+    if not admitted:
+        return result
+    result["probes"].append(probes[-1])
+    for position, fmt in enumerate(spec["order"]):
+        result["runs"].append(capture_fn(position, fmt))
+        result["probes"].append(probe_fn())
+    return result
+
+
+def pair_identity_reasons(runs, plan, spec):
+    reasons = []
+    if [r.get("format") for r in runs] != spec["order"]:
+        reasons.append("order_mismatch")
+    for field, expected in (("binary_sha256", plan["binary_sha256"]), ("boot_id", plan["boot_id"]),
+                            ("cpu_mask", plan["cpu_mask"])):
+        if any(run.get(field) != expected for run in runs):
+            reasons.append(field + "_mismatch")
+    expected_params = {"num": plan["num"], "threads": plan["writers"], "batch_size": plan["batch_entries"],
+                       "value_size": plan["value_bytes"], "wal_io_mode": "parallel",
+                       "seed": 42, "latency_sample_every": 10}
+    expected_options = {"wal": True, "compaction": "none", "target_sst_size": 2147483648}
+    for index, run in enumerate(runs):
+        try:
+            record, phases = run["record"], run["phases"]
+            if any(record["params"].get(key) != value for key, value in expected_params.items()) or any(
+                record["engine_options"].get(key) != value for key, value in expected_options.items()
+            ) or record["params"]["wal_format_version"] != int(run["format"][1:]):
+                reasons.append(f"run_{index}:workload_mismatch")
+            raw = record["result"]
+            expected_metrics = {"puts_s": raw["ops_per_sec"], "p99_ms": record["latency"]["p99_ms"],
+                                "cpu_s": (raw["process_cpu_user_ms"] + raw["process_cpu_system_ms"]) / 1000,
+                                "syncs": raw["wal_pipeline"]["sync_count"],
+                                "voluntary": phases["process_after"]["voluntary"] - phases["process_before"]["voluntary"]}
+            if raw["ops"] != plan["num"] or any(
+                not math.isfinite(value) or value <= 0 or run["metrics"][key] != value
+                for key, value in expected_metrics.items()
+            ):
+                reasons.append(f"run_{index}:invalid_metrics")
+            expected_flag = expected_metrics["p99_ms"] > 10 or (
+                raw["wal_pipeline"]["fdatasync_ns"] / raw["wal_pipeline"]["sync_count"] / 1e6 > 1)
+            if run["metrics"].get("existing_storage_flag") != expected_flag:
+                reasons.append(f"run_{index}:invalid_storage_flag")
+            if run["format"] == "v8":
+                digest = raw["wal_v8_digest"]
+                if digest["payload_hash_bytes"] != plan["num"] * 1050 or digest["post_encode_hash_reread_bytes"] != 0:
+                    reasons.append(f"run_{index}:digest_accounting_mismatch")
+        except (KeyError, TypeError, ValueError, OverflowError):
+            reasons.append(f"run_{index}:invalid_capture")
+    return reasons
+
+
+def summarize_pair(pair, plan, spec):
+    policy = plan["policy"]
+    reasons = ["capture_error"] if pair.get("error") else []
+    admission = pair.get("admission_probes", [])
+    admitted = False
+    try:
+        for probe in admission:
+            checked_probe(probe, policy)
+        if len(admission) > plan["admission_max_probes"]:
+            reasons.append("admission_probe_limit_exceeded")
+        admitted = admission_ready(admission, spec["target_state"], policy)
+        if any(admission_ready(admission[:end], spec["target_state"], policy)
+               for end in range(2, len(admission))):
+            reasons.append("admission_continued_after_success")
+    except (KeyError, TypeError, ValueError):
+        reasons.append("invalid_admission_probe")
+    if not admitted or pair.get("admitted") is not True:
+        reasons.append("stable_state_not_admitted")
+    if pair.get("target_state") != spec["target_state"] or pair.get("order") != spec["order"]:
+        reasons.append("schedule_mismatch")
+    probes, runs = pair.get("probes", []), pair.get("runs", [])
+    if len(probes) != 3 or len(runs) != 2:
+        reasons.append("incomplete_pair")
+    if admitted and probes and probes[0] != admission[-1]:
+        reasons.append("pair_did_not_start_at_admission_boundary")
+    valid_probes = []
+    for index, probe in enumerate(probes):
+        try:
+            valid_probes.append(checked_probe(probe, policy))
+        except (KeyError, TypeError, ValueError):
+            reasons.append(f"probe_{index}:invalid_raw_probe")
+    for index, probe in enumerate(valid_probes):
+        if probe["storage_state"] != spec["target_state"]:
+            reasons.append(f"probe_{index}:wrong_or_transitioning_state")
+        for other in range(index):
+            reasons += [f"probes_{other}_{index}:" + why
+                        for why in compare_probes(valid_probes[other], probe, policy)]
+    reasons += pair_identity_reasons(runs, plan, spec)
+    ratios = None
+    if not reasons:
+        by_format = {run["format"]: run["metrics"] for run in runs}
+        ratios = {key: by_format["v8"][key] / by_format["v7"][key] for key in RATIO_FIELDS}
+    return {"target_state": spec["target_state"], "order": spec["order"],
+            "status": "accepted" if not reasons else ("rejected" if admitted else "not_admitted"),
+            "probe_compatible_diagnostic_pair": not reasons, "rejection_reasons": reasons,
+            "v8_over_v7": ratios,
+            "both_runs_pass_existing_storage_filter": len(runs) == 2 and all(
+                not r.get("metrics", {}).get("existing_storage_flag", True) for r in runs),
+            "RFC_performance_qualified": False}
+
+
+def summarize_pairs(pairs):
+    states = {}
+    for state in ("fast", "slow"):
+        accepted = [p for p in pairs if p["target_state"] == state and p["probe_compatible_diagnostic_pair"]]
+        orders = {tuple(p["order"]) for p in accepted}
+        both = orders == {("v7", "v8"), ("v8", "v7")}
+        states[state] = {"accepted_pairs": len(accepted), "both_orders_observed": both,
+                         "geomean_v8_over_v7": {
+                             key: math.exp(sum(math.log(p["v8_over_v7"][key]) for p in accepted) / len(accepted))
+                             for key in RATIO_FIELDS
+                         } if both else None}
+    return states
+
+
 def sha256(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -187,6 +349,18 @@ def phase_estimates(phases):
 
 def analyze_directory(out):
     plan = json.loads((out / "plan.json").read_text())
+    if plan.get("protocol") == PAIR_PROTOCOL:
+        raw_pairs = [json.loads((out / f"pair{i}.json").read_text()) if (out / f"pair{i}.json").is_file()
+                     else {} for i in range(len(plan["pair_schedule"]))]
+        pairs = [summarize_pair(pair, plan, spec) for pair, spec in zip(raw_pairs, plan["pair_schedule"], strict=True)]
+        summary = {"protocol": PAIR_PROTOCOL, "pairs": pairs, "by_storage_state": summarize_pairs(pairs),
+                   "compatible_pairs": sum(p["probe_compatible_diagnostic_pair"] for p in pairs),
+                   "all_scheduled_attempts_present": all(bool(pair) for pair in raw_pairs),
+                   "RFC_performance_qualified": False, "runtime_changes": False}
+        (out / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+        return summary
+    if plan.get("protocol") is not None:
+        raise ValueError("Unsupported benchmark protocol; do not reinterpret records")
     raw_blocks = [json.loads((out / f"block{i}.json").read_text()) if (out / f"block{i}.json").is_file()
                   else {"runs": [], "probes": []} for i in range(2)]
     blocks = [summarize_block(block, plan["policy"]) for block in raw_blocks]
@@ -314,14 +488,17 @@ def main():
     out.mkdir()
     binary_hash = sha256(binary)
     boot_id = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
-    plan = {"binary": str(binary), "binary_sha256": binary_hash, "boot_id": boot_id,
+    plan = {"protocol": PAIR_PROTOCOL, "pair_schedule": PAIR_SCHEDULE,
+            "admission_max_probes": ADMISSION_MAX_PROBES, "admission_consecutive_probes": 2,
+            "attempts_per_scheduled_pair": 1,
+            "binary": str(binary), "binary_sha256": binary_hash, "boot_id": boot_id,
             "kernel": os.uname().release, "filesystem": fs, "cpu_mask": args.cpu_list,
-            "scratch_file": str(reference), "scratch_inode": s.st_ino, "orders": ORDERS,
+            "scratch_file": str(reference), "scratch_inode": s.st_ino,
             "num": args.num, "writers": 16, "batch_entries": 64, "value_bytes": 1024,
             "probe_writes": 1024, "probe_fdatasync_every": 4, "policy": POLICY,
             "script_sha256": sha256(Path(__file__)), "runtime_changed": False, "device_settings_changed": False,
             "qualifies_RFC_performance": False, "diagnostic_instrumentation": True,
-            "scope": "Same binary/boot/mask. Shared probes before and after each capture; preserve rejected blocks. CPU scopes are sampled and inclusive. No within-run state or matched completion-pattern claim."}
+            "scope": "Prespecified pair-level gate and bounded stable-state admission; no retrospective reuse of v1 data. Three measurement probes must agree pairwise. Preserve skipped/rejected attempts and separate fast/slow ratios. Diagnostic only, no within-run state or identical completion-pattern claim."}
     (out / "plan.json").write_text(json.dumps(plan, indent=2) + "\n")
     buf = mmap.mmap(-1, 4096)
     payload = bytes(range(256)) * 16
@@ -332,22 +509,32 @@ def main():
     try:
         if os.fstat(fd).st_ino != s.st_ino or os.preadv(fd, [buf], 0) != 4096 or bytes(buf) != payload:
             raise RuntimeError("Scratch inode or expected contents mismatch")
-        for index, order in enumerate(ORDERS):
-            block = {"block": index, "runs": [], "probes": []}
-            # Capture data and phase JSON stay in RAM until the whole block ends.
+        for index, spec in enumerate(PAIR_SCHEDULE):
+            pair = {"pair_index": index}
+
+            def probe():
+                value = storage_probe(fd, buf, args.probe_cpu)
+                print(json.dumps({"pair": index, "probe_state": value["storage_state"],
+                                  "post_sync_p50_us": value["first_after_sync"]["p50_us"],
+                                  "post_sync_p99_us": value["first_after_sync"]["p99_us"]}), flush=True)
+                return value
+
+            def capture(position, fmt):
+                name = f"pair{index}-{spec['target_state']}-{position}-{fmt}"
+                print("START", name, flush=True)
+                value = run_capture(binary, out, name, fmt, args, binary_hash, boot_id)
+                print(json.dumps({"name": name, **value["metrics"]}), flush=True)
+                return value
+
+            # Captures and phase JSON stay in RAM until this attempt ends.
             try:
-                block["probes"].append(storage_probe(fd, buf, args.probe_cpu))
-                for position, fmt in enumerate(order):
-                    name = f"block{index}-{position}-{fmt}"
-                    print("START", name, flush=True)
-                    run = run_capture(binary, out, name, fmt, args, binary_hash, boot_id)
-                    block["runs"].append(run)
-                    block["probes"].append(storage_probe(fd, buf, args.probe_cpu))
-                    print(json.dumps({"name": name, **run["metrics"], "probe_state_after": block["probes"][-1]["storage_state"]}), flush=True)
+                run_pair(spec, probe, capture, result=pair)
+            except BaseException as error:
+                pair["error"] = str(error)
+                raise
             finally:
-                (out / f"block{index}.json").write_text(json.dumps(block, indent=2) + "\n")
-            block_summary = summarize_block(block)
-            print(json.dumps({"block": index, **block_summary}), flush=True)
+                (out / f"pair{index}.json").write_text(json.dumps(pair, indent=2) + "\n")
+            print(json.dumps({"pair": index, **summarize_pair(pair, plan, spec)}), flush=True)
         if os.preadv(fd, [buf], 1023 * 4096) != 4096 or bytes(buf) != payload:
             raise RuntimeError("Final scratch contents mismatch")
     finally:
