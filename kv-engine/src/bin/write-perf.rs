@@ -3662,7 +3662,7 @@ fn run_wal_batch_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>
     let retry_pitr_barrier = cfg.pitr;
     let baseline = collect_counters(&engine)?;
     #[cfg(feature = "bench")]
-    let timeline = wal_timeline::Capture::from_env(engine.clone())?;
+    let timeline = wal_timeline::Capture::from_env(engine.clone(), &path)?;
     #[cfg(feature = "bench")]
     let timeline_enabled = timeline.is_some();
     let cpu_start = process_cpu_times();

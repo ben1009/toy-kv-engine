@@ -15,6 +15,7 @@ import sys
 import time
 
 from wal_trace_regimes import POLICY
+from wal_extent_trace import EXTENT_POLICY, EXTENT_PROTOCOL, EXTRA_EVENTS, storage_device
 
 
 EVENTS = ("nvme/nvme_setup_cmd", "nvme/nvme_complete_rq",
@@ -61,6 +62,8 @@ def main():
     parser.add_argument("--uid", type=int, default=int(os.getenv("SUDO_UID", "0")))
     parser.add_argument("--gid", type=int, default=int(os.getenv("SUDO_GID", "0")))
     parser.add_argument("--smoke", action="store_true")
+    parser.add_argument("--wal-extents", action="store_true", help="Capture inode mapping evidence and WAL frame inventory")
+    parser.add_argument("--counter-interval-ms", type=int, choices=(100, 200))
     args = parser.parse_args()
     if os.geteuid() != 0 or args.uid <= 0 or args.gid <= 0:
         parser.error("Use sudo; only perf needs privilege, the benchmark must be non-root")
@@ -68,23 +71,33 @@ def main():
     cpu_list = cpus(args.cpus)
     if not set(cpu_list) <= os.sched_getaffinity(0):
         parser.error("Requested CPUs are not available")
+    if args.counter_interval_ms and not args.wal_extents:
+        parser.error("Finer counters require the new extent protocol; old cohorts keep their policy")
+    events = EVENTS + EXTRA_EVENTS if args.wal_extents else EVENTS
+    policy = dict(EXTENT_POLICY) if args.wal_extents else POLICY
+    if args.counter_interval_ms:
+        policy["counter_interval_ms"] = args.counter_interval_ms
     formats = {name: (Path("/sys/kernel/tracing/events") / name / "format").read_text()
-               for name in EVENTS}
+               for name in events}
     perf_version = subprocess.check_output(["/usr/bin/perf", "version"], text=True).strip()
     workloads = [{"name": "point", "num": 1024 if args.smoke else 20000, "writers": 1, "batch": 1}]
     if not args.smoke:
         workloads.append({"name": "batch64", "num": 750000, "writers": 16, "batch": 64})
     order = ORDER[:2] if args.smoke else ORDER
-    plan = {"protocol": "kv-engine.passive-wal-trace.v1", "binary": str(binary),
+    plan = {"protocol": EXTENT_PROTOCOL if args.wal_extents else "kv-engine.passive-wal-trace.v1", "binary": str(binary),
             "binary_sha256": sha256(binary), "runner_sha256": sha256(Path(__file__)),
             "analyzer_sha256": sha256(Path(__file__).with_name("wal_trace_regimes.py")),
             "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
-            "cpu_mask": cpu_list, "events": EVENTS, "clock": "CLOCK_MONOTONIC",
+            "cpu_mask": cpu_list, "events": events, "clock": "CLOCK_MONOTONIC",
             "kernel": os.uname().release, "perf": perf_version,
-            "policy": POLICY, "order": order, "workloads": workloads, "uid": args.uid,
+            "policy": policy, "order": order, "workloads": workloads, "uid": args.uid,
             "capture_in_ram_for_entire_cohort": True, "raw_device_writes": False,
             "device_settings_changed": False, "RFC_performance_qualified": False,
             "scope": "Instrumented diagnostic; no endpoint probes. The calibrated 4KiB isolated-write signal does not classify arbitrary bulk or overlapping writes."}
+    if args.wal_extents:
+        plan.update({"device": storage_device(out.parent),
+                     "extent_helper_sha256": sha256(Path(__file__).with_name("wal_extent_trace.py")),
+                     "scope": "WAL extent/role attribution and per-shape calibration distributions. No inherited 4KiB thresholds, no same-cohort calibration scoring, and no RFC qualification."})
     out.mkdir(parents=True, exist_ok=False)
     os.chown(out, args.uid, args.gid)
 
@@ -100,6 +113,13 @@ def main():
     # in memfds / pipes until every workload in this cohort has stopped.
     save_json("plan.json", plan)
     save_json("formats.json", formats)
+    if args.wal_extents:
+        for filename, source in (
+            ("capture-as-executed.py", Path(__file__)),
+            ("extent-helper-as-executed.py", Path(__file__).with_name("wal_extent_trace.py")),
+            ("base-analyzer-as-executed.py", Path(__file__).with_name("wal_trace_regimes.py")),
+        ):
+            save(filename, source.read_bytes())
     pending = []
     active = None
 
@@ -125,10 +145,12 @@ def main():
                 env = {k: v for k, v in os.environ.items()
                        if not k.startswith(("TOYKV_", "KV_PERF_")) and k != "LD_PRELOAD"}
                 env["TOYKV_WAL_TIMELINE"] = f"/proc/self/fd/{timeline_fd}"
-                env["TOYKV_WAL_TIMELINE_INTERVAL_MS"] = "1000"
+                env["TOYKV_WAL_TIMELINE_INTERVAL_MS"] = str(policy["counter_interval_ms"]) if args.wal_extents else "1000"
+                if args.wal_extents:
+                    env["TOYKV_WAL_EXTENT_HELPER"] = str(Path(__file__).with_name("wal_extent_trace.py").resolve())
                 command = ["/usr/bin/perf", "record", "-a", "-m", "64", "-c", "1",
                            "-R", "-T", "--sample-cpu", "--clockid", "mono"]
-                for event in EVENTS:
+                for event in events:
                     command += ["-e", event.replace("/", ":")]
                 command += ["-o", f"/proc/self/fd/{trace_fd}", "--", "/usr/bin/python3",
                             str(Path(__file__).resolve()), "--as-user", str(args.uid), str(args.gid),

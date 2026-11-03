@@ -2,7 +2,8 @@
 
 use std::{
     fs::File,
-    path::PathBuf,
+    path::{Path, PathBuf},
+    process::Command,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -61,6 +62,9 @@ pub(super) struct Capture {
     initial: Option<CounterPoint>,
     stop: Arc<AtomicBool>,
     sampler: Option<JoinHandle<Result<Vec<CounterPoint>>>>,
+    extent_helper: Option<PathBuf>,
+    database: PathBuf,
+    initial_extents: Option<serde_json::Value>,
 }
 
 pub(super) struct Output {
@@ -68,10 +72,11 @@ pub(super) struct Output {
     interval_ms: u64,
     points: Vec<CounterPoint>,
     requests: Vec<RequestSpan>,
+    wal_extents: Option<serde_json::Value>,
 }
 
 impl Capture {
-    pub(super) fn from_env(engine: Arc<KvEngine>) -> Result<Option<Self>> {
+    pub(super) fn from_env(engine: Arc<KvEngine>, database: &Path) -> Result<Option<Self>> {
         let Some(destination) = std::env::var_os("TOYKV_WAL_TIMELINE") else {
             return Ok(None);
         };
@@ -80,6 +85,11 @@ impl Capture {
                 .ok()
                 .as_deref(),
         )?;
+        let extent_helper = std::env::var_os("TOYKV_WAL_EXTENT_HELPER").map(PathBuf::from);
+        let initial_extents = extent_helper
+            .as_ref()
+            .map(|helper| extent_snapshot(helper, database, false))
+            .transpose()?;
         let initial = CounterPoint::capture(&engine)?;
         let stop = Arc::new(AtomicBool::new(false));
         let sampler_stop = stop.clone();
@@ -105,6 +115,9 @@ impl Capture {
             initial: Some(initial),
             stop,
             sampler: Some(sampler),
+            extent_helper,
+            database: database.to_owned(),
+            initial_extents,
         }))
     }
 
@@ -128,6 +141,19 @@ impl Capture {
         ];
         points.extend(self.stop_sampler()?);
         points.push(CounterPoint::capture(&self.engine)?);
+        // Only query extents and read frame bytes after the final timed counter.
+        // The helper writes JSON to a pipe; the capture runner persists it later.
+        let wal_extents = self
+            .extent_helper
+            .as_ref()
+            .map(|helper| {
+                let after = extent_snapshot(helper, &self.database, true)?;
+                Ok::<_, anyhow::Error>(serde_json::json!({
+                    "before": self.initial_extents.take(),
+                    "after": after,
+                }))
+            })
+            .transpose()?;
         requests.sort_unstable_by_key(|span| span.end_ns);
         ensure!(
             requests
@@ -140,6 +166,7 @@ impl Capture {
             interval_ms: self.interval_ms,
             points,
             requests,
+            wal_extents,
         })
     }
 }
@@ -162,12 +189,35 @@ impl Output {
                 "counter_points": self.points,
                 "requests": self.requests,
                 "counter_acquisition_is_bracketed": true,
+                "wal_extents": self.wal_extents,
                 "latency_samples": "all completed application batches; no percentile averaging",
             }),
         )?;
 
         Ok(())
     }
+}
+
+fn extent_snapshot(helper: &Path, database: &Path, inventory: bool) -> Result<serde_json::Value> {
+    let mut command = Command::new("python3");
+    command
+        .arg("-B")
+        .arg(helper)
+        .arg("--snapshot")
+        .arg(database);
+    if inventory {
+        command.arg("--inventory");
+    }
+    let output = command
+        .output()
+        .context("run read-only WAL extent helper")?;
+    ensure!(
+        output.status.success(),
+        "WAL extent helper failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    serde_json::from_slice(&output.stdout).context("decode WAL extent snapshot")
 }
 
 fn interval_ms(value: Option<&str>) -> Result<u64> {

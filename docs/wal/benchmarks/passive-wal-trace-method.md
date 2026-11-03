@@ -12,6 +12,10 @@ V7/V8 controls. A shared label alone does not eliminate workload or order effect
 The earlier [probe-based protocol](paired-v7-v8-method.md) and its historical
 rejections remain unchanged.
 
+The newer [extent attribution method](wal-extent-attribution-method.md) adds
+file/record identity, allocation-time evidence and 100 ms counters. It exports
+separate calibration observations; this protocol and its decisions stay intact.
+
 ## Capture
 
 The benchmark's opt-in `bench` feature hook records every completed batch's start,
