@@ -141,9 +141,14 @@ source/executable hashes, artifact copies, Python syntax and relative links.
 
 The [first plan](artifacts/rfc-026-v8-notification-rerun-20261102-plan.json)
 and [runner](artifacts/rfc-026-v8-notification-rerun-20261102-run.py),
-[confirmation plan](artifacts/rfc-026-v8-notification-rerun-20261102-confirmation-plan.json)
-and [runner](artifacts/rfc-026-v8-notification-rerun-20261102-confirmation.py),
+[confirmation plan](artifacts/rfc-026-v8-notification-rerun-20261102-confirmation-plan.json),
+[confirmation runner](artifacts/rfc-026-v8-notification-rerun-20261102-confirmation.py),
 and [archive script](artifacts/rfc-026-v8-notification-rerun-20261102-archive.py)
 are preserved. Local paths refer to
 `target/rfc-026-v8-notification-rerun-20261102/` and the preceding experiment's
 executables; adjust those paths when reproducing elsewhere.
+
+The confirmation runner now resumes interrupted cohorts by checking the plan,
+preserving completed samples, and archiving partial attempts. The original run
+used the runner in commit `b8da402a`. A resumed cohort may span different device
+states and requires a fresh timing and eligibility audit.
