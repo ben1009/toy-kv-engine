@@ -1,0 +1,8 @@
+{
+  "executed_runner_sha256": "89a265a89ee560273544acf260e456d7a77af96c8f9e09b2aa5f3334036c62d1",
+  "current_runner": "../paired_v7_v8.py",
+  "post_capture_changes": "Counter names corrected; incomplete analysis, workload identity validation and child-failure handling hardened. Capture-time program and raw records are preserved unchanged.",
+  "raw_metric_correction": "The capture-time derived key DATA_groups aliases result.wal_pipeline.commit_groups. V8 records that at FRONTIER publication; it is not an independent DATA submission group count. Use raw worker_eventfd_notifications separately.",
+  "phase_scope_correction": "Zero calls for a phase indicate uninstrumented/unobserved work, not zero CPU cost.",
+  "no_winner_or_RFC_performance_claim": true
+}

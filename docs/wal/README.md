@@ -38,6 +38,8 @@ the retained and rejected experiments.
 
 ## Benchmarks and qualification
 
+- [Paired V7/V8 diagnostic method and storage-state classification](benchmarks/paired-v7-v8-method.md)
+- [RFC 026 paired V7/V8 probes: both blocks transition, 2026-11-03](benchmarks/rfc-026-v8-state-paired-20261103.md)
 - [RFC 026 P-core CPU profiles and allocator screen (not retained), 2026-11-03](benchmarks/rfc-026-v8-pcore-cpu-20261103.md)
 - [RFC 026 V8 background-role and kernel-worker affinity (inconclusive), 2026-11-02](benchmarks/rfc-026-v8-background-affinity-20261102.md)
 - [RFC 026 writer-only versus whole-process P-core affinity, 2026-11-02](benchmarks/rfc-026-v8-writer-affinity-20261102.md)

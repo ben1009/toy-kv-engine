@@ -1,0 +1,63 @@
+{
+  "blocks": [
+    {
+      "storage_state": "transitioning",
+      "probe_compatible_diagnostic_block": false,
+      "rejection_reasons": [
+        "probe_1:post_flush_p99_drift"
+      ],
+      "adjacent_pairs": [],
+      "paired_geomean_v8_over_v7": null,
+      "all_runs_pass_existing_storage_filter": false,
+      "RFC_performance_qualified": false,
+      "scope": "Instrumented paired diagnostic only. Matched probes cannot prove identical device state throughout a run or identical I/O completion patterns."
+    },
+    {
+      "storage_state": "slow",
+      "probe_compatible_diagnostic_block": true,
+      "rejection_reasons": [],
+      "adjacent_pairs": [
+        {
+          "run_indices": [
+            0,
+            1
+          ],
+          "v8_over_v7": {
+            "puts_s": 1.062901977559177,
+            "p99_ms": 1.2973336952802372,
+            "cpu_s": 1.2069342069342068,
+            "syncs": 1.0,
+            "voluntary": 1.4718446601941748
+          }
+        },
+        {
+          "run_indices": [
+            2,
+            3
+          ],
+          "v8_over_v7": {
+            "puts_s": 0.9635230749663674,
+            "p99_ms": 1.0212681623548874,
+            "cpu_s": 1.2444852941176472,
+            "syncs": 1.0,
+            "voluntary": 1.61875
+          }
+        }
+      ],
+      "paired_geomean_v8_over_v7": {
+        "puts_s": 1.0119933704356225,
+        "p99_ms": 1.151054125113117,
+        "cpu_s": 1.2255659392693508,
+        "syncs": 1.0,
+        "voluntary": 1.5435506288066227
+      },
+      "all_runs_pass_existing_storage_filter": false,
+      "RFC_performance_qualified": false,
+      "scope": "Instrumented paired diagnostic only. Matched probes cannot prove identical device state throughout a run or identical I/O completion patterns."
+    }
+  ],
+  "all_raw_blocks_preserved": true,
+  "compatible_blocks": 1,
+  "RFC_performance_qualified": false,
+  "runtime_changes": false
+}

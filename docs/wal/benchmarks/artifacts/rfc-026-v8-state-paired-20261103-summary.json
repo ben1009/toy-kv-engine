@@ -1,0 +1,59 @@
+{
+  "blocks": [
+    {
+      "storage_state": "transitioning",
+      "probe_compatible_diagnostic_block": false,
+      "rejection_reasons": [
+        "probe_1:storage_state_changed_or_transitioning",
+        "probe_1:post_flush_p50_drift",
+        "probe_1:post_flush_p99_drift",
+        "probe_1:long_write_count_drift",
+        "probe_2:storage_state_changed_or_transitioning",
+        "probe_2:post_flush_p50_drift",
+        "probe_2:post_flush_p99_drift",
+        "probe_2:long_write_count_drift",
+        "probe_3:storage_state_changed_or_transitioning",
+        "probe_3:post_flush_p50_drift",
+        "probe_3:post_flush_p99_drift",
+        "probe_3:long_write_count_drift",
+        "probe_4:storage_state_changed_or_transitioning",
+        "probe_4:post_flush_p50_drift",
+        "probe_4:post_flush_p99_drift",
+        "probe_4:long_write_count_drift"
+      ],
+      "adjacent_pairs": [],
+      "paired_geomean_v8_over_v7": null,
+      "all_runs_pass_existing_storage_filter": false,
+      "RFC_performance_qualified": false,
+      "scope": "Instrumented paired diagnostic only. Matched probes cannot prove identical device state throughout a run or identical I/O completion patterns."
+    },
+    {
+      "storage_state": "transitioning",
+      "probe_compatible_diagnostic_block": false,
+      "rejection_reasons": [
+        "probe_1:storage_state_changed_or_transitioning",
+        "probe_1:post_flush_p50_drift",
+        "probe_1:post_flush_p99_drift",
+        "probe_1:long_write_count_drift",
+        "probe_2:storage_state_changed_or_transitioning",
+        "probe_2:post_flush_p50_drift",
+        "probe_2:post_flush_p99_drift",
+        "probe_3:storage_state_changed_or_transitioning",
+        "probe_3:post_flush_p50_drift",
+        "probe_3:post_flush_p99_drift",
+        "probe_4:storage_state_changed_or_transitioning",
+        "probe_4:post_flush_p50_drift",
+        "probe_4:post_flush_p99_drift"
+      ],
+      "adjacent_pairs": [],
+      "paired_geomean_v8_over_v7": null,
+      "all_runs_pass_existing_storage_filter": false,
+      "RFC_performance_qualified": false,
+      "scope": "Instrumented paired diagnostic only. Matched probes cannot prove identical device state throughout a run or identical I/O completion patterns."
+    }
+  ],
+  "all_raw_blocks_preserved": true,
+  "compatible_blocks": 0,
+  "RFC_performance_qualified": false,
+  "runtime_changes": false
+}
