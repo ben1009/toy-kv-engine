@@ -1,0 +1,73 @@
+{
+  "protocol": "kv-engine.passive-wal-trace.v1",
+  "binary": "/home/liu/proj/toy-kv-engine/target/rfc-026-v8-trace-regimes-20261103/write-perf-timeline",
+  "binary_sha256": "da000b99a0d3b63039976a1b6468dad26abce297a7def2a035a04a55cff62c44",
+  "runner_sha256": "decde9e607f6767c9f0af63d94b41c931c4344d12e7a22bffa45e988a92ffb2f",
+  "analyzer_sha256": "1e5b3c83b88715a45c6cf3d02ec5a01390b5f5864b27c49613a170ef8c64a021",
+  "boot_id": "b801063f-4f4d-427b-8842-8d2809a4776e",
+  "cpu_mask": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15
+  ],
+  "events": [
+    "nvme/nvme_setup_cmd",
+    "nvme/nvme_complete_rq",
+    "block/block_rq_issue",
+    "block/block_rq_complete"
+  ],
+  "clock": "CLOCK_MONOTONIC",
+  "kernel": "6.12.71-1-lts",
+  "perf": "perf version 6.19-2",
+  "policy": {
+    "window_samples": 16,
+    "confirm_windows": 5,
+    "fast_below_us": 100,
+    "slow_above_us": 400,
+    "max_sample_gap_ns": 250000000,
+    "guard_ns": 20000000,
+    "signal_write_bytes": 4096,
+    "logical_block_bytes": 512,
+    "min_interval_ns": 250000000,
+    "min_percentile_samples": 100
+  },
+  "order": [
+    "v7",
+    "v8",
+    "v8",
+    "v7"
+  ],
+  "workloads": [
+    {
+      "name": "point",
+      "num": 20000,
+      "writers": 1,
+      "batch": 1
+    },
+    {
+      "name": "batch64",
+      "num": 750000,
+      "writers": 16,
+      "batch": 64
+    }
+  ],
+  "uid": 1000,
+  "capture_in_ram_for_entire_cohort": true,
+  "raw_device_writes": false,
+  "device_settings_changed": false,
+  "RFC_performance_qualified": false,
+  "scope": "Instrumented diagnostic; no endpoint probes. The calibrated 4KiB isolated-write signal does not classify arbitrary bulk or overlapping writes."
+}

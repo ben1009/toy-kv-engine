@@ -323,7 +323,7 @@ def analyze(perf_path, formats, timeline, benchmark, policy=POLICY):
 
 def write_csv(path, rows, columns):
     with path.open("w", newline="") as stream:
-        writer = csv.DictWriter(stream, fieldnames=columns, extrasaction="ignore")
+        writer = csv.DictWriter(stream, fieldnames=columns, extrasaction="ignore", lineterminator="\n")
         writer.writeheader()
         writer.writerows(rows)
 

@@ -30,6 +30,14 @@ def point(index):
 
 
 
+class CsvTests(unittest.TestCase):
+    def test_exports_use_lf_and_preserve_values(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'regimes.csv'
+            trace.write_csv(path, [{'state': 'slow', 'start_ns': 123}], ['state', 'start_ns'])
+            self.assertEqual(path.read_bytes(), b'state,start_ns\nslow,123\n')
+
+
 class PerfDecoderTests(unittest.TestCase):
     def fixture(self, clock=1, lost=0, truncate=False):
         # Minimal native perf file with one real tracepoint-shaped sample.

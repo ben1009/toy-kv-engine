@@ -1,0 +1,57 @@
+{
+  "scope": "Benchmark timeline and passive trace tools; engine/WAL library runtime unchanged",
+  "commands": [
+    {
+      "command": "cargo test --package kv-engine --all-features --bin write-perf",
+      "exit_code": 0,
+      "passed": 158
+    },
+    {
+      "command": "cargo clippy --package kv-engine --all-features --bin write-perf -- -D warnings",
+      "exit_code": 0
+    },
+    {
+      "command": "cargo check --package kv-engine --no-default-features --bin write-perf",
+      "exit_code": 0
+    },
+    {
+      "command": "python3 -m unittest discover -s docs/wal/benchmarks -p test_wal_trace_regimes.py",
+      "exit_code": 0,
+      "passed": 29
+    },
+    {
+      "command": "python3 -m unittest discover -s docs/wal/benchmarks -p test_paired_v7_v8.py",
+      "exit_code": 0,
+      "passed": 40
+    },
+    {
+      "command": "cargo fmt --all --check",
+      "exit_code": 0
+    },
+    {
+      "command": "typos .",
+      "exit_code": 0
+    },
+    {
+      "command": "git diff --check",
+      "exit_code": 0
+    }
+  ],
+  "native_smoke_captures": 2,
+  "native_full_captures": 8,
+  "full_matched_nvme_commands": 398259,
+  "full_captures_with_trace_loss": 0,
+  "full_captures_with_matching_anomalies": 0,
+  "classified_full_metric_intervals": 0,
+  "archives_verified": 48,
+  "replay_expected": "Every full capture is reanalyzed from the compressed archive; complete analysis output must match byte-normalized JSON",
+  "RFC_performance_qualified": false,
+  "source_sha256": {
+    "kv-engine/src/bin/write-perf.rs": "f179e4602f56251205a327d7fd15e36f5b86d117c8234a0ed014518dc72319ef",
+    "kv-engine/src/bin/write_perf/timeline.rs": "5a92f36b2c1ec9fa47ff16e8e62dde8a2a294042791b3364ddb5da2776fcf869",
+    "docs/wal/benchmarks/capture_wal_trace.py": "decde9e607f6767c9f0af63d94b41c931c4344d12e7a22bffa45e988a92ffb2f",
+    "docs/wal/benchmarks/wal_trace_regimes.py": "5e20d0ae14b00eba82dd75d8e1c3a50cfbfea3a2cf0d5936dcaddf8594f29f39",
+    "docs/wal/benchmarks/test_wal_trace_regimes.py": "6ae3252b59f47637eb60d83c76b71b880c7a501d175b4537aa864aec22d6f6f7"
+  },
+  "csv_line_endings_normalized": true
+}
