@@ -2,10 +2,17 @@
 
 | Field | Value |
 | --- | --- |
-| Status | Proposed |
+| Status | Implemented; v7 default superseded by RFC 026 on 2026-11-03 |
 | Date | 2026-10-08 |
 | Author | kv-engine Contributors |
 | Builds on | [RFC 024](024-dedicated-wal-pipeline.md), [RFC 023](023-point-in-time-recovery.md) |
+
+> **Current adoption status (2026-11-03):** This RFC defines PITR WAL v7 and
+> its original rollout policy. [RFC 026](026-composable-wal-prefix-digest.md)
+> defines v8, which the maintainer selected as the default for new PITR WALs
+> while its performance matrix remains unqualified. See the [V8 adoption
+> note](../docs/wal/rfc-026-v8-default-20261103.md). Existing v5/v6/v7 segments
+> retain their format identities.
 
 ## 1. Summary
 
@@ -34,12 +41,13 @@ tradeoff, described in section 6.
 
 Existing files keep their format-specific recovery semantics: ordinary v4
 already defaults to Parallel; PITR v5/v6 and older MVCC files retain Leader;
-unframed files retain buffered I/O. New PITR segments use v7 after a durable
-rotation when persisted capacity can support its recovery workspace. A healthy
-legacy database with insufficient capacity remains writable using v5/v6 Leader
-until an explicit capacity change permits migration (section 7.2). This is a
-proposed format and adoption policy; the current writer still creates PITR v6.
-WAL remains optional through `enable_wal`.
+unframed files retain buffered I/O. This RFC's original rollout uses v7 after a
+durable rotation when persisted capacity can support its recovery workspace. A
+healthy legacy database with insufficient capacity remains writable using its
+current v5/v6 format until an explicit capacity change permits migration
+(section 7.2). RFC 026 later defines v8 and supersedes v7 as the default for new
+PITR WALs; v7 remains a supported migration and compatibility format. WAL
+remains optional through `enable_wal`.
 
 ## 2. Findings from the existing RFCs and implementation
 
@@ -75,9 +83,14 @@ Changing the selector alone would expose a normal interrupted parallel write
 as corruption under v5/v6. RFC 024 explicitly requires a persisted prefix or
 an equivalent generation protocol before extending the pipeline to PITR.
 
-## 3. Default and compatibility policy
+## 3. Original v7 default and compatibility policy
 
-| File format | Default after implementation | Creation and recovery policy |
+This section records RFC 025's original v7 rollout policy. RFC 026 later
+selected v8 as the default for new PITR WALs; v7 remains supported for existing
+segments and explicit compatibility use. Current default and migration behavior
+is described in the [V8 adoption note](../docs/wal/rfc-026-v8-default-20261103.md).
+
+| File format | Default under the original RFC 025 rollout | Creation and recovery policy |
 | --- | --- | --- |
 | Legacy unframed | Buffered | Preserve legacy recovery. |
 | Older MVCC v2/v3 | Leader | Recover with the existing codec; successors use the current writer format. |
@@ -760,7 +773,11 @@ copy bookkeeping, not a persisted Active durable anchor. Persisted Active
 references MUST use section 6.2's logical tuple; physical-image authority
 requires the durable Sealing/immutable transition.
 
-### 7.2 Existing databases
+### 7.2 Existing databases under the original v7 rollout
+
+This subsection records RFC 025's v7 migration and capacity policy. The
+currently adopted V8 migration path and its capacity preflight are documented
+in the [V8 adoption note](../docs/wal/rfc-026-v8-default-20261103.md).
 
 Reopen reads v5/v6 with their current strict scanners and digest rules.
 Before committing a migration, it MUST preflight the persisted capacity
@@ -848,7 +865,11 @@ persisted limits. Count/capacity exhaustion triggers rotation before admission.
 Physical reservation release follows existing allocation verification, durable
 cleanup, and pin-release rules.
 
-## 8. Implementation and default activation
+## 8. Original implementation and default activation plan
+
+The staged plan below records the implementation and activation of v7. Its
+selection of v7 as the current PITR writer was superseded by RFC 026's V8
+adoption on 2026-11-03; V8 is now the default for new PITR WALs.
 
 Implement in reviewable stages:
 

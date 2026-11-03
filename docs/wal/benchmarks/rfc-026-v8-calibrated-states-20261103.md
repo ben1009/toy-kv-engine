@@ -5,8 +5,10 @@ and runs separate training, validation and fresh evaluation cohorts, with no
 production WAL or capture instrumentation change. **No class passed the
 predeclared calibration gate, so no V8/V7 performance ratio is reported.**
 This is a negative calibration result, not a V8 performance regression or a
-finding that the SSD lacks distinct latency regimes. RFC 026 remains unqualified
-and V8 remains default-off.
+finding that the SSD lacks distinct latency regimes. RFC 026 remains unqualified.
+The maintainer separately selected V8 as the default for new PITR WALs on
+2026-11-03 despite that result; default adoption is not performance
+qualification. See the [adoption note](../rfc-026-v8-default-20261103.md).
 
 ## Fixed experiment
 

@@ -18,14 +18,21 @@ Ordinary v4 WALs now default to the dedicated pipeline in
 [RFC 024](024-dedicated-wal-pipeline.md). PITR v5/v6 continue using leader I/O
 and their existing strict recovery, sealing, and hash-chain rules. The
 [default adoption note](../docs/wal/rfc-024-parallel-wal-default-20261005.md)
-records the format boundary; this change does not enable parallel PITR writes.
+records the ordinary-WAL format boundary; this RFC's original PITR v5/v6
+implementation does not enable parallel PITR writes. Subsequent [RFC
+025](025-parallel-wal-embedded-frontiers.md) defined PITR v7, and [RFC
+026](026-composable-wal-prefix-digest.md) defined v8. The maintainer selected
+V8 as the default for new PITR WALs on 2026-11-03 while the performance matrix
+remains unqualified; see the [V8 adoption note](../docs/wal/rfc-026-v8-default-20261103.md).
+Existing segments retain their original format.
 
-[RFC 025](025-parallel-wal-embedded-frontiers.md) proposes PITR v7 with persistent
-batch tickets and in-WAL DATA/FRONTIER frames so new PITR segments can default
-to Parallel with one WAL sync per advance. Active v7 validates candidate
-prefixes and may fall back above durable manifest boundaries; sealing and
-archive validation stay strict. Existing v5/v6 recovery and digest rules remain
-as implemented.
+[RFC 025](025-parallel-wal-embedded-frontiers.md) defined PITR v7 with
+persistent batch tickets and in-WAL DATA/FRONTIER frames. RFC 026 builds on that
+protocol with v8's composable prefix digest; new PITR WALs now default to v8
+Parallel under the adoption decision above. V7 remains a supported format.
+Active v7 validates candidate prefixes and may fall back above durable manifest
+boundaries; sealing and archive validation stay strict. Existing v5/v6
+recovery and digest rules remain as implemented.
 
 ## 1. Summary
 

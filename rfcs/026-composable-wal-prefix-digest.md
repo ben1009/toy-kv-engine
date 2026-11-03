@@ -450,8 +450,11 @@ the implementation plan MUST cover at least:
   Document and measure any path that retains a separate full-stream hash scan.
 - An explicit adoption decision based on correctness, performance and resource
   evidence. A fixed-size ordered step and avoiding full-buffer rereads do not
-  prove an end-to-end gain. If throughput or tail latency is not favorable,
-  keep v7 as the default.
+  prove an end-to-end gain. The original performance-gated recommendation was
+  to keep v7 as the default if throughput or tail latency was not favorable.
+  The maintainer's explicit 2026-11-03 adoption decision superseded that
+  recommendation while leaving the performance matrix unqualified; see the
+  adoption note in section 1.
 
 ## 9. Alternatives
 

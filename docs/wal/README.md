@@ -30,7 +30,7 @@ the retained and rejected experiments.
 - [Native async point-write integration](rfc-024-native-async-integration-20261005.md)
 - [Retire frozen parallel WAL runtimes](rfc-024-frozen-wal-retirement.md)
 
-## Proposed extensions
+## Format RFCs
 
 - [RFC 025: Parallel WAL with Embedded Frontiers and One Sync](../../rfcs/025-parallel-wal-embedded-frontiers.md)
 - [RFC 026: Composable WAL Prefix Digests](../../rfcs/026-composable-wal-prefix-digest.md)

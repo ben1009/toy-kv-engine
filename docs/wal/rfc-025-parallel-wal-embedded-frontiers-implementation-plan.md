@@ -2,8 +2,19 @@
 
 **RFC:** [Parallel WAL with Embedded Frontiers and One Sync](../../rfcs/025-parallel-wal-embedded-frontiers.md)
 
-**Status:** In progress — Stage 2 codec and persistence-model implementation is
-complete. Stage 3 now includes bounded backward FRONTIER discovery, single-pass
+**Current default:** This plan records the v7 implementation history. RFC 026
+later defined V8, and the maintainer selected V8 as the default for new PITR
+WALs on 2026-11-03 despite the unqualified performance matrix. V7 remains a
+supported format for existing data and explicit compatibility use; see the
+[V8 adoption note](rfc-026-v8-default-20261103.md).
+
+**Status:** V7 implementation complete; performance qualification remains
+unqualified and RFC 026 superseded V7 as the default for new PITR WALs. The
+following stage notes are retained as implementation history. See the [V8
+adoption note](rfc-026-v8-default-20261103.md).
+
+Stage 2 codec and persistence-model implementation is complete. Stage 3
+includes bounded backward FRONTIER discovery, single-pass
 candidate-prefix verification, authority/anchor selection, the Active
 fresh-inode normalization primitive, an authority-required coordinator, and
 durable replay of logical Active v7 manifest boundaries. Old PITR snapshots
@@ -527,9 +538,12 @@ the final gate.
 The RFC is the protocol authority. This plan identifies code changes and
 acceptance criteria; it does not change the wire format or recovery contract.
 New types and module paths named below are proposed implementation boundaries.
-Fresh PITR segments still begin as v6. Capacity-eligible nonempty legacy Active
-segments migrate to v7 on resume or maintenance rotation; final default
-selection and qualification remain later work.
+At this plan's source baseline, fresh PITR segments began as v6 and
+capacity-eligible nonempty legacy Active segments migrated to v7 on resume or
+maintenance rotation. RFC 026 and the later V8 adoption decision superseded
+that rollout target: new PITR Active WALs now use V8 after the durable V6 → V7
+→ V8 bootstrap. The staged v7 implementation and qualification history below
+is retained as a record of how the format was built.
 
 The delivery includes synchronous and asynchronous engine entry points,
 explicit v7 Leader comparison mode using the same frontier protocol, and

@@ -11,15 +11,17 @@ implemented: if io_uring or O_DIRECT initialization fails for an MVCC WAL,
 creation or reopen returns an error. Legacy non-MVCC WALs continue using the
 buffered path.
 
-Ordinary v4 WALs now default to ticket-ordered I/O through the dedicated
-parallel pipeline described in [RFC 024](024-dedicated-wal-pipeline.md). PITR
-v5/v6 and older MVCC formats retain leader I/O; legacy unframed WALs retain
-buffered I/O. See the
-[default adoption note](../docs/wal/rfc-024-parallel-wal-default-20261005.md).
+Ordinary v4 WALs default to ticket-ordered I/O through the dedicated parallel
+pipeline described in [RFC 024](024-dedicated-wal-pipeline.md). New PITR WALs
+default to v8 Parallel under [RFC 026](026-composable-wal-prefix-digest.md);
+v7 remains a supported compatibility format with its embedded-frontier
+protocol. PITR v5/v6 and older MVCC formats retain leader I/O; legacy unframed
+WALs retain buffered I/O. See the [V4 adoption note](../docs/wal/rfc-024-parallel-wal-default-20261005.md)
+and [V8 adoption note](../docs/wal/rfc-026-v8-default-20261103.md).
 
-[RFC 025](025-parallel-wal-embedded-frontiers.md) proposes Parallel as the default
-for future formats, with narrowly documented exceptions. Its PITR v7 protocol
-embeds frontier frames and uses one WAL sync per durability advance.
+[RFC 025](025-parallel-wal-embedded-frontiers.md) defines Parallel as the
+default for future formats, with narrowly documented exceptions. Its PITR v7
+protocol embeds frontier frames and uses one WAL sync per durability advance.
 
 The remaining sections preserve the original proposal. For shipped behavior,
 see `kv-engine/src/wal.rs` and the WAL tests under `kv-engine/src/tests/`.
