@@ -1,8 +1,9 @@
 # RFC 026 Implementation Plan
 
-This plan fixes the initial v8 wire identity before any v8 WAL bytes are
-written. It stages implementation so digest primitives and codecs can be
-reviewed before they are connected to WAL creation, recovery, or migration.
+This plan records the V8 wire identity and implementation slices. V8 is now
+the default for new PITR WALs by the [2026-11-03 maintainer decision](rfc-026-v8-default-20261103.md);
+the performance matrix remains unqualified. The slice history below records
+the correctness, persistence, compatibility, and resource gates.
 
 ## Fixed v8 identity
 
@@ -25,8 +26,8 @@ reviewed before they are connected to WAL creation, recovery, or migration.
   on-disk scheme selector; an unknown version must be rejected.
 - Persisted archive descriptor: v8 uses `seal_format_version = 3` with the
   same immutable-boundary fields as the v7 catalog descriptor. Its sidecar
-  identity is `TKVSEAL3` / version `3`; archive publication remains disabled
-  until that sidecar is strictly verified against the frozen WAL image.
+  identity is `TKVSEAL3` / version `3`; archive publication requires strict
+  verification of that sidecar against the frozen WAL image.
 - Physical header binding remains `SHA256(W)` in frame headers. The logical
   digest seed remains `BLAKE3(HEADER || W)`. Existing v7 FRONTIER, seal,
   archive and object digest meanings remain unchanged.
@@ -35,10 +36,9 @@ reviewed before they are connected to WAL creation, recovery, or migration.
   version before they can interpret a prefix digest; v7 anchor bytes retain
   their current SHA-256 meaning.
 
-These identifiers are implementation decisions for the proposed v8 format,
-not a change to existing files. The writer remains disabled until header,
-frame, recovery, persisted metadata, migration and compatibility paths all
-dispatch on version 8.
+These identifiers are implementation decisions for the v8 format,
+not a change to existing files. Header, frame, recovery, persisted metadata,
+migration and compatibility paths all dispatch on version 8.
 
 The v7 codec currently equates the physical header digest with the
 generation-zero FRONTIER prefix and reconstructs that frame when validating its
@@ -168,8 +168,9 @@ these fixtures. The earlier reader is covered only while its required durable
 excluded because the reader mutates the database there and those states are
 unreachable through the guard publication sequence. This does not claim
 compatibility with every historical release. The performance matrix remains
-outstanding, so v7 remains the default and automatic v8 creation and new v7-to-v8
-migration initiation stay disabled.
+outstanding. The maintainer selected V8 as the default on 2026-11-03
+without declaring that gate qualified; see the [adoption note](rfc-026-v8-default-20261103.md).
+Public enable and eligible resume now initiate the capacity-checked transitions.
 
 ## Slices
 
@@ -216,9 +217,8 @@ migration initiation stay disabled.
    `create_recovery_point` now completes the Active v8 rotation, installs its
    v8 successor and archives the sealed source. Once an Active v8 segment
    exists, automatic same-format size/timer rotation and archival use the
-   normal maintenance path. Automatic v8 format selection and new v7-to-v8
-   migration initiation remain disabled; explicit resume only completes an
-   already-published intent.
+   normal maintenance path. New PITR enable selects V8; eligible resume can
+   initiate migration as well as complete an already-published intent.
 5. **Persistence and transitions:** version persisted seal/manifest/backup
    digest references, validate v8 archive objects, support v5/v6/v7/v8 chain
    transitions and the old-reader compatibility gate above. Add capacity and
@@ -234,8 +234,8 @@ migration initiation stay disabled.
   `resume_pitr` now rechecks and reserves migration capacity after restart,
   then finishes a pre-seal intent through the existing v7 sealing path and
   installs only its exact authorized v8 successor. It keeps commit admission
-  fenced throughout. New migration initiation and automatic v8 adoption remain
-  disabled pending the remaining qualification gates, including performance.
+  fenced throughout. Default adoption now connects public enable and eligible
+  resume to the same capacity and compatibility gates.
   Once `SegmentSealed` durably binds the v7 source and exact empty v8 boundary,
   startup can strictly
    validate that source and recreate/register the v8 successor if interrupted
@@ -250,14 +250,14 @@ migration initiation stay disabled.
    preparation now syncs and persists the exact v7 Active boundary, reserves
    that complete transition budget, and only then publishes the old-reader
    compatibility guard followed by `V8MigrationStarted`; the returned owner
-  retains the reservation. No automatic runtime path invokes this preparation;
-  explicit resume only completes an already-published durable intent.
+  retains the reservation through installation. Public enable and eligible
+  resume invoke this preparation; recovered intents remain authoritative.
    Active recovery
    normalization is tested with repeated process
    interruption after temp-image write, temp sync, rename, and directory sync;
    retries preserve the hard anchor. Returned errors before sync, rename, and
-   directory sync are also covered. Automatic v8 creation remains disabled
-   pending the remaining qualification gates, including performance. Active v8
+   directory sync are also covered. The default-adoption change preserves these
+   recovery and compatibility gates while leaving performance unqualified. Active v8
    checkpoint capture now seals the fixed cutoff, flushes its immutable state,
    and resumes writes on an empty v8 successor. PITR base backups use the same boundary and
    store a detached engine manifest, so an exact-base restore does not retain a
@@ -268,23 +268,31 @@ migration initiation stay disabled.
 6. **Qualification and adoption:** the non-performance crash, recovery, and
    compatibility tests pass for the implemented states and the two pinned
    historical readers described above. The predeclared performance matrix is
-   the remaining qualification gate; keep v7 as the default unless its results
-   justify an explicit later adoption decision.
+   the remaining qualification gate. The explicit 2026-11-03 maintainer
+   adoption selects V8 without claiming that performance qualification passed.
 
-The Linux `write-perf --features bench` binary now accepts the explicit
-`--pitr --pitr-format v8` selector. It prepares the database through the
+The Linux `write-perf` binary defaults `--pitr` to V8 and accepts explicit
+`--pitr-format v6|v7|v8` controls. It prepares the database through the
 capacity-checked v6-to-v7 and v7-to-v8 migration paths before the measured
-workload; the default PITR format remains v7. This is a benchmark setup path,
-not a qualification result or a production v8 creation policy. V8 Leader and
+workload using the public default-V8 enable/resume path. This selection is
+not a performance qualification result. V8 Leader and
 Parallel modes are selectable explicitly, and the harness verifies that the
 active WAL reports the requested mode. V8 Leader and Parallel now contribute
 durability-group, FRONTIER-write and `fdatasync` counters to the same
 `wal_pipeline` record used for v4-v7, while V8 digest CPU counters remain in
 `wal_v8_digest`. For V8, a commit group is the set of logical tickets covered
 by one FRONTIER/fdatasync cycle; `commit_buffers` counts those ticket buffers
-and `commit_bytes` their aligned DATA frame bytes. io_uring, CQE and eventfd
-counters remain zero because V8 submits positional writes directly. The normal
-build rejects the v8 selector before opening a database. PITR write-perf workers
+and `commit_bytes` their aligned DATA frame bytes. V8 Parallel submits DATA
+through the existing bounded `IoWorker` and reports its io_uring, CQE and
+eventfd activity; the FRONTIER remains a direct aligned write followed by the
+single durability sync. The positional DATA-write timing counter applies only
+to Leader mode; Parallel mode uses worker metrics. V8 Parallel now gives
+already-admitted unfinished successors a bounded 100–400 microsecond
+durability coalescing opportunity, selected by the previous sync latency.
+Lone producers and fully ready windows skip the wait; close and poison wake
+it. The [coalescing screen](benchmarks/rfc-026-v8-bounded-coalescing-20261102.md)
+records the gains and remaining tail-latency uncertainty. Normal Linux builds
+use the public V8 path without a benchmark-only migration hook. PITR write-perf workers
 retry only the exact pre-admission `commit admission is stopped at a PITR
 barrier` error, with a bounded five-second wait. The retry time remains inside
 the measured operation latency; other errors still fail the run immediately.
@@ -293,7 +301,18 @@ instead of failing a write when the in-flight ticket window is temporarily
 full. The admission waiter is released by frontier publication, close or
 poison, and a focused coordinator test covers the durable-capacity handoff.
 
+The DATA submitter now derives its group window from the admitted ticket
+high-water mark, independently of the ready-buffer map. A multi-frame head
+with admitted successors may open a group for up to 10 microseconds while
+their frames become ready, refreshing membership within the same deadline.
+Single-frame heads and a lone admitted ticket submit immediately. A
+cooperative producer owns packing only until it has drained currently ready
+work; later readiness cannot race its ownership release and leave a queued
+head stranded. The [DATA-group screen](benchmarks/rfc-026-v8-admitted-data-groups-20261102.md)
+records correctness coverage, rejected policies, and the remaining performance
+uncertainty. Its retained binary is not yet qualified against v7 or v4.
+
 Each slice must leave existing v2-v7 reads, writes, recovery and digest
 interpretation unchanged. The non-performance workspace and historical-reader
 test gates have passed; performance qualification remains the final gate before
-any decision to enable v8.
+the documented default-adoption decision.

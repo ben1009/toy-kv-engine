@@ -1,0 +1,104 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 3K of event 'cpu-clock:u'
+# Event count (approx.): 7194388720
+#
+# Overhead Symbol IPC [IPC Coverage]
+# ........ ................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................. ....................
+#
+9.89% [.] _blake3_hash_many_avx2 - -
+|
+|--1.42%--0x17
+|
+|--1.25%--0x27
+|
+|--1.20%--0x2f
+|
+|--1.14%--0x1f
+|
+|--1.11%--0x37
+|
+|--1.03%--0xf
+|
+|--1.03%--0x7
+|
+|--0.64%--0x1
+|
+|--0.56%--0xffffffffffffffff
+|
+--0.50%--0x3
+
+8.75% [.] <crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::search_position::<bytes::bytes::Bytes> - -
+8.44% [.] <crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert_internal::<<crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert::{closure#0}, <crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert::{closure#1}> - -
+6.27% [.] 0x00000000000a5fdc - -
+|
+|--2.65%--<core::iter::adapters::map::Map<core::slice::iter::Iter<(bytes::bytes::Bytes, bytes::bytes::Bytes, kv_engine::mvcc::BatchEntryKind)>, <kv_engine::mvcc::LsmMvccInner>::write_batch_wal_only_inner::{closure#0}> as core::iter::traits::iterator::Iterator>::fold::<(), core::iter::traits::iterator::Iterator::for_each::call<kv_engine::pitr::WalEntry, <alloc::vec::Vec<kv_engine::pitr::WalEntry>>::extend_trusted<core::iter::adapters::map::Map<core::slice::iter::Iter<(bytes::bytes::Bytes, bytes::bytes::Bytes, kv_engine::mvcc::BatchEntryKind)>, <kv_engine::mvcc::LsmMvccInner>::write_batch_wal_only_inner::{closure#0}>>::{closure#0}>::{closure#0}>
+| |
+| --2.45%--0x3f
+|
+|--1.73%--<crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert_internal::<<crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert::{closure#0}, <crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert::{closure#1}>
+|
+--0.56%--<bytes::bytes::Bytes>::copy_from_slice
+
+5.32% [.] <kv_engine::mvcc::LsmMvccInner>::publish_commit_ts - -
+4.96% [.] __vdso_clock_gettime - -
+|
+---clock_gettime
+<std::sys::pal::unix::time::Timespec>::now
+|
+|--2.87%--<std::time::Instant>::elapsed
+| |
+| --2.79%--<std::thread::local::LocalKey<core::cell::RefCell<alloc::vec::Vec<u8>>>>::with::<<kv_engine::mem_table::MemTable>::publish_raw_batch::{closure#0}, ()>
+|
+--1.92%--<std::thread::local::LocalKey<core::cell::RefCell<alloc::vec::Vec<u8>>>>::with::<<kv_engine::mem_table::MemTable>::publish_raw_batch::{closure#0}, ()>
+
+4.60% [.] <std::thread::local::LocalKey<core::cell::RefCell<alloc::vec::Vec<u8>>>>::with::<<kv_engine::mem_table::MemTable>::publish_raw_batch::{closure#0}, ()> - -
+3.54% [.] 0x00000000000a5ffc - -
+|
+--1.67%--<core::iter::adapters::map::Map<core::slice::iter::Iter<(bytes::bytes::Bytes, bytes::bytes::Bytes, kv_engine::mvcc::BatchEntryKind)>, <kv_engine::mvcc::LsmMvccInner>::write_batch_wal_only_inner::{closure#0}> as core::iter::traits::iterator::Iterator>::fold::<(), core::iter::traits::iterator::Iterator::for_each::call<kv_engine::pitr::WalEntry, <alloc::vec::Vec<kv_engine::pitr::WalEntry>>::extend_trusted<core::iter::adapters::map::Map<core::slice::iter::Iter<(bytes::bytes::Bytes, bytes::bytes::Bytes, kv_engine::mvcc::BatchEntryKind)>, <kv_engine::mvcc::LsmMvccInner>::write_batch_wal_only_inner::{closure#0}>>::{closure#0}>::{closure#0}>
+|
+--1.53%--0x3f
+
+2.48% [.] crc32fast::baseline::update_fast_16 - -
+|
+|--1.17%--<kv_engine::pitr::CanonicalWalEntryStream>::encode_into_with_observer::<<kv_engine::wal::v8::prepare::AdmittedWalV8Batch<kv_engine::wal::v8::parallel::WalV8ParallelAdmissionGuard, kv_engine::wal::v8::leader::WalV8PreflightReservation>>::encode::{closure#0}>
+|
+--0.72%--0xc0da79c6ac983ba
+
+2.23% [.] _blake3_compress_in_place_sse41 - -
+2.17% [.] crc32fast::specialized::pclmulqdq::calculate - -
+1.89% [.] 0x000000000016d053 - -
+|
+|--1.09%--<kv_engine::wal::v8::prepare::AdmittedWalV8Batch<kv_engine::wal::v8::parallel::WalV8ParallelAdmissionGuard, kv_engine::wal::v8::leader::WalV8PreflightReservation>>::encode
+|
+--0.81%--kv_engine::wal::v8::codec::encode_data_fragment_frame_into
+
+1.39% [.] 0x00000000000a481c - -
+1.28% [.] <parking_lot::raw_mutex::RawMutex>::lock_slow - -
+1.23% [.] <core::slice::iter::Iter<kv_engine::pitr::WalEntry> as core::iter::traits::iterator::Iterator>::try_fold::<(), <core::iter::adapters::enumerate::Enumerate<_> as core::iter::traits::iterator::Iterator>::try_fold::enumerate<&kv_engine::pitr::WalEntry, (), core::ops::control_flow::ControlFlow<&kv_engine::pitr::WalEntry>, core::iter::traits::iterator::Iterator::find_map::check<(usize, &kv_engine::pitr::WalEntry), &kv_engine::pitr::WalEntry, &mut <kv_engine::pitr::CanonicalWalEntryStream>::entries::{closure#0}>::{closure#0}>::{closure#0}, core::ops::control_flow::ControlFlow<&kv_engine::pitr::WalEntry>> - -
+0.92% [.] <core::iter::adapters::map::Map<core::slice::iter::Iter<(bytes::bytes::Bytes, bytes::bytes::Bytes, kv_engine::mvcc::BatchEntryKind)>, <kv_engine::mvcc::LsmMvccInner>::write_batch_wal_only_inner::{closure#0}> as core::iter::traits::iterator::Iterator>::fold::<(), core::iter::traits::iterator::Iterator::for_each::call<kv_engine::pitr::WalEntry, <alloc::vec::Vec<kv_engine::pitr::WalEntry>>::extend_trusted<core::iter::adapters::map::Map<core::slice::iter::Iter<(bytes::bytes::Bytes, bytes::bytes::Bytes, kv_engine::mvcc::BatchEntryKind)>, <kv_engine::mvcc::LsmMvccInner>::write_batch_wal_only_inner::{closure#0}>>::{closure#0}>::{closure#0}> - -
+|
+--0.89%--0x3f
+
+0.89% [.] 0x00000000000a4809 - -
+0.89% [.] 0x000000000016c11d - -
+|
+--0.53%--<core::slice::iter::Iter<kv_engine::pitr::WalEntry> as core::iter::traits::iterator::Iterator>::try_fold::<(), <core::iter::adapters::enumerate::Enumerate<_> as core::iter::traits::iterator::Iterator>::try_fold::enumerate<&kv_engine::pitr::WalEntry, (), core::ops::control_flow::ControlFlow<&kv_engine::pitr::WalEntry>, core::iter::traits::iterator::Iterator::find_map::check<(usize, &kv_engine::pitr::WalEntry), &kv_engine::pitr::WalEntry, &mut <kv_engine::pitr::CanonicalWalEntryStream>::entries::{closure#0}>::{closure#0}>::{closure#0}, core::ops::control_flow::ControlFlow<&kv_engine::pitr::WalEntry>>
+
+0.72% [.] syscall - -
+0.67% [.] malloc - -
+0.64% [.] 0x000000000016be20 - -
+0.61% [.] 0x000000000016c887 - -
+|
+--0.58%--kv_engine::wal::v8::codec::encode_data_fragment_frame_into
+
+0.56% [.] <kv_engine::lsm_storage::LsmStorageInner>::push_point_batch_entry::<&[u8]> - -
+0.50% [.] <crossbeam_channel::flavors::list::Channel<kv_engine::wal::parallel_worker::GroupWriteResult>>::recv - -
+
+
+#
+# (Tip: To record every process run by a user: perf record -u <user>)
+#

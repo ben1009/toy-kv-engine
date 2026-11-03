@@ -1,0 +1,10 @@
+COOLDOWN 15s
+START 00-batch64
+{"name": "00-batch64", "puts_s": 106089.83793452971, "p99_ms": 26.268867, "cpu_s": 10.255137, "syncs": 1524, "mean_sync_ms": 2.479524904855643, "storage_flag": true}
+START 01-batch256
+{"name": "01-batch256", "puts_s": 138311.34652782555, "p99_ms": 119.623984, "cpu_s": 9.104708, "syncs": 473, "mean_sync_ms": 6.060146099365751, "storage_flag": true}
+START 02-batch256
+{"name": "02-batch256", "puts_s": 286043.71468714305, "p99_ms": 50.774613, "cpu_s": 5.3978139999999994, "syncs": 423, "mean_sync_ms": 2.769680678486998, "storage_flag": true}
+START 03-batch64
+{"name": "03-batch64", "puts_s": 324467.9445703415, "p99_ms": 17.55291, "cpu_s": 6.977645000000001, "syncs": 1039, "mean_sync_ms": 1.1179464456207893, "storage_flag": true}
+DONE

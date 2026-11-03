@@ -1,0 +1,105 @@
+{
+  "RFC_performance_qualified": false,
+  "binary": "/home/liu/proj/toy-kv-engine/target/rfc-026-v8-wal-extents-20261103/write-perf-extents",
+  "binary_sha256": "9d35fcabc018c4815cc1b882af7f53d4c38f3724f04101a1aec977e0154c9747",
+  "boot_id": "b801063f-4f4d-427b-8842-8d2809a4776e",
+  "capture_order": [
+    "v7",
+    "v8",
+    "v8",
+    "v7"
+  ],
+  "cohorts": [
+    "training",
+    "validation",
+    "evaluation"
+  ],
+  "counter_interval_ms": 100,
+  "cpu_mask": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15
+  ],
+  "declared_monotonic_ns": 2603447580867790,
+  "declared_unix_ns": 1793685723728340391,
+  "episode_selection": "highest throughput eligible episode per arm; p99/CPU from that episode",
+  "model_selection": "I/O features only; no outcome-based fitting or retries",
+  "policy": {
+    "assignment_margin": 0.2,
+    "confirm_windows": 5,
+    "distance_weights": [
+      2.0,
+      1.0,
+      1.0
+    ],
+    "dominant_class_fraction": 0.8,
+    "envelope_expansion": 2.0,
+    "guard_ns": 20000000,
+    "interval_max_ns": 110000000,
+    "interval_min_ns": 90000000,
+    "invalid_trace": "quarantine_entire_run_as_unknown",
+    "max_fit_iterations": 50,
+    "max_pair_class_tv": 0.1,
+    "max_window_ns": 250000000,
+    "min_episode_ns": 500000000,
+    "min_io_observations": 16,
+    "min_percentile_samples": 100,
+    "min_supported_fraction": 0.95,
+    "namespace_median_separation": 4.0,
+    "namespace_quantile_separation": 2.0,
+    "pairs": [
+      [
+        0,
+        1
+      ],
+      [
+        2,
+        3
+      ]
+    ],
+    "radius_floor": 0.35,
+    "radius_p95_scale": 1.5,
+    "scope": "conditional latency-mode diagnostic; no RFC qualification",
+    "train_min_per_format_mode": 2,
+    "train_min_per_mode": 4,
+    "train_min_windows": 12,
+    "validation_min_coverage": 0.8,
+    "validation_min_per_format_mode": 2,
+    "validation_min_persistence_ns": 100000000,
+    "window_samples": 16
+  },
+  "schema": "kv-engine.wal-path-calibration.v1",
+  "source_sha256": {
+    "capture_wal_trace.py": "0543c3c202f490ad681788d4aa8577bad7c6d7c8e328996af781823961d32489",
+    "wal_extent_trace.py": "0e99fa82409828a3a1d7de56da10428661b57f7815ad8738120ff05247ec121e",
+    "wal_state_calibration.py": "dce69dc13b042f611799d5d037ffc0a4719b724afd6cb4da7fef85d31275f413",
+    "wal_trace_regimes.py": "5e20d0ae14b00eba82dd75d8e1c3a50cfbfea3a2cf0d5936dcaddf8594f29f39"
+  },
+  "workloads": [
+    {
+      "batch": 1,
+      "name": "point",
+      "num": 20000,
+      "writers": 1
+    },
+    {
+      "batch": 64,
+      "name": "batch64",
+      "num": 750000,
+      "writers": 16
+    }
+  ]
+}

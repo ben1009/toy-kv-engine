@@ -1,0 +1,33 @@
+{
+  "base_revision": "b8da402a276d7969f4c40ca99787a10a63d93f33",
+  "temporary_build_command": "cargo build --release --package kv-engine --features bench --bin write-perf",
+  "temporary_focused_tests": {
+    "command": "cargo nextest run --workspace --all-features --lib -E 'test(wal::v8::) | test(wal::v7::codec::) | test(pitr::tests::canonical_entry_stream)'",
+    "passed": 112,
+    "failed": 0,
+    "log": "target/rfc-026-v8-producer-attribution-20261102/tests.log"
+  },
+  "micro_samples": 840,
+  "micro_assertions": "canonical bytes, CRCs, RFC entry digest, shared logical bytes and V8 frame structural/CRC validation passed",
+  "live_commands": 14,
+  "failed_live_commands": 0,
+  "stall_flagged": 10,
+  "post_restore": {
+    "source_hashes_match_base": true,
+    "runtime_git_diff_empty": true,
+    "temporary_modules_removed": true,
+    "cargo fmt --all -- --check": "passed",
+    "targeted typos": "passed",
+    "attribution patch applies to base": "passed",
+    "JSON/JSONL, source hashes, phase/byte counts, script syntax, artifact copies and documentation links": "passed"
+  },
+  "previous_retained_runtime_full_check": {
+    "passed": 2151,
+    "skipped": 32,
+    "repeated_for_identical_restoration": false
+  },
+  "runtime_optimization_retained_this_slice": false,
+  "existing_notification_optimization_kept": true,
+  "pushed": false,
+  "merged": false
+}

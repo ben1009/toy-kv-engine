@@ -1,0 +1,43 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 4K of event 'cpu-clock:u'
+# Event count (approx.): 8130260456
+#
+# Overhead Symbol IPC [IPC Coverage]
+# ........ ................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................. ....................
+#
+13.29% [.] <kv_engine::mvcc::LsmMvccInner>::publish_commit_ts - -
+8.63% [.] _blake3_hash_many_avx2 - -
+6.51% [.] <crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::search_position::<bytes::bytes::Bytes> - -
+5.32% [.] <crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert_internal::<<crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert::{closure#0}, <crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert::{closure#1}> - -
+4.63% [.] __vdso_clock_gettime - -
+4.61% [.] 0x00000000000a5fdc - -
+4.17% [.] <std::thread::local::LocalKey<core::cell::RefCell<alloc::vec::Vec<u8>>>>::with::<<kv_engine::mem_table::MemTable>::publish_raw_batch::{closure#0}, ()> - -
+2.46% [.] 0x00000000000a5ffc - -
+2.27% [.] crc32fast::baseline::update_fast_16 - -
+1.92% [.] crc32fast::specialized::pclmulqdq::calculate - -
+1.82% [.] _blake3_compress_in_place_sse41 - -
+1.48% [.] 0x000000000016d053 - -
+1.26% [.] 0x00000000000a481c - -
+1.16% [.] <parking_lot::raw_mutex::RawMutex>::lock_slow - -
+1.16% [.] syscall - -
+1.01% [.] <core::slice::iter::Iter<kv_engine::pitr::WalEntry> as core::iter::traits::iterator::Iterator>::try_fold::<(), <core::iter::adapters::enumerate::Enumerate<_> as core::iter::traits::iterator::Iterator>::try_fold::enumerate<&kv_engine::pitr::WalEntry, (), core::ops::control_flow::ControlFlow<&kv_engine::pitr::WalEntry>, core::iter::traits::iterator::Iterator::find_map::check<(usize, &kv_engine::pitr::WalEntry), &kv_engine::pitr::WalEntry, &mut <kv_engine::pitr::CanonicalWalEntryStream>::entries::{closure#0}>::{closure#0}>::{closure#0}, core::ops::control_flow::ControlFlow<&kv_engine::pitr::WalEntry>> - -
+0.86% [.] malloc - -
+0.84% [.] 0x00000000000a4809 - -
+0.79% [.] cfree - -
+0.79% [.] 0x000000000016c11d - -
+0.71% [.] <crossbeam_channel::flavors::list::Channel<kv_engine::wal::parallel_worker::GroupWriteResult>>::recv - -
+0.69% [.] <parking_lot::condvar::Condvar>::wait_until_internal - -
+0.67% [.] 0x000000000016c887 - -
+0.62% [.] <kv_engine::lsm_storage::LsmStorageInner>::push_point_batch_entry::<&[u8]> - -
+0.57% [.] clock_gettime - -
+0.54% [.] <parking_lot::raw_mutex::RawMutex>::unlock_slow - -
+0.54% [.] 0x000000000016bf08 - -
+
+
+#
+# (Tip: Search options using a keyword: perf report -h <keyword>)
+#

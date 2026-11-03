@@ -1,0 +1,11 @@
+COOLDOWN 60s
+START calibration-00-unregistered
+{"name": "calibration-00-unregistered", "puts_s": 330150, "p99_ms": 20.667, "cpu_s": 7.47, "syncs": 1036, "mean_sync_ms": 1.044, "stall_flag": true, "role_masks_validated": true, "context": {"involuntary": 530, "voluntary": 95437}}
+START calibration-01-registered
+{"name": "calibration-01-registered", "puts_s": 106160, "p99_ms": 27.09, "cpu_s": 11.006, "syncs": 1567, "mean_sync_ms": 2.621, "stall_flag": true, "role_masks_validated": true, "context": {"involuntary": 1155, "voluntary": 112712}}
+COOLDOWN 60s
+START calibration-02-registered
+{"name": "calibration-02-registered", "puts_s": 104996, "p99_ms": 23.526, "cpu_s": 10.873, "syncs": 1563, "mean_sync_ms": 2.551, "stall_flag": true, "role_masks_validated": true, "context": {"involuntary": 767, "voluntary": 111204}}
+START calibration-03-unregistered
+{"name": "calibration-03-unregistered", "puts_s": 102528, "p99_ms": 28.715, "cpu_s": 10.771, "syncs": 1577, "mean_sync_ms": 2.665, "stall_flag": true, "role_masks_validated": true, "context": {"involuntary": 893, "voluntary": 112606}}
+CALIBRATION DONE

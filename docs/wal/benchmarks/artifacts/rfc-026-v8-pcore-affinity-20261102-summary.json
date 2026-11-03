@@ -1,0 +1,265 @@
+{
+  "samples": 40,
+  "stall_flagged": 34,
+  "groups": [
+    {
+      "mode": "diagnostic",
+      "format": "v7",
+      "affinity": "hybrid",
+      "eligible": 0,
+      "total": 2,
+      "best_eligible": null,
+      "median_eligible": null
+    },
+    {
+      "mode": "diagnostic",
+      "format": "v7",
+      "affinity": "pcore",
+      "eligible": 0,
+      "total": 2,
+      "best_eligible": null,
+      "median_eligible": null
+    },
+    {
+      "mode": "diagnostic",
+      "format": "v8",
+      "affinity": "hybrid",
+      "eligible": 1,
+      "total": 2,
+      "best_eligible": {
+        "name": "17-diagnostic-v8-hybrid",
+        "puts_s": 464855.7574711701,
+        "p99_ms": 4.39043,
+        "cpu_s": 9.471233,
+        "context": {
+          "voluntary": 96690,
+          "involuntary": 489
+        },
+        "mean_sync_ms": 0.46446930682617876,
+        "digest_cpu_estimates": {
+          "payload_hash_cpu_estimated_s": 0.9983746188695652,
+          "header_batch_hash_cpu_estimated_s": 0.01646267008695652,
+          "ordered_link_hash_cpu_estimated_s": 0.013730938434782609
+        }
+      },
+      "median_eligible": {
+        "puts_s": 464855.7574711701,
+        "p99_ms": 4.39043,
+        "cpu_s": 9.471233
+      }
+    },
+    {
+      "mode": "diagnostic",
+      "format": "v8",
+      "affinity": "pcore",
+      "eligible": 0,
+      "total": 2,
+      "best_eligible": null,
+      "median_eligible": null
+    },
+    {
+      "mode": "normal",
+      "format": "v7",
+      "affinity": "hybrid",
+      "eligible": 0,
+      "total": 10,
+      "best_eligible": null,
+      "median_eligible": null
+    },
+    {
+      "mode": "normal",
+      "format": "v7",
+      "affinity": "pcore",
+      "eligible": 1,
+      "total": 10,
+      "best_eligible": {
+        "name": "v7-rerun-02-normal-v7-pcore",
+        "puts_s": 636927.8681414331,
+        "p99_ms": 3.800039,
+        "cpu_s": 4.153479,
+        "context": {
+          "involuntary": 640,
+          "voluntary": 63425
+        },
+        "mean_sync_ms": 0.35749755159883717,
+        "digest_cpu_estimates": null
+      },
+      "median_eligible": {
+        "puts_s": 636927.8681414331,
+        "p99_ms": 3.800039,
+        "cpu_s": 4.153479
+      }
+    },
+    {
+      "mode": "normal",
+      "format": "v8",
+      "affinity": "hybrid",
+      "eligible": 2,
+      "total": 6,
+      "best_eligible": {
+        "name": "01-normal-v8-hybrid",
+        "puts_s": 514878.71628516243,
+        "p99_ms": 4.829163,
+        "cpu_s": 8.164526,
+        "context": {
+          "involuntary": 1533,
+          "voluntary": 97586
+        },
+        "mean_sync_ms": 0.4326042811306341,
+        "digest_cpu_estimates": {
+          "payload_hash_cpu_estimated_s": 0.8150101433913044,
+          "header_batch_hash_cpu_estimated_s": 0.014647953304347826,
+          "ordered_link_hash_cpu_estimated_s": 0.012496120260869565
+        }
+      },
+      "median_eligible": {
+        "puts_s": 493459.41914788855,
+        "p99_ms": 4.829543,
+        "cpu_s": 8.853957
+      }
+    },
+    {
+      "mode": "normal",
+      "format": "v8",
+      "affinity": "pcore",
+      "eligible": 2,
+      "total": 6,
+      "best_eligible": {
+        "name": "02-normal-v8-pcore",
+        "puts_s": 650192.2024066844,
+        "p99_ms": 3.334852,
+        "cpu_s": 5.854402,
+        "context": {
+          "involuntary": 585,
+          "voluntary": 92398
+        },
+        "mean_sync_ms": 0.4157928088077336,
+        "digest_cpu_estimates": {
+          "payload_hash_cpu_estimated_s": 0.552285733826087,
+          "header_batch_hash_cpu_estimated_s": 0.011126175130434783,
+          "ordered_link_hash_cpu_estimated_s": 0.008690766695652174
+        }
+      },
+      "median_eligible": {
+        "puts_s": 644306.6159343661,
+        "p99_ms": 3.2454359999999998,
+        "cpu_s": 6.0288845
+      }
+    }
+  ],
+  "cohort_counts": [
+    {
+      "cohort": "confirmation",
+      "mode": "normal",
+      "format": "v7",
+      "affinity": "hybrid",
+      "total": 2,
+      "eligible": 0
+    },
+    {
+      "cohort": "confirmation",
+      "mode": "normal",
+      "format": "v7",
+      "affinity": "pcore",
+      "total": 2,
+      "eligible": 0
+    },
+    {
+      "cohort": "confirmation",
+      "mode": "normal",
+      "format": "v8",
+      "affinity": "hybrid",
+      "total": 2,
+      "eligible": 1
+    },
+    {
+      "cohort": "confirmation",
+      "mode": "normal",
+      "format": "v8",
+      "affinity": "pcore",
+      "total": 2,
+      "eligible": 0
+    },
+    {
+      "cohort": "initial",
+      "mode": "diagnostic",
+      "format": "v7",
+      "affinity": "hybrid",
+      "total": 2,
+      "eligible": 0
+    },
+    {
+      "cohort": "initial",
+      "mode": "diagnostic",
+      "format": "v7",
+      "affinity": "pcore",
+      "total": 2,
+      "eligible": 0
+    },
+    {
+      "cohort": "initial",
+      "mode": "diagnostic",
+      "format": "v8",
+      "affinity": "hybrid",
+      "total": 2,
+      "eligible": 1
+    },
+    {
+      "cohort": "initial",
+      "mode": "diagnostic",
+      "format": "v8",
+      "affinity": "pcore",
+      "total": 2,
+      "eligible": 0
+    },
+    {
+      "cohort": "initial",
+      "mode": "normal",
+      "format": "v7",
+      "affinity": "hybrid",
+      "total": 4,
+      "eligible": 0
+    },
+    {
+      "cohort": "initial",
+      "mode": "normal",
+      "format": "v7",
+      "affinity": "pcore",
+      "total": 4,
+      "eligible": 0
+    },
+    {
+      "cohort": "initial",
+      "mode": "normal",
+      "format": "v8",
+      "affinity": "hybrid",
+      "total": 4,
+      "eligible": 1
+    },
+    {
+      "cohort": "initial",
+      "mode": "normal",
+      "format": "v8",
+      "affinity": "pcore",
+      "total": 4,
+      "eligible": 2
+    },
+    {
+      "cohort": "v7-user-rerun",
+      "mode": "normal",
+      "format": "v7",
+      "affinity": "hybrid",
+      "total": 4,
+      "eligible": 0
+    },
+    {
+      "cohort": "v7-user-rerun",
+      "mode": "normal",
+      "format": "v7",
+      "affinity": "pcore",
+      "total": 4,
+      "eligible": 1
+    }
+  ],
+  "runtime_modified": false
+}

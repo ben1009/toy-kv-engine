@@ -21,9 +21,10 @@ the repository root examples, tests, benchmarks, and RFCs.
   backup repository built on immutable SST/vLog object identity and checkpoint
   capture.
 - `src/wal.rs` implements the WAL. Ordinary v4 WALs use the ticket-ordered
-  parallel io_uring durable path by default. PITR v5/v6 and older MVCC formats
-  retain leader I/O; legacy unframed WALs retain buffered I/O. See the
-  [default adoption note](../docs/wal/rfc-024-parallel-wal-default-20261005.md).
+  parallel io_uring durable path by default. New PITR WALs default to V8
+  Parallel; retained V5/V6 and older MVCC formats use Leader I/O, and legacy
+  unframed WALs use buffered I/O. See the
+  [V8 default adoption note](../docs/wal/rfc-026-v8-default-20261103.md).
 - `src/vlog/` contains value-separation storage, indexing, and GC.
 - `src/tests/` contains in-crate test coverage for MVCC, compaction,
   TTL, scans, and cache behavior.

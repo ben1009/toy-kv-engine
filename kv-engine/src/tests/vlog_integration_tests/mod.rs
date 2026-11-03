@@ -26,6 +26,7 @@ fn options_with_vlog_enabled(block_size: usize, target_sst_size: usize) -> LsmSt
         compaction_options: CompactionOptions::NoCompaction,
         enable_wal: false,
         pitr_repository: None,
+        pitr_writer_format: Default::default(),
         serializable: false,
         value_separation: Some(ValueSeparationOptions {
             enabled: true,
@@ -59,6 +60,7 @@ fn options_with_vlog_and_compaction(
         }),
         enable_wal: false,
         pitr_repository: None,
+        pitr_writer_format: Default::default(),
         serializable: false,
         value_separation: Some(ValueSeparationOptions {
             enabled: true,

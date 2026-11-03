@@ -1,0 +1,34 @@
+diff --git a/kv-engine/src/wal/v8/leader.rs b/kv-engine/src/wal/v8/leader.rs
+index ca71c5f0..37d39c01 100644
+--- a/kv-engine/src/wal/v8/leader.rs
++++ b/kv-engine/src/wal/v8/leader.rs
+@@ -1633,6 +1633,10 @@ impl WalV8ParallelWriter {
+         let ticket_end = ticket
+             .checked_add(1)
+             .context("v8 Parallel durable ticket end overflows")?;
++        // One caller drives readiness and sync until its target is durable.
++        // Keep this ownership while waiting for DATA: followers wait on this
++        // mutex instead of waking on every admission, digest, and frame event.
++        let mut previous = self.frontier.lock();
+         loop {
+             if self.coordinator.is_poisoned() {
+                 anyhow::bail!("v8 Parallel WAL is poisoned");
+@@ -1642,10 +1646,6 @@ impl WalV8ParallelWriter {
+             }
+ 
+             let observed_generation = self.coordinator.change_generation();
+-            let mut previous = self.frontier.lock();
+-            if self.coordinator.durable_ticket_end() >= ticket_end {
+-                return Ok(());
+-            }
+ 
+             #[cfg(feature = "bench")]
+             let profile = self.profile.load_full();
+@@ -1685,7 +1685,6 @@ impl WalV8ParallelWriter {
+             let ready = snapshot.ready_prefix;
+ 
+             if ready.is_empty() {
+-                drop(previous);
+                 let wake = self
+                     .coordinator
+                     .wait_for_change(observed_generation, Duration::from_secs(1));

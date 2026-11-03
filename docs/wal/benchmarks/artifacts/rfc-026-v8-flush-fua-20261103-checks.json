@@ -1,0 +1,22 @@
+{
+  "python_AST_pass": true,
+  "compressed_native_trace_hashes_pass": true,
+  "analyzer_reproduces_identical_summary": true,
+  "all_20528_targeted_writes_match_native_trace": true,
+  "every_fua_write_control_0x4000": true,
+  "all_capture_sample_loss_zero": true,
+  "zero_flush_zero_other_write_confirmation_has_122_long_writes": true,
+  "apst_bit_and_256_byte_table_restored_exactly": true,
+  "vwc_unchanged": true,
+  "raw_device_writes": false,
+  "full_probe_count": 20,
+  "full_probe_scratch_write_mib": 80,
+  "runtime_sources_changed": false,
+  "rust_tests_repeated": false,
+  "native_perf_report_all_capture_loss_zero": true,
+  "typos_exit_code": 0,
+  "typos_scope": "New report, WAL index, .typos.toml, and all uncompressed artifacts under this prefix",
+  "no_rust_sources_changed": true,
+  "note": "Documentation and diagnostic artifacts only; full Rust tests were not rerun.",
+  "no_additional_device_probes_during_archival_validation": true
+}

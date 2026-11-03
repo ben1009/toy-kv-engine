@@ -1,0 +1,26 @@
+{
+  "scope": "Unqualified application-batch mitigation screen, not a runtime optimization or parity score. Both larger-batch samples and both controls are storage-flagged.",
+  "captures": 4,
+  "storage_flagged": 4,
+  "pairs": [
+    {
+      "batch64_record": "00-batch64",
+      "batch256_record": "01-batch256",
+      "throughput_change_pct": 30.371908582969475,
+      "batch_p99_change_pct": 355.38311187916855,
+      "sync_count_change_pct": -68.96325459317585
+    },
+    {
+      "batch64_record": "03-batch64",
+      "batch256_record": "02-batch256",
+      "throughput_change_pct": -11.84222679811393,
+      "batch_p99_change_pct": 189.26607041225645,
+      "sync_count_change_pct": -59.28777670837344
+    }
+  ],
+  "durability_unchanged": true,
+  "device_settings_changed": false,
+  "runtime_changed": false,
+  "recommend_default_change": false,
+  "reason": "Reduced sync count, but throughput direction reverses and per-batch p99 increases in both orderings."
+}

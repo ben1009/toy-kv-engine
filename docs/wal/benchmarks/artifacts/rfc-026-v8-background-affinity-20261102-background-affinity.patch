@@ -1,0 +1,316 @@
+diff --git a/kv-engine/src/bin/write-perf.rs b/kv-engine/src/bin/write-perf.rs
+index e61ce944..689e8477 100644
+--- a/kv-engine/src/bin/write-perf.rs
++++ b/kv-engine/src/bin/write-perf.rs
+@@ -1227,6 +1227,217 @@ fn process_cpu_delta(
+     }
+ }
+ 
++// Temporary Linux-only benchmark experiment. This module is not linked into the
++// engine library and will be removed after preserving the comparison executable.
++mod bench_writer_affinity {
++    use std::{fs, io, path::PathBuf};
++
++    use anyhow::{Context, Result, ensure};
++    use serde::Serialize;
++
++    #[derive(Serialize)]
++    pub struct Placement {
++        writer_index: usize,
++        tid: i32,
++        allowed_cpus: Vec<usize>,
++    }
++
++    #[derive(Serialize)]
++    struct BackgroundPlacement {
++        tid: u32,
++        name: String,
++        allowed_cpus: String,
++    }
++
++    pub struct Capture {
++        path: Option<PathBuf>,
++        mode: String,
++        pin_writers: bool,
++        background_original: Vec<BackgroundPlacement>,
++        background_before: Vec<BackgroundPlacement>,
++        context_before: Option<[i64; 2]>,
++    }
++
++    impl Capture {
++        pub fn new() -> Result<Self> {
++            let path = std::env::var_os("TOYKV_AFFINITY_REPORT").map(PathBuf::from);
++            let mode =
++                std::env::var("TOYKV_AFFINITY_MODE").unwrap_or_else(|_| "writers".to_owned());
++            ensure!(
++                matches!(
++                    mode.as_str(),
++                    "writers" | "io" | "reaper" | "userspace" | "kernel" | "whole"
++                ),
++                "unknown diagnostic affinity mode"
++            );
++            let pin_writers = mode != "whole";
++            ensure!(
++                !pin_writers || path.is_some(),
++                "writer affinity requires an audit path"
++            );
++            let background_original = if path.is_some() {
++                background_snapshot()?
++            } else {
++                Vec::new()
++            };
++            for task in &background_original {
++                let kernel = task.name.starts_with("iou-wrk-");
++                let worker = task.name == "wal-io-worker";
++                let reaper = task.name == "wal-v8-completi";
++                let selected = match mode.as_str() {
++                    "io" => worker,
++                    "reaper" => worker || reaper,
++                    "userspace" | "kernel" => task.tid != std::process::id() && !kernel,
++                    _ => false,
++                };
++                if selected {
++                    pin_thread(task.tid as libc::pid_t)?;
++                }
++            }
++            let background_before = if path.is_some() {
++                background_snapshot()?
++            } else {
++                Vec::new()
++            };
++            Ok(Self {
++                path,
++                mode,
++                pin_writers,
++                background_original,
++                background_before,
++                context_before: None,
++            })
++        }
++
++        pub fn enabled(&self) -> bool {
++            self.path.is_some()
++        }
++
++        pub fn pin_writers(&self) -> bool {
++            self.pin_writers
++        }
++
++        pub fn start_measurement(&mut self) -> Result<()> {
++            if self.enabled() {
++                self.context_before = Some(context_usage()?);
++            }
++            Ok(())
++        }
++
++        pub fn finish(self, writers: Vec<Placement>) -> Result<()> {
++            let Some(path) = self.path else {
++                return Ok(());
++            };
++            let context_after = context_usage()?;
++            let context_before = self
++                .context_before
++                .context("missing starting context usage")?;
++            let background_after = background_snapshot()?;
++            let report = serde_json::json!({
++                "pid": std::process::id(),
++                "mode": self.mode,
++                "pin_writers": self.pin_writers,
++                "writers": writers,
++                "background_original": self.background_original,
++                "background_before": self.background_before,
++                "background_after": background_after,
++                "context": {
++                    "voluntary": context_after[0] - context_before[0],
++                    "involuntary": context_after[1] - context_before[1],
++                },
++            });
++            fs::write(path, serde_json::to_vec_pretty(&report)?)?;
++            Ok(())
++        }
++    }
++
++    pub fn place_writer(writer_index: usize, pin: bool) -> Result<Placement> {
++        if pin {
++            pin_thread(0)?;
++        }
++        // SAFETY: cpu_set_t is a plain integer bitset and zero is an empty mask.
++        let mut mask = unsafe { std::mem::zeroed::<libc::cpu_set_t>() };
++        // SAFETY: mask is a writable CPU_SETSIZE bitset of the supplied size.
++        let result = unsafe {
++            libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut mask)
++        };
++        ensure!(
++            result == 0,
++            "read writer affinity: {}",
++            io::Error::last_os_error()
++        );
++        let allowed_cpus = (0..libc::CPU_SETSIZE as usize)
++            // SAFETY: every index is bounded by CPU_SETSIZE.
++            .filter(|&cpu| unsafe { libc::CPU_ISSET(cpu, &mask) })
++            .collect();
++        Ok(Placement {
++            writer_index,
++            // SAFETY: gettid takes no arguments and only reports this thread ID.
++            tid: unsafe { libc::gettid() },
++            allowed_cpus,
++        })
++    }
++
++    fn pin_thread(tid: libc::pid_t) -> Result<()> {
++        // SAFETY: cpu_set_t is an integer bitset; selected indices fit CPU_SETSIZE.
++        let mut mask = unsafe { std::mem::zeroed::<libc::cpu_set_t>() };
++        for cpu in 0..16 {
++            // SAFETY: each index is bounded by CPU_SETSIZE.
++            unsafe { libc::CPU_SET(cpu, &mut mask) };
++        }
++        // SAFETY: mask is initialized and its complete size is supplied. A zero
++        // tid selects this writer; other tids were read from /proc/self/task.
++        let result =
++            unsafe { libc::sched_setaffinity(tid, std::mem::size_of::<libc::cpu_set_t>(), &mask) };
++        ensure!(
++            result == 0,
++            "pin diagnostic thread {tid}: {}",
++            io::Error::last_os_error()
++        );
++        Ok(())
++    }
++
++    fn context_usage() -> Result<[i64; 2]> {
++        let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
++        // SAFETY: getrusage initializes the complete output on success.
++        let result = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
++        ensure!(
++            result == 0,
++            "read context usage: {}",
++            io::Error::last_os_error()
++        );
++        // SAFETY: the successful syscall initialized this structure.
++        let usage = unsafe { usage.assume_init() };
++        Ok([usage.ru_nvcsw, usage.ru_nivcsw])
++    }
++
++    fn background_snapshot() -> Result<Vec<BackgroundPlacement>> {
++        let mut result = Vec::new();
++        for task in fs::read_dir("/proc/self/task")? {
++            let task = task?;
++            let status = match fs::read_to_string(task.path().join("status")) {
++                Ok(status) => status,
++                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
++                Err(error) => return Err(error.into()),
++            };
++            let field = |name: &str| -> Result<String> {
++                status
++                    .lines()
++                    .find_map(|line| line.strip_prefix(name))
++                    .map(|value| value.trim().to_owned())
++                    .with_context(|| format!("missing thread status field {name}"))
++            };
++            result.push(BackgroundPlacement {
++                tid: task.file_name().to_string_lossy().parse()?,
++                name: field("Name:")?,
++                allowed_cpus: field("Cpus_allowed_list:")?,
++            });
++        }
++        result.sort_by_key(|thread| thread.tid);
++        Ok(result)
++    }
++}
++
+ #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+ struct MeasurementCounters {
+     block_cache_entry_count: u64,
+@@ -3650,7 +3861,11 @@ fn run_wal_batch_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>
+     let num_keys = cfg.num;
+     let writer_threads = cfg.threads;
+     let retry_pitr_barrier = cfg.pitr;
++    let mut affinity_capture = bench_writer_affinity::Capture::new()?;
++    let audit_affinity = affinity_capture.enabled();
++    let pin_writers = affinity_capture.pin_writers();
+     let baseline = collect_counters(&engine)?;
++    affinity_capture.start_measurement()?;
+     let cpu_start = process_cpu_times();
+     let per_thread = num_keys / writer_threads;
+     let remainder = num_keys % writer_threads;
+@@ -3661,7 +3876,12 @@ fn run_wal_batch_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>
+         let eng = engine.clone();
+         let val = value.clone();
+         let sample_every = cfg.latency_sample_every;
+-        handles.push(std::thread::spawn(move || -> Result<Vec<u64>> {
++        handles.push(std::thread::spawn(move || -> Result<_> {
++            let placement = if audit_affinity {
++                Some(bench_writer_affinity::place_writer(t, pin_writers)?)
++            } else {
++                None
++            };
+             let thread_ops = per_thread + usize::from(t < remainder);
+             let start_idx = t * per_thread + remainder.min(t);
+             let mut next = 0usize;
+@@ -3687,10 +3907,11 @@ fn run_wal_batch_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>
+                 next += current_batch;
+                 batch_index += 1;
+             }
+-            Ok(latency_samples)
++            Ok((latency_samples, placement))
+         }));
+     }
+     let mut latency_samples = Vec::new();
++    let mut writer_placements = Vec::new();
+     let mut writer_error = None;
+     for handle in handles {
+         let result = match handle.join() {
+@@ -3698,7 +3919,10 @@ fn run_wal_batch_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>
+             Err(_) => Err(anyhow!("writer thread panicked")),
+         };
+         match result {
+-            Ok(samples) => latency_samples.extend(samples),
++            Ok((samples, placement)) => {
++                latency_samples.extend(samples);
++                writer_placements.extend(placement);
++            }
+             Err(error) => {
+                 writer_error.get_or_insert(error);
+             }
+@@ -3711,6 +3935,7 @@ fn run_wal_batch_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>
+     let elapsed = start.elapsed();
+     let (process_cpu_user_ms, process_cpu_system_ms) =
+         process_cpu_delta(cpu_start, process_cpu_times());
++    affinity_capture.finish(writer_placements)?;
+     #[cfg(feature = "bench")]
+     let wal_pipeline = wal_pipeline_record(&engine, cfg.profile, wal_run_info)?;
+     #[cfg(not(feature = "bench"))]
+diff --git a/kv-engine/src/wal/parallel/worker.rs b/kv-engine/src/wal/parallel/worker.rs
+index 9885d117..70f7f901 100644
+--- a/kv-engine/src/wal/parallel/worker.rs
++++ b/kv-engine/src/wal/parallel/worker.rs
+@@ -1634,6 +1634,30 @@ impl<B: WorkerBuffer> IoWorker<B> {
+                         return Err(anyhow!("WAL io_uring initialization failed"));
+                     }
+                 };
++                // Temporary benchmark-only diagnostic; removed after preserving
++                // the comparison executable. Ring flags and I/O policy stay unchanged.
++                #[cfg(feature = "bench")]
++                if let Ok(setting) = std::env::var("TOYKV_IOWQ_PCORE") {
++                    let cpu_count = if setting == "1" { 16 } else { 32 };
++                    // SAFETY: cpu_set_t is an integer bitset and zero is empty.
++                    let mut mask = unsafe { std::mem::zeroed::<libc::cpu_set_t>() };
++                    for cpu in 0..cpu_count {
++                        // SAFETY: all indices fit CPU_SETSIZE.
++                        unsafe { libc::CPU_SET(cpu, &mut mask) };
++                    }
++                    if let Err(error) = ring.submitter().register_iowq_aff(&mask) {
++                        let _ = startup_tx
++                            .send(Err(anyhow!(error)
++                                .context("diagnostic io-wq affinity registration failed")));
++                        return Err(anyhow!("diagnostic io-wq affinity setup failed"));
++                    }
++                    // SAFETY: gettid only reports the calling thread ID.
++                    let tid = unsafe { libc::gettid() };
++                    eprintln!(
++                        "TOYKV_IOWQ_AFFINITY registered=1 cpus=0-{} tid={tid}",
++                        cpu_count - 1
++                    );
++                }
+                 if let Err(error) = ring.submitter().register_files(&[worker_file.as_raw_fd()]) {
+                     let _ = startup_tx.send(Err(
+                         anyhow!(error).context("failed to register WAL file with io_uring")

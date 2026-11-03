@@ -1,0 +1,949 @@
+[
+  {
+    "cohort": "confirmation",
+    "kind": "batch",
+    "writers": 1,
+    "arm": "baseline",
+    "eligible": 2,
+    "total": 2,
+    "median_eligible_puts_s": 69591.51312433492,
+    "best": {
+      "sample": "confirm-00-batch-baseline-1",
+      "puts_s": 71064.04093839761,
+      "p99_ms": 1.314061,
+      "cpu_ms": 6132.9580000000005,
+      "context_switches": {
+        "involuntary": 94,
+        "voluntary": 95003
+      },
+      "eventfd_requests": 11719,
+      "eventfd_writes": 0,
+      "sync_count": 11719,
+      "publication_cpu_estimates": null
+    }
+  },
+  {
+    "cohort": "confirmation",
+    "kind": "batch",
+    "writers": 1,
+    "arm": "cursor",
+    "eligible": 2,
+    "total": 2,
+    "median_eligible_puts_s": 68394.3323167407,
+    "best": {
+      "sample": "confirm-01-batch-cursor-1",
+      "puts_s": 68757.89992687946,
+      "p99_ms": 1.381914,
+      "cpu_ms": 6393.332,
+      "context_switches": {
+        "involuntary": 143,
+        "voluntary": 94964
+      },
+      "eventfd_requests": 11719,
+      "eventfd_writes": 0,
+      "sync_count": 11719,
+      "publication_cpu_estimates": null
+    }
+  },
+  {
+    "cohort": "confirmation",
+    "kind": "batch",
+    "writers": 8,
+    "arm": "baseline",
+    "eligible": 1,
+    "total": 2,
+    "median_eligible_puts_s": 311595.9531586096,
+    "best": {
+      "sample": "confirm-03-batch-baseline-8",
+      "puts_s": 311595.9531586096,
+      "p99_ms": 3.38094,
+      "cpu_ms": 8619.267,
+      "context_switches": {
+        "involuntary": 447,
+        "voluntary": 150299
+      },
+      "eventfd_requests": 5976,
+      "eventfd_writes": 4002,
+      "sync_count": 1506,
+      "publication_cpu_estimates": null
+    }
+  },
+  {
+    "cohort": "confirmation",
+    "kind": "batch",
+    "writers": 8,
+    "arm": "cursor",
+    "eligible": 1,
+    "total": 2,
+    "median_eligible_puts_s": 315546.10353704303,
+    "best": {
+      "sample": "confirm-02-batch-cursor-8",
+      "puts_s": 315546.10353704303,
+      "p99_ms": 2.695413,
+      "cpu_ms": 8103.351,
+      "context_switches": {
+        "involuntary": 455,
+        "voluntary": 86621
+      },
+      "eventfd_requests": 6164,
+      "eventfd_writes": 4148,
+      "sync_count": 1527,
+      "publication_cpu_estimates": null
+    }
+  },
+  {
+    "cohort": "confirmation",
+    "kind": "point",
+    "writers": 16,
+    "arm": "baseline",
+    "eligible": 0,
+    "total": 2,
+    "median_eligible_puts_s": null,
+    "best": null
+  },
+  {
+    "cohort": "confirmation",
+    "kind": "point",
+    "writers": 16,
+    "arm": "cursor",
+    "eligible": 0,
+    "total": 2,
+    "median_eligible_puts_s": null,
+    "best": null
+  },
+  {
+    "cohort": "cursor-guards",
+    "kind": "batch",
+    "writers": 1,
+    "arm": "baseline",
+    "eligible": 1,
+    "total": 2,
+    "median_eligible_puts_s": 73191.04756417745,
+    "best": {
+      "sample": "cursor-guard-22-batch-baseline-1",
+      "puts_s": 73191.04756417745,
+      "p99_ms": 1.307766,
+      "cpu_ms": 5787.139,
+      "context_switches": {
+        "involuntary": 84,
+        "voluntary": 95319
+      },
+      "eventfd_requests": 11719,
+      "eventfd_writes": 1,
+      "sync_count": 11719,
+      "publication_cpu_estimates": null
+    }
+  },
+  {
+    "cohort": "cursor-guards",
+    "kind": "batch",
+    "writers": 1,
+    "arm": "cursor",
+    "eligible": 1,
+    "total": 2,
+    "median_eligible_puts_s": 71299.43914696609,
+    "best": {
+      "sample": "cursor-guard-23-batch-cursor-1",
+      "puts_s": 71299.43914696609,
+      "p99_ms": 1.341218,
+      "cpu_ms": 5980.983,
+      "context_switches": {
+        "involuntary": 171,
+        "voluntary": 95039
+      },
+      "eventfd_requests": 11719,
+      "eventfd_writes": 1,
+      "sync_count": 11719,
+      "publication_cpu_estimates": null
+    }
+  },
+  {
+    "cohort": "cursor-guards",
+    "kind": "batch",
+    "writers": 8,
+    "arm": "baseline",
+    "eligible": 1,
+    "total": 2,
+    "median_eligible_puts_s": 323286.8878240139,
+    "best": {
+      "sample": "cursor-guard-18-batch-baseline-8",
+      "puts_s": 323286.8878240139,
+      "p99_ms": 2.600887,
+      "cpu_ms": 8285.339,
+      "context_switches": {
+        "involuntary": 501,
+        "voluntary": 147026
+      },
+      "eventfd_requests": 6084,
+      "eventfd_writes": 4113,
+      "sync_count": 1524,
+      "publication_cpu_estimates": null
+    }
+  },
+  {
+    "cohort": "cursor-guards",
+    "kind": "batch",
+    "writers": 8,
+    "arm": "cursor",
+    "eligible": 1,
+    "total": 2,
+    "median_eligible_puts_s": 315373.26834498905,
+    "best": {
+      "sample": "cursor-guard-19-batch-cursor-8",
+      "puts_s": 315373.26834498905,
+      "p99_ms": 2.66394,
+      "cpu_ms": 8152.812,
+      "context_switches": {
+        "involuntary": 342,
+        "voluntary": 85116
+      },
+      "eventfd_requests": 6159,
+      "eventfd_writes": 4123,
+      "sync_count": 1534,
+      "publication_cpu_estimates": null
+    }
+  },
+  {
+    "cohort": "cursor-guards",
+    "kind": "batch",
+    "writers": 16,
+    "arm": "baseline",
+    "eligible": 1,
+    "total": 2,
+    "median_eligible_puts_s": 379866.85028721124,
+    "best": {
+      "sample": "cursor-guard-08-batch-baseline-16",
+      "puts_s": 379866.85028721124,
+      "p99_ms": 5.445819,
+      "cpu_ms": 10970.195000000002,
+      "context_switches": {
+        "involuntary": 729,
+        "voluntary": 166945
+      },
+      "eventfd_requests": 5910,
+      "eventfd_writes": 4270,
+      "sync_count": 1376,
+      "publication_cpu_estimates": null
+    }
+  },
+  {
+    "cohort": "cursor-guards",
+    "kind": "batch",
+    "writers": 16,
+    "arm": "cursor",
+    "eligible": 1,
+    "total": 2,
+    "median_eligible_puts_s": 486531.7650786718,
+    "best": {
+      "sample": "cursor-guard-15-batch-cursor-16",
+      "puts_s": 486531.7650786718,
+      "p99_ms": 4.05935,
+      "cpu_ms": 9500.579,
+      "context_switches": {
+        "involuntary": 440,
+        "voluntary": 95470
+      },
+      "eventfd_requests": 6090,
+      "eventfd_writes": 4312,
+      "sync_count": 1347,
+      "publication_cpu_estimates": null
+    }
+  },
+  {
+    "cohort": "cursor-guards",
+    "kind": "point",
+    "writers": 1,
+    "arm": "baseline",
+    "eligible": 1,
+    "total": 2,
+    "median_eligible_puts_s": 1562.207879331314,
+    "best": {
+      "sample": "cursor-guard-21-point-baseline-1",
+      "puts_s": 1562.207879331314,
+      "p99_ms": 1.253815,
+      "cpu_ms": 869.444,
+      "context_switches": null,
+      "eventfd_requests": 5000,
+      "eventfd_writes": 0,
+      "sync_count": 5000,
+      "publication_cpu_estimates": null
+    }
+  },
+  {
+    "cohort": "cursor-guards",
+    "kind": "point",
+    "writers": 1,
+    "arm": "cursor",
+    "eligible": 1,
+    "total": 2,
+    "median_eligible_puts_s": 1593.6601780852013,
+    "best": {
+      "sample": "cursor-guard-20-point-cursor-1",
+      "puts_s": 1593.6601780852013,
+      "p99_ms": 1.239056,
+      "cpu_ms": 826.444,
+      "context_switches": null,
+      "eventfd_requests": 5000,
+      "eventfd_writes": 0,
+      "sync_count": 5000,
+      "publication_cpu_estimates": null
+    }
+  },
+  {
+    "cohort": "cursor-guards",
+    "kind": "point",
+    "writers": 8,
+    "arm": "baseline",
+    "eligible": 2,
+    "total": 2,
+    "median_eligible_puts_s": 9083.403784778635,
+    "best": {
+      "sample": "cursor-guard-07-point-baseline-8",
+      "puts_s": 9103.351456508446,
+      "p99_ms": 1.640003,
+      "cpu_ms": 4139.914,
+      "context_switches": null,
+      "eventfd_requests": 19299,
+      "eventfd_writes": 10766,
+      "sync_count": 2538,
+      "publication_cpu_estimates": null
+    }
+  },
+  {
+    "cohort": "cursor-guards",
+    "kind": "point",
+    "writers": 8,
+    "arm": "cursor",
+    "eligible": 2,
+    "total": 2,
+    "median_eligible_puts_s": 9440.707409565795,
+    "best": {
+      "sample": "cursor-guard-16-point-cursor-8",
+      "puts_s": 9510.020193786098,
+      "p99_ms": 1.578554,
+      "cpu_ms": 3164.737,
+      "context_switches": null,
+      "eventfd_requests": 19870,
+      "eventfd_writes": 9167,
+      "sync_count": 2520,
+      "publication_cpu_estimates": null
+    }
+  },
+  {
+    "cohort": "cursor-guards",
+    "kind": "point",
+    "writers": 16,
+    "arm": "baseline",
+    "eligible": 0,
+    "total": 2,
+    "median_eligible_puts_s": null,
+    "best": null
+  },
+  {
+    "cohort": "cursor-guards",
+    "kind": "point",
+    "writers": 16,
+    "arm": "cursor",
+    "eligible": 0,
+    "total": 2,
+    "median_eligible_puts_s": null,
+    "best": null
+  },
+  {
+    "cohort": "cursor-screen",
+    "kind": "batch",
+    "writers": 8,
+    "arm": "baseline",
+    "eligible": 1,
+    "total": 2,
+    "median_eligible_puts_s": 317057.4163291291,
+    "best": {
+      "sample": "cursor-05-baseline-8",
+      "puts_s": 317057.4163291291,
+      "p99_ms": 3.029993,
+      "cpu_ms": 8418.633999999998,
+      "context_switches": {
+        "involuntary": 419,
+        "voluntary": 131425
+      },
+      "eventfd_requests": 6589,
+      "eventfd_writes": 4489,
+      "sync_count": 1612,
+      "publication_cpu_estimates": null
+    }
+  },
+  {
+    "cohort": "cursor-screen",
+    "kind": "batch",
+    "writers": 8,
+    "arm": "cursor",
+    "eligible": 2,
+    "total": 2,
+    "median_eligible_puts_s": 310104.5453178802,
+    "best": {
+      "sample": "cursor-04-cursor-8",
+      "puts_s": 317490.31286997796,
+      "p99_ms": 2.594702,
+      "cpu_ms": 8021.72,
+      "context_switches": {
+        "involuntary": 486,
+        "voluntary": 85661
+      },
+      "eventfd_requests": 6144,
+      "eventfd_writes": 4101,
+      "sync_count": 1531,
+      "publication_cpu_estimates": null
+    }
+  },
+  {
+    "cohort": "cursor-screen",
+    "kind": "batch",
+    "writers": 16,
+    "arm": "baseline",
+    "eligible": 2,
+    "total": 2,
+    "median_eligible_puts_s": 444711.6566340915,
+    "best": {
+      "sample": "cursor-03-baseline-16",
+      "puts_s": 449578.12469951325,
+      "p99_ms": 4.163286,
+      "cpu_ms": 9987.587,
+      "context_switches": {
+        "involuntary": 1163,
+        "voluntary": 175690
+      },
+      "eventfd_requests": 5809,
+      "eventfd_writes": 4193,
+      "sync_count": 1355,
+      "publication_cpu_estimates": null
+    }
+  },
+  {
+    "cohort": "cursor-screen",
+    "kind": "batch",
+    "writers": 16,
+    "arm": "cursor",
+    "eligible": 1,
+    "total": 2,
+    "median_eligible_puts_s": 504246.81406727515,
+    "best": {
+      "sample": "cursor-02-cursor-16",
+      "puts_s": 504246.81406727515,
+      "p99_ms": 3.67925,
+      "cpu_ms": 8427.943,
+      "context_switches": {
+        "involuntary": 1763,
+        "voluntary": 96246
+      },
+      "eventfd_requests": 5852,
+      "eventfd_writes": 4155,
+      "sync_count": 1291,
+      "publication_cpu_estimates": null
+    }
+  },
+  {
+    "cohort": "publication-cpu",
+    "kind": "batch",
+    "writers": 16,
+    "arm": "baseline",
+    "eligible": 1,
+    "total": 2,
+    "median_eligible_puts_s": 433557.35575262504,
+    "best": {
+      "sample": "cpu-00-baseline-16",
+      "puts_s": 433557.35575262504,
+      "p99_ms": 5.240983,
+      "cpu_ms": 10912.608,
+      "context_switches": {
+        "involuntary": 638,
+        "voluntary": 174672
+      },
+      "eventfd_requests": 5799,
+      "eventfd_writes": 4205,
+      "sync_count": 1297,
+      "publication_cpu_estimates": {
+        "memtable_publish": {
+          "calls": 11728,
+          "samples": 192,
+          "estimated_cpu_ms": 3449.59127425,
+          "estimated_wall_ms": 3489.0440219166667
+        },
+        "mvcc_publish": {
+          "calls": 11728,
+          "samples": 192,
+          "estimated_cpu_ms": 933.3185769166666,
+          "estimated_wall_ms": 1856.4797895833335
+        }
+      }
+    }
+  },
+  {
+    "cohort": "publication-cpu",
+    "kind": "batch",
+    "writers": 16,
+    "arm": "roles",
+    "eligible": 1,
+    "total": 2,
+    "median_eligible_puts_s": 430122.8512184974,
+    "best": {
+      "sample": "cpu-01-roles-16",
+      "puts_s": 430122.8512184974,
+      "p99_ms": 4.743057,
+      "cpu_ms": 9651.195,
+      "context_switches": {
+        "involuntary": 487,
+        "voluntary": 108290
+      },
+      "eventfd_requests": 5893,
+      "eventfd_writes": 4220,
+      "sync_count": 1297,
+      "publication_cpu_estimates": {
+        "memtable_publish": {
+          "calls": 11728,
+          "samples": 192,
+          "estimated_cpu_ms": 3354.3530118333333,
+          "estimated_wall_ms": 3388.842921916667
+        },
+        "mvcc_publish": {
+          "calls": 11728,
+          "samples": 192,
+          "estimated_cpu_ms": 472.9275074166667,
+          "estimated_wall_ms": 639.2724505833335
+        }
+      }
+    }
+  },
+  {
+    "cohort": "roles-guards",
+    "kind": "batch",
+    "writers": 1,
+    "arm": "baseline",
+    "eligible": 1,
+    "total": 2,
+    "median_eligible_puts_s": 69794.8066446721,
+    "best": {
+      "sample": "guard-22-batch-baseline-1",
+      "puts_s": 69794.8066446721,
+      "p99_ms": 1.357461,
+      "cpu_ms": 6349.089,
+      "context_switches": {
+        "involuntary": 100,
+        "voluntary": 95014
+      },
+      "eventfd_requests": 11719,
+      "eventfd_writes": 0,
+      "sync_count": 11719,
+      "publication_cpu_estimates": null
+    }
+  },
+  {
+    "cohort": "roles-guards",
+    "kind": "batch",
+    "writers": 1,
+    "arm": "roles",
+    "eligible": 1,
+    "total": 2,
+    "median_eligible_puts_s": 50422.61759290492,
+    "best": {
+      "sample": "guard-01-batch-roles-1",
+      "puts_s": 50422.61759290492,
+      "p99_ms": 9.386744,
+      "cpu_ms": 6776.99,
+      "context_switches": {
+        "involuntary": 133,
+        "voluntary": 95412
+      },
+      "eventfd_requests": 11719,
+      "eventfd_writes": 0,
+      "sync_count": 11719,
+      "publication_cpu_estimates": null
+    }
+  },
+  {
+    "cohort": "roles-guards",
+    "kind": "batch",
+    "writers": 8,
+    "arm": "baseline",
+    "eligible": 1,
+    "total": 2,
+    "median_eligible_puts_s": 334754.8934957957,
+    "best": {
+      "sample": "guard-18-batch-baseline-8",
+      "puts_s": 334754.8934957957,
+      "p99_ms": 3.219195,
+      "cpu_ms": 7774.389999999999,
+      "context_switches": {
+        "involuntary": 517,
+        "voluntary": 150568
+      },
+      "eventfd_requests": 5954,
+      "eventfd_writes": 3944,
+      "sync_count": 1521,
+      "publication_cpu_estimates": null
+    }
+  },
+  {
+    "cohort": "roles-guards",
+    "kind": "batch",
+    "writers": 8,
+    "arm": "roles",
+    "eligible": 1,
+    "total": 2,
+    "median_eligible_puts_s": 293847.4093093608,
+    "best": {
+      "sample": "guard-19-batch-roles-8",
+      "puts_s": 293847.4093093608,
+      "p99_ms": 3.213569,
+      "cpu_ms": 8348.35,
+      "context_switches": {
+        "involuntary": 369,
+        "voluntary": 96905
+      },
+      "eventfd_requests": 6090,
+      "eventfd_writes": 4123,
+      "sync_count": 1533,
+      "publication_cpu_estimates": null
+    }
+  },
+  {
+    "cohort": "roles-guards",
+    "kind": "batch",
+    "writers": 16,
+    "arm": "baseline",
+    "eligible": 1,
+    "total": 2,
+    "median_eligible_puts_s": 438669.65080801456,
+    "best": {
+      "sample": "guard-08-batch-baseline-16",
+      "puts_s": 438669.65080801456,
+      "p99_ms": 4.684491,
+      "cpu_ms": 10959.744000000002,
+      "context_switches": {
+        "involuntary": 632,
+        "voluntary": 164627
+      },
+      "eventfd_requests": 5892,
+      "eventfd_writes": 4221,
+      "sync_count": 1318,
+      "publication_cpu_estimates": null
+    }
+  },
+  {
+    "cohort": "roles-guards",
+    "kind": "batch",
+    "writers": 16,
+    "arm": "roles",
+    "eligible": 1,
+    "total": 2,
+    "median_eligible_puts_s": 402206.042871007,
+    "best": {
+      "sample": "guard-09-batch-roles-16",
+      "puts_s": 402206.042871007,
+      "p99_ms": 5.626403,
+      "cpu_ms": 10501.759,
+      "context_switches": {
+        "involuntary": 518,
+        "voluntary": 107640
+      },
+      "eventfd_requests": 5908,
+      "eventfd_writes": 4167,
+      "sync_count": 1327,
+      "publication_cpu_estimates": null
+    }
+  },
+  {
+    "cohort": "roles-guards",
+    "kind": "point",
+    "writers": 1,
+    "arm": "baseline",
+    "eligible": 1,
+    "total": 2,
+    "median_eligible_puts_s": 1567.7610567898262,
+    "best": {
+      "sample": "guard-21-point-baseline-1",
+      "puts_s": 1567.7610567898262,
+      "p99_ms": 1.296355,
+      "cpu_ms": 872.489,
+      "context_switches": null,
+      "eventfd_requests": 5000,
+      "eventfd_writes": 0,
+      "sync_count": 5000,
+      "publication_cpu_estimates": null
+    }
+  },
+  {
+    "cohort": "roles-guards",
+    "kind": "point",
+    "writers": 1,
+    "arm": "roles",
+    "eligible": 1,
+    "total": 2,
+    "median_eligible_puts_s": 1591.1914092744385,
+    "best": {
+      "sample": "guard-20-point-roles-1",
+      "puts_s": 1591.1914092744385,
+      "p99_ms": 1.242955,
+      "cpu_ms": 878.058,
+      "context_switches": null,
+      "eventfd_requests": 5000,
+      "eventfd_writes": 0,
+      "sync_count": 5000,
+      "publication_cpu_estimates": null
+    }
+  },
+  {
+    "cohort": "roles-guards",
+    "kind": "point",
+    "writers": 8,
+    "arm": "baseline",
+    "eligible": 2,
+    "total": 2,
+    "median_eligible_puts_s": 8788.251961052705,
+    "best": {
+      "sample": "guard-17-point-baseline-8",
+      "puts_s": 8967.126135828263,
+      "p99_ms": 1.690953,
+      "cpu_ms": 4340.269,
+      "context_switches": null,
+      "eventfd_requests": 19453,
+      "eventfd_writes": 11254,
+      "sync_count": 2532,
+      "publication_cpu_estimates": null
+    }
+  },
+  {
+    "cohort": "roles-guards",
+    "kind": "point",
+    "writers": 8,
+    "arm": "roles",
+    "eligible": 1,
+    "total": 2,
+    "median_eligible_puts_s": 9051.737941831396,
+    "best": {
+      "sample": "guard-06-point-roles-8",
+      "puts_s": 9051.737941831396,
+      "p99_ms": 1.664512,
+      "cpu_ms": 3331.71,
+      "context_switches": null,
+      "eventfd_requests": 19880,
+      "eventfd_writes": 8526,
+      "sync_count": 2535,
+      "publication_cpu_estimates": null
+    }
+  },
+  {
+    "cohort": "roles-guards",
+    "kind": "point",
+    "writers": 16,
+    "arm": "baseline",
+    "eligible": 0,
+    "total": 2,
+    "median_eligible_puts_s": null,
+    "best": null
+  },
+  {
+    "cohort": "roles-guards",
+    "kind": "point",
+    "writers": 16,
+    "arm": "roles",
+    "eligible": 1,
+    "total": 2,
+    "median_eligible_puts_s": 9510.756079025034,
+    "best": {
+      "sample": "guard-10-point-roles-16",
+      "puts_s": 9510.756079025034,
+      "p99_ms": 3.816228,
+      "cpu_ms": 5259.754,
+      "context_switches": null,
+      "eventfd_requests": 19682,
+      "eventfd_writes": 7070,
+      "sync_count": 1968,
+      "publication_cpu_estimates": null
+    }
+  },
+  {
+    "cohort": "roles-screen",
+    "kind": "batch",
+    "writers": 8,
+    "arm": "baseline",
+    "eligible": 0,
+    "total": 2,
+    "median_eligible_puts_s": null,
+    "best": null
+  },
+  {
+    "cohort": "roles-screen",
+    "kind": "batch",
+    "writers": 8,
+    "arm": "roles",
+    "eligible": 0,
+    "total": 2,
+    "median_eligible_puts_s": null,
+    "best": null
+  },
+  {
+    "cohort": "roles-screen",
+    "kind": "batch",
+    "writers": 16,
+    "arm": "baseline",
+    "eligible": 1,
+    "total": 2,
+    "median_eligible_puts_s": 424969.0788531848,
+    "best": {
+      "sample": "roles-03-baseline-16",
+      "puts_s": 424969.0788531848,
+      "p99_ms": 5.377105,
+      "cpu_ms": 10820.784,
+      "context_switches": {
+        "involuntary": 839,
+        "voluntary": 169847
+      },
+      "eventfd_requests": 5765,
+      "eventfd_writes": 4153,
+      "sync_count": 1378,
+      "publication_cpu_estimates": null
+    }
+  },
+  {
+    "cohort": "roles-screen",
+    "kind": "batch",
+    "writers": 16,
+    "arm": "roles",
+    "eligible": 0,
+    "total": 2,
+    "median_eligible_puts_s": null,
+    "best": null
+  },
+  {
+    "cohort": "split-confirmation",
+    "kind": "batch",
+    "writers": 8,
+    "arm": "baseline",
+    "eligible": 0,
+    "total": 2,
+    "median_eligible_puts_s": null,
+    "best": null
+  },
+  {
+    "cohort": "split-confirmation",
+    "kind": "batch",
+    "writers": 8,
+    "arm": "split",
+    "eligible": 0,
+    "total": 2,
+    "median_eligible_puts_s": null,
+    "best": null
+  },
+  {
+    "cohort": "split-confirmation",
+    "kind": "batch",
+    "writers": 16,
+    "arm": "baseline",
+    "eligible": 0,
+    "total": 2,
+    "median_eligible_puts_s": null,
+    "best": null
+  },
+  {
+    "cohort": "split-confirmation",
+    "kind": "batch",
+    "writers": 16,
+    "arm": "split",
+    "eligible": 0,
+    "total": 2,
+    "median_eligible_puts_s": null,
+    "best": null
+  },
+  {
+    "cohort": "split-screen",
+    "kind": "batch",
+    "writers": 8,
+    "arm": "baseline",
+    "eligible": 1,
+    "total": 2,
+    "median_eligible_puts_s": 338140.3999273886,
+    "best": {
+      "sample": "05-baseline-8",
+      "puts_s": 338140.3999273886,
+      "p99_ms": 3.323366,
+      "cpu_ms": 7796.11,
+      "context_switches": {
+        "involuntary": 726,
+        "voluntary": 143510
+      },
+      "eventfd_requests": 6360,
+      "eventfd_writes": 4301,
+      "sync_count": 1566,
+      "publication_cpu_estimates": null
+    }
+  },
+  {
+    "cohort": "split-screen",
+    "kind": "batch",
+    "writers": 8,
+    "arm": "split",
+    "eligible": 1,
+    "total": 2,
+    "median_eligible_puts_s": 320086.2702661277,
+    "best": {
+      "sample": "04-split-8",
+      "puts_s": 320086.2702661277,
+      "p99_ms": 3.665292,
+      "cpu_ms": 8037.401,
+      "context_switches": {
+        "involuntary": 502,
+        "voluntary": 103587
+      },
+      "eventfd_requests": 6439,
+      "eventfd_writes": 4443,
+      "sync_count": 1538,
+      "publication_cpu_estimates": null
+    }
+  },
+  {
+    "cohort": "split-screen",
+    "kind": "batch",
+    "writers": 16,
+    "arm": "baseline",
+    "eligible": 2,
+    "total": 2,
+    "median_eligible_puts_s": 427097.49868143426,
+    "best": {
+      "sample": "03-baseline-16",
+      "puts_s": 429006.14196596085,
+      "p99_ms": 5.350562,
+      "cpu_ms": 10861.159000000001,
+      "context_switches": {
+        "involuntary": 656,
+        "voluntary": 176838
+      },
+      "eventfd_requests": 5736,
+      "eventfd_writes": 4175,
+      "sync_count": 1278,
+      "publication_cpu_estimates": null
+    }
+  },
+  {
+    "cohort": "split-screen",
+    "kind": "batch",
+    "writers": 16,
+    "arm": "split",
+    "eligible": 1,
+    "total": 2,
+    "median_eligible_puts_s": 438651.7051647201,
+    "best": {
+      "sample": "07-split-16",
+      "puts_s": 438651.7051647201,
+      "p99_ms": 4.728286,
+      "cpu_ms": 10463.43,
+      "context_switches": {
+        "involuntary": 481,
+        "voluntary": 125698
+      },
+      "eventfd_requests": 5778,
+      "eventfd_writes": 4240,
+      "sync_count": 1219,
+      "publication_cpu_estimates": null
+    }
+  }
+]

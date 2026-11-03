@@ -1,0 +1,12 @@
+COOLDOWN 15 control pair 0
+START 00-v8-writers
+{"name": "00-v8-writers", "puts_s": 143767, "p99_ms": 31.224, "cpu_s": 10.623, "syncs": 1562, "mean_sync_ms": 1.683, "stall_flag": true, "role_masks_validated": true, "context": {"involuntary": 609, "voluntary": 109277}}
+START 01-v8-whole
+{"name": "01-v8-whole", "puts_s": 257426, "p99_ms": 25.651, "cpu_s": 7.474, "syncs": 1179, "mean_sync_ms": 1.192, "stall_flag": true, "role_masks_validated": true, "context": {"involuntary": 764, "voluntary": 98665}}
+COOLDOWN 45 control pair 1
+START 02-v8-whole
+{"name": "02-v8-whole", "puts_s": 106058, "p99_ms": 29.052, "cpu_s": 10.845, "syncs": 1555, "mean_sync_ms": 2.388, "stall_flag": true, "role_masks_validated": true, "context": {"involuntary": 1245, "voluntary": 112252}}
+START 03-v8-writers
+{"name": "03-v8-writers", "puts_s": 99501, "p99_ms": 27.172, "cpu_s": 11.913, "syncs": 1703, "mean_sync_ms": 2.299, "stall_flag": true, "role_masks_validated": true, "context": {"involuntary": 1441, "voluntary": 115361}}
+ROLE EXPANSION SKIPPED: neither endpoint control pair was jointly eligible
+RERUN DONE

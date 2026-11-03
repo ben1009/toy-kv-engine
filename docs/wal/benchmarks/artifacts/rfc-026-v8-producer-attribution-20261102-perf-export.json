@@ -1,0 +1,82 @@
+[
+  {
+    "name": "00-diagnostic-v7-1",
+    "artifact": "-symbols.txt",
+    "returncode": 0
+  },
+  {
+    "name": "00-diagnostic-v7-1",
+    "artifact": "-stacks.txt",
+    "returncode": 255
+  },
+  {
+    "name": "01-diagnostic-v8-1",
+    "artifact": "-symbols.txt",
+    "returncode": 0
+  },
+  {
+    "name": "01-diagnostic-v8-1",
+    "artifact": "-stacks.txt",
+    "returncode": 255
+  },
+  {
+    "name": "02-diagnostic-v7-16",
+    "artifact": "-symbols.txt",
+    "returncode": 0
+  },
+  {
+    "name": "02-diagnostic-v7-16",
+    "artifact": "-stacks.txt",
+    "returncode": 255
+  },
+  {
+    "name": "03-diagnostic-v8-16",
+    "artifact": "-symbols.txt",
+    "returncode": 0
+  },
+  {
+    "name": "03-diagnostic-v8-16",
+    "artifact": "-stacks.txt",
+    "returncode": 255
+  },
+  {
+    "name": "04-diagnostic-v8-16",
+    "artifact": "-symbols.txt",
+    "returncode": 0
+  },
+  {
+    "name": "04-diagnostic-v8-16",
+    "artifact": "-stacks.txt",
+    "returncode": 255
+  },
+  {
+    "name": "05-diagnostic-v7-16",
+    "artifact": "-symbols.txt",
+    "returncode": 0
+  },
+  {
+    "name": "05-diagnostic-v7-16",
+    "artifact": "-stacks.txt",
+    "returncode": 255
+  },
+  {
+    "name": "06-diagnostic-v8-1",
+    "artifact": "-symbols.txt",
+    "returncode": 0
+  },
+  {
+    "name": "06-diagnostic-v8-1",
+    "artifact": "-stacks.txt",
+    "returncode": 255
+  },
+  {
+    "name": "07-diagnostic-v7-1",
+    "artifact": "-symbols.txt",
+    "returncode": 0
+  },
+  {
+    "name": "07-diagnostic-v7-1",
+    "artifact": "-stacks.txt",
+    "returncode": 255
+  }
+]

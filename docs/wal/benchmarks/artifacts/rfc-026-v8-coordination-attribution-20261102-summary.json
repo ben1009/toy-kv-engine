@@ -1,0 +1,182 @@
+[
+  {
+    "cohort": "initial-attribution",
+    "arm": "v7",
+    "writers": 16,
+    "workload": "wal_batch_concurrent",
+    "eligible": 1,
+    "total": 2,
+    "eligible_median_puts_s": 484337.97516692255,
+    "best": {
+      "sample": "03-v7-16",
+      "puts_s": 484337.97516692255,
+      "p99_ms": 4.451809,
+      "cpu_ms": 6197.224,
+      "sync_count": 1508
+    }
+  },
+  {
+    "cohort": "initial-attribution",
+    "arm": "v8",
+    "writers": 16,
+    "workload": "wal_batch_concurrent",
+    "eligible": 1,
+    "total": 2,
+    "eligible_median_puts_s": 402305.9790358966,
+    "best": {
+      "sample": "02-v8-16",
+      "puts_s": 402305.9790358966,
+      "p99_ms": 4.268184,
+      "cpu_ms": 11081.694,
+      "sync_count": 1604
+    }
+  },
+  {
+    "cohort": "complete",
+    "arm": "v8",
+    "writers": 16,
+    "workload": "wal_batch_concurrent",
+    "eligible": 1,
+    "total": 1,
+    "eligible_median_puts_s": 403410.79611124535,
+    "best": {
+      "sample": "complete-00-v8-16",
+      "puts_s": 403410.79611124535,
+      "p99_ms": 4.474245,
+      "cpu_ms": 10741.570000000002,
+      "sync_count": 1563
+    }
+  },
+  {
+    "cohort": "complete",
+    "arm": "v7",
+    "writers": 16,
+    "workload": "wal_batch_concurrent",
+    "eligible": 1,
+    "total": 1,
+    "eligible_median_puts_s": 483074.1189064774,
+    "best": {
+      "sample": "complete-01-v7-16",
+      "puts_s": 483074.1189064774,
+      "p99_ms": 5.143152,
+      "cpu_ms": 6201.646999999999,
+      "sync_count": 1516
+    }
+  },
+  {
+    "cohort": "control",
+    "arm": "v7",
+    "writers": 16,
+    "workload": "wal_batch_concurrent",
+    "eligible": 2,
+    "total": 2,
+    "eligible_median_puts_s": 511386.38441903406,
+    "best": {
+      "sample": "control-00-v7-16",
+      "puts_s": 541791.3781023481,
+      "p99_ms": 4.418782,
+      "cpu_ms": 5141.254,
+      "sync_count": 1413
+    }
+  },
+  {
+    "cohort": "control",
+    "arm": "v8",
+    "writers": 16,
+    "workload": "wal_batch_concurrent",
+    "eligible": 2,
+    "total": 2,
+    "eligible_median_puts_s": 471623.6626190569,
+    "best": {
+      "sample": "control-02-v8-16",
+      "puts_s": 539131.0309333876,
+      "p99_ms": 4.181337,
+      "cpu_ms": 8434.443,
+      "sync_count": 1126
+    }
+  },
+  {
+    "cohort": "mirrors",
+    "arm": "baseline",
+    "writers": 8,
+    "workload": "wal_batch_concurrent",
+    "eligible": 1,
+    "total": 2,
+    "eligible_median_puts_s": 320101.0581063395,
+    "best": {
+      "sample": "mirrors-05-baseline-8",
+      "puts_s": 320101.0581063395,
+      "p99_ms": 3.591156,
+      "cpu_ms": 8033.655000000001,
+      "sync_count": 1594
+    }
+  },
+  {
+    "cohort": "mirrors",
+    "arm": "mirrors",
+    "writers": 8,
+    "workload": "wal_batch_concurrent",
+    "eligible": 1,
+    "total": 2,
+    "eligible_median_puts_s": 312943.52429513953,
+    "best": {
+      "sample": "mirrors-04-mirrors-8",
+      "puts_s": 312943.52429513953,
+      "p99_ms": 3.351604,
+      "cpu_ms": 8483.871000000001,
+      "sync_count": 1545
+    }
+  },
+  {
+    "cohort": "mirrors",
+    "arm": "mirrors",
+    "writers": 16,
+    "workload": "wal_batch_concurrent",
+    "eligible": 2,
+    "total": 2,
+    "eligible_median_puts_s": 417141.37261721084,
+    "best": {
+      "sample": "mirrors-07-mirrors-16",
+      "puts_s": 420705.44949949806,
+      "p99_ms": 4.644542,
+      "cpu_ms": 10664.08,
+      "sync_count": 1442
+    }
+  },
+  {
+    "cohort": "mirrors",
+    "arm": "baseline",
+    "writers": 16,
+    "workload": "wal_batch_concurrent",
+    "eligible": 2,
+    "total": 2,
+    "eligible_median_puts_s": 432918.26059236634,
+    "best": {
+      "sample": "mirrors-06-baseline-16",
+      "puts_s": 440930.5083977029,
+      "p99_ms": 4.123143,
+      "cpu_ms": 10814.802,
+      "sync_count": 1278
+    }
+  },
+  {
+    "cohort": "normal",
+    "arm": "v8",
+    "writers": 16,
+    "workload": "wal_batch_concurrent",
+    "eligible": 0,
+    "total": 1,
+    "eligible_median_puts_s": null,
+    "best": null
+  },
+  {
+    "cohort": "normal",
+    "arm": "v7",
+    "writers": 16,
+    "workload": "wal_batch_concurrent",
+    "eligible": 0,
+    "total": 1,
+    "eligible_median_puts_s": null,
+    "best": null
+  }
+]

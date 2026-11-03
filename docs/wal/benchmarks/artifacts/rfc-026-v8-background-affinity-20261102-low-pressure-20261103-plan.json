@@ -1,0 +1,46 @@
+{
+  "purpose": "Work within the existing single physical SSD: test whether reducing benchmark write volume gives usable endpoint controls. Lower-pressure diagnostic only, not a replacement for the 750k-put RFC performance gate.",
+  "binary": "/home/liu/proj/toy-kv-engine/target/rfc-026-v8-background-affinity-20261102/write-perf-background-affinity",
+  "binary_sha256": "2ee0a92c06ff4d1f69937fb1bfe0130582b3a679c1b5730fa0c4110bb22578f1",
+  "schedule": [
+    {
+      "round": 0,
+      "position": 0,
+      "mode": "writers",
+      "format": "v8"
+    },
+    {
+      "round": 0,
+      "position": 1,
+      "mode": "whole",
+      "format": "v8"
+    },
+    {
+      "round": 1,
+      "position": 0,
+      "mode": "whole",
+      "format": "v8"
+    },
+    {
+      "round": 1,
+      "position": 1,
+      "mode": "writers",
+      "format": "v8"
+    }
+  ],
+  "puts_per_capture": 150000,
+  "writers": 16,
+  "application_batch_entries": 64,
+  "value_bytes": 1024,
+  "format": "v8",
+  "wal_io_mode": "parallel",
+  "storage": "Fresh local repository paths on ext4 /home; no tmpfs substitution or other SSD.",
+  "masks": "Same writer-only and whole-process endpoints as prior cohorts, including explicit io-wq masks and all role audits.",
+  "idle_before_each_pair_seconds": 15,
+  "between_captures_seconds": 3,
+  "storage_flag": "Existing p99_ms >10 OR mean fdatasync_ms >1; unchanged.",
+  "selection": "Preserve all four captures and pair results. Report storage eligibility separately from RFC qualification. Short runs have fewer latency samples and no sustained-write/parity claim; no earlier 750k scores are replaced.",
+  "runtime_changed": false,
+  "device_settings_changed": false,
+  "tracing_or_admin_queries_during_capture": false
+}

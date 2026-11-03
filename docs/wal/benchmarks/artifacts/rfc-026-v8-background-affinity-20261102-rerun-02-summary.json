@@ -1,0 +1,51 @@
+{
+  "samples": 4,
+  "flagged": 4,
+  "groups": [
+    {
+      "mode": "writers",
+      "total": 2,
+      "eligible": 0,
+      "best_eligible": null,
+      "median_eligible": null
+    },
+    {
+      "mode": "kernel_only",
+      "total": 0,
+      "eligible": 0,
+      "best_eligible": null,
+      "median_eligible": null
+    },
+    {
+      "mode": "io",
+      "total": 0,
+      "eligible": 0,
+      "best_eligible": null,
+      "median_eligible": null
+    },
+    {
+      "mode": "reaper",
+      "total": 0,
+      "eligible": 0,
+      "best_eligible": null,
+      "median_eligible": null
+    },
+    {
+      "mode": "userspace",
+      "total": 0,
+      "eligible": 0,
+      "best_eligible": null,
+      "median_eligible": null
+    },
+    {
+      "mode": "whole",
+      "total": 2,
+      "eligible": 0,
+      "best_eligible": null,
+      "median_eligible": null
+    }
+  ],
+  "runtime_changed": false,
+  "binary_sha256": "2ee0a92c06ff4d1f69937fb1bfe0130582b3a679c1b5730fa0c4110bb22578f1",
+  "scope": "Unchanged executable with forward/reverse writer-only and whole-process endpoint controls gating optional six-mode role expansion. All masks and io-wq registrations verified. No production affinity change."
+}

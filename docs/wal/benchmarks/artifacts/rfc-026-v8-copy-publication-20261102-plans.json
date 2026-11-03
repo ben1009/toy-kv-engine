@@ -1,0 +1,410 @@
+{
+  "owned-publish-plan.json": {
+    "schedule": [
+      [
+        "baseline",
+        8
+      ],
+      [
+        "owned-publish",
+        8
+      ],
+      [
+        "owned-publish",
+        16
+      ],
+      [
+        "baseline",
+        16
+      ],
+      [
+        "owned-publish",
+        8
+      ],
+      [
+        "baseline",
+        8
+      ],
+      [
+        "baseline",
+        16
+      ],
+      [
+        "owned-publish",
+        16
+      ]
+    ],
+    "binary_hashes": {
+      "baseline": "5f9bc6248986cb14b50ff5ced29c7ff8c9ec4c446447a813b49a89fb92938c7e",
+      "owned-publish": "48de8932c52d35d003b2537ed66637e4392ae4be07a10401c7dcbe9cf011cb4b"
+    },
+    "selection": "highest throughput eligible; same-run p99; flag p99 > 10 ms or mean sync > 1 ms; preserve all records"
+  },
+  "borrowed-plan.json": {
+    "schedule": [
+      [
+        "baseline",
+        8
+      ],
+      [
+        "borrowed",
+        8
+      ],
+      [
+        "borrowed",
+        16
+      ],
+      [
+        "baseline",
+        16
+      ],
+      [
+        "borrowed",
+        8
+      ],
+      [
+        "baseline",
+        8
+      ],
+      [
+        "baseline",
+        16
+      ],
+      [
+        "borrowed",
+        16
+      ]
+    ],
+    "binary_hashes": {
+      "baseline": "f3d7dd9b52f727936f02c8031f30f6d960b1d4df0364444e728078a80139d7f5",
+      "borrowed": "5613001971211257caf87137ddcef1f3177c35fc9cb1b36786ee3ac16e715f1c"
+    },
+    "selection": "highest throughput eligible; same-run p99; flag p99 > 10 ms or mean sync > 1 ms; preserve all records"
+  },
+  "both-copies-plan.json": {
+    "schedule": [
+      [
+        "baseline",
+        8
+      ],
+      [
+        "both-copies",
+        8
+      ],
+      [
+        "both-copies",
+        16
+      ],
+      [
+        "baseline",
+        16
+      ],
+      [
+        "both-copies",
+        8
+      ],
+      [
+        "baseline",
+        8
+      ],
+      [
+        "baseline",
+        16
+      ],
+      [
+        "both-copies",
+        16
+      ]
+    ],
+    "binary_hashes": {
+      "baseline": "5f9bc6248986cb14b50ff5ced29c7ff8c9ec4c446447a813b49a89fb92938c7e",
+      "both-copies": "244f8501bc2d400506abc806b07924176b9a8d7c61e93aafc9d156389d60d447"
+    },
+    "selection": "highest throughput eligible; same-run p99; flag p99 > 10 ms or mean sync > 1 ms; preserve all records"
+  },
+  "screen-plan.json": {
+    "schedule": [
+      [
+        "baseline",
+        8
+      ],
+      [
+        "owner",
+        8
+      ],
+      [
+        "owner",
+        16
+      ],
+      [
+        "baseline",
+        16
+      ],
+      [
+        "owner",
+        8
+      ],
+      [
+        "baseline",
+        8
+      ],
+      [
+        "baseline",
+        16
+      ],
+      [
+        "owner",
+        16
+      ]
+    ],
+    "binary_hashes": {
+      "baseline": "f3d7dd9b52f727936f02c8031f30f6d960b1d4df0364444e728078a80139d7f5",
+      "owner": "5eebd84af1be497dd5eb59dba898a87939b0b5604251f8a4525d1329354c3055"
+    },
+    "selection": "highest throughput eligible; same-run p99; flag p99 > 10 ms or mean sync > 1 ms; preserve all records"
+  },
+  "borrowed-cooled-plan.json": {
+    "schedule": [
+      [
+        "baseline",
+        1
+      ],
+      [
+        "borrowed",
+        1
+      ],
+      [
+        "borrowed",
+        8
+      ],
+      [
+        "baseline",
+        8
+      ],
+      [
+        "baseline",
+        16
+      ],
+      [
+        "borrowed",
+        16
+      ],
+      [
+        "borrowed",
+        1
+      ],
+      [
+        "baseline",
+        1
+      ],
+      [
+        "baseline",
+        8
+      ],
+      [
+        "borrowed",
+        8
+      ],
+      [
+        "borrowed",
+        16
+      ],
+      [
+        "baseline",
+        16
+      ]
+    ],
+    "binary_hashes": {
+      "baseline": "f3d7dd9b52f727936f02c8031f30f6d960b1d4df0364444e728078a80139d7f5",
+      "borrowed": "5613001971211257caf87137ddcef1f3177c35fc9cb1b36786ee3ac16e715f1c"
+    },
+    "selection": "highest throughput eligible; same-run p99; flag p99 > 10 ms or mean sync > 1 ms; preserve all records"
+  },
+  "publication-plan.json": {
+    "schedule": [
+      [
+        "baseline",
+        8
+      ],
+      [
+        "publication",
+        8
+      ],
+      [
+        "combined",
+        8
+      ],
+      [
+        "combined",
+        16
+      ],
+      [
+        "publication",
+        16
+      ],
+      [
+        "baseline",
+        16
+      ],
+      [
+        "combined",
+        8
+      ],
+      [
+        "publication",
+        8
+      ],
+      [
+        "baseline",
+        8
+      ],
+      [
+        "baseline",
+        16
+      ],
+      [
+        "publication",
+        16
+      ],
+      [
+        "combined",
+        16
+      ]
+    ],
+    "binary_hashes": {
+      "baseline": "5f9bc6248986cb14b50ff5ced29c7ff8c9ec4c446447a813b49a89fb92938c7e",
+      "publication": "5333aa6f201987fa57692cbaf26f79de471f00374732b695c6d7152d02768463",
+      "combined": "16c11b3bf01922b160e186af517f3e2f527ce0420b8985b75de94bd1d32dfaed"
+    },
+    "selection": "highest throughput eligible; same-run p99; flag p99 > 10 ms or mean sync > 1 ms; preserve all records"
+  },
+  "borrowed-guards-plan.json": {
+    "schedule": [
+      [
+        "batch",
+        1,
+        "baseline"
+      ],
+      [
+        "batch",
+        1,
+        "borrowed"
+      ],
+      [
+        "point",
+        1,
+        "borrowed"
+      ],
+      [
+        "point",
+        1,
+        "baseline"
+      ],
+      [
+        "batch",
+        8,
+        "borrowed"
+      ],
+      [
+        "batch",
+        8,
+        "baseline"
+      ],
+      [
+        "point",
+        8,
+        "baseline"
+      ],
+      [
+        "point",
+        8,
+        "borrowed"
+      ],
+      [
+        "batch",
+        16,
+        "baseline"
+      ],
+      [
+        "batch",
+        16,
+        "borrowed"
+      ],
+      [
+        "point",
+        16,
+        "borrowed"
+      ],
+      [
+        "point",
+        16,
+        "baseline"
+      ],
+      [
+        "batch",
+        1,
+        "borrowed"
+      ],
+      [
+        "batch",
+        1,
+        "baseline"
+      ],
+      [
+        "point",
+        1,
+        "baseline"
+      ],
+      [
+        "point",
+        1,
+        "borrowed"
+      ],
+      [
+        "batch",
+        8,
+        "baseline"
+      ],
+      [
+        "batch",
+        8,
+        "borrowed"
+      ],
+      [
+        "point",
+        8,
+        "borrowed"
+      ],
+      [
+        "point",
+        8,
+        "baseline"
+      ],
+      [
+        "batch",
+        16,
+        "borrowed"
+      ],
+      [
+        "batch",
+        16,
+        "baseline"
+      ],
+      [
+        "point",
+        16,
+        "baseline"
+      ],
+      [
+        "point",
+        16,
+        "borrowed"
+      ]
+    ],
+    "binary_hashes": {
+      "baseline": "5f9bc6248986cb14b50ff5ced29c7ff8c9ec4c446447a813b49a89fb92938c7e",
+      "borrowed": "3cb8c062cff26748f4ba681a67938c952c43c3a29cb9740a9494128bfa0ccc46"
+    },
+    "selection": "highest throughput eligible; same-run p99; flag p99 > 10 ms or mean sync > 1 ms; preserve all records"
+  }
+}

@@ -1,0 +1,130 @@
+{
+  "complete": true,
+  "quiet_elapsed_s": 1800.0204682387412,
+  "settings_changed": false,
+  "production_code_changed": false,
+  "normal_performance_qualification": false,
+  "operations_per_probe": 1024,
+  "writes_per_probe_mib": 4,
+  "syncs_per_probe": 256,
+  "quiet_samples": 360,
+  "whole_device_quiet_interval": {
+    "read_mib": 0.0,
+    "write_mib": 77.02734375,
+    "discard_mib": 0.0,
+    "flushes": 361,
+    "io_ms": 513
+  },
+  "interfering_jobs_observed": [],
+  "sample_intervals_without_completed_io": 46,
+  "longest_observed_stretch_without_completed_host_io_s": 15.0020408090204,
+  "idle_limitation": "Benchmarks/builds/maintenance absent at observed checks. OS still writes/flushes. Five-second host counters do not measure internal NAND/GC activity or establish thirty minutes of uninterrupted device idleness.",
+  "probes": [
+    {
+      "name": "before-quiet",
+      "ops_s": 3407.290877763616,
+      "elapsed_s": 0.300532017,
+      "write": {
+        "count": 1024,
+        "mean_us": 230.859583984375,
+        "p50_us": 13.684,
+        "p99_us": 644.205,
+        "max_us": 9155.569,
+        "over_1ms": 8,
+        "over_5ms": 8
+      },
+      "sync": {
+        "count": 256,
+        "mean_us": 248.1050546875,
+        "p50_us": 219.704,
+        "p99_us": 536.03,
+        "max_us": 537.296,
+        "over_1ms": 0,
+        "over_5ms": 0
+      },
+      "first_write_after_fdatasync": {
+        "count": 256,
+        "mean_us": 882.66662109375,
+        "p50_us": 640.057,
+        "p99_us": 8301.726,
+        "max_us": 9155.569,
+        "over_1ms": 8,
+        "over_5ms": 8
+      },
+      "other_writes": {
+        "count": 768,
+        "mean_us": 13.590571614583334,
+        "p50_us": 13.539,
+        "p99_us": 22.593,
+        "max_us": 54.795,
+        "over_1ms": 0,
+        "over_5ms": 0
+      },
+      "slow_write_indices": [
+        100,
+        228,
+        356,
+        484,
+        612,
+        740,
+        868,
+        996
+      ],
+      "all_over_5ms_writes_immediately_follow_probe_fdatasync": true
+    },
+    {
+      "name": "after-quiet",
+      "ops_s": 3316.949621310761,
+      "elapsed_s": 0.308717381,
+      "write": {
+        "count": 1024,
+        "mean_us": 237.7742900390625,
+        "p50_us": 16.497,
+        "p99_us": 643.326,
+        "max_us": 9485.966,
+        "over_1ms": 8,
+        "over_5ms": 8
+      },
+      "sync": {
+        "count": 256,
+        "mean_us": 251.90947265625,
+        "p50_us": 221.739,
+        "p99_us": 537.09,
+        "max_us": 540.323,
+        "over_1ms": 0,
+        "over_5ms": 0
+      },
+      "first_write_after_fdatasync": {
+        "count": 256,
+        "mean_us": 903.52137109375,
+        "p50_us": 640.137,
+        "p99_us": 9177.495,
+        "max_us": 9485.966,
+        "over_1ms": 8,
+        "over_5ms": 8
+      },
+      "other_writes": {
+        "count": 768,
+        "mean_us": 15.858596354166666,
+        "p50_us": 16.25,
+        "p99_us": 24.725,
+        "max_us": 46.683,
+        "over_1ms": 0,
+        "over_5ms": 0
+      },
+      "slow_write_indices": [
+        68,
+        196,
+        320,
+        448,
+        576,
+        704,
+        832,
+        960
+      ],
+      "all_over_5ms_writes_immediately_follow_probe_fdatasync": true
+    }
+  ],
+  "ops_s_change_pct": -2.6514101582119975,
+  "interpretation": "No observed return to the earlier fast state after thirty minutes without benchmark writes. Post-fdatasync write delay and eight >5ms writes persist. This does not identify garbage collection or prove that longer/fully idle conditions cannot help."
+}

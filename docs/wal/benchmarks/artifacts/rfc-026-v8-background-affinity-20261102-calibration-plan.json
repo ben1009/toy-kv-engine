@@ -1,0 +1,22 @@
+{
+  "purpose": "Whole-process P-core calibration of the startup affinity-registration hook, using the earlier preflight executable with the same foreground harness. Original main cohort remains separate.",
+  "schedule": [
+    "unregistered",
+    "registered",
+    "registered",
+    "unregistered"
+  ],
+  "binary_sha256": {
+    "unregistered": "d323b9633846138f5dde2f5e8f765fd6c1ecef32cc5292038ba1b858c0e09657",
+    "registered": "2ee0a92c06ff4d1f69937fb1bfe0130582b3a679c1b5730fa0c4110bb22578f1"
+  },
+  "puts": 750000,
+  "writers": 16,
+  "batch": 64,
+  "format": "v8",
+  "storage_flag": "p99_ms >10 OR mean fdatasync_ms >1, unchanged",
+  "cooldown_before_each_pair_seconds": 60,
+  "between_captures_seconds": 3,
+  "selection": "All records retained; highest eligible within each calibration arm, with same-run metrics. No comparison of raw throughput from storage-flagged captures.",
+  "change": "Both use taskset 0-15 and the same one-time writer/background mask audit. Registered executable invokes register_iowq_aff(0-15) before each ring starts; unregistered does not. No hook remains in source."
+}

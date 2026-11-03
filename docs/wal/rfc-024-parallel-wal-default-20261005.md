@@ -49,10 +49,13 @@ not invalidate healthy close; a write requiring the failed suffix still
 poisons that ticket boundary. Kernel-owned buffers remain retained through
 terminal completions or proven-safe ring teardown.
 
-PITR v5/v6 WALs and older MVCC formats retain the leader path. Legacy unframed
-WALs retain buffered I/O. Format detection selects the compatible path on
-recovery; the default change does not rewrite existing WAL formats. There is
-no automatic fallback when io_uring or O_DIRECT initialization fails.
+New PITR WALs now default to v8 Parallel under the later [V8 adoption
+decision](rfc-026-v8-default-20261103.md). V7 remains a supported compatibility
+format with the embedded-frontier protocol; PITR v5/v6 WALs and older MVCC
+formats retain the leader path. Legacy unframed WALs retain buffered I/O.
+Format detection selects the compatible path on recovery; default changes do
+not rewrite existing WAL formats. There is no automatic fallback when io_uring
+or O_DIRECT initialization fails.
 
 Leader remains available through `KvEngine::open_with_wal_io_mode(...,
 WalIoMode::Leader)` for controls and explicit rollback. This existing selector

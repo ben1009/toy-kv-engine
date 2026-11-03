@@ -1,0 +1,18 @@
+{
+  "normal_captures_completed": 18,
+  "smoke_captures_completed": 6,
+  "all_returncodes_zero": true,
+  "all_16_writer_masks_validated_every_capture": true,
+  "WAL_worker_completion_reaper_and_maintenance_masks_validated_before_and_after": true,
+  "all_750000_operation_counts_and_V8_hash_byte_counts_validated": true,
+  "post_encode_hash_reread_bytes": 0,
+  "runtime_diff_empty": true,
+  "benchmark_source_restored": true,
+  "benchmark_hook_retained": false,
+  "no_new_worker_pool": true,
+  "no_production_affinity_change": true,
+  "binary_sha256": "b422f940a95fef7fa81da96d85e3787e8909e8226fe6d5e62a720fd0d8e1e81d",
+  "source_hashes": {
+    "kv-engine/src/bin/write-perf.rs": "83c7352eab8b9f0eefc49ba6c128142908941a5c95214a3f4eb288f9538cd5b9"
+  }
+}

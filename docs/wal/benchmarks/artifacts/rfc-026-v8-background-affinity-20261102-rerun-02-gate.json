@@ -1,0 +1,8 @@
+{
+  "jointly_eligible_control_pairs": [
+    false,
+    false
+  ],
+  "role_expansion_enabled": false,
+  "gate_evaluated_after_all_four_controls": true
+}

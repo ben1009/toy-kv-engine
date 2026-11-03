@@ -1,0 +1,12 @@
+{
+  "base_revision": "fdde06706ffc96c458c50fb87a431c13ec76d4d7",
+  "retention": "Combined candidate kept locally at explicit maintainer request; do not auto-revert on performance results.",
+  "restored_source_sha256": {
+    "kv-engine/src/wal.rs": "89988769b9ef7eb20d2557892f8f2bdfa046e35e24da7ec8364f18c5d99d3861",
+    "kv-engine/src/wal/v8/parallel.rs": "4eb7f192be918fc16e6ea162ae8fcefd2a5cf29e2d426a302390f8ab9f99f5a1",
+    "kv-engine/src/wal/v8/leader.rs": "85bd911696e0e8c2e78a1c01532cfbd6a4d8662f5c1588c926552e8609748198"
+  },
+  "source_matches_previously_tested_prototype": true,
+  "previous_check": "./dev check: 2151 passed, 32 skipped; no runtime changes since that check",
+  "merge_authorized": false
+}

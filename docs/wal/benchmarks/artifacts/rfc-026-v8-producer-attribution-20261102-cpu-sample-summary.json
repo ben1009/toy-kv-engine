@@ -1,0 +1,75 @@
+{
+  "method": "Leaf-symbol sample counts by recorded CPU; P=kernel cpu_core 0-15, E=cpu_atom 16-31. Sample shares, not jobs/bytes or elapsed time; original records lack CPU fields. Ordered-packer SHA subset matches thread IDs with observed v7_logical_hash calls.",
+  "samples": {
+    "cpu-00-diagnostic-v8-16-stacks": {
+      "all": {
+        "P_samples": 2114,
+        "E_samples": 1943,
+        "E_pct": 47.89253142716293,
+        "threads": 19
+      },
+      "other": {
+        "P_samples": 1787,
+        "E_samples": 1631,
+        "E_pct": 47.71796372147455,
+        "threads": 19
+      },
+      "crc32": {
+        "P_samples": 99,
+        "E_samples": 84,
+        "E_pct": 45.90163934426229,
+        "threads": 16
+      },
+      "blake3_hash_many": {
+        "P_samples": 164,
+        "E_samples": 186,
+        "E_pct": 53.142857142857146,
+        "threads": 16
+      },
+      "blake3_other": {
+        "P_samples": 57,
+        "E_samples": 41,
+        "E_pct": 41.83673469387755,
+        "threads": 16
+      },
+      "sha256": {
+        "P_samples": 7,
+        "E_samples": 1,
+        "E_pct": 12.5,
+        "threads": 6
+      }
+    },
+    "cpu-01-diagnostic-v7-16-stacks": {
+      "all": {
+        "P_samples": 1983,
+        "E_samples": 1768,
+        "E_pct": 47.13409757398027,
+        "threads": 21
+      },
+      "sha256": {
+        "P_samples": 464,
+        "E_samples": 101,
+        "E_pct": 17.876106194690266,
+        "threads": 2
+      },
+      "sha256_on_ordered_packer": {
+        "P_samples": 463,
+        "E_samples": 99,
+        "E_pct": 17.615658362989326,
+        "threads": 1
+      },
+      "other": {
+        "P_samples": 1434,
+        "E_samples": 1584,
+        "E_pct": 52.485089463220675,
+        "threads": 21
+      },
+      "crc32": {
+        "P_samples": 85,
+        "E_samples": 83,
+        "E_pct": 49.404761904761905,
+        "threads": 17
+      }
+    }
+  }
+}

@@ -27,6 +27,7 @@ fn make_options(vlog_enabled: bool, min_value_size: usize) -> LsmStorageOptions 
         compaction_options: CompactionOptions::NoCompaction,
         enable_wal: false,
         pitr_repository: None,
+        pitr_writer_format: Default::default(),
         serializable: false,
         value_separation: if vlog_enabled {
             Some(ValueSeparationOptions {
@@ -59,6 +60,7 @@ fn make_options_with_compaction(vlog_enabled: bool, min_value_size: usize) -> Ls
         }),
         enable_wal: false,
         pitr_repository: None,
+        pitr_writer_format: Default::default(),
         serializable: false,
         value_separation: if vlog_enabled {
             Some(ValueSeparationOptions {
@@ -121,6 +123,7 @@ fn make_options_with_cache(min_value_size: usize, cache_bytes: u64) -> LsmStorag
         }),
         enable_wal: false,
         pitr_repository: None,
+        pitr_writer_format: Default::default(),
         serializable: false,
         value_separation: Some(ValueSeparationOptions {
             enabled: true,
@@ -385,6 +388,7 @@ fn bench_prefix_scan(c: &mut Criterion) {
             compaction_options: CompactionOptions::NoCompaction,
             enable_wal: false,
             pitr_repository: None,
+            pitr_writer_format: Default::default(),
             serializable: false,
             value_separation: None,
             manifest_snapshot_threshold_bytes: 0,
@@ -511,6 +515,7 @@ fn bench_cold_point_get(c: &mut Criterion) {
             }),
             enable_wal: false,
             pitr_repository: None,
+            pitr_writer_format: Default::default(),
             serializable: false,
             value_separation: if vlog_enabled {
                 Some(ValueSeparationOptions {
@@ -582,6 +587,7 @@ fn bench_flush_throughput(c: &mut Criterion) {
                         compaction_options: CompactionOptions::NoCompaction,
                         enable_wal: false,
                         pitr_repository: None,
+                        pitr_writer_format: Default::default(),
                         serializable: false,
                         value_separation: if vlog_enabled {
                             Some(ValueSeparationOptions {
@@ -650,6 +656,7 @@ fn bench_cold_scan(c: &mut Criterion) {
             }),
             enable_wal: false,
             pitr_repository: None,
+            pitr_writer_format: Default::default(),
             serializable: false,
             value_separation: if vlog_enabled {
                 Some(ValueSeparationOptions {
@@ -741,6 +748,7 @@ fn bench_backfill_comparison(c: &mut Criterion) {
             compaction_options: CompactionOptions::NoCompaction,
             enable_wal: false,
             pitr_repository: None,
+            pitr_writer_format: Default::default(),
             serializable: false,
             value_separation: None,
             manifest_snapshot_threshold_bytes: 0,
@@ -821,6 +829,7 @@ fn bench_compaction_backfill(c: &mut Criterion) {
             }),
             enable_wal: false,
             pitr_repository: None,
+            pitr_writer_format: Default::default(),
             serializable: false,
             value_separation: None,
             manifest_snapshot_threshold_bytes: 0,

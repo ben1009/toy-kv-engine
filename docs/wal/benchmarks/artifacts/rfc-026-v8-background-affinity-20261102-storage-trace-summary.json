@@ -1,0 +1,513 @@
+{
+  "probe_pid": 2929107,
+  "scope": "NVMe setup-to-driver-completion latency. Writes/reads filtered by submitting probe PID and disk; flushes cover the whole disk because kernel worker threads submit them. Following-flush means the last observed device completion at write setup was a flush, not a proof of internal controller ordering. Includes driver/transport/interrupt latency, not direct firmware/NAND timing.",
+  "stats": {
+    "write": {
+      "count": 24592,
+      "mean_us": 164.8485134596617,
+      "p50_us": 7.714,
+      "p99_us": 633.153,
+      "max_us": 20394.007,
+      "over_1ms": 155,
+      "over_5ms": 155
+    },
+    "read": {
+      "count": 8192,
+      "mean_us": 17.70244738769531,
+      "p50_us": 17.071,
+      "p99_us": 58.662,
+      "max_us": 337.325,
+      "over_1ms": 0,
+      "over_5ms": 0
+    },
+    "device_flush": {
+      "count": 4100,
+      "mean_us": 242.33053829268295,
+      "p50_us": 212.596,
+      "p99_us": 532.349,
+      "max_us": 933.95,
+      "over_1ms": 0,
+      "over_5ms": 0
+    },
+    "write_following_device_flush": {
+      "count": 4094,
+      "mean_us": 905.0598905715682,
+      "p50_us": 629.851,
+      "p99_us": 8707.56,
+      "max_us": 20394.007,
+      "over_1ms": 135,
+      "over_5ms": 135
+    },
+    "other_write": {
+      "count": 20498,
+      "mean_us": 17.00846184993658,
+      "p50_us": 7.549,
+      "p99_us": 14.486,
+      "max_us": 9819.154,
+      "over_1ms": 20,
+      "over_5ms": 20
+    }
+  },
+  "matched_probe_commands": 32784,
+  "matched_device_commands": 36946,
+  "other_or_unmatched": {
+    "other_pid_pairs": 4162
+  },
+  "pending_at_end": 0,
+  "nonzero_status_commands": 0,
+  "raw_field_format_fallback_lines": 73892,
+  "decode_note": "perf reports FAILED TO PARSE for the opcode-specific pretty formatter, but emits raw disk/ctrl_id/qid/cid/opcode/status fields used for pairing. No opcode-specific cdw payload decoding is used.",
+  "trace_sha256": "14e35c49811d22fc66f661a59a297862843efee9f0330aad7cd1644edd637607",
+  "slowest_probe_commands": [
+    {
+      "setup_ns": 2550206569160886,
+      "pid": 2929107,
+      "cpu": 11,
+      "opcode": 1,
+      "key": [
+        0,
+        5,
+        180
+      ],
+      "follows_device_flush": true,
+      "completion_ns": 2550206589554893,
+      "duration_ns": 20394007,
+      "status": 0
+    },
+    {
+      "setup_ns": 2550210160931641,
+      "pid": 2929107,
+      "cpu": 11,
+      "opcode": 1,
+      "key": [
+        0,
+        5,
+        37038
+      ],
+      "follows_device_flush": true,
+      "completion_ns": 2550210176267237,
+      "duration_ns": 15335596,
+      "status": 0
+    },
+    {
+      "setup_ns": 2550206546547616,
+      "pid": 2929107,
+      "cpu": 11,
+      "opcode": 1,
+      "key": [
+        0,
+        5,
+        41132
+      ],
+      "follows_device_flush": true,
+      "completion_ns": 2550206561811039,
+      "duration_ns": 15263423,
+      "status": 0
+    },
+    {
+      "setup_ns": 2550207496403122,
+      "pid": 2929107,
+      "cpu": 2,
+      "opcode": 1,
+      "key": [
+        0,
+        1,
+        49186
+      ],
+      "follows_device_flush": true,
+      "completion_ns": 2550207511611175,
+      "duration_ns": 15208053,
+      "status": 0
+    },
+    {
+      "setup_ns": 2550205609373673,
+      "pid": 2929107,
+      "cpu": 0,
+      "opcode": 1,
+      "key": [
+        0,
+        1,
+        36
+      ],
+      "follows_device_flush": true,
+      "completion_ns": 2550205624383968,
+      "duration_ns": 15010295,
+      "status": 0
+    },
+    {
+      "setup_ns": 2550209253201730,
+      "pid": 2929107,
+      "cpu": 11,
+      "opcode": 1,
+      "key": [
+        0,
+        5,
+        37040
+      ],
+      "follows_device_flush": true,
+      "completion_ns": 2550209268181494,
+      "duration_ns": 14979764,
+      "status": 0
+    },
+    {
+      "setup_ns": 2550208314069242,
+      "pid": 2929107,
+      "cpu": 11,
+      "opcode": 1,
+      "key": [
+        0,
+        5,
+        49329
+      ],
+      "follows_device_flush": true,
+      "completion_ns": 2550208329033369,
+      "duration_ns": 14964127,
+      "status": 0
+    },
+    {
+      "setup_ns": 2550209213947945,
+      "pid": 2929107,
+      "cpu": 11,
+      "opcode": 1,
+      "key": [
+        0,
+        5,
+        20656
+      ],
+      "follows_device_flush": true,
+      "completion_ns": 2550209223959989,
+      "duration_ns": 10012044,
+      "status": 0
+    },
+    {
+      "setup_ns": 2550209275068362,
+      "pid": 2929107,
+      "cpu": 11,
+      "opcode": 1,
+      "key": [
+        0,
+        5,
+        37048
+      ],
+      "follows_device_flush": true,
+      "completion_ns": 2550209284934971,
+      "duration_ns": 9866609,
+      "status": 0
+    },
+    {
+      "setup_ns": 2550206507329696,
+      "pid": 2929107,
+      "cpu": 11,
+      "opcode": 1,
+      "key": [
+        0,
+        5,
+        24748
+      ],
+      "follows_device_flush": true,
+      "completion_ns": 2550206517196152,
+      "duration_ns": 9866456,
+      "status": 0
+    },
+    {
+      "setup_ns": 2550207518514656,
+      "pid": 2929107,
+      "cpu": 2,
+      "opcode": 1,
+      "key": [
+        0,
+        1,
+        24618
+      ],
+      "follows_device_flush": true,
+      "completion_ns": 2550207528337270,
+      "duration_ns": 9822614,
+      "status": 0
+    },
+    {
+      "setup_ns": 2550207829779255,
+      "pid": 2929107,
+      "cpu": 2,
+      "opcode": 1,
+      "key": [
+        0,
+        1,
+        32809
+      ],
+      "follows_device_flush": false,
+      "completion_ns": 2550207839598409,
+      "duration_ns": 9819154,
+      "status": 0
+    },
+    {
+      "setup_ns": 2550210122249424,
+      "pid": 2929107,
+      "cpu": 11,
+      "opcode": 1,
+      "key": [
+        0,
+        5,
+        20654
+      ],
+      "follows_device_flush": true,
+      "completion_ns": 2550210132002692,
+      "duration_ns": 9753268,
+      "status": 0
+    },
+    {
+      "setup_ns": 2550208275176866,
+      "pid": 2929107,
+      "cpu": 11,
+      "opcode": 1,
+      "key": [
+        0,
+        5,
+        32945
+      ],
+      "follows_device_flush": true,
+      "completion_ns": 2550208284902222,
+      "duration_ns": 9725356,
+      "status": 0
+    },
+    {
+      "setup_ns": 2550208634726456,
+      "pid": 2929107,
+      "cpu": 11,
+      "opcode": 1,
+      "key": [
+        0,
+        5,
+        37040
+      ],
+      "follows_device_flush": true,
+      "completion_ns": 2550208644371853,
+      "duration_ns": 9645397,
+      "status": 0
+    },
+    {
+      "setup_ns": 2550205024731223,
+      "pid": 2929107,
+      "cpu": 0,
+      "opcode": 1,
+      "key": [
+        0,
+        1,
+        12330
+      ],
+      "follows_device_flush": false,
+      "completion_ns": 2550205034364074,
+      "duration_ns": 9632851,
+      "status": 0
+    },
+    {
+      "setup_ns": 2550210483261416,
+      "pid": 2929107,
+      "cpu": 2,
+      "opcode": 1,
+      "key": [
+        0,
+        1,
+        16419
+      ],
+      "follows_device_flush": true,
+      "completion_ns": 2550210492852813,
+      "duration_ns": 9591397,
+      "status": 0
+    },
+    {
+      "setup_ns": 2550209853612310,
+      "pid": 2929107,
+      "cpu": 11,
+      "opcode": 1,
+      "key": [
+        0,
+        5,
+        24751
+      ],
+      "follows_device_flush": true,
+      "completion_ns": 2550209863093414,
+      "duration_ns": 9481104,
+      "status": 0
+    },
+    {
+      "setup_ns": 2550207457684521,
+      "pid": 2929107,
+      "cpu": 2,
+      "opcode": 1,
+      "key": [
+        0,
+        1,
+        32802
+      ],
+      "follows_device_flush": true,
+      "completion_ns": 2550207467108738,
+      "duration_ns": 9424217,
+      "status": 0
+    },
+    {
+      "setup_ns": 2550207757755232,
+      "pid": 2929107,
+      "cpu": 2,
+      "opcode": 1,
+      "key": [
+        0,
+        1,
+        8233
+      ],
+      "follows_device_flush": false,
+      "completion_ns": 2550207767174765,
+      "duration_ns": 9419533,
+      "status": 0
+    },
+    {
+      "setup_ns": 2550206881439242,
+      "pid": 2929107,
+      "cpu": 3,
+      "opcode": 1,
+      "key": [
+        0,
+        2,
+        12516
+      ],
+      "follows_device_flush": true,
+      "completion_ns": 2550206890851898,
+      "duration_ns": 9412656,
+      "status": 0
+    },
+    {
+      "setup_ns": 2550207776023788,
+      "pid": 2929107,
+      "cpu": 2,
+      "opcode": 1,
+      "key": [
+        0,
+        1,
+        41001
+      ],
+      "follows_device_flush": false,
+      "completion_ns": 2550207785396712,
+      "duration_ns": 9372924,
+      "status": 0
+    },
+    {
+      "setup_ns": 2550205570476638,
+      "pid": 2929107,
+      "cpu": 0,
+      "opcode": 1,
+      "key": [
+        0,
+        1,
+        49188
+      ],
+      "follows_device_flush": true,
+      "completion_ns": 2550205579827890,
+      "duration_ns": 9351252,
+      "status": 0
+    },
+    {
+      "setup_ns": 2550206238334807,
+      "pid": 2929107,
+      "cpu": 4,
+      "opcode": 1,
+      "key": [
+        0,
+        2,
+        12397
+      ],
+      "follows_device_flush": true,
+      "completion_ns": 2550206247627966,
+      "duration_ns": 9293159,
+      "status": 0
+    },
+    {
+      "setup_ns": 2550205631384246,
+      "pid": 2929107,
+      "cpu": 0,
+      "opcode": 1,
+      "key": [
+        0,
+        1,
+        44
+      ],
+      "follows_device_flush": true,
+      "completion_ns": 2550205640591441,
+      "duration_ns": 9207195,
+      "status": 0
+    },
+    {
+      "setup_ns": 2550207686279204,
+      "pid": 2929107,
+      "cpu": 2,
+      "opcode": 1,
+      "key": [
+        0,
+        1,
+        8233
+      ],
+      "follows_device_flush": false,
+      "completion_ns": 2550207695468799,
+      "duration_ns": 9189595,
+      "status": 0
+    },
+    {
+      "setup_ns": 2550207794214402,
+      "pid": 2929107,
+      "cpu": 2,
+      "opcode": 1,
+      "key": [
+        0,
+        1,
+        8233
+      ],
+      "follows_device_flush": false,
+      "completion_ns": 2550207803342956,
+      "duration_ns": 9128554,
+      "status": 0
+    },
+    {
+      "setup_ns": 2550207722167428,
+      "pid": 2929107,
+      "cpu": 2,
+      "opcode": 1,
+      "key": [
+        0,
+        1,
+        8233
+      ],
+      "follows_device_flush": false,
+      "completion_ns": 2550207731295762,
+      "duration_ns": 9128334,
+      "status": 0
+    },
+    {
+      "setup_ns": 2550207704313142,
+      "pid": 2929107,
+      "cpu": 2,
+      "opcode": 1,
+      "key": [
+        0,
+        1,
+        41001
+      ],
+      "follows_device_flush": false,
+      "completion_ns": 2550207713432722,
+      "duration_ns": 9119580,
+      "status": 0
+    },
+    {
+      "setup_ns": 2550209569479900,
+      "pid": 2929107,
+      "cpu": 11,
+      "opcode": 1,
+      "key": [
+        0,
+        5,
+        20648
+      ],
+      "follows_device_flush": true,
+      "completion_ns": 2550209578586805,
+      "duration_ns": 9106905,
+      "status": 0
+    }
+  ]
+}

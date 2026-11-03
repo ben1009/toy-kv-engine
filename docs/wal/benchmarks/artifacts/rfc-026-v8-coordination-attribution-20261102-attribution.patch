@@ -1,0 +1,828 @@
+--- a/kv-engine/src/bin/write-perf.rs
++++ b/kv-engine/src/bin/write-perf.rs
+@@ -3626,6 +3626,44 @@
+     Ok(vec![measurement])
+ }
+ 
++fn perf_timed_control(command: &str) -> Result<()> {
++    use std::io::{BufRead, Write};
++    let Some(directory) = std::env::var_os("KV_PERF_CONTROL_DIR") else { return Ok(()) };
++    let directory = std::path::Path::new(&directory);
++    let mut control = std::fs::OpenOptions::new().write(true).open(directory.join("control"))?;
++    let ack = std::fs::OpenOptions::new().read(true).write(true).open(directory.join("ack"))?;
++    writeln!(control, "{command}")?;
++    let mut response = String::new();
++    std::io::BufReader::new(ack).read_line(&mut response)?;
++    Ok(())
++}
++
++#[cfg(feature = "bench")]
++struct AttributionAllocator;
++#[cfg(feature = "bench")]
++unsafe impl std::alloc::GlobalAlloc for AttributionAllocator {
++    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
++        let ptr = unsafe { std::alloc::System.alloc(layout) };
++        kv_engine::profiling::wal_attribution::allocation(0, layout.size()); ptr
++    }
++    unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
++        let ptr = unsafe { std::alloc::System.alloc_zeroed(layout) };
++        kv_engine::profiling::wal_attribution::allocation(0, layout.size()); ptr
++    }
++    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
++        kv_engine::profiling::wal_attribution::allocation(2, layout.size());
++        unsafe { std::alloc::System.dealloc(ptr, layout) };
++    }
++    unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, size: usize) -> *mut u8 {
++        let ptr = unsafe { std::alloc::System.realloc(ptr, layout, size) };
++        kv_engine::profiling::wal_attribution::allocation(2, layout.size());
++        kv_engine::profiling::wal_attribution::allocation(0, size); ptr
++    }
++}
++#[cfg(feature = "bench")]
++#[global_allocator]
++static ATTRIBUTION_ALLOCATOR: AttributionAllocator = AttributionAllocator;
++
+ fn run_wal_batch_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
+     let workload = "wal_batch_concurrent";
+     let path = prepare_path(cfg, workload)?;
+@@ -3651,6 +3689,8 @@
+     let writer_threads = cfg.threads;
+     let retry_pitr_barrier = cfg.pitr;
+     let baseline = collect_counters(&engine)?;
++    kv_engine::profiling::wal_attribution::begin();
++    perf_timed_control("enable")?;
+     let cpu_start = process_cpu_times();
+     let per_thread = num_keys / writer_threads;
+     let remainder = num_keys % writer_threads;
+@@ -3680,13 +3720,14 @@
+                 let sample_start = sample_every
+                     .filter(|every| batch_index.is_multiple_of(*every))
+                     .map(|_| Instant::now());
+-                with_pitr_admission_retry(retry_pitr_barrier, || eng.write_batch(&batch))?;
++                kv_engine::wal_attribution!(Producer, with_pitr_admission_retry(retry_pitr_barrier, || eng.write_batch(&batch)))?;
+                 if let Some(sample_start) = sample_start {
+                     latency_samples.push(sample_start.elapsed().as_nanos() as u64);
+                 }
+                 next += current_batch;
+                 batch_index += 1;
+             }
++            kv_engine::profiling::wal_attribution::producer_finished();
+             Ok(latency_samples)
+         }));
+     }
+@@ -3711,6 +3752,8 @@
+     let elapsed = start.elapsed();
+     let (process_cpu_user_ms, process_cpu_system_ms) =
+         process_cpu_delta(cpu_start, process_cpu_times());
++    kv_engine::profiling::wal_attribution::end();
++    perf_timed_control("disable")?;
+     #[cfg(feature = "bench")]
+     let wal_pipeline = wal_pipeline_record(&engine, cfg.profile, wal_run_info)?;
+     #[cfg(not(feature = "bench"))]
+@@ -3733,6 +3776,8 @@
+     }
+     let counters = collect_counter_delta(&baseline, &collect_counters(&engine)?);
+     engine.close()?;
++    drop(engine);
++    kv_engine::profiling::wal_attribution::finish()?;
+     cleanup.finalize()?;
+ 
+     let mut measurement = make_measurement(
+--- a/kv-engine/src/mem_table.rs
++++ b/kv-engine/src/mem_table.rs
+@@ -3058,6 +3058,7 @@
+     }
+ 
+     pub(crate) fn publish_raw_batch(&self, data: &[(KeySlice, &[u8])]) -> Result<()> {
++        crate::wal_attribution!(MemtablePublish);
+         struct AbortOnPanic;
+         impl Drop for AbortOnPanic {
+             fn drop(&mut self) {
+@@ -3183,6 +3184,7 @@
+     }
+ 
+     pub(crate) fn publish_raw_batch_owned(&self, entries: Vec<(Bytes, Bytes)>) -> Result<()> {
++        crate::wal_attribution!(MemtablePublish);
+         struct AbortOnPanic;
+         impl Drop for AbortOnPanic {
+             fn drop(&mut self) {
+--- a/kv-engine/src/mvcc.rs
++++ b/kv-engine/src/mvcc.rs
+@@ -719,6 +719,7 @@
+     }
+ 
+     pub(crate) fn publish_commit_ts(&self, commit_ts: u64) -> anyhow::Result<()> {
++        crate::wal_attribution!(MvccPublish);
+         let mut publication = self.publication.lock();
+         if publication
+             .poisoned_at
+--- a/kv-engine/src/pitr/mod.rs
++++ b/kv-engine/src/pitr/mod.rs
+@@ -542,6 +542,7 @@
+     }
+ 
+     pub(crate) fn new(batch: &'a WalBatch, limits: WalV5Limits) -> Result<Self> {
++        crate::wal_attribution!(Preflight);
+         let limits = limits.validate()?;
+         let point_index_capacity = Self::point_index_capacity(batch, limits)?;
+         let mut last_point = Vec::new();
+--- a/kv-engine/src/profiling.rs
++++ b/kv-engine/src/profiling.rs
+@@ -3,6 +3,26 @@
+ //! The `hotpath-profile` feature enables broad phase timing through hotpath-rs.
+ //! Without that feature, `profile_scope!` evaluates its body directly and adds
+ //! no runtime dependency or hot-path measurement cost.
++
++#[cfg(feature = "bench")]
++pub mod wal_attribution;
++
++#[macro_export]
++macro_rules! wal_attribution {
++    ($phase:ident) => {
++        #[cfg(feature = "bench")]
++        let _wal_attribution_scope = $crate::profiling::wal_attribution::scope(
++            $crate::profiling::wal_attribution::Phase::$phase,
++        );
++    };
++    ($phase:ident, $expr:expr) => {{
++        #[cfg(feature = "bench")]
++        let _wal_attribution_scope = $crate::profiling::wal_attribution::scope(
++            $crate::profiling::wal_attribution::Phase::$phase,
++        );
++        $expr
++    }};
++}
+ 
+ #[cfg(feature = "hotpath-profile")]
+ pub use hotpath::HotpathGuard;
+--- a/kv-engine/src/wal/parallel/runtime.rs
++++ b/kv-engine/src/wal/parallel/runtime.rs
+@@ -2344,7 +2344,7 @@
+                         input.commit_ts > prefix.last_commit_ts,
+                         "v7 packer commit timestamp does not advance"
+                     );
+-                    prefix.logical_hasher.update(input.logical_batch.as_bytes());
++                    crate::wal_attribution!(V7LogicalHash, prefix.logical_hasher.update(input.logical_batch.as_bytes()));
+                     prefix.last_commit_ts = input.commit_ts;
+                 }
+                 publish_v7_prefix(inner, expected_ticket, prefix)
+@@ -2508,6 +2508,7 @@
+ }
+ 
+ fn frame_v7_batch(batch: &mut AdmittedBatch, input: &WalV7AdmittedInput) -> Result<()> {
++    crate::wal_attribution!(Frame);
+     if batch.v7_framed {
+         ensure!(
+             batch.buffer.len() == batch.aligned_len,
+@@ -2531,6 +2532,7 @@
+ }
+ 
+ fn materialize_v7_batch(batch: &mut AdmittedBatch, prefix: &mut WalV7PrefixMetadata) -> Result<()> {
++        crate::wal_attribution!(V7Materialize);
+     let input = batch
+         .v7_input
+         .take()
+@@ -2540,7 +2542,7 @@
+         "v7 packer commit timestamp does not advance"
+     );
+     frame_v7_batch(batch, &input)?;
+-    prefix.logical_hasher.update(input.logical_batch.as_bytes());
++    crate::wal_attribution!(V7LogicalHash, prefix.logical_hasher.update(input.logical_batch.as_bytes()));
+     prefix.last_commit_ts = input.commit_ts;
+ 
+     Ok(())
+@@ -3249,6 +3251,7 @@
+ }
+ 
+ fn synchronize_written_prefix(sync_file: &File, inner: &RuntimeInner) -> Result<Option<Duration>> {
++        crate::wal_attribution!(V7SyncCycle);
+     let (target, durable, poison_ticket) = {
+         let state = inner.durability.state.lock();
+         let target = state
+--- a/kv-engine/src/wal/parallel/worker.rs
++++ b/kv-engine/src/wal/parallel/worker.rs
+@@ -1765,6 +1765,7 @@
+     /// Queue a preallocated group. Backpressure counts queued and in-flight
+     /// groups together, not just groups already submitted to the ring.
+     pub(crate) fn submit_group(&self, group: WriteGroup<B>) -> Result<u64> {
++        crate::wal_attribution!(WorkerSubmit);
+         let tickets = group.tickets.clone();
+         for write in group.writes.iter() {
+             ensure!(
+@@ -2030,7 +2031,7 @@
+                 }
+                 return Ok(());
+             }
+-            match commands.recv() {
++            match crate::wal_attribution!(WorkerReceive, commands.recv()) {
+                 Ok(WorkerCommand::Group { id, group, permit }) => {
+                     enqueue_group_command(id, group, permit, core, group_permits, completions)?;
+                 }
+@@ -2233,6 +2234,7 @@
+     slots: &GroupSlots,
+     io_event: &WalIoEvent<'_>,
+ ) -> Result<()> {
++    crate::wal_attribution!(WorkerCqe);
+     for (user_data, cqe_result) in completed {
+         let request_id = RequestId(user_data);
+         #[cfg(all(test, feature = "chaos-testing"))]
+--- a/kv-engine/src/wal/v8/leader.rs
++++ b/kv-engine/src/wal/v8/leader.rs
+@@ -257,7 +257,7 @@
+         let completion_thread = thread::Builder::new()
+             .name("wal-v8-completion-reaper".to_owned())
+             .spawn(move || {
+-                while let Ok(result) = completions.recv() {
++                while let Ok(result) = crate::wal_attribution!(CompletionReceive, completions.recv()) {
+                     if let Err(error) = reap_v8_group_result(&completion_coordinator, result) {
+                         log::error!("v8 WAL completion reaper failed: {error:#}");
+                         completion_coordinator.poison();
+@@ -302,7 +302,7 @@
+             offset.is_multiple_of(FRAME_LEN_U64),
+             "v8 FRONTIER worker offset is not frame aligned"
+         );
+-        let mut submission = self.submission.lock();
++        let mut submission = crate::wal_attribution!(SubmissionLock, self.submission.lock());
+         ensure!(
+             submission
+                 .next_file_offset
+@@ -329,7 +329,8 @@
+     }
+ 
+     fn publish_data(&self, ticket: u64, file_offset: u64, buffer: WalV8DataBuffer) -> Result<()> {
+-        let mut submission = self.submission.lock();
++        crate::wal_attribution!(SubmitData);
++        let mut submission = crate::wal_attribution!(SubmissionLock, self.submission.lock());
+         ensure!(
+             ticket >= submission.next_ticket,
+             "v8 DATA ticket was already submitted"
+@@ -370,6 +371,7 @@
+     }
+ 
+     fn pack_admitted_group(&self, first_ticket: u64) -> Result<()> {
++        crate::wal_attribution!(PackData);
+         let mut guard = WalV8DataPackingGuard {
+             io: self,
+             armed: true,
+@@ -392,7 +394,7 @@
+                 window.ticket_end > first_ticket,
+                 "v8 DATA packer has no admitted head"
+             );
+-            let mut submission = self.submission.lock();
++            let mut submission = crate::wal_attribution!(SubmissionLock, self.submission.lock());
+             ensure!(
+                 submission.packing && submission.next_ticket == first_ticket,
+                 "v8 DATA packer lost its submission cursor"
+@@ -554,6 +556,7 @@
+     coordinator: &WalV8ParallelCoordinator,
+     result: GroupWriteResult,
+ ) -> Result<()> {
++        crate::wal_attribution!(CompletionPublish);
+     if let Some(error) = result.error {
+         coordinator.poison();
+         anyhow::bail!("v8 DATA worker group {} failed: {error}", result.group_id);
+@@ -643,7 +646,7 @@
+             .admitted
+             .take()
+             .context("v8 producer job lost its admitted batch")?;
+-        let mut encoded = match admitted.encode() {
++        let mut encoded = match crate::wal_attribution!(Encode, admitted.encode()) {
+             Ok(encoded) => encoded,
+             Err(error) => {
+                 self.coordinator.poison();
+@@ -666,7 +669,7 @@
+             .data_buffer
+             .as_mut()
+             .context("v8 producer job lost its DATA buffer")?;
+-        let data_len = encoded.encode_data_frames_into(data_buffer.as_mut_slice())?;
++        let data_len = crate::wal_attribution!(Frame, encoded.encode_data_frames_into(data_buffer.as_mut_slice()))?;
+         ensure!(
+             data_len == data_buffer.cap(),
+             "v8 DATA materializer returned an unexpected frame length"
+@@ -1211,11 +1214,11 @@
+                 #[cfg(feature = "bench")]
+                 let data_write_profile = profile.clone();
+                 handles.push(scope.spawn(move || -> Result<ProducerCompletion> {
+-                    let mut encoded = admitted.encode()?;
++                    let mut encoded = crate::wal_attribution!(Encode, admitted.encode())?;
+                     let assignment = encoded.assignment();
+                     let digest_ready = encoded.digest_ready()?;
+                     coordinator.mark_digest_ready(digest_ready)?;
+-                    let data_len = encoded.encode_data_frames_into(data_buffer.as_mut_slice())?;
++                    let data_len = crate::wal_attribution!(Frame, encoded.encode_data_frames_into(data_buffer.as_mut_slice()))?;
+                     ensure!(
+                         data_len == data_buffer.cap(),
+                         "v8 DATA materializer returned an unexpected frame length"
+@@ -1312,7 +1315,7 @@
+             previous_frontier_offset: self.frontier_offset,
+             previous_frontier_digest: self.frontier_digest,
+         };
+-        let frontier_frame = encode_frontier_successor(
++        let frontier_frame = crate::wal_attribution!(FrontierEncode, encode_frontier_successor(
+             frontier,
+             self.frontier,
+             self.frontier_offset,
+@@ -1320,7 +1323,7 @@
+             frontier_offset,
+             self.physical_header_digest,
+             self.initial_prefix_digest,
+-        )?;
++        ))?;
+         frontier_buffer.as_mut_slice()[..WAL_V8_FRAME_LEN].copy_from_slice(&frontier_frame);
+         frontier_buffer.set_len(WAL_V8_FRAME_LEN);
+         let frontier_digest = frame_record_digest(&frontier_frame)?;
+@@ -1348,7 +1351,7 @@
+         }
+         #[cfg(feature = "bench")]
+         let sync_started = profile.as_ref().map(|_| Instant::now());
+-        let sync_result = fdatasync_once(&self.sync_file);
++        let sync_result = crate::wal_attribution!(FrontierSync, fdatasync_once(&self.sync_file));
+         #[cfg(feature = "bench")]
+         if let (Some(profile), Some(started)) = (&profile, sync_started) {
+             let duration_ns = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+@@ -1642,7 +1645,7 @@
+             }
+ 
+             let observed_generation = self.coordinator.change_generation();
+-            let mut previous = self.frontier.lock();
++            let mut previous = crate::wal_attribution!(FrontierLock, self.frontier.lock());
+             if self.coordinator.durable_ticket_end() >= ticket_end {
+                 return Ok(());
+             }
+@@ -1740,7 +1743,7 @@
+                 previous_frontier_offset: previous.offset,
+                 previous_frontier_digest: previous.digest,
+             };
+-            let frontier_frame = encode_frontier_successor(
++            let frontier_frame = crate::wal_attribution!(FrontierEncode, encode_frontier_successor(
+                 frontier,
+                 previous.frontier,
+                 previous.offset,
+@@ -1748,18 +1751,18 @@
+                 reservation.frame_offset,
+                 self.physical_header_digest,
+                 self.initial_prefix_digest,
+-            )?;
++            ))?;
+             let frontier_digest = frame_record_digest(&frontier_frame)?;
+             let mut frontier_buffer = DirectBuf::new(WAL_V8_FRAME_LEN);
+             frontier_buffer.as_mut_slice()[..WAL_V8_FRAME_LEN].copy_from_slice(&frontier_frame);
+             frontier_buffer.set_len(WAL_V8_FRAME_LEN);
+             #[cfg(feature = "bench")]
+             let frontier_write_started = profile.as_ref().map(|_| Instant::now());
+-            write_aligned_once(
++            crate::wal_attribution!(FrontierWrite, write_aligned_once(
+                 &self.write_file,
+                 frontier_buffer.initialized_slice(0, WAL_V8_FRAME_LEN),
+                 reservation.frame_offset,
+-            )
++            ))
+             .context("write v8 Parallel FRONTIER")?;
+             #[cfg(feature = "chaos-testing")]
+             crate::chaos::failpoint::wal_crash_point("wal_v8.parallel.after_frontier_write");
+@@ -1776,7 +1779,7 @@
+                 );
+             }
+             let sync_started = Instant::now();
+-            let sync_result = fdatasync_once(&self.sync_file);
++            let sync_result = crate::wal_attribution!(FrontierSync, fdatasync_once(&self.sync_file));
+             previous.last_sync_latency = Some(sync_started.elapsed());
+             #[cfg(feature = "bench")]
+             if let Some(profile) = &profile {
+@@ -1832,6 +1835,7 @@
+     }
+ 
+     fn retire_frontier_resources(&self, first_ticket: u64, ticket_end: u64) -> Result<()> {
++        crate::wal_attribution!(ResourcesRetire);
+         if self.reservation_owner.is_none() {
+             return Ok(());
+         }
+@@ -1862,6 +1866,7 @@
+     }
+ 
+     fn retire_frontier_guards(&self, first_ticket: u64, ticket_end: u64) -> Result<()> {
++        crate::wal_attribution!(GuardsRetire);
+         let mut guards = self.producer_guards.lock();
+         let tickets: Vec<u64> = guards
+             .range(first_ticket..ticket_end)
+--- a/kv-engine/src/wal/v8/parallel.rs
++++ b/kv-engine/src/wal/v8/parallel.rs
+@@ -272,7 +272,7 @@
+         max_tickets: usize,
+     ) -> Result<WalV8DataGroupWindow> {
+         ensure!(max_tickets > 0, "v8 DATA group window must be nonempty");
+-        let state = self.inner.state.lock();
++        let state = crate::wal_attribution!(CoordinatorLock, self.inner.state.lock());
+         ensure!(!state.poisoned, "v8 Parallel coordinator is poisoned");
+         ensure!(
+             first_ticket >= state.durable_ticket_end && first_ticket <= state.next_ticket,
+@@ -291,7 +291,7 @@
+ 
+     /// Return the contiguous head prefix whose DATA frames are ready to submit.
+     pub(crate) fn frame_ready_prefix(&self) -> Vec<WalV8TicketProgress> {
+-        let state = self.inner.state.lock();
++        let state = crate::wal_attribution!(CoordinatorLock, self.inner.state.lock());
+         if state.poisoned {
+             return Vec::new();
+         }
+@@ -306,7 +306,7 @@
+     /// Return the contiguous head prefix whose frames, ordered digest fold,
+     /// and DATA completion are ready for an embedded FRONTIER.
+     pub(crate) fn frontier_ready_prefix(&self) -> Vec<WalV8TicketProgress> {
+-        let state = self.inner.state.lock();
++        let state = crate::wal_attribution!(CoordinatorLock, self.inner.state.lock());
+         if state.poisoned {
+             return Vec::new();
+         }
+@@ -322,7 +322,8 @@
+     /// ready durability prefix. A lone producer or fully ready window never
+     /// waits, and close/poison terminates the optional wait immediately.
+     pub(crate) fn coalesce_frontier_ready(&self, budget: Duration) -> bool {
+-        let mut state = self.inner.state.lock();
++        crate::wal_attribution!(Coalesce);
++        let mut state = crate::wal_attribution!(CoordinatorLock, self.inner.state.lock());
+         let deadline = Instant::now() + budget;
+         let mut waited = false;
+         while !state.closed
+@@ -358,7 +359,8 @@
+     /// the blocked ticket's readiness to identify why a durability group
+     /// stopped at this boundary.
+     pub(crate) fn frontier_ready_snapshot(&self) -> WalV8FrontierReadySnapshot {
+-        let state = self.inner.state.lock();
++        crate::wal_attribution!(Snapshot);
++        let state = crate::wal_attribution!(CoordinatorLock, self.inner.state.lock());
+         if state.poisoned {
+             return WalV8FrontierReadySnapshot {
+                 ready_prefix: Vec::new(),
+@@ -393,7 +395,8 @@
+ 
+     /// Publish that one ticket's physical DATA frames have been materialized.
+     pub(crate) fn mark_frames_ready(&self, ticket: u64) -> Result<()> {
+-        let mut state = self.inner.state.lock();
++        crate::wal_attribution!(FramesReady);
++        let mut state = crate::wal_attribution!(CoordinatorLock, self.inner.state.lock());
+         ensure!(!state.poisoned, "v8 Parallel coordinator is poisoned");
+         let Some(index) = state
+             .tickets
+@@ -416,7 +419,7 @@
+     /// readiness timestamp.
+     #[cfg(feature = "bench")]
+     pub(crate) fn mark_data_write_started(&self, ticket: u64) -> Result<()> {
+-        let mut state = self.inner.state.lock();
++        let mut state = crate::wal_attribution!(CoordinatorLock, self.inner.state.lock());
+         ensure!(!state.poisoned, "v8 Parallel coordinator is poisoned");
+         let Some(index) = state
+             .tickets
+@@ -446,7 +449,8 @@
+     /// Publish a producer digest and return the ordered-link CPU time spent
+     /// folding digests that became contiguous because of this event.
+     pub(crate) fn mark_digest_ready_with_cpu(&self, digest: WalV8DigestReady) -> Result<u64> {
+-        let mut state = self.inner.state.lock();
++        crate::wal_attribution!(Digest);
++        let mut state = crate::wal_attribution!(CoordinatorLock, self.inner.state.lock());
+         ensure!(!state.poisoned, "v8 Parallel coordinator is poisoned");
+         let Some(index) = state
+             .tickets
+@@ -495,7 +499,7 @@
+     /// Publish that a submitted DATA write has completed. Frame readiness must
+     /// already have been published, while digest readiness can arrive later.
+     pub(crate) fn mark_data_complete(&self, ticket: u64) -> Result<()> {
+-        let mut state = self.inner.state.lock();
++        let mut state = crate::wal_attribution!(CoordinatorLock, self.inner.state.lock());
+         ensure!(!state.poisoned, "v8 Parallel coordinator is poisoned");
+         let Some(index) = state
+             .tickets
+@@ -520,7 +524,8 @@
+     /// Publish a worker group's DATA completion atomically so frontier
+     /// formation cannot observe a partial completion from one group.
+     pub(crate) fn mark_data_group_complete(&self, tickets: Range<u64>) -> Result<()> {
+-        let mut state = self.inner.state.lock();
++        crate::wal_attribution!(DataComplete);
++        let mut state = crate::wal_attribution!(CoordinatorLock, self.inner.state.lock());
+         ensure!(!state.poisoned, "v8 Parallel coordinator is poisoned");
+         let Some(ticket_count) = tickets.end.checked_sub(tickets.start) else {
+             poison_locked(&self.inner, &mut state);
+@@ -610,7 +615,8 @@
+     where
+         F: FnOnce(WalV8FrontierReservation) -> Result<()>,
+     {
+-        let mut state = self.inner.state.lock();
++        crate::wal_attribution!(ReserveFrontier);
++        let mut state = crate::wal_attribution!(CoordinatorLock, self.inner.state.lock());
+         ensure!(!state.poisoned, "v8 Parallel coordinator is poisoned");
+         ensure!(
+             state.pending_frontier.is_none(),
+@@ -668,7 +674,8 @@
+         &self,
+         reservation: WalV8FrontierReservation,
+     ) -> Result<()> {
+-        let mut state = self.inner.state.lock();
++        crate::wal_attribution!(PublishDurable);
++        let mut state = crate::wal_attribution!(CoordinatorLock, self.inner.state.lock());
+         ensure!(!state.poisoned, "v8 Parallel coordinator is poisoned");
+         if state.pending_frontier != Some(reservation) {
+             poison_locked(&self.inner, &mut state);
+@@ -740,7 +747,7 @@
+ 
+     /// Stop new admissions and wake packer/durability waiters.
+     pub(crate) fn close(&self) {
+-        let mut state = self.inner.state.lock();
++        let mut state = crate::wal_attribution!(CoordinatorLock, self.inner.state.lock());
+         if !state.closed {
+             state.closed = true;
+             signal_change(&self.inner, &mut state);
+@@ -749,33 +756,33 @@
+ 
+     /// Poison the admission window after an uncertain write, marker, or sync.
+     pub(crate) fn poison(&self) {
+-        let mut state = self.inner.state.lock();
++        let mut state = crate::wal_attribution!(CoordinatorLock, self.inner.state.lock());
+         poison_locked(&self.inner, &mut state);
+     }
+ 
+     pub(crate) fn is_poisoned(&self) -> bool {
+-        self.inner.state.lock().poisoned
++        crate::wal_attribution!(CoordinatorLock, self.inner.state.lock()).poisoned
+     }
+ 
+     #[cfg(feature = "bench")]
+     pub(crate) fn ordered_link_hash_cpu_ns(&self) -> u64 {
+-        self.inner.state.lock().ordered_link_hash_cpu_ns
++        crate::wal_attribution!(CoordinatorLock, self.inner.state.lock()).ordered_link_hash_cpu_ns
+     }
+ 
+     pub(crate) fn durable_ticket_end(&self) -> u64 {
+-        self.inner.state.lock().durable_ticket_end
++        crate::wal_attribution!(CoordinatorLock, self.inner.state.lock()).durable_ticket_end
+     }
+ 
+     /// Return the verified digest at the current durable ticket boundary.
+     pub(crate) fn durable_prefix_digest(&self) -> WalV8Digest {
+-        self.inner.state.lock().durable_prefix_digest
++        crate::wal_attribution!(CoordinatorLock, self.inner.state.lock()).durable_prefix_digest
+     }
+ 
+     /// Return the folded digest at a ticket end still represented in the live
+     /// admission window, or the current durable digest. Older durable prefixes
+     /// are intentionally not retained here.
+     pub(crate) fn prefix_digest_at(&self, ticket_end: u64) -> Option<WalV8Digest> {
+-        let state = self.inner.state.lock();
++        let state = crate::wal_attribution!(CoordinatorLock, self.inner.state.lock());
+         if state.poisoned || ticket_end < state.durable_ticket_end {
+             return None;
+         }
+@@ -791,7 +798,7 @@
+     }
+ 
+     pub(crate) fn next_ticket(&self) -> u64 {
+-        self.inner.state.lock().next_ticket
++        crate::wal_attribution!(CoordinatorLock, self.inner.state.lock()).next_ticket
+     }
+ 
+     /// Run a diagnostics-state update while excluding ticket admission. This
+@@ -799,21 +806,21 @@
+     /// new ticket.
+     #[cfg(feature = "bench")]
+     pub(crate) fn with_next_ticket<T>(&self, update: impl FnOnce(u64) -> T) -> T {
+-        let state = self.inner.state.lock();
++        let state = crate::wal_attribution!(CoordinatorLock, self.inner.state.lock());
+         update(state.next_ticket)
+     }
+ 
+     pub(crate) fn last_frontier_end(&self) -> u64 {
+-        self.inner.state.lock().last_frontier_end
++        crate::wal_attribution!(CoordinatorLock, self.inner.state.lock()).last_frontier_end
+     }
+ 
+     pub(crate) fn change_generation(&self) -> u64 {
+-        self.inner.state.lock().change_generation
++        crate::wal_attribution!(CoordinatorLock, self.inner.state.lock()).change_generation
+     }
+ 
+     #[cfg(test)]
+     fn ticket_admission_waiter_count(&self) -> usize {
+-        self.inner.state.lock().ticket_admission_waiters
++        crate::wal_attribution!(CoordinatorLock, self.inner.state.lock()).ticket_admission_waiters
+     }
+ 
+     /// Wait until admission, readiness, close, or poison changes, with a
+@@ -823,7 +830,8 @@
+         observed_generation: u64,
+         timeout: Duration,
+     ) -> WalV8CoordinatorWake {
+-        let mut state = self.inner.state.lock();
++        crate::wal_attribution!(CoordinatorWait);
++        let mut state = crate::wal_attribution!(CoordinatorLock, self.inner.state.lock());
+         if state.change_generation == observed_generation && !state.closed && !state.poisoned {
+             self.inner.changed.wait_for(&mut state, timeout);
+         }
+@@ -842,7 +850,7 @@
+             bytes <= self.inner.max_inflight_bytes,
+             "v8 preparation index exceeds the configured byte window"
+         );
+-        let mut state = self.inner.state.lock();
++        let mut state = crate::wal_attribution!(CoordinatorLock, self.inner.state.lock());
+         ensure!(!state.poisoned, "v8 Parallel coordinator is poisoned");
+         ensure!(!state.closed, "v8 Parallel coordinator is closed");
+         let new_preparation_bytes = state
+@@ -872,6 +880,7 @@
+         &self,
+         plan: WalV8AdmissionPlan,
+     ) -> Result<(WalV8BatchAssignment, Self::Guard)> {
++        crate::wal_attribution!(Admit);
+         validate_plan(plan)?;
+         let data_bytes = u64::try_from(plan.frame_buffer_bytes)?;
+         let reserved_bytes = u64::try_from(plan.logical_batch_bytes)?
+@@ -882,7 +891,7 @@
+             "v8 Parallel batch exceeds the configured byte window"
+         );
+ 
+-        let mut state = self.inner.state.lock();
++        let mut state = crate::wal_attribution!(CoordinatorLock, self.inner.state.lock());
+         while state.tickets.len() >= self.inner.max_inflight_tickets {
+             ensure!(!state.poisoned, "v8 Parallel coordinator is poisoned");
+             ensure!(!state.closed, "v8 Parallel coordinator is closed");
+@@ -1015,7 +1024,7 @@
+         if self.bytes == 0 {
+             return;
+         }
+-        let mut state = self.coordinator.inner.state.lock();
++        let mut state = crate::wal_attribution!(CoordinatorLock, self.coordinator.inner.state.lock());
+         let Some(remaining) = state.reserved_preparation_bytes.checked_sub(self.bytes) else {
+             poison_locked(&self.coordinator.inner, &mut state);
+             return;
+@@ -1052,7 +1061,7 @@
+ 
+ impl WalV8ParallelCoordinator {
+     fn poison_ticket_if_pending(&self, ticket: u64) {
+-        let mut state = self.inner.state.lock();
++        let mut state = crate::wal_attribution!(CoordinatorLock, self.inner.state.lock());
+         if ticket >= state.durable_ticket_end {
+             poison_locked(&self.inner, &mut state);
+         }
+--- a/kv-engine/src/wal.rs
++++ b/kv-engine/src/wal.rs
+@@ -138,12 +138,15 @@
+ 
+ impl DirectBuf {
+     pub(crate) fn new(size: usize) -> Self {
++        crate::wal_attribution!(DirectAlloc);
+         // Cap must be 4KB-aligned to prevent io_uring out-of-bounds reads.
+         // align_up() rounds write sizes to 4KB; if cap is smaller, io_uring
+         // reads past the allocation.
+         let cap = Self::align_up(size.max(4096));
+         let mut ptr: *mut libc::c_void = std::ptr::null_mut();
+         let ret = unsafe { libc::posix_memalign(&mut ptr, 4096, cap) };
++        #[cfg(feature = "bench")]
++        crate::profiling::wal_attribution::allocation(4, cap);
+         // posix_memalign failure is OOM — recovery is impossible at this point.
+         assert_eq!(ret, 0, "posix_memalign failed (OOM)");
+ 
+@@ -237,6 +240,8 @@
+ 
+ impl Drop for DirectBuf {
+     fn drop(&mut self) {
++        #[cfg(feature = "bench")]
++        crate::profiling::wal_attribution::allocation(6, self.cap);
+         unsafe { libc::free(self.ptr as *mut libc::c_void) };
+     }
+ }
+--- /dev/null
++++ b/kv-engine/src/profiling/wal_attribution.rs
+@@ -0,0 +1,136 @@
++//! Temporary, opt-in timed-interval WAL attribution. Scope timings are sampled
++//! and inclusive. Allocation counts cover active-interval Rust allocations and
++//! separately instrumented native aligned buffers.
++
++use std::{cell::{Cell, RefCell}, sync::{Mutex, atomic::{AtomicBool, Ordering}}, time::Instant};
++use serde::Serialize;
++
++pub static ACTIVE: AtomicBool = AtomicBool::new(false);
++const SAMPLE_RATE: u64 = 64;
++const COUNT: usize = 34;
++#[derive(Clone, Copy)]
++#[repr(usize)]
++pub enum Phase {
++    Producer, Preflight, Encode, Frame, DirectAlloc, Admit, Digest, FramesReady,
++    DataComplete, ReserveFrontier, PublishDurable, Snapshot, Coalesce, CoordinatorLock,
++    SubmissionLock, SubmitData, PackData, WorkerSubmit, WorkerCqe, CompletionReceive,
++    CompletionPublish, FrontierEncode, FrontierWrite, FrontierSync, ResourcesRetire,
++    GuardsRetire, V7Materialize, V7SyncCycle, WorkerReceive, MemtablePublish, MvccPublish, V7LogicalHash, FrontierLock, CoordinatorWait,
++}
++const NAMES: [&str; COUNT] = [
++    "producer", "preflight", "encode", "frame", "direct_alloc", "admit", "digest_ready",
++    "frames_ready", "data_complete", "reserve_frontier", "publish_durable", "snapshot",
++    "coalesce", "coordinator_lock_wait", "submission_lock_wait", "submit_data", "pack_data",
++    "worker_submit", "worker_cqe", "completion_receive", "completion_publish", "frontier_encode",
++    "frontier_write", "frontier_sync", "resources_retire", "guards_retire", "v7_materialize",
++    "v7_sync_cycle", "worker_receive", "memtable_publish", "mvcc_publish", "v7_logical_hash", "frontier_lock_wait", "coordinator_wait",
++];
++
++#[derive(Clone, Copy, Default, Serialize)]
++struct Bucket { calls: u64, samples: u64, cpu_ns: u64, wall_ns: u64 }
++#[derive(Clone, Copy, Default, Serialize)]
++struct Usage { user_us: u64, system_us: u64, voluntary: u64, involuntary: u64, minor_faults: u64, major_faults: u64 }
++#[derive(Serialize)]
++struct ThreadStats {
++    tid: u32, name: String, buckets: Vec<Bucket>,
++    first_usage: Usage, last_usage: Usage, allocations: [u64; 8],
++}
++static THREADS: Mutex<Vec<ThreadStats>> = Mutex::new(Vec::new());
++static PROCESS: Mutex<(Usage, Usage)> = Mutex::new((Usage { user_us: 0, system_us: 0, voluntary: 0, involuntary: 0, minor_faults: 0, major_faults: 0 }, Usage { user_us: 0, system_us: 0, voluntary: 0, involuntary: 0, minor_faults: 0, major_faults: 0 }));
++struct LocalStats(Option<ThreadStats>);
++impl Drop for LocalStats {
++    fn drop(&mut self) {
++        if let Some(mut stats) = self.0.take() {
++            stats.allocations = ALLOCATIONS.try_with(Cell::get).unwrap_or_default();
++            THREADS.lock().unwrap().push(stats);
++        }
++    }
++}
++thread_local! {
++    static LOCAL: RefCell<LocalStats> = const { RefCell::new(LocalStats(None)) };
++    static ALLOCATIONS: Cell<[u64; 8]> = const { Cell::new([0; 8]) };
++}
++
++pub fn allocation(event: usize, bytes: usize) {
++    if ACTIVE.load(Ordering::Relaxed) {
++        let _ = ALLOCATIONS.try_with(|cell| {
++            let mut counters = cell.get();
++            counters[event] += 1;
++            counters[event + 1] += bytes as u64;
++            cell.set(counters);
++        });
++    }
++}
++
++fn usage(who: i32) -> Usage {
++    let mut raw = std::mem::MaybeUninit::<libc::rusage>::uninit();
++    // SAFETY: getrusage initializes the supplied struct on success.
++    if unsafe { libc::getrusage(who, raw.as_mut_ptr()) } != 0 { return Usage::default(); }
++    // SAFETY: successful getrusage initialized the value.
++    let raw = unsafe { raw.assume_init() };
++    Usage {
++        user_us: (raw.ru_utime.tv_sec * 1_000_000 + raw.ru_utime.tv_usec) as u64,
++        system_us: (raw.ru_stime.tv_sec * 1_000_000 + raw.ru_stime.tv_usec) as u64,
++        voluntary: raw.ru_nvcsw as u64, involuntary: raw.ru_nivcsw as u64,
++        minor_faults: raw.ru_minflt as u64, major_faults: raw.ru_majflt as u64,
++    }
++}
++
++pub struct Scope { phase: usize, started: Instant, cpu: u64 }
++pub fn scope(phase: Phase) -> Option<Scope> {
++    if !ACTIVE.load(Ordering::Relaxed) { return None; }
++    let sampled = LOCAL.with(|cell| {
++        let mut local = cell.borrow_mut();
++        let stats = local.0.get_or_insert_with(|| ThreadStats {
++            // SAFETY: gettid has no memory arguments.
++            tid: unsafe { libc::syscall(libc::SYS_gettid) as u32 },
++            name: std::thread::current().name().unwrap_or("producer").to_owned(),
++            buckets: vec![Bucket::default(); COUNT], first_usage: usage(libc::RUSAGE_THREAD),
++            last_usage: Usage::default(), allocations: [0; 8],
++        });
++        let b = &mut stats.buckets[phase as usize]; b.calls += 1;
++        b.calls % SAMPLE_RATE == 1
++    });
++    sampled.then(|| Scope { phase: phase as usize, started: Instant::now(), cpu: crate::wal::v8::digest::thread_cpu_time_ns() })
++}
++impl Drop for Scope {
++    fn drop(&mut self) {
++        let cpu = crate::wal::v8::digest::thread_cpu_time_ns().saturating_sub(self.cpu);
++        let wall = self.started.elapsed().as_nanos() as u64;
++        if !ACTIVE.load(Ordering::Relaxed) { return; }
++        LOCAL.with(|cell| {
++            if let Some(stats) = cell.borrow_mut().0.as_mut() {
++                let b = &mut stats.buckets[self.phase];
++                b.samples += 1; b.cpu_ns += cpu; b.wall_ns += wall;
++                stats.last_usage = usage(libc::RUSAGE_THREAD);
++            }
++        });
++    }
++}
++
++pub fn begin() {
++    if std::env::var_os("TOYKV_WAL_ATTRIBUTION").is_none() { return; }
++    *THREADS.lock().unwrap() = Vec::with_capacity(128);
++    PROCESS.lock().unwrap().0 = usage(libc::RUSAGE_SELF);
++    ACTIVE.store(true, Ordering::Release);
++}
++pub fn producer_finished() {
++    if ACTIVE.load(Ordering::Relaxed) {
++        LOCAL.with(|cell| { if let Some(stats) = cell.borrow_mut().0.as_mut() { stats.last_usage = usage(libc::RUSAGE_THREAD); } });
++    }
++}
++pub fn end() {
++    if ACTIVE.swap(false, Ordering::AcqRel) { PROCESS.lock().unwrap().1 = usage(libc::RUSAGE_SELF); }
++}
++pub fn finish() -> anyhow::Result<()> {
++    let Some(path) = std::env::var_os("TOYKV_WAL_ATTRIBUTION") else { return Ok(()); };
++    LOCAL.with(|cell| { cell.borrow_mut().0.take().map(|s| drop(LocalStats(Some(s)))); });
++    let threads = THREADS.lock().unwrap();
++    let process = PROCESS.lock().unwrap();
++    serde_json::to_writer_pretty(std::fs::File::create(path)?, &serde_json::json!({
++        "sample_rate": SAMPLE_RATE, "scopes_are_inclusive": true,
++        "allocation_fields": ["rust_alloc_calls", "rust_alloc_bytes", "rust_free_calls", "rust_free_bytes", "native_alloc_calls", "native_alloc_bytes", "native_free_calls", "native_free_bytes"],
++        "phase_names": &NAMES[..], "process_before": process.0, "process_after": process.1, "threads": *threads,
++    }))?;
++    Ok(())
++}

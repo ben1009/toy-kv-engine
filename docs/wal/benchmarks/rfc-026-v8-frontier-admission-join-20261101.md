@@ -1,5 +1,11 @@
 # RFC 026 V8 admission-visible frontier-join screen (2026-11-01)
 
+This historical screen predates the 2026-11-03 maintainer decision to make V8
+the default for new PITR WALs. Statements below about V7 being the default
+describe the state and recommendation at the time of this experiment. The
+adoption decision left performance qualification open; see the
+[V8 adoption note](../rfc-026-v8-default-20261103.md).
+
 ## Result
 
 The admission-visible 10µs join is not retained. It waits when a ticket after
@@ -13,8 +19,10 @@ A separate same-checkout 8-writer V8/V7 pair ran without the same stall
 signature. V8 Parallel measured 330,674 ops/s, p99 2.698ms and 3,188 syncs;
 V7 Parallel measured 498,401 ops/s, p99 1.507ms and 1,515 syncs. This is one
 directional pair, not qualification evidence, but it confirms that V8's sync
-grouping remains a significant performance question. Keep V7 as the default
-and V8 creation disabled.
+grouping remains a significant performance question. The recommendation at the
+time of this screen was to keep V7 as the default and V8 creation disabled.
+The later adoption decision selected V8 for new PITR WALs despite the
+unqualified performance matrix.
 
 ## Method
 
@@ -69,5 +77,5 @@ The candidate passed the focused V8 suite (135 tests) and Clippy. An
 independent review found no correctness or progress blocker; it noted that the
 wait remains bounded even when an admitted ticket has not started I/O. No
 clean paired performance result was obtained, so the candidate code was not
-retained. The next V8 performance work should first isolate the sync-grouping
-gap with repeatable ext4 runs and preserve the existing V7 default.
+retained. The recommendation at the time was to isolate the sync-grouping gap
+with repeatable ext4 runs while preserving the then-current V7 default.

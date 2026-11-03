@@ -1,0 +1,55 @@
+{
+  "commands": [
+    {
+      "command": "cargo test --package kv-engine --all-features --bin write-perf",
+      "exit_code": 0,
+      "passed": 158
+    },
+    {
+      "command": "cargo clippy --package kv-engine --all-features --bin write-perf -- -D warnings",
+      "exit_code": 0
+    },
+    {
+      "command": "cargo check --package kv-engine --no-default-features --bin write-perf",
+      "exit_code": 0
+    },
+    {
+      "command": "python3 -B -m unittest discover -s docs/wal/benchmarks -p test_wal*trace*.py",
+      "exit_code": 0,
+      "passed": 47
+    },
+    {
+      "command": "python3 -B -m unittest discover -s docs/wal/benchmarks -p test_paired_v7_v8.py",
+      "exit_code": 0,
+      "passed": 40
+    },
+    {
+      "command": "cargo fmt --all --check",
+      "exit_code": 0
+    },
+    {
+      "command": "typos .",
+      "exit_code": 0
+    },
+    {
+      "command": "git diff --check",
+      "exit_code": 0
+    }
+  ],
+  "full_captures": 8,
+  "smoke_captures": 2,
+  "trace_loss": 0,
+  "matching_anomalies": 0,
+  "full_tracepoints_present": true,
+  "archive_replay_expected": "Full analysis JSON equals reanalysis of compressed traces/timelines; every captured run retained",
+  "calibration_pending": true,
+  "RFC_performance_qualified": false,
+  "WAL_library_runtime_changes": false,
+  "source_sha256": {
+    "kv-engine/src/bin/write-perf.rs": "f732789b1d194beb97b294ad2d30ec7d28508a2a3674deba6d9c4045f64c7f63",
+    "kv-engine/src/bin/write_perf/timeline.rs": "0cda463dafac624815777462101d19cf847a8f89090d830439ca8e7ac9f6f7e0",
+    "docs/wal/benchmarks/capture_wal_trace.py": "0543c3c202f490ad681788d4aa8577bad7c6d7c8e328996af781823961d32489",
+    "docs/wal/benchmarks/wal_extent_trace.py": "0e99fa82409828a3a1d7de56da10428661b57f7815ad8738120ff05247ec121e",
+    "docs/wal/benchmarks/test_wal_extent_trace.py": "3cc3fa263026f9f1a60e8e83951e0c8d871e4f842ecd05d72fe142f21729a8a2"
+  }
+}

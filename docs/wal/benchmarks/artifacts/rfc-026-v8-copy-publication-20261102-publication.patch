@@ -1,0 +1,13 @@
+--- a/kv-engine/src/mvcc.rs
++++ b/kv-engine/src/mvcc.rs
+@@ -26,8 +26,8 @@
+ /// Spin budget before a publication waiter parks under low contention.
+ const PUBLICATION_SPIN_LIMIT: u32 = 1 << 12;
+ const CONTENDED_PUBLICATION_SPIN_LIMIT: u32 = 256;
+-const PUBLICATION_CONTENTION_THRESHOLD: u64 = 32;
+-const PUBLICATION_DISTANCE_THRESHOLD: u64 = 16;
++const PUBLICATION_CONTENTION_THRESHOLD: u64 = 8;
++const PUBLICATION_DISTANCE_THRESHOLD: u64 = 4;
+ 
+ /// How long the commit barrier waits before rechecking a drain, so that a
+ /// signal missed by the lock-free publication path costs a bounded delay

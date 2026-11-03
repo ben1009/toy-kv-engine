@@ -10,6 +10,7 @@ fn test_value_cache_hit_miss() {
         compaction_options: CompactionOptions::NoCompaction,
         enable_wal: false,
         pitr_repository: None,
+        pitr_writer_format: Default::default(),
         serializable: false,
         value_separation: Some(ValueSeparationOptions {
             enabled: true,
@@ -76,6 +77,7 @@ fn test_value_cache_disabled_by_default() {
         compaction_options: CompactionOptions::NoCompaction,
         enable_wal: false,
         pitr_repository: None,
+        pitr_writer_format: Default::default(),
         serializable: false,
         value_separation: Some(ValueSeparationOptions {
             enabled: true,
@@ -118,6 +120,7 @@ fn test_value_cache_enabled_by_default() {
         compaction_options: CompactionOptions::NoCompaction,
         enable_wal: false,
         pitr_repository: None,
+        pitr_writer_format: Default::default(),
         serializable: false,
         value_separation: Some(ValueSeparationOptions {
             enabled: true,

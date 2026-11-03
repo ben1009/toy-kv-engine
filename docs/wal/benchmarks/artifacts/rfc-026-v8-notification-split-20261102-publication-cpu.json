@@ -1,0 +1,1186 @@
+{
+  "cpu-00-baseline-16": {
+    "sample_rate": 64,
+    "inclusive": true,
+    "threads": [
+      {
+        "tid": 2835157,
+        "name": "producer",
+        "phases": {
+          "memtable_publish": {
+            "calls": 733,
+            "cpu_ns": 3202543,
+            "samples": 12,
+            "wall_ns": 3243434
+          },
+          "mvcc_publish": {
+            "calls": 733,
+            "cpu_ns": 1232730,
+            "samples": 12,
+            "wall_ns": 1519527
+          }
+        }
+      },
+      {
+        "tid": 2835165,
+        "name": "producer",
+        "phases": {
+          "memtable_publish": {
+            "calls": 733,
+            "cpu_ns": 3331609,
+            "samples": 12,
+            "wall_ns": 3380349
+          },
+          "mvcc_publish": {
+            "calls": 733,
+            "cpu_ns": 1980208,
+            "samples": 12,
+            "wall_ns": 3702001
+          }
+        }
+      },
+      {
+        "tid": 2835162,
+        "name": "producer",
+        "phases": {
+          "memtable_publish": {
+            "calls": 733,
+            "cpu_ns": 3397439,
+            "samples": 12,
+            "wall_ns": 3453739
+          },
+          "mvcc_publish": {
+            "calls": 733,
+            "cpu_ns": 628257,
+            "samples": 12,
+            "wall_ns": 1183984
+          }
+        }
+      },
+      {
+        "tid": 2835155,
+        "name": "producer",
+        "phases": {
+          "memtable_publish": {
+            "calls": 733,
+            "cpu_ns": 3266719,
+            "samples": 12,
+            "wall_ns": 3297635
+          },
+          "mvcc_publish": {
+            "calls": 733,
+            "cpu_ns": 729808,
+            "samples": 12,
+            "wall_ns": 1327799
+          }
+        }
+      },
+      {
+        "tid": 2835167,
+        "name": "producer",
+        "phases": {
+          "memtable_publish": {
+            "calls": 733,
+            "cpu_ns": 3490842,
+            "samples": 12,
+            "wall_ns": 3546572
+          },
+          "mvcc_publish": {
+            "calls": 733,
+            "cpu_ns": 1200086,
+            "samples": 12,
+            "wall_ns": 2566040
+          }
+        }
+      },
+      {
+        "tid": 2835153,
+        "name": "producer",
+        "phases": {
+          "memtable_publish": {
+            "calls": 733,
+            "cpu_ns": 3500197,
+            "samples": 12,
+            "wall_ns": 3525524
+          },
+          "mvcc_publish": {
+            "calls": 733,
+            "cpu_ns": 866639,
+            "samples": 12,
+            "wall_ns": 2312043
+          }
+        }
+      },
+      {
+        "tid": 2835168,
+        "name": "producer",
+        "phases": {
+          "memtable_publish": {
+            "calls": 733,
+            "cpu_ns": 3492428,
+            "samples": 12,
+            "wall_ns": 3539681
+          },
+          "mvcc_publish": {
+            "calls": 733,
+            "cpu_ns": 791356,
+            "samples": 12,
+            "wall_ns": 1454192
+          }
+        }
+      },
+      {
+        "tid": 2835160,
+        "name": "producer",
+        "phases": {
+          "memtable_publish": {
+            "calls": 733,
+            "cpu_ns": 3528182,
+            "samples": 12,
+            "wall_ns": 3550175
+          },
+          "mvcc_publish": {
+            "calls": 733,
+            "cpu_ns": 1260212,
+            "samples": 12,
+            "wall_ns": 2717824
+          }
+        }
+      },
+      {
+        "tid": 2835163,
+        "name": "producer",
+        "phases": {
+          "memtable_publish": {
+            "calls": 733,
+            "cpu_ns": 3759700,
+            "samples": 12,
+            "wall_ns": 3809988
+          },
+          "mvcc_publish": {
+            "calls": 733,
+            "cpu_ns": 499299,
+            "samples": 12,
+            "wall_ns": 679753
+          }
+        }
+      },
+      {
+        "tid": 2835164,
+        "name": "producer",
+        "phases": {
+          "memtable_publish": {
+            "calls": 733,
+            "cpu_ns": 3759149,
+            "samples": 12,
+            "wall_ns": 3802210
+          },
+          "mvcc_publish": {
+            "calls": 733,
+            "cpu_ns": 486359,
+            "samples": 12,
+            "wall_ns": 705808
+          }
+        }
+      },
+      {
+        "tid": 2835169,
+        "name": "producer",
+        "phases": {
+          "memtable_publish": {
+            "calls": 733,
+            "cpu_ns": 3296321,
+            "samples": 12,
+            "wall_ns": 3325237
+          },
+          "mvcc_publish": {
+            "calls": 733,
+            "cpu_ns": 1494604,
+            "samples": 12,
+            "wall_ns": 2829728
+          }
+        }
+      },
+      {
+        "tid": 2835156,
+        "name": "producer",
+        "phases": {
+          "memtable_publish": {
+            "calls": 733,
+            "cpu_ns": 3583332,
+            "samples": 12,
+            "wall_ns": 3631323
+          },
+          "mvcc_publish": {
+            "calls": 733,
+            "cpu_ns": 1356011,
+            "samples": 12,
+            "wall_ns": 5063657
+          }
+        }
+      },
+      {
+        "tid": 2835154,
+        "name": "producer",
+        "phases": {
+          "memtable_publish": {
+            "calls": 733,
+            "cpu_ns": 3370307,
+            "samples": 12,
+            "wall_ns": 3405941
+          },
+          "mvcc_publish": {
+            "calls": 733,
+            "cpu_ns": 1228370,
+            "samples": 12,
+            "wall_ns": 2220069
+          }
+        }
+      },
+      {
+        "tid": 2835159,
+        "name": "producer",
+        "phases": {
+          "memtable_publish": {
+            "calls": 733,
+            "cpu_ns": 3699577,
+            "samples": 12,
+            "wall_ns": 3747940
+          },
+          "mvcc_publish": {
+            "calls": 733,
+            "cpu_ns": 501078,
+            "samples": 12,
+            "wall_ns": 657531
+          }
+        }
+      },
+      {
+        "tid": 2835158,
+        "name": "producer",
+        "phases": {
+          "memtable_publish": {
+            "calls": 733,
+            "cpu_ns": 3854967,
+            "samples": 12,
+            "wall_ns": 3886602
+          },
+          "mvcc_publish": {
+            "calls": 733,
+            "cpu_ns": 510334,
+            "samples": 12,
+            "wall_ns": 550404
+          }
+        }
+      },
+      {
+        "tid": 2835166,
+        "name": "producer",
+        "phases": {
+          "memtable_publish": {
+            "calls": 733,
+            "cpu_ns": 3940215,
+            "samples": 12,
+            "wall_ns": 3973061
+          },
+          "mvcc_publish": {
+            "calls": 733,
+            "cpu_ns": 514080,
+            "samples": 12,
+            "wall_ns": 902215
+          }
+        }
+      }
+    ],
+    "original_phase_record": "target/rfc-026-v8-notification-split-20261102/cpu-00-baseline-16-phases.json",
+    "original_phase_sha256": "f7d8ec43d8e8fea52a4bdc42a972afaad09968c0b88a9dcb475cb085c8c4fe75"
+  },
+  "cpu-01-roles-16": {
+    "sample_rate": 64,
+    "inclusive": true,
+    "threads": [
+      {
+        "tid": 2835336,
+        "name": "producer",
+        "phases": {
+          "memtable_publish": {
+            "calls": 733,
+            "cpu_ns": 3435792,
+            "samples": 12,
+            "wall_ns": 3456861
+          },
+          "mvcc_publish": {
+            "calls": 733,
+            "cpu_ns": 1019896,
+            "samples": 12,
+            "wall_ns": 1126631
+          }
+        }
+      },
+      {
+        "tid": 2835334,
+        "name": "producer",
+        "phases": {
+          "memtable_publish": {
+            "calls": 733,
+            "cpu_ns": 3442846,
+            "samples": 12,
+            "wall_ns": 3496946
+          },
+          "mvcc_publish": {
+            "calls": 733,
+            "cpu_ns": 542506,
+            "samples": 12,
+            "wall_ns": 1235982
+          }
+        }
+      },
+      {
+        "tid": 2835329,
+        "name": "producer",
+        "phases": {
+          "memtable_publish": {
+            "calls": 733,
+            "cpu_ns": 3337794,
+            "samples": 12,
+            "wall_ns": 3361378
+          },
+          "mvcc_publish": {
+            "calls": 733,
+            "cpu_ns": 447055,
+            "samples": 12,
+            "wall_ns": 483266
+          }
+        }
+      },
+      {
+        "tid": 2835337,
+        "name": "producer",
+        "phases": {
+          "memtable_publish": {
+            "calls": 733,
+            "cpu_ns": 3069726,
+            "samples": 12,
+            "wall_ns": 3100326
+          },
+          "mvcc_publish": {
+            "calls": 733,
+            "cpu_ns": 611890,
+            "samples": 12,
+            "wall_ns": 1749167
+          }
+        }
+      },
+      {
+        "tid": 2835343,
+        "name": "producer",
+        "phases": {
+          "memtable_publish": {
+            "calls": 733,
+            "cpu_ns": 3468389,
+            "samples": 12,
+            "wall_ns": 3492828
+          },
+          "mvcc_publish": {
+            "calls": 733,
+            "cpu_ns": 457613,
+            "samples": 12,
+            "wall_ns": 517023
+          }
+        }
+      },
+      {
+        "tid": 2835341,
+        "name": "producer",
+        "phases": {
+          "memtable_publish": {
+            "calls": 733,
+            "cpu_ns": 3392247,
+            "samples": 12,
+            "wall_ns": 3424707
+          },
+          "mvcc_publish": {
+            "calls": 733,
+            "cpu_ns": 317212,
+            "samples": 12,
+            "wall_ns": 326181
+          }
+        }
+      },
+      {
+        "tid": 2835338,
+        "name": "producer",
+        "phases": {
+          "memtable_publish": {
+            "calls": 733,
+            "cpu_ns": 3327687,
+            "samples": 12,
+            "wall_ns": 3375112
+          },
+          "mvcc_publish": {
+            "calls": 733,
+            "cpu_ns": 1000860,
+            "samples": 12,
+            "wall_ns": 1087627
+          }
+        }
+      },
+      {
+        "tid": 2835328,
+        "name": "producer",
+        "phases": {
+          "memtable_publish": {
+            "calls": 733,
+            "cpu_ns": 3305759,
+            "samples": 12,
+            "wall_ns": 3354004
+          },
+          "mvcc_publish": {
+            "calls": 733,
+            "cpu_ns": 613657,
+            "samples": 12,
+            "wall_ns": 918459
+          }
+        }
+      },
+      {
+        "tid": 2835344,
+        "name": "producer",
+        "phases": {
+          "memtable_publish": {
+            "calls": 733,
+            "cpu_ns": 3544644,
+            "samples": 12,
+            "wall_ns": 3596699
+          },
+          "mvcc_publish": {
+            "calls": 733,
+            "cpu_ns": 228279,
+            "samples": 12,
+            "wall_ns": 237769
+          }
+        }
+      },
+      {
+        "tid": 2835331,
+        "name": "producer",
+        "phases": {
+          "memtable_publish": {
+            "calls": 733,
+            "cpu_ns": 3021155,
+            "samples": 12,
+            "wall_ns": 3055837
+          },
+          "mvcc_publish": {
+            "calls": 733,
+            "cpu_ns": 329921,
+            "samples": 12,
+            "wall_ns": 361990
+          }
+        }
+      },
+      {
+        "tid": 2835342,
+        "name": "producer",
+        "phases": {
+          "memtable_publish": {
+            "calls": 733,
+            "cpu_ns": 3867143,
+            "samples": 12,
+            "wall_ns": 3889998
+          },
+          "mvcc_publish": {
+            "calls": 733,
+            "cpu_ns": 311271,
+            "samples": 12,
+            "wall_ns": 320264
+          }
+        }
+      },
+      {
+        "tid": 2835332,
+        "name": "producer",
+        "phases": {
+          "memtable_publish": {
+            "calls": 733,
+            "cpu_ns": 3338721,
+            "samples": 12,
+            "wall_ns": 3359683
+          },
+          "mvcc_publish": {
+            "calls": 733,
+            "cpu_ns": 407737,
+            "samples": 12,
+            "wall_ns": 481252
+          }
+        }
+      },
+      {
+        "tid": 2835327,
+        "name": "producer",
+        "phases": {
+          "memtable_publish": {
+            "calls": 733,
+            "cpu_ns": 3476037,
+            "samples": 12,
+            "wall_ns": 3512359
+          },
+          "mvcc_publish": {
+            "calls": 733,
+            "cpu_ns": 560955,
+            "samples": 12,
+            "wall_ns": 570284
+          }
+        }
+      },
+      {
+        "tid": 2835335,
+        "name": "producer",
+        "phases": {
+          "memtable_publish": {
+            "calls": 733,
+            "cpu_ns": 3733114,
+            "samples": 12,
+            "wall_ns": 3754917
+          },
+          "mvcc_publish": {
+            "calls": 733,
+            "cpu_ns": 362371,
+            "samples": 12,
+            "wall_ns": 430121
+          }
+        }
+      },
+      {
+        "tid": 2835330,
+        "name": "producer",
+        "phases": {
+          "memtable_publish": {
+            "calls": 733,
+            "cpu_ns": 3574939,
+            "samples": 12,
+            "wall_ns": 3620896
+          },
+          "mvcc_publish": {
+            "calls": 733,
+            "cpu_ns": 324209,
+            "samples": 12,
+            "wall_ns": 403644
+          }
+        }
+      },
+      {
+        "tid": 2835333,
+        "name": "producer",
+        "phases": {
+          "memtable_publish": {
+            "calls": 733,
+            "cpu_ns": 3578381,
+            "samples": 12,
+            "wall_ns": 3626460
+          },
+          "mvcc_publish": {
+            "calls": 733,
+            "cpu_ns": 206901,
+            "samples": 12,
+            "wall_ns": 215919
+          }
+        }
+      }
+    ],
+    "original_phase_record": "target/rfc-026-v8-notification-split-20261102/cpu-01-roles-16-phases.json",
+    "original_phase_sha256": "5ea8c0538b93a957306b00e1478b31d0cabd59352b1b88edcdf367e871125d53"
+  },
+  "cpu-02-roles-16": {
+    "sample_rate": 64,
+    "inclusive": true,
+    "threads": [
+      {
+        "tid": 2835508,
+        "name": "producer",
+        "phases": {
+          "memtable_publish": {
+            "calls": 733,
+            "cpu_ns": 3298078,
+            "samples": 12,
+            "wall_ns": 3373021
+          },
+          "mvcc_publish": {
+            "calls": 733,
+            "cpu_ns": 1626679,
+            "samples": 12,
+            "wall_ns": 13307453
+          }
+        }
+      },
+      {
+        "tid": 2835504,
+        "name": "producer",
+        "phases": {
+          "memtable_publish": {
+            "calls": 733,
+            "cpu_ns": 3092000,
+            "samples": 12,
+            "wall_ns": 3143404
+          },
+          "mvcc_publish": {
+            "calls": 733,
+            "cpu_ns": 1422994,
+            "samples": 12,
+            "wall_ns": 12999596
+          }
+        }
+      },
+      {
+        "tid": 2835509,
+        "name": "producer",
+        "phases": {
+          "memtable_publish": {
+            "calls": 733,
+            "cpu_ns": 3201660,
+            "samples": 12,
+            "wall_ns": 3228891
+          },
+          "mvcc_publish": {
+            "calls": 733,
+            "cpu_ns": 2306076,
+            "samples": 12,
+            "wall_ns": 7079134
+          }
+        }
+      },
+      {
+        "tid": 2835501,
+        "name": "producer",
+        "phases": {
+          "memtable_publish": {
+            "calls": 733,
+            "cpu_ns": 3427588,
+            "samples": 12,
+            "wall_ns": 3465460
+          },
+          "mvcc_publish": {
+            "calls": 733,
+            "cpu_ns": 1322291,
+            "samples": 12,
+            "wall_ns": 3609173
+          }
+        }
+      },
+      {
+        "tid": 2835502,
+        "name": "producer",
+        "phases": {
+          "memtable_publish": {
+            "calls": 733,
+            "cpu_ns": 3631616,
+            "samples": 12,
+            "wall_ns": 3671569
+          },
+          "mvcc_publish": {
+            "calls": 733,
+            "cpu_ns": 781320,
+            "samples": 12,
+            "wall_ns": 1183039
+          }
+        }
+      },
+      {
+        "tid": 2835496,
+        "name": "producer",
+        "phases": {
+          "memtable_publish": {
+            "calls": 733,
+            "cpu_ns": 3258942,
+            "samples": 12,
+            "wall_ns": 3287777
+          },
+          "mvcc_publish": {
+            "calls": 733,
+            "cpu_ns": 1879116,
+            "samples": 12,
+            "wall_ns": 5352962
+          }
+        }
+      },
+      {
+        "tid": 2835499,
+        "name": "producer",
+        "phases": {
+          "memtable_publish": {
+            "calls": 733,
+            "cpu_ns": 3393169,
+            "samples": 12,
+            "wall_ns": 3434496
+          },
+          "mvcc_publish": {
+            "calls": 733,
+            "cpu_ns": 2370504,
+            "samples": 12,
+            "wall_ns": 16742026
+          }
+        }
+      },
+      {
+        "tid": 2835503,
+        "name": "producer",
+        "phases": {
+          "memtable_publish": {
+            "calls": 733,
+            "cpu_ns": 3147122,
+            "samples": 12,
+            "wall_ns": 3194019
+          },
+          "mvcc_publish": {
+            "calls": 733,
+            "cpu_ns": 3245007,
+            "samples": 12,
+            "wall_ns": 8381655
+          }
+        }
+      },
+      {
+        "tid": 2835507,
+        "name": "producer",
+        "phases": {
+          "memtable_publish": {
+            "calls": 733,
+            "cpu_ns": 3560319,
+            "samples": 12,
+            "wall_ns": 3630337
+          },
+          "mvcc_publish": {
+            "calls": 733,
+            "cpu_ns": 1703671,
+            "samples": 12,
+            "wall_ns": 15108430
+          }
+        }
+      },
+      {
+        "tid": 2835510,
+        "name": "producer",
+        "phases": {
+          "memtable_publish": {
+            "calls": 733,
+            "cpu_ns": 3583039,
+            "samples": 12,
+            "wall_ns": 3624301
+          },
+          "mvcc_publish": {
+            "calls": 733,
+            "cpu_ns": 804066,
+            "samples": 12,
+            "wall_ns": 3890006
+          }
+        }
+      },
+      {
+        "tid": 2835497,
+        "name": "producer",
+        "phases": {
+          "memtable_publish": {
+            "calls": 733,
+            "cpu_ns": 3315467,
+            "samples": 12,
+            "wall_ns": 3353122
+          },
+          "mvcc_publish": {
+            "calls": 733,
+            "cpu_ns": 949214,
+            "samples": 12,
+            "wall_ns": 1242254
+          }
+        }
+      },
+      {
+        "tid": 2835500,
+        "name": "producer",
+        "phases": {
+          "memtable_publish": {
+            "calls": 733,
+            "cpu_ns": 3312635,
+            "samples": 12,
+            "wall_ns": 3340728
+          },
+          "mvcc_publish": {
+            "calls": 733,
+            "cpu_ns": 1866013,
+            "samples": 12,
+            "wall_ns": 12596123
+          }
+        }
+      },
+      {
+        "tid": 2835506,
+        "name": "producer",
+        "phases": {
+          "memtable_publish": {
+            "calls": 733,
+            "cpu_ns": 3368895,
+            "samples": 12,
+            "wall_ns": 3408104
+          },
+          "mvcc_publish": {
+            "calls": 733,
+            "cpu_ns": 1119358,
+            "samples": 12,
+            "wall_ns": 10103171
+          }
+        }
+      },
+      {
+        "tid": 2835498,
+        "name": "producer",
+        "phases": {
+          "memtable_publish": {
+            "calls": 733,
+            "cpu_ns": 2964458,
+            "samples": 12,
+            "wall_ns": 3018974
+          },
+          "mvcc_publish": {
+            "calls": 733,
+            "cpu_ns": 1292612,
+            "samples": 12,
+            "wall_ns": 2953160
+          }
+        }
+      },
+      {
+        "tid": 2835505,
+        "name": "producer",
+        "phases": {
+          "memtable_publish": {
+            "calls": 733,
+            "cpu_ns": 3208862,
+            "samples": 12,
+            "wall_ns": 3263042
+          },
+          "mvcc_publish": {
+            "calls": 733,
+            "cpu_ns": 875213,
+            "samples": 12,
+            "wall_ns": 5711375
+          }
+        }
+      },
+      {
+        "tid": 2835511,
+        "name": "producer",
+        "phases": {
+          "memtable_publish": {
+            "calls": 733,
+            "cpu_ns": 3084412,
+            "samples": 12,
+            "wall_ns": 3109761
+          },
+          "mvcc_publish": {
+            "calls": 733,
+            "cpu_ns": 1353499,
+            "samples": 12,
+            "wall_ns": 3026237
+          }
+        }
+      }
+    ],
+    "original_phase_record": "target/rfc-026-v8-notification-split-20261102/cpu-02-roles-16-phases.json",
+    "original_phase_sha256": "e09f9f57eb5dc07b3d94ebf778229bbd661c3fa24b6f2c2f861ac8fd14f7d6ba"
+  },
+  "cpu-03-baseline-16": {
+    "sample_rate": 64,
+    "inclusive": true,
+    "threads": [
+      {
+        "tid": 2835798,
+        "name": "producer",
+        "phases": {
+          "memtable_publish": {
+            "calls": 733,
+            "cpu_ns": 3218453,
+            "samples": 12,
+            "wall_ns": 3258611
+          },
+          "mvcc_publish": {
+            "calls": 733,
+            "cpu_ns": 1516125,
+            "samples": 12,
+            "wall_ns": 7177925
+          }
+        }
+      },
+      {
+        "tid": 2835790,
+        "name": "producer",
+        "phases": {
+          "memtable_publish": {
+            "calls": 733,
+            "cpu_ns": 3583213,
+            "samples": 12,
+            "wall_ns": 3620863
+          },
+          "mvcc_publish": {
+            "calls": 733,
+            "cpu_ns": 313365,
+            "samples": 12,
+            "wall_ns": 469519
+          }
+        }
+      },
+      {
+        "tid": 2835788,
+        "name": "producer",
+        "phases": {
+          "memtable_publish": {
+            "calls": 733,
+            "cpu_ns": 3343856,
+            "samples": 12,
+            "wall_ns": 3419594
+          },
+          "mvcc_publish": {
+            "calls": 733,
+            "cpu_ns": 1472173,
+            "samples": 12,
+            "wall_ns": 7540187
+          }
+        }
+      },
+      {
+        "tid": 2835791,
+        "name": "producer",
+        "phases": {
+          "memtable_publish": {
+            "calls": 733,
+            "cpu_ns": 3348164,
+            "samples": 12,
+            "wall_ns": 3394869
+          },
+          "mvcc_publish": {
+            "calls": 733,
+            "cpu_ns": 851864,
+            "samples": 12,
+            "wall_ns": 4397276
+          }
+        }
+      },
+      {
+        "tid": 2835785,
+        "name": "producer",
+        "phases": {
+          "memtable_publish": {
+            "calls": 733,
+            "cpu_ns": 3321795,
+            "samples": 12,
+            "wall_ns": 3397684
+          },
+          "mvcc_publish": {
+            "calls": 733,
+            "cpu_ns": 1168801,
+            "samples": 12,
+            "wall_ns": 1656244
+          }
+        }
+      },
+      {
+        "tid": 2835794,
+        "name": "producer",
+        "phases": {
+          "memtable_publish": {
+            "calls": 733,
+            "cpu_ns": 3557863,
+            "samples": 12,
+            "wall_ns": 3602689
+          },
+          "mvcc_publish": {
+            "calls": 733,
+            "cpu_ns": 978773,
+            "samples": 12,
+            "wall_ns": 5057651
+          }
+        }
+      },
+      {
+        "tid": 2835786,
+        "name": "producer",
+        "phases": {
+          "memtable_publish": {
+            "calls": 733,
+            "cpu_ns": 3402144,
+            "samples": 12,
+            "wall_ns": 3444596
+          },
+          "mvcc_publish": {
+            "calls": 733,
+            "cpu_ns": 580201,
+            "samples": 12,
+            "wall_ns": 2050410
+          }
+        }
+      },
+      {
+        "tid": 2835793,
+        "name": "producer",
+        "phases": {
+          "memtable_publish": {
+            "calls": 733,
+            "cpu_ns": 3220463,
+            "samples": 12,
+            "wall_ns": 3275797
+          },
+          "mvcc_publish": {
+            "calls": 733,
+            "cpu_ns": 1937863,
+            "samples": 12,
+            "wall_ns": 16139186
+          }
+        }
+      },
+      {
+        "tid": 2835800,
+        "name": "producer",
+        "phases": {
+          "memtable_publish": {
+            "calls": 733,
+            "cpu_ns": 3702798,
+            "samples": 12,
+            "wall_ns": 3745502
+          },
+          "mvcc_publish": {
+            "calls": 733,
+            "cpu_ns": 1748024,
+            "samples": 12,
+            "wall_ns": 9703513
+          }
+        }
+      },
+      {
+        "tid": 2835787,
+        "name": "producer",
+        "phases": {
+          "memtable_publish": {
+            "calls": 733,
+            "cpu_ns": 3364889,
+            "samples": 12,
+            "wall_ns": 3393299
+          },
+          "mvcc_publish": {
+            "calls": 733,
+            "cpu_ns": 1802153,
+            "samples": 12,
+            "wall_ns": 17168292
+          }
+        }
+      },
+      {
+        "tid": 2835795,
+        "name": "producer",
+        "phases": {
+          "memtable_publish": {
+            "calls": 733,
+            "cpu_ns": 3681205,
+            "samples": 12,
+            "wall_ns": 3733118
+          },
+          "mvcc_publish": {
+            "calls": 733,
+            "cpu_ns": 1449656,
+            "samples": 12,
+            "wall_ns": 6543732
+          }
+        }
+      },
+      {
+        "tid": 2835801,
+        "name": "producer",
+        "phases": {
+          "memtable_publish": {
+            "calls": 733,
+            "cpu_ns": 3251630,
+            "samples": 12,
+            "wall_ns": 3283995
+          },
+          "mvcc_publish": {
+            "calls": 733,
+            "cpu_ns": 789036,
+            "samples": 12,
+            "wall_ns": 946453
+          }
+        }
+      },
+      {
+        "tid": 2835784,
+        "name": "producer",
+        "phases": {
+          "memtable_publish": {
+            "calls": 733,
+            "cpu_ns": 3376509,
+            "samples": 12,
+            "wall_ns": 3415850
+          },
+          "mvcc_publish": {
+            "calls": 733,
+            "cpu_ns": 1717210,
+            "samples": 12,
+            "wall_ns": 2900849
+          }
+        }
+      },
+      {
+        "tid": 2835799,
+        "name": "producer",
+        "phases": {
+          "memtable_publish": {
+            "calls": 733,
+            "cpu_ns": 3548158,
+            "samples": 12,
+            "wall_ns": 3607089
+          },
+          "mvcc_publish": {
+            "calls": 733,
+            "cpu_ns": 2298988,
+            "samples": 12,
+            "wall_ns": 17712013
+          }
+        }
+      },
+      {
+        "tid": 2835792,
+        "name": "producer",
+        "phases": {
+          "memtable_publish": {
+            "calls": 733,
+            "cpu_ns": 3540813,
+            "samples": 12,
+            "wall_ns": 3582822
+          },
+          "mvcc_publish": {
+            "calls": 733,
+            "cpu_ns": 2855138,
+            "samples": 12,
+            "wall_ns": 20804929
+          }
+        }
+      },
+      {
+        "tid": 2835789,
+        "name": "producer",
+        "phases": {
+          "memtable_publish": {
+            "calls": 733,
+            "cpu_ns": 3512072,
+            "samples": 12,
+            "wall_ns": 3541893
+          },
+          "mvcc_publish": {
+            "calls": 733,
+            "cpu_ns": 756499,
+            "samples": 12,
+            "wall_ns": 3576270
+          }
+        }
+      }
+    ],
+    "original_phase_record": "target/rfc-026-v8-notification-split-20261102/cpu-03-baseline-16-phases.json",
+    "original_phase_sha256": "0cf0ca183702830c2ae68d39eac6b3c49db3a28480c32d795b10a91474915849"
+  }
+}

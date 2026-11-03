@@ -1,0 +1,45 @@
+{
+  "reason": "Original perf records omit PERF_SAMPLE_CPU; omit unavailable CPU field for stack export, do not infer original CPU placement.",
+  "results": [
+    {
+      "sample": "00-diagnostic-v7-1",
+      "returncode": 0,
+      "bytes": 581608
+    },
+    {
+      "sample": "01-diagnostic-v8-1",
+      "returncode": 0,
+      "bytes": 539618
+    },
+    {
+      "sample": "02-diagnostic-v7-16",
+      "returncode": 0,
+      "bytes": 904138
+    },
+    {
+      "sample": "03-diagnostic-v8-16",
+      "returncode": 0,
+      "bytes": 1073248
+    },
+    {
+      "sample": "04-diagnostic-v8-16",
+      "returncode": 0,
+      "bytes": 1004959
+    },
+    {
+      "sample": "05-diagnostic-v7-16",
+      "returncode": 0,
+      "bytes": 579466
+    },
+    {
+      "sample": "06-diagnostic-v8-1",
+      "returncode": 0,
+      "bytes": 557565
+    },
+    {
+      "sample": "07-diagnostic-v7-1",
+      "returncode": 0,
+      "bytes": 753417
+    }
+  ]
+}

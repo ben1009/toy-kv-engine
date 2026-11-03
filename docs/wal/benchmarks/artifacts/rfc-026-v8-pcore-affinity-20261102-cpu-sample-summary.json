@@ -1,0 +1,285 @@
+{
+  "method": "Leaf-symbol counts from timed --sample-cpu cpu-clock:u recordings; kernel P=0-15, E=16-31. Time-weighted samples, not job/byte proportions. Ordered SHA subset matches thread IDs with measured V7 logical hashing.",
+  "samples": {
+    "16-diagnostic-v7-hybrid": {
+      "all": {
+        "P_samples": 1460,
+        "E_samples": 1089,
+        "E_pct": 42.722636327971756,
+        "threads": 20
+      },
+      "other": {
+        "P_samples": 960,
+        "E_samples": 989,
+        "E_pct": 50.743971267316574,
+        "threads": 20
+      },
+      "crc32": {
+        "P_samples": 81,
+        "E_samples": 60,
+        "E_pct": 42.5531914893617,
+        "threads": 17
+      },
+      "sha256": {
+        "P_samples": 419,
+        "E_samples": 40,
+        "E_pct": 8.714596949891067,
+        "threads": 2
+      },
+      "sha256_on_ordered_packer": {
+        "P_samples": 419,
+        "E_samples": 38,
+        "E_pct": 8.315098468271335,
+        "threads": 1
+      }
+    },
+    "17-diagnostic-v8-hybrid": {
+      "all": {
+        "P_samples": 1645,
+        "E_samples": 1945,
+        "E_pct": 54.17827298050139,
+        "threads": 18
+      },
+      "crc32": {
+        "P_samples": 102,
+        "E_samples": 69,
+        "E_pct": 40.35087719298246,
+        "threads": 16
+      },
+      "other": {
+        "P_samples": 1351,
+        "E_samples": 1608,
+        "E_pct": 54.34268333896587,
+        "threads": 18
+      },
+      "blake3_hash_many": {
+        "P_samples": 135,
+        "E_samples": 220,
+        "E_pct": 61.971830985915496,
+        "threads": 16
+      },
+      "blake3_other": {
+        "P_samples": 48,
+        "E_samples": 47,
+        "E_pct": 49.473684210526315,
+        "threads": 16
+      },
+      "sha256": {
+        "P_samples": 9,
+        "E_samples": 1,
+        "E_pct": 10.0,
+        "threads": 7
+      }
+    },
+    "18-diagnostic-v8-pcore": {
+      "all": {
+        "P_samples": 2666,
+        "E_samples": 0,
+        "E_pct": 0.0,
+        "threads": 18
+      },
+      "crc32": {
+        "P_samples": 128,
+        "E_samples": 0,
+        "E_pct": 0.0,
+        "threads": 16
+      },
+      "other": {
+        "P_samples": 2225,
+        "E_samples": 0,
+        "E_pct": 0.0,
+        "threads": 18
+      },
+      "blake3_hash_many": {
+        "P_samples": 254,
+        "E_samples": 0,
+        "E_pct": 0.0,
+        "threads": 16
+      },
+      "blake3_other": {
+        "P_samples": 54,
+        "E_samples": 0,
+        "E_pct": 0.0,
+        "threads": 16
+      },
+      "sha256": {
+        "P_samples": 5,
+        "E_samples": 0,
+        "E_pct": 0.0,
+        "threads": 3
+      }
+    },
+    "19-diagnostic-v7-pcore": {
+      "all": {
+        "P_samples": 3543,
+        "E_samples": 0,
+        "E_pct": 0.0,
+        "threads": 21
+      },
+      "sha256": {
+        "P_samples": 677,
+        "E_samples": 0,
+        "E_pct": 0.0,
+        "threads": 2
+      },
+      "sha256_on_ordered_packer": {
+        "P_samples": 675,
+        "E_samples": 0,
+        "E_pct": 0.0,
+        "threads": 1
+      },
+      "other": {
+        "P_samples": 2685,
+        "E_samples": 0,
+        "E_pct": 0.0,
+        "threads": 21
+      },
+      "crc32": {
+        "P_samples": 181,
+        "E_samples": 0,
+        "E_pct": 0.0,
+        "threads": 17
+      }
+    },
+    "20-diagnostic-v7-pcore": {
+      "all": {
+        "P_samples": 3533,
+        "E_samples": 0,
+        "E_pct": 0.0,
+        "threads": 19
+      },
+      "sha256": {
+        "P_samples": 659,
+        "E_samples": 0,
+        "E_pct": 0.0,
+        "threads": 2
+      },
+      "sha256_on_ordered_packer": {
+        "P_samples": 651,
+        "E_samples": 0,
+        "E_pct": 0.0,
+        "threads": 1
+      },
+      "other": {
+        "P_samples": 2673,
+        "E_samples": 0,
+        "E_pct": 0.0,
+        "threads": 19
+      },
+      "crc32": {
+        "P_samples": 201,
+        "E_samples": 0,
+        "E_pct": 0.0,
+        "threads": 17
+      }
+    },
+    "21-diagnostic-v8-pcore": {
+      "all": {
+        "P_samples": 3880,
+        "E_samples": 0,
+        "E_pct": 0.0,
+        "threads": 20
+      },
+      "crc32": {
+        "P_samples": 187,
+        "E_samples": 0,
+        "E_pct": 0.0,
+        "threads": 16
+      },
+      "other": {
+        "P_samples": 3291,
+        "E_samples": 0,
+        "E_pct": 0.0,
+        "threads": 20
+      },
+      "blake3_hash_many": {
+        "P_samples": 297,
+        "E_samples": 0,
+        "E_pct": 0.0,
+        "threads": 16
+      },
+      "blake3_other": {
+        "P_samples": 100,
+        "E_samples": 0,
+        "E_pct": 0.0,
+        "threads": 16
+      },
+      "sha256": {
+        "P_samples": 5,
+        "E_samples": 0,
+        "E_pct": 0.0,
+        "threads": 3
+      }
+    },
+    "22-diagnostic-v8-hybrid": {
+      "all": {
+        "P_samples": 2130,
+        "E_samples": 1805,
+        "E_pct": 45.870393900889454,
+        "threads": 19
+      },
+      "other": {
+        "P_samples": 1802,
+        "E_samples": 1493,
+        "E_pct": 45.311077389984824,
+        "threads": 19
+      },
+      "blake3_hash_many": {
+        "P_samples": 164,
+        "E_samples": 192,
+        "E_pct": 53.93258426966292,
+        "threads": 16
+      },
+      "crc32": {
+        "P_samples": 119,
+        "E_samples": 78,
+        "E_pct": 39.59390862944162,
+        "threads": 16
+      },
+      "blake3_other": {
+        "P_samples": 44,
+        "E_samples": 40,
+        "E_pct": 47.61904761904762,
+        "threads": 16
+      },
+      "sha256": {
+        "P_samples": 1,
+        "E_samples": 2,
+        "E_pct": 66.66666666666667,
+        "threads": 3
+      }
+    },
+    "23-diagnostic-v7-hybrid": {
+      "all": {
+        "P_samples": 1911,
+        "E_samples": 1680,
+        "E_pct": 46.78362573099415,
+        "threads": 20
+      },
+      "sha256": {
+        "P_samples": 454,
+        "E_samples": 125,
+        "E_pct": 21.58894645941278,
+        "threads": 2
+      },
+      "sha256_on_ordered_packer": {
+        "P_samples": 453,
+        "E_samples": 122,
+        "E_pct": 21.217391304347824,
+        "threads": 1
+      },
+      "other": {
+        "P_samples": 1385,
+        "E_samples": 1466,
+        "E_pct": 51.42055419151175,
+        "threads": 20
+      },
+      "crc32": {
+        "P_samples": 72,
+        "E_samples": 89,
+        "E_pct": 55.27950310559006,
+        "threads": 16
+      }
+    }
+  }
+}

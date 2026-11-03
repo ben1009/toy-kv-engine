@@ -1,0 +1,14 @@
+{
+  "decoded_trace_sha256": "0ef2d71676e5bdde82ff75cf2edae4f0e1fc5b2b45d496fb118869dc22f6bbc3",
+  "compressed_trace_sha256": "de989489f10ad2fc4040ce900308ae1ae804e158a5311cdb0dd16c14e7e0ad33",
+  "compressed_trace_bytes": 693673,
+  "decode_command": [
+    "perf",
+    "script",
+    "--ns",
+    "-i",
+    "storage-trace/perf.data"
+  ],
+  "raw_trace_retained_locally": true,
+  "raw_perf_bytes": 11242092
+}

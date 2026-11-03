@@ -1,0 +1,486 @@
+{
+  "runs": [
+    {
+      "name": "point-0-v7",
+      "format": "v7",
+      "workload": "point",
+      "trace_quality_ok": true,
+      "metadata": {
+        "lost": 0,
+        "record_counts": {
+          "69": 1,
+          "10": 3557,
+          "78": 5,
+          "73": 1,
+          "74": 1,
+          "17": 25,
+          "18": 24,
+          "7": 1058,
+          "3": 1063,
+          "82": 1,
+          "68": 359,
+          "9": 267918,
+          "4": 19
+        },
+        "event_counts": {
+          "nvme/nvme_setup_cmd": 61964,
+          "block/block_rq_issue": 61964,
+          "nvme/nvme_complete_rq": 61964,
+          "block/block_rq_complete": 82026
+        },
+        "clock": "CLOCK_MONOTONIC"
+      },
+      "matching_anomalies": {
+        "setup_without_completion": 0
+      },
+      "missing_events": [],
+      "matched_commands": 61964,
+      "post_flush_samples": 20060,
+      "eligible_post_flush_samples": 19673,
+      "ineligible_reasons": {
+        "other_process": 222,
+        "nonordinary_write_control": 219,
+        "overlapping_namespace_io": 15,
+        "uncalibrated_write_size": 157
+      },
+      "intervals": 26,
+      "eligible_intervals": 0,
+      "policy": {
+        "window_samples": 16,
+        "confirm_windows": 5,
+        "fast_below_us": 100,
+        "slow_above_us": 400,
+        "max_sample_gap_ns": 250000000,
+        "guard_ns": 20000000,
+        "signal_write_bytes": 4096,
+        "logical_block_bytes": 512,
+        "min_interval_ns": 250000000,
+        "min_percentile_samples": 100
+      },
+      "RFC_performance_qualified": false,
+      "scope": "Observed isolated 4KiB post-flush namespace-write latency, not independent proof of firmware state. Block events retained as context; partial completions are not naively paired."
+    },
+    {
+      "name": "point-1-v8",
+      "format": "v8",
+      "workload": "point",
+      "trace_quality_ok": true,
+      "metadata": {
+        "lost": 0,
+        "record_counts": {
+          "69": 1,
+          "10": 3518,
+          "78": 5,
+          "73": 1,
+          "74": 1,
+          "17": 25,
+          "18": 24,
+          "7": 1126,
+          "3": 1097,
+          "82": 1,
+          "68": 543,
+          "4": 87,
+          "9": 422062
+        },
+        "event_counts": {
+          "nvme/nvme_setup_cmd": 100489,
+          "block/block_rq_issue": 100489,
+          "nvme/nvme_complete_rq": 100489,
+          "block/block_rq_complete": 120595
+        },
+        "clock": "CLOCK_MONOTONIC"
+      },
+      "matching_anomalies": {
+        "setup_without_completion": 0
+      },
+      "missing_events": [],
+      "matched_commands": 100489,
+      "post_flush_samples": 20106,
+      "eligible_post_flush_samples": 1,
+      "ineligible_reasons": {
+        "other_process": 20104,
+        "nonordinary_write_control": 20104,
+        "overlapping_namespace_io": 11,
+        "uncalibrated_write_size": 1
+      },
+      "intervals": 38,
+      "eligible_intervals": 0,
+      "policy": {
+        "window_samples": 16,
+        "confirm_windows": 5,
+        "fast_below_us": 100,
+        "slow_above_us": 400,
+        "max_sample_gap_ns": 250000000,
+        "guard_ns": 20000000,
+        "signal_write_bytes": 4096,
+        "logical_block_bytes": 512,
+        "min_interval_ns": 250000000,
+        "min_percentile_samples": 100
+      },
+      "RFC_performance_qualified": false,
+      "scope": "Observed isolated 4KiB post-flush namespace-write latency, not independent proof of firmware state. Block events retained as context; partial completions are not naively paired."
+    },
+    {
+      "name": "point-2-v8",
+      "format": "v8",
+      "workload": "point",
+      "trace_quality_ok": true,
+      "metadata": {
+        "lost": 0,
+        "record_counts": {
+          "69": 1,
+          "10": 3698,
+          "78": 5,
+          "73": 1,
+          "74": 1,
+          "17": 25,
+          "18": 24,
+          "7": 1070,
+          "3": 1075,
+          "82": 1,
+          "68": 582,
+          "4": 30,
+          "9": 423119
+        },
+        "event_counts": {
+          "nvme/nvme_setup_cmd": 100754,
+          "block/block_rq_issue": 100754,
+          "nvme/nvme_complete_rq": 100754,
+          "block/block_rq_complete": 120857
+        },
+        "clock": "CLOCK_MONOTONIC"
+      },
+      "matching_anomalies": {
+        "setup_without_completion": 0
+      },
+      "missing_events": [],
+      "matched_commands": 100754,
+      "post_flush_samples": 20103,
+      "eligible_post_flush_samples": 1,
+      "ineligible_reasons": {
+        "other_process": 20100,
+        "nonordinary_write_control": 20099,
+        "overlapping_namespace_io": 16,
+        "uncalibrated_write_size": 1
+      },
+      "intervals": 17,
+      "eligible_intervals": 0,
+      "policy": {
+        "window_samples": 16,
+        "confirm_windows": 5,
+        "fast_below_us": 100,
+        "slow_above_us": 400,
+        "max_sample_gap_ns": 250000000,
+        "guard_ns": 20000000,
+        "signal_write_bytes": 4096,
+        "logical_block_bytes": 512,
+        "min_interval_ns": 250000000,
+        "min_percentile_samples": 100
+      },
+      "RFC_performance_qualified": false,
+      "scope": "Observed isolated 4KiB post-flush namespace-write latency, not independent proof of firmware state. Block events retained as context; partial completions are not naively paired."
+    },
+    {
+      "name": "point-3-v7",
+      "format": "v7",
+      "workload": "point",
+      "trace_quality_ok": true,
+      "metadata": {
+        "lost": 0,
+        "record_counts": {
+          "69": 1,
+          "10": 3656,
+          "78": 5,
+          "73": 1,
+          "74": 1,
+          "17": 25,
+          "18": 24,
+          "7": 1104,
+          "3": 1078,
+          "82": 1,
+          "68": 339,
+          "9": 267661,
+          "4": 61
+        },
+        "event_counts": {
+          "nvme/nvme_setup_cmd": 61900,
+          "block/block_rq_issue": 61900,
+          "nvme/nvme_complete_rq": 61900,
+          "block/block_rq_complete": 81961
+        },
+        "clock": "CLOCK_MONOTONIC"
+      },
+      "matching_anomalies": {
+        "setup_without_completion": 0
+      },
+      "missing_events": [],
+      "matched_commands": 61900,
+      "post_flush_samples": 20061,
+      "eligible_post_flush_samples": 19678,
+      "ineligible_reasons": {
+        "other_process": 220,
+        "nonordinary_write_control": 219,
+        "overlapping_namespace_io": 11,
+        "uncalibrated_write_size": 158
+      },
+      "intervals": 26,
+      "eligible_intervals": 0,
+      "policy": {
+        "window_samples": 16,
+        "confirm_windows": 5,
+        "fast_below_us": 100,
+        "slow_above_us": 400,
+        "max_sample_gap_ns": 250000000,
+        "guard_ns": 20000000,
+        "signal_write_bytes": 4096,
+        "logical_block_bytes": 512,
+        "min_interval_ns": 250000000,
+        "min_percentile_samples": 100
+      },
+      "RFC_performance_qualified": false,
+      "scope": "Observed isolated 4KiB post-flush namespace-write latency, not independent proof of firmware state. Block events retained as context; partial completions are not naively paired."
+    },
+    {
+      "name": "batch64-0-v7",
+      "format": "v7",
+      "workload": "batch64",
+      "trace_quality_ok": true,
+      "metadata": {
+        "lost": 0,
+        "record_counts": {
+          "69": 1,
+          "10": 3552,
+          "78": 5,
+          "73": 1,
+          "74": 1,
+          "17": 25,
+          "18": 24,
+          "7": 1452,
+          "3": 1389,
+          "82": 1,
+          "68": 116,
+          "4": 364,
+          "9": 77408
+        },
+        "event_counts": {
+          "nvme/nvme_setup_cmd": 18956,
+          "block/block_rq_issue": 18956,
+          "nvme/nvme_complete_rq": 18956,
+          "block/block_rq_complete": 20540
+        },
+        "clock": "CLOCK_MONOTONIC"
+      },
+      "matching_anomalies": {
+        "setup_without_completion": 0
+      },
+      "missing_events": [],
+      "matched_commands": 18956,
+      "post_flush_samples": 1584,
+      "eligible_post_flush_samples": 0,
+      "ineligible_reasons": {
+        "other_process": 1480,
+        "nonordinary_write_control": 1480,
+        "overlapping_namespace_io": 1079,
+        "uncalibrated_write_size": 102
+      },
+      "intervals": 8,
+      "eligible_intervals": 0,
+      "policy": {
+        "window_samples": 16,
+        "confirm_windows": 5,
+        "fast_below_us": 100,
+        "slow_above_us": 400,
+        "max_sample_gap_ns": 250000000,
+        "guard_ns": 20000000,
+        "signal_write_bytes": 4096,
+        "logical_block_bytes": 512,
+        "min_interval_ns": 250000000,
+        "min_percentile_samples": 100
+      },
+      "RFC_performance_qualified": false,
+      "scope": "Observed isolated 4KiB post-flush namespace-write latency, not independent proof of firmware state. Block events retained as context; partial completions are not naively paired."
+    },
+    {
+      "name": "batch64-1-v8",
+      "format": "v8",
+      "workload": "batch64",
+      "trace_quality_ok": true,
+      "metadata": {
+        "lost": 0,
+        "record_counts": {
+          "69": 1,
+          "10": 3412,
+          "78": 5,
+          "73": 1,
+          "74": 1,
+          "17": 25,
+          "18": 24,
+          "7": 1376,
+          "3": 1368,
+          "82": 1,
+          "68": 96,
+          "4": 290,
+          "9": 73436
+        },
+        "event_counts": {
+          "nvme/nvme_setup_cmd": 17968,
+          "block/block_rq_issue": 17968,
+          "nvme/nvme_complete_rq": 17968,
+          "block/block_rq_complete": 19532
+        },
+        "clock": "CLOCK_MONOTONIC"
+      },
+      "matching_anomalies": {
+        "setup_without_completion": 0
+      },
+      "missing_events": [],
+      "matched_commands": 17968,
+      "post_flush_samples": 1564,
+      "eligible_post_flush_samples": 1,
+      "ineligible_reasons": {
+        "other_process": 1491,
+        "nonordinary_write_control": 1490,
+        "overlapping_namespace_io": 732,
+        "uncalibrated_write_size": 73
+      },
+      "intervals": 9,
+      "eligible_intervals": 0,
+      "policy": {
+        "window_samples": 16,
+        "confirm_windows": 5,
+        "fast_below_us": 100,
+        "slow_above_us": 400,
+        "max_sample_gap_ns": 250000000,
+        "guard_ns": 20000000,
+        "signal_write_bytes": 4096,
+        "logical_block_bytes": 512,
+        "min_interval_ns": 250000000,
+        "min_percentile_samples": 100
+      },
+      "RFC_performance_qualified": false,
+      "scope": "Observed isolated 4KiB post-flush namespace-write latency, not independent proof of firmware state. Block events retained as context; partial completions are not naively paired."
+    },
+    {
+      "name": "batch64-2-v8",
+      "format": "v8",
+      "workload": "batch64",
+      "trace_quality_ok": true,
+      "metadata": {
+        "lost": 0,
+        "record_counts": {
+          "69": 1,
+          "10": 3409,
+          "78": 5,
+          "73": 1,
+          "74": 1,
+          "17": 25,
+          "18": 24,
+          "7": 1376,
+          "3": 1362,
+          "82": 1,
+          "68": 99,
+          "4": 289,
+          "9": 73527
+        },
+        "event_counts": {
+          "nvme/nvme_setup_cmd": 17989,
+          "block/block_rq_issue": 17989,
+          "nvme/nvme_complete_rq": 17989,
+          "block/block_rq_complete": 19560
+        },
+        "clock": "CLOCK_MONOTONIC"
+      },
+      "matching_anomalies": {
+        "setup_without_completion": 0
+      },
+      "missing_events": [],
+      "matched_commands": 17989,
+      "post_flush_samples": 1571,
+      "eligible_post_flush_samples": 1,
+      "ineligible_reasons": {
+        "other_process": 1493,
+        "nonordinary_write_control": 1492,
+        "overlapping_namespace_io": 760,
+        "uncalibrated_write_size": 78
+      },
+      "intervals": 8,
+      "eligible_intervals": 0,
+      "policy": {
+        "window_samples": 16,
+        "confirm_windows": 5,
+        "fast_below_us": 100,
+        "slow_above_us": 400,
+        "max_sample_gap_ns": 250000000,
+        "guard_ns": 20000000,
+        "signal_write_bytes": 4096,
+        "logical_block_bytes": 512,
+        "min_interval_ns": 250000000,
+        "min_percentile_samples": 100
+      },
+      "RFC_performance_qualified": false,
+      "scope": "Observed isolated 4KiB post-flush namespace-write latency, not independent proof of firmware state. Block events retained as context; partial completions are not naively paired."
+    },
+    {
+      "name": "batch64-3-v7",
+      "format": "v7",
+      "workload": "batch64",
+      "trace_quality_ok": true,
+      "metadata": {
+        "lost": 0,
+        "record_counts": {
+          "69": 1,
+          "10": 3552,
+          "78": 5,
+          "73": 1,
+          "74": 1,
+          "17": 25,
+          "18": 24,
+          "7": 1321,
+          "3": 1305,
+          "82": 1,
+          "68": 105,
+          "4": 233,
+          "9": 74394
+        },
+        "event_counts": {
+          "nvme/nvme_setup_cmd": 18239,
+          "block/block_rq_issue": 18239,
+          "nvme/nvme_complete_rq": 18239,
+          "block/block_rq_complete": 19677
+        },
+        "clock": "CLOCK_MONOTONIC"
+      },
+      "matching_anomalies": {
+        "setup_without_completion": 0
+      },
+      "missing_events": [],
+      "matched_commands": 18239,
+      "post_flush_samples": 1438,
+      "eligible_post_flush_samples": 1,
+      "ineligible_reasons": {
+        "other_process": 1390,
+        "nonordinary_write_control": 1390,
+        "overlapping_namespace_io": 1034,
+        "uncalibrated_write_size": 47
+      },
+      "intervals": 2,
+      "eligible_intervals": 0,
+      "policy": {
+        "window_samples": 16,
+        "confirm_windows": 5,
+        "fast_below_us": 100,
+        "slow_above_us": 400,
+        "max_sample_gap_ns": 250000000,
+        "guard_ns": 20000000,
+        "signal_write_bytes": 4096,
+        "logical_block_bytes": 512,
+        "min_interval_ns": 250000000,
+        "min_percentile_samples": 100
+      },
+      "RFC_performance_qualified": false,
+      "scope": "Observed isolated 4KiB post-flush namespace-write latency, not independent proof of firmware state. Block events retained as context; partial completions are not naively paired."
+    }
+  ],
+  "RFC_performance_qualified": false,
+  "scope": "No cross-format ratio: this command exports time intervals, not a winner selection."
+}

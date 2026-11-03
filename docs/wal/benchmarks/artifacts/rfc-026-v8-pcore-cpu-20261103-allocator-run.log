@@ -1,0 +1,10 @@
+COOLDOWN 15s
+START 00-system
+{"name": "00-system", "puts_s": 194610.52821903402, "p99_ms": 25.883523, "cpu_s": 8.458890000000002, "syncs": 1205, "mean_sync_ms": 1.7323726580912862, "storage_flag": true, "diagnostic_only": true}
+START 01-mimalloc
+{"name": "01-mimalloc", "puts_s": 102297.95744111254, "p99_ms": 29.314527, "cpu_s": 10.47951, "syncs": 1546, "mean_sync_ms": 2.5142453065976715, "storage_flag": true, "diagnostic_only": true}
+START 02-mimalloc
+{"name": "02-mimalloc", "puts_s": 104534.33396950341, "p99_ms": 30.927379, "cpu_s": 10.183802, "syncs": 1553, "mean_sync_ms": 2.423478411461687, "storage_flag": true, "diagnostic_only": true}
+START 03-system
+{"name": "03-system", "puts_s": 103547.70698354345, "p99_ms": 26.887857, "cpu_s": 11.241131000000001, "syncs": 1590, "mean_sync_ms": 2.461684231446541, "storage_flag": true, "diagnostic_only": true}
+DONE

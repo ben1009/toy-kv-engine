@@ -10,8 +10,10 @@ segment.
 On the 16-writer batch-64 ext4 screen, the 32-ticket candidate formed fewer
 durability groups and showed higher throughput and lower p99 latency than the
 8-ticket control. Keep this as a provisional V8 Parallel optimization. This
-small screen is not RFC 026 performance qualification and does not change the
-v7 default or enable V8 for normal database creation.
+small screen is not RFC 026 performance qualification. It did not change the
+then-current V7 default. On 2026-11-03, the maintainer selected V8 as the
+default for new PITR WALs despite the unqualified performance matrix; see the
+[adoption note](../rfc-026-v8-default-20261103.md).
 
 ## Method
 

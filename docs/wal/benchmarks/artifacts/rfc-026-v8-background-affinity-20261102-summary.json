@@ -1,0 +1,69 @@
+{
+  "samples": 24,
+  "flagged": 22,
+  "groups": [
+    {
+      "mode": "writers",
+      "total": 4,
+      "eligible": 0,
+      "best_eligible": null,
+      "median_eligible": null
+    },
+    {
+      "mode": "kernel_only",
+      "total": 4,
+      "eligible": 0,
+      "best_eligible": null,
+      "median_eligible": null
+    },
+    {
+      "mode": "io",
+      "total": 4,
+      "eligible": 0,
+      "best_eligible": null,
+      "median_eligible": null
+    },
+    {
+      "mode": "reaper",
+      "total": 4,
+      "eligible": 0,
+      "best_eligible": null,
+      "median_eligible": null
+    },
+    {
+      "mode": "userspace",
+      "total": 4,
+      "eligible": 2,
+      "best_eligible": {
+        "name": "07-v8-userspace",
+        "puts_s": 667497.4274382148,
+        "p99_ms": 3.393822,
+        "cpu_s": 5.872962000000001,
+        "context": {
+          "involuntary": 710,
+          "voluntary": 92226
+        },
+        "syncs": 942,
+        "mean_sync_ms": 0.40769191932059445,
+        "payload_hash_cpu_estimated_s": 0.5597885943478261,
+        "ordered_link_cpu_estimated_s": 0.00841203547826087
+      },
+      "median_eligible": {
+        "puts_s": 648150.1755078277,
+        "p99_ms": 3.8010195,
+        "cpu_s": 6.286708500000001,
+        "payload_hash_cpu_estimated_s": 0.602344662173913
+      }
+    },
+    {
+      "mode": "whole",
+      "total": 4,
+      "eligible": 0,
+      "best_eligible": null,
+      "median_eligible": null
+    }
+  ],
+  "runtime_changed": false,
+  "binary_sha256": "2ee0a92c06ff4d1f69937fb1bfe0130582b3a679c1b5730fa0c4110bb22578f1",
+  "scope": "One new executable for six cumulative placement modes; all masks audited and io-wq registration explicitly verified. Historical scores are context only. No production affinity change."
+}

@@ -1,0 +1,263 @@
+{
+  "guard-repeat-plan.json": {
+    "schedule": [
+      [
+        "point",
+        16,
+        20000,
+        "candidate"
+      ],
+      [
+        "point",
+        16,
+        20000,
+        "baseline"
+      ],
+      [
+        "batch",
+        1,
+        750000,
+        "candidate"
+      ],
+      [
+        "batch",
+        1,
+        750000,
+        "baseline"
+      ],
+      [
+        "point",
+        1,
+        5000,
+        "baseline"
+      ],
+      [
+        "point",
+        1,
+        5000,
+        "candidate"
+      ]
+    ],
+    "stall_flags": "p99>10ms or mean sync>1ms; retain all raw samples"
+  },
+  "guards-plan.json": {
+    "schedule": [
+      [
+        "batch",
+        1,
+        750000,
+        "baseline"
+      ],
+      [
+        "batch",
+        1,
+        750000,
+        "candidate"
+      ],
+      [
+        "point",
+        8,
+        20000,
+        "candidate"
+      ],
+      [
+        "point",
+        8,
+        20000,
+        "baseline"
+      ],
+      [
+        "point",
+        8,
+        20000,
+        "baseline"
+      ],
+      [
+        "point",
+        8,
+        20000,
+        "candidate"
+      ],
+      [
+        "point",
+        16,
+        20000,
+        "baseline"
+      ],
+      [
+        "point",
+        16,
+        20000,
+        "candidate"
+      ],
+      [
+        "point",
+        1,
+        5000,
+        "candidate"
+      ],
+      [
+        "point",
+        1,
+        5000,
+        "baseline"
+      ]
+    ],
+    "stall_flags": "p99>10ms or mean sync>1ms; retain all raw samples"
+  },
+  "confirmation-plan.json": {
+    "schedule": [
+      [
+        "batch",
+        1,
+        750000,
+        "baseline"
+      ],
+      [
+        "batch",
+        1,
+        750000,
+        "candidate-final"
+      ],
+      [
+        "batch",
+        8,
+        750000,
+        "candidate-final"
+      ],
+      [
+        "batch",
+        8,
+        750000,
+        "baseline"
+      ]
+    ],
+    "stall_flags": "p99>10ms or mean sync>1ms; retain all raw samples"
+  },
+  "final-plan.json": {
+    "schedule": [
+      [
+        "batch",
+        1,
+        750000,
+        "candidate-final"
+      ],
+      [
+        "batch",
+        1,
+        750000,
+        "baseline"
+      ],
+      [
+        "batch",
+        8,
+        750000,
+        "baseline"
+      ],
+      [
+        "batch",
+        8,
+        750000,
+        "candidate-final"
+      ],
+      [
+        "batch",
+        16,
+        750000,
+        "candidate-final"
+      ],
+      [
+        "batch",
+        16,
+        750000,
+        "baseline"
+      ],
+      [
+        "point",
+        1,
+        5000,
+        "baseline"
+      ],
+      [
+        "point",
+        1,
+        5000,
+        "candidate-final"
+      ],
+      [
+        "point",
+        8,
+        20000,
+        "candidate-final"
+      ],
+      [
+        "point",
+        8,
+        20000,
+        "baseline"
+      ],
+      [
+        "point",
+        16,
+        20000,
+        "baseline"
+      ],
+      [
+        "point",
+        16,
+        20000,
+        "candidate-final"
+      ]
+    ],
+    "stall_flags": "p99>10ms or mean sync>1ms; retain all raw samples"
+  },
+  "plan.json": {
+    "workload": "batch64, 750000 puts, 1024-byte values, PITR V8 Parallel, ext4, 2GiB target SST, no compaction",
+    "schedule": [
+      [
+        8,
+        "candidate"
+      ],
+      [
+        8,
+        "baseline"
+      ],
+      [
+        8,
+        "baseline"
+      ],
+      [
+        8,
+        "candidate"
+      ],
+      [
+        16,
+        "baseline"
+      ],
+      [
+        16,
+        "candidate"
+      ],
+      [
+        16,
+        "candidate"
+      ],
+      [
+        16,
+        "baseline"
+      ]
+    ],
+    "stall_flags": "flag p99 >10ms OR mean fdatasync >1ms; preserve every result; no replacements",
+    "retention": "require improved throughput and p99 on non-stall matched evidence; qualify point/solo if promising",
+    "binaries": {
+      "baseline": "be27fc427f65450d8d7c942b5b1750f213729d164c924f51d15a29776c472827",
+      "candidate": "4f3f9541a1e8300ea7c306012b56b5ae3df7b2b259d9761eeeca78623fed3419"
+    }
+  },
+  "binary_sha256": {
+    "baseline": "be27fc427f65450d8d7c942b5b1750f213729d164c924f51d15a29776c472827",
+    "candidate": "4f3f9541a1e8300ea7c306012b56b5ae3df7b2b259d9761eeeca78623fed3419",
+    "candidate-final": "97e69480b1c0faccc36d11406801b1373cc5b35974dc749d5d6f6f2c4bcdee68"
+  },
+  "paused_final_sequence": "After final-00, paused runner while final-01 child completed, then resumed following a 30-second cooldown. I/O PSI avg10 fell from ~10% to 0.06%. Raw stalled results remain included."
+}

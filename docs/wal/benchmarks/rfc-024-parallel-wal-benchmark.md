@@ -1,12 +1,18 @@
 # RFC 024: Parallel WAL benchmark outcomes
 
-**Current status (2026-10-06):** Ordinary v4 WALs use parallel I/O by
+**Status as of 2026-10-06:** Ordinary v4 WALs use parallel I/O by
 maintainer decision; PITR and legacy formats retain their existing paths.
 The [default adoption note](../rfc-024-parallel-wal-default-20261005.md) records
 the scope and accepted limits. The retained backend has 32 in-flight group
 slots, 256 ring entries, bounded completion drain, and optional cutoff refresh
 within the unchanged 400-microsecond deadline. The full RFC performance gate
 remains **UNQUALIFIED**.
+
+Current PITR defaults have since changed: new PITR WALs use V8 Parallel by
+maintainer decision, while ordinary WALs remain V4 Parallel. The
+[V8 adoption note](../rfc-026-v8-default-20261103.md) records the change and
+the still-unqualified performance matrix. The results below remain historical
+V4/V7 measurements.
 
 ## Latest direct comparisons
 
@@ -622,12 +628,14 @@ completed on both filesystems: tmpfs measured 164,470 ops/s with p50/p99
 `1.1292/2.6707 ms`. At the time of that run, candidate mode was rejected with
 `--pitr`; these results are a v6 historical control, not a v7 comparison.
 
-The current `write-perf` harness supports the v6/v7 comparison controls below.
-PITR defaults to v7 Parallel; v6 defaults to Leader and rejects Parallel. V7
-accepts either scheduler so the format and I/O mode can be compared
-independently. The harness records the Active WAL format version and I/O mode
-reported by PITR status in each comparison result. A run that requested v7 but
-could not migrate because of capacity fails instead of being labeled v7.
+At the time of this V4/V7 benchmark, the `write-perf` harness supported the
+v6/v7 comparison controls below and PITR defaulted to v7 Parallel; v6 defaulted
+to Leader and rejected Parallel. V7 accepted either scheduler so the format and
+I/O mode could be compared independently. The harness recorded the Active WAL
+format version and I/O mode reported by PITR status in each comparison result.
+A run that requested v7 but could not migrate because of capacity failed
+instead of being labeled v7. New PITR WALs now default to V8 as described in
+the [adoption note](../rfc-026-v8-default-20261103.md).
 The default PITR preset uses 20,000 entries. Segment sizing includes the file
 header, generation-zero marker, DATA fragmentation, and one FRONTIER for each
 planned commit without assuming coalescing. It accounts for the effective batch

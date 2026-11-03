@@ -1,0 +1,9 @@
+{
+  "source_hashes_restored": true,
+  "runtime_diff_empty": true,
+  "instrumentation_kept": false,
+  "two_source_files_restored": [
+    "kv-engine/src/bin/write-perf.rs",
+    "kv-engine/src/wal/parallel/worker.rs"
+  ]
+}

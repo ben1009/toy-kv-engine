@@ -26,6 +26,28 @@ pub const MAX_VERIFY_PAGE_SIZE: NonZeroUsize = NonZeroUsize::new(4096).unwrap();
 pub const MAX_VERIFY_SAMPLED_TARGETS: NonZeroUsize = NonZeroUsize::new(4096).unwrap();
 pub const DEFAULT_PITR_ARCHIVE_BURST_BYTES: NonZeroU64 = NonZeroU64::new(1024 * 1024).unwrap();
 
+/// Preferred format for newly enabled PITR and eligible format migrations.
+///
+/// Existing segments retain their encoded format. Older formats remain
+/// selectable for comparisons; selecting them never downgrades an Active WAL.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PitrWriterFormat {
+    V6,
+    V7,
+    #[default]
+    V8,
+}
+
+impl PitrWriterFormat {
+    pub const fn version(self) -> u16 {
+        match self {
+            Self::V6 => 6,
+            Self::V7 => 7,
+            Self::V8 => 8,
+        }
+    }
+}
+
 /// Eagerly dispatched asynchronous PITR operation.
 ///
 /// The synchronous state machine remains authoritative. The task runs it on

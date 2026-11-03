@@ -108,7 +108,7 @@ impl V7MigrationCapacity {
 /// Read-only capacity estimate for transitioning a v7 Active segment to v8.
 ///
 /// This estimate does not reserve resources or authorize a format handoff. A
-/// future transition must stop admission, refresh the source image and retained
+/// transition must stop admission, refresh the source image and retained
 /// allocation measurements, and atomically reserve the resulting charge before
 /// publishing durable migration intent.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

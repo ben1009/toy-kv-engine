@@ -1,0 +1,12 @@
+{
+  "captures": 4,
+  "storage_eligible": 0,
+  "jointly_eligible_pairs": [
+    false,
+    false
+  ],
+  "RFC_performance_qualified": false,
+  "scope": "150k-put diagnostic: workload reduced by 80%; same binary, batch64, roles, device and thresholds. Not a sustained SSD or V4/V7 parity score.",
+  "runtime_changed": false,
+  "device_settings_changed": false
+}

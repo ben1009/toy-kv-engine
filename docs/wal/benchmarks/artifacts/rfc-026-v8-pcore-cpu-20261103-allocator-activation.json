@@ -1,0 +1,12 @@
+{
+  "mi_version_raw": 224,
+  "library_sha256": "0480b3b2de1eea334388482e4e8554a318e0887d717a0dd684a8df74dce462bb",
+  "symbols": {
+    "malloc": "/usr/lib/libmimalloc.so.2",
+    "calloc": "/usr/lib/libmimalloc.so.2",
+    "realloc": "/usr/lib/libmimalloc.so.2",
+    "free": "/usr/lib/libmimalloc.so.2",
+    "posix_memalign": "/usr/lib/libmimalloc.so.2"
+  },
+  "aligned_allocation_contents_and_matching_free_pass": true
+}

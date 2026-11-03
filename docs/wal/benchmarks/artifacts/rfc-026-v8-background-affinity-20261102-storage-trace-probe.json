@@ -1,0 +1,484 @@
+{
+  "pid": 2929107,
+  "allowed_cpus": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15
+  ],
+  "filesystem": "same local ext4 as WAL captures",
+  "path": "/home/liu/proj/toy-kv-engine/target/rfc-026-v8-background-affinity-20261102/storage-trace/standalone-direct-probe.data",
+  "initialized_file_bytes": 8388608,
+  "block_bytes": 4096,
+  "operations_per_phase": 8192,
+  "scope": "Synchronous Python os.pwrite/preadv O_DIRECT and fdatasync; no engine, io_uring, MVCC, memtable, WAL coordinator, or affinity-registration hook. Diagnostic only, not an adoption score.",
+  "phases": [
+    {
+      "phase": "sync-every-four-first",
+      "elapsed_s": 2.521734322,
+      "ops_s": 3248.5579184657663,
+      "operation": {
+        "count": 8192,
+        "mean_us": 242.4573897705078,
+        "p50_us": 19.041,
+        "p99_us": 649.51,
+        "max_us": 20414.832,
+        "over_1ms": 67,
+        "over_5ms": 67
+      },
+      "sync": {
+        "count": 2048,
+        "mean_us": 255.40244921875,
+        "p50_us": 225.289,
+        "p99_us": 543.838,
+        "max_us": 720.112,
+        "over_1ms": 0,
+        "over_5ms": 0
+      },
+      "diskstats_delta": {
+        "reads": 0,
+        "reads_merged": 0,
+        "sectors_read": 0,
+        "read_ms": 0,
+        "writes": 10241,
+        "writes_merged": 0,
+        "sectors_written": 65544,
+        "write_ms": 2417,
+        "io_ms": 2416,
+        "weighted_io_ms": 2923,
+        "discards": 0,
+        "discards_merged": 0,
+        "sectors_discarded": 0,
+        "discard_ms": 0,
+        "flushes": 2048,
+        "flush_ms": 506
+      },
+      "cpu_s": 0.09485899999999998,
+      "context": {
+        "voluntary": 10238,
+        "involuntary": 1846
+      },
+      "slowest_operations": [
+        {
+          "index": 5000,
+          "offset": 3702784,
+          "duration_ns": 20414832
+        },
+        {
+          "index": 4968,
+          "offset": 3571712,
+          "duration_ns": 15280859
+        },
+        {
+          "index": 8036,
+          "offset": 7749632,
+          "duration_ns": 15230311
+        },
+        {
+          "index": 1900,
+          "offset": 7782400,
+          "duration_ns": 15028771
+        },
+        {
+          "index": 4840,
+          "offset": 3047424,
+          "duration_ns": 9884062
+        },
+        {
+          "index": 8068,
+          "offset": 7880704,
+          "duration_ns": 9839703
+        },
+        {
+          "index": 7908,
+          "offset": 7225344,
+          "duration_ns": 9441418
+        },
+        {
+          "index": 5988,
+          "offset": 7749632,
+          "duration_ns": 9429647
+        },
+        {
+          "index": 1772,
+          "offset": 7258112,
+          "duration_ns": 9368887
+        },
+        {
+          "index": 3944,
+          "offset": 7766016,
+          "duration_ns": 9310694
+        },
+        {
+          "index": 1932,
+          "offset": 7913472,
+          "duration_ns": 9225091
+        },
+        {
+          "index": 8164,
+          "offset": 8273920,
+          "duration_ns": 8795307
+        },
+        {
+          "index": 876,
+          "offset": 3588096,
+          "duration_ns": 8762699
+        },
+        {
+          "index": 748,
+          "offset": 3063808,
+          "duration_ns": 8736995
+        },
+        {
+          "index": 2920,
+          "offset": 3571712,
+          "duration_ns": 8644220
+        },
+        {
+          "index": 7012,
+          "offset": 3555328,
+          "duration_ns": 8579771
+        },
+        {
+          "index": 2536,
+          "offset": 1998848,
+          "duration_ns": 8561897
+        },
+        {
+          "index": 620,
+          "offset": 2539520,
+          "duration_ns": 8516228
+        },
+        {
+          "index": 5352,
+          "offset": 5144576,
+          "duration_ns": 8514630
+        },
+        {
+          "index": 5096,
+          "offset": 4096000,
+          "duration_ns": 8505066
+        }
+      ]
+    },
+    {
+      "phase": "write-without-periodic-sync",
+      "elapsed_s": 0.287535349,
+      "ops_s": 28490.410060851336,
+      "operation": {
+        "count": 8192,
+        "mean_us": 34.01892443847656,
+        "p50_us": 16.241,
+        "p99_us": 24.971,
+        "max_us": 9835.274,
+        "over_1ms": 16,
+        "over_5ms": 16
+      },
+      "sync": null,
+      "diskstats_delta": {
+        "reads": 0,
+        "reads_merged": 0,
+        "sectors_read": 0,
+        "read_ms": 0,
+        "writes": 8192,
+        "writes_merged": 0,
+        "sectors_written": 65536,
+        "write_ms": 216,
+        "io_ms": 184,
+        "weighted_io_ms": 216,
+        "discards": 0,
+        "discards_merged": 0,
+        "sectors_discarded": 0,
+        "discard_ms": 0,
+        "flushes": 0,
+        "flush_ms": 0
+      },
+      "cpu_s": 0.052664,
+      "context": {
+        "voluntary": 8191,
+        "involuntary": 0
+      },
+      "slowest_operations": [
+        {
+          "index": 7435,
+          "offset": 5287936,
+          "duration_ns": 9835274
+        },
+        {
+          "index": 5419,
+          "offset": 5419008,
+          "duration_ns": 9436238
+        },
+        {
+          "index": 5923,
+          "offset": 7483392,
+          "duration_ns": 9386462
+        },
+        {
+          "index": 3403,
+          "offset": 5550080,
+          "duration_ns": 9199866
+        },
+        {
+          "index": 6427,
+          "offset": 1159168,
+          "duration_ns": 9142573
+        },
+        {
+          "index": 4411,
+          "offset": 1290240,
+          "duration_ns": 9141822
+        },
+        {
+          "index": 3907,
+          "offset": 7614464,
+          "duration_ns": 9133031
+        },
+        {
+          "index": 1401,
+          "offset": 5738496,
+          "duration_ns": 9093636
+        },
+        {
+          "index": 897,
+          "offset": 3674112,
+          "duration_ns": 9015723
+        },
+        {
+          "index": 1890,
+          "offset": 7741440,
+          "duration_ns": 9012042
+        },
+        {
+          "index": 393,
+          "offset": 1609728,
+          "duration_ns": 8999630
+        },
+        {
+          "index": 4915,
+          "offset": 3354624,
+          "duration_ns": 8957312
+        },
+        {
+          "index": 2899,
+          "offset": 3485696,
+          "duration_ns": 8952369
+        },
+        {
+          "index": 2395,
+          "offset": 1421312,
+          "duration_ns": 8941576
+        },
+        {
+          "index": 6931,
+          "offset": 3223552,
+          "duration_ns": 8912909
+        },
+        {
+          "index": 7939,
+          "offset": 7352320,
+          "duration_ns": 8791668
+        }
+      ]
+    },
+    {
+      "phase": "direct-read",
+      "elapsed_s": 0.204713971,
+      "ops_s": 40016.809600161585,
+      "operation": {
+        "count": 8192,
+        "mean_us": 24.23942529296875,
+        "p50_us": 23.644,
+        "p99_us": 65.033,
+        "max_us": 370.531,
+        "over_1ms": 0,
+        "over_5ms": 0
+      },
+      "sync": null,
+      "diskstats_delta": {
+        "reads": 8192,
+        "reads_merged": 0,
+        "sectors_read": 65536,
+        "read_ms": 152,
+        "writes": 0,
+        "writes_merged": 0,
+        "sectors_written": 0,
+        "write_ms": 0,
+        "io_ms": 140,
+        "weighted_io_ms": 152,
+        "discards": 0,
+        "discards_merged": 0,
+        "sectors_discarded": 0,
+        "discard_ms": 0,
+        "flushes": 0,
+        "flush_ms": 0
+      },
+      "cpu_s": 0.03884599999999999,
+      "context": {
+        "voluntary": 8192,
+        "involuntary": 0
+      },
+      "slowest_operations": []
+    },
+    {
+      "phase": "sync-every-four-second",
+      "elapsed_s": 2.519857687,
+      "ops_s": 3250.9772445732565,
+      "operation": {
+        "count": 8192,
+        "mean_us": 243.003296875,
+        "p50_us": 16.893,
+        "p99_us": 646.854,
+        "max_us": 15353.105,
+        "over_1ms": 68,
+        "over_5ms": 68
+      },
+      "sync": {
+        "count": 2048,
+        "mean_us": 252.98594775390626,
+        "p50_us": 223.654,
+        "p99_us": 544.712,
+        "max_us": 625.853,
+        "over_1ms": 0,
+        "over_5ms": 0
+      },
+      "diskstats_delta": {
+        "reads": 0,
+        "reads_merged": 0,
+        "sectors_read": 0,
+        "read_ms": 0,
+        "writes": 10299,
+        "writes_merged": 421,
+        "sectors_written": 69440,
+        "write_ms": 2503,
+        "io_ms": 2403,
+        "weighted_io_ms": 3008,
+        "discards": 0,
+        "discards_merged": 0,
+        "sectors_discarded": 0,
+        "discard_ms": 0,
+        "flushes": 2050,
+        "flush_ms": 505
+      },
+      "cpu_s": 0.06821400000000002,
+      "context": {
+        "voluntary": 10233,
+        "involuntary": 1834
+      },
+      "slowest_operations": [
+        {
+          "index": 6832,
+          "offset": 2818048,
+          "duration_ns": 15353105
+        },
+        {
+          "index": 3896,
+          "offset": 7569408,
+          "duration_ns": 14996746
+        },
+        {
+          "index": 828,
+          "offset": 3391488,
+          "duration_ns": 14982455
+        },
+        {
+          "index": 3768,
+          "offset": 7045120,
+          "duration_ns": 10028877
+        },
+        {
+          "index": 3928,
+          "offset": 7700480,
+          "duration_ns": 9883529
+        },
+        {
+          "index": 6704,
+          "offset": 2293760,
+          "duration_ns": 9770403
+        },
+        {
+          "index": 700,
+          "offset": 2867200,
+          "duration_ns": 9743357
+        },
+        {
+          "index": 1848,
+          "offset": 7569408,
+          "duration_ns": 9662655
+        },
+        {
+          "index": 7852,
+          "offset": 6995968,
+          "duration_ns": 9608924
+        },
+        {
+          "index": 5812,
+          "offset": 7028736,
+          "duration_ns": 9497040
+        },
+        {
+          "index": 4888,
+          "offset": 3244032,
+          "duration_ns": 9124663
+        },
+        {
+          "index": 4024,
+          "offset": 8093696,
+          "duration_ns": 9055950
+        },
+        {
+          "index": 860,
+          "offset": 3522560,
+          "duration_ns": 8968261
+        },
+        {
+          "index": 4152,
+          "offset": 229376,
+          "duration_ns": 8890468
+        },
+        {
+          "index": 956,
+          "offset": 3915776,
+          "duration_ns": 8875358
+        },
+        {
+          "index": 1340,
+          "offset": 5488640,
+          "duration_ns": 8870709
+        },
+        {
+          "index": 3640,
+          "offset": 6520832,
+          "duration_ns": 8857021
+        },
+        {
+          "index": 188,
+          "offset": 770048,
+          "duration_ns": 8811161
+        },
+        {
+          "index": 6864,
+          "offset": 2949120,
+          "duration_ns": 8808435
+        },
+        {
+          "index": 1976,
+          "offset": 8093696,
+          "duration_ns": 8801010
+        }
+      ]
+    }
+  ]
+}

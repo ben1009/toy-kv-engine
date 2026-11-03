@@ -1,0 +1,12 @@
+{
+  "schedule_cpu_ids": [
+    8,
+    31,
+    31,
+    8
+  ],
+  "reason": "Initial probe used CPU31. Topology exposes SMT cores at 5.1-5.3GHz max and single-thread cores at 3.9GHz max; compare one representative of each in reversed order before drawing a hash-backend conclusion.",
+  "binary_sha256": "fbb90ea8a6f20bf476760e79ae60e04cda3edae04138d45ae5a9e6346da299f1",
+  "changes": "CPU affinity for isolated probe only; identical codec, BLAKE3, SHA, data, chunk sizes and iteration counts; no SSD or production runtime affinity changes.",
+  "method": "One warmup plus seven reversed-stage rounds per invocation, 2000 iterations per stage, two invocations per CPU."
+}

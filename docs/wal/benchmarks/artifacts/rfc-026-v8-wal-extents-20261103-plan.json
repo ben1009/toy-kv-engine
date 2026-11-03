@@ -1,0 +1,84 @@
+{
+  "protocol": "kv-engine.passive-wal-extents.v1",
+  "binary": "/home/liu/proj/toy-kv-engine/target/rfc-026-v8-wal-extents-20261103/write-perf-extents",
+  "binary_sha256": "9d35fcabc018c4815cc1b882af7f53d4c38f3724f04101a1aec977e0154c9747",
+  "runner_sha256": "0543c3c202f490ad681788d4aa8577bad7c6d7c8e328996af781823961d32489",
+  "analyzer_sha256": "5e20d0ae14b00eba82dd75d8e1c3a50cfbfea3a2cf0d5936dcaddf8594f29f39",
+  "boot_id": "b801063f-4f4d-427b-8842-8d2809a4776e",
+  "cpu_mask": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15
+  ],
+  "events": [
+    "nvme/nvme_setup_cmd",
+    "nvme/nvme_complete_rq",
+    "block/block_rq_issue",
+    "block/block_rq_complete",
+    "ext4/ext4_ext_map_blocks_exit",
+    "ext4/ext4_free_blocks"
+  ],
+  "clock": "CLOCK_MONOTONIC",
+  "kernel": "6.12.71-1-lts",
+  "perf": "perf version 6.19-2",
+  "policy": {
+    "counter_interval_ms": 100,
+    "min_interval_ns": 50000000,
+    "window_samples": 16,
+    "confirm_windows": 5,
+    "guard_ns": 20000000,
+    "max_sample_gap_ns": 250000000,
+    "min_percentile_samples": 100,
+    "mode": "calibration_only_no_performance_ratio"
+  },
+  "order": [
+    "v7",
+    "v8",
+    "v8",
+    "v7"
+  ],
+  "workloads": [
+    {
+      "name": "point",
+      "num": 20000,
+      "writers": 1,
+      "batch": 1
+    },
+    {
+      "name": "batch64",
+      "num": 750000,
+      "writers": 16,
+      "batch": 64
+    }
+  ],
+  "uid": 1000,
+  "capture_in_ram_for_entire_cohort": true,
+  "raw_device_writes": false,
+  "device_settings_changed": false,
+  "RFC_performance_qualified": false,
+  "scope": "WAL extent/role attribution and per-shape calibration distributions. No inherited 4KiB thresholds, no same-cohort calibration scoring, and no RFC qualification.",
+  "device": {
+    "partition_start_bytes": 54761881600,
+    "fs_major": 259,
+    "fs_minor": 3,
+    "disk_major": 259,
+    "disk_minor": 0,
+    "disk": "nvme0n1",
+    "nsid": 1,
+    "logical_block_bytes": 512
+  },
+  "extent_helper_sha256": "8bee997cb56971c20774ae245d67e3100135f912c394068484d35074b854f7bd"
+}

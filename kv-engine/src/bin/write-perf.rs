@@ -1,3 +1,6 @@
+#[cfg(feature = "bench")]
+#[path = "write_perf/timeline.rs"]
+mod wal_timeline;
 mod wrapper;
 
 use parking_lot::Mutex;
@@ -284,7 +287,7 @@ struct Args {
     /// exercised at all, whatever the build contains.
     #[arg(long)]
     pitr: bool,
-    /// PITR format for WAL comparisons (v7 default; v6 legacy control; v8 bench-only opt-in).
+    /// PITR format for WAL comparisons (v8 default; v6/v7 compatibility controls).
     #[arg(long, value_enum, requires = "pitr")]
     pitr_format: Option<PitrFormatArg>,
     #[arg(long)]
@@ -539,6 +542,11 @@ impl HarnessConfig {
             },
             enable_wal,
             pitr_repository: None,
+            pitr_writer_format: match self.pitr_format.unwrap_or(PitrFormatArg::V8) {
+                PitrFormatArg::V6 => kv_engine::pitr::api::PitrWriterFormat::V6,
+                PitrFormatArg::V7 => kv_engine::pitr::api::PitrWriterFormat::V7,
+                PitrFormatArg::V8 => kv_engine::pitr::api::PitrWriterFormat::V8,
+            },
             serializable: false,
             value_separation: if enable_vlog {
                 Some(ValueSeparationOptions {
@@ -3359,10 +3367,10 @@ fn pitr_workload_limits(cfg: &HarnessConfig, batch_size: usize) -> Result<(u64, 
         segment <= MAX_SEGMENT_BYTES,
         "PITR workload requires a {segment}-byte segment, exceeding the 1 GiB WAL limit; reduce --num or --value-size, or use wal_batch_concurrent with a larger --wal-batch-size"
     );
-    // Four segments cover the legacy source, v7 image, recovery workspace,
-    // seals, successor, and transition metadata during setup migration.
+    // Five segments cover retained legacy allocation, v7 source growth, the
+    // v8 image and recovery workspace, plus seals and transition headroom.
     let budget = segment
-        .checked_mul(4)
+        .checked_mul(5)
         .context("PITR workload unarchived budget overflow")?;
 
     Ok((segment, budget))
@@ -3426,8 +3434,8 @@ fn enable_pitr_for_workload(
         "PITR enable did not complete"
     );
 
-    let requested_format = cfg.pitr_format.unwrap_or(PitrFormatArg::V7);
-    if matches!(requested_format, PitrFormatArg::V7 | PitrFormatArg::V8) {
+    let requested_format = cfg.pitr_format.unwrap_or(PitrFormatArg::V8);
+    if requested_format == PitrFormatArg::V7 {
         // A nonempty v6 source lets the regular, capacity-checked migration
         // path install v7. Setup is outside the measured interval.
         engine.put(b"write-perf-v7-migration-seed", b"setup")?;
@@ -3438,28 +3446,10 @@ fn enable_pitr_for_workload(
             }
         }
     }
-    #[cfg(all(feature = "bench", target_os = "linux"))]
-    let engine = if requested_format == PitrFormatArg::V8 {
-        // RFC 026 v8 creation is gated in production. Keep the explicit
-        // migration reachable only through this bench-feature binary. Reopen
-        // after the setup v6-to-v7 migration so this process holds the v7 WAL
-        // compatibility lock required to publish the v8 guard.
-        engine.close()?;
-        drop(engine);
-        let engine = KvEngine::open_with_wal_io_mode(path, options, cfg.wal_io_mode.into())?;
-        engine.start_v8_pitr_for_benchmark(&repository)?;
-        engine
-    } else {
-        engine
-    };
-    #[cfg(not(all(feature = "bench", target_os = "linux")))]
-    let engine = {
-        ensure!(
-            requested_format != PitrFormatArg::V8,
-            "PITR v8 comparison requires a Linux write-perf build with --features bench"
-        );
-        engine
-    };
+    #[cfg(target_os = "linux")]
+    if requested_format == PitrFormatArg::V8 {
+        engine.wait_for_pitr_benchmark_maintenance()?;
+    }
 
     let status = engine.pitr_status(PitrStatusOptions {
         cursor: None,
@@ -3622,6 +3612,13 @@ fn run_wal_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
     Ok(vec![measurement])
 }
 
+#[derive(Default)]
+struct WalWriterResult {
+    latency_samples: Vec<u64>,
+    #[cfg(feature = "bench")]
+    spans: Vec<wal_timeline::RequestSpan>,
+}
+
 fn run_wal_batch_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
     let workload = "wal_batch_concurrent";
     let path = prepare_path(cfg, workload)?;
@@ -3647,6 +3644,10 @@ fn run_wal_batch_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>
     let writer_threads = cfg.threads;
     let retry_pitr_barrier = cfg.pitr;
     let baseline = collect_counters(&engine)?;
+    #[cfg(feature = "bench")]
+    let timeline = wal_timeline::Capture::from_env(engine.clone(), &path)?;
+    #[cfg(feature = "bench")]
+    let timeline_enabled = timeline.is_some();
     let cpu_start = process_cpu_times();
     let per_thread = num_keys / writer_threads;
     let remainder = num_keys % writer_threads;
@@ -3657,12 +3658,18 @@ fn run_wal_batch_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>
         let eng = engine.clone();
         let val = value.clone();
         let sample_every = cfg.latency_sample_every;
-        handles.push(std::thread::spawn(move || -> Result<Vec<u64>> {
+        handles.push(std::thread::spawn(move || -> Result<WalWriterResult> {
             let thread_ops = per_thread + usize::from(t < remainder);
             let start_idx = t * per_thread + remainder.min(t);
             let mut next = 0usize;
             let mut batch_index = 0usize;
             let mut latency_samples = Vec::new();
+            #[cfg(feature = "bench")]
+            let mut spans = if timeline_enabled {
+                Vec::with_capacity(thread_ops.div_ceil(batch_size))
+            } else {
+                Vec::new()
+            };
             while next < thread_ops {
                 let current_batch = (thread_ops - next).min(batch_size);
                 let mut keys = Vec::with_capacity(current_batch);
@@ -3673,20 +3680,38 @@ fn run_wal_batch_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>
                     .iter()
                     .map(|key| WriteBatchRecord::Put(key.as_slice(), val.as_slice()))
                     .collect();
+                #[cfg(feature = "bench")]
+                let request_start = timeline_enabled
+                    .then(wal_timeline::monotonic_ns)
+                    .transpose()?;
                 let sample_start = sample_every
                     .filter(|every| batch_index.is_multiple_of(*every))
                     .map(|_| Instant::now());
                 with_pitr_admission_retry(retry_pitr_barrier, || eng.write_batch(&batch))?;
+                #[cfg(feature = "bench")]
+                if let Some(start_ns) = request_start {
+                    spans.push(wal_timeline::RequestSpan {
+                        start_ns,
+                        end_ns: wal_timeline::monotonic_ns()?,
+                        puts: current_batch as u64,
+                    });
+                }
                 if let Some(sample_start) = sample_start {
                     latency_samples.push(sample_start.elapsed().as_nanos() as u64);
                 }
                 next += current_batch;
                 batch_index += 1;
             }
-            Ok(latency_samples)
+            Ok(WalWriterResult {
+                latency_samples,
+                #[cfg(feature = "bench")]
+                spans,
+            })
         }));
     }
     let mut latency_samples = Vec::new();
+    #[cfg(feature = "bench")]
+    let mut timeline_spans = Vec::new();
     let mut writer_error = None;
     for handle in handles {
         let result = match handle.join() {
@@ -3694,7 +3719,11 @@ fn run_wal_batch_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>
             Err(_) => Err(anyhow!("writer thread panicked")),
         };
         match result {
-            Ok(samples) => latency_samples.extend(samples),
+            Ok(output) => {
+                latency_samples.extend(output.latency_samples);
+                #[cfg(feature = "bench")]
+                timeline_spans.extend(output.spans);
+            }
             Err(error) => {
                 writer_error.get_or_insert(error);
             }
@@ -3707,6 +3736,10 @@ fn run_wal_batch_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>
     let elapsed = start.elapsed();
     let (process_cpu_user_ms, process_cpu_system_ms) =
         process_cpu_delta(cpu_start, process_cpu_times());
+    #[cfg(feature = "bench")]
+    let timeline_output = timeline
+        .map(|capture| capture.finish(timeline_spans))
+        .transpose()?;
     #[cfg(feature = "bench")]
     let wal_pipeline = wal_pipeline_record(&engine, cfg.profile, wal_run_info)?;
     #[cfg(not(feature = "bench"))]
@@ -3729,6 +3762,10 @@ fn run_wal_batch_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>
     }
     let counters = collect_counter_delta(&baseline, &collect_counters(&engine)?);
     engine.close()?;
+    #[cfg(feature = "bench")]
+    if let Some(output) = timeline_output {
+        output.persist()?;
+    }
     cleanup.finalize()?;
 
     let mut measurement = make_measurement(
@@ -8403,10 +8440,7 @@ fn validate_config(cfg: &HarnessConfig) -> Result<()> {
     if let Some(format) = cfg.pitr_format {
         anyhow::ensure!(cfg.pitr, "--pitr-format requires --pitr");
         if format == PitrFormatArg::V8 {
-            anyhow::ensure!(
-                cfg!(all(feature = "bench", target_os = "linux")),
-                "PITR v8 comparison requires a Linux write-perf build with --features bench"
-            );
+            anyhow::ensure!(cfg!(target_os = "linux"), "PITR v8 requires Linux");
         }
         if format == PitrFormatArg::V6 && cfg.wal_io_mode_explicit {
             anyhow::ensure!(
@@ -8540,7 +8574,7 @@ mod tests {
         cfg.value_size = 1024;
         let (segment, budget) = pitr_workload_limits(&cfg, 1).expect("size small-value workload");
         assert!(segment > 8192 + 20_000 * 8192);
-        assert_eq!(budget, segment * 4);
+        assert_eq!(budget, segment * 5);
 
         cfg.value_size = 16 * 1024;
         let (segment, budget) = pitr_workload_limits(&cfg, 1).expect("size large-value workload");
@@ -8552,7 +8586,7 @@ mod tests {
         cfg.value_size = 1024;
         assert_eq!(
             pitr_workload_limits(&cfg, 1).expect("keep minimum budget"),
-            (256 * 1024 * 1024, 1024 * 1024 * 1024)
+            (256 * 1024 * 1024, 5 * 256 * 1024 * 1024)
         );
     }
 
@@ -8673,7 +8707,11 @@ mod tests {
         assert_eq!(pitr_default.wal_io_mode, WalIoModeArg::Parallel);
         assert_eq!(pitr_default.num, 20_000);
         assert_eq!(pitr_default.pitr_format, None);
-        validate_config(&pitr_default).expect("default PITR v7 uses parallel");
+        assert_eq!(
+            pitr_default.build_options(true, false).pitr_writer_format,
+            kv_engine::pitr::api::PitrWriterFormat::V8
+        );
+        validate_config(&pitr_default).expect("default PITR v8 uses parallel");
         validate_run_mode(&pitr_default, Some("wal_concurrent"))
             .expect("PITR comparison mode is valid");
         let workloads = select_workloads(Some("wal_concurrent"), &pitr_default)
@@ -8727,14 +8765,14 @@ mod tests {
         assert_eq!(v8_parallel.wal_io_mode, WalIoModeArg::Parallel);
         assert_eq!(v8_parallel.pitr_format, Some(PitrFormatArg::V8));
         assert_eq!(v8_parallel.pitr_format.map(PitrFormatArg::version), Some(8));
-        if cfg!(all(feature = "bench", target_os = "linux")) {
+        if cfg!(target_os = "linux") {
             validate_config(&v8_parallel).expect("v8 supports the default Parallel mode");
         } else {
             assert!(
                 validate_config(&v8_parallel)
                     .unwrap_err()
                     .to_string()
-                    .contains("requires a Linux write-perf build with --features bench")
+                    .contains("PITR v8 requires Linux")
             );
         }
 
@@ -8750,14 +8788,14 @@ mod tests {
             .expect("parse v8 Leader comparison"),
         );
         assert_eq!(v8_leader.wal_io_mode, WalIoModeArg::Leader);
-        if cfg!(all(feature = "bench", target_os = "linux")) {
+        if cfg!(target_os = "linux") {
             validate_config(&v8_leader).expect("v8 supports the explicit Leader comparison");
         } else {
             assert!(
                 validate_config(&v8_leader)
                     .unwrap_err()
                     .to_string()
-                    .contains("requires a Linux write-perf build with --features bench")
+                    .contains("PITR v8 requires Linux")
             );
         }
         assert_eq!(

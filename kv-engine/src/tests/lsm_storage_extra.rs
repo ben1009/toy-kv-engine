@@ -290,6 +290,7 @@ fn test_compaction_filter_with_value_separation_preserves_unrelated_values() {
         compaction_options: CompactionOptions::NoCompaction,
         enable_wal: false,
         pitr_repository: None,
+        pitr_writer_format: Default::default(),
         serializable: false,
         value_separation: Some(ValueSeparationOptions {
             enabled: true,
@@ -397,6 +398,7 @@ fn test_cache_stats_with_vlog() {
         compaction_options: CompactionOptions::NoCompaction,
         enable_wal: false,
         pitr_repository: None,
+        pitr_writer_format: Default::default(),
         serializable: false,
         value_separation: Some(ValueSeparationOptions {
             enabled: true,
@@ -439,6 +441,7 @@ fn test_vlog_stats_with_vlog() {
         compaction_options: CompactionOptions::NoCompaction,
         enable_wal: false,
         pitr_repository: None,
+        pitr_writer_format: Default::default(),
         serializable: false,
         value_separation: Some(ValueSeparationOptions {
             enabled: true,

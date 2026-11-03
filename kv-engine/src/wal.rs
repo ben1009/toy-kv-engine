@@ -2366,7 +2366,7 @@ impl Wal {
         ticket: u64,
     ) -> Result<u64> {
         let result = (|| {
-            let durable_ticket_end = self.refresh_v8_parallel_cursor(writer)?;
+            let durable_ticket_end = self.refresh_v8_parallel_cursor(writer);
             ensure!(
                 ticket < durable_ticket_end,
                 "v8 Parallel append returned before its ticket became durable"
@@ -2379,27 +2379,23 @@ impl Wal {
         result
     }
 
-    fn refresh_v8_parallel_cursor(&self, writer: &v8::leader::WalV8ParallelWriter) -> Result<u64> {
-        let result = (|| {
-            let (_, active) = writer.active_boundaries()?;
-            let append_offset = writer.image_len()?;
-            self.alloc_offset
-                .fetch_max(append_offset, Ordering::Release);
-            self.preallocated_size
-                .fetch_max(append_offset, Ordering::Release);
-            let mut reserved_end = self.pitr_reserved_end.lock();
-            *reserved_end = (*reserved_end).max(append_offset);
-            self.completion_state
-                .durable_ticket
-                .fetch_max(active.ticket_end, Ordering::Release);
-            self.next_ticket
-                .fetch_max(writer.next_ticket(), Ordering::Release);
-            Ok(active.ticket_end)
-        })();
-        if result.is_err() {
-            self.poisoned.store(true, Ordering::Release);
-        }
-        result
+    fn refresh_v8_parallel_cursor(&self, writer: &v8::leader::WalV8ParallelWriter) -> u64 {
+        // The coordinator publishes this cursor only after the covering sync.
+        // A completed caller must not join a later physical FRONTIER cycle
+        // merely to rebuild an ActiveBoundary and read the completed image end.
+        let (ticket_end, append_offset, admitted_ticket_end) = writer.published_cursor();
+        self.alloc_offset
+            .fetch_max(append_offset, Ordering::Release);
+        self.preallocated_size
+            .fetch_max(append_offset, Ordering::Release);
+        let mut reserved_end = self.pitr_reserved_end.lock();
+        *reserved_end = (*reserved_end).max(append_offset);
+        self.completion_state
+            .durable_ticket
+            .fetch_max(ticket_end, Ordering::Release);
+        self.next_ticket
+            .fetch_max(admitted_ticket_end, Ordering::Release);
+        ticket_end
     }
 
     fn record_v8_parallel_error(
@@ -2532,7 +2528,7 @@ impl Wal {
             self.record_v8_parallel_error(writer, &error);
             return Err(error);
         }
-        self.refresh_v8_parallel_cursor(writer)?;
+        self.refresh_v8_parallel_cursor(writer);
         Ok(())
     }
 
@@ -2552,7 +2548,7 @@ impl Wal {
         }
         anyhow::ensure!(
             !matches!(descriptor.framing, WalFraming::EmbeddedFrontier),
-            "WAL v7 recovery is not implemented"
+            "WAL v7/v8 recovery requires the dedicated manifest-bound frontier reader"
         );
         let data_len = data.len();
         let mut max_ts: u64 = 0;

@@ -9,20 +9,23 @@
 ## Current adoption status
 
 Ordinary v4 WALs now use ticket-ordered parallel I/O by default, including
-native async waits for non-serializable point writes. PITR v5/v6 and older
-MVCC formats retain leader I/O; legacy unframed WALs retain buffered I/O.
-Leader remains available as an explicit v4 control. The
+native async waits for non-serializable point writes. New PITR WALs default to
+v8 Parallel under RFC 026; v7 remains a supported compatibility format, while
+PITR v5/v6 and older MVCC formats retain leader I/O. Legacy unframed WALs
+retain buffered I/O. Leader remains available as an explicit v4 control. The
 [default adoption note](../docs/wal/rfc-024-parallel-wal-default-20261005.md)
 records the maintainer decision and its scope. The original performance gate
 remains unqualified; the proposal and benchmark criteria below are retained as
 the historical design, not evidence that the gate passed. The current limits
 are 32 in-flight groups and 256 ring entries.
 
-[RFC 025](025-parallel-wal-embedded-frontiers.md) proposes Parallel as the default
-for future formats, with narrowly documented exceptions. Its PITR v7 in-WAL
-frontier frames use one sync and an explicit candidate-validation/fallback
-contract for Active recovery. Durable manifest/sealing boundaries stay strict,
-and existing v5/v6 semantics are preserved.
+[RFC 025](025-parallel-wal-embedded-frontiers.md) defines Parallel as the
+default for new WAL formats, with narrowly documented exceptions. Its PITR v7
+in-WAL frontier frames use one sync and an explicit candidate-validation/
+fallback contract for Active recovery. [RFC 026](026-composable-wal-prefix-digest.md)
+adds the v8 composable digest; new PITR WALs now default to v8 Parallel, while
+v5/v6 semantics and existing segment formats are preserved. See the
+[V8 adoption note](../docs/wal/rfc-026-v8-default-20261103.md).
 
 ## Summary
 
