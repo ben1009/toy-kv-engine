@@ -1,0 +1,610 @@
+{
+  "protocol": "kv-engine.passive-wal-extents.v1",
+  "runs": [
+    {
+      "name": "point-0-v7",
+      "format": "v7",
+      "workload": "point",
+      "trace_quality_ok": true,
+      "metadata": {
+        "lost": 0,
+        "record_counts": {
+          "69": 1,
+          "10": 3689,
+          "78": 7,
+          "73": 1,
+          "74": 1,
+          "17": 25,
+          "18": 24,
+          "7": 1145,
+          "3": 1080,
+          "82": 1,
+          "68": 390,
+          "4": 112,
+          "9": 272265
+        },
+        "event_counts": {
+          "nvme/nvme_setup_cmd": 62316,
+          "block/block_rq_issue": 62316,
+          "nvme/nvme_complete_rq": 62316,
+          "block/block_rq_complete": 82375,
+          "ext4/ext4_ext_map_blocks_exit": 2778,
+          "ext4/ext4_free_blocks": 164
+        },
+        "clock": "CLOCK_MONOTONIC"
+      },
+      "matching_anomalies": {
+        "setup_without_completion": 0
+      },
+      "missing_events": [],
+      "attribution": {
+        "roles": {
+          "UNOBSERVED_ALLOCATION": 1,
+          "OVERWRITTEN_OR_INITIALIZATION": 1251,
+          "DATA": 20000,
+          "FRONTIER": 20000,
+          "UNTYPED": 5
+        },
+        "mapping_problems": {
+          "wal_metadata_blocks_freed": 15
+        },
+        "physical_blocks": 40192,
+        "block_issues_starting_in_wal_extent": 41256,
+        "allocation_observation": "Initial FIEMAP or matching ext4 map event preceding command setup; post-only mappings are not backdated."
+      },
+      "window_write_roles": {
+        "OVERWRITTEN_OR_INITIALIZATION": 1251,
+        "DATA": 20000,
+        "FRONTIER": 20000,
+        "NON_WAL": 413,
+        "UNTYPED": 5
+      },
+      "attributed_DATA_bytes": 81920000,
+      "inventory_DATA_bytes": 81920000,
+      "non_WAL_fua_writes": 160,
+      "non_WAL_write_bytes": 5918720,
+      "post_flush_wal_observations": 19999,
+      "eligible_wal_DATA_samples": 19998,
+      "ineligible_reasons": {
+        "UNTYPED": 1
+      },
+      "intervals": 178,
+      "eligible_intervals": 0,
+      "calibration_pending": true,
+      "RFC_performance_qualified": false
+    },
+    {
+      "name": "point-1-v8",
+      "format": "v8",
+      "workload": "point",
+      "trace_quality_ok": true,
+      "metadata": {
+        "lost": 0,
+        "record_counts": {
+          "69": 1,
+          "10": 3694,
+          "78": 7,
+          "73": 1,
+          "74": 1,
+          "17": 25,
+          "18": 24,
+          "7": 1124,
+          "3": 1103,
+          "82": 1,
+          "68": 870,
+          "4": 87,
+          "9": 564323
+        },
+        "event_counts": {
+          "ext4/ext4_ext_map_blocks_exit": 60170,
+          "nvme/nvme_setup_cmd": 120998,
+          "block/block_rq_issue": 120998,
+          "ext4/ext4_free_blocks": 43,
+          "nvme/nvme_complete_rq": 120998,
+          "block/block_rq_complete": 141116
+        },
+        "clock": "CLOCK_MONOTONIC"
+      },
+      "matching_anomalies": {
+        "setup_without_completion": 0
+      },
+      "missing_events": [],
+      "attribution": {
+        "roles": {
+          "UNOBSERVED_ALLOCATION": 2,
+          "DATA": 20000,
+          "FRONTIER": 20000
+        },
+        "mapping_problems": {},
+        "physical_blocks": 40004,
+        "block_issues_starting_in_wal_extent": 40000,
+        "allocation_observation": "Initial FIEMAP or matching ext4 map event preceding command setup; post-only mappings are not backdated."
+      },
+      "window_write_roles": {
+        "DATA": 20000,
+        "FRONTIER": 20000,
+        "NON_WAL": 40603
+      },
+      "attributed_DATA_bytes": 81920000,
+      "inventory_DATA_bytes": 81920000,
+      "non_WAL_fua_writes": 20012,
+      "non_WAL_write_bytes": 578248704,
+      "post_flush_wal_observations": 19999,
+      "eligible_wal_DATA_samples": 19999,
+      "ineligible_reasons": {},
+      "intervals": 414,
+      "eligible_intervals": 0,
+      "calibration_pending": true,
+      "RFC_performance_qualified": false
+    },
+    {
+      "name": "point-2-v8",
+      "format": "v8",
+      "workload": "point",
+      "trace_quality_ok": true,
+      "metadata": {
+        "lost": 0,
+        "record_counts": {
+          "69": 1,
+          "10": 3358,
+          "78": 7,
+          "73": 1,
+          "74": 1,
+          "17": 25,
+          "18": 24,
+          "7": 1067,
+          "3": 1074,
+          "82": 1,
+          "68": 857,
+          "4": 34,
+          "9": 561778
+        },
+        "event_counts": {
+          "ext4/ext4_ext_map_blocks_exit": 60149,
+          "nvme/nvme_setup_cmd": 120372,
+          "block/block_rq_issue": 120372,
+          "ext4/ext4_free_blocks": 41,
+          "nvme/nvme_complete_rq": 120372,
+          "block/block_rq_complete": 140472
+        },
+        "clock": "CLOCK_MONOTONIC"
+      },
+      "matching_anomalies": {
+        "setup_without_completion": 0
+      },
+      "missing_events": [],
+      "attribution": {
+        "roles": {
+          "UNOBSERVED_ALLOCATION": 2,
+          "DATA": 20000,
+          "FRONTIER": 20000
+        },
+        "mapping_problems": {},
+        "physical_blocks": 40004,
+        "block_issues_starting_in_wal_extent": 40000,
+        "allocation_observation": "Initial FIEMAP or matching ext4 map event preceding command setup; post-only mappings are not backdated."
+      },
+      "window_write_roles": {
+        "DATA": 20000,
+        "FRONTIER": 20000,
+        "NON_WAL": 40005
+      },
+      "attributed_DATA_bytes": 81920000,
+      "inventory_DATA_bytes": 81920000,
+      "non_WAL_fua_writes": 20001,
+      "non_WAL_write_bytes": 573571072,
+      "post_flush_wal_observations": 19999,
+      "eligible_wal_DATA_samples": 19999,
+      "ineligible_reasons": {},
+      "intervals": 145,
+      "eligible_intervals": 0,
+      "calibration_pending": true,
+      "RFC_performance_qualified": false
+    },
+    {
+      "name": "point-3-v7",
+      "format": "v7",
+      "workload": "point",
+      "trace_quality_ok": true,
+      "metadata": {
+        "lost": 0,
+        "record_counts": {
+          "69": 1,
+          "10": 3597,
+          "78": 7,
+          "73": 1,
+          "74": 1,
+          "17": 25,
+          "18": 24,
+          "7": 1109,
+          "3": 1078,
+          "82": 1,
+          "68": 358,
+          "4": 73,
+          "9": 272662
+        },
+        "event_counts": {
+          "nvme/nvme_setup_cmd": 62356,
+          "block/block_rq_issue": 62356,
+          "nvme/nvme_complete_rq": 62356,
+          "block/block_rq_complete": 82417,
+          "ext4/ext4_ext_map_blocks_exit": 2768,
+          "ext4/ext4_free_blocks": 409
+        },
+        "clock": "CLOCK_MONOTONIC"
+      },
+      "matching_anomalies": {
+        "setup_without_completion": 0
+      },
+      "missing_events": [],
+      "attribution": {
+        "roles": {
+          "UNOBSERVED_ALLOCATION": 1,
+          "OVERWRITTEN_OR_INITIALIZATION": 1251,
+          "DATA": 20000,
+          "FRONTIER": 20000,
+          "UNTYPED": 5
+        },
+        "mapping_problems": {
+          "wal_metadata_blocks_freed": 266
+        },
+        "physical_blocks": 40192,
+        "block_issues_starting_in_wal_extent": 41256,
+        "allocation_observation": "Initial FIEMAP or matching ext4 map event preceding command setup; post-only mappings are not backdated."
+      },
+      "window_write_roles": {
+        "OVERWRITTEN_OR_INITIALIZATION": 1251,
+        "DATA": 20000,
+        "FRONTIER": 20000,
+        "NON_WAL": 456,
+        "UNTYPED": 5
+      },
+      "attributed_DATA_bytes": 81920000,
+      "inventory_DATA_bytes": 81920000,
+      "non_WAL_fua_writes": 161,
+      "non_WAL_write_bytes": 6336512,
+      "post_flush_wal_observations": 19999,
+      "eligible_wal_DATA_samples": 19998,
+      "ineligible_reasons": {
+        "UNTYPED": 1
+      },
+      "intervals": 284,
+      "eligible_intervals": 0,
+      "calibration_pending": true,
+      "RFC_performance_qualified": false
+    },
+    {
+      "name": "batch64-0-v7",
+      "format": "v7",
+      "workload": "batch64",
+      "trace_quality_ok": true,
+      "metadata": {
+        "lost": 0,
+        "record_counts": {
+          "69": 1,
+          "10": 3357,
+          "78": 7,
+          "73": 1,
+          "74": 1,
+          "17": 25,
+          "18": 24,
+          "7": 1490,
+          "3": 1429,
+          "82": 1,
+          "68": 151,
+          "9": 115387,
+          "4": 410
+        },
+        "event_counts": {
+          "ext4/ext4_ext_map_blocks_exit": 28361,
+          "nvme/nvme_setup_cmd": 21181,
+          "block/block_rq_issue": 21181,
+          "nvme/nvme_complete_rq": 21181,
+          "block/block_rq_complete": 22731,
+          "ext4/ext4_free_blocks": 752
+        },
+        "clock": "CLOCK_MONOTONIC"
+      },
+      "matching_anomalies": {
+        "setup_without_completion": 0
+      },
+      "missing_events": [],
+      "attribution": {
+        "roles": {
+          "UNOBSERVED_ALLOCATION": 1,
+          "DATA": 12358,
+          "FRONTIER": 1490,
+          "OTHER_ISSUER_IN_WAL_EXTENT": 38,
+          "OVERWRITTEN_OR_INITIALIZATION": 92
+        },
+        "mapping_problems": {
+          "wal_metadata_blocks_freed": 5
+        },
+        "physical_blocks": 200960,
+        "block_issues_starting_in_wal_extent": 13978,
+        "allocation_observation": "Initial FIEMAP or matching ext4 map event preceding command setup; post-only mappings are not backdated."
+      },
+      "window_write_roles": {
+        "DATA": 12358,
+        "FRONTIER": 1490,
+        "NON_WAL": 3213,
+        "OTHER_ISSUER_IN_WAL_EXTENT": 38,
+        "OVERWRITTEN_OR_INITIALIZATION": 92
+      },
+      "attributed_DATA_bytes": 814776320,
+      "inventory_DATA_bytes": 816054272,
+      "non_WAL_fua_writes": 1489,
+      "non_WAL_write_bytes": 32444416,
+      "post_flush_wal_observations": 1450,
+      "eligible_wal_DATA_samples": 1450,
+      "ineligible_reasons": {},
+      "intervals": 96,
+      "eligible_intervals": 0,
+      "calibration_pending": true,
+      "RFC_performance_qualified": false
+    },
+    {
+      "name": "batch64-1-v8",
+      "format": "v8",
+      "workload": "batch64",
+      "trace_quality_ok": true,
+      "metadata": {
+        "lost": 0,
+        "record_counts": {
+          "69": 1,
+          "10": 3357,
+          "78": 7,
+          "73": 1,
+          "74": 1,
+          "17": 25,
+          "18": 24,
+          "7": 1371,
+          "3": 1363,
+          "82": 1,
+          "68": 143,
+          "9": 106355,
+          "4": 292
+        },
+        "event_counts": {
+          "ext4/ext4_ext_map_blocks_exit": 20042,
+          "nvme/nvme_setup_cmd": 21158,
+          "block/block_rq_issue": 21158,
+          "nvme/nvme_complete_rq": 21158,
+          "block/block_rq_complete": 22798,
+          "ext4/ext4_free_blocks": 41
+        },
+        "clock": "CLOCK_MONOTONIC"
+      },
+      "matching_anomalies": {
+        "setup_without_completion": 0
+      },
+      "missing_events": [],
+      "attribution": {
+        "roles": {
+          "UNOBSERVED_ALLOCATION": 2,
+          "DATA": 11735,
+          "FRONTIER": 1539,
+          "OTHER_ISSUER_IN_WAL_EXTENT": 2
+        },
+        "mapping_problems": {},
+        "physical_blocks": 200775,
+        "block_issues_starting_in_wal_extent": 13276,
+        "allocation_observation": "Initial FIEMAP or matching ext4 map event preceding command setup; post-only mappings are not backdated."
+      },
+      "window_write_roles": {
+        "DATA": 11735,
+        "FRONTIER": 1539,
+        "NON_WAL": 3087,
+        "OTHER_ISSUER_IN_WAL_EXTENT": 2
+      },
+      "attributed_DATA_bytes": 815931392,
+      "inventory_DATA_bytes": 816054272,
+      "non_WAL_fua_writes": 1540,
+      "non_WAL_write_bytes": 49188864,
+      "post_flush_wal_observations": 1392,
+      "eligible_wal_DATA_samples": 1392,
+      "ineligible_reasons": {},
+      "intervals": 95,
+      "eligible_intervals": 0,
+      "calibration_pending": true,
+      "RFC_performance_qualified": false
+    },
+    {
+      "name": "batch64-2-v8",
+      "format": "v8",
+      "workload": "batch64",
+      "trace_quality_ok": true,
+      "metadata": {
+        "lost": 0,
+        "record_counts": {
+          "69": 1,
+          "10": 3500,
+          "78": 7,
+          "73": 1,
+          "74": 1,
+          "17": 25,
+          "18": 24,
+          "7": 1252,
+          "3": 1238,
+          "82": 1,
+          "68": 160,
+          "9": 91772,
+          "4": 173
+        },
+        "event_counts": {
+          "ext4/ext4_ext_map_blocks_exit": 17995,
+          "nvme/nvme_setup_cmd": 18099,
+          "block/block_rq_issue": 18099,
+          "ext4/ext4_free_blocks": 373,
+          "nvme/nvme_complete_rq": 18099,
+          "block/block_rq_complete": 19107
+        },
+        "clock": "CLOCK_MONOTONIC"
+      },
+      "matching_anomalies": {
+        "setup_without_completion": 0
+      },
+      "missing_events": [],
+      "attribution": {
+        "roles": {
+          "UNOBSERVED_ALLOCATION": 3,
+          "DATA": 11733,
+          "FRONTIER": 910
+        },
+        "mapping_problems": {
+          "wal_metadata_blocks_freed": 332
+        },
+        "physical_blocks": 200146,
+        "block_issues_starting_in_wal_extent": 12643,
+        "allocation_observation": "Initial FIEMAP or matching ext4 map event preceding command setup; post-only mappings are not backdated."
+      },
+      "window_write_roles": {
+        "DATA": 11733,
+        "FRONTIER": 910,
+        "NON_WAL": 1820
+      },
+      "attributed_DATA_bytes": 816054272,
+      "inventory_DATA_bytes": 816054272,
+      "non_WAL_fua_writes": 910,
+      "non_WAL_write_bytes": 31408128,
+      "post_flush_wal_observations": 892,
+      "eligible_wal_DATA_samples": 892,
+      "ineligible_reasons": {},
+      "intervals": 15,
+      "eligible_intervals": 0,
+      "calibration_pending": true,
+      "RFC_performance_qualified": false
+    },
+    {
+      "name": "batch64-3-v7",
+      "format": "v7",
+      "workload": "batch64",
+      "trace_quality_ok": true,
+      "metadata": {
+        "lost": 0,
+        "record_counts": {
+          "69": 1,
+          "10": 3361,
+          "78": 7,
+          "73": 1,
+          "74": 1,
+          "17": 25,
+          "18": 24,
+          "7": 1298,
+          "3": 1281,
+          "82": 1,
+          "68": 159,
+          "9": 111408,
+          "4": 215
+        },
+        "event_counts": {
+          "ext4/ext4_ext_map_blocks_exit": 27959,
+          "nvme/nvme_setup_cmd": 20198,
+          "block/block_rq_issue": 20198,
+          "ext4/ext4_free_blocks": 1243,
+          "nvme/nvme_complete_rq": 20198,
+          "block/block_rq_complete": 21612
+        },
+        "clock": "CLOCK_MONOTONIC"
+      },
+      "matching_anomalies": {
+        "setup_without_completion": 0
+      },
+      "missing_events": [],
+      "attribution": {
+        "roles": {
+          "UNOBSERVED_ALLOCATION": 1,
+          "DATA": 12275,
+          "FRONTIER": 1355,
+          "OVERWRITTEN_OR_INITIALIZATION": 70,
+          "OTHER_ISSUER_IN_WAL_EXTENT": 28,
+          "UNTYPED": 3
+        },
+        "mapping_problems": {
+          "wal_metadata_blocks_freed": 599
+        },
+        "physical_blocks": 200704,
+        "block_issues_starting_in_wal_extent": 13731,
+        "allocation_observation": "Initial FIEMAP or matching ext4 map event preceding command setup; post-only mappings are not backdated."
+      },
+      "window_write_roles": {
+        "DATA": 12275,
+        "FRONTIER": 1355,
+        "NON_WAL": 2702,
+        "OVERWRITTEN_OR_INITIALIZATION": 70,
+        "OTHER_ISSUER_IN_WAL_EXTENT": 28,
+        "UNTYPED": 3
+      },
+      "attributed_DATA_bytes": 814907392,
+      "inventory_DATA_bytes": 816054272,
+      "non_WAL_fua_writes": 1351,
+      "non_WAL_write_bytes": 30531584,
+      "post_flush_wal_observations": 1353,
+      "eligible_wal_DATA_samples": 1349,
+      "ineligible_reasons": {
+        "OTHER_ISSUER_IN_WAL_EXTENT": 4
+      },
+      "intervals": 12,
+      "eligible_intervals": 0,
+      "calibration_pending": true,
+      "RFC_performance_qualified": false
+    }
+  ],
+  "common_strata_by_workload": {
+    "point": [
+      "{\"flush_queue\":\"0\",\"gap\":\"gt_500us\",\"intervening_reads\":false,\"intervening_writes\":\"fua\",\"peak\":\"0\",\"queue\":\"0\",\"size\":\"le_4096\"}",
+      "{\"flush_queue\":\"0\",\"gap\":\"le_100us\",\"intervening_reads\":false,\"intervening_writes\":\"fua\",\"peak\":\"0\",\"queue\":\"0\",\"size\":\"le_4096\"}",
+      "{\"flush_queue\":\"0\",\"gap\":\"le_100us\",\"intervening_reads\":false,\"intervening_writes\":\"none\",\"peak\":\"1\",\"queue\":\"0\",\"size\":\"le_4096\"}",
+      "{\"flush_queue\":\"0\",\"gap\":\"le_500us\",\"intervening_reads\":false,\"intervening_writes\":\"fua\",\"peak\":\"0\",\"queue\":\"0\",\"size\":\"le_4096\"}"
+    ],
+    "batch64": [
+      "{\"flush_queue\":\"0\",\"gap\":\"gt_500us\",\"intervening_reads\":false,\"intervening_writes\":\"fua\",\"peak\":\"0\",\"queue\":\"0\",\"size\":\"le_131072\"}",
+      "{\"flush_queue\":\"0\",\"gap\":\"gt_500us\",\"intervening_reads\":false,\"intervening_writes\":\"fua\",\"peak\":\"0\",\"queue\":\"0\",\"size\":\"le_65536\"}",
+      "{\"flush_queue\":\"0\",\"gap\":\"gt_500us\",\"intervening_reads\":false,\"intervening_writes\":\"mixed\",\"peak\":\"0\",\"queue\":\"0\",\"size\":\"le_131072\"}",
+      "{\"flush_queue\":\"0\",\"gap\":\"gt_500us\",\"intervening_reads\":false,\"intervening_writes\":\"mixed\",\"peak\":\"1\",\"queue\":\"0\",\"size\":\"le_131072\"}",
+      "{\"flush_queue\":\"0\",\"gap\":\"gt_500us\",\"intervening_reads\":false,\"intervening_writes\":\"mixed\",\"peak\":\"1\",\"queue\":\"1\",\"size\":\"le_131072\"}",
+      "{\"flush_queue\":\"0\",\"gap\":\"le_100us\",\"intervening_reads\":false,\"intervening_writes\":\"fua\",\"peak\":\"0\",\"queue\":\"0\",\"size\":\"le_131072\"}",
+      "{\"flush_queue\":\"0\",\"gap\":\"le_100us\",\"intervening_reads\":false,\"intervening_writes\":\"fua\",\"peak\":\"1\",\"queue\":\"0\",\"size\":\"le_131072\"}",
+      "{\"flush_queue\":\"0\",\"gap\":\"le_100us\",\"intervening_reads\":false,\"intervening_writes\":\"fua\",\"peak\":\"1\",\"queue\":\"1\",\"size\":\"le_131072\"}",
+      "{\"flush_queue\":\"0\",\"gap\":\"le_100us\",\"intervening_reads\":false,\"intervening_writes\":\"fua\",\"peak\":\"2-7\",\"queue\":\"1\",\"size\":\"le_131072\"}",
+      "{\"flush_queue\":\"0\",\"gap\":\"le_100us\",\"intervening_reads\":false,\"intervening_writes\":\"none\",\"peak\":\"0\",\"queue\":\"0\",\"size\":\"le_131072\"}",
+      "{\"flush_queue\":\"0\",\"gap\":\"le_100us\",\"intervening_reads\":false,\"intervening_writes\":\"none\",\"peak\":\"1\",\"queue\":\"0\",\"size\":\"le_131072\"}",
+      "{\"flush_queue\":\"0\",\"gap\":\"le_100us\",\"intervening_reads\":false,\"intervening_writes\":\"none\",\"peak\":\"2-7\",\"queue\":\"0\",\"size\":\"le_131072\"}",
+      "{\"flush_queue\":\"0\",\"gap\":\"le_500us\",\"intervening_reads\":false,\"intervening_writes\":\"fua\",\"peak\":\"0\",\"queue\":\"0\",\"size\":\"le_131072\"}",
+      "{\"flush_queue\":\"0\",\"gap\":\"le_500us\",\"intervening_reads\":false,\"intervening_writes\":\"fua\",\"peak\":\"0\",\"queue\":\"0\",\"size\":\"le_65536\"}",
+      "{\"flush_queue\":\"0\",\"gap\":\"le_500us\",\"intervening_reads\":false,\"intervening_writes\":\"fua\",\"peak\":\"1\",\"queue\":\"1\",\"size\":\"le_131072\"}",
+      "{\"flush_queue\":\"0\",\"gap\":\"le_500us\",\"intervening_reads\":false,\"intervening_writes\":\"mixed\",\"peak\":\"0\",\"queue\":\"0\",\"size\":\"le_131072\"}",
+      "{\"flush_queue\":\"0\",\"gap\":\"le_500us\",\"intervening_reads\":false,\"intervening_writes\":\"mixed\",\"peak\":\"1\",\"queue\":\"0\",\"size\":\"le_131072\"}",
+      "{\"flush_queue\":\"0\",\"gap\":\"le_500us\",\"intervening_reads\":false,\"intervening_writes\":\"mixed\",\"peak\":\"1\",\"queue\":\"1\",\"size\":\"le_131072\"}",
+      "{\"flush_queue\":\"1\",\"gap\":\"gt_500us\",\"intervening_reads\":false,\"intervening_writes\":\"fua\",\"peak\":\"0\",\"queue\":\"0\",\"size\":\"le_131072\"}",
+      "{\"flush_queue\":\"1\",\"gap\":\"gt_500us\",\"intervening_reads\":false,\"intervening_writes\":\"fua\",\"peak\":\"1\",\"queue\":\"0\",\"size\":\"le_131072\"}",
+      "{\"flush_queue\":\"1\",\"gap\":\"gt_500us\",\"intervening_reads\":false,\"intervening_writes\":\"fua\",\"peak\":\"2-7\",\"queue\":\"0\",\"size\":\"le_131072\"}",
+      "{\"flush_queue\":\"1\",\"gap\":\"gt_500us\",\"intervening_reads\":false,\"intervening_writes\":\"mixed\",\"peak\":\"0\",\"queue\":\"0\",\"size\":\"le_131072\"}",
+      "{\"flush_queue\":\"1\",\"gap\":\"gt_500us\",\"intervening_reads\":false,\"intervening_writes\":\"mixed\",\"peak\":\"1\",\"queue\":\"1\",\"size\":\"le_131072\"}",
+      "{\"flush_queue\":\"1\",\"gap\":\"le_100us\",\"intervening_reads\":false,\"intervening_writes\":\"fua\",\"peak\":\"1\",\"queue\":\"0\",\"size\":\"le_131072\"}",
+      "{\"flush_queue\":\"1\",\"gap\":\"le_100us\",\"intervening_reads\":false,\"intervening_writes\":\"fua\",\"peak\":\"2-7\",\"queue\":\"0\",\"size\":\"le_131072\"}",
+      "{\"flush_queue\":\"1\",\"gap\":\"le_100us\",\"intervening_reads\":false,\"intervening_writes\":\"none\",\"peak\":\"1\",\"queue\":\"1\",\"size\":\"le_131072\"}",
+      "{\"flush_queue\":\"1\",\"gap\":\"le_100us\",\"intervening_reads\":false,\"intervening_writes\":\"none\",\"peak\":\"2-7\",\"queue\":\"1\",\"size\":\"le_131072\"}",
+      "{\"flush_queue\":\"1\",\"gap\":\"le_500us\",\"intervening_reads\":false,\"intervening_writes\":\"fua\",\"peak\":\"0\",\"queue\":\"0\",\"size\":\"le_131072\"}",
+      "{\"flush_queue\":\"1\",\"gap\":\"le_500us\",\"intervening_reads\":false,\"intervening_writes\":\"fua\",\"peak\":\"1\",\"queue\":\"0\",\"size\":\"le_131072\"}",
+      "{\"flush_queue\":\"1\",\"gap\":\"le_500us\",\"intervening_reads\":false,\"intervening_writes\":\"fua\",\"peak\":\"2-7\",\"queue\":\"0\",\"size\":\"le_131072\"}",
+      "{\"flush_queue\":\"1\",\"gap\":\"le_500us\",\"intervening_reads\":false,\"intervening_writes\":\"mixed\",\"peak\":\"1\",\"queue\":\"1\",\"size\":\"le_131072\"}",
+      "{\"flush_queue\":\"2-7\",\"gap\":\"gt_500us\",\"intervening_reads\":false,\"intervening_writes\":\"fua\",\"peak\":\"0\",\"queue\":\"0\",\"size\":\"le_131072\"}",
+      "{\"flush_queue\":\"2-7\",\"gap\":\"gt_500us\",\"intervening_reads\":false,\"intervening_writes\":\"fua\",\"peak\":\"1\",\"queue\":\"0\",\"size\":\"le_131072\"}",
+      "{\"flush_queue\":\"2-7\",\"gap\":\"gt_500us\",\"intervening_reads\":false,\"intervening_writes\":\"fua\",\"peak\":\"2-7\",\"queue\":\"0\",\"size\":\"le_131072\"}",
+      "{\"flush_queue\":\"2-7\",\"gap\":\"gt_500us\",\"intervening_reads\":false,\"intervening_writes\":\"mixed\",\"peak\":\"0\",\"queue\":\"0\",\"size\":\"le_131072\"}",
+      "{\"flush_queue\":\"2-7\",\"gap\":\"gt_500us\",\"intervening_reads\":false,\"intervening_writes\":\"mixed\",\"peak\":\"1\",\"queue\":\"1\",\"size\":\"le_131072\"}",
+      "{\"flush_queue\":\"2-7\",\"gap\":\"le_100us\",\"intervening_reads\":false,\"intervening_writes\":\"fua\",\"peak\":\"0\",\"queue\":\"0\",\"size\":\"le_131072\"}",
+      "{\"flush_queue\":\"2-7\",\"gap\":\"le_100us\",\"intervening_reads\":false,\"intervening_writes\":\"fua\",\"peak\":\"1\",\"queue\":\"0\",\"size\":\"le_131072\"}",
+      "{\"flush_queue\":\"2-7\",\"gap\":\"le_100us\",\"intervening_reads\":false,\"intervening_writes\":\"fua\",\"peak\":\"2-7\",\"queue\":\"0\",\"size\":\"le_131072\"}",
+      "{\"flush_queue\":\"2-7\",\"gap\":\"le_100us\",\"intervening_reads\":false,\"intervening_writes\":\"fua\",\"peak\":\"2-7\",\"queue\":\"2-7\",\"size\":\"le_131072\"}",
+      "{\"flush_queue\":\"2-7\",\"gap\":\"le_100us\",\"intervening_reads\":false,\"intervening_writes\":\"none\",\"peak\":\"2-7\",\"queue\":\"2-7\",\"size\":\"le_131072\"}",
+      "{\"flush_queue\":\"2-7\",\"gap\":\"le_500us\",\"intervening_reads\":false,\"intervening_writes\":\"fua\",\"peak\":\"0\",\"queue\":\"0\",\"size\":\"le_131072\"}",
+      "{\"flush_queue\":\"2-7\",\"gap\":\"le_500us\",\"intervening_reads\":false,\"intervening_writes\":\"fua\",\"peak\":\"1\",\"queue\":\"0\",\"size\":\"le_131072\"}",
+      "{\"flush_queue\":\"2-7\",\"gap\":\"le_500us\",\"intervening_reads\":false,\"intervening_writes\":\"mixed\",\"peak\":\"1\",\"queue\":\"1\",\"size\":\"le_131072\"}"
+    ]
+  },
+  "RFC_performance_qualified": false,
+  "calibration_pending": true,
+  "scope": "File-attributed per-shape latency distributions; no inherited namespace thresholds and no same-cohort performance ratio."
+}

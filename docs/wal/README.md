@@ -38,6 +38,8 @@ the retained and rejected experiments.
 
 ## Benchmarks and qualification
 
+- [WAL extent attribution and calibration observations](benchmarks/wal-extent-attribution-method.md)
+- [RFC 026 extent-aware traces: DATA coverage and intervening FUA, 2026-11-03](benchmarks/rfc-026-v8-wal-extents-20261103.md)
 - [Passive WAL trace regimes and monotonic metric joins](benchmarks/passive-wal-trace-method.md)
 - [RFC 026 passive traces: clean capture, insufficient classification coverage, 2026-11-03](benchmarks/rfc-026-v8-passive-regimes-20261103.md)
 - [Paired V7/V8 diagnostic method and storage-state classification](benchmarks/paired-v7-v8-method.md)

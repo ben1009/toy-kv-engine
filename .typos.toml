@@ -24,4 +24,5 @@ extend-exclude = [
     "docs/wal/benchmarks/artifacts/rfc-026-v8-pcore-cpu-20261103-*-stacks.txt.gz",
     "docs/wal/benchmarks/artifacts/rfc-026-v8-flush-fua-20261103-*.perf.gz",
     "docs/wal/benchmarks/artifacts/rfc-026-v8-passive-regimes-20261103-*.gz",
+    "docs/wal/benchmarks/artifacts/rfc-026-v8-wal-extents-20261103-*.gz",
 ]

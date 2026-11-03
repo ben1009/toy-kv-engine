@@ -1,0 +1,298 @@
+{
+  "rfc-026-v8-wal-extents-20261103-base-analyzer-as-executed.py": {
+    "sha256": "5e20d0ae14b00eba82dd75d8e1c3a50cfbfea3a2cf0d5936dcaddf8594f29f39",
+    "bytes": 21964,
+    "decoded_sha256": "5e20d0ae14b00eba82dd75d8e1c3a50cfbfea3a2cf0d5936dcaddf8594f29f39",
+    "decoded_bytes": 21964
+  },
+  "rfc-026-v8-wal-extents-20261103-batch64-0-v7-benchmark.json": {
+    "sha256": "bf1f69460ebaf939494139a3ef96bd20ae5cf8eb6dde20a718ec1ec47068841b",
+    "bytes": 3925,
+    "decoded_sha256": "bf1f69460ebaf939494139a3ef96bd20ae5cf8eb6dde20a718ec1ec47068841b",
+    "decoded_bytes": 3925
+  },
+  "rfc-026-v8-wal-extents-20261103-batch64-0-v7-capture.json": {
+    "sha256": "58a64ec801a8328db015f06b191fe09ad37b4c0076294541feb646b8c0f7c39e",
+    "bytes": 5846,
+    "decoded_sha256": "58a64ec801a8328db015f06b191fe09ad37b4c0076294541feb646b8c0f7c39e",
+    "decoded_bytes": 5846
+  },
+  "rfc-026-v8-wal-extents-20261103-batch64-0-v7-extent-analysis.json.gz": {
+    "sha256": "bc7dff31635ae9f9ca9afbac3168097a6176414b49c5385741054129ae21bb90",
+    "bytes": 540769,
+    "decoded_sha256": "8231fa6be7930e03d005cbd1021f637f2c6032b618fcf97852ea16f9a3924150",
+    "decoded_bytes": 7046942
+  },
+  "rfc-026-v8-wal-extents-20261103-batch64-0-v7-timeline.json.gz": {
+    "sha256": "d0b4211c9f6ba12c70354f4459e5ebe238ccd0974abcacdd25501570477d5ae8",
+    "bytes": 161685,
+    "decoded_sha256": "55d6c62af26de7c99c93a58c748cf79597756370d50fd80c14a7e020df4545f8",
+    "decoded_bytes": 995431
+  },
+  "rfc-026-v8-wal-extents-20261103-batch64-0-v7.perf.gz": {
+    "sha256": "57bab692e91f2eb06a7e1a345155e4d4d58808aea1eb8e4c7659fe362fd157b0",
+    "bytes": 1590343,
+    "decoded_sha256": "db25ad06d939874d828949939850ce0e2816080f6f6398169d8400c7ae13174a",
+    "decoded_bytes": 15588336
+  },
+  "rfc-026-v8-wal-extents-20261103-batch64-1-v8-benchmark.json": {
+    "sha256": "17d2de1fc7c746d21974449c243ab0c5cb33f43905d21eb534c6ca83659993e4",
+    "bytes": 4147,
+    "decoded_sha256": "17d2de1fc7c746d21974449c243ab0c5cb33f43905d21eb534c6ca83659993e4",
+    "decoded_bytes": 4147
+  },
+  "rfc-026-v8-wal-extents-20261103-batch64-1-v8-capture.json": {
+    "sha256": "a893ee01453f567d6f00c9da2ec3361ff548160c01ca018af3a027e94c582b0b",
+    "bytes": 6083,
+    "decoded_sha256": "a893ee01453f567d6f00c9da2ec3361ff548160c01ca018af3a027e94c582b0b",
+    "decoded_bytes": 6083
+  },
+  "rfc-026-v8-wal-extents-20261103-batch64-1-v8-extent-analysis.json.gz": {
+    "sha256": "d39ffbdf9957d8e60930f0dbc6c970b7d1550ccab2efa0ced9a7e3ab3d125e5f",
+    "bytes": 491718,
+    "decoded_sha256": "59999881fccc37af4d7edab0f940091cb655d7239208086cdd66cd4b1edd2b56",
+    "decoded_bytes": 6673946
+  },
+  "rfc-026-v8-wal-extents-20261103-batch64-1-v8-timeline.json.gz": {
+    "sha256": "ce8daffd69430a3fee56cc14bfe496758dd321dfa364f4ef000b94e1bf7dd991",
+    "bytes": 147397,
+    "decoded_sha256": "75da6928dfc0c3188e21f1dadcb63d08333cf9e7927ab6cee823110fb0af495b",
+    "decoded_bytes": 911332
+  },
+  "rfc-026-v8-wal-extents-20261103-batch64-1-v8.perf.gz": {
+    "sha256": "d31f69667a19cdfbd2b99eb849fa8faa6246c1516f9321a5f4f898af7c1c8d2b",
+    "bytes": 1529543,
+    "decoded_sha256": "f449b87da8aeb6646a5f4198fddc51fdbb9ab7fd7053e78f95a9f046dda62e91",
+    "decoded_bytes": 14488904
+  },
+  "rfc-026-v8-wal-extents-20261103-batch64-2-v8-benchmark.json": {
+    "sha256": "9e90c179c9c3e9161ae544875c26be50aa0ff1ce0cef3665cb702810c0bf9357",
+    "bytes": 4131,
+    "decoded_sha256": "9e90c179c9c3e9161ae544875c26be50aa0ff1ce0cef3665cb702810c0bf9357",
+    "decoded_bytes": 4131
+  },
+  "rfc-026-v8-wal-extents-20261103-batch64-2-v8-capture.json": {
+    "sha256": "572cf2ba955fbaf8aac2ae4daeefdd3e8f12ae9ffacab611d5e251fd679aa961",
+    "bytes": 6066,
+    "decoded_sha256": "572cf2ba955fbaf8aac2ae4daeefdd3e8f12ae9ffacab611d5e251fd679aa961",
+    "decoded_bytes": 6066
+  },
+  "rfc-026-v8-wal-extents-20261103-batch64-2-v8-extent-analysis.json.gz": {
+    "sha256": "56ade12b1331b93813344c7907ab607c1dd4231ae7699ee6540cf163e349d65c",
+    "bytes": 416990,
+    "decoded_sha256": "e526ec5daf564e1ca8ecaa9372cfa98e7d2f16347006114f7eccf9c054f29809",
+    "decoded_bytes": 5758764
+  },
+  "rfc-026-v8-wal-extents-20261103-batch64-2-v8-timeline.json.gz": {
+    "sha256": "79a09fea251ed505fa50a4be7871244f19b0519c317e4e112ce6abb98183f254",
+    "bytes": 134137,
+    "decoded_sha256": "7fe170204880c402941e8890ee7fba5211ffd41274196bdfef71cbcb74c97d11",
+    "decoded_bytes": 864113
+  },
+  "rfc-026-v8-wal-extents-20261103-batch64-2-v8.perf.gz": {
+    "sha256": "57023c75dde409fecae5fbe7fa0aeac42dc2601f030e6d43f1413e8d582a9ce1",
+    "bytes": 1282488,
+    "decoded_sha256": "0a472eb7d90b6908df0c23b3318661b5eae3431f5ad91cf3ac34bb1fbb7c7133",
+    "decoded_bytes": 12587432
+  },
+  "rfc-026-v8-wal-extents-20261103-batch64-3-v7-benchmark.json": {
+    "sha256": "35515fffe757c4ba18ec130526deb94bfb6c0061055910ddb2925252888af96b",
+    "bytes": 3893,
+    "decoded_sha256": "35515fffe757c4ba18ec130526deb94bfb6c0061055910ddb2925252888af96b",
+    "decoded_bytes": 3893
+  },
+  "rfc-026-v8-wal-extents-20261103-batch64-3-v7-capture.json": {
+    "sha256": "d4a4a3bc5f2339eab2468550a783392d3f532c7f9c3a7f138ddc3654229c82dd",
+    "bytes": 5814,
+    "decoded_sha256": "d4a4a3bc5f2339eab2468550a783392d3f532c7f9c3a7f138ddc3654229c82dd",
+    "decoded_bytes": 5814
+  },
+  "rfc-026-v8-wal-extents-20261103-batch64-3-v7-extent-analysis.json.gz": {
+    "sha256": "13ffdd8d060fd40836fc98efc45fb66c9cdd2ff1c0b0a9e06c3fb255b5c334a9",
+    "bytes": 499702,
+    "decoded_sha256": "feed47bdd62776375466fff0f433bbe49c7713e07ca4c07abacee07c76a6b604",
+    "decoded_bytes": 6763826
+  },
+  "rfc-026-v8-wal-extents-20261103-batch64-3-v7-timeline.json.gz": {
+    "sha256": "4b90facef22970482ac2994357c9cabf6ffc41b7a8489bcfde203af249d94ba5",
+    "bytes": 145016,
+    "decoded_sha256": "7d1386e686e0d59ce2fe262cc37f12fa5aef57b6bc3ea12895ad37f223f72750",
+    "decoded_bytes": 932394
+  },
+  "rfc-026-v8-wal-extents-20261103-batch64-3-v7.perf.gz": {
+    "sha256": "7c6a89fc76c662810c27c3ad7121458e50b8c9ea1bd7384a37c9aebefedae41f",
+    "bytes": 1468551,
+    "decoded_sha256": "8c3526574c1bee3003b57c6c1a0e8d8936a763dc85acd386523eb6cdf4b31cfa",
+    "decoded_bytes": 15027056
+  },
+  "rfc-026-v8-wal-extents-20261103-capture-as-executed.py": {
+    "sha256": "0543c3c202f490ad681788d4aa8577bad7c6d7c8e328996af781823961d32489",
+    "bytes": 10881,
+    "decoded_sha256": "0543c3c202f490ad681788d4aa8577bad7c6d7c8e328996af781823961d32489",
+    "decoded_bytes": 10881
+  },
+  "rfc-026-v8-wal-extents-20261103-extent-helper-as-executed.py": {
+    "sha256": "8bee997cb56971c20774ae245d67e3100135f912c394068484d35074b854f7bd",
+    "bytes": 26350,
+    "decoded_sha256": "8bee997cb56971c20774ae245d67e3100135f912c394068484d35074b854f7bd",
+    "decoded_bytes": 26350
+  },
+  "rfc-026-v8-wal-extents-20261103-extent-summary.json": {
+    "sha256": "08ec2de21e5bb0c46183d511594a1688b23376d4c59e72f631f9ea02267d0725",
+    "bytes": 24238,
+    "decoded_sha256": "08ec2de21e5bb0c46183d511594a1688b23376d4c59e72f631f9ea02267d0725",
+    "decoded_bytes": 24238
+  },
+  "rfc-026-v8-wal-extents-20261103-formats.json": {
+    "sha256": "6fa7549f2424d44a7e936909b438c1a0a3b137da29a65ceb0e231a3e0007a454",
+    "bytes": 10269,
+    "decoded_sha256": "6fa7549f2424d44a7e936909b438c1a0a3b137da29a65ceb0e231a3e0007a454",
+    "decoded_bytes": 10269
+  },
+  "rfc-026-v8-wal-extents-20261103-interval-metrics.csv": {
+    "sha256": "38931f9562c4457baaa98e57b6b5b42610e3d66933de10230b2cd057f6cb9e31",
+    "bytes": 245382,
+    "decoded_sha256": "38931f9562c4457baaa98e57b6b5b42610e3d66933de10230b2cd057f6cb9e31",
+    "decoded_bytes": 245382
+  },
+  "rfc-026-v8-wal-extents-20261103-plan.json": {
+    "sha256": "24db52e32fa64110d7efd6836f0123e7bd0682cdf0dd79ebb4d61b0232f3e71d",
+    "bytes": 2100,
+    "decoded_sha256": "24db52e32fa64110d7efd6836f0123e7bd0682cdf0dd79ebb4d61b0232f3e71d",
+    "decoded_bytes": 2100
+  },
+  "rfc-026-v8-wal-extents-20261103-point-0-v7-benchmark.json": {
+    "sha256": "8e706c9a2d9adfc02ad76a950013844af5d57c5d7f4b771dab8f7013a7e2ff0b",
+    "bytes": 3894,
+    "decoded_sha256": "8e706c9a2d9adfc02ad76a950013844af5d57c5d7f4b771dab8f7013a7e2ff0b",
+    "decoded_bytes": 3894
+  },
+  "rfc-026-v8-wal-extents-20261103-point-0-v7-capture.json": {
+    "sha256": "062b517a4d0d7a1093b5e72487193dede618f18508b7bd2e427a24e4b03a1102",
+    "bytes": 5801,
+    "decoded_sha256": "062b517a4d0d7a1093b5e72487193dede618f18508b7bd2e427a24e4b03a1102",
+    "decoded_bytes": 5801
+  },
+  "rfc-026-v8-wal-extents-20261103-point-0-v7-extent-analysis.json.gz": {
+    "sha256": "f790c0244decba392372454aeb210db90ae30c21c2f166ec394b0d77997136b4",
+    "bytes": 2156013,
+    "decoded_sha256": "6a72838e3abd3edaa792e53c966e9ba3f999db9d66ad1a8a347987ca629243c7",
+    "decoded_bytes": 39334088
+  },
+  "rfc-026-v8-wal-extents-20261103-point-0-v7-timeline.json.gz": {
+    "sha256": "89e6b086eee1c2c78bacf00a2b7e986e3d26922351e45ade64224a9d89be9b90",
+    "bytes": 472709,
+    "decoded_sha256": "5ccf9054080ea7adc62a18680aa35e1731ae512e54e58d8abfdbf46d7e055687",
+    "decoded_bytes": 3377197
+  },
+  "rfc-026-v8-wal-extents-20261103-point-0-v7.perf.gz": {
+    "sha256": "de8f7493d7329be80c2c4ce7579368b789d445f19dc927a2f4069c8c18cf8bf9",
+    "bytes": 2775336,
+    "decoded_sha256": "27d6d304ca4c315925864a3b0be3f85d9327321048f904553e8ed5afe29ddaff",
+    "decoded_bytes": 36222344
+  },
+  "rfc-026-v8-wal-extents-20261103-point-1-v8-benchmark.json": {
+    "sha256": "cf6fb202fdb901ca6257d85a52bfdf7092788b3e9d6c7bf142324e43411d25de",
+    "bytes": 4123,
+    "decoded_sha256": "cf6fb202fdb901ca6257d85a52bfdf7092788b3e9d6c7bf142324e43411d25de",
+    "decoded_bytes": 4123
+  },
+  "rfc-026-v8-wal-extents-20261103-point-1-v8-capture.json": {
+    "sha256": "3178299a5e4ef3d90f54f32859db8835e6f5fac15fb335ec9309074eaec82592",
+    "bytes": 6046,
+    "decoded_sha256": "3178299a5e4ef3d90f54f32859db8835e6f5fac15fb335ec9309074eaec82592",
+    "decoded_bytes": 6046
+  },
+  "rfc-026-v8-wal-extents-20261103-point-1-v8-extent-analysis.json.gz": {
+    "sha256": "52f33737948151fc6cf55830d6a4715076db34048d60cb42db788fa233f2f5e2",
+    "bytes": 2128239,
+    "decoded_sha256": "4eab73feee114ae781634bfb8fa26f917e56fbfc341e3f9068cd85e0797c6da2",
+    "decoded_bytes": 39199643
+  },
+  "rfc-026-v8-wal-extents-20261103-point-1-v8-timeline.json.gz": {
+    "sha256": "6228b6447b62212a703efa91e482c154aadd2fe24448b0bc7a335d7e48358403",
+    "bytes": 485881,
+    "decoded_sha256": "72f16cacd69bb2bad074b13ac5e1f91710c6a0b8944d313d96524358ebbd084a",
+    "decoded_bytes": 3424910
+  },
+  "rfc-026-v8-wal-extents-20261103-point-1-v8.perf.gz": {
+    "sha256": "be96909ea3e7cb6ad3a979cc20e5e4daa6e246c8733509602db8a9a4817ec973",
+    "bytes": 6088044,
+    "decoded_sha256": "499f323f5d78ff1ff98cb31417644e0ddcf1808895ced7efb33743424b8c6596",
+    "decoded_bytes": 74088832
+  },
+  "rfc-026-v8-wal-extents-20261103-point-2-v8-benchmark.json": {
+    "sha256": "725a64df55bdd1bb817f93a1f9e9d9a7ada185ce7e38a1e35fb86d55a49663f0",
+    "bytes": 4126,
+    "decoded_sha256": "725a64df55bdd1bb817f93a1f9e9d9a7ada185ce7e38a1e35fb86d55a49663f0",
+    "decoded_bytes": 4126
+  },
+  "rfc-026-v8-wal-extents-20261103-point-2-v8-capture.json": {
+    "sha256": "a3ec0b80f1469c2727e1ecc26289615f63974cc438e45e6e5505bd471fce1901",
+    "bytes": 6049,
+    "decoded_sha256": "a3ec0b80f1469c2727e1ecc26289615f63974cc438e45e6e5505bd471fce1901",
+    "decoded_bytes": 6049
+  },
+  "rfc-026-v8-wal-extents-20261103-point-2-v8-extent-analysis.json.gz": {
+    "sha256": "20f7f9900c942446ba3fafab94e6946f4328d20087b4de861c6b644cde3d47e1",
+    "bytes": 2059292,
+    "decoded_sha256": "1c975052c469ca7d6a618a9eaf8d3ab6582be381176d52325036ba63e7e2f8ed",
+    "decoded_bytes": 38970097
+  },
+  "rfc-026-v8-wal-extents-20261103-point-2-v8-timeline.json.gz": {
+    "sha256": "93f58ec653c2da42b9a50fb9b509876da8003ce1b57458608ffa66f6c03880c4",
+    "bytes": 469176,
+    "decoded_sha256": "8e92b9e26e2f755bb1227dc832927e9fd8c1415f9a5fafab5173131c0d479531",
+    "decoded_bytes": 3362689
+  },
+  "rfc-026-v8-wal-extents-20261103-point-2-v8.perf.gz": {
+    "sha256": "1668337d117d637827c5a129618702b28690c8ee5cde3cc29bc9600a796d59ee",
+    "bytes": 5938538,
+    "decoded_sha256": "5e4559f1618a8a2d6bd075b33cbfbfec9e23ce2f994607070d2b52615a0f3c90",
+    "decoded_bytes": 73705568
+  },
+  "rfc-026-v8-wal-extents-20261103-point-3-v7-benchmark.json": {
+    "sha256": "f6c315bd5f9ba7779b9fd8c961142dad632a17ba60cd06cf5b5584a815f73bbd",
+    "bytes": 3885,
+    "decoded_sha256": "f6c315bd5f9ba7779b9fd8c961142dad632a17ba60cd06cf5b5584a815f73bbd",
+    "decoded_bytes": 3885
+  },
+  "rfc-026-v8-wal-extents-20261103-point-3-v7-capture.json": {
+    "sha256": "53509967b3d0812bc388d8b73bfc5e4cfe4617bae5b79f4ea2a7306d492d5265",
+    "bytes": 5792,
+    "decoded_sha256": "53509967b3d0812bc388d8b73bfc5e4cfe4617bae5b79f4ea2a7306d492d5265",
+    "decoded_bytes": 5792
+  },
+  "rfc-026-v8-wal-extents-20261103-point-3-v7-extent-analysis.json.gz": {
+    "sha256": "dfb6804267dcacd145fd3715c141a8d52384a1e12f1fb7c75338f2c1af58e128",
+    "bytes": 2196576,
+    "decoded_sha256": "27f67a75468306df07b88567717ac3f86d7fc149793666807b019245e63f1289",
+    "decoded_bytes": 39425837
+  },
+  "rfc-026-v8-wal-extents-20261103-point-3-v7-timeline.json.gz": {
+    "sha256": "1071332341d60ccd1d2614e21777ff99ab91fceab5fbcc7973d5931b0f481d4d",
+    "bytes": 480584,
+    "decoded_sha256": "936fea059bab369b0d2ae78aec57c2c72306ab5a727c3ff2d008b25a29e1e00e",
+    "decoded_bytes": 3400643
+  },
+  "rfc-026-v8-wal-extents-20261103-point-3-v7.perf.gz": {
+    "sha256": "f798e46d9e90378ebdc7a49b547b3ea3112ac026d970333d0b5e1c3afbbb4027",
+    "bytes": 2804253,
+    "decoded_sha256": "4141a7a5bf3b96c0b0887aa7d7e944ffe60160be257251338728052f0b432c17",
+    "decoded_bytes": 36253808
+  },
+  "rfc-026-v8-wal-extents-20261103-wal-calibration.csv": {
+    "sha256": "7537f2ed51d708068bffc86d8afbd3446684495610e9611cd4bfe3bf1c3fa4a3",
+    "bytes": 113970,
+    "decoded_sha256": "7537f2ed51d708068bffc86d8afbd3446684495610e9611cd4bfe3bf1c3fa4a3",
+    "decoded_bytes": 113970
+  },
+  "rfc-026-v8-wal-extents-20261103-analyzer-final.py": {
+    "sha256": "0e99fa82409828a3a1d7de56da10428661b57f7815ad8738120ff05247ec121e",
+    "bytes": 29234
+  },
+  "rfc-026-v8-wal-extents-20261103-checks.json": {
+    "sha256": "b6b8d87ba40391202133acd17bba7f2f61a2f9a7a2396b893dba92530897ca89",
+    "bytes": 1899
+  }
+}
