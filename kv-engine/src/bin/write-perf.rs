@@ -287,7 +287,7 @@ struct Args {
     /// exercised at all, whatever the build contains.
     #[arg(long)]
     pitr: bool,
-    /// PITR format for WAL comparisons (v7 default; v6 legacy control; v8 bench-only opt-in).
+    /// PITR format for WAL comparisons (v8 default; v6/v7 compatibility controls).
     #[arg(long, value_enum, requires = "pitr")]
     pitr_format: Option<PitrFormatArg>,
     #[arg(long)]
@@ -542,6 +542,11 @@ impl HarnessConfig {
             },
             enable_wal,
             pitr_repository: None,
+            pitr_writer_format: match self.pitr_format.unwrap_or(PitrFormatArg::V8) {
+                PitrFormatArg::V6 => kv_engine::pitr::api::PitrWriterFormat::V6,
+                PitrFormatArg::V7 => kv_engine::pitr::api::PitrWriterFormat::V7,
+                PitrFormatArg::V8 => kv_engine::pitr::api::PitrWriterFormat::V8,
+            },
             serializable: false,
             value_separation: if enable_vlog {
                 Some(ValueSeparationOptions {
@@ -3362,10 +3367,10 @@ fn pitr_workload_limits(cfg: &HarnessConfig, batch_size: usize) -> Result<(u64, 
         segment <= MAX_SEGMENT_BYTES,
         "PITR workload requires a {segment}-byte segment, exceeding the 1 GiB WAL limit; reduce --num or --value-size, or use wal_batch_concurrent with a larger --wal-batch-size"
     );
-    // Four segments cover the legacy source, v7 image, recovery workspace,
-    // seals, successor, and transition metadata during setup migration.
+    // Five segments cover retained legacy allocation, v7 source growth, the
+    // v8 image and recovery workspace, plus seals and transition headroom.
     let budget = segment
-        .checked_mul(4)
+        .checked_mul(5)
         .context("PITR workload unarchived budget overflow")?;
 
     Ok((segment, budget))
@@ -3429,8 +3434,8 @@ fn enable_pitr_for_workload(
         "PITR enable did not complete"
     );
 
-    let requested_format = cfg.pitr_format.unwrap_or(PitrFormatArg::V7);
-    if matches!(requested_format, PitrFormatArg::V7 | PitrFormatArg::V8) {
+    let requested_format = cfg.pitr_format.unwrap_or(PitrFormatArg::V8);
+    if requested_format == PitrFormatArg::V7 {
         // A nonempty v6 source lets the regular, capacity-checked migration
         // path install v7. Setup is outside the measured interval.
         engine.put(b"write-perf-v7-migration-seed", b"setup")?;
@@ -3441,29 +3446,7 @@ fn enable_pitr_for_workload(
             }
         }
     }
-    #[cfg(all(feature = "bench", target_os = "linux"))]
-    let engine = if requested_format == PitrFormatArg::V8 {
-        // RFC 026 v8 creation is gated in production. Keep the explicit
-        // migration reachable only through this bench-feature binary. Reopen
-        // after the setup v6-to-v7 migration so this process holds the v7 WAL
-        // compatibility lock required to publish the v8 guard.
-        engine.close()?;
-        drop(engine);
-        let engine = KvEngine::open_with_wal_io_mode(path, options, cfg.wal_io_mode.into())?;
-        engine.start_v8_pitr_for_benchmark(&repository)?;
-        engine
-    } else {
-        engine
-    };
-    #[cfg(not(all(feature = "bench", target_os = "linux")))]
-    let engine = {
-        ensure!(
-            requested_format != PitrFormatArg::V8,
-            "PITR v8 comparison requires a Linux write-perf build with --features bench"
-        );
-        engine
-    };
-    #[cfg(all(feature = "bench", target_os = "linux"))]
+    #[cfg(target_os = "linux")]
     if requested_format == PitrFormatArg::V8 {
         engine.wait_for_pitr_benchmark_maintenance()?;
     }
@@ -8457,10 +8440,7 @@ fn validate_config(cfg: &HarnessConfig) -> Result<()> {
     if let Some(format) = cfg.pitr_format {
         anyhow::ensure!(cfg.pitr, "--pitr-format requires --pitr");
         if format == PitrFormatArg::V8 {
-            anyhow::ensure!(
-                cfg!(all(feature = "bench", target_os = "linux")),
-                "PITR v8 comparison requires a Linux write-perf build with --features bench"
-            );
+            anyhow::ensure!(cfg!(target_os = "linux"), "PITR v8 requires Linux");
         }
         if format == PitrFormatArg::V6 && cfg.wal_io_mode_explicit {
             anyhow::ensure!(
@@ -8594,7 +8574,7 @@ mod tests {
         cfg.value_size = 1024;
         let (segment, budget) = pitr_workload_limits(&cfg, 1).expect("size small-value workload");
         assert!(segment > 8192 + 20_000 * 8192);
-        assert_eq!(budget, segment * 4);
+        assert_eq!(budget, segment * 5);
 
         cfg.value_size = 16 * 1024;
         let (segment, budget) = pitr_workload_limits(&cfg, 1).expect("size large-value workload");
@@ -8606,7 +8586,7 @@ mod tests {
         cfg.value_size = 1024;
         assert_eq!(
             pitr_workload_limits(&cfg, 1).expect("keep minimum budget"),
-            (256 * 1024 * 1024, 1024 * 1024 * 1024)
+            (256 * 1024 * 1024, 5 * 256 * 1024 * 1024)
         );
     }
 
@@ -8727,7 +8707,11 @@ mod tests {
         assert_eq!(pitr_default.wal_io_mode, WalIoModeArg::Parallel);
         assert_eq!(pitr_default.num, 20_000);
         assert_eq!(pitr_default.pitr_format, None);
-        validate_config(&pitr_default).expect("default PITR v7 uses parallel");
+        assert_eq!(
+            pitr_default.build_options(true, false).pitr_writer_format,
+            kv_engine::pitr::api::PitrWriterFormat::V8
+        );
+        validate_config(&pitr_default).expect("default PITR v8 uses parallel");
         validate_run_mode(&pitr_default, Some("wal_concurrent"))
             .expect("PITR comparison mode is valid");
         let workloads = select_workloads(Some("wal_concurrent"), &pitr_default)
@@ -8781,14 +8765,14 @@ mod tests {
         assert_eq!(v8_parallel.wal_io_mode, WalIoModeArg::Parallel);
         assert_eq!(v8_parallel.pitr_format, Some(PitrFormatArg::V8));
         assert_eq!(v8_parallel.pitr_format.map(PitrFormatArg::version), Some(8));
-        if cfg!(all(feature = "bench", target_os = "linux")) {
+        if cfg!(target_os = "linux") {
             validate_config(&v8_parallel).expect("v8 supports the default Parallel mode");
         } else {
             assert!(
                 validate_config(&v8_parallel)
                     .unwrap_err()
                     .to_string()
-                    .contains("requires a Linux write-perf build with --features bench")
+                    .contains("PITR v8 requires Linux")
             );
         }
 
@@ -8804,14 +8788,14 @@ mod tests {
             .expect("parse v8 Leader comparison"),
         );
         assert_eq!(v8_leader.wal_io_mode, WalIoModeArg::Leader);
-        if cfg!(all(feature = "bench", target_os = "linux")) {
+        if cfg!(target_os = "linux") {
             validate_config(&v8_leader).expect("v8 supports the explicit Leader comparison");
         } else {
             assert!(
                 validate_config(&v8_leader)
                     .unwrap_err()
                     .to_string()
-                    .contains("requires a Linux write-perf build with --features bench")
+                    .contains("PITR v8 requires Linux")
             );
         }
         assert_eq!(

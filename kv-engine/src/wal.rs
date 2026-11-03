@@ -2548,7 +2548,7 @@ impl Wal {
         }
         anyhow::ensure!(
             !matches!(descriptor.framing, WalFraming::EmbeddedFrontier),
-            "WAL v7 recovery is not implemented"
+            "WAL v7/v8 recovery requires the dedicated manifest-bound frontier reader"
         );
         let data_len = data.len();
         let mut max_ts: u64 = 0;

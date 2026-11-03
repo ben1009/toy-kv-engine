@@ -161,6 +161,7 @@ impl RunConfig {
             },
             enable_wal: self.wal,
             pitr_repository: None,
+            pitr_writer_format: Default::default(),
             serializable: false,
             value_separation: if self.vlog {
                 Some(ValueSeparationOptions {

@@ -482,6 +482,7 @@ fn main() -> Result<()> {
             },
             enable_wal: args.enable_wal,
             pitr_repository: None,
+            pitr_writer_format: Default::default(),
             serializable: args.serializable,
             value_separation: None,
             manifest_snapshot_threshold_bytes: 4 << 20, // 4MB

@@ -33,6 +33,7 @@ fn make_options() -> LsmStorageOptions {
         }),
         enable_wal: false,
         pitr_repository: None,
+        pitr_writer_format: Default::default(),
         serializable: false,
         value_separation: None,
         manifest_snapshot_threshold_bytes: 0,
@@ -46,6 +47,7 @@ fn make_options_wal() -> LsmStorageOptions {
     LsmStorageOptions {
         enable_wal: true,
         pitr_repository: None,
+        pitr_writer_format: Default::default(),
         ..make_options()
     }
 }

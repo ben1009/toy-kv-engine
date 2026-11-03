@@ -1,8 +1,7 @@
-//! Staged primitives for the proposed RFC 026 WAL format.
+//! RFC 026 WAL with composable BLAKE3 prefix digests.
 //!
-//! The format is registered in the format catalog, but remains unavailable to
-//! production readers and writers until persistence, compatibility, and
-//! qualification gates are complete.
+//! V8 is the default for newly enabled PITR. Dedicated readers and writers
+//! preserve the embedded-frontier recovery and compatibility contracts.
 #![allow(dead_code)]
 
 pub(crate) mod codec;

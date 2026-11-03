@@ -161,6 +161,13 @@ fn child_main(args: &[String]) -> Result<(), String> {
         config.storage_options.serializable = true;
     }
 
+    if matches!(
+        scenario.as_str(),
+        "pitr-v7-parallel-crash" | "pitr-v7-leader-crash"
+    ) {
+        config.storage_options.pitr_writer_format = kv_engine::pitr::api::PitrWriterFormat::V7;
+    }
+
     // Open the database
     let engine = KvEngine::open_with_wal_io_mode(
         db_path.as_str(),

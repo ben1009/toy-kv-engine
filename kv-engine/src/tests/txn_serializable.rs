@@ -16,6 +16,7 @@ fn serializable_options() -> LsmStorageOptions {
         compaction_options: CompactionOptions::NoCompaction,
         enable_wal: false,
         pitr_repository: None,
+        pitr_writer_format: Default::default(),
         serializable: true,
         value_separation: None,
         manifest_snapshot_threshold_bytes: 0,

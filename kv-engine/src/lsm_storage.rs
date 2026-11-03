@@ -213,7 +213,6 @@ struct PitrV8MigrationReservation {
 
 #[cfg(target_os = "linux")]
 #[must_use = "retain migration capacity until the v8 successor owns the reservation"]
-#[allow(dead_code)] // The v7-to-v8 migration executor remains disabled pending qualification.
 struct PublishedPitrV8MigrationIntent<'borrow, 'engine> {
     state: crate::pitr::manifest::PitrState,
     _reservation: PitrV8MigrationReservation,
@@ -1389,13 +1388,17 @@ pub struct LsmStorageOptions {
     // Maximum number of memtables in memory, flush to L0 when exceeding this limit
     pub num_memtable_limit: usize,
     pub compaction_options: CompactionOptions,
-    /// When `false`, an enabled PITR epoch keeps its persisted state but new
-    /// writes go to a non-PITR memtable, so they are not covered by the archive
-    /// until WAL is enabled again.
+    /// Enable write-ahead logging. Reopening V7/V8 PITR requires `true`.
+    /// For legacy PITR epochs, `false` retains their persisted state but sends
+    /// new writes to a non-PITR memtable outside archive coverage.
     pub enable_wal: bool,
     /// Repository used to automatically resume a persisted PITR epoch on open.
     /// When omitted, a PITR-enabled database opens read-only until `resume_pitr` succeeds.
     pub pitr_repository: Option<PathBuf>,
+    /// Preferred PITR writer format. Defaults to V8 with Parallel I/O unless
+    /// the explicit Leader selector is used. Existing segments are upgraded
+    /// only through capacity-checked, durably recorded migration transitions.
+    pub pitr_writer_format: crate::pitr::api::PitrWriterFormat,
     pub serializable: bool,
     /// Options for key-value separation (vLog). If `Some` with `enabled` true, large
     /// values are stored in a separate Value Log file. Defaults to `None` (disabled).
@@ -1425,6 +1428,7 @@ impl Default for LsmStorageOptions {
             compaction_options: CompactionOptions::NoCompaction,
             enable_wal: false,
             pitr_repository: None,
+            pitr_writer_format: crate::pitr::api::PitrWriterFormat::V8,
             num_memtable_limit: 50,
             serializable: false,
             value_separation: None,
@@ -4193,9 +4197,8 @@ impl KvEngine {
     }
 
     /// Persist a fenced v7-to-v8 migration intent only after the complete
-    /// transition capacity has been reserved. This is preparation plumbing for
-    /// the future executor; no normal path invokes it while migration remains
-    /// disabled pending compatibility qualification.
+    /// transition capacity has been reserved. The caller retains the lifecycle
+    /// locks and reservation until the exact v8 successor is installed.
     #[cfg(target_os = "linux")]
     #[allow(dead_code)]
     fn publish_pitr_v8_migration_intent<'borrow, 'engine>(
@@ -4340,76 +4343,76 @@ impl KvEngine {
         }))
     }
 
-    /// Explicitly migrate an already enabled PITR database to v8 for the
-    /// opt-in `write-perf` benchmark. This benchmark-only entry point does not
-    /// change automatic format selection or the default writer format.
-    #[cfg(all(target_os = "linux", feature = "bench"))]
-    #[doc(hidden)]
-    pub fn start_v8_pitr_for_benchmark(
+    /// Advance an eligible Active v7 segment while the caller owns both
+    /// lifecycle locks. Compatibility publication and transition reservations
+    /// precede the durable migration intent; capacity deferral preserves v7.
+    #[cfg(target_os = "linux")]
+    fn start_eligible_v8_migration(
         &self,
-        repository: impl AsRef<std::path::Path>,
-    ) -> Result<()> {
-        match self.resume_pitr(&repository)? {
-            crate::pitr::api::PitrResumeOutcome::Resumed => {}
-            crate::pitr::api::PitrResumeOutcome::ReconciliationRequired(error) => {
-                anyhow::bail!("v8 PITR benchmark setup requires reconciliation: {error:?}");
-            }
+        guards: &V8CompatibilityPublicationGuards<'_>,
+    ) -> Result<bool> {
+        use crate::pitr::manifest::{ObligationState, PitrMode};
+
+        let state = self.pitr_manifest_state.lock().clone();
+        if self.inner.options.pitr_writer_format != crate::pitr::api::PitrWriterFormat::V8
+            || state.mode != PitrMode::Enabled
+            || !self.inner.state.load().memtable.uses_v7_wal()
+            || state.obligations.values().any(|obligation| {
+                !matches!(
+                    obligation.state,
+                    ObligationState::Reclaimable | ObligationState::Abandoned
+                )
+            })
+        {
+            return Ok(false);
         }
         self.inner
             .mvcc
             .as_ref()
-            .ok_or_else(|| anyhow!("v8 PITR benchmark requires MVCC"))?
+            .ok_or_else(|| anyhow!("v8 migration requires MVCC"))?
             .stop_commit_admission_and_capture()?;
-
-        let guards = self.lock_v8_compatibility_publication();
-        let Some(intent) = self.publish_pitr_v8_migration_intent(&guards)? else {
-            drop(guards);
-            match self.resume_pitr(&repository)? {
-                crate::pitr::api::PitrResumeOutcome::Resumed => {}
-                crate::pitr::api::PitrResumeOutcome::ReconciliationRequired(error) => {
-                    anyhow::bail!(
-                        "v8 PITR benchmark migration preflight was deferred and resume requires reconciliation: {error:?}"
-                    );
-                }
+        // Capacity is an adoption gate, not a reason to fence a healthy v7
+        // database indefinitely. The caller resumes its existing writer when
+        // migration cannot be funded or filesystem sampling is unavailable.
+        match self.pitr_v8_migration_capacity_status(&state, &self.inner.state.load().memtable) {
+            Ok(Some(capacity))
+                if capacity.decision
+                    == crate::pitr::api::PitrV8MigrationCapacityDecision::Eligible => {}
+            Ok(capacity) => {
+                log::info!("PITR v8 migration deferred; keeping Active v7: {capacity:?}");
+                return Ok(false);
             }
-            anyhow::bail!("v8 PITR benchmark migration was deferred by capacity preflight");
-        };
-
-        // Keep both the transition reservation and compatibility lifecycle
-        // barriers alive until the durable intent has installed its exact v8
-        // successor. Calling `resume_pitr` before this handoff would drop the
-        // reservation and leave a gap in lifecycle serialization.
-        let source_segment_id =
-            unsupported_v7_to_v8_migration_source(&intent.state).ok_or_else(|| {
-                anyhow!("published v8 benchmark migration intent has no Active source")
-            })?;
-        let successor_segment_id = intent
-            .state
-            .obligations
-            .get(&source_segment_id)
-            .ok_or_else(|| anyhow!("published v8 benchmark migration source has no obligation"))?
-            .successor_segment_id;
-        let prepared = self
-            .seal_rotate_v7_active_wal(source_segment_id, successor_segment_id)
-            .context("install the benchmark v8 successor")?;
-        drop(prepared);
-        drop(intent);
-        drop(guards);
-
-        match self.resume_pitr(repository)? {
-            crate::pitr::api::PitrResumeOutcome::Resumed => Ok(()),
-            crate::pitr::api::PitrResumeOutcome::ReconciliationRequired(error) => {
-                anyhow::bail!("v8 PITR benchmark migration requires reconciliation: {error:?}");
+            Err(error) => {
+                log::warn!(
+                    "could not assess PITR v8 migration capacity; keeping Active v7: {error:#}"
+                );
+                return Ok(false);
             }
         }
+        let mut open_lock = self.inner.wal_v7_open_lock.lock();
+        if open_lock.is_none() {
+            *open_lock = Some(WalV7OpenLock::acquire(&self.inner.path)?);
+        }
+        drop(open_lock);
+        let Some(intent) = self.publish_pitr_v8_migration_intent(guards)? else {
+            return Ok(false);
+        };
+        let source_segment_id = unsupported_v7_to_v8_migration_source(&intent.state)
+            .ok_or_else(|| anyhow!("published v8 migration has no Active source"))?;
+        let successor_segment_id =
+            intent.state.obligations[&source_segment_id].successor_segment_id;
+        self.seal_rotate_v7_active_wal(source_segment_id, successor_segment_id)
+            .context("install the default v8 PITR successor")?;
+        drop(intent);
+        Ok(true)
     }
 
-    /// Drain PITR maintenance made eligible by the benchmark-only v8 migration
+    /// Drain PITR maintenance made eligible by PITR bootstrap or migration
     /// before a timed write workload begins. The migration can leave a sealed
     /// predecessor that causes the periodic worker to capture a recovery point;
     /// allowing that barrier to race the measured writes makes the benchmark
     /// depend on startup scheduling rather than steady-state WAL behavior.
-    #[cfg(all(target_os = "linux", feature = "bench"))]
+    #[cfg(target_os = "linux")]
     #[doc(hidden)]
     pub fn wait_for_pitr_benchmark_maintenance(&self) -> Result<()> {
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
@@ -4497,6 +4500,50 @@ impl KvEngine {
         )?;
         capacity.ensure_eligible()?;
         Ok(capacity)
+    }
+
+    /// Check both durable bootstrap transitions before creating a repository
+    /// or enabling PITR. The v8 handoff can overlap the retained legacy image
+    /// and its seal with the empty v7 source, so charge all three explicitly.
+    #[cfg(target_os = "linux")]
+    fn assess_new_pitr_enable_capacity(
+        &self,
+        config: &crate::pitr::manifest::PersistedPitrConfig,
+    ) -> Result<()> {
+        let legacy = self.assess_new_pitr_v7_enable_capacity(config)?;
+        if self.inner.options.pitr_writer_format != crate::pitr::api::PitrWriterFormat::V8 {
+            return Ok(());
+        }
+        let empty_image_bytes = (crate::wal::v7::codec::WAL_V7_HEADER_LEN
+            + crate::wal::v7::codec::WAL_V7_FRAME_LEN) as u64;
+        let allocated_bytes = crate::pitr::segment::filesystem_allocation_reservation(
+            &self.inner.path,
+            empty_image_bytes,
+        )?;
+        let retained_bytes = legacy
+            .retained_source_spool_bytes
+            .checked_add(legacy.legacy_seal_sidecar_bytes)
+            .and_then(|bytes| bytes.checked_add(allocated_bytes))
+            .ok_or_else(|| anyhow!("PITR v8 bootstrap allocation overflows"))?;
+        let allocation_unit =
+            crate::pitr::segment::filesystem_allocation_reservation(&self.inner.path, 1)?;
+        let capacity = crate::pitr::migration::assess_v8_migration_capacity(
+            config,
+            empty_image_bytes,
+            allocated_bytes,
+            retained_bytes,
+            allocation_unit,
+        )?;
+        if let crate::pitr::migration::V8MigrationCapacityDecision::Deferred(reason) =
+            capacity.decision
+        {
+            anyhow::bail!(
+                "PITR v8 enable capacity is deferred ({reason:?}): {} bytes total required, {} bytes available in the source-spool limit",
+                capacity.required_total_bytes,
+                capacity.source_spool_limit_bytes,
+            );
+        }
+        Ok(())
     }
 
     #[cfg(target_os = "linux")]
@@ -4713,7 +4760,7 @@ impl KvEngine {
         // Completing a durable Sealing transition closes admission again to
         // drain its source. Capture the resulting fence, not the earlier one,
         // so the explicit resume can reopen the newly installed successor.
-        let fence_generation = self
+        let mut fence_generation = self
             .inner
             .mvcc
             .as_ref()
@@ -4764,6 +4811,40 @@ impl KvEngine {
             }
         }
         drop(migration_reservation);
+        let guards = V8CompatibilityPublicationGuards {
+            inner: self.inner.as_ref(),
+            _operation_guard,
+            _barrier_guard: barrier,
+        };
+        if self.start_eligible_v8_migration(&guards)? {
+            state = self.pitr_manifest_state.lock().clone();
+            fence_generation = self
+                .inner
+                .mvcc
+                .as_ref()
+                .and_then(|mvcc| mvcc.closed_admission_generation());
+            *self.pitr_v8_pending_resume.lock() = if has_base {
+                state
+                    .active_segment_id
+                    .zip(fence_generation)
+                    .map(|(segment, generation)| {
+                        (timeline_id, archive_epoch_id, segment, generation)
+                    })
+            } else {
+                None
+            };
+            state = self.reconcile_durable_archive_obligations(state)?;
+            if state.obligations.values().any(|obligation| {
+                obligation.state == crate::pitr::manifest::ObligationState::Reclaimable
+            }) {
+                state = self.reconcile_durable_archive_obligations(state)?;
+            }
+        }
+        let V8CompatibilityPublicationGuards {
+            _operation_guard,
+            _barrier_guard: barrier,
+            ..
+        } = guards;
         self.report_deferred_v7_migration_on_resume(&state, &mut report_sink);
         drop(barrier);
         if state.mode == crate::pitr::manifest::PitrMode::PublicationUncertain {
@@ -4954,7 +5035,8 @@ impl KvEngine {
         };
         use crate::wal::v7::codec::{WAL_V7_HEADER_LEN, WalV7Header};
 
-        if state.mode != PitrMode::Enabled
+        if self.inner.options.pitr_writer_format == crate::pitr::api::PitrWriterFormat::V6
+            || state.mode != PitrMode::Enabled
             || state.active_boundary.is_some()
             || state.obligations.values().any(|obligation| {
                 !matches!(
@@ -4996,7 +5078,9 @@ impl KvEngine {
                 }),
             "PITR Active state changed while preparing legacy migration"
         );
-        if active.is_empty() {
+        if active.is_empty()
+            && self.inner.options.pitr_writer_format != crate::pitr::api::PitrWriterFormat::V8
+        {
             return Ok(None);
         }
         let config = state
@@ -5028,6 +5112,14 @@ impl KvEngine {
                 return Ok(None);
             }
         };
+
+        // Retain exclusive ownership before publishing the first versioned
+        // successor of a database opened with an ordinary or legacy WAL.
+        let mut open_lock = self.inner.wal_v7_open_lock.lock();
+        if open_lock.is_none() {
+            *open_lock = Some(WalV7OpenLock::acquire(&self.inner.path)?);
+        }
+        drop(open_lock);
 
         active.sync_wal()?;
         let (seal, seal_bytes) = active.finalize_pitr_seal()?;
@@ -9045,7 +9137,7 @@ impl KvEngine {
         );
         options.validate()?;
         let requested_config = options.persisted_config()?;
-        self.assess_new_pitr_v7_enable_capacity(&requested_config)?;
+        self.assess_new_pitr_enable_capacity(&requested_config)?;
         let request = match self.prepare_pitr_enable_request(&options) {
             Ok(request) => request,
             Err(error) => {
@@ -9101,11 +9193,40 @@ impl KvEngine {
         *self.pitr_archiver.lock() = Some(archiver);
         *self.pitr_repository_path.lock() = Some(options.repository.clone());
         self.publish_pitr_base(&options.repository, false)?;
-        self.inner
-            .mvcc
-            .as_ref()
-            .ok_or_else(|| anyhow!("PITR enable requires MVCC"))?
-            .resume_commit_admission();
+        if self.inner.options.pitr_writer_format == crate::pitr::api::PitrWriterFormat::V8 {
+            let guards = V8CompatibilityPublicationGuards {
+                inner: self.inner.as_ref(),
+                _operation_guard,
+                _barrier_guard: self.pitr_barrier_lock.lock(),
+            };
+            let state = self.pitr_manifest_state.lock().clone();
+            if let Some((state, reservation)) = self.start_eligible_legacy_v7_migration(&state)? {
+                let (state, reservation) =
+                    self.resume_v7_successor_install_with_reservation(state, Some(reservation))?;
+                self.reconcile_durable_archive_obligations(state)?;
+                drop(reservation);
+            }
+            self.start_eligible_v8_migration(&guards)?;
+            ensure!(
+                self.inner.state.load().memtable.uses_v8_wal(),
+                "PITR v8 enable was deferred by its migration capacity checks"
+            );
+            let state = self.pitr_manifest_state.lock().clone();
+            self.reconcile_durable_archive_obligations(state)?;
+            self.validate_installed_v8_active_boundary(&self.pitr_manifest_state.lock())?;
+            self.inner
+                .mvcc
+                .as_ref()
+                .ok_or_else(|| anyhow!("PITR enable requires MVCC"))?
+                .resume_commit_admission();
+            drop(guards);
+        } else {
+            self.inner
+                .mvcc
+                .as_ref()
+                .ok_or_else(|| anyhow!("PITR enable requires MVCC"))?
+                .resume_commit_admission();
+        }
 
         Ok(crate::pitr::api::EnablePitrOutcome::Enabled {
             repository_id,
@@ -13099,7 +13220,7 @@ impl LsmStorageInner {
                             unsupported_v7_to_v8_migration_source(&pitr_state)
                         {
                             anyhow::bail!(
-                                "cannot recover v7-to-v8 PITR migration for source segment {source_segment_id}: migration execution is disabled until its compatibility and capacity gates are connected"
+                                "inconsistent v8 Active boundary: v7 migration source {source_segment_id} is still installed"
                             );
                         }
                         let successor_is_registered = pitr_memtable_segments
@@ -19426,8 +19547,8 @@ impl LsmStorageInner {
     /// Publish the compatibility guard while the v7 Active WAL is exclusively
     /// owned and commit admission is stopped. The caller must pass the token
     /// produced by `KvEngine::lock_v8_compatibility_publication` and retain it
-    /// through the migration. V8 WAL creation remains disabled until a
-    /// migration path checks this durable result.
+    /// through the migration. No v8 successor may be created before this
+    /// compatibility publication is durable.
     #[cfg(target_os = "linux")]
     #[allow(dead_code)]
     pub(crate) fn publish_v8_compatibility_guard(
@@ -19581,8 +19702,8 @@ impl LsmStorageInner {
     }
 
     /// Install a v8 successor only after the old Active image is durably
-    /// sealed and commit admission is stopped. This covers v8 rotation and an
-    /// explicitly authorized v7-to-v8 migration; ordinary v8 creation remains
+    /// sealed and commit admission is stopped. This covers v8 rotation and a
+    /// capacity-checked v7-to-v8 migration; ordinary v8 creation remains
     /// disabled through the format registry.
     #[cfg(target_os = "linux")]
     fn force_freeze_with_sealed_v8_successor_locked(
@@ -19745,7 +19866,7 @@ impl LsmStorageInner {
         // A v7 successor remains the Active WAL after the forced boundary. A
         // concurrent commit may reach it before this freeze lock is acquired;
         // never detach that WAL from the PITR manifest with a generic freeze.
-        let must_remain_active = if state.memtable.uses_v7_wal() {
+        let must_remain_active = if state.memtable.uses_v7_wal() || state.memtable.uses_v8_wal() {
             true
         } else {
             state.memtable.uses_wal_v5()
@@ -22741,6 +22862,7 @@ mod tests {
         let engine = KvEngine::open(
             &database,
             LsmStorageOptions {
+                pitr_writer_format: crate::pitr::api::PitrWriterFormat::V7,
                 enable_wal: true,
                 ..LsmStorageOptions::default_for_test()
             },
@@ -22819,6 +22941,7 @@ mod tests {
         let parent = crate::backup::open_directory_no_follow(dir.path()).unwrap();
         crate::backup::bootstrap_repository(&parent, "repository").unwrap();
         let options = LsmStorageOptions {
+            pitr_writer_format: crate::pitr::api::PitrWriterFormat::V7,
             enable_wal: true,
             ..LsmStorageOptions::default_for_test()
         };
@@ -22880,6 +23003,7 @@ mod tests {
             let parent = crate::backup::open_directory_no_follow(dir.path()).unwrap();
             crate::backup::bootstrap_repository(&parent, "repository").unwrap();
             let options = LsmStorageOptions {
+                pitr_writer_format: crate::pitr::api::PitrWriterFormat::V7,
                 enable_wal: true,
                 ..LsmStorageOptions::default_for_test()
             };
@@ -22955,6 +23079,7 @@ mod tests {
         let parent = crate::backup::open_directory_no_follow(dir.path()).unwrap();
         crate::backup::bootstrap_repository(&parent, "repository").unwrap();
         let options = LsmStorageOptions {
+            pitr_writer_format: crate::pitr::api::PitrWriterFormat::V7,
             enable_wal: true,
             ..LsmStorageOptions::default_for_test()
         };
@@ -22999,6 +23124,7 @@ mod tests {
         let parent = crate::backup::open_directory_no_follow(dir.path()).unwrap();
         crate::backup::bootstrap_repository(&parent, "repository").unwrap();
         let options = LsmStorageOptions {
+            pitr_writer_format: crate::pitr::api::PitrWriterFormat::V7,
             enable_wal: true,
             ..LsmStorageOptions::default_for_test()
         };
@@ -23228,6 +23354,7 @@ mod tests {
         let parent = crate::backup::open_directory_no_follow(dir.path()).unwrap();
         crate::backup::bootstrap_repository(&parent, "repository").unwrap();
         let options = LsmStorageOptions {
+            pitr_writer_format: crate::pitr::api::PitrWriterFormat::V7,
             enable_wal: true,
             ..LsmStorageOptions::default_for_test()
         };
@@ -23297,6 +23424,7 @@ mod tests {
         let parent = crate::backup::open_directory_no_follow(dir.path()).unwrap();
         crate::backup::bootstrap_repository(&parent, "repository").unwrap();
         let options = LsmStorageOptions {
+            pitr_writer_format: crate::pitr::api::PitrWriterFormat::V7,
             enable_wal: true,
             ..LsmStorageOptions::default_for_test()
         };
@@ -23412,6 +23540,7 @@ mod tests {
         let parent = crate::backup::open_directory_no_follow(dir.path()).unwrap();
         crate::backup::bootstrap_repository(&parent, "repository").unwrap();
         let options = LsmStorageOptions {
+            pitr_writer_format: crate::pitr::api::PitrWriterFormat::V7,
             enable_wal: true,
             ..LsmStorageOptions::default_for_test()
         };
@@ -23502,6 +23631,7 @@ mod tests {
         let parent = crate::backup::open_directory_no_follow(dir.path()).unwrap();
         crate::backup::bootstrap_repository(&parent, "repository").unwrap();
         let options = LsmStorageOptions {
+            pitr_writer_format: crate::pitr::api::PitrWriterFormat::V7,
             enable_wal: true,
             ..LsmStorageOptions::default_for_test()
         };
@@ -23624,6 +23754,7 @@ mod tests {
         let engine = KvEngine::open(
             &database,
             LsmStorageOptions {
+                pitr_writer_format: crate::pitr::api::PitrWriterFormat::V7,
                 enable_wal: true,
                 ..LsmStorageOptions::default_for_test()
             },
@@ -23656,6 +23787,7 @@ mod tests {
         let reopened = KvEngine::open(
             &database,
             LsmStorageOptions {
+                pitr_writer_format: crate::pitr::api::PitrWriterFormat::V7,
                 enable_wal: false,
                 ..LsmStorageOptions::default_for_test()
             },
@@ -23918,6 +24050,7 @@ mod tests {
         let engine = KvEngine::open(
             &database_path,
             LsmStorageOptions {
+                pitr_writer_format: crate::pitr::api::PitrWriterFormat::V7,
                 enable_wal: true,
                 pitr_repository: Some(repository_path.clone()),
                 ..LsmStorageOptions::default_for_test()
@@ -24825,6 +24958,7 @@ mod tests {
 
         Ok(LsmStorageOptions {
             enable_wal: true,
+            pitr_writer_format: crate::pitr::api::PitrWriterFormat::V7,
             pitr_repository: Some(directory.join("repository")),
             ..LsmStorageOptions::default_for_test()
         })
@@ -27468,6 +27602,7 @@ mod tests {
             drop(engine);
 
             let options = LsmStorageOptions {
+                pitr_writer_format: crate::pitr::api::PitrWriterFormat::V7,
                 enable_wal: true,
                 pitr_repository: Some(repository.clone()),
                 ..LsmStorageOptions::default_for_test()
@@ -27507,6 +27642,7 @@ mod tests {
             let reopened = KvEngine::open(
                 &database,
                 LsmStorageOptions {
+                    pitr_writer_format: crate::pitr::api::PitrWriterFormat::V7,
                     enable_wal: true,
                     pitr_repository: Some(repository),
                     ..LsmStorageOptions::default_for_test()
@@ -38079,6 +38215,7 @@ mod tests {
         crate::backup::bootstrap_repository(&parent, "repository").unwrap();
         let repository = dir.path().join("repository");
         let options = LsmStorageOptions {
+            pitr_writer_format: crate::pitr::api::PitrWriterFormat::V7,
             enable_wal: true,
             ..LsmStorageOptions::default_for_test()
         };
@@ -38156,6 +38293,7 @@ mod tests {
         let repository = dir.path().join("repository");
         let db = dir.path().join("db");
         let options = LsmStorageOptions {
+            pitr_writer_format: crate::pitr::api::PitrWriterFormat::V7,
             enable_wal: true,
             target_sst_size: 2 * 1024 * 1024,
             ..LsmStorageOptions::default_for_test()
@@ -38284,6 +38422,7 @@ mod tests {
         // report a commit log shorter than the one on disk, so it is refused.
         let dir = tempdir().unwrap();
         let options = LsmStorageOptions {
+            pitr_writer_format: crate::pitr::api::PitrWriterFormat::V7,
             enable_wal: true,
             target_sst_size: 64 * 1024 * 1024,
             ..LsmStorageOptions::default_for_test()
@@ -38309,6 +38448,7 @@ mod tests {
         // be mintable again or the next freeze fails on the file being there.
         let dir = tempdir().unwrap();
         let options = LsmStorageOptions {
+            pitr_writer_format: crate::pitr::api::PitrWriterFormat::V7,
             enable_wal: true,
             target_sst_size: 64 * 1024 * 1024,
             ..LsmStorageOptions::default_for_test()
@@ -38336,6 +38476,7 @@ mod tests {
         // the records exist to prevent.
         let dir = tempdir().unwrap();
         let options = LsmStorageOptions {
+            pitr_writer_format: crate::pitr::api::PitrWriterFormat::V7,
             enable_wal: true,
             target_sst_size: 64 * 1024 * 1024,
             ..LsmStorageOptions::default_for_test()
@@ -38345,6 +38486,7 @@ mod tests {
         let engine = KvEngine::open(
             &db,
             LsmStorageOptions {
+                pitr_writer_format: crate::pitr::api::PitrWriterFormat::V7,
                 manifest_snapshot_threshold_bytes: 1,
                 ..options.clone()
             },
@@ -38382,6 +38524,7 @@ mod tests {
         // newest WALs on disk.
         let dir = tempdir().unwrap();
         let options = LsmStorageOptions {
+            pitr_writer_format: crate::pitr::api::PitrWriterFormat::V7,
             enable_wal: true,
             target_sst_size: 64 * 1024 * 1024,
             ..LsmStorageOptions::default_for_test()
@@ -38424,6 +38567,7 @@ mod tests {
         let repository = dir.path().join("repository");
         let db = dir.path().join("db");
         let options = LsmStorageOptions {
+            pitr_writer_format: crate::pitr::api::PitrWriterFormat::V7,
             enable_wal: true,
             target_sst_size: 2 * 1024 * 1024,
             ..LsmStorageOptions::default_for_test()
@@ -38538,6 +38682,7 @@ mod tests {
         let repository = dir.path().join("repository");
         let db = dir.path().join("db");
         let options = LsmStorageOptions {
+            pitr_writer_format: crate::pitr::api::PitrWriterFormat::V7,
             enable_wal: true,
             target_sst_size: 1024,
             ..LsmStorageOptions::default_for_test()
@@ -38673,6 +38818,7 @@ mod tests {
         let engine = KvEngine::open(
             dir.path().join("db"),
             LsmStorageOptions {
+                pitr_writer_format: crate::pitr::api::PitrWriterFormat::V7,
                 enable_wal: true,
                 ..LsmStorageOptions::default_for_test()
             },
@@ -39066,6 +39212,7 @@ mod tests {
         let engine = KvEngine::open(
             &database,
             LsmStorageOptions {
+                pitr_writer_format: crate::pitr::api::PitrWriterFormat::V7,
                 enable_wal: true,
                 ..LsmStorageOptions::default_for_test()
             },
@@ -39116,6 +39263,275 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn default_v8_pitr_enable_reopens_and_keeps_explicit_io_modes() -> anyhow::Result<()> {
+        use crate::pitr::api::{
+            EnablePitrOutcome, PersistedPitrConfig, PitrOptions, PitrRuntimeOptions,
+        };
+        use crate::wal::WalIoMode;
+
+        for mode in [WalIoMode::Parallel, WalIoMode::Leader] {
+            let dir = tempdir()?;
+            let repository = dir.path().join("repository");
+            let mut options = LsmStorageOptions {
+                enable_wal: true,
+                ..LsmStorageOptions::default_for_test()
+            };
+            assert_eq!(
+                options.pitr_writer_format,
+                crate::pitr::api::PitrWriterFormat::V8
+            );
+            let engine =
+                KvEngine::open_with_wal_io_mode(dir.path().join("db"), options.clone(), mode)?;
+            engine.put(b"before-pitr", b"ordinary")?;
+            assert!(matches!(
+                engine.enable_pitr(PitrOptions {
+                    repository: repository.clone(),
+                    config: PersistedPitrConfig {
+                        archive_interval: std::time::Duration::from_secs(3600),
+                        max_segment_bytes: 1 << 20,
+                        max_unarchived_bytes: 4 << 20,
+                        max_source_spool_bytes: 16 << 20
+                    },
+                    runtime: PitrRuntimeOptions::default(),
+                })?,
+                EnablePitrOutcome::Enabled { .. }
+            ));
+            assert!(engine.inner.state.load().memtable.uses_v8_wal());
+            assert_eq!(engine.inner.state.load().memtable.wal_io_mode(), Some(mode));
+            assert!(
+                engine
+                    .inner
+                    .manifest
+                    .as_ref()
+                    .unwrap()
+                    .v8_compatibility_guard_ready()
+            );
+            engine.put(b"v8-data", b"value")?;
+            engine.sync()?;
+            let restore_ts = engine.inner.mvcc.as_ref().unwrap().latest_commit_ts();
+            let restore_state = engine.pitr_manifest_state.lock().clone();
+            assert!(matches!(
+                engine.create_recovery_point()?,
+                crate::pitr::api::RecoveryPointOutcome::Durable(_)
+            ));
+            assert!(engine.inner.state.load().memtable.uses_v8_wal());
+            engine.close()?;
+            drop(engine);
+            options.pitr_repository = Some(repository.clone());
+            let reopened = KvEngine::open_with_wal_io_mode(dir.path().join("db"), options, mode)?;
+            assert!(reopened.inner.state.load().memtable.uses_v8_wal());
+            assert_eq!(
+                reopened.get(b"before-pitr")?.as_deref(),
+                Some(b"ordinary".as_slice())
+            );
+            assert_eq!(
+                reopened.get(b"v8-data")?.as_deref(),
+                Some(b"value".as_slice())
+            );
+            reopened.put(b"after-reopen", b"value")?;
+            reopened.close()?;
+            drop(reopened);
+            let restored_path = dir.path().join("restored");
+            let outcome = crate::backup::BackupRepository::open(&repository)?.restore_to(
+                crate::pitr::api::RecoveryTarget::CommitTs(restore_ts),
+                &restored_path,
+                crate::pitr::api::PitrRestoreOptions {
+                    selector: crate::pitr::api::RecoverySelector {
+                        timeline_id: restore_state.timeline_id.unwrap(),
+                        archive_epoch_id: restore_state.archive_epoch_id,
+                        base_backup_id: None,
+                    },
+                    implementations: crate::pitr::api::ImplementationRegistry,
+                    executor_threads: std::num::NonZeroUsize::new(1).unwrap(),
+                    cache_capacity: 4096,
+                    storage: LsmStorageOptions::default_for_test(),
+                },
+            )?;
+            assert!(matches!(
+                outcome,
+                crate::pitr::api::RestoreToOutcome::Restored(_)
+            ));
+            let restored = KvEngine::open(&restored_path, LsmStorageOptions::default_for_test())?;
+            assert_eq!(
+                restored.get(b"before-pitr")?.as_deref(),
+                Some(b"ordinary".as_slice())
+            );
+            assert_eq!(
+                restored.get(b"v8-data")?.as_deref(),
+                Some(b"value".as_slice())
+            );
+            assert_eq!(restored.get(b"after-reopen")?, None);
+            restored.close()?;
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn default_v8_migrates_legacy_and_v7_across_startup_paths() -> anyhow::Result<()> {
+        for source_v7 in [false, true] {
+            for startup_path in 0..3 {
+                let dir = tempdir()?;
+                if source_v7 {
+                    v7_recovery_test_database(dir.path())?;
+                } else {
+                    let engine = pitr_flush_test_engine(dir.path());
+                    suspend_pitr_maintenance_for_test(&engine);
+                    engine.put(b"legacy-key", b"legacy-value")?;
+                    engine.sync()?;
+                    engine.close_storage()?;
+                }
+                let options = LsmStorageOptions {
+                    enable_wal: true,
+                    pitr_repository: Some(dir.path().join("repository")),
+                    ..LsmStorageOptions::default_for_test()
+                };
+                let database = dir.path().join("db");
+                let engine = match startup_path {
+                    0 => KvEngine::open(&database, options.clone())?,
+                    1 => KvEngine::open_async(&database, options.clone()).await?,
+                    _ => KvEngine::open_repairing(&database, options.clone())?.0,
+                };
+                assert!(engine.inner.state.load().memtable.uses_v8_wal());
+                if source_v7 {
+                    assert_eq!(engine.get(b"v7-key")?.as_deref(), Some(b"v".as_slice()));
+                } else {
+                    assert_eq!(
+                        engine.get(b"legacy-key")?.as_deref(),
+                        Some(b"legacy-value".as_slice())
+                    );
+                }
+                engine.put(b"migrated", b"v8-value")?;
+                engine.sync()?;
+                engine.close()?;
+                drop(engine);
+                // Compatibility controls never downgrade an existing v8 WAL.
+                let reopened = KvEngine::open(
+                    &database,
+                    LsmStorageOptions {
+                        pitr_writer_format: crate::pitr::api::PitrWriterFormat::V6,
+                        ..options
+                    },
+                )?;
+                assert!(reopened.inner.state.load().memtable.uses_v8_wal());
+                assert_eq!(
+                    reopened.get(b"migrated")?.as_deref(),
+                    Some(b"v8-value".as_slice())
+                );
+                reopened.close()?;
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn default_v8_capacity_deferral_keeps_existing_v7_writable() -> anyhow::Result<()> {
+        use crate::pitr::{api::PitrWriterFormat, manifest::PitrManifestRecord};
+
+        let dir = tempdir()?;
+        let mut options = v7_recovery_test_database(dir.path())?;
+        let engine = KvEngine::open(dir.path().join("db"), options.clone())?;
+        suspend_pitr_maintenance_for_test(&engine);
+        let mut state = engine.pitr_manifest_state.lock().clone();
+        let capacity = engine
+            .pitr_v8_migration_capacity_status(&state, &engine.inner.state.load().memtable)?
+            .ok_or_else(|| anyhow::anyhow!("v7 source has no v8 capacity estimate"))?;
+        state.config.as_mut().unwrap().max_source_spool_bytes =
+            capacity.required_total_bytes - 4096;
+        let state_lock = engine.inner.state_lock.lock();
+        engine.persist_pitr_lifecycle_with_state_guard(
+            &[PitrManifestRecord::Snapshot(Box::new(state.clone()))],
+            state,
+            &state_lock,
+        )?;
+        drop(state_lock);
+        engine.inner.ensure_manifest_v7()?;
+        engine.close_storage()?;
+        drop(engine);
+        options.pitr_writer_format = PitrWriterFormat::V8;
+        let reopened = KvEngine::open(dir.path().join("db"), options)?;
+        assert!(reopened.inner.state.load().memtable.uses_v7_wal());
+        assert!(
+            reopened
+                .inner
+                .mvcc
+                .as_ref()
+                .unwrap()
+                .commit_admission_is_open()
+        );
+        assert!(
+            !reopened
+                .inner
+                .manifest
+                .as_ref()
+                .unwrap()
+                .v8_compatibility_guard_ready()
+        );
+        reopened.put(b"deferred", b"still-writable")?;
+        reopened.sync()?;
+        assert_eq!(
+            reopened.get(b"deferred")?.as_deref(),
+            Some(b"still-writable".as_slice())
+        );
+        reopened.close()?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn default_v8_capacity_rejects_before_enable_side_effects() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let engine = KvEngine::open(
+            dir.path().join("db"),
+            LsmStorageOptions {
+                enable_wal: true,
+                ..LsmStorageOptions::default_for_test()
+            },
+        )?;
+        let mut config = crate::pitr::manifest::PersistedPitrConfig {
+            archive_interval_ms: 3_600_000,
+            max_segment_bytes: 1 << 20,
+            max_unarchived_bytes: 4 << 20,
+            max_source_spool_bytes: 16 << 20,
+        };
+        let legacy = engine.assess_new_pitr_v7_enable_capacity(&config)?;
+        config.max_source_spool_bytes = legacy.required_total_bytes;
+        engine.assess_new_pitr_v7_enable_capacity(&config)?;
+        let repository = dir.path().join("repository");
+        let error = engine
+            .enable_pitr(crate::pitr::api::PitrOptions {
+                repository: repository.clone(),
+                config: crate::pitr::api::PersistedPitrConfig {
+                    archive_interval: std::time::Duration::from_millis(config.archive_interval_ms),
+                    max_segment_bytes: config.max_segment_bytes,
+                    max_unarchived_bytes: config.max_unarchived_bytes,
+                    max_source_spool_bytes: config.max_source_spool_bytes,
+                },
+                runtime: crate::pitr::api::PitrRuntimeOptions::default(),
+            })
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("PITR v8 enable capacity"));
+        assert!(!repository.exists());
+        assert_eq!(
+            engine.pitr_manifest_state.lock().mode,
+            crate::pitr::manifest::PitrMode::Disabled
+        );
+        assert!(
+            !engine
+                .inner
+                .manifest
+                .as_ref()
+                .unwrap()
+                .v8_compatibility_guard_ready()
+        );
+        engine.put(b"ordinary", b"still-writable")?;
+        engine.close()?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn public_enable_pitr_installs_v5_successor_and_resumes_writes() {
         let dir = tempdir().unwrap();
         let parent = crate::backup::open_directory_no_follow(dir.path()).unwrap();
@@ -39123,6 +39539,7 @@ mod tests {
         let engine = KvEngine::open(
             dir.path().join("db"),
             LsmStorageOptions {
+                pitr_writer_format: crate::pitr::api::PitrWriterFormat::V7,
                 enable_wal: true,
                 ..LsmStorageOptions::default_for_test()
             },
@@ -39292,6 +39709,7 @@ mod tests {
         let reopened = KvEngine::open(
             dir.path().join("db"),
             LsmStorageOptions {
+                pitr_writer_format: crate::pitr::api::PitrWriterFormat::V7,
                 enable_wal: true,
                 pitr_repository: Some(dir.path().join("repository")),
                 ..LsmStorageOptions::default_for_test()
@@ -39329,6 +39747,7 @@ mod tests {
             dir.join("db"),
             LsmStorageOptions {
                 enable_wal: true,
+                pitr_writer_format: crate::pitr::api::PitrWriterFormat::V7,
                 ..LsmStorageOptions::default_for_test()
             },
         )
@@ -40739,6 +41158,7 @@ mod tests {
         let parent = crate::backup::open_directory_no_follow(dir.path()).unwrap();
         crate::backup::bootstrap_repository(&parent, "repository").unwrap();
         let options = LsmStorageOptions {
+            pitr_writer_format: crate::pitr::api::PitrWriterFormat::V7,
             enable_wal: true,
             ..LsmStorageOptions::default_for_test()
         };
@@ -40809,6 +41229,7 @@ mod tests {
         let engine = KvEngine::open(
             dir.path().join("db"),
             LsmStorageOptions {
+                pitr_writer_format: crate::pitr::api::PitrWriterFormat::V7,
                 enable_wal: true,
                 ..LsmStorageOptions::default_for_test()
             },
@@ -40846,6 +41267,7 @@ mod tests {
         let reopened = KvEngine::open(
             dir.path().join("db"),
             LsmStorageOptions {
+                pitr_writer_format: crate::pitr::api::PitrWriterFormat::V7,
                 enable_wal: true,
                 ..LsmStorageOptions::default_for_test()
             },
@@ -40864,6 +41286,7 @@ mod tests {
         let engine = KvEngine::open(
             dir.path().join("db"),
             LsmStorageOptions {
+                pitr_writer_format: crate::pitr::api::PitrWriterFormat::V7,
                 enable_wal: true,
                 ..LsmStorageOptions::default_for_test()
             },
@@ -40902,6 +41325,7 @@ mod tests {
         let engine = KvEngine::open(
             dir.path().join("db"),
             LsmStorageOptions {
+                pitr_writer_format: crate::pitr::api::PitrWriterFormat::V7,
                 enable_wal: true,
                 ..LsmStorageOptions::default_for_test()
             },
@@ -40972,6 +41396,7 @@ mod tests {
         let reopened = KvEngine::open(
             dir.path().join("db"),
             LsmStorageOptions {
+                pitr_writer_format: crate::pitr::api::PitrWriterFormat::V7,
                 enable_wal: true,
                 ..LsmStorageOptions::default_for_test()
             },
@@ -41141,6 +41566,7 @@ mod tests {
         let parent = crate::backup::open_directory_no_follow(dir.path()).unwrap();
         crate::backup::bootstrap_repository(&parent, "repository").unwrap();
         let options = LsmStorageOptions {
+            pitr_writer_format: crate::pitr::api::PitrWriterFormat::V7,
             enable_wal: true,
             ..LsmStorageOptions::default_for_test()
         };
@@ -41273,6 +41699,7 @@ mod tests {
         crate::backup::bootstrap_repository(&parent, "repository").unwrap();
         let repository = dir.path().join("repository");
         let options = LsmStorageOptions {
+            pitr_writer_format: crate::pitr::api::PitrWriterFormat::V7,
             enable_wal: true,
             ..LsmStorageOptions::default_for_test()
         };
@@ -41456,6 +41883,7 @@ mod tests {
         crate::backup::bootstrap_repository(&parent, "repository").unwrap();
         let repository = dir.path().join("repository");
         let options = LsmStorageOptions {
+            pitr_writer_format: crate::pitr::api::PitrWriterFormat::V7,
             enable_wal: true,
             ..LsmStorageOptions::default_for_test()
         };
@@ -41576,6 +42004,7 @@ mod tests {
         let engine = KvEngine::open(
             dir.path().join("db"),
             LsmStorageOptions {
+                pitr_writer_format: crate::pitr::api::PitrWriterFormat::V7,
                 enable_wal: true,
                 ..LsmStorageOptions::default_for_test()
             },
@@ -41648,6 +42077,7 @@ mod tests {
             let engine = KvEngine::open(
                 dir.path().join("db"),
                 LsmStorageOptions {
+                    pitr_writer_format: crate::pitr::api::PitrWriterFormat::V7,
                     enable_wal: true,
                     ..LsmStorageOptions::default_for_test()
                 },
@@ -42541,6 +42971,7 @@ mod tests {
         let engine = KvEngine::open(
             dir.path().join("db"),
             LsmStorageOptions {
+                pitr_writer_format: crate::pitr::api::PitrWriterFormat::V7,
                 enable_wal: true,
                 ..LsmStorageOptions::default_for_test()
             },
@@ -42571,6 +43002,7 @@ mod tests {
         let reopened = KvEngine::open(
             dir.path().join("db"),
             LsmStorageOptions {
+                pitr_writer_format: crate::pitr::api::PitrWriterFormat::V7,
                 enable_wal: true,
                 pitr_repository: Some(repository_path),
                 ..LsmStorageOptions::default_for_test()
@@ -42592,6 +43024,7 @@ mod tests {
         let engine = KvEngine::open(
             dir.path().join("db"),
             LsmStorageOptions {
+                pitr_writer_format: crate::pitr::api::PitrWriterFormat::V7,
                 enable_wal: true,
                 ..LsmStorageOptions::default_for_test()
             },

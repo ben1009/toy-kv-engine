@@ -315,6 +315,7 @@ fn failpoint_parallel_wal_crash_boundaries() {
 fn failpoint_v7_parallel_pitr_crash_recovery_install_rename_boundaries() {
     let probe_dir = tempfile::tempdir().expect("create v7 Parallel crash probe directory");
     let probe_options = LsmStorageOptions {
+        pitr_writer_format: kv_engine::pitr::api::PitrWriterFormat::V7,
         enable_wal: true,
         ..LsmStorageOptions::default_for_test()
     };
@@ -329,6 +330,7 @@ fn failpoint_v7_parallel_pitr_crash_recovery_install_rename_boundaries() {
     let engine = KvEngine::open(
         &db_path,
         LsmStorageOptions {
+            pitr_writer_format: kv_engine::pitr::api::PitrWriterFormat::V7,
             enable_wal: true,
             ..LsmStorageOptions::default_for_test()
         },
@@ -457,6 +459,7 @@ fn failpoint_v7_parallel_pitr_crash_recovery_install_rename_boundaries() {
     let first_recovery = KvEngine::open_with_wal_io_mode(
         &db_path,
         LsmStorageOptions {
+            pitr_writer_format: kv_engine::pitr::api::PitrWriterFormat::V7,
             enable_wal: true,
             pitr_repository: Some(repository.clone()),
             ..LsmStorageOptions::default_for_test()
@@ -536,6 +539,7 @@ fn failpoint_v7_parallel_pitr_crash_recovery_install_rename_boundaries() {
     );
 
     let recovery_options = LsmStorageOptions {
+        pitr_writer_format: kv_engine::pitr::api::PitrWriterFormat::V7,
         enable_wal: true,
         pitr_repository: Some(repository.clone()),
         ..LsmStorageOptions::default_for_test()
@@ -607,6 +611,7 @@ fn failpoint_v7_parallel_pitr_crash_recovery_install_rename_boundaries() {
     );
 
     let continued_recovery_options = LsmStorageOptions {
+        pitr_writer_format: kv_engine::pitr::api::PitrWriterFormat::V7,
         enable_wal: true,
         pitr_repository: Some(repository.clone()),
         ..LsmStorageOptions::default_for_test()
@@ -731,6 +736,7 @@ fn failpoint_v7_leader_pitr_crash_after_sync_before_publish_recovers() {
     let engine = KvEngine::open_with_wal_io_mode(
         &db_path,
         LsmStorageOptions {
+            pitr_writer_format: kv_engine::pitr::api::PitrWriterFormat::V7,
             enable_wal: true,
             ..LsmStorageOptions::default_for_test()
         },
@@ -780,6 +786,7 @@ fn failpoint_v7_leader_pitr_crash_after_sync_before_publish_recovers() {
     let recovered = KvEngine::open_with_wal_io_mode(
         &db_path,
         LsmStorageOptions {
+            pitr_writer_format: kv_engine::pitr::api::PitrWriterFormat::V7,
             enable_wal: true,
             pitr_repository: Some(repository),
             ..LsmStorageOptions::default_for_test()
@@ -818,6 +825,7 @@ fn failpoint_v7_leader_pitr_crash_after_sync_before_publish_recovers() {
 fn failpoint_v7_parallel_pitr_fallback_archive_restore() {
     let probe_dir = tempfile::tempdir().expect("create v7 Parallel fallback probe directory");
     let probe_options = LsmStorageOptions {
+        pitr_writer_format: kv_engine::pitr::api::PitrWriterFormat::V7,
         enable_wal: true,
         ..LsmStorageOptions::default_for_test()
     };
@@ -885,6 +893,7 @@ fn failpoint_v7_parallel_pitr_fallback_archive_restore() {
     let discovered = KvEngine::open_with_wal_io_mode(
         &discovery_db_path,
         LsmStorageOptions {
+            pitr_writer_format: kv_engine::pitr::api::PitrWriterFormat::V7,
             enable_wal: true,
             pitr_repository: Some(discovery_repository),
             ..LsmStorageOptions::default_for_test()
@@ -948,6 +957,7 @@ fn failpoint_v7_parallel_pitr_fallback_archive_restore() {
     let recovered = KvEngine::open_with_wal_io_mode(
         &db_path,
         LsmStorageOptions {
+            pitr_writer_format: kv_engine::pitr::api::PitrWriterFormat::V7,
             enable_wal: true,
             pitr_repository: Some(repository.clone()),
             ..LsmStorageOptions::default_for_test()
@@ -1097,6 +1107,7 @@ fn failpoint_v7_parallel_pitr_fallback_normalization_write_crash_archives_and_re
     let probe = KvEngine::open_with_wal_io_mode(
         probe_dir.path(),
         LsmStorageOptions {
+            pitr_writer_format: kv_engine::pitr::api::PitrWriterFormat::V7,
             enable_wal: true,
             ..LsmStorageOptions::default_for_test()
         },
@@ -1281,6 +1292,7 @@ fn failpoint_v7_parallel_later_group_cqe_does_not_advance_past_gap() {
     let probe = KvEngine::open_with_wal_io_mode(
         probe_dir.path(),
         LsmStorageOptions {
+            pitr_writer_format: kv_engine::pitr::api::PitrWriterFormat::V7,
             enable_wal: true,
             ..LsmStorageOptions::default_for_test()
         },
@@ -1335,6 +1347,7 @@ fn failpoint_v7_parallel_later_group_cqe_does_not_advance_past_gap() {
     let recovered = KvEngine::open_with_wal_io_mode(
         &db_path,
         LsmStorageOptions {
+            pitr_writer_format: kv_engine::pitr::api::PitrWriterFormat::V7,
             enable_wal: true,
             pitr_repository: Some(repository.clone()),
             ..LsmStorageOptions::default_for_test()
@@ -1386,6 +1399,7 @@ fn failpoint_v7_parallel_later_group_cqe_does_not_advance_past_gap() {
 fn pitr_v7_empty_segment_archive_restore() {
     let probe_dir = tempfile::tempdir().expect("create v7 Parallel empty-segment probe directory");
     let probe_options = LsmStorageOptions {
+        pitr_writer_format: kv_engine::pitr::api::PitrWriterFormat::V7,
         enable_wal: true,
         ..LsmStorageOptions::default_for_test()
     };
@@ -1944,6 +1958,7 @@ fn failpoint_v7_empty_successor_segment_sealed_partial_append_reopens() {
 fn failpoint_v7_empty_successor_partial_manifest_append_crash_reopens() {
     let probe_dir = tempfile::tempdir().expect("create v7 partial-append crash probe directory");
     let probe_options = LsmStorageOptions {
+        pitr_writer_format: kv_engine::pitr::api::PitrWriterFormat::V7,
         enable_wal: true,
         ..LsmStorageOptions::default_for_test()
     };
@@ -2006,6 +2021,7 @@ fn failpoint_v7_empty_successor_partial_manifest_append_crash_reopens() {
 fn failpoint_v7_empty_successor_manifest_append_crash() {
     let probe_dir = tempfile::tempdir().expect("create v7 manifest-crash probe directory");
     let probe_options = LsmStorageOptions {
+        pitr_writer_format: kv_engine::pitr::api::PitrWriterFormat::V7,
         enable_wal: true,
         ..LsmStorageOptions::default_for_test()
     };
@@ -2108,6 +2124,7 @@ fn v7_manifest_authorized_empty_successor_corruption_fails_open() {
     let open_result = KvEngine::open_with_wal_io_mode(
         &db_path,
         LsmStorageOptions {
+            pitr_writer_format: kv_engine::pitr::api::PitrWriterFormat::V7,
             enable_wal: true,
             pitr_repository: Some(repository),
             ..LsmStorageOptions::default_for_test()
@@ -2154,6 +2171,7 @@ fn v7_manifest_authorized_empty_successor_corruption_fails_open() {
 fn failpoint_v7_sealing_startup_stays_fenced_after_seal_started_crash() {
     let probe_dir = tempfile::tempdir().expect("create v7 Parallel sealing probe directory");
     let probe_options = LsmStorageOptions {
+        pitr_writer_format: kv_engine::pitr::api::PitrWriterFormat::V7,
         enable_wal: true,
         ..LsmStorageOptions::default_for_test()
     };
@@ -2209,6 +2227,7 @@ fn failpoint_v7_sealing_startup_stays_fenced_after_seal_started_crash() {
     );
 
     let options = LsmStorageOptions {
+        pitr_writer_format: kv_engine::pitr::api::PitrWriterFormat::V7,
         enable_wal: true,
         pitr_repository: Some(repository.clone()),
         ..LsmStorageOptions::default_for_test()
@@ -2416,6 +2435,7 @@ fn failpoint_v7_sealing_startup_stays_fenced_after_seal_started_crash() {
 fn failpoint_v7_sealing_crashes_after_durable_seal_install_with_nonempty_source() {
     let probe_dir = tempfile::tempdir().expect("create v7 Parallel seal-install probe directory");
     let probe_options = LsmStorageOptions {
+        pitr_writer_format: kv_engine::pitr::api::PitrWriterFormat::V7,
         enable_wal: true,
         ..LsmStorageOptions::default_for_test()
     };
@@ -2534,6 +2554,7 @@ fn failpoint_v7_sealing_crashes_after_durable_seal_install_with_nonempty_source(
     );
 
     let options = LsmStorageOptions {
+        pitr_writer_format: kv_engine::pitr::api::PitrWriterFormat::V7,
         enable_wal: true,
         pitr_repository: Some(repository.clone()),
         ..LsmStorageOptions::default_for_test()
@@ -2588,6 +2609,7 @@ fn failpoint_v7_sealing_crashes_after_durable_seal_install_with_nonempty_source(
 fn failpoint_v7_empty_successor_install_crash_boundaries_preserves_nonempty_source() {
     let probe_dir = tempfile::tempdir().expect("create v7 empty-successor probe directory");
     let probe_options = LsmStorageOptions {
+        pitr_writer_format: kv_engine::pitr::api::PitrWriterFormat::V7,
         enable_wal: true,
         ..LsmStorageOptions::default_for_test()
     };
@@ -3649,6 +3671,7 @@ fn failpoint_v7_parallel_async_checkpoint_cancellation_keeps_cutoff_and_close_wa
 fn failpoint_v7_parallel_pitr_async_sync_survives_crash_after_return() {
     let probe_dir = tempfile::tempdir().expect("create v7 async sync crash probe directory");
     let probe_options = LsmStorageOptions {
+        pitr_writer_format: kv_engine::pitr::api::PitrWriterFormat::V7,
         enable_wal: true,
         ..LsmStorageOptions::default_for_test()
     };
@@ -3719,6 +3742,7 @@ fn failpoint_v7_parallel_pitr_async_sync_survives_crash_after_return() {
 fn failpoint_v7_parallel_pitr_sync_survives_crash_after_return() {
     let probe_dir = tempfile::tempdir().expect("create v7 sync crash probe directory");
     let probe_options = LsmStorageOptions {
+        pitr_writer_format: kv_engine::pitr::api::PitrWriterFormat::V7,
         enable_wal: true,
         ..LsmStorageOptions::default_for_test()
     };
@@ -3788,6 +3812,7 @@ fn failpoint_v7_parallel_pitr_sync_survives_crash_after_return() {
 fn failpoint_v7_parallel_pitr_close_survives_crash_after_return() {
     let probe_dir = tempfile::tempdir().expect("create v7 close crash probe directory");
     let probe_options = LsmStorageOptions {
+        pitr_writer_format: kv_engine::pitr::api::PitrWriterFormat::V7,
         enable_wal: true,
         ..LsmStorageOptions::default_for_test()
     };
@@ -3857,6 +3882,7 @@ fn failpoint_v7_parallel_pitr_close_survives_crash_after_return() {
 fn failpoint_v7_parallel_pitr_async_close_survives_crash_after_return() {
     let probe_dir = tempfile::tempdir().expect("create v7 async close crash probe directory");
     let probe_options = LsmStorageOptions {
+        pitr_writer_format: kv_engine::pitr::api::PitrWriterFormat::V7,
         enable_wal: true,
         ..LsmStorageOptions::default_for_test()
     };
@@ -3930,6 +3956,7 @@ fn failpoint_v7_parallel_pitr_async_close_survives_crash_after_return() {
 fn failpoint_v7_parallel_async_pitr_crash_after_sync_before_ack_recovers() {
     let probe_dir = tempfile::tempdir().expect("create v7 async crash probe directory");
     let probe_options = LsmStorageOptions {
+        pitr_writer_format: kv_engine::pitr::api::PitrWriterFormat::V7,
         enable_wal: true,
         ..LsmStorageOptions::default_for_test()
     };
@@ -3984,6 +4011,7 @@ fn failpoint_v7_parallel_async_pitr_crash_after_sync_before_ack_recovers() {
 fn failpoint_v7_parallel_async_transaction_crash_after_sync_before_ack_recovers() {
     let probe_dir = tempfile::tempdir().expect("create v7 async transaction probe directory");
     let probe_options = LsmStorageOptions {
+        pitr_writer_format: kv_engine::pitr::api::PitrWriterFormat::V7,
         enable_wal: true,
         ..LsmStorageOptions::default_for_test()
     };
@@ -4045,6 +4073,7 @@ fn failpoint_v7_parallel_async_transaction_crash_after_sync_before_ack_recovers(
 fn failpoint_v7_parallel_sync_serializable_transaction_crash_after_sync_before_ack_recovers() {
     let probe_dir = tempfile::tempdir().expect("create v7 sync transaction probe directory");
     let probe_options = LsmStorageOptions {
+        pitr_writer_format: kv_engine::pitr::api::PitrWriterFormat::V7,
         enable_wal: true,
         serializable: true,
         ..LsmStorageOptions::default_for_test()
@@ -4107,6 +4136,7 @@ fn failpoint_v7_parallel_sync_serializable_transaction_crash_after_sync_before_a
 fn failpoint_v7_parallel_sync_batch_crash_after_sync_before_ack_recovers_all_entries() {
     let probe_dir = tempfile::tempdir().expect("create v7 sync batch probe directory");
     let probe_options = LsmStorageOptions {
+        pitr_writer_format: kv_engine::pitr::api::PitrWriterFormat::V7,
         enable_wal: true,
         ..LsmStorageOptions::default_for_test()
     };
@@ -4170,6 +4200,7 @@ fn failpoint_v7_parallel_sync_batch_crash_after_sync_before_ack_recovers_all_ent
 fn failpoint_v7_parallel_sync_delete_crash_after_sync_before_ack_recovers_tombstone() {
     let probe_dir = tempfile::tempdir().expect("create v7 sync delete probe directory");
     let probe_options = LsmStorageOptions {
+        pitr_writer_format: kv_engine::pitr::api::PitrWriterFormat::V7,
         enable_wal: true,
         ..LsmStorageOptions::default_for_test()
     };
@@ -4222,6 +4253,7 @@ fn failpoint_v7_parallel_sync_delete_crash_after_sync_before_ack_recovers_tombst
 fn failpoint_v7_parallel_sync_range_delete_crash_after_sync_before_ack_recovers_tombstone() {
     let probe_dir = tempfile::tempdir().expect("create v7 sync range-delete probe directory");
     let probe_options = LsmStorageOptions {
+        pitr_writer_format: kv_engine::pitr::api::PitrWriterFormat::V7,
         enable_wal: true,
         ..LsmStorageOptions::default_for_test()
     };
@@ -4288,6 +4320,7 @@ fn failpoint_v7_parallel_sync_range_delete_crash_after_sync_before_ack_recovers_
 fn failpoint_v7_parallel_sync_ttl_crash_after_sync_before_ack_recovers_expiration() {
     let probe_dir = tempfile::tempdir().expect("create v7 sync TTL probe directory");
     let probe_options = LsmStorageOptions {
+        pitr_writer_format: kv_engine::pitr::api::PitrWriterFormat::V7,
         enable_wal: true,
         ..LsmStorageOptions::default_for_test()
     };
@@ -4341,6 +4374,7 @@ fn failpoint_v7_parallel_sync_ttl_crash_after_sync_before_ack_recovers_expiratio
 fn failpoint_v7_parallel_async_batch_crash_after_sync_before_ack_recovers_all_entries() {
     let probe_dir = tempfile::tempdir().expect("create v7 async batch probe directory");
     let probe_options = LsmStorageOptions {
+        pitr_writer_format: kv_engine::pitr::api::PitrWriterFormat::V7,
         enable_wal: true,
         ..LsmStorageOptions::default_for_test()
     };
@@ -4416,6 +4450,7 @@ fn failpoint_v7_parallel_async_batch_crash_after_sync_before_ack_recovers_all_en
 fn failpoint_v7_parallel_async_delete_crash_after_sync_before_ack_recovers_tombstone() {
     let probe_dir = tempfile::tempdir().expect("create v7 async delete probe directory");
     let probe_options = LsmStorageOptions {
+        pitr_writer_format: kv_engine::pitr::api::PitrWriterFormat::V7,
         enable_wal: true,
         ..LsmStorageOptions::default_for_test()
     };
@@ -4479,6 +4514,7 @@ fn failpoint_v7_parallel_async_delete_crash_after_sync_before_ack_recovers_tombs
 fn failpoint_v7_parallel_async_range_delete_crash_after_sync_before_ack_recovers_tombstone() {
     let probe_dir = tempfile::tempdir().expect("create v7 async range-delete probe directory");
     let probe_options = LsmStorageOptions {
+        pitr_writer_format: kv_engine::pitr::api::PitrWriterFormat::V7,
         enable_wal: true,
         ..LsmStorageOptions::default_for_test()
     };
@@ -4555,6 +4591,7 @@ fn failpoint_v7_parallel_async_range_delete_crash_after_sync_before_ack_recovers
 fn failpoint_v7_parallel_async_range_batch_crash_after_sync_before_ack_recovers_all_tombstones() {
     let probe_dir = tempfile::tempdir().expect("create v7 async range-batch probe directory");
     let probe_options = LsmStorageOptions {
+        pitr_writer_format: kv_engine::pitr::api::PitrWriterFormat::V7,
         enable_wal: true,
         ..LsmStorageOptions::default_for_test()
     };
@@ -4711,6 +4748,7 @@ fn failpoint_v7_parallel_async_range_batch_crash_after_sync_before_ack_recovers_
 fn failpoint_v7_parallel_async_ttl_crash_after_sync_before_ack_recovers_expiration() {
     let probe_dir = tempfile::tempdir().expect("create v7 async TTL probe directory");
     let probe_options = LsmStorageOptions {
+        pitr_writer_format: kv_engine::pitr::api::PitrWriterFormat::V7,
         enable_wal: true,
         ..LsmStorageOptions::default_for_test()
     };
@@ -4775,6 +4813,7 @@ fn failpoint_v7_parallel_async_ttl_crash_after_sync_before_ack_recovers_expirati
 fn failpoint_v7_recovery_point_archive_crash_after_source_seal_recovers_and_resumes() {
     let probe_dir = tempfile::tempdir().expect("create v7 recovery-point crash probe directory");
     let probe_options = LsmStorageOptions {
+        pitr_writer_format: kv_engine::pitr::api::PitrWriterFormat::V7,
         enable_wal: true,
         ..LsmStorageOptions::default_for_test()
     };
@@ -4918,6 +4957,7 @@ fn failpoint_v7_recovery_point_archive_crash_after_archived_manifest_recovers_an
 fn run_v7_recovery_point_archive_manifest_crash(crash_point: &str) {
     let probe_dir = tempfile::tempdir().expect("create v7 recovery-point reclaim probe directory");
     let probe_options = LsmStorageOptions {
+        pitr_writer_format: kv_engine::pitr::api::PitrWriterFormat::V7,
         enable_wal: true,
         ..LsmStorageOptions::default_for_test()
     };
@@ -5111,6 +5151,7 @@ fn prepare_empty_v7_parallel_pitr(
     let engine = KvEngine::open(
         db_path,
         LsmStorageOptions {
+            pitr_writer_format: kv_engine::pitr::api::PitrWriterFormat::V7,
             enable_wal: true,
             ..LsmStorageOptions::default_for_test()
         },
@@ -5175,6 +5216,7 @@ fn open_and_resume_parallel_pitr(
     let engine = KvEngine::open_with_wal_io_mode(
         db_path,
         LsmStorageOptions {
+            pitr_writer_format: kv_engine::pitr::api::PitrWriterFormat::V7,
             enable_wal: true,
             pitr_repository: Some(repository.to_path_buf()),
             ..LsmStorageOptions::default_for_test()
@@ -5810,6 +5852,7 @@ fn prepare_legacy_v7_fallback_source(db_path: &std::path::Path, repository: &std
     let engine = KvEngine::open(
         db_path,
         LsmStorageOptions {
+            pitr_writer_format: kv_engine::pitr::api::PitrWriterFormat::V7,
             enable_wal: true,
             ..LsmStorageOptions::default_for_test()
         },
