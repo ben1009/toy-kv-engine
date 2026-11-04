@@ -183,9 +183,10 @@ p99, and CPU percentage deltas against V4),
 `summary.json`, and lifecycle/cleanup status. A comparison is descriptive for
 this capture only; it does not assert that the device stayed in one storage
 state. A nonzero benchmark exit still triggers artifact collection and VM
-teardown attempts. If results transfer remains incomplete, the VM is retained
-only until its configured server-side deadline so the operator can retry
-collection; incomplete collection or failed teardown returns a nonzero status.
+teardown attempts. If results transfer remains incomplete, the runner still
+deletes the VM and temporary firewall rule, so remote results cannot be
+recovered later; incomplete collection or failed teardown returns a nonzero
+status.
 
 ## Cloud references
 

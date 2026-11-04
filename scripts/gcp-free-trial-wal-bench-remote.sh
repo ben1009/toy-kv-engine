@@ -101,6 +101,7 @@ findmnt /mnt/gcp-wal-bench >"$RESULTS/findmnt.txt"
 df -hT /mnt/gcp-wal-bench >"$RESULTS/df.txt"
 
 chown -R bench:bench /mnt/gcp-wal-bench
+chown bench:bench "$BOOT_LOG"
 set +e
 runuser -u bench -- env \
     BENCH_COMMIT="$COMMIT" \
@@ -110,6 +111,7 @@ runuser -u bench -- env \
     BENCH_WORK="$WORK" \
     BENCH_RUNTIME_BUDGET_SECONDS="$RUNTIME_BUDGET_SECONDS" \
     BENCH_SCRIPT_STARTED_EPOCH="$REMOTE_STARTED_EPOCH" \
+    BENCH_BOOT_LOG="$BOOT_LOG" \
     bash -s <<'BENCH_USER_SCRIPT'
 set -Eeuo pipefail
 
@@ -216,7 +218,7 @@ for WRITERS in 1 4 8; do
             RUN_START="$(date +%s.%N)"
             if (( RUN_INDEX == 1 )); then
                 # Keep a marker on the boot-disk log if result transfer fails.
-                echo "WAL_BENCHMARK_STARTED $(date --iso-8601=seconds)" | tee -a "$BOOT_LOG"
+                echo "WAL_BENCHMARK_STARTED $(date --iso-8601=seconds)" | tee -a "$BENCH_BOOT_LOG"
             fi
             set +e
             timeout --signal=INT --kill-after=30s "$RUN_TIMEOUT_SECONDS" env "${RUN_ENV[@]}" "${COMMAND[@]}" \

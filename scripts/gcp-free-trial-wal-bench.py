@@ -1139,6 +1139,23 @@ def provision_and_run(
                  "benchmark_started": False, "remote_execution_uncertain": False,
                  "collected": False, "cleanup": []}
     results_dir.mkdir(parents=True, exist_ok=True)
+    lifecycle_path = results_dir / "lifecycle.json"
+
+    def persist_lifecycle() -> None:
+        temporary_path = lifecycle_path.with_name(".lifecycle.json.tmp")
+        with temporary_path.open("w", encoding="utf-8") as stream:
+            stream.write(json.dumps(lifecycle, indent=2, sort_keys=True) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary_path, lifecycle_path)
+        directory_fd = os.open(results_dir, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+
+    # Save resource names before cloud create requests can be interrupted.
+    persist_lifecycle()
 
     # VPC firewall rules are additive. A temporary /32 rule cannot restrict a
     # pre-existing target-all allow rule, so reject a broader SSH path first.
@@ -1175,6 +1192,7 @@ def provision_and_run(
             # Mark intent before invoking gcloud: a transport failure may happen
             # after GCP accepted the insert request.
             lifecycle["created"] = True
+            persist_lifecycle()
             gcloud.run(create, timeout=600)
             instance_info = gcloud.json([
                 "compute", "instances", "describe", instance,
@@ -1218,6 +1236,7 @@ def provision_and_run(
             # VM creation cannot orphan a firewall rule. The server-side VM
             # deadline remains the fallback for a local runner that disappears.
             lifecycle["firewall_created"] = True
+            persist_lifecycle()
             gcloud.run([
                 "compute", "firewall-rules", "create", firewall, f"--project={args.project}",
                 f"--network={args.network}", "--direction=INGRESS", "--priority=900", "--action=ALLOW",
@@ -1261,16 +1280,19 @@ def provision_and_run(
                 run = ssh_command(key, known_hosts, ip, remote_command, timeout=remaining)
             except subprocess.TimeoutExpired as error:
                 lifecycle["remote_execution_uncertain"] = True
+                persist_lifecycle()
                 append_local_log(ssh_log, f"REMOTE RUN TIMED OUT after {remaining} seconds\n")
                 raise BenchError("Remote benchmark exceeded the local run deadline; collecting partial results") from error
             append_local_log(ssh_log, run.stdout + run.stderr)
             if run.returncode:
                 raise BenchError(f"Remote benchmark failed with exit code {run.returncode}")
             lifecycle["benchmark_started"] = True
+            persist_lifecycle()
             return_code = 0
         except BaseException as error:
             return_code = 1
             lifecycle["error"] = str(error)
+            persist_lifecycle()
             append_local_log(results_dir / "orchestrator.log", f"ERROR: {error}\n")
         finally:
             if lifecycle["created"]:
@@ -1284,17 +1306,22 @@ def provision_and_run(
                         lifecycle["benchmark_started"] = bool(
                             lifecycle["benchmark_started"] or collection.get("benchmark_started")
                         )
+                        persist_lifecycle()
                         lifecycle["collected"] = bool(collection.get("results"))
+                        persist_lifecycle()
                         if not lifecycle["collected"]:
                             return_code = 1
                             lifecycle["cleanup"].append(
                                 "result transfer incomplete after retries; see artifact-collection.json and local logs"
                             )
+                            persist_lifecycle()
                         elif not collection.get("bootstrap_log"):
                             lifecycle["cleanup"].append("bootstrap log could not be collected; benchmark results are local")
+                            persist_lifecycle()
                 except BaseException as error:
                     return_code = 1
                     lifecycle["cleanup"].append(f"artifact collection failed: {error}")
+                    persist_lifecycle()
             cleanup_messages, cleanup_verification, cleanup_failed = cleanup_gcp_resources(
                 gcloud,
                 project=args.project,
@@ -1309,7 +1336,7 @@ def provision_and_run(
                 lifecycle["cleanup_verification"] = cleanup_verification
             if cleanup_failed:
                 return_code = 1
-            write_json(results_dir / "lifecycle.json", lifecycle)
+            persist_lifecycle()
 
     return return_code
 
@@ -1356,13 +1383,6 @@ def main(argv: list[str] | None = None) -> int:
             }
         write_json(results_dir / "preflight.json", report)
         print(json.dumps(report, indent=2))
-        if args.preflight_only:
-            print(f"Read-only preflight passed. No VM or network rule was created. Results: {results_dir}")
-            return 0
-        print("Preflight passed. Creating a disposable C4 VM; the runner will not alter billing or quota settings.")
-        run_status = provision_and_run(args, gcloud, results_dir, report)
-        print(f"Benchmark artifacts: {results_dir}")
-        return run_status
     except BaseException as error:
         write_json(results_dir / "preflight-failure.json", {
             "project": args.project,
@@ -1374,6 +1394,27 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Preflight failed; no VM was created: {error}", file=sys.stderr)
         print(f"Preflight diagnostics: {results_dir}", file=sys.stderr)
         return 2
+
+    if args.preflight_only:
+        print(f"Read-only preflight passed. No VM or network rule was created. Results: {results_dir}")
+        return 0
+
+    print("Preflight passed. Creating a disposable C4 VM; the runner will not alter billing or quota settings.")
+    try:
+        run_status = provision_and_run(args, gcloud, results_dir, report)
+    except BaseException as error:
+        write_json(results_dir / "run-failure.json", {
+            "project": args.project,
+            "zone": args.zone,
+            "error": str(error),
+            "resource_state": "provisioning may have started; inspect lifecycle.json and gcloud-commands.jsonl",
+            "note": "The server-side VM deletion deadline remains the fallback if local cleanup did not complete.",
+        })
+        print(f"Benchmark run failed; provisioning may have started: {error}", file=sys.stderr)
+        print(f"Run diagnostics: {results_dir}", file=sys.stderr)
+        return 2
+    print(f"Benchmark artifacts: {results_dir}")
+    return run_status
 
 
 if __name__ == "__main__":

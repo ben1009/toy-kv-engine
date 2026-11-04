@@ -348,7 +348,7 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
     def test_remote_run_parser_allows_missing_profile_counters(self) -> None:
         remote_script = Path(__file__).with_name("gcp-free-trial-wal-bench-remote.sh")
         source = remote_script.read_text(encoding="utf-8")
-        self.assertIn('echo "WAL_BENCHMARK_STARTED $(date --iso-8601=seconds)" | tee -a "$BOOT_LOG"', source)
+        self.assertIn('echo "WAL_BENCHMARK_STARTED $(date --iso-8601=seconds)" | tee -a "$BENCH_BOOT_LOG"', source)
         marker = 'python3 - "$RUN_DIR" "$WRITERS" "$BLOCK" "$POSITION" "$FORMAT" "$EXIT_CODE" '
         parser_start = source.index(marker)
         heredoc_start = source.index("<<'PY'\n", parser_start) + len("<<'PY'\n")
