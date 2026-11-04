@@ -85,6 +85,71 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
         self.assertEqual(unknown["state"], "unknown")
         self.assertEqual(failed["state"], "unknown")
 
+    def test_cleanup_deletes_and_verifies_vm_and_firewall(self) -> None:
+        class FakeGcloud:
+            def __init__(self):
+                self.calls = []
+                self.responses = [
+                    subprocess.CompletedProcess([], 0, "", ""),
+                    subprocess.CompletedProcess([], 1, "", "resource not found"),
+                    subprocess.CompletedProcess([], 0, "", ""),
+                    subprocess.CompletedProcess([], 1, "", "resource not found"),
+                ]
+
+            def run(self, args, *, check, timeout):
+                self.calls.append(args)
+                if check:
+                    raise AssertionError("cleanup commands must not short-circuit")
+                return self.responses.pop(0)
+
+        gcloud = FakeGcloud()
+        messages, verification, failed = BENCH.cleanup_gcp_resources(
+            gcloud,
+            project="test-project",
+            zone="us-central1-a",
+            instance="walbench-test",
+            firewall="walbench-ssh-test",
+            vm_created=True,
+            firewall_created=True,
+        )
+
+        self.assertFalse(failed)
+        self.assertEqual(verification["vm"]["state"], "absent")
+        self.assertEqual(verification["firewall"]["state"], "absent")
+        self.assertIn("VM deletion verification: absent", messages[1])
+        self.assertIn("temporary firewall deletion verification: absent", messages[3])
+        self.assertEqual([call[2] for call in gcloud.calls], ["delete", "describe", "delete", "describe"])
+
+    def test_cleanup_reports_unverified_resources_as_failure(self) -> None:
+        class FakeGcloud:
+            def __init__(self):
+                self.responses = [
+                    subprocess.CompletedProcess([], 1, "", "permission denied"),
+                    subprocess.CompletedProcess([], 0, "{}", ""),
+                    subprocess.CompletedProcess([], 0, "", ""),
+                    subprocess.CompletedProcess([], 1, "", "resource not found"),
+                ]
+
+            def run(self, _args, *, check, timeout):
+                if check:
+                    raise AssertionError("cleanup commands must not short-circuit")
+                return self.responses.pop(0)
+
+        messages, verification, failed = BENCH.cleanup_gcp_resources(
+            FakeGcloud(),
+            project="test-project",
+            zone="us-central1-a",
+            instance="walbench-test",
+            firewall="walbench-ssh-test",
+            vm_created=True,
+            firewall_created=True,
+        )
+
+        self.assertTrue(failed)
+        self.assertEqual(verification["vm"]["state"], "present")
+        self.assertEqual(verification["firewall"]["state"], "absent")
+        self.assertTrue(any("VM deletion verification: present" in message for message in messages))
+
     def test_firewall_audit_rejects_broad_ssh_allow(self) -> None:
         rule = {
             "name": "allow-ssh-from-anywhere",

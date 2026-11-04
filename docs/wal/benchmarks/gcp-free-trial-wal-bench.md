@@ -73,18 +73,19 @@ format any other disk.
 
 Local SSD data is ephemeral. Results are copied back to the local results
 directory before VM deletion. `bench-results/` is ignored by Git. If result
-transfer still fails after two attempts, the runner preserves the VM and
-restricted SSH rule temporarily, saves recovery credentials under the
-results directory with owner-only permissions, and records retry instructions.
-The VM's server-side deadline independently deletes it; after collecting the
-results or after VM auto-deletion, remove the named temporary firewall rule
-from `recovery/README.txt`. On normal completion, failed benchmark runs, or
-when the benchmark never started, cleanup still attempts to delete the VM and
+transfer still fails after two attempts, the runner preserves the local
+collection-attempt directories, transfer diagnostics, bootstrap log if
+available, and orchestration logs, then proceeds with VM and firewall cleanup.
+The runner prints the local artifact directory on success and failure. A
+complete remote benchmark result cannot be returned when every transfer
+attempt fails; `artifact-collection.json` records that condition and the local
+diagnostics remain available. On normal completion, failed benchmark runs, or
+when the benchmark never started, cleanup attempts to delete the VM and
 firewall rule, then describes each resource and records `absent`, `present`, or
 `unknown` in `lifecycle.json`. A resource that is present or cannot be verified
 causes the run to report cleanup failure. A force-kill or host failure can
 still leave the temporary firewall rule behind; the lifecycle record contains
-its name for manual cleanup.
+its name for manual cleanup, and the VM has a server-side deletion deadline.
 Before retrying, the runner refuses to provision while any non-terminated
 `walbench-*` VM remains in the project, preventing an interrupted benchmark
 from silently creating a second VM.

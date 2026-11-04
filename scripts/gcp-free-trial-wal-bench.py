@@ -116,6 +116,67 @@ def verify_resource_absent(gcloud: Gcloud, describe_args: list[str]) -> dict[str
     return {"state": "unknown", "detail": detail or "describe failed without a not-found response"}
 
 
+def cleanup_gcp_resources(
+    gcloud: Gcloud,
+    *,
+    project: str,
+    zone: str,
+    instance: str,
+    firewall: str,
+    vm_created: bool,
+    firewall_created: bool,
+) -> tuple[list[str], dict[str, dict[str, str]], bool]:
+    """Attempt and verify cleanup for every resource that may have been created."""
+    cleanup: list[str] = []
+    verification: dict[str, dict[str, str]] = {}
+    failed = False
+
+    if vm_created:
+        try:
+            result = gcloud.run([
+                "compute", "instances", "delete", instance,
+                f"--project={project}", f"--zone={zone}", "--quiet",
+            ], check=False, timeout=300)
+            cleanup.append(
+                "VM delete completed" if result.returncode == 0
+                else f"VM delete failed: {result.stderr.strip()}"
+            )
+        except BaseException as error:
+            cleanup.append(f"VM delete failed: {error}")
+        verification["vm"] = verify_resource_absent(gcloud, [
+            "compute", "instances", "describe", instance,
+            f"--project={project}", f"--zone={zone}", "--format=json",
+        ])
+        vm_state = verification["vm"]
+        cleanup.append(f"VM deletion verification: {vm_state['state']} ({vm_state['detail']})")
+        failed = failed or vm_state["state"] != "absent"
+
+    if firewall_created:
+        try:
+            result = gcloud.run([
+                "compute", "firewall-rules", "delete", firewall,
+                f"--project={project}", "--quiet",
+            ], check=False, timeout=180)
+            cleanup.append(
+                "temporary firewall rule deleted" if result.returncode == 0
+                else f"firewall delete failed: {result.stderr.strip()}"
+            )
+        except BaseException as error:
+            cleanup.append(f"firewall delete failed: {error}")
+        verification["firewall"] = verify_resource_absent(gcloud, [
+            "compute", "firewall-rules", "describe", firewall,
+            f"--project={project}", "--format=json",
+        ])
+        firewall_state = verification["firewall"]
+        cleanup.append(
+            "temporary firewall deletion verification: "
+            f"{firewall_state['state']} ({firewall_state['detail']})"
+        )
+        failed = failed or firewall_state["state"] != "absent"
+
+    return cleanup, verification, failed
+
+
 def zone_region(zone: str) -> str:
     region, separator, zone_suffix = zone.rpartition("-")
     if not separator or not zone_suffix or not re.fullmatch(r"[a-z]", zone_suffix):
@@ -913,65 +974,6 @@ def collect_artifacts(ip: str, key: Path, known_hosts: Path, results_dir: Path) 
     }
 
 
-def preserve_recovery_access(
-    results_dir: Path,
-    key: Path,
-    known_hosts: Path,
-    *,
-    ip: str,
-    project: str,
-    zone: str,
-    instance: str,
-    firewall: str,
-    termination_timestamp: str | None,
-) -> Path:
-    """Persist least-privilege SSH access when results could not be copied."""
-    recovery = results_dir / "recovery"
-    recovery.mkdir(mode=0o700, parents=True, exist_ok=True)
-    os.chmod(recovery, 0o700)
-    recovery_key = recovery / "bench_ed25519"
-    recovery_hosts = recovery / "known_hosts"
-    shutil.copyfile(key, recovery_key)
-    os.chmod(recovery_key, 0o600)
-    if known_hosts.is_file():
-        shutil.copyfile(known_hosts, recovery_hosts)
-        os.chmod(recovery_hosts, 0o600)
-    metadata = {
-        "project": project,
-        "zone": zone,
-        "instance": instance,
-        "external_ip": ip,
-        "firewall_rule": firewall,
-        "termination_timestamp": termination_timestamp,
-        "private_key": str(recovery_key),
-        "known_hosts": str(recovery_hosts),
-    }
-    write_json(recovery / "recovery.json", metadata)
-    if (recovery / "known_hosts").exists():
-        host_options = (
-            f"-o StrictHostKeyChecking=yes -o UserKnownHostsFile={shlex.quote(str(recovery_hosts))} "
-            "-o GlobalKnownHostsFile=/dev/null"
-        )
-        instructions = (
-            "Artifact transfer did not complete. The VM and its narrowly scoped SSH firewall rule were "
-            "left in place temporarily; the VM has a server-side delete deadline.\n\n"
-            "Retry result collection before that deadline:\n"
-            f"scp -i {shlex.quote(str(recovery_key))} {host_options} -r "
-            f"bench@{ip}:/mnt/gcp-wal-bench/results {shlex.quote(str(results_dir / 'recovered'))}\n\n"
-            f"After recovery or VM auto-deletion, remove the temporary rule:\n"
-            f"gcloud compute firewall-rules delete {shlex.quote(firewall)} "
-            f"--project={shlex.quote(project)} --quiet\n"
-        )
-    else:
-        instructions = (
-            "Artifact transfer did not complete and no verified SSH host key was available to save. "
-            "The VM has a server-side delete deadline.\n"
-            f"After VM deletion, remove firewall rule {firewall!r} with gcloud if it still exists.\n"
-        )
-    (recovery / "README.txt").write_text(instructions, encoding="utf-8")
-    return recovery
-
-
 def _host_key_lines(response: Any, ip: str) -> list[str]:
     if not isinstance(response, dict):
         return []
@@ -1263,7 +1265,6 @@ def provision_and_run(
             lifecycle["error"] = str(error)
             append_local_log(results_dir / "orchestrator.log", f"ERROR: {error}\n")
         finally:
-            preserve_resources = False
             if lifecycle["created"]:
                 try:
                     # Copy results even when a benchmark or SSH command failed.
@@ -1279,93 +1280,27 @@ def provision_and_run(
                         if not lifecycle["collected"]:
                             return_code = 1
                             lifecycle["cleanup"].append(
-                                "result transfer incomplete after retries; marking benchmark run failed"
+                                "result transfer incomplete after retries; see artifact-collection.json and local logs"
                             )
-                            if lifecycle["benchmark_started"] or lifecycle["remote_execution_uncertain"]:
-                                recovery = preserve_recovery_access(
-                                    results_dir, key, known_hosts,
-                                    ip=ip,
-                                    project=args.project,
-                                    zone=args.zone,
-                                    instance=instance,
-                                    firewall=firewall,
-                                    termination_timestamp=termination_time,
-                                )
-                                preserve_resources = True
-                                lifecycle["recovery_directory"] = str(recovery)
-                                lifecycle["cleanup"].append(
-                                    "VM and restricted SSH rule preserved until the server-side delete deadline "
-                                    "so artifact transfer can be retried"
-                                )
                         elif not collection.get("bootstrap_log"):
                             lifecycle["cleanup"].append("bootstrap log could not be collected; benchmark results are local")
                 except BaseException as error:
                     return_code = 1
                     lifecycle["cleanup"].append(f"artifact collection failed: {error}")
-                    if (lifecycle["benchmark_started"] or lifecycle["remote_execution_uncertain"]) and "ip" in locals():
-                        try:
-                            recovery = preserve_recovery_access(
-                                results_dir, key, known_hosts,
-                                ip=ip,
-                                project=args.project,
-                                zone=args.zone,
-                                instance=instance,
-                                firewall=firewall,
-                                termination_timestamp=termination_time,
-                            )
-                            preserve_resources = True
-                            lifecycle["recovery_directory"] = str(recovery)
-                            lifecycle["cleanup"].append(
-                                "VM and restricted SSH rule preserved after collection error until the "
-                                "server-side delete deadline"
-                            )
-                        except BaseException as recovery_error:
-                            lifecycle["cleanup"].append(f"could not save recovery access: {recovery_error}")
-                if not preserve_resources:
-                    try:
-                        delete_result = gcloud.run([
-                            "compute", "instances", "delete", instance,
-                            f"--project={args.project}", f"--zone={args.zone}", "--quiet",
-                        ], check=False, timeout=300)
-                        lifecycle["cleanup"].append(
-                            "VM delete completed" if delete_result.returncode == 0
-                            else f"VM delete failed: {delete_result.stderr.strip()}"
-                        )
-                    except BaseException as error:
-                        lifecycle["cleanup"].append(f"VM delete failed: {error}")
-                    vm_verification = verify_resource_absent(gcloud, [
-                        "compute", "instances", "describe", instance,
-                        f"--project={args.project}", f"--zone={args.zone}", "--format=json",
-                    ])
-                    lifecycle.setdefault("cleanup_verification", {})["vm"] = vm_verification
-                    lifecycle["cleanup"].append(
-                        f"VM deletion verification: {vm_verification['state']} ({vm_verification['detail']})"
-                    )
-                    if vm_verification["state"] != "absent":
-                        return_code = 1
-            if lifecycle["firewall_created"] and not preserve_resources:
-                try:
-                    firewall_result = gcloud.run([
-                        "compute", "firewall-rules", "delete", firewall,
-                        f"--project={args.project}", "--quiet",
-                    ], check=False, timeout=180)
-                    lifecycle["cleanup"].append(
-                        "temporary firewall rule deleted" if firewall_result.returncode == 0
-                        else f"firewall delete failed: {firewall_result.stderr.strip()}"
-                    )
-                except BaseException as error:
-                    lifecycle["cleanup"].append(f"firewall delete failed: {error}")
-                firewall_verification = verify_resource_absent(gcloud, [
-                    "compute", "firewall-rules", "describe", firewall,
-                    f"--project={args.project}", "--format=json",
-                ])
-                lifecycle.setdefault("cleanup_verification", {})["firewall"] = firewall_verification
-                lifecycle["cleanup"].append(
-                    "temporary firewall deletion verification: "
-                    f"{firewall_verification['state']} ({firewall_verification['detail']})"
-                )
-                if firewall_verification["state"] != "absent":
-                    return_code = 1
+            cleanup_messages, cleanup_verification, cleanup_failed = cleanup_gcp_resources(
+                gcloud,
+                project=args.project,
+                zone=args.zone,
+                instance=instance,
+                firewall=firewall,
+                vm_created=lifecycle["created"],
+                firewall_created=lifecycle["firewall_created"],
+            )
+            lifecycle["cleanup"].extend(cleanup_messages)
+            if cleanup_verification:
+                lifecycle["cleanup_verification"] = cleanup_verification
+            if cleanup_failed:
+                return_code = 1
             write_json(results_dir / "lifecycle.json", lifecycle)
 
     return return_code
@@ -1417,7 +1352,9 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Read-only preflight passed. No VM or network rule was created. Results: {results_dir}")
             return 0
         print("Preflight passed. Creating a disposable C4 VM; the runner will not alter billing or quota settings.")
-        return provision_and_run(args, gcloud, results_dir, report)
+        run_status = provision_and_run(args, gcloud, results_dir, report)
+        print(f"Benchmark artifacts: {results_dir}")
+        return run_status
     except BaseException as error:
         write_json(results_dir / "preflight-failure.json", {
             "project": args.project,
@@ -1427,6 +1364,7 @@ def main(argv: list[str] | None = None) -> int:
             "note": "Preflight failed before any VM or firewall resource was created.",
         })
         print(f"Preflight failed; no VM was created: {error}", file=sys.stderr)
+        print(f"Preflight diagnostics: {results_dir}", file=sys.stderr)
         return 2
 
 
