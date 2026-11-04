@@ -250,6 +250,34 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
         self.assertEqual(verification["firewall"]["state"], "absent")
         self.assertTrue(any("VM deletion verification: present" in message for message in messages))
 
+    def test_interrupted_vm_verification_does_not_skip_firewall_cleanup(self) -> None:
+        class FakeGcloud:
+            def __init__(self):
+                self.calls = []
+                self.responses = [
+                    subprocess.CompletedProcess([], 0, "", ""),
+                    KeyboardInterrupt(),
+                    subprocess.CompletedProcess([], 0, "", ""),
+                    subprocess.CompletedProcess([], 1, "", "resource not found"),
+                ]
+
+            def run(self, args, *, check, timeout):
+                self.calls.append(args)
+                result = self.responses.pop(0)
+                if isinstance(result, BaseException):
+                    raise result
+                return result
+
+        gcloud = FakeGcloud()
+        _, verification, failed = BENCH.cleanup_gcp_resources(
+            gcloud, project="test-project", zone="us-central1-a", instance="walbench-test",
+            firewall="walbench-ssh-test", vm_created=True, firewall_created=True,
+        )
+        self.assertEqual([call[2] for call in gcloud.calls], ["delete", "describe", "delete", "describe"])
+        self.assertEqual(verification["vm"], {"state": "unknown", "detail": "KeyboardInterrupt"})
+        self.assertEqual(verification["firewall"]["state"], "absent")
+        self.assertTrue(failed)
+
     def test_local_lifecycle_write_failure_cannot_skip_cloud_cleanup(self) -> None:
         class FakeGcloud:
             def run(self, command, **_kwargs):

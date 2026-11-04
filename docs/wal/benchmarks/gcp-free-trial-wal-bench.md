@@ -87,7 +87,8 @@ diagnostics remain available. On normal completion, failed benchmark runs, or
 when the benchmark never started, cleanup attempts to delete the VM and
 firewall rule, then describes each resource and records `absent`, `present`, or
 `unknown` in `lifecycle.json`. A resource that is present or cannot be verified
-causes the run to report cleanup failure. Local artifact or lifecycle-write
+causes the run to report cleanup failure. An interrupted verification is
+recorded as `unknown`, and cleanup continues to the other resource. Local artifact or lifecycle-write
 errors also trigger cleanup, even when those errors prevent saving the final
 diagnostics. A force-kill or host failure can
 still leave the temporary firewall rule behind; the lifecycle record contains

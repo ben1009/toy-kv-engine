@@ -107,8 +107,10 @@ def verify_resource_absent(gcloud: Gcloud, describe_args: list[str]) -> dict[str
     """Check whether a GCP resource is absent after a delete attempt."""
     try:
         result = gcloud.run(describe_args, check=False, timeout=120)
-    except Exception as error:
-        return {"state": "unknown", "detail": str(error)}
+    except BaseException as error:
+        # SIGTERM becomes KeyboardInterrupt in this runner. Teardown must
+        # continue to the other resource even if a verification is interrupted.
+        return {"state": "unknown", "detail": str(error) or type(error).__name__}
     if result.returncode == 0:
         return {"state": "present", "detail": "describe command still found the resource"}
 
