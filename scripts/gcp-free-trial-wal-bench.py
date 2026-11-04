@@ -681,16 +681,19 @@ def collect_artifacts(ip: str, key: Path, known_hosts: Path, results_dir: Path) 
         if attempt_number < 2:
             time.sleep(5)
 
+    # The bootstrap log lives on the VM root disk and can still be useful when
+    # setup failed before the Local SSD results directory was created. Collect
+    # it independently so a missing results tree does not suppress diagnostics.
+    boot_log_destination = (collected if results_collected else results_dir) / "bootstrap.log"
     boot_log_collected = False
-    if results_collected:
-        try:
-            boot_log = scp_from_vm(
-                ip, "/var/log/gcp-free-trial-wal-bench.log", collected / "bootstrap.log",
-                key, known_hosts, timeout=30,
-            )
-            boot_log_collected = boot_log.returncode == 0
-        except (OSError, subprocess.TimeoutExpired):
-            boot_log_collected = False
+    try:
+        boot_log = scp_from_vm(
+            ip, "/var/log/gcp-free-trial-wal-bench.log", boot_log_destination,
+            key, known_hosts, timeout=30,
+        )
+        boot_log_collected = boot_log.returncode == 0 and boot_log_destination.is_file()
+    except (OSError, subprocess.TimeoutExpired):
+        boot_log_collected = False
     write_json(results_dir / "artifact-collection.json", {
         "attempts": attempts,
         "results_collected": results_collected,

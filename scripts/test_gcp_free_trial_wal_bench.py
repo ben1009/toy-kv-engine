@@ -136,6 +136,28 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
             self.assertTrue((root / "collected" / "results" / "summary.json").is_file())
             self.assertEqual(calls, 2)
 
+    def test_collection_keeps_bootstrap_log_when_results_are_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            key = root / "key"
+            known_hosts = root / "known_hosts"
+            key.write_text("private", encoding="utf-8")
+            known_hosts.write_text("host-key", encoding="utf-8")
+
+            def scp(_ip, remote, destination, _key, _known_hosts, *, recursive=False, timeout):
+                if recursive:
+                    return subprocess.CompletedProcess([], 1, "", "Local SSD setup failed")
+                self.assertEqual(remote, "/var/log/gcp-free-trial-wal-bench.log")
+                destination.write_text("bootstrap failure details", encoding="utf-8")
+                return subprocess.CompletedProcess([], 0, "", "")
+
+            with patch.object(BENCH, "scp_from_vm", side_effect=scp), patch.object(BENCH.time, "sleep"):
+                result = BENCH.collect_artifacts("192.0.2.1", key, known_hosts, root)
+
+            self.assertFalse(result["results"])
+            self.assertTrue(result["bootstrap_log"])
+            self.assertEqual((root / "bootstrap.log").read_text(encoding="utf-8"), "bootstrap failure details")
+
     def test_remote_run_parser_allows_missing_profile_counters(self) -> None:
         remote_script = Path(__file__).with_name("gcp-free-trial-wal-bench-remote.sh")
         source = remote_script.read_text(encoding="utf-8")
