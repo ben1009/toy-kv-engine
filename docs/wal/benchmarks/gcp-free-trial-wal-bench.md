@@ -26,12 +26,16 @@ Before creating any VM or firewall rule, the read-only preflight checks:
 - the selected project is active and the Compute Engine and Cloud Quotas APIs
   are already enabled;
 - the requested zone is up and exposes `c4-standard-8-lssd` as 8 vCPUs with
-  exactly one 375 GB Local SSD;
+  exactly one bundled NVMe Local SSD, using the API's
+  `bundledLocalSsds.partitionCount` and `defaultInterface` fields; this fixed
+  machine type provides 375 GiB, which is checked again on the guest before
+  formatting;
 - a ready Ubuntu 24.04 boot image is resolved and pinned by image name for the
   VM creation;
 - C4 CPU and applicable Local SSD quota limits cover the new VM after
   accounting for existing instances in the region (family-scoped quota counts
-  C4 use; legacy regional quota counts all Local SSD use);
+  C4 use; legacy regional quota counts all Local SSD use, including optional
+  `SCRATCH` disk attachments on other machine families);
 - at least one regional VM instance quota and one ephemeral external IPv4
   address quota remain;
 - at least 50 GB of regional Hyperdisk Balanced quota remains for the C4 boot
@@ -83,7 +87,9 @@ diagnostics remain available. On normal completion, failed benchmark runs, or
 when the benchmark never started, cleanup attempts to delete the VM and
 firewall rule, then describes each resource and records `absent`, `present`, or
 `unknown` in `lifecycle.json`. A resource that is present or cannot be verified
-causes the run to report cleanup failure. A force-kill or host failure can
+causes the run to report cleanup failure. Local artifact or lifecycle-write
+errors also trigger cleanup, even when those errors prevent saving the final
+diagnostics. A force-kill or host failure can
 still leave the temporary firewall rule behind; the lifecycle record contains
 its name for manual cleanup, and the VM has a server-side deletion deadline.
 Before retrying, the runner refuses to provision while any non-terminated
@@ -188,9 +194,22 @@ deletes the VM and temporary firewall rule, so remote results cannot be
 recovered later; incomplete collection or failed teardown returns a nonzero
 status.
 
+## Offline validation
+
+CI runs the runner tests without cloud credentials or provisioning resources:
+
+```bash
+bash -n scripts/gcp-free-trial-wal-bench-remote.sh
+python3 -m unittest discover -s scripts -p test_gcp_free_trial_wal_bench.py
+```
+
+The tests cover API-shaped preflight responses, quota accounting, failure
+cleanup, and successful and partial matrix summary generation.
+
 ## Cloud references
 
 - [C4 machine types](https://docs.cloud.google.com/compute/docs/general-purpose-machines)
+- [Machine-type Local SSD metadata](https://docs.cloud.google.com/compute/docs/reference/rest/v1/machineTypes)
 - [Local SSD quotas](https://docs.cloud.google.com/compute/resource-usage)
 - [Linux Local SSD device names and formatting](https://docs.cloud.google.com/compute/docs/disks/add-local-ssd)
 - [Automatically limit VM runtime](https://docs.cloud.google.com/compute/docs/instances/limit-vm-runtime)

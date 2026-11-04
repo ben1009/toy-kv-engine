@@ -288,6 +288,23 @@ def _instance_is_running(instance: dict[str, Any]) -> bool:
     return str(instance.get("status", "")).upper() != "TERMINATED"
 
 
+def _instance_local_ssd_gib(instance: dict[str, Any]) -> int:
+    name = instance.get("name", "<unnamed>")
+    disks = instance.get("disks")
+    if not isinstance(disks, list):
+        raise BenchError(f"Cannot verify the attached disk inventory for instance {name}")
+    total = 0
+    for disk in disks:
+        if not isinstance(disk, dict) or disk.get("type") not in {"PERSISTENT", "SCRATCH"}:
+            raise BenchError(f"Cannot verify an attached disk type for instance {name}")
+        if disk["type"] == "SCRATCH":
+            size = _number(disk.get("diskSizeGb"), f"Local SSD diskSizeGb for instance {name}")
+            if size == 0 or not size.is_integer():
+                raise BenchError(f"Invalid Local SSD diskSizeGb for instance {name}")
+            total += int(size)
+    return total
+
+
 def _active_benchmark_instances(instances: list[dict[str, Any]]) -> list[str]:
     return sorted(
         str(item.get("name", "<unnamed>"))
@@ -553,12 +570,16 @@ def preflight(gcloud: Gcloud, project: str, zone: str, network: str, subnet: str
     ])
     if int(machine.get("guestCpus", -1)) != EXPECTED_VCPUS:
         raise BenchError(f"{MACHINE_TYPE} did not report exactly {EXPECTED_VCPUS} vCPUs")
-    scratch_disks = [disk for disk in machine.get("disks", []) if str(disk.get("type", "")).upper() == "SCRATCH"]
-    if len(scratch_disks) != 1 or int(scratch_disks[0].get("sizeGb", 0)) != LOCAL_SSD_GB:
+    bundled_local_ssds = machine.get("bundledLocalSsds")
+    if (not isinstance(bundled_local_ssds, dict)
+            or bundled_local_ssds.get("partitionCount") != 1
+            or bundled_local_ssds.get("defaultInterface") != "NVME"):
         raise BenchError(
-            f"{MACHINE_TYPE} in {zone} must expose exactly one {LOCAL_SSD_GB} GB SCRATCH disk; "
-            f"machine type returned {scratch_disks!r}"
+            f"{MACHINE_TYPE} in {zone} must expose exactly one bundled NVMe Local SSD; "
+            f"machine type returned bundledLocalSsds={bundled_local_ssds!r}"
         )
+    # This fixed machine type provides one 375-GiB partition. MachineType
+    # exposes its count/interface; the guest verifies capacity before formatting.
 
     # Resolve the mutable image family once, then create from its immutable
     # image name so every host record can identify the exact boot image.
@@ -637,22 +658,21 @@ def preflight(gcloud: Gcloud, project: str, zone: str, network: str, subnet: str
         is_c4 = machine_name.startswith("c4-")
         if not is_c4 and local_ssd_family_scoped:
             continue
-        instance_zone = _resource_zone(instance)
-        cache_key = (machine_name, instance_zone)
-        if cache_key not in machine_cache:
-            machine_cache[cache_key] = gcloud.json([
-                "compute", "machine-types", "describe", machine_name,
-                f"--zone={instance_zone}", f"--project={project}"
-            ])
-        machine_metadata = machine_cache[cache_key]
         if is_c4 and _instance_is_running(instance):
+            instance_zone = _resource_zone(instance)
+            cache_key = (machine_name, instance_zone)
+            if cache_key not in machine_cache:
+                machine_cache[cache_key] = gcloud.json([
+                    "compute", "machine-types", "describe", machine_name,
+                    f"--zone={instance_zone}", f"--project={project}"
+                ])
+            machine_metadata = machine_cache[cache_key]
             c4_cpu_used += int(machine_metadata.get("guestCpus", 0))
             c4_running_names.append(str(instance.get("name", machine_name)))
-        scratch = [disk for disk in machine_metadata.get("disks", [])
-                   if str(disk.get("type", "")).upper() == "SCRATCH"]
-        # Local SSD quota is conservatively counted for every extant C4 VM,
+        # Local SSDs can be optional attachments rather than part of a machine
+        # type. Count actual SCRATCH disks on every relevant extant instance,
         # including stopped/terminated instances that have not been deleted.
-        scratch_gb = sum(int(disk.get("sizeGb", 0)) for disk in scratch)
+        scratch_gb = _instance_local_ssd_gib(instance)
         regional_ssd_used += scratch_gb
         if is_c4:
             c4_ssd_used += scratch_gb
@@ -759,7 +779,8 @@ def preflight(gcloud: Gcloud, project: str, zone: str, network: str, subnet: str
         "zone_status": zone_info.get("status"),
         "machine_type": MACHINE_TYPE,
         "guest_vcpus": int(machine["guestCpus"]),
-        "scratch_disks": scratch_disks,
+        "bundled_local_ssds": bundled_local_ssds,
+        "local_ssd_capacity_gib": LOCAL_SSD_GIB,
         "machine_type_local_ssd_verified": True,
         "boot_image": {
             "project": "ubuntu-os-cloud",
@@ -1295,48 +1316,52 @@ def provision_and_run(
             persist_lifecycle()
             append_local_log(results_dir / "orchestrator.log", f"ERROR: {error}\n")
         finally:
-            if lifecycle["created"]:
-                try:
-                    # Copy results even when a benchmark or SSH command failed.
-                    if "ip" in locals():
-                        collection = collect_artifacts(
-                            ip, key, known_hosts, results_dir
-                        )
-                        lifecycle["artifact_collection"] = collection
-                        lifecycle["benchmark_started"] = bool(
-                            lifecycle["benchmark_started"] or collection.get("benchmark_started")
-                        )
-                        persist_lifecycle()
-                        lifecycle["collected"] = bool(collection.get("results"))
-                        persist_lifecycle()
-                        if not lifecycle["collected"]:
-                            return_code = 1
-                            lifecycle["cleanup"].append(
-                                "result transfer incomplete after retries; see artifact-collection.json and local logs"
+            try:
+                if lifecycle["created"]:
+                    try:
+                        # Copy results even when a benchmark or SSH command failed.
+                        if "ip" in locals():
+                            collection = collect_artifacts(
+                                ip, key, known_hosts, results_dir
+                            )
+                            lifecycle["artifact_collection"] = collection
+                            lifecycle["benchmark_started"] = bool(
+                                lifecycle["benchmark_started"] or collection.get("benchmark_started")
                             )
                             persist_lifecycle()
-                        elif not collection.get("bootstrap_log"):
-                            lifecycle["cleanup"].append("bootstrap log could not be collected; benchmark results are local")
+                            lifecycle["collected"] = bool(collection.get("results"))
                             persist_lifecycle()
-                except BaseException as error:
+                            if not lifecycle["collected"]:
+                                return_code = 1
+                                lifecycle["cleanup"].append(
+                                    "result transfer incomplete after retries; see artifact-collection.json and local logs"
+                                )
+                                persist_lifecycle()
+                            elif not collection.get("bootstrap_log"):
+                                lifecycle["cleanup"].append("bootstrap log could not be collected; benchmark results are local")
+                                persist_lifecycle()
+                    except BaseException as error:
+                        return_code = 1
+                        lifecycle["cleanup"].append(f"artifact collection failed: {error}")
+                        persist_lifecycle()
+            finally:
+                # Local log/collection I/O can fail (for example, a full disk).
+                # It must never prevent teardown of the cloud resources.
+                cleanup_messages, cleanup_verification, cleanup_failed = cleanup_gcp_resources(
+                    gcloud,
+                    project=args.project,
+                    zone=args.zone,
+                    instance=instance,
+                    firewall=firewall,
+                    vm_created=lifecycle["created"],
+                    firewall_created=lifecycle["firewall_created"],
+                )
+                lifecycle["cleanup"].extend(cleanup_messages)
+                if cleanup_verification:
+                    lifecycle["cleanup_verification"] = cleanup_verification
+                if cleanup_failed:
                     return_code = 1
-                    lifecycle["cleanup"].append(f"artifact collection failed: {error}")
-                    persist_lifecycle()
-            cleanup_messages, cleanup_verification, cleanup_failed = cleanup_gcp_resources(
-                gcloud,
-                project=args.project,
-                zone=args.zone,
-                instance=instance,
-                firewall=firewall,
-                vm_created=lifecycle["created"],
-                firewall_created=lifecycle["firewall_created"],
-            )
-            lifecycle["cleanup"].extend(cleanup_messages)
-            if cleanup_verification:
-                lifecycle["cleanup_verification"] = cleanup_verification
-            if cleanup_failed:
-                return_code = 1
-            persist_lifecycle()
+                persist_lifecycle()
 
     return return_code
 

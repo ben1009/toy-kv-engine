@@ -240,7 +240,6 @@ import csv
 import json
 import math
 from pathlib import Path
-from statistics import median
 import sys
 
 run_dir = Path(sys.argv[1])
@@ -311,6 +310,7 @@ python3 - "$BENCH_RESULTS" "$FAILED" "$RUN_INDEX" <<'PY'
 import csv
 import json
 from pathlib import Path
+from statistics import median
 import sys
 
 root, failed, runs = Path(sys.argv[1]), bool(int(sys.argv[2])), int(sys.argv[3])
@@ -391,7 +391,7 @@ summary = {
 (root / "remote-exit.json").write_text(json.dumps({"failed": failed, "runs_started": runs}, indent=2) + "\n")
 PY
 
-date -u +%Y-%m-%dT%H:%M:%SZ >"$RESULTS/finished_utc.txt"
+date -u +%Y-%m-%dT%H:%M:%SZ >"$BENCH_RESULTS/finished_utc.txt"
 echo "WAL benchmark matrix finished; runs_started=$RUN_INDEX failed=$FAILED"
 if (( FAILED )); then
     exit 1

@@ -93,6 +93,23 @@ jobs:
       - name: cargo check hotpath-profile
         run: cargo check --locked -p kv-engine --features hotpath-profile --bin write-perf
 
+  gcp-bench:
+    runs-on: ubuntu-latest
+    name: gcp-bench
+    timeout-minutes: 5
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check remote runner syntax
+        run: bash -n scripts/gcp-free-trial-wal-bench-remote.sh
+      - name: Check GCP orchestration and result generation offline
+        run: python3 -m unittest discover -s scripts -p test_gcp_free_trial_wal_bench.py
+
   typos:
     runs-on: ubuntu-latest
     name: typos
