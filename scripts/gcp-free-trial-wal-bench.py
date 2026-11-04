@@ -62,6 +62,8 @@ class Gcloud:
         command = ["gcloud", *args]
         started = datetime.now(timezone.utc).isoformat()
         try:
+            # argv items are not shell-evaluated; this is intentionally not shell=True.
+            # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
             result = subprocess.run(
                 command,
                 input=input_text,
@@ -1072,6 +1074,8 @@ def ssh_command(
         "-o", "GlobalKnownHostsFile=/dev/null", "-o", "ConnectTimeout=8", "-o", "ServerAliveInterval=30",
         "-o", "ServerAliveCountMax=3", f"bench@{ip}", remote_command,
     ]
+    # Local argv is not shell-evaluated; dynamic remote arguments are built with shlex.join.
+    # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
     return subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                           timeout=timeout, check=False, shell=False)
 
@@ -1086,6 +1090,8 @@ def scp_from_vm(
     if recursive:
         command.append("-r")
     command.extend((f"bench@{ip}:{remote_path}", str(destination)))
+    # SCP receives separate argv items and does not pass them through a local shell.
+    # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
     return subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                           timeout=timeout, check=False, shell=False)
 
@@ -1096,6 +1102,8 @@ def scp_to_vm(
     command = ["scp", "-i", str(key), "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes",
                "-o", "StrictHostKeyChecking=yes", "-o", f"UserKnownHostsFile={known_hosts}",
                "-o", "GlobalKnownHostsFile=/dev/null", str(local_path), f"bench@{ip}:{remote_path}"]
+    # SCP receives separate argv items and does not pass them through a local shell.
+    # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
     return subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                           timeout=timeout, check=False, shell=False)
 
