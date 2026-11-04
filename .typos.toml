@@ -16,6 +16,7 @@ extend-ignore-re = [
 
 [default.extend-identifiers]
 "FiFoQueues"="FiFoQueues" # Preserve TinyUFO's type name in CPU profiles.
+"firewallPolicys"="firewallPolicys" # Preserve the Compute Engine API response field.
 
 [files]
 # Compressed diagnostic data is checked by decompression and content hashes.
