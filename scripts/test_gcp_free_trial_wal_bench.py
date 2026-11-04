@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import struct
 import subprocess
+import stat
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -23,14 +24,38 @@ SPEC.loader.exec_module(BENCH)
 class GcpFreeTrialWalBenchTests(unittest.TestCase):
     def test_quota_family_is_selected_from_dimensions(self) -> None:
         quotas = [{
+            "quotaId": "LOCAL_SSD_TOTAL_GB_PER_VM_FAMILY",
+            "metric": "compute.googleapis.com/local_ssd_total_storage_per_vm_family",
+            "dimensionsInfo": [
+                {"dimensions": {"region": "us-central1", "vm_family": "C4"},
+                 "details": {"quotaValue": 750}},
+                {"dimensions": {"region": "us-central1", "vm_family": "N2"},
+                 "details": {"quotaValue": 9000}},
+                {"dimensions": {"region": "us-east1", "vm_family": "C4"},
+                 "details": {"quotaValue": 8000}},
+            ],
+        }]
+        self.assertEqual(BENCH.quota_limit(quotas, "local_ssd", "us-central1")[0], 750)
+
+    def test_legacy_regional_local_ssd_quota_is_accepted(self) -> None:
+        quotas = [{
             "quotaId": "LOCAL_SSD_TOTAL_GB",
             "metric": "compute.googleapis.com/local_ssd_total_gb",
             "dimensionsInfo": [{
-                "dimensions": {"region": "us-central1", "vm_family": "C4"},
+                "dimensions": {"region": "us-central1"},
                 "details": {"quotaValue": 750},
             }],
         }]
-        self.assertEqual(BENCH.quota_limit(quotas, "local_ssd", "us-central1")[0], 750)
+        _, source = BENCH.quota_limit(quotas, "local_ssd", "us-central1")
+        self.assertEqual(source["dimensions"], {"region": "us-central1"})
+
+    def test_existing_benchmark_vm_blocks_a_retry_but_terminated_vm_does_not(self) -> None:
+        instances = [
+            {"name": "walbench-old-run", "status": "RUNNING"},
+            {"name": "walbench-finished", "status": "TERMINATED"},
+            {"name": "unrelated", "status": "RUNNING"},
+        ]
+        self.assertEqual(BENCH._active_benchmark_instances(instances), ["walbench-old-run"])
 
     def test_firewall_audit_rejects_broad_ssh_allow(self) -> None:
         rule = {
@@ -70,17 +95,77 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
             rule, "default", "walbench-12345678", "203.0.113.10/32"
         ))
 
+    def test_firewall_audit_handles_numeric_tcp_and_effective_policy_rules(self) -> None:
+        rule = {
+            "action": "allow",
+            "direction": "INGRESS",
+            "match": {
+                "srcIpRanges": ["0.0.0.0/0"],
+                "layer4Configs": [{"ipProtocol": "6", "ports": ["22"]}],
+            },
+        }
+        self.assertTrue(BENCH._effective_ssh_rule_exceeds_source_range(
+            rule, "default", "walbench-12345678", "203.0.113.10/32"
+        ))
+        narrow = {**rule, "match": {**rule["match"], "srcIpRanges": ["203.0.113.10/32"]}}
+        self.assertFalse(BENCH._effective_ssh_rule_exceeds_source_range(
+            narrow, "default", "walbench-12345678", "203.0.113.0/24"
+        ))
+
+    def test_effective_firewall_parser_accepts_empty_inventory_and_policy_rules(self) -> None:
+        self.assertEqual(BENCH._effective_firewall_rules({"firewalls": [], "firewallPolicys": []}), [])
+        policy = {"firewallPolicys": [{"rules": [{"action": "deny"}]}]}
+        self.assertEqual(BENCH._effective_firewall_rules(policy), [{"action": "deny"}])
+
+    def test_firewall_audit_handles_snake_case_policy_output(self) -> None:
+        flattened_policy_rule = {
+            "action": "allow",
+            "direction": "INGRESS",
+            "src_ip_ranges": ["0.0.0.0/0"],
+            "layer4_configs": [{"ip_protocol": "6", "ports": ["22"]}],
+        }
+        self.assertTrue(BENCH._effective_ssh_rule_exceeds_source_range(
+            flattened_policy_rule, "default", "walbench-12345678", "203.0.113.10/32"
+        ))
+
+    def test_firewall_audit_checks_regional_effective_policy(self) -> None:
+        broad_rule = {
+            "action": "allow",
+            "direction": "INGRESS",
+            "match": {
+                "srcIpRanges": ["0.0.0.0/0"],
+                "layer4Configs": [{"ipProtocol": "6", "ports": ["22"]}],
+            },
+        }
+
+        class FakeGcloud:
+            def json(self, command):
+                if command[:3] == ["compute", "firewall-rules", "list"]:
+                    return []
+                if command[:3] == ["compute", "networks", "get-effective-firewalls"]:
+                    return {"firewalls": [], "firewallPolicys": []}
+                if command[:3] == ["compute", "network-firewall-policies", "get-effective-firewalls"]:
+                    return {"firewallPolicys": [{"rules": [broad_rule]}]}
+                raise AssertionError(command)
+
+        with self.assertRaises(BENCH.BenchError):
+            BENCH.audit_ssh_firewall_rules(
+                FakeGcloud(), "project", "default", "us-central1", "walbench-12345678", "203.0.113.10/32"
+            )
+
     def test_host_key_parser_accepts_guest_attribute_and_openssh_forms(self) -> None:
         algorithm = b"ssh-ed25519"
         blob = struct.pack(">I", len(algorithm)) + algorithm + b"public-key-body"
         encoded = base64.b64encode(blob).decode("ascii")
-        response = {"guestAttributes": [
+        guest_response = {"guestAttributes": [
             {"queryPath": "hostkeys/ssh-ed25519", "value": encoded},
+        ]}
+        openssh_response = {"guestAttributes": [
             {"queryPath": "hostkeys/ssh-ed25519/0", "value": f"ssh-ed25519 {encoded} vm"},
         ]}
-        self.assertEqual(BENCH._host_key_lines(response, "192.0.2.1"), [
-            f"192.0.2.1 ssh-ed25519 {encoded}",
-        ])
+        expected = [f"192.0.2.1 ssh-ed25519 {encoded}"]
+        self.assertEqual(BENCH._host_key_lines(guest_response, "192.0.2.1"), expected)
+        self.assertEqual(BENCH._host_key_lines(openssh_response, "192.0.2.1"), expected)
 
     def test_host_key_parser_rejects_algorithm_mismatch(self) -> None:
         algorithm = b"ssh-ed25519"
@@ -148,7 +233,9 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
                 if recursive:
                     return subprocess.CompletedProcess([], 1, "", "Local SSD setup failed")
                 self.assertEqual(remote, "/var/log/gcp-free-trial-wal-bench.log")
-                destination.write_text("bootstrap failure details", encoding="utf-8")
+                destination.write_text(
+                    "bootstrap details\nWAL_BENCHMARK_STARTED 2026-11-04T10:00:00Z\n", encoding="utf-8"
+                )
                 return subprocess.CompletedProcess([], 0, "", "")
 
             with patch.object(BENCH, "scp_from_vm", side_effect=scp), patch.object(BENCH.time, "sleep"):
@@ -156,7 +243,14 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
 
             self.assertFalse(result["results"])
             self.assertTrue(result["bootstrap_log"])
-            self.assertEqual((root / "bootstrap.log").read_text(encoding="utf-8"), "bootstrap failure details")
+            self.assertTrue(result["benchmark_started"])
+            self.assertIn("WAL_BENCHMARK_STARTED", (root / "bootstrap.log").read_text(encoding="utf-8"))
+
+    def test_results_directory_is_private_under_permissive_umask(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            results = Path(temp) / "results"
+            BENCH.create_private_results_directory(results)
+            self.assertEqual(stat.S_IMODE(results.stat().st_mode), 0o700)
 
     def test_remote_run_parser_allows_missing_profile_counters(self) -> None:
         remote_script = Path(__file__).with_name("gcp-free-trial-wal-bench-remote.sh")
@@ -192,7 +286,13 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             row = (run_dir.parent / "summary.tsv").read_text(encoding="utf-8").splitlines()[1]
-            self.assertEqual(row.split("\t")[9], "")
+            fields = row.split("\t")
+            self.assertEqual(fields[5], "64")
+            self.assertEqual(float(fields[6]), 1000.0)
+            self.assertEqual(float(fields[7]), 1.2)
+            self.assertAlmostEqual(float(fields[8]), 0.015)
+            self.assertEqual(fields[9], "")
+            self.assertAlmostEqual(float(fields[10]), 1.0)
 
 
 if __name__ == "__main__":

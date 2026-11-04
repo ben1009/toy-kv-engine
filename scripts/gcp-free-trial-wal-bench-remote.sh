@@ -214,6 +214,10 @@ for WRITERS in 1 4 8; do
             printf '\n' >>"$RUN_DIR/command.sh"
             date -u +%Y-%m-%dT%H:%M:%SZ >"$RUN_DIR/start_utc.txt"
             RUN_START="$(date +%s.%N)"
+            if (( RUN_INDEX == 1 )); then
+                # Keep a marker on the boot-disk log if result transfer fails.
+                echo "WAL_BENCHMARK_STARTED $(date --iso-8601=seconds)"
+            fi
             set +e
             timeout --signal=INT --kill-after=30s "$RUN_TIMEOUT_SECONDS" env "${RUN_ENV[@]}" "${COMMAND[@]}" \
                 >"$RUN_DIR/result.json" 2>"$RUN_DIR/stderr.log"

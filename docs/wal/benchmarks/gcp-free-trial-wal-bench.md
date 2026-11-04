@@ -29,8 +29,9 @@ Before creating any VM or firewall rule, the read-only preflight checks:
   exactly one 375 GB Local SSD;
 - a ready Ubuntu 24.04 boot image is resolved and pinned by image name for the
   VM creation;
-- C4 family CPU and Local SSD quota limits cover the new VM after accounting
-  for existing C4 instances in the region;
+- C4 CPU and applicable Local SSD quota limits cover the new VM after
+  accounting for existing instances in the region (family-scoped quota counts
+  C4 use; legacy regional quota counts all Local SSD use);
 - at least one regional VM instance quota and one ephemeral external IPv4
   address quota remain;
 - at least 50 GB of regional Hyperdisk Balanced quota remains for the C4 boot
@@ -47,10 +48,18 @@ restricted. The runner does not retry by changing zones or billing state.
 
 Provisioning requires an explicit IPv4 CIDR no broader than `/24` for SSH (a
 single public IP as `/32` is preferred). Before creating resources, the runner
-audits existing project VPC firewall rules on the selected network and refuses
-to proceed if an applicable SSH allow rule permits a broader source. This
-requires `compute.firewalls.list`; default networks with a target-all
-`0.0.0.0/0` SSH rule must be narrowed or replaced with an isolated VPC first.
+audits project VPC firewall rules and global and regional effective firewall
+policies on the selected network. It refuses to proceed if an applicable SSH
+allow rule permits a broader source, and repeats the audit immediately before
+opening each SSH/SCP connection. This requires `compute.firewalls.list`,
+`compute.networks.getEffectiveFirewalls`, and
+`compute.networks.getRegionEffectiveFirewalls`; default networks with a
+target-all `0.0.0.0/0` SSH rule must be narrowed or replaced with an isolated
+VPC first. The audit is a point-in-time check: a project or organization actor
+with firewall-policy permissions could change the effective policy after a
+check. Do not run while another actor is changing firewall policy; use a
+dedicated network or an enforced policy when concurrent policy changes cannot
+be ruled out.
 The VM blocks project-wide SSH keys, has no service account, and receives a
 temporary firewall rule targeted only at its unique network tag; the rule is
 removed during teardown. The VM has a server-side maximum runtime (default 180
@@ -73,6 +82,9 @@ from `recovery/README.txt`. On normal completion, failed benchmark runs, or
 when the benchmark never started, cleanup still attempts to delete the VM and
 firewall rule. A force-kill or host failure can leave the temporary firewall
 rule behind; the lifecycle record contains its name for manual cleanup.
+Before retrying, the runner refuses to provision while any non-terminated
+`walbench-*` VM remains in the project, preventing an interrupted benchmark
+from silently creating a second VM.
 
 ## Requirements and preflight
 
@@ -102,8 +114,10 @@ guest attributes. Applicable IAM permission names include
 `compute.instances.getGuestAttributes`, `compute.instances.delete`,
 `compute.disks.create`, `compute.disks.delete`, `compute.networks.use`,
 `compute.subnetworks.use`, `compute.reservations.list`,
-`compute.firewalls.list`, `compute.firewalls.create`, and `compute.firewalls.delete`. Project policies
-can require additional permissions. Use a least-privilege custom role or
+`compute.firewalls.list`, `compute.networks.getEffectiveFirewalls`,
+`compute.networks.getRegionEffectiveFirewalls`, `compute.firewalls.create`, and
+`compute.firewalls.delete`. Project policies can require additional
+permissions. Use a least-privilege custom role or
 existing roles that grant these operations; the runner itself never grants
 roles or enables APIs.
 

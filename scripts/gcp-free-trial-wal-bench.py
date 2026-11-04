@@ -70,6 +70,7 @@ class Gcloud:
                 stderr=subprocess.PIPE,
                 timeout=timeout,
                 check=False,
+                shell=False,
             )
         except (OSError, subprocess.TimeoutExpired) as error:
             self._log({"started": started, "command": command, "error": str(error)})
@@ -159,7 +160,13 @@ def quota_limit(
             has_applicable_region = isinstance(applicable, list) and region in applicable
             if not has_region and not has_applicable_region:
                 continue
-            if dimensions.get("vm_family", "").upper() != family.upper():
+            vm_family = dimensions.get("vm_family")
+            if vm_family and vm_family.upper() != family.upper():
+                continue
+            # The deprecated LOCAL_SSD_TOTAL_GB quota is regional rather than
+            # family-scoped. Accept it only as a fallback for Local SSD; callers
+            # must account for all regional Local SSD usage in that case.
+            if kind != "local_ssd" and not vm_family:
                 continue
             details = item.get("details") or {}
             raw_limit = details.get("quotaValue", details.get("value", details.get("limit")))
@@ -203,6 +210,14 @@ def _instance_is_running(instance: dict[str, Any]) -> bool:
     return str(instance.get("status", "")).upper() != "TERMINATED"
 
 
+def _active_benchmark_instances(instances: list[dict[str, Any]]) -> list[str]:
+    return sorted(
+        str(item.get("name", "<unnamed>"))
+        for item in instances
+        if str(item.get("name", "")).startswith("walbench-") and _instance_is_running(item)
+    )
+
+
 def _firewall_allows_ssh(rule: dict[str, Any]) -> bool:
     if str(rule.get("direction", "INGRESS")).upper() != "INGRESS":
         return False
@@ -218,7 +233,7 @@ def _firewall_allows_ssh(rule: dict[str, Any]) -> bool:
         ports = allowed.get("ports")
         if protocol == "all":
             return True
-        if protocol != "tcp":
+        if protocol not in {"tcp", "6"}:
             continue
         # An omitted TCP port list means all TCP ports in a Compute firewall
         # rule, including SSH.
@@ -234,6 +249,131 @@ def _firewall_allows_ssh(rule: dict[str, Any]) -> bool:
                     return True
             except ValueError:
                 continue
+    return False
+
+
+def _effective_firewall_rules(response: Any) -> list[dict[str, Any]]:
+    """Normalize the network effective-firewalls response across gcloud shapes."""
+    if isinstance(response, list):
+        rules = response
+    elif isinstance(response, dict):
+        if not any(key in response for key in ("firewalls", "firewallPolicys", "firewallPolicies")):
+            if any(key in response for key in ("allowed", "action", "match")):
+                rules = [response]
+            else:
+                raise BenchError("Could not safely interpret effective firewall rules; no VM will be created")
+        else:
+            raw_firewalls = response.get("firewalls", [])
+            raw_policies = response.get("firewallPolicys", response.get("firewallPolicies", []))
+            if not isinstance(raw_firewalls, list) or not isinstance(raw_policies, list):
+                raise BenchError("Could not safely interpret effective firewall rules; no VM will be created")
+            rules = list(raw_firewalls)
+        for policy in response.get("firewallPolicys", response.get("firewallPolicies", [])):
+            if isinstance(policy, dict):
+                policy_rules = policy.get("rules", [])
+                if not isinstance(policy_rules, list):
+                    raise BenchError("Could not safely interpret effective firewall rules; no VM will be created")
+                rules.extend(policy_rules)
+            else:
+                raise BenchError("Could not safely interpret effective firewall rules; no VM will be created")
+    else:
+        raise BenchError("Could not safely interpret effective firewall rules; no VM will be created")
+    # Empty firewall and policy lists are valid; malformed response shapes fail closed.
+    if any(not isinstance(rule, dict) for rule in rules):
+        raise BenchError("Could not safely interpret effective firewall rules; no VM will be created")
+    return rules
+
+
+def _effective_ssh_rule_exceeds_source_range(
+    rule: dict[str, Any], network_name: str, vm_tag: str, source_range: str
+) -> bool:
+    """Conservatively detect broad SSH allows in effective VPC or policy rules."""
+    action = str(rule.get("action", "allow" if rule.get("allowed") else "")).lower()
+    if action not in {"allow", "allowed"} or str(rule.get("disabled", "false")).lower() == "true":
+        return False
+    if str(rule.get("direction", "INGRESS")).upper() != "INGRESS":
+        return False
+    if rule.get("targetServiceAccounts") or rule.get("target_service_accounts") or rule.get("target_svc_acct"):
+        # The VM has no service account, so these rules cannot match it.
+        return False
+    target_tags = rule.get("targetTags") or rule.get("target_tags") or []
+    if target_tags and vm_tag not in target_tags:
+        return False
+    if rule.get("targetSecureTags") or rule.get("target_secure_tags"):
+        # This VM is not assigned secure tags.
+        return False
+    target_networks = rule.get("targetNetworks") or rule.get("target_networks") or []
+    if target_networks:
+        network_names = {str(value).rstrip("/").split("/")[-1] for value in target_networks}
+        if network_name not in network_names:
+            return False
+    target_resources = rule.get("targetResources") or rule.get("target_resources") or []
+    network_targets = [str(value).rstrip("/").split("/")[-1]
+                       for value in target_resources if "/networks/" in str(value)]
+    if network_targets and network_name not in network_targets:
+        return False
+    if str(rule.get("targetType", "INSTANCES")).upper() not in {"", "INSTANCES"}:
+        return False
+
+    match = rule.get("match") or {}
+    allowed = rule.get("allowed")
+    if isinstance(allowed, list):
+        if not _firewall_allows_ssh(rule):
+            return False
+    else:
+        layer4 = match.get("layer4Configs") or match.get("layer4_configs") or rule.get("layer4_configs") or []
+        if not layer4:
+            protocol = str(rule.get("IPProtocol", rule.get("ipProtocol", rule.get("ip_protocol", "")))).lower()
+            if protocol and protocol not in {"all", "tcp", "6"}:
+                return False
+            if rule.get("ports") and not _ports_allow_ssh(rule["ports"]):
+                return False
+        elif not any(
+            str(config.get("ipProtocol", config.get("IPProtocol", config.get("ip_protocol", "")))).lower()
+            in {"all", "tcp", "6"}
+            and _ports_allow_ssh(config.get("ports"))
+            for config in layer4 if isinstance(config, dict)
+        ):
+            return False
+
+    source_ranges = (
+        rule.get("sourceRanges") or rule.get("source_ranges") or rule.get("ipRanges")
+        or rule.get("ip_ranges") or rule.get("srcIpRanges") or rule.get("src_ip_ranges")
+        or match.get("srcIpRanges") or match.get("src_ip_ranges") or []
+    )
+    other_source_selectors = (
+        rule.get("sourceTags") or rule.get("source_tags") or rule.get("src_tags")
+        or rule.get("sourceServiceAccounts") or rule.get("source_service_accounts") or rule.get("src_svc_acct")
+        or match.get("srcSecureTags") or match.get("srcNetworks") or match.get("srcNetworkType")
+        or match.get("srcNetworkContext") or match.get("srcAddressGroups") or match.get("srcFqdns")
+        or match.get("srcRegionCodes") or match.get("srcThreatIntelligences")
+    )
+    if other_source_selectors or not source_ranges:
+        return True
+    requested = ipaddress.ip_network(source_range, strict=False)
+    for raw_source in source_ranges:
+        try:
+            existing = ipaddress.ip_network(str(raw_source), strict=False)
+        except ValueError:
+            return True
+        if existing.version != requested.version or not existing.subnet_of(requested):
+            return True
+    return False
+
+
+def _ports_allow_ssh(ports: Any) -> bool:
+    if not ports:
+        return True
+    for value in ports:
+        try:
+            if "-" in str(value):
+                first, last = (int(part) for part in str(value).split("-", 1))
+                if first <= 22 <= last:
+                    return True
+            elif int(value) == 22:
+                return True
+        except ValueError:
+            continue
     return False
 
 
@@ -272,18 +412,30 @@ def _ssh_rule_exceeds_source_range(
 
 
 def audit_ssh_firewall_rules(
-    gcloud: Gcloud, project: str, network: str, vm_tag: str, source_range: str
+    gcloud: Gcloud, project: str, network: str, region: str, vm_tag: str, source_range: str
 ) -> None:
     network_name = str(network).rstrip("/").split("/")[-1]
     rules = gcloud.json(["compute", "firewall-rules", "list", f"--project={project}"])
     if not isinstance(rules, list):
         raise BenchError("Could not safely audit existing VPC firewall rules; no VM will be created")
+    effective = _effective_firewall_rules(gcloud.json([
+        "compute", "networks", "get-effective-firewalls", network_name, f"--project={project}"
+    ]))
+    regional_effective = _effective_firewall_rules(gcloud.json([
+        "compute", "network-firewall-policies", "get-effective-firewalls",
+        f"--network={network_name}", f"--region={region}", f"--project={project}"
+    ]))
     conflicts = [
         str(rule.get("name", "<unnamed>"))
         for rule in rules
         if isinstance(rule, dict)
         and _ssh_rule_exceeds_source_range(rule, network_name, vm_tag, source_range)
     ]
+    conflicts.extend(
+        str(rule.get("name") or rule.get("firewallPolicyName") or rule.get("firewall_policy_name") or "<unnamed>")
+        for rule in [*effective, *regional_effective]
+        if _effective_ssh_rule_exceeds_source_range(rule, network_name, vm_tag, source_range)
+    )
     if conflicts:
         names = ", ".join(sorted(conflicts))
         raise BenchError(
@@ -358,11 +510,19 @@ def preflight(gcloud: Gcloud, project: str, zone: str, network: str, subnet: str
     ], timeout=180)
     c4_cpu_limit, c4_cpu_source = quota_limit(quota_infos, "c4_cpu", region)
     local_ssd_limit, local_ssd_source = quota_limit(quota_infos, "local_ssd", region)
+    local_ssd_family_scoped = "vm_family" in local_ssd_source["dimensions"]
 
     instances = gcloud.json(["compute", "instances", "list", f"--project={project}"], timeout=180)
     regional_instances = [item for item in instances if zone_region(_resource_zone(item)) == region]
+    existing_benchmark_instances = _active_benchmark_instances(instances)
+    if existing_benchmark_instances:
+        raise BenchError(
+            "An earlier WAL benchmark VM is still present in this project "
+            f"({', '.join(sorted(existing_benchmark_instances))}); clean it up before retrying."
+        )
     reservations = gcloud.json(["compute", "reservations", "list", f"--project={project}"], timeout=180)
     regional_c4_reservations: list[str] = []
+    regional_ssd_reservations: list[str] = []
     for reservation in reservations:
         reservation_zone = _resource_zone(reservation)
         if not reservation_zone or zone_region(reservation_zone) != region:
@@ -374,21 +534,30 @@ def preflight(gcloud: Gcloud, project: str, zone: str, network: str, subnet: str
                 f"Cannot determine the machine family for reservation {reservation.get('name')} in {region}; "
                 "quota headroom cannot be verified safely."
             )
+        reservation_name = str(reservation.get("name", reserved_machine_type))
         if reserved_machine_type.startswith("c4-"):
-            regional_c4_reservations.append(str(reservation.get("name", reserved_machine_type)))
+            regional_c4_reservations.append(reservation_name)
+        regional_ssd_reservations.append(reservation_name)
     if regional_c4_reservations:
         raise BenchError(
             f"C4 reservations exist in {region} ({', '.join(regional_c4_reservations)}); "
             "the runner cannot safely derive their C4 CPU/Local SSD quota usage, so it will not provision."
         )
+    if not local_ssd_family_scoped and regional_ssd_reservations:
+        raise BenchError(
+            f"Reservations exist in {region} ({', '.join(regional_ssd_reservations)}); "
+            "the runner cannot safely derive their regional Local SSD usage, so it will not provision."
+        )
 
     c4_cpu_used = 0
     c4_ssd_used = 0
+    regional_ssd_used = 0
     c4_running_names: list[str] = []
     machine_cache: dict[tuple[str, str], dict[str, Any]] = {}
     for instance in regional_instances:
         machine_name = _machine_type_name(instance)
-        if not machine_name.startswith("c4-"):
+        is_c4 = machine_name.startswith("c4-")
+        if not is_c4 and local_ssd_family_scoped:
             continue
         instance_zone = _resource_zone(instance)
         cache_key = (machine_name, instance_zone)
@@ -398,17 +567,21 @@ def preflight(gcloud: Gcloud, project: str, zone: str, network: str, subnet: str
                 f"--zone={instance_zone}", f"--project={project}"
             ])
         machine_metadata = machine_cache[cache_key]
-        if _instance_is_running(instance):
+        if is_c4 and _instance_is_running(instance):
             c4_cpu_used += int(machine_metadata.get("guestCpus", 0))
             c4_running_names.append(str(instance.get("name", machine_name)))
         scratch = [disk for disk in machine_metadata.get("disks", [])
                    if str(disk.get("type", "")).upper() == "SCRATCH"]
         # Local SSD quota is conservatively counted for every extant C4 VM,
         # including stopped/terminated instances that have not been deleted.
-        c4_ssd_used += sum(int(disk.get("sizeGb", 0)) for disk in scratch)
+        scratch_gb = sum(int(disk.get("sizeGb", 0)) for disk in scratch)
+        regional_ssd_used += scratch_gb
+        if is_c4:
+            c4_ssd_used += scratch_gb
 
     c4_cpu_available = c4_cpu_limit - c4_cpu_used
-    local_ssd_available = local_ssd_limit - c4_ssd_used
+    local_ssd_used = c4_ssd_used if local_ssd_family_scoped else regional_ssd_used
+    local_ssd_available = local_ssd_limit - local_ssd_used
     if c4_cpu_available < EXPECTED_VCPUS:
         raise BenchError(
             f"Insufficient C4 CPU quota in {region}: limit={c4_cpu_limit:g}, "
@@ -417,7 +590,7 @@ def preflight(gcloud: Gcloud, project: str, zone: str, network: str, subnet: str
     if local_ssd_available < LOCAL_SSD_GB:
         raise BenchError(
             f"Insufficient C4 Local SSD quota in {region}: limit={local_ssd_limit:g} GB, "
-            f"current C4 Local SSD use={c4_ssd_used} GB, available={local_ssd_available:g} GB, "
+            f"current Local SSD use={local_ssd_used} GB, available={local_ssd_available:g} GB, "
             f"need={LOCAL_SSD_GB} GB."
         )
 
@@ -533,7 +706,8 @@ def preflight(gcloud: Gcloud, project: str, zone: str, network: str, subnet: str
             },
             "c4_local_ssd_gb": {
                 "limit": local_ssd_limit,
-                "inventory_used": c4_ssd_used,
+                "inventory_used": local_ssd_used,
+                "inventory_scope": "C4" if local_ssd_family_scoped else "region",
                 "available": local_ssd_available,
                 "required": LOCAL_SSD_GB,
                 "source": local_ssd_source,
@@ -565,6 +739,7 @@ def preflight(gcloud: Gcloud, project: str, zone: str, network: str, subnet: str
             },
         },
         "existing_c4_running_instances": c4_running_names,
+        "existing_benchmark_instances": existing_benchmark_instances,
         "regional_c4_reservations": regional_c4_reservations,
         "existing_region_instance_count": len(regional_instances),
         "billing": {
@@ -641,6 +816,13 @@ def write_json(path: Path, value: Any) -> None:
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def create_private_results_directory(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=False, mode=0o700)
+    # mkdir's mode is affected by umask; explicitly ensure artifacts stay private
+    # even when the runner is invoked with a permissive shared-host umask.
+    os.chmod(path, 0o700)
+
+
 def gcloud_base(project: str, zone: str) -> list[str]:
     return ["--project", project, "--zone", zone]
 
@@ -651,6 +833,7 @@ def collect_artifacts(ip: str, key: Path, known_hosts: Path, results_dir: Path) 
     attempts: list[dict[str, Any]] = []
     results_collected = False
     summary_complete = False
+    benchmark_started = False
     for attempt_number in range(1, 3):
         staging = results_dir / f"collection-attempt-{attempt_number:02d}"
         staging.mkdir(parents=True, exist_ok=False)
@@ -692,6 +875,11 @@ def collect_artifacts(ip: str, key: Path, known_hosts: Path, results_dir: Path) 
             key, known_hosts, timeout=30,
         )
         boot_log_collected = boot_log.returncode == 0 and boot_log_destination.is_file()
+        if boot_log_collected:
+            try:
+                benchmark_started = "WAL_BENCHMARK_STARTED" in boot_log_destination.read_text(encoding="utf-8")
+            except OSError:
+                benchmark_started = False
     except (OSError, subprocess.TimeoutExpired):
         boot_log_collected = False
     write_json(results_dir / "artifact-collection.json", {
@@ -699,11 +887,13 @@ def collect_artifacts(ip: str, key: Path, known_hosts: Path, results_dir: Path) 
         "results_collected": results_collected,
         "summary_complete": summary_complete,
         "bootstrap_log_collected": boot_log_collected,
+        "benchmark_started": benchmark_started,
     })
     return {
         "bootstrap_log": boot_log_collected,
         "results": results_collected,
         "summary_complete": summary_complete,
+        "benchmark_started": benchmark_started,
         "attempts": attempts,
     }
 
@@ -866,7 +1056,7 @@ def ssh_command(
         "-o", "ServerAliveCountMax=3", f"bench@{ip}", remote_command,
     ]
     return subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                          timeout=timeout, check=False)
+                          timeout=timeout, check=False, shell=False)
 
 
 def scp_from_vm(
@@ -880,7 +1070,7 @@ def scp_from_vm(
         command.append("-r")
     command.extend((f"bench@{ip}:{remote_path}", str(destination)))
     return subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                          timeout=timeout, check=False)
+                          timeout=timeout, check=False, shell=False)
 
 
 def scp_to_vm(
@@ -890,7 +1080,7 @@ def scp_to_vm(
                "-o", "StrictHostKeyChecking=yes", "-o", f"UserKnownHostsFile={known_hosts}",
                "-o", "GlobalKnownHostsFile=/dev/null", str(local_path), f"bench@{ip}:{remote_path}"]
     return subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                          timeout=timeout, check=False)
+                          timeout=timeout, check=False, shell=False)
 
 
 def append_local_log(path: Path, text: str) -> None:
@@ -921,18 +1111,21 @@ def provision_and_run(
     key_log = results_dir / "ssh.log"
     ssh_log = results_dir / "remote-session.log"
     lifecycle = {"instance": instance, "firewall": firewall, "created": False, "firewall_created": False,
-                 "benchmark_started": False, "collected": False, "cleanup": []}
+                 "benchmark_started": False, "remote_execution_uncertain": False,
+                 "collected": False, "cleanup": []}
     results_dir.mkdir(parents=True, exist_ok=True)
 
     # VPC firewall rules are additive. A temporary /32 rule cannot restrict a
     # pre-existing target-all allow rule, so reject a broader SSH path first.
-    audit_ssh_firewall_rules(gcloud, args.project, args.network, tag, args.ssh_source_range)
+    network_region = zone_region(args.zone)
+    audit_ssh_firewall_rules(gcloud, args.project, args.network, network_region, tag, args.ssh_source_range)
 
     with tempfile.TemporaryDirectory(prefix="gcp-wal-bench-") as temporary:
         key = Path(temporary) / "bench_ed25519"
         known_hosts = Path(temporary) / "known_hosts"
         keygen = subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(key)],
-                                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+                                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+                                shell=False)
         if keygen.returncode:
             raise BenchError(f"ssh-keygen failed: {keygen.stderr.strip()}")
         public_key = Path(str(key) + ".pub").read_text(encoding="utf-8").strip()
@@ -968,6 +1161,12 @@ def provision_and_run(
             if not ip:
                 raise BenchError("Created VM has no external IPv4 address; cannot transfer artifacts over SSH")
 
+            # Recheck effective VPC and inherited policy rules immediately before
+            # opening the VM's SSH path, narrowing the preflight/create race.
+            audit_ssh_firewall_rules(
+                gcloud, args.project, args.network, network_region, tag, args.ssh_source_range
+            )
+
             write_json(results_dir / "instance.json", {
                 "project": args.project, "zone": args.zone, "instance": instance,
                 "machine_type": MACHINE_TYPE, "external_ip": ip,
@@ -1002,6 +1201,11 @@ def provision_and_run(
             ], timeout=180)
             connected = False
             while time.monotonic() < deadline:
+                # Recheck immediately before each new connection so a changed
+                # effective policy fails closed before this runner opens SSH.
+                audit_ssh_firewall_rules(
+                    gcloud, args.project, args.network, network_region, tag, args.ssh_source_range
+                )
                 probe = ssh_command(key, known_hosts, ip, "true", timeout=12)
                 append_local_log(key_log, probe.stdout + probe.stderr)
                 if probe.returncode == 0:
@@ -1012,6 +1216,9 @@ def provision_and_run(
                 raise BenchError("SSH did not become ready before timeout")
 
             remote_script = RUNNERS
+            audit_ssh_firewall_rules(
+                gcloud, args.project, args.network, network_region, tag, args.ssh_source_range
+            )
             scp_result = scp_to_vm(ip, remote_script, "/tmp/run-wal-bench.sh", key, known_hosts, timeout=120)
             append_local_log(key_log, scp_result.stdout + scp_result.stderr)
             if scp_result.returncode:
@@ -1022,15 +1229,19 @@ def provision_and_run(
                 args.commit.lower(), str(args.num), args.project, args.zone, instance, str(remaining_budget)
             ])
             remaining = max(30, int(deadline - time.monotonic()))
-            lifecycle["benchmark_started"] = True
             try:
+                audit_ssh_firewall_rules(
+                    gcloud, args.project, args.network, network_region, tag, args.ssh_source_range
+                )
                 run = ssh_command(key, known_hosts, ip, remote_command, timeout=remaining)
             except subprocess.TimeoutExpired as error:
+                lifecycle["remote_execution_uncertain"] = True
                 append_local_log(ssh_log, f"REMOTE RUN TIMED OUT after {remaining} seconds\n")
                 raise BenchError("Remote benchmark exceeded the local run deadline; collecting partial results") from error
             append_local_log(ssh_log, run.stdout + run.stderr)
             if run.returncode:
                 raise BenchError(f"Remote benchmark failed with exit code {run.returncode}")
+            lifecycle["benchmark_started"] = True
             return_code = 0
         except BaseException as error:
             return_code = 1
@@ -1046,13 +1257,16 @@ def provision_and_run(
                             ip, key, known_hosts, results_dir
                         )
                         lifecycle["artifact_collection"] = collection
+                        lifecycle["benchmark_started"] = bool(
+                            lifecycle["benchmark_started"] or collection.get("benchmark_started")
+                        )
                         lifecycle["collected"] = bool(collection.get("results"))
                         if not lifecycle["collected"]:
                             return_code = 1
                             lifecycle["cleanup"].append(
                                 "result transfer incomplete after retries; marking benchmark run failed"
                             )
-                            if lifecycle["benchmark_started"]:
+                            if lifecycle["benchmark_started"] or lifecycle["remote_execution_uncertain"]:
                                 recovery = preserve_recovery_access(
                                     results_dir, key, known_hosts,
                                     ip=ip,
@@ -1073,7 +1287,7 @@ def provision_and_run(
                 except BaseException as error:
                     return_code = 1
                     lifecycle["cleanup"].append(f"artifact collection failed: {error}")
-                    if lifecycle["benchmark_started"] and "ip" in locals():
+                    if (lifecycle["benchmark_started"] or lifecycle["remote_execution_uncertain"]) and "ip" in locals():
                         try:
                             recovery = preserve_recovery_access(
                                 results_dir, key, known_hosts,
@@ -1136,7 +1350,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         # Atomic reservation prevents two local runners from sharing results
         # and overwriting each other's captures.
-        results_dir.mkdir(parents=True, exist_ok=False)
+        create_private_results_directory(results_dir)
     except FileExistsError:
         print(
             f"Results directory already exists; refusing to reuse it: {results_dir}",
