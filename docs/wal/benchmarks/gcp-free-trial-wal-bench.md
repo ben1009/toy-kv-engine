@@ -80,8 +80,11 @@ The VM's server-side deadline independently deletes it; after collecting the
 results or after VM auto-deletion, remove the named temporary firewall rule
 from `recovery/README.txt`. On normal completion, failed benchmark runs, or
 when the benchmark never started, cleanup still attempts to delete the VM and
-firewall rule. A force-kill or host failure can leave the temporary firewall
-rule behind; the lifecycle record contains its name for manual cleanup.
+firewall rule, then describes each resource and records `absent`, `present`, or
+`unknown` in `lifecycle.json`. A resource that is present or cannot be verified
+causes the run to report cleanup failure. A force-kill or host failure can
+still leave the temporary firewall rule behind; the lifecycle record contains
+its name for manual cleanup.
 Before retrying, the runner refuses to provision while any non-terminated
 `walbench-*` VM remains in the project, preventing an interrupted benchmark
 from silently creating a second VM.

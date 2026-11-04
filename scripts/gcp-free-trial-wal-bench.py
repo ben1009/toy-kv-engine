@@ -101,6 +101,21 @@ class Gcloud:
             stream.write(json.dumps(record, sort_keys=True) + "\n")
 
 
+def verify_resource_absent(gcloud: Gcloud, describe_args: list[str]) -> dict[str, str]:
+    """Check whether a GCP resource is absent after a delete attempt."""
+    try:
+        result = gcloud.run(describe_args, check=False, timeout=120)
+    except Exception as error:
+        return {"state": "unknown", "detail": str(error)}
+    if result.returncode == 0:
+        return {"state": "present", "detail": "describe command still found the resource"}
+
+    detail = (result.stderr.strip() or result.stdout.strip())[-2000:]
+    if re.search(r"\b(?:not found|not_found|does not exist)\b", detail, re.IGNORECASE):
+        return {"state": "absent", "detail": detail or "describe reported not found"}
+    return {"state": "unknown", "detail": detail or "describe failed without a not-found response"}
+
+
 def zone_region(zone: str) -> str:
     region, separator, zone_suffix = zone.rpartition("-")
     if not separator or not zone_suffix or not re.fullmatch(r"[a-z]", zone_suffix):
@@ -1316,11 +1331,18 @@ def provision_and_run(
                             "VM delete completed" if delete_result.returncode == 0
                             else f"VM delete failed: {delete_result.stderr.strip()}"
                         )
-                        if delete_result.returncode:
-                            return_code = 1
                     except BaseException as error:
-                        return_code = 1
                         lifecycle["cleanup"].append(f"VM delete failed: {error}")
+                    vm_verification = verify_resource_absent(gcloud, [
+                        "compute", "instances", "describe", instance,
+                        f"--project={args.project}", f"--zone={args.zone}", "--format=json",
+                    ])
+                    lifecycle.setdefault("cleanup_verification", {})["vm"] = vm_verification
+                    lifecycle["cleanup"].append(
+                        f"VM deletion verification: {vm_verification['state']} ({vm_verification['detail']})"
+                    )
+                    if vm_verification["state"] != "absent":
+                        return_code = 1
             if lifecycle["firewall_created"] and not preserve_resources:
                 try:
                     firewall_result = gcloud.run([
@@ -1331,11 +1353,19 @@ def provision_and_run(
                         "temporary firewall rule deleted" if firewall_result.returncode == 0
                         else f"firewall delete failed: {firewall_result.stderr.strip()}"
                     )
-                    if firewall_result.returncode:
-                        return_code = 1
                 except BaseException as error:
-                    return_code = 1
                     lifecycle["cleanup"].append(f"firewall delete failed: {error}")
+                firewall_verification = verify_resource_absent(gcloud, [
+                    "compute", "firewall-rules", "describe", firewall,
+                    f"--project={args.project}", "--format=json",
+                ])
+                lifecycle.setdefault("cleanup_verification", {})["firewall"] = firewall_verification
+                lifecycle["cleanup"].append(
+                    "temporary firewall deletion verification: "
+                    f"{firewall_verification['state']} ({firewall_verification['detail']})"
+                )
+                if firewall_verification["state"] != "absent":
+                    return_code = 1
             write_json(results_dir / "lifecycle.json", lifecycle)
 
     return return_code

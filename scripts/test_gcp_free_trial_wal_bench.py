@@ -57,6 +57,34 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
         ]
         self.assertEqual(BENCH._active_benchmark_instances(instances), ["walbench-old-run"])
 
+    def test_resource_deletion_verification_distinguishes_absent_present_and_unknown(self) -> None:
+        class FakeGcloud:
+            def __init__(self, result):
+                self.result = result
+
+            def run(self, _args, *, check, timeout):
+                if check or timeout != 120:
+                    raise AssertionError((check, timeout))
+                if isinstance(self.result, Exception):
+                    raise self.result
+                return self.result
+
+        absent = BENCH.verify_resource_absent(
+            FakeGcloud(subprocess.CompletedProcess([], 1, "", "resource was not found")), ["describe"]
+        )
+        present = BENCH.verify_resource_absent(
+            FakeGcloud(subprocess.CompletedProcess([], 0, "{}", "")), ["describe"]
+        )
+        unknown = BENCH.verify_resource_absent(
+            FakeGcloud(subprocess.CompletedProcess([], 1, "", "permission denied")), ["describe"]
+        )
+        failed = BENCH.verify_resource_absent(FakeGcloud(BENCH.BenchError("API unavailable")), ["describe"])
+
+        self.assertEqual(absent["state"], "absent")
+        self.assertEqual(present["state"], "present")
+        self.assertEqual(unknown["state"], "unknown")
+        self.assertEqual(failed["state"], "unknown")
+
     def test_firewall_audit_rejects_broad_ssh_allow(self) -> None:
         rule = {
             "name": "allow-ssh-from-anywhere",
