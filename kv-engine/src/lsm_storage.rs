@@ -2767,8 +2767,8 @@ impl KvEngine {
     /// binary. Ordinary V4 and PITR V7/V8 WALs default to `Parallel`; `Leader`
     /// selects their serial comparison path. Older MVCC V2/V3 and PITR V5/V6
     /// WALs retain Leader I/O, and legacy unframed WALs retain buffered I/O.
-    /// Non-serializable async V4 point writes await durability and MVCC
-    /// publication natively. The selected format determines the supported
+    /// Non-serializable async V4 Parallel point writes await durability and
+    /// MVCC publication natively. The selected format determines the supported
     /// native or engine-owned blocking path for other write shapes.
     #[doc(hidden)]
     pub fn open_with_wal_io_mode(
@@ -10431,12 +10431,14 @@ impl KvEngine {
 
     /// Async write batch.
     ///
-    /// With a parallel WAL, non-serializable point batches and v7 range-delete
-    /// batches await durability and ordered publication without occupying a
-    /// blocking thread. V7 encoding and admission still run on the bounded
-    /// blocking executor. After dispatch, cancelling the caller's wait does not
-    /// cancel its owned commit; its outcome can remain unknown to that caller.
-    /// Shutdown drains the commit before closing the WAL.
+    /// With a V4 or V7 Parallel WAL, non-serializable point batches await
+    /// durability and ordered publication without occupying a blocking thread;
+    /// V7 range-delete batches use the same native wait path. V8 Parallel point
+    /// writes currently use the engine-owned blocking executor. V7 encoding
+    /// and admission still run on the bounded blocking executor. After dispatch,
+    /// cancelling the caller's wait does not cancel its owned commit; its outcome
+    /// can remain unknown to that caller. Shutdown drains the commit before
+    /// closing the WAL.
     pub async fn write_batch_async<T: AsRef<[u8]>>(
         &self,
         batch: &[WriteBatchRecord<T>],
