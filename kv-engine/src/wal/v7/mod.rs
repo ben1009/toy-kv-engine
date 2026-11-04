@@ -1,4 +1,7 @@
-//! PITR WAL v7 wire-format components.
+//! PITR WAL V7 codecs, recovery, reservations and Leader compatibility writer.
+//!
+//! V7 remains supported for existing segments and explicit compatibility
+//! selection. New PITR epochs default to the V8 format defined by RFC 026.
 #![allow(dead_code)]
 
 pub(crate) mod admission;

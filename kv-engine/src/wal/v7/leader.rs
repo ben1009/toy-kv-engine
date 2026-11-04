@@ -1,7 +1,7 @@
 //! Single-owner v7 WAL commits using the embedded FRONTIER protocol.
 //!
-//! This is the serial Leader leg used to establish the on-disk protocol before
-//! wiring the same marker cycle into the parallel runtime. The caller supplies
+//! This is the explicit Leader comparison path for the same on-disk protocol
+//! used by the Parallel runtime. The caller supplies
 //! an installed Active recovery seed and exclusive ownership of both file
 //! handles. A successful call writes one ticket's DATA frames, writes its
 //! canonical FRONTIER, calls `fdatasync` once, and only then returns success.

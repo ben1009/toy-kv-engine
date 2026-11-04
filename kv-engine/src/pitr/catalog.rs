@@ -2,7 +2,7 @@
 //!
 //! This module deliberately does not publish repository objects or mutate the
 //! source manifest. It provides the bounded catalog substrate used by the
-//! later archiver state machine.
+//! archiver state machine.
 #![allow(dead_code)]
 
 use std::{

@@ -1,10 +1,9 @@
-//! Single-owner v8 commits for exercising the RFC 026 durability protocol.
+//! V8 WAL writer with Leader and Parallel submission under RFC 026.
 //!
-//! This path is deliberately not selected by the WAL registry. V8 production
-//! selection stays disabled until persistence, compatibility and qualification
-//! slices are complete. The writer nevertheless follows the same admission,
-//! DATA/FRONTIER and single-sync ordering required by the eventual Parallel
-//! runtime.
+//! Parallel is the default; Leader remains an explicit comparison path. Both
+//! modes use admission-before-encoding, DATA/FRONTIER frames and one successful
+//! WAL sync before durable publication. Parallel submits DATA through the shared
+//! I/O worker and folds only fixed-size digest links in ticket order.
 
 use std::{
     cell::RefCell,

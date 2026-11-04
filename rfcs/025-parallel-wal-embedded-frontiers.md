@@ -49,7 +49,10 @@ current v5/v6 format until an explicit capacity change permits migration
 PITR WALs; v7 remains a supported migration and compatibility format. WAL
 remains optional through `enable_wal`.
 
-## 2. Findings from the existing RFCs and implementation
+## 2. Findings at the RFC 025 source baseline
+
+These findings describe the V4/V5/V6 implementation before V7/V8 integration.
+The current default and migration policy is recorded in the adoption note above.
 
 [RFC 012](012-parallel-wal.md) introduced aligned, framed v4 writes using
 io_uring and `O_DIRECT`. Its original proposal must be read alongside its
@@ -75,7 +78,7 @@ The remaining format restriction is deliberate:
 - `walk_v5_segment` in `kv-engine/src/pitr/seal.rs` validates the segment in
   physical order. v5 hashes the whole aligned prefix; v6 hashes the immutable
   file header and batch headers/payloads, excluding alignment padding.
-- The parallel runtime currently assumes v4 framing, a 4096-byte data start,
+- The original parallel runtime assumed v4 framing, a 4096-byte data start,
   and tickets starting at zero. PITR also requires ordered recorded times,
   seal indexing, predecessor chains, and shared spool reservations.
 

@@ -61,10 +61,16 @@ The CLI supports basic manual operations such as `fill`, `get`, `del`, `scan`,
 
 - Write-ahead logging is optional. Ordinary v4 WALs use ticket-based group
   commit with parallel I/O by default. New PITR WALs default to V8 with
-  parallel I/O; retained V5/V6 and older MVCC WALs use Leader I/O, and legacy
-  unframed WALs use buffered I/O. See the
+  parallel I/O; V7 remains a supported Parallel compatibility format.
+  Retained V5/V6 and older MVCC WALs use Leader I/O, and legacy unframed WALs
+  use buffered I/O. See the
   [V8 adoption and compatibility note](docs/wal/rfc-026-v8-default-20261103.md).
-- Framed MVCC WAL writes use `io_uring` + `O_DIRECT` for durability.
+- V7/V8 embed DATA/FRONTIER frames with one WAL sync per durability advance.
+  V8 hashes canonical entries with BLAKE3 during producer encoding and folds
+  a fixed-size prefix link in ticket order.
+- Parallel WAL writes use `io_uring`, normally with `O_DIRECT`. V8 Parallel
+  supports buffered worker I/O when the filesystem rejects direct I/O,
+  preserving the DATA/FRONTIER and `fdatasync` durability ordering.
 - Point-in-time recovery from archived WAL segments, with timeline-aware
   restore support.
 - Batched writes through `write_batch`, including optimized same-batch publish
@@ -253,6 +259,8 @@ rotation and maintenance continue on the blocking executor.
   and memtable leases that protect pending publication during freeze,
   checkpoint, and GC.
 - `kv-engine/src/wal.rs` - WAL, group commit, and `io_uring` durable writes.
+- `kv-engine/src/wal/` - format registry, shared I/O worker, V4 pipeline,
+  V7 embedded frontiers, and V8 composable prefix digests and recovery.
 - `kv-engine/src/mem_table.rs` - lock-free skip-list memtable.
 - `kv-engine/src/block.rs`, `kv-engine/src/table.rs` - SST block and table
   formats.
@@ -364,9 +372,13 @@ TOYKV_COMPACTION_SETSUM=1 cargo nextest run --workspace --all-features --lib
 
 The [parallel WAL overview](docs/wal/benchmarks/rfc-024-parallel-wal-benchmark.md) records
 the current default, retained optimizations, and failed qualification controls.
-Its direct Leader comparisons distinguish the October 5 one-put matrix from
-the October 6 batch64 rerun. Earlier benchmark reports describe their measured
-revisions and do not measure the later default change or review fixes.
+Its V4 Leader comparisons distinguish the October 5 one-put matrix from
+the October 6 batch64 rerun. V8 was selected as the PITR default by maintainer
+decision; its performance matrix remains unqualified. The
+[V7/V8 calibration report](docs/wal/benchmarks/rfc-026-v8-calibrated-states-20261103.md)
+records why the local SSD results do not establish parity. Dated benchmark
+reports describe their measured revisions; their format defaults and candidate
+decisions must be read with the [current adoption note](docs/wal/rfc-026-v8-default-20261103.md).
 
 The current benchmark reports compare ToyKV with Fjall, RocksDB, Redb, and
 SurrealKV through `crud-bench` using roughly matched embedded adapter settings.
@@ -430,6 +442,8 @@ requires both p95 and p99 to pass, and allows at most 5% regression per metric.
 - [RFC 022 Incremental Backup Implementation Plan](docs/backup/rfc-022-incremental-backup-plan.md)
 - [RFC 023 PITR Implementation Plan](docs/pitr/rfc-023-pitr-implementation-plan.md)
 - [RFC 024 Parallel WAL Implementation Plan](docs/wal/rfc-024-parallel-wal-implementation-plan.md)
+- [RFC 025 Embedded-Frontier WAL Implementation Plan](docs/wal/rfc-025-parallel-wal-embedded-frontiers-implementation-plan.md)
+- [RFC 026 Composable Prefix Digest Implementation Plan](docs/wal/rfc-026-implementation-plan.md)
 - [V8 PITR WAL Default Adoption](docs/wal/rfc-026-v8-default-20261103.md)
 - [Parallel v4 WAL Default Adoption](docs/wal/rfc-024-parallel-wal-default-20261005.md)
 
@@ -459,8 +473,8 @@ requires both p95 and p99 to pass, and allows at most 5% regression per metric.
 - [022: Incremental Backup and Restore](rfcs/022-incremental-backup.md)
 - [023: Point-in-Time Recovery](rfcs/023-point-in-time-recovery.md)
 - [024: Dedicated WAL I/O Pipeline](rfcs/024-dedicated-wal-pipeline.md)
-- [025: Parallel WAL with Embedded Frontiers and One Sync (proposed)](rfcs/025-parallel-wal-embedded-frontiers.md)
-- [026: Composable WAL Prefix Digests (proposed)](rfcs/026-composable-wal-prefix-digest.md)
+- [025: Parallel WAL with Embedded Frontiers and One Sync (implemented V7 compatibility format)](rfcs/025-parallel-wal-embedded-frontiers.md)
+- [026: Composable WAL Prefix Digests (implemented; default for new PITR WALs)](rfcs/026-composable-wal-prefix-digest.md)
 
 ## License
 

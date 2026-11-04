@@ -76,10 +76,11 @@ DATA and FRONTIER framing, logical batch encoding, ordering rules, and other
 fields use RFC 025's v7 definitions except where this RFC explicitly changes
 the format identifier or digest rule. Header/version validation and all
 format-specific object validators MUST dispatch by the actual format. The
-exact numeric version assignment, magic, flags and registry entries MUST be
-specified in the implementation plan before any v8 files are written; `v8`
-below is the proposed format identity, not permission to reuse the v7 format
-version identifier.
+exact numeric version assignment, magic, flags and registry entries are
+recorded in the [implementation plan](../docs/wal/rfc-026-implementation-plan.md#fixed-v8-identity):
+WAL version `8`, header magic `WAL2`, frame magic `TKVW8FR1`, and zero header
+flags. V8 is registered separately from V7; its format identity MUST NOT reuse
+the v7 version identifier.
 
 A registered v8 identity selects exactly the BLAKE3-256 entry-chain scheme
 defined here. Changing the primitive, hash mode, tags or preimages requires a

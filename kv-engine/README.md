@@ -22,9 +22,16 @@ the repository root examples, tests, benchmarks, and RFCs.
   capture.
 - `src/wal.rs` implements the WAL. Ordinary v4 WALs use the ticket-ordered
   parallel io_uring durable path by default. New PITR WALs default to V8
-  Parallel; retained V5/V6 and older MVCC formats use Leader I/O, and legacy
-  unframed WALs use buffered I/O. See the
+  Parallel; V7 remains a supported Parallel compatibility format. Retained
+  V5/V6 and older MVCC formats use Leader I/O, and legacy unframed WALs use
+  buffered I/O. See the
   [V8 default adoption note](../docs/wal/rfc-026-v8-default-20261103.md).
+- `src/wal/` contains the format registry, shared I/O worker and V4 pipeline,
+  plus V7/V8 embedded-frontier codecs, recovery and writer runtimes. V8 uses
+  BLAKE3 during producer encoding and a fixed-size ordered prefix link. V8
+  Parallel normally uses `O_DIRECT`, with buffered worker I/O on filesystems
+  that reject direct I/O. Both paths publish durability after the same single
+  WAL sync. The V8 performance matrix remains unqualified.
 - `src/vlog/` contains value-separation storage, indexing, and GC.
 - `src/tests/` contains in-crate test coverage for MVCC, compaction,
   TTL, scans, and cache behavior.

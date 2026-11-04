@@ -16,7 +16,49 @@ older writers. Explicit V6/V7 controls never downgrade existing V8 segments.
 Active recovery validates logical hard anchors before candidate fallback and
 fresh-inode normalization; sealed/archive validation stays strict.
 
-Dated filenames identify individual measurements and follow-ups. The
+## Current format selection
+
+| WAL format | Default I/O | Selection and compatibility |
+| --- | --- | --- |
+| Legacy unframed | Buffered | Preserve the legacy codec and recovery behavior. |
+| Older MVCC V2/V3 | Leader | Recover existing files without changing their format. |
+| Ordinary V4 | Parallel | Remains the non-PITR writer format. |
+| PITR V5/V6 | Leader | Retain existing writers when migration is deferred; V6 is an explicit compatibility preference. |
+| PITR V7 | Parallel | Supported for existing data and the explicit V7 preference. |
+| PITR V8 | Parallel | Default for newly enabled PITR and eligible resume migrations. |
+
+`LsmStorageOptions::pitr_writer_format` defaults to `PitrWriterFormat::V8`.
+`WalIoMode::Leader` remains an explicit comparison path for V4/V7/V8.
+Capacity deferral keeps the existing writer writable; selecting V6 or V7 never
+downgrades V8. V7/V8 require WAL-enabled reopen and currently reject PITR disable
+operations before mutation. See the adoption note for lifecycle details.
+
+V8 Parallel normally uses `O_DIRECT`. If the filesystem rejects direct I/O,
+its worker uses a buffered handle with the same DATA completion → FRONTIER
+write → WAL sync → durable publication ordering. This fallback does not extend
+to the V4 direct-I/O path.
+
+## Retained V8 runtime
+
+Admission publishes tickets before payload preparation. Producers encode
+canonical entries with entry CRC and BLAKE3, then materialize DATA frames and
+frame CRCs. The submitter forms groups from admitted tickets, while readiness
+controls submission. The ordered coordinator folds a 113-byte digest link per
+ticket, and bounded durability coalescing combines completed prefixes into
+FRONTIER/sync cycles.
+
+Preparation, durability progress and durable publication use separate
+notifications. One durability driver forms frontiers; followers wait for
+publication and read the published cursor without taking the physical FRONTIER
+mutex. These changes are retained; the
+[notification rerun](benchmarks/rfc-026-v8-notification-rerun-20261102.md)
+records their evidence and limits. The
+[implementation plan](rfc-026-implementation-plan.md) describes the other
+implemented paths.
+
+Dated filenames identify individual measurements and follow-ups. Their defaults,
+candidate decisions and validation counts describe the measured revision;
+the adoption notes above define current selection. The
 [benchmark overview](benchmarks/rfc-024-parallel-wal-benchmark.md) connects
 the retained and rejected experiments.
 

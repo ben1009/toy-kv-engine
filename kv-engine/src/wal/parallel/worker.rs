@@ -1,6 +1,7 @@
-//! Dormant dedicated io_uring writer for the v4 parallel WAL candidate.
+//! Shared dedicated io_uring writer for the V4/V7/V8 parallel WAL pipelines.
 //!
-//! Dedicated io_uring writer for the v4 parallel WAL candidate.
+//! Groups retain their buffers through terminal I/O completion. The caller's
+//! format-specific coordinator publishes the contiguous durable prefix.
 
 use std::{
     collections::{HashMap, VecDeque},

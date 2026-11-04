@@ -102,14 +102,15 @@ const GROUP_COMMIT_MIN_SOLO_BYTES: usize = 512 * 1024;
 /// Runtime WAL I/O path selector.
 ///
 /// This is exposed only so the benchmark binary can select the path on an
-/// individual engine. Parallel is the default for ordinary v4 WALs. Older
-/// MVCC and PITR WALs use leader I/O; legacy unframed WALs use buffered I/O.
+/// individual engine. Parallel is the default for ordinary V4 and PITR V7/V8
+/// WALs. Older MVCC V2/V3 and PITR V5/V6 WALs use Leader I/O; legacy unframed
+/// WALs use buffered I/O. New PITR epochs default to V8.
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum WalIoMode {
     /// Existing client-leader submission and sync path.
     Leader,
-    /// Default v4 path: dedicated packer, io_uring worker, and durability coordinator.
+    /// Ticket-ordered parallel I/O with a worker and contiguous durability publication.
     #[default]
     Parallel,
 }
@@ -466,8 +467,8 @@ pub struct Wal {
     mvcc_format: bool,
     /// Explicit on-disk WAL format version. Zero denotes the legacy unframed format.
     format_version: u16,
-    /// Effective I/O path. Ordinary v4 WALs and recovered v7 WALs use the
-    /// requested mode; legacy and v5/v6 PITR WALs use the leader path.
+    /// Effective I/O mode. V4/V7/V8 WALs honor the requested mode; older
+    /// framed MVCC and V5/V6 PITR WALs use Leader. Unframed WALs use buffered I/O.
     io_mode: WalIoMode,
     /// Dedicated packer/worker/sync coordinator for parallel v4 and recovered
     /// v7 WALs.
@@ -1851,12 +1852,12 @@ impl Wal {
     }
 
     #[allow(dead_code)]
-    /// Append a PITR batch. v5/v6 enqueue for the Leader barrier; serial v7
-    /// commits DATA and FRONTIER together before returning.
+    /// Append a PITR batch through its format-specific writer. V5/V6 enqueue
+    /// for the Leader barrier; V7/V8 use their DATA/FRONTIER durability protocol.
     ///
     /// `profile` receives the same phase counters the v4 path records, on the
-    /// same fields: on this path they time the v5 encoder, the batch-budget
-    /// checks and the enqueue, which is what the v4 fields mean here.
+    /// same fields: on the V5/V6 path they time the legacy encoder, batch-budget
+    /// checks and enqueue. V7/V8 dispatch before those legacy counters.
     pub(crate) fn put_v5_batch(
         &self,
         batch: &crate::pitr::WalBatch,

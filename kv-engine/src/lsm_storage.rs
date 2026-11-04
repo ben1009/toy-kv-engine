@@ -133,7 +133,7 @@ impl PreparedV7PitrSeal<'_> {
 
 #[cfg(target_os = "linux")]
 #[must_use = "install only after durable SealStarted and retain all reservations through reclamation"]
-#[allow(dead_code)] // Connected to the v8 rotation/resume path in a later slice.
+#[allow(dead_code)]
 pub(crate) struct PreparedV8PitrSeal<'guard> {
     seal: crate::pitr::seal::V8Seal,
     wal_path: PathBuf,
@@ -148,7 +148,7 @@ pub(crate) struct PreparedV8PitrSeal<'guard> {
 }
 
 #[cfg(target_os = "linux")]
-#[allow(dead_code)] // Connected to the v8 rotation/resume path in a later slice.
+#[allow(dead_code)]
 impl PreparedV8PitrSeal<'_> {
     pub(crate) fn boundary(&self) -> crate::pitr::manifest::ImmutableBoundary {
         self.seal.boundary
@@ -679,15 +679,14 @@ struct RecoveryPlan {
     wal_io_mode: crate::wal::WalIoMode,
     compaction_controller: CompactionController,
     pitr_state: crate::pitr::manifest::PitrState,
-    /// The newest segment the database has on disk, measured at recovery. The
-    /// durable frontier cannot say which that is - it records the segments that
-    /// have been sealed, and nothing produces those records yet - so this carries
-    /// the measurement forward to seed the runtime segment allocator, and names
-    /// the memtable that is adopted as active.
+    /// The newest segment the database has on disk, measured at recovery.
+    /// This seeds the runtime segment allocator and identifies the memtable
+    /// adopted as Active, including an unsealed legacy segment not named by
+    /// the archived frontier.
     recovered_pitr_segment_id: Option<u64>,
     recovered_unbound_pitr_active: bool,
-    /// Serializes v7 Active recovery and remains held while the installed Active
-    /// v7 WAL is owned by this process.
+    /// Serializes V7/V8 Active recovery and remains held while the installed
+    /// Active WAL is owned by this process.
     wal_v7_open_lock: Option<WalV7OpenLock>,
 }
 
@@ -1860,9 +1859,9 @@ pub(crate) struct LsmStorageInner {
     #[cfg(test)]
     native_write_pause: Mutex<Option<Arc<native_write::NativeWritePause>>>,
     path: PathBuf,
-    /// Held from before manifest replay through Active v7 installation, then
+    /// Held from before manifest replay through Active V7/V8 installation, then
     /// retained until close or drop so no second process can recover over an
-    /// open v7 Active WAL.
+    /// open V7/V8 Active WAL.
     wal_v7_open_lock: Mutex<Option<WalV7OpenLock>>,
     pub(crate) block_cache: Arc<BlockCache>,
     next_sst_id: AtomicUsize,
@@ -2755,8 +2754,9 @@ impl KvEngine {
     /// Start the storage engine by either loading an existing directory or creating a new one if
     /// the directory does not exist.
     ///
-    /// When WAL is enabled, ordinary v4 WALs use the parallel pipeline by default.
-    /// PITR and older WAL formats retain their compatible I/O paths.
+    /// When WAL is enabled, ordinary V4 and PITR V7/V8 WALs default to Parallel.
+    /// New PITR epochs prefer V8; eligible resume migrations are capacity-checked.
+    /// Existing V5/V6 and older MVCC WALs retain Leader I/O until migration.
     pub fn open(path: impl AsRef<Path>, options: LsmStorageOptions) -> Result<Arc<Self>> {
         Self::open_with_wal_io_mode(path, options, crate::wal::WalIoMode::default())
     }
@@ -2764,11 +2764,12 @@ impl KvEngine {
     /// Open an engine with a selected WAL I/O path.
     ///
     /// This hidden selector is used by `write-perf` to compare paths in one
-    /// binary. Ordinary v4 WALs use `Parallel` by default; `Leader` selects
-    /// the client-led control path. The dedicated pipeline applies only to v4;
-    /// legacy and PITR WALs retain their existing path. Non-serializable async
-    /// point writes await v4 durability and MVCC publication natively. Other
-    /// write shapes keep their engine-owned blocking boundary.
+    /// binary. Ordinary V4 and PITR V7/V8 WALs default to `Parallel`; `Leader`
+    /// selects their serial comparison path. Older MVCC V2/V3 and PITR V5/V6
+    /// WALs retain Leader I/O, and legacy unframed WALs retain buffered I/O.
+    /// Non-serializable async V4 Parallel point writes await durability and
+    /// MVCC publication natively. The selected format determines the supported
+    /// native or engine-owned blocking path for other write shapes.
     #[doc(hidden)]
     pub fn open_with_wal_io_mode(
         path: impl AsRef<Path>,
@@ -9469,7 +9470,7 @@ impl KvEngine {
 
     /// Sync the active WAL to a fixed admission cutoff.
     ///
-    /// For an Active v7 PITR WAL, this drains currently admitted commits before
+    /// For an Active V7/V8 PITR WAL, this drains currently admitted commits before
     /// syncing the WAL and persisting the resulting logical boundary in the
     /// PITR manifest. It resumes previously open admission after success or a
     /// manifest append confirmed absent. Uncertain outcomes keep admission closed.
@@ -10430,12 +10431,14 @@ impl KvEngine {
 
     /// Async write batch.
     ///
-    /// With a parallel WAL, non-serializable point batches and v7 range-delete
-    /// batches await durability and ordered publication without occupying a
-    /// blocking thread. V7 encoding and admission still run on the bounded
-    /// blocking executor. After dispatch, cancelling the caller's wait does not
-    /// cancel its owned commit; its outcome can remain unknown to that caller.
-    /// Shutdown drains the commit before closing the WAL.
+    /// With a V4 or V7 Parallel WAL, non-serializable point batches await
+    /// durability and ordered publication without occupying a blocking thread;
+    /// V7 range-delete batches use the same native wait path. V8 Parallel point
+    /// writes currently use the engine-owned blocking executor. V7 encoding
+    /// and admission still run on the bounded blocking executor. After dispatch,
+    /// cancelling the caller's wait does not cancel its owned commit; its outcome
+    /// can remain unknown to that caller. Shutdown drains the commit before
+    /// closing the WAL.
     pub async fn write_batch_async<T: AsRef<[u8]>>(
         &self,
         batch: &[WriteBatchRecord<T>],
@@ -20711,7 +20714,7 @@ impl LsmStorageInner {
     /// mutating the source image. The caller holds `state_lock` before the
     /// active-memtable write guard through `SealStarted` and installation.
     #[cfg(target_os = "linux")]
-    #[allow(dead_code)] // Connected to v8 rotation/resume in a later slice.
+    #[allow(dead_code)]
     pub(crate) fn prepare_v8_pitr_seal_for_active_wal<'guard>(
         &self,
         _state_lock: &'guard MutexGuard<'_, ()>,
@@ -20995,7 +20998,7 @@ impl LsmStorageInner {
     /// durable. The source image is normalized and synced before sidecar
     /// publication; failures after SealStarted leave admission stopped.
     #[cfg(target_os = "linux")]
-    #[allow(dead_code)] // Connected to v8 rotation/resume in a later slice.
+    #[allow(dead_code)]
     pub(crate) fn install_v8_pitr_seal_for_sealing_obligation(
         &self,
         prepared: &mut PreparedV8PitrSeal<'_>,

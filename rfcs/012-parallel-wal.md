@@ -5,11 +5,12 @@
 **Author:** kv-engine Contributors
 **Reference:** SpanDB (FAST 2021) — "SpanDB: A Fast, Cost-Effective LSM-tree Based KV Store on Hybrid Storage"
 
-The MVCC WAL path now uses registered io_uring and O_DIRECT writes with
-buffered recovery reads. The synchronous fallback proposed below is not
-implemented: if io_uring or O_DIRECT initialization fails for an MVCC WAL,
-creation or reopen returns an error. Legacy non-MVCC WALs continue using the
-buffered path.
+The ordinary V4 MVCC WAL path uses registered io_uring and O_DIRECT writes
+with buffered recovery reads. Its synchronous fallback proposed below is not
+implemented: if io_uring or O_DIRECT initialization fails, V4 creation or
+reopen returns an error. V8 Parallel supports a buffered worker handle when
+the filesystem rejects direct I/O, preserving its DATA/FRONTIER/sync ordering.
+Legacy non-MVCC WALs continue using the buffered path.
 
 Ordinary v4 WALs default to ticket-ordered I/O through the dedicated parallel
 pipeline described in [RFC 024](024-dedicated-wal-pipeline.md). New PITR WALs

@@ -1,9 +1,9 @@
-//! Bounded admission and readiness coordination for the proposed v8 Parallel writer.
+//! Bounded admission and readiness coordination for the V8 Parallel writer.
 //!
-//! This coordinator is intentionally not connected to the WAL registry. It
-//! keeps ticket visibility independent from digest, frame, and DATA completion
-//! so the live writer can form groups from admitted work without waiting for
-//! producer preparation.
+//! Admitted tickets stay visible to group formation independently of digest,
+//! frame and DATA completion. Preparation, durability progress and durable
+//! publication use separate notifications for the submitter, single durability
+//! driver and followers.
 
 use std::{
     collections::VecDeque,

@@ -4,8 +4,11 @@ Ordinary v4 parallel WAL point writes now use cooperative waits through the
 public `put_async`, `delete_async`, and `write_batch_async` APIs. This replaces
 the restricted [native-wait prototype](experiments/rfc-024-native-async-waits-20261005.md)
 with engine lifecycle, memtable freeze, rotation, and cancellation support.
-Parallel WAL is now the default for ordinary v4 WALs; PITR and legacy formats
-retain their existing paths. See the [default adoption note](rfc-024-parallel-wal-default-20261005.md).
+Parallel WAL is the default for ordinary v4 WALs. This report covers that V4
+integration; the later [V8 adoption note](rfc-026-v8-default-20261103.md) records
+the current PITR default and supported V6/V7 compatibility preferences. Retained
+V5/V6 and legacy formats keep their format-specific paths. See the [V4
+adoption note](rfc-024-parallel-wal-default-20261005.md).
 The RFC performance adoption gate is still unqualified.
 
 The [October 5 direct leader comparison](benchmarks/rfc-024-native-async-vs-leader-20261005.md)
