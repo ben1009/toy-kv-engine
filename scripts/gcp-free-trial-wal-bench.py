@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+from collections.abc import Callable
 from datetime import datetime, timezone
 import ipaddress
 import json
@@ -928,7 +929,9 @@ def gcloud_base(project: str, zone: str) -> list[str]:
     return ["--project", project, "--zone", zone]
 
 
-def collect_artifacts(ip: str, key: Path, known_hosts: Path, results_dir: Path) -> dict[str, Any]:
+def collect_artifacts(
+    ip: str, key: Path, known_hosts: Path, results_dir: Path, *, before_connect: Callable[[], None]
+) -> dict[str, Any]:
     """Retry result transfer into isolated staging directories before teardown."""
     collected = results_dir / "collected"
     attempts: list[dict[str, Any]] = []
@@ -939,6 +942,7 @@ def collect_artifacts(ip: str, key: Path, known_hosts: Path, results_dir: Path) 
         staging = results_dir / f"collection-attempt-{attempt_number:02d}"
         staging.mkdir(parents=True, exist_ok=False)
         try:
+            before_connect()
             transfer = scp_from_vm(
                 ip, "/mnt/gcp-wal-bench/results", staging, key, known_hosts,
                 recursive=True, timeout=240,
@@ -971,6 +975,7 @@ def collect_artifacts(ip: str, key: Path, known_hosts: Path, results_dir: Path) 
     boot_log_destination = (collected if results_collected else results_dir) / "bootstrap.log"
     boot_log_collected = False
     try:
+        before_connect()
         boot_log = scp_from_vm(
             ip, "/var/log/gcp-free-trial-wal-bench.log", boot_log_destination,
             key, known_hosts, timeout=30,
@@ -1109,7 +1114,7 @@ def scp_from_vm(
 ) -> subprocess.CompletedProcess[str]:
     command = ["scp", "-i", str(key), "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes",
                "-o", "StrictHostKeyChecking=yes", "-o", f"UserKnownHostsFile={known_hosts}",
-               "-o", "GlobalKnownHostsFile=/dev/null"]
+               "-o", "GlobalKnownHostsFile=/dev/null", "-o", "ConnectTimeout=8"]
     if recursive:
         command.append("-r")
     command.extend((f"bench@{ip}:{remote_path}", str(destination)))
@@ -1124,7 +1129,8 @@ def scp_to_vm(
 ) -> subprocess.CompletedProcess[str]:
     command = ["scp", "-i", str(key), "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes",
                "-o", "StrictHostKeyChecking=yes", "-o", f"UserKnownHostsFile={known_hosts}",
-               "-o", "GlobalKnownHostsFile=/dev/null", str(local_path), f"bench@{ip}:{remote_path}"]
+               "-o", "GlobalKnownHostsFile=/dev/null", "-o", "ConnectTimeout=8",
+               str(local_path), f"bench@{ip}:{remote_path}"]
     # SCP receives separate argv items and does not pass them through a local shell.
     # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
     return subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -1198,6 +1204,7 @@ def provision_and_run(
         key_metadata.write_text(f"bench:{public_key}\n", encoding="utf-8")
         os.chmod(key, 0o600)
 
+        connected = False
         try:
             create = [
                 "beta", "compute", "instances", "create", instance,
@@ -1266,7 +1273,6 @@ def provision_and_run(
                 "--rules=tcp:22", f"--source-ranges={args.ssh_source_range}", f"--target-tags={tag}",
                 "--description=Temporary restricted SSH for disposable WAL benchmark VM",
             ], timeout=180)
-            connected = False
             while time.monotonic() < deadline:
                 # Recheck immediately before each new connection so a changed
                 # effective policy fails closed before this runner opens SSH.
@@ -1322,9 +1328,12 @@ def provision_and_run(
                 if lifecycle["created"]:
                     try:
                         # Copy results even when a benchmark or SSH command failed.
-                        if "ip" in locals():
+                        if connected:
                             collection = collect_artifacts(
-                                ip, key, known_hosts, results_dir
+                                ip, key, known_hosts, results_dir,
+                                before_connect=lambda: audit_ssh_firewall_rules(
+                                    gcloud, args.project, args.network, network_region, tag, args.ssh_source_range
+                                ),
                             )
                             lifecycle["artifact_collection"] = collection
                             lifecycle["benchmark_started"] = bool(

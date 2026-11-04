@@ -76,7 +76,10 @@ existing filesystem signature. It refuses to guess a device by size or to
 format any other disk.
 
 Local SSD data is ephemeral. Results are copied back to the local results
-directory before VM deletion. `bench-results/` is ignored by Git. If result
+directory before VM deletion. Collection requires a previously verified SSH
+connection and repeats the firewall audit before every transfer. Failures
+before SSH is established proceed directly to cleanup. `bench-results/` is
+ignored by Git. If result
 transfer still fails after two attempts, the runner preserves the local
 collection-attempt directories, transfer diagnostics, bootstrap log if
 available, and orchestration logs, then proceeds with VM and firewall cleanup.
@@ -88,8 +91,8 @@ when the benchmark never started, cleanup attempts to delete the VM and
 firewall rule, then describes each resource and records `absent`, `present`, or
 `unknown` in `lifecycle.json`. A resource that is present or cannot be verified
 causes the run to report cleanup failure. An interrupted verification is
-recorded as `unknown`, and cleanup continues to the other resource. Local artifact or lifecycle-write
-errors also trigger cleanup, even when those errors prevent saving the final
+recorded as `unknown`, and cleanup continues to the other resource. Local
+artifact or lifecycle-write errors also trigger cleanup, even when those errors prevent saving the final
 diagnostics. A force-kill or host failure can
 still leave the temporary firewall rule behind; the lifecycle record contains
 its name for manual cleanup, and the VM has a server-side deletion deadline.

@@ -76,6 +76,24 @@ class PreflightGcloud:
         raise AssertionError(command)
 
 
+class ProvisionGcloud:
+    def run(self, command, **_kwargs):
+        return subprocess.CompletedProcess(command, 0, "--max-run-duration --instance-termination-action", "")
+
+    def json(self, command):
+        return {
+            "creationTimestamp": BENCH.datetime.now(BENCH.timezone.utc).isoformat(),
+            "networkInterfaces": [{"accessConfigs": [{"natIP": "192.0.2.1"}]}],
+        }
+
+
+def fake_keygen(command, **_kwargs):
+    key = Path(command[-1])
+    key.write_text("private-key", encoding="utf-8")
+    key.with_suffix(".pub").write_text("public-key", encoding="utf-8")
+    return subprocess.CompletedProcess(command, 0, "", "")
+
+
 class GcpFreeTrialWalBenchTests(unittest.TestCase):
     def preflight(self, gcloud):
         with patch.object(BENCH.shutil, "which", return_value="/usr/bin/gcloud"):
@@ -279,16 +297,6 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
         self.assertTrue(failed)
 
     def test_local_lifecycle_write_failure_cannot_skip_cloud_cleanup(self) -> None:
-        class FakeGcloud:
-            def run(self, command, **_kwargs):
-                return subprocess.CompletedProcess(command, 0, "--max-run-duration --instance-termination-action", "")
-
-            def json(self, command):
-                return {
-                    "creationTimestamp": BENCH.datetime.now(BENCH.timezone.utc).isoformat(),
-                    "networkInterfaces": [{"accessConfigs": [{"natIP": "192.0.2.1"}]}],
-                }
-
         with tempfile.TemporaryDirectory() as temp:
             results = Path(temp)
             args = BENCH.argparse.Namespace(
@@ -297,13 +305,7 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
             )
             disk_full = False
 
-            def keygen(command, **_kwargs):
-                key = Path(command[-1])
-                key.write_text("private-key", encoding="utf-8")
-                key.with_suffix(".pub").write_text("public-key", encoding="utf-8")
-                return subprocess.CompletedProcess(command, 0, "", "")
-
-            def collect(*_args):
+            def collect(*_args, **_kwargs):
                 nonlocal disk_full
                 disk_full = True
                 return {"results": True, "bootstrap_log": True, "summary_complete": True}
@@ -317,7 +319,7 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
                 patch.object(BENCH.shutil, "which", return_value="/usr/bin/tool"),
                 patch.object(BENCH, "audit_ssh_firewall_rules"),
                 patch.object(BENCH, "wait_for_verified_host_keys"),
-                patch.object(BENCH.subprocess, "run", side_effect=keygen),
+                patch.object(BENCH.subprocess, "run", side_effect=fake_keygen),
                 patch.object(BENCH, "ssh_command", return_value=success),
                 patch.object(BENCH, "scp_to_vm", return_value=success),
                 patch.object(BENCH, "collect_artifacts", side_effect=collect),
@@ -325,10 +327,35 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
                 patch.object(BENCH, "cleanup_gcp_resources", return_value=([], {}, False)) as cleanup,
             ):
                 with self.assertRaisesRegex(OSError, "No space left on device"):
-                    BENCH.provision_and_run(args, FakeGcloud(), results, {"boot_image": {"name": "pinned"}})
+                    BENCH.provision_and_run(args, ProvisionGcloud(), results, {"boot_image": {"name": "pinned"}})
                 cleanup.assert_called_once()
                 self.assertTrue(cleanup.call_args.kwargs["vm_created"])
                 self.assertTrue(cleanup.call_args.kwargs["firewall_created"])
+
+    def test_host_key_failure_skips_collection_and_still_deletes_vm(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            args = BENCH.argparse.Namespace(
+                project="test-project", zone="us-central1-a", network="default", subnet=None,
+                ssh_source_range="203.0.113.10/32", max_runtime_minutes=60, commit="a" * 40, num=64,
+            )
+            with (
+                patch.object(BENCH.shutil, "which", return_value="/usr/bin/tool"),
+                patch.object(BENCH, "audit_ssh_firewall_rules"),
+                patch.object(BENCH, "wait_for_verified_host_keys", side_effect=BENCH.BenchError("host keys unavailable")),
+                patch.object(BENCH.subprocess, "run", side_effect=fake_keygen),
+                patch.object(BENCH, "ssh_command") as ssh,
+                patch.object(BENCH, "collect_artifacts") as collection,
+                patch.object(BENCH, "cleanup_gcp_resources", return_value=([], {}, False)) as cleanup,
+            ):
+                result = BENCH.provision_and_run(
+                    args, ProvisionGcloud(), Path(temp), {"boot_image": {"name": "pinned"}}
+                )
+                self.assertEqual(result, 1)
+                ssh.assert_not_called()
+                collection.assert_not_called()
+                cleanup.assert_called_once()
+                self.assertTrue(cleanup.call_args.kwargs["vm_created"])
+                self.assertFalse(cleanup.call_args.kwargs["firewall_created"])
 
     def test_firewall_audit_rejects_broad_ssh_allow(self) -> None:
         rule = {
@@ -473,9 +500,12 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
             key.write_text("private", encoding="utf-8")
             known_hosts.write_text("host-key", encoding="utf-8")
             calls = 0
+            events = []
 
             def scp(_ip, _remote, destination, _key, _known_hosts, *, recursive=False, timeout):
                 nonlocal calls
+                self.assertEqual(events[-1], "audit")
+                events.append("scp")
                 if recursive:
                     calls += 1
                     if calls == 1:
@@ -488,11 +518,14 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
                 return subprocess.CompletedProcess([], 0, "", "")
 
             with patch.object(BENCH, "scp_from_vm", side_effect=scp), patch.object(BENCH.time, "sleep"):
-                result = BENCH.collect_artifacts("192.0.2.1", key, known_hosts, root)
+                result = BENCH.collect_artifacts(
+                    "192.0.2.1", key, known_hosts, root, before_connect=lambda: events.append("audit")
+                )
             self.assertTrue(result["results"])
             self.assertFalse(result["summary_complete"])
             self.assertTrue((root / "collected" / "results" / "summary.json").is_file())
             self.assertEqual(calls, 2)
+            self.assertEqual(events, ["audit", "scp"] * 3)
 
     def test_collection_keeps_bootstrap_log_when_results_are_unavailable(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -512,12 +545,40 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
                 return subprocess.CompletedProcess([], 0, "", "")
 
             with patch.object(BENCH, "scp_from_vm", side_effect=scp), patch.object(BENCH.time, "sleep"):
-                result = BENCH.collect_artifacts("192.0.2.1", key, known_hosts, root)
+                result = BENCH.collect_artifacts("192.0.2.1", key, known_hosts, root, before_connect=lambda: None)
 
             self.assertFalse(result["results"])
             self.assertTrue(result["bootstrap_log"])
             self.assertTrue(result["benchmark_started"])
             self.assertIn("WAL_BENCHMARK_STARTED", (root / "bootstrap.log").read_text(encoding="utf-8"))
+
+    def test_collection_stops_connecting_when_firewall_audit_rejects_access(self) -> None:
+        for rejected_audit in (1, 2):
+            with self.subTest(rejected_audit=rejected_audit), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                events = []
+
+                def audit():
+                    events.append("audit")
+                    if events.count("audit") == rejected_audit:
+                        raise BENCH.BenchError("SSH firewall policy changed")
+
+                def scp(_ip, _remote, destination, _key, _known_hosts, *, recursive=False, timeout):
+                    events.append("scp")
+                    self.assertTrue(recursive)
+                    result_dir = destination / "results"
+                    result_dir.mkdir()
+                    (result_dir / "summary.json").write_text('{"complete": true}\n', encoding="utf-8")
+                    return subprocess.CompletedProcess([], 0, "", "")
+
+                with patch.object(BENCH, "scp_from_vm", side_effect=scp):
+                    with self.assertRaisesRegex(BENCH.BenchError, "SSH firewall policy changed"):
+                        BENCH.collect_artifacts(
+                            "192.0.2.1", root / "key", root / "known_hosts", root, before_connect=audit
+                        )
+                self.assertEqual(events, ["audit"] if rejected_audit == 1 else ["audit", "scp", "audit"])
+                if rejected_audit == 2:
+                    self.assertTrue((root / "collected" / "results" / "summary.json").is_file())
 
     def test_results_directory_is_private_under_permissive_umask(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
