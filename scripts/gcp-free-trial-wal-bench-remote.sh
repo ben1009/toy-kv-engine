@@ -193,7 +193,7 @@ for WRITERS in 1 4 8; do
         for POSITION in 1 2 3 4 5 6; do
             NOW="$(date +%s)"
             ELAPSED=$((NOW - START_EPOCH))
-            if (( ELAPSED + 600 >= BENCH_RUNTIME_BUDGET_SECONDS )); then
+            if (( ELAPSED + RUN_TIMEOUT_SECONDS + 30 + 300 >= BENCH_RUNTIME_BUDGET_SECONDS )); then
                 echo "stopping before VM auto-delete deadline; partial matrix retained" >&2
                 FAILED=1
                 break 3
@@ -262,7 +262,7 @@ if record is not None:
             "puts_per_second": float(result["ops_per_sec"]),
             "p99_ms": float(record["latency"]["p99_ms"]),
             "cpu_seconds": cpu_ms / 1000,
-            "sync_count": int(pipeline["sync_count"]),
+            "sync_count": int(pipeline["sync_count"]) if pipeline.get("sync_count") is not None else "",
         }
         numeric = (metrics["puts_per_second"], metrics["p99_ms"], metrics["cpu_seconds"])
         if any(not math.isfinite(value) or value < 0 for value in numeric):
@@ -337,7 +337,6 @@ for writer in (1, 4, 8):
                     and row["format"] == fmt and row["exit_code"] == "0"]
         stats = summarize(selected)
         per_format[fmt] = stats
-        comparison_rows.append({"writer": writer, "format": fmt, **stats})
     baseline = per_format["v4"]
     comparisons = {}
     for fmt in ("v7", "v8"):
@@ -351,10 +350,22 @@ for writer in (1, 4, 8):
                 (current_value / base_value - 1) * 100
                 if base_value not in (None, 0) and current_value is not None else None
             )
+    for fmt in ("v4", "v7", "v8"):
+        row = {"writer": writer, "format": fmt, **per_format[fmt]}
+        if fmt == "v4":
+            row.update({
+                "throughput_change_pct_vs_v4": 0.0 if baseline["median_puts_per_second"] is not None else None,
+                "p99_change_pct_vs_v4": 0.0 if baseline["median_p99_ms"] is not None else None,
+                "cpu_change_pct_vs_v4": 0.0 if baseline["median_cpu_seconds"] is not None else None,
+            })
+        else:
+            row.update(comparisons[fmt])
+        comparison_rows.append(row)
     by_writer[str(writer)] = {"formats": per_format, "relative_to_v4": comparisons}
 
 with (root / "comparison.tsv").open("w", encoding="utf-8", newline="") as stream:
-    columns = ["writer", "format", "runs", *metric_fields.values()]
+    columns = ["writer", "format", "runs", *metric_fields.values(),
+               "throughput_change_pct_vs_v4", "p99_change_pct_vs_v4", "cpu_change_pct_vs_v4"]
     output_writer = csv.DictWriter(stream, fieldnames=columns, delimiter="\t")
     output_writer.writeheader()
     output_writer.writerows(comparison_rows)

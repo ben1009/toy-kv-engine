@@ -9,6 +9,8 @@ project is still on a Free Trial and the read-only preflight passes.
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 from datetime import datetime, timezone
 import ipaddress
 import json
@@ -19,6 +21,7 @@ import re
 import shlex
 import signal
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -75,8 +78,10 @@ class Gcloud:
             "started": started,
             "command": command,
             "returncode": result.returncode,
-            "stdout": result.stdout,
-            "stderr": result.stderr,
+            # gcloud JSON responses can contain project or instance metadata.
+            # Keep command/status diagnostics without persisting response bodies.
+            "stdout_bytes": len(result.stdout.encode("utf-8")),
+            "stderr_bytes": len(result.stderr.encode("utf-8")),
         })
         if check and result.returncode:
             detail = result.stderr.strip() or result.stdout.strip()
@@ -118,9 +123,11 @@ def _norm(value: Any) -> str:
 
 def _quota_kind(info: dict[str, Any]) -> str | None:
     names = _norm(info.get("quotaId", "")) + _norm(info.get("metric", ""))
-    if "localssd" in names and ("vmfamily" in names or "pervmfamily" in names):
+    # Cloud Quotas may identify the C4 family only in dimensionsInfo, rather
+    # than in quotaId/metric. quota_limit() filters that dimension below.
+    if "localssd" in names:
         return "local_ssd"
-    if "cpus" in names and ("vmfamily" in names or "pervmfamily" in names):
+    if "cpus" in names:
         return "c4_cpu"
     if "instancesperprojectregion" in names or names.endswith("instances"):
         return "instances"
@@ -194,6 +201,95 @@ def _instance_is_running(instance: dict[str, Any]) -> bool:
     # Treat unfamiliar non-terminated states as consuming CPU. This is
     # intentionally conservative when estimating remaining family quota.
     return str(instance.get("status", "")).upper() != "TERMINATED"
+
+
+def _firewall_allows_ssh(rule: dict[str, Any]) -> bool:
+    if str(rule.get("direction", "INGRESS")).upper() != "INGRESS":
+        return False
+    if str(rule.get("disabled", "false")).lower() == "true":
+        return False
+    allowed_rules = rule.get("allowed")
+    if not isinstance(allowed_rules, list):
+        return False
+    for allowed in allowed_rules:
+        if not isinstance(allowed, dict):
+            continue
+        protocol = str(allowed.get("IPProtocol", "")).lower()
+        ports = allowed.get("ports")
+        if protocol == "all":
+            return True
+        if protocol != "tcp":
+            continue
+        # An omitted TCP port list means all TCP ports in a Compute firewall
+        # rule, including SSH.
+        if not ports:
+            return True
+        for value in ports:
+            try:
+                if "-" in str(value):
+                    first, last = (int(part) for part in str(value).split("-", 1))
+                    if first <= 22 <= last:
+                        return True
+                elif int(value) == 22:
+                    return True
+            except ValueError:
+                continue
+    return False
+
+
+def _ssh_rule_exceeds_source_range(
+    rule: dict[str, Any], network_name: str, vm_tag: str, source_range: str
+) -> bool:
+    if not _firewall_allows_ssh(rule):
+        return False
+    rule_network = str(rule.get("network", "")).rstrip("/").split("/")[-1]
+    if not rule_network:
+        return True
+    if rule_network != network_name:
+        return False
+    target_tags = rule.get("targetTags") or []
+    if target_tags and vm_tag not in target_tags:
+        return False
+    # The VM is created with --no-service-account, so target-service-account
+    # rules do not apply to it.
+    if rule.get("targetServiceAccounts"):
+        return False
+
+    requested = ipaddress.ip_network(source_range, strict=False)
+    source_ranges = rule.get("sourceRanges") or []
+    # Source tags/service accounts are identity-based and cannot be bounded by
+    # the operator's CIDR. Missing source ranges are also treated as unknown.
+    if not source_ranges or rule.get("sourceTags") or rule.get("sourceServiceAccounts"):
+        return True
+    for raw_source in source_ranges:
+        try:
+            existing = ipaddress.ip_network(str(raw_source), strict=False)
+        except ValueError:
+            return True
+        if existing.version != requested.version or not existing.subnet_of(requested):
+            return True
+    return False
+
+
+def audit_ssh_firewall_rules(
+    gcloud: Gcloud, project: str, network: str, vm_tag: str, source_range: str
+) -> None:
+    network_name = str(network).rstrip("/").split("/")[-1]
+    rules = gcloud.json(["compute", "firewall-rules", "list", f"--project={project}"])
+    if not isinstance(rules, list):
+        raise BenchError("Could not safely audit existing VPC firewall rules; no VM will be created")
+    conflicts = [
+        str(rule.get("name", "<unnamed>"))
+        for rule in rules
+        if isinstance(rule, dict)
+        and _ssh_rule_exceeds_source_range(rule, network_name, vm_tag, source_range)
+    ]
+    if conflicts:
+        names = ", ".join(sorted(conflicts))
+        raise BenchError(
+            "Existing VPC firewall ALLOW rules can expose SSH beyond --ssh-source-range "
+            f"({names}). Narrow or remove those rules, or use an isolated VPC, before provisioning."
+        )
 
 
 def preflight(gcloud: Gcloud, project: str, zone: str, network: str, subnet: str | None) -> dict[str, Any]:
@@ -549,32 +645,123 @@ def gcloud_base(project: str, zone: str) -> list[str]:
     return ["--project", project, "--zone", zone]
 
 
-def collect_artifacts(ip: str, key: Path, known_hosts: Path, results_dir: Path) -> dict[str, bool]:
-    destination = results_dir / "collected"
-    destination.mkdir(parents=True, exist_ok=True)
-    try:
-        boot_log = scp_from_vm(
-            ip, "/var/log/gcp-free-trial-wal-bench.log", destination / "bootstrap.log", key, known_hosts,
-            timeout=180,
-        )
-        boot_log_collected = boot_log.returncode == 0
-    except (OSError, subprocess.TimeoutExpired):
-        boot_log_collected = False
-    try:
-        remote_results = scp_from_vm(
-            ip, "/mnt/gcp-wal-bench/results", destination, key, known_hosts, recursive=True, timeout=300,
-        )
-        results_complete = remote_results.returncode == 0
-    except (OSError, subprocess.TimeoutExpired):
-        results_complete = False
-    summary_path = destination / "results" / "summary.json"
-    if results_complete:
+def collect_artifacts(ip: str, key: Path, known_hosts: Path, results_dir: Path) -> dict[str, Any]:
+    """Retry result transfer into isolated staging directories before teardown."""
+    collected = results_dir / "collected"
+    attempts: list[dict[str, Any]] = []
+    results_collected = False
+    summary_complete = False
+    for attempt_number in range(1, 3):
+        staging = results_dir / f"collection-attempt-{attempt_number:02d}"
+        staging.mkdir(parents=True, exist_ok=False)
         try:
-            summary = json.loads(summary_path.read_text(encoding="utf-8"))
-            results_complete = summary.get("complete") is True
-        except (OSError, json.JSONDecodeError):
-            results_complete = False
-    return {"bootstrap_log": boot_log_collected, "results": results_complete}
+            transfer = scp_from_vm(
+                ip, "/mnt/gcp-wal-bench/results", staging, key, known_hosts,
+                recursive=True, timeout=240,
+            )
+            local_results = staging / "results"
+            results_collected = transfer.returncode == 0 and local_results.is_dir()
+            attempt = {"number": attempt_number, "returncode": transfer.returncode,
+                       "stderr": transfer.stderr[-4000:], "results_collected": results_collected}
+            if results_collected:
+                summary_path = local_results / "summary.json"
+                try:
+                    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+                    summary_complete = summary.get("complete") is True
+                except (OSError, json.JSONDecodeError):
+                    summary_complete = False
+                collected.mkdir(parents=True, exist_ok=True)
+                os.replace(local_results, collected / "results")
+                attempts.append(attempt)
+                shutil.rmtree(staging, ignore_errors=True)
+                break
+            attempts.append(attempt)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            attempts.append({"number": attempt_number, "error": str(error), "results_collected": False})
+        if attempt_number < 2:
+            time.sleep(5)
+
+    boot_log_collected = False
+    if results_collected:
+        try:
+            boot_log = scp_from_vm(
+                ip, "/var/log/gcp-free-trial-wal-bench.log", collected / "bootstrap.log",
+                key, known_hosts, timeout=30,
+            )
+            boot_log_collected = boot_log.returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            boot_log_collected = False
+    write_json(results_dir / "artifact-collection.json", {
+        "attempts": attempts,
+        "results_collected": results_collected,
+        "summary_complete": summary_complete,
+        "bootstrap_log_collected": boot_log_collected,
+    })
+    return {
+        "bootstrap_log": boot_log_collected,
+        "results": results_collected,
+        "summary_complete": summary_complete,
+        "attempts": attempts,
+    }
+
+
+def preserve_recovery_access(
+    results_dir: Path,
+    key: Path,
+    known_hosts: Path,
+    *,
+    ip: str,
+    project: str,
+    zone: str,
+    instance: str,
+    firewall: str,
+    termination_timestamp: str | None,
+) -> Path:
+    """Persist least-privilege SSH access when results could not be copied."""
+    recovery = results_dir / "recovery"
+    recovery.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(recovery, 0o700)
+    recovery_key = recovery / "bench_ed25519"
+    recovery_hosts = recovery / "known_hosts"
+    shutil.copyfile(key, recovery_key)
+    os.chmod(recovery_key, 0o600)
+    if known_hosts.is_file():
+        shutil.copyfile(known_hosts, recovery_hosts)
+        os.chmod(recovery_hosts, 0o600)
+    metadata = {
+        "project": project,
+        "zone": zone,
+        "instance": instance,
+        "external_ip": ip,
+        "firewall_rule": firewall,
+        "termination_timestamp": termination_timestamp,
+        "private_key": str(recovery_key),
+        "known_hosts": str(recovery_hosts),
+    }
+    write_json(recovery / "recovery.json", metadata)
+    if (recovery / "known_hosts").exists():
+        host_options = (
+            f"-o StrictHostKeyChecking=yes -o UserKnownHostsFile={shlex.quote(str(recovery_hosts))} "
+            "-o GlobalKnownHostsFile=/dev/null"
+        )
+        instructions = (
+            "Artifact transfer did not complete. The VM and its narrowly scoped SSH firewall rule were "
+            "left in place temporarily; the VM has a server-side delete deadline.\n\n"
+            "Retry result collection before that deadline:\n"
+            f"scp -i {shlex.quote(str(recovery_key))} {host_options} -r "
+            f"bench@{ip}:/mnt/gcp-wal-bench/results {shlex.quote(str(results_dir / 'recovered'))}\n\n"
+            f"After recovery or VM auto-deletion, remove the temporary rule:\n"
+            f"gcloud compute firewall-rules delete {shlex.quote(firewall)} "
+            f"--project={shlex.quote(project)} --quiet\n"
+        )
+    else:
+        instructions = (
+            "Artifact transfer did not complete and no verified SSH host key was available to save. "
+            "The VM has a server-side delete deadline.\n"
+            f"After VM deletion, remove firewall rule {firewall!r} with gcloud if it still exists.\n"
+        )
+    (recovery / "README.txt").write_text(instructions, encoding="utf-8")
+    return recovery
 
 
 def _host_key_lines(response: Any, ip: str) -> list[str]:
@@ -599,17 +786,48 @@ def _host_key_lines(response: Any, ip: str) -> list[str]:
                 for item in items
                 if isinstance(item, dict)
             )
-    lines = []
+    lines: set[str] = set()
     for attribute in attributes:
         if not isinstance(attribute, dict):
             continue
         query_path = str(attribute.get("queryPath", ""))
-        algorithm = query_path.rsplit("/", 1)[-1]
-        key_data = str(attribute.get("value", "")).strip()
-        if algorithm not in allowed_algorithms or not re.fullmatch(r"[A-Za-z0-9+/]+={0,2}", key_data):
+        path_algorithm = next(
+            (part for part in reversed(query_path.split("/")) if part in allowed_algorithms), ""
+        )
+        value_parts = str(attribute.get("value", "")).strip().split()
+        if not value_parts:
             continue
-        lines.append(f"{ip} {algorithm} {key_data}")
-    return lines
+        if value_parts[0] in allowed_algorithms:
+            algorithm = value_parts[0]
+            if path_algorithm in allowed_algorithms and path_algorithm != algorithm:
+                continue
+            if len(value_parts) < 2:
+                continue
+            key_data = value_parts[1]
+        else:
+            algorithm = path_algorithm
+            if algorithm not in allowed_algorithms or len(value_parts) != 1:
+                continue
+            key_data = value_parts[0]
+        if not re.fullmatch(r"[A-Za-z0-9+/]+={0,2}", key_data):
+            continue
+        try:
+            key_blob = base64.b64decode(key_data, validate=True)
+        except (binascii.Error, ValueError):
+            continue
+        if len(key_blob) < 4:
+            continue
+        algorithm_length = struct.unpack(">I", key_blob[:4])[0]
+        if algorithm_length > len(key_blob) - 4:
+            continue
+        try:
+            blob_algorithm = key_blob[4:4 + algorithm_length].decode("ascii")
+        except UnicodeDecodeError:
+            continue
+        if blob_algorithm != algorithm:
+            continue
+        lines.add(f"{ip} {algorithm} {key_data}")
+    return sorted(lines)
 
 
 def wait_for_verified_host_keys(
@@ -700,8 +918,12 @@ def provision_and_run(
     key_log = results_dir / "ssh.log"
     ssh_log = results_dir / "remote-session.log"
     lifecycle = {"instance": instance, "firewall": firewall, "created": False, "firewall_created": False,
-                 "collected": False, "cleanup": []}
+                 "benchmark_started": False, "collected": False, "cleanup": []}
     results_dir.mkdir(parents=True, exist_ok=True)
+
+    # VPC firewall rules are additive. A temporary /32 rule cannot restrict a
+    # pre-existing target-all allow rule, so reject a broader SSH path first.
+    audit_ssh_firewall_rules(gcloud, args.project, args.network, tag, args.ssh_source_range)
 
     with tempfile.TemporaryDirectory(prefix="gcp-wal-bench-") as temporary:
         key = Path(temporary) / "bench_ed25519"
@@ -724,7 +946,7 @@ def provision_and_run(
                 f"--max-run-duration={args.max_runtime_minutes}m", "--instance-termination-action=DELETE",
                 "--no-service-account",
                 f"--network={args.network}", f"--tags={tag}", f"--metadata-from-file=ssh-keys={key_metadata}",
-                "--metadata=enable-guest-attributes=TRUE,enable-oslogin=FALSE",
+                "--metadata=block-project-ssh-keys=TRUE,enable-guest-attributes=TRUE,enable-oslogin=FALSE",
                 "--quiet",
             ]
             if args.subnet:
@@ -752,15 +974,11 @@ def provision_and_run(
 
             termination_time = instance_info.get("terminationTimestamp")
             if termination_time:
-                from datetime import datetime
-
                 deadline_epoch = datetime.fromisoformat(termination_time.replace("Z", "+00:00")).timestamp()
             else:
                 creation_time = instance_info.get("creationTimestamp")
                 if not creation_time:
                     raise BenchError("GCP did not report a VM creation time or auto-delete deadline")
-                from datetime import datetime
-
                 creation_epoch = datetime.fromisoformat(creation_time.replace("Z", "+00:00")).timestamp()
                 deadline_epoch = creation_epoch + args.max_runtime_minutes * 60
 
@@ -801,6 +1019,7 @@ def provision_and_run(
                 args.commit.lower(), str(args.num), args.project, args.zone, instance, str(remaining_budget)
             ])
             remaining = max(30, int(deadline - time.monotonic()))
+            lifecycle["benchmark_started"] = True
             try:
                 run = ssh_command(key, known_hosts, ip, remote_command, timeout=remaining)
             except subprocess.TimeoutExpired as error:
@@ -815,6 +1034,7 @@ def provision_and_run(
             lifecycle["error"] = str(error)
             append_local_log(results_dir / "orchestrator.log", f"ERROR: {error}\n")
         finally:
+            preserve_resources = False
             if lifecycle["created"]:
                 try:
                     # Copy results even when a benchmark or SSH command failed.
@@ -823,30 +1043,68 @@ def provision_and_run(
                             ip, key, known_hosts, results_dir
                         )
                         lifecycle["artifact_collection"] = collection
-                        lifecycle["collected"] = all(collection.values())
+                        lifecycle["collected"] = bool(collection.get("results"))
                         if not lifecycle["collected"]:
                             return_code = 1
                             lifecycle["cleanup"].append(
-                                "artifact collection incomplete; marking benchmark run failed"
+                                "result transfer incomplete after retries; marking benchmark run failed"
                             )
+                            if lifecycle["benchmark_started"]:
+                                recovery = preserve_recovery_access(
+                                    results_dir, key, known_hosts,
+                                    ip=ip,
+                                    project=args.project,
+                                    zone=args.zone,
+                                    instance=instance,
+                                    firewall=firewall,
+                                    termination_timestamp=termination_time,
+                                )
+                                preserve_resources = True
+                                lifecycle["recovery_directory"] = str(recovery)
+                                lifecycle["cleanup"].append(
+                                    "VM and restricted SSH rule preserved until the server-side delete deadline "
+                                    "so artifact transfer can be retried"
+                                )
+                        elif not collection.get("bootstrap_log"):
+                            lifecycle["cleanup"].append("bootstrap log could not be collected; benchmark results are local")
                 except BaseException as error:
                     return_code = 1
                     lifecycle["cleanup"].append(f"artifact collection failed: {error}")
-                try:
-                    delete_result = gcloud.run([
-                        "compute", "instances", "delete", instance,
-                        f"--project={args.project}", f"--zone={args.zone}", "--quiet",
-                    ], check=False, timeout=300)
-                    lifecycle["cleanup"].append(
-                        "VM delete completed" if delete_result.returncode == 0
-                        else f"VM delete failed: {delete_result.stderr.strip()}"
-                    )
-                    if delete_result.returncode:
+                    if lifecycle["benchmark_started"] and "ip" in locals():
+                        try:
+                            recovery = preserve_recovery_access(
+                                results_dir, key, known_hosts,
+                                ip=ip,
+                                project=args.project,
+                                zone=args.zone,
+                                instance=instance,
+                                firewall=firewall,
+                                termination_timestamp=termination_time,
+                            )
+                            preserve_resources = True
+                            lifecycle["recovery_directory"] = str(recovery)
+                            lifecycle["cleanup"].append(
+                                "VM and restricted SSH rule preserved after collection error until the "
+                                "server-side delete deadline"
+                            )
+                        except BaseException as recovery_error:
+                            lifecycle["cleanup"].append(f"could not save recovery access: {recovery_error}")
+                if not preserve_resources:
+                    try:
+                        delete_result = gcloud.run([
+                            "compute", "instances", "delete", instance,
+                            f"--project={args.project}", f"--zone={args.zone}", "--quiet",
+                        ], check=False, timeout=300)
+                        lifecycle["cleanup"].append(
+                            "VM delete completed" if delete_result.returncode == 0
+                            else f"VM delete failed: {delete_result.stderr.strip()}"
+                        )
+                        if delete_result.returncode:
+                            return_code = 1
+                    except BaseException as error:
                         return_code = 1
-                except BaseException as error:
-                    return_code = 1
-                    lifecycle["cleanup"].append(f"VM delete failed: {error}")
-            if lifecycle["firewall_created"]:
+                        lifecycle["cleanup"].append(f"VM delete failed: {error}")
+            if lifecycle["firewall_created"] and not preserve_resources:
                 try:
                     firewall_result = gcloud.run([
                         "compute", "firewall-rules", "delete", firewall,
@@ -872,13 +1130,16 @@ def main(argv: list[str] | None = None) -> int:
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         args.results_dir = Path("bench-results") / f"gcp-wal-{stamp}"
     results_dir: Path = args.results_dir.resolve()
-    if results_dir.exists() and any(results_dir.iterdir()):
+    try:
+        # Atomic reservation prevents two local runners from sharing results
+        # and overwriting each other's captures.
+        results_dir.mkdir(parents=True, exist_ok=False)
+    except FileExistsError:
         print(
-            f"Results directory is not empty; refusing to overwrite existing data: {results_dir}",
+            f"Results directory already exists; refusing to reuse it: {results_dir}",
             file=sys.stderr,
         )
         return 2
-    results_dir.mkdir(parents=True, exist_ok=True)
     gcloud = Gcloud(args.project, results_dir / "gcloud-commands.jsonl")
 
     try:

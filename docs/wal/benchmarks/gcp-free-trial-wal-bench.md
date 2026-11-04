@@ -46,8 +46,13 @@ creation can still fail if the zone is depleted or Free Trial access is
 restricted. The runner does not retry by changing zones or billing state.
 
 Provisioning requires an explicit IPv4 CIDR no broader than `/24` for SSH (a
-single public IP as `/32` is preferred). It creates a
-temporary firewall rule targeted only at the uniquely tagged VM; the rule is
+single public IP as `/32` is preferred). Before creating resources, the runner
+audits existing project VPC firewall rules on the selected network and refuses
+to proceed if an applicable SSH allow rule permits a broader source. This
+requires `compute.firewalls.list`; default networks with a target-all
+`0.0.0.0/0` SSH rule must be narrowed or replaced with an isolated VPC first.
+The VM blocks project-wide SSH keys, has no service account, and receives a
+temporary firewall rule targeted only at its unique network tag; the rule is
 removed during teardown. The VM has a server-side maximum runtime (default 180
 minutes; the allowed range is 60–180 minutes) with automatic deletion, a 50 GB
 auto-delete Hyperdisk Balanced boot disk, and one automatically attached Local
@@ -58,13 +63,16 @@ existing filesystem signature. It refuses to guess a device by size or to
 format any other disk.
 
 Local SSD data is ephemeral. Results are copied back to the local results
-directory before VM deletion. `bench-results/` is ignored by Git. If the local
-process is interrupted, its cleanup attempts to collect artifacts and delete
-the VM and firewall rule; the GCP runtime limit independently deletes the VM
-if the local process disappears. A force-kill or host failure can leave the
-temporary firewall rule behind; the lifecycle record contains its name so it
-can be removed with `gcloud compute firewall-rules delete RULE --project
-PROJECT`. The server-side VM deadline still deletes the instance.
+directory before VM deletion. `bench-results/` is ignored by Git. If result
+transfer still fails after two attempts, the runner preserves the VM and
+restricted SSH rule temporarily, saves recovery credentials under the
+results directory with owner-only permissions, and records retry instructions.
+The VM's server-side deadline independently deletes it; after collecting the
+results or after VM auto-deletion, remove the named temporary firewall rule
+from `recovery/README.txt`. On normal completion, failed benchmark runs, or
+when the benchmark never started, cleanup still attempts to delete the VM and
+firewall rule. A force-kill or host failure can leave the temporary firewall
+rule behind; the lifecycle record contains its name for manual cleanup.
 
 ## Requirements and preflight
 
@@ -94,7 +102,7 @@ guest attributes. Applicable IAM permission names include
 `compute.instances.getGuestAttributes`, `compute.instances.delete`,
 `compute.disks.create`, `compute.disks.delete`, `compute.networks.use`,
 `compute.subnetworks.use`, `compute.reservations.list`,
-`compute.firewalls.create`, and `compute.firewalls.delete`. Project policies
+`compute.firewalls.list`, `compute.firewalls.create`, and `compute.firewalls.delete`. Project policies
 can require additional permissions. Use a least-privilege custom role or
 existing roles that grant these operations; the runner itself never grants
 roles or enables APIs.
@@ -133,8 +141,9 @@ This is a local guard based on operator input, not a Google Cloud billing cap;
 it cannot constrain unmodeled charges. It never switches the account to Paid.
 
 The default result directory is `bench-results/gcp-wal-<UTC timestamp>`; pass
-`--results-dir` to choose another local path; it must not contain existing
-files, which the runner refuses to overwrite. `--num` changes writes per run
+`--results-dir` to choose another local path. The path must not already exist;
+the runner reserves it atomically and refuses to share it with another run.
+`--num` changes writes per run
 (it must be at least 64). `--max-runtime-minutes` accepts 60–180 minutes and
 sets the VM auto-delete deadline. The runner exits before creating resources
 when quota or machine support cannot be verified.
@@ -151,12 +160,14 @@ The local result directory includes the preflight quota report, GCP command
 log, VM identity and termination deadline, remote session log, collected
 Local SSD contents, build SHA/toolchain, benchmark plan, each run's command,
 raw JSON and stderr, 100 ms timeline captures when supported by the benchmark,
-`summary.tsv`, `comparison.tsv` (per-writer V4/V7/V8 medians and deltas),
+`summary.tsv`, `comparison.tsv` (per-writer V4/V7/V8 medians and throughput,
+p99, and CPU percentage deltas against V4),
 `summary.json`, and lifecycle/cleanup status. A comparison is descriptive for
 this capture only; it does not assert that the device stayed in one storage
 state. A nonzero benchmark exit still triggers artifact collection and VM
-teardown attempts, and incomplete collection or failed teardown returns a
-nonzero status.
+teardown attempts. If results transfer remains incomplete, the VM is retained
+only until its configured server-side deadline so the operator can retry
+collection; incomplete collection or failed teardown returns a nonzero status.
 
 ## Cloud references
 
