@@ -25,3 +25,4 @@ perf.data*
 moka
 lcov.info
 lcov2.info
+bench-results/

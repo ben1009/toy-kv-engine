@@ -35,6 +35,7 @@ and do not define the current writer selection.
 - [VLog Performance Benchmark Report](benchmarks/bench-report-vlog.md)
 - [Io_uring Benchmark Results](benchmarks/io-uring-bench.md)
 - [Performance Profiling Report](benchmarks/perf-profile.md)
+- [GCP Free Trial WAL benchmark runner](wal/benchmarks/gcp-free-trial-wal-bench.md)
 
 ## Backup
 
