@@ -3,22 +3,26 @@
 `scripts/gcp-free-trial-wal-bench.py` provisions a disposable
 `c4-standard-8-lssd` VM by default, mounts its instance-local Local SSD, builds
 one pinned toy-kv-engine commit, and runs the V4/V7/V8 batch64 matrix with 1, 4,
-and 8 writers. The optional 16-vCPU mode uses `c4-standard-16-lssd`, verifies
-both bundled Local SSDs, and stripes them as RAID0 for the full RFC 026 matrix.
-It collects the raw JSON, stderr, commands, host metadata, and summary before
-deleting the VM.
+and 8 writers by default. Pass `--writers` to select a unique subset of the
+supported counts (1, 2, 4, 8, 16). The optional 16-vCPU mode uses
+`c4-standard-16-lssd`, verifies both bundled Local SSDs, and stripes them as
+RAID0 for the full RFC 026 matrix. It collects the raw JSON, stderr, commands,
+host metadata, and summary before deleting the VM.
 
 The matrix has 36 runs: for each writer count, it runs two reversed six-run
 blocks (`V4, V7, V8, V8, V7, V4` and `V8, V7, V4, V4, V7, V8`). V4 uses
 ordinary V4 WAL; V7 and V8 use PITR WAL. Each run uses 750,000 writes by
-default, 1 KiB values, and 64-entry batches. The two blocks reduce order bias;
-the output is a same-VM capture, not a storage-state-qualified V7/V8 comparison.
+default, 1 KiB values, and 64-entry batches. `--writers` changes the selected
+writer counts; the plan contains 12 runs per writer. The two blocks reduce
+order bias; the output is a same-VM capture, not a storage-state-qualified
+V7/V8 comparison.
 
 For the full RFC 026 matrix, `--full-rfc026-matrix` selects point, batch8,
 batch16, and batch64 workloads; V4 Parallel, V7 Parallel, V8 Parallel, and V8
-Leader arms; and four counterbalanced repetitions. Supplying five writer counts
-(1/2/4/8/16) schedules 320 scored runs on one host. The 16-vCPU shape bundles
-two NVMe Local SSDs; the guest verifies both blank, unmounted devices, assembles
+Leader arms; and four counterbalanced repetitions. Without `--writers`, this
+mode schedules all 320 runs for counts 1/2/4/8/16; explicitly passing
+`--writers` selects a subset. The 16-vCPU shape bundles two NVMe Local SSDs; the
+guest verifies both blank, unmounted devices, assembles
 them into RAID0, and formats only that verified array. The full-matrix mode is
 intended for a 16-vCPU VM and produces a same-host result, not a cross-machine
 or storage-state-qualified performance claim.
@@ -139,7 +143,7 @@ guest attributes. Applicable IAM permission names include
 `compute.subnetworks.get`, `compute.instances.list`,
 `compute.instances.create`, `compute.instances.get`,
 `compute.instances.getGuestAttributes`, `compute.instances.delete`,
-`compute.disks.create`, `compute.disks.delete`, `compute.networks.use`,
+`compute.disks.list`, `compute.disks.create`, `compute.disks.delete`, `compute.networks.use`,
 `compute.subnetworks.use`, `compute.reservations.list`,
 `compute.firewalls.list`, `compute.networks.getEffectiveFirewalls`,
 `compute.networks.getRegionEffectiveFirewalls`, `compute.firewalls.create`, and

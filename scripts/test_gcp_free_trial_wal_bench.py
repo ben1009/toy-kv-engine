@@ -15,6 +15,16 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from gcp_wal_matrix import (
+    FULL_DEFAULT_WRITERS,
+    LEGACY_DEFAULT_WRITERS,
+    build_benchmark_plan,
+    build_batch64_schedule,
+    build_rfc026_schedule,
+    validate_batch64_rows,
+    validate_rfc026_rows,
+)
+
 
 SCRIPT = Path(__file__).with_name("gcp-free-trial-wal-bench.py")
 SPEC = importlib.util.spec_from_file_location("gcp_free_trial_wal_bench", SCRIPT)
@@ -109,6 +119,63 @@ def fake_keygen(command, **_kwargs):
 
 
 class GcpFreeTrialWalBenchTests(unittest.TestCase):
+    def test_writer_defaults_are_suite_specific_and_duplicates_are_rejected(self) -> None:
+        common = ["--project", "project", "--zone", "us-central1-a", "--commit", "a" * 40, "--preflight-only"]
+        legacy = BENCH.parse_args(common)
+        full = BENCH.parse_args([*common, "--full-rfc026-matrix"])
+        self.assertEqual(legacy.writers, LEGACY_DEFAULT_WRITERS)
+        self.assertEqual(full.writers, FULL_DEFAULT_WRITERS)
+        explicit = BENCH.parse_args([*common, "--writers", "2", "16"])
+        self.assertEqual(explicit.writers, (2, 16))
+        with self.assertRaises(SystemExit):
+            BENCH.parse_args([*common, "--writers", "2", "2"])
+
+    def test_benchmark_plan_matches_suite_and_machine_shape(self) -> None:
+        full = build_benchmark_plan(
+            full_matrix=True, writers=FULL_DEFAULT_WRITERS, machine_type="c4-standard-16-lssd",
+            machine_spec={"vcpus": 16, "ssd_count": 2, "ssd_gib": 750},
+        )
+        self.assertEqual(full["score_runs_planned"], 320)
+        self.assertEqual(full["runtime_protocol"], "single 16-vCPU host; RAID0 over 2 Local SSDs")
+        small = build_benchmark_plan(
+            full_matrix=False, writers=(2,), machine_type="c4-standard-8-lssd",
+            machine_spec={"vcpus": 8, "ssd_count": 1, "ssd_gib": 375}, num=128,
+        )
+        self.assertEqual(small["score_runs_planned"], 12)
+        self.assertEqual(small["runtime_protocol"], "single 8-vCPU host; single Local SSD")
+
+    def test_matrix_validators_reject_missing_duplicate_unexpected_failed_and_wrong_ops(self) -> None:
+        full_schedule = build_rfc026_schedule((1,))
+        full_rows = [{
+            "writer": cell["writer"], "workload": cell["workload"], "repetition": cell["repetition"],
+            "arm": cell["arm"], "ops": cell["num"], "exit_code": 0,
+        } for cell in full_schedule]
+        self.assertTrue(validate_rfc026_rows(full_rows, (1,))["complete"])
+        self.assertFalse(validate_rfc026_rows(full_rows[:-1], (1,))["complete"])
+        forked = [*full_rows[:-1], full_rows[0]]
+        result = validate_rfc026_rows(forked, (1,))
+        self.assertFalse(result["complete"])
+        self.assertTrue(result["duplicate_cells"])
+        self.assertTrue(result["missing_cells"])
+        wrong_ops = [*full_rows]
+        wrong_ops[0] = {**wrong_ops[0], "ops": 99}
+        self.assertFalse(validate_rfc026_rows(wrong_ops, (1,))["complete"])
+        unexpected = [*full_rows, {**full_rows[0], "writer": 2}]
+        self.assertFalse(validate_rfc026_rows(unexpected, (1,))["complete"])
+        failed = [*full_rows]
+        failed[0] = {**failed[0], "exit_code": 65}
+        self.assertFalse(validate_rfc026_rows(failed, (1,))["complete"])
+
+        legacy_schedule = build_batch64_schedule((2,))
+        legacy_rows = [{
+            "writer": cell["writer"], "block": cell["block"], "position": cell["position"],
+            "format": cell["arm"], "ops": 128, "exit_code": 0,
+        } for cell in legacy_schedule]
+        self.assertTrue(validate_batch64_rows(legacy_rows, (2,), 128)["complete"])
+        self.assertFalse(validate_batch64_rows(legacy_rows[:-1], (2,), 128)["complete"])
+        legacy_duplicate = [*legacy_rows[:-1], legacy_rows[0]]
+        self.assertFalse(validate_batch64_rows(legacy_duplicate, (2,), 128)["complete"])
+
     def preflight(self, gcloud, machine_type=BENCH.MACHINE_TYPE):
         with patch.object(BENCH.shutil, "which", return_value="/usr/bin/gcloud"):
             return BENCH.preflight(gcloud, "test-project", "us-central1-a", "default", None, machine_type)
@@ -743,7 +810,10 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
                     "process_cpu_user_ms": 10,
                     "process_cpu_system_ms": 5,
                 },
-                "params": {"wal_format_version": 8},
+                "params": {
+                    "num": 64, "threads": 8, "value_size": 1024, "batch_size": 8,
+                    "wal_format_version": 8, "wal_io_mode": "parallel",
+                },
                 "latency": {"p99_ms": 1.2},
             }), encoding="utf-8")
             with (run_dir.parent / "summary.tsv").open("w", encoding="utf-8") as stream:
@@ -752,7 +822,7 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
                     "p99_ms\tcpu_seconds\tsync_count\tduration_seconds\n"
                 )
             result = subprocess.run(
-                ["python3", "-", str(run_dir), "1", "1", "1", "v8", "0", "1.0", "64"],
+                ["python3", "-", str(run_dir), "8", "1", "1", "v8", "0", "1.0", "64"],
                 input=parser,
                 text=True,
                 capture_output=True,
@@ -768,14 +838,30 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
             self.assertEqual(fields[9], "")
             self.assertAlmostEqual(float(fields[10]), 1.0)
 
+            # Batch size is capped by the largest per-writer operation partition.
+            record_path = run_dir / "result.json"
+            record = json.loads(record_path.read_text(encoding="utf-8"))
+            record["params"]["batch_size"] = 64
+            record_path.write_text(json.dumps(record), encoding="utf-8")
+            rejected = subprocess.run(
+                ["python3", "-", str(run_dir), "8", "1", "2", "v8", "0", "1.0", "64"],
+                input=parser,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(rejected.returncode, 65)
+
     def test_remote_summary_completes_with_only_the_benchmark_environment(self) -> None:
         source = Path(__file__).with_name("gcp-free-trial-wal-bench-remote.sh").read_text(encoding="utf-8")
-        start = source.index('python3 - "$BENCH_RESULTS" "$FAILED" "$RUN_INDEX" <<\'PY\'')
+        start = source.index(
+            'python3 - "$BENCH_RESULTS" "$FAILED" "$RUN_INDEX" "$BENCH_WRITERS" "$BENCH_NUM" <<\'PY\''
+        )
         finish = source.index("\nBENCH_USER_SCRIPT\n", start)
         script = "if false; then :; else\n" + source[start:finish]
         orders = (("v4", "v7", "v8", "v8", "v7", "v4"), ("v8", "v7", "v4", "v4", "v7", "v8"))
         rows = []
-        for writers in (1, 4, 8):
+        for writers in LEGACY_DEFAULT_WRITERS:
             repetitions = dict.fromkeys(("v4", "v7", "v8"), 0)
             for block, order in enumerate(orders, 1):
                 for position, fmt in enumerate(order, 1):
@@ -803,6 +889,8 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
                     env={
                         "PATH": os.environ["PATH"], "BENCH_RESULTS": str(results),
                         "FAILED": str(int(failed)), "RUN_INDEX": str(len(selected)),
+                        "BENCH_WRITERS": "1,4,8", "BENCH_NUM": "64",
+                        "PYTHONPATH": str(Path(__file__).parent),
                     },
                     capture_output=True, text=True, check=False,
                 )
@@ -831,48 +919,87 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
     def test_full_rfc026_summary_accepts_all_320_runs(self) -> None:
         source = Path(__file__).with_name("gcp-free-trial-wal-bench-remote.sh").read_text(encoding="utf-8")
         self.assertIn('IFS=\',\' read -r -a WRITER_COUNTS <<<"$BENCH_WRITERS"', source)
-        self.assertIn('for WRITER_COUNT in "${WRITER_COUNTS[@]}"; do', source)
+        self.assertIn('while IFS=$\'\\t\' read -r PLAN_INDEX WRITER_COUNT WORKLOAD REPETITION ARM', source)
+        self.assertIn("build_rfc026_schedule", source)
         self.assertIn('if (( RUN_INDEX != EXPECTED_RUNS )); then', source)
         start = source.index('python3 - "$BENCH_RESULTS" "$FAILED" "$RUN_INDEX" "$BENCH_WRITERS"')
         finish = source.index('\nPY\n    date -u +%Y-%m-%dT%H:%M:%SZ >"$BENCH_RESULTS/finished_utc.txt"', start)
         script = source[start:finish + len("\nPY")]
-        arms = ("v4_parallel", "v7_parallel", "v8_parallel", "v8_leader")
-        workloads = ("point", "batch8", "batch16", "batch64")
+        schedule = build_rfc026_schedule(FULL_DEFAULT_WRITERS)
+        self.assertEqual(len(schedule), 320)
         rows = []
-        for writer in (1, 2, 4, 8, 16):
-            for workload in workloads:
-                for repetition in range(1, 5):
-                    for arm_index, arm in enumerate(arms, 1):
-                        rows.append({
-                            "writer": writer, "workload": workload, "repetition": repetition, "arm": arm,
-                            "exit_code": 0, "ops": 100, "puts_per_second": 100 * arm_index,
-                            "p99_ms": 4 / arm_index, "cpu_seconds": 1 / arm_index,
-                            "sync_count": 10 * arm_index, "duration_seconds": 1,
-                        })
+        for item in schedule:
+            arm_index = ("v4_parallel", "v7_parallel", "v8_parallel", "v8_leader").index(item["arm"]) + 1
+            rows.append({
+                "writer": item["writer"], "workload": item["workload"],
+                "repetition": item["repetition"], "arm": item["arm"],
+                "exit_code": 0, "ops": item["num"], "puts_per_second": 100 * arm_index,
+                "p99_ms": 4 / arm_index, "cpu_seconds": 1 / arm_index,
+                "sync_count": 10 * arm_index, "duration_seconds": 1,
+            })
 
+        scenarios = (
+            ("complete", rows, 320, True),
+            ("missing", rows[:-1], 319, False),
+            ("duplicate", [*rows[:-1], rows[0]], 320, False),
+        )
+        for name, selected, run_index, expected_complete in scenarios:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temp:
+                results = Path(temp)
+                with (results / "summary.tsv").open("w", encoding="utf-8", newline="") as stream:
+                    writer = csv.DictWriter(stream, fieldnames=rows[0], delimiter="\t")
+                    writer.writeheader()
+                    writer.writerows(selected)
+                result = subprocess.run(
+                    ["bash", "-euc", script],
+                    env={
+                        "PATH": os.environ["PATH"], "PYTHONPATH": str(Path(__file__).parent),
+                        "BENCH_RESULTS": str(results), "FAILED": "0",
+                        "RUN_INDEX": str(run_index), "BENCH_WRITERS": "1,2,4,8,16",
+                    },
+                    capture_output=True, text=True, check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                summary = json.loads((results / "summary.json").read_text(encoding="utf-8"))
+                self.assertEqual(summary["complete"], expected_complete)
+                self.assertEqual(summary["runs_planned"], 320)
+                self.assertEqual(summary["runs_completed"], len(selected))
+                self.assertEqual(summary["writers"], [1, 2, 4, 8, 16])
+                if expected_complete:
+                    cell = summary["comparison_by_cell"]["w16-batch64"]
+                    self.assertEqual(cell["v4_parallel"]["puts_per_second"], 100)
+                    self.assertEqual(cell["v8_parallel"]["puts_per_second"], 300)
+                else:
+                    self.assertFalse(summary["matrix_validation"]["complete"])
+                    if name == "duplicate":
+                        self.assertTrue(summary["matrix_validation"]["duplicate_cells"])
+                        self.assertTrue(summary["matrix_validation"]["missing_cells"])
+
+    def test_remote_rfc026_scheduler_emits_exact_tabular_plan(self) -> None:
+        source = Path(__file__).with_name("gcp-free-trial-wal-bench-remote.sh").read_text(encoding="utf-8")
+        marker = 'python3 - "$RUN_PLAN" "$BENCH_WRITERS" <<\'PY\'\n'
+        start = source.index(marker) + len(marker)
+        finish = source.index("\nPY\n", start)
+        generator = source[start:finish]
         with tempfile.TemporaryDirectory() as temp:
-            results = Path(temp)
-            with (results / "summary.tsv").open("w", encoding="utf-8", newline="") as stream:
-                writer = csv.DictWriter(stream, fieldnames=rows[0], delimiter="\t")
-                writer.writeheader()
-                writer.writerows(rows)
+            plan_path = Path(temp) / "schedule.tsv"
             result = subprocess.run(
-                ["bash", "-euc", script],
-                env={
-                    "PATH": os.environ["PATH"], "BENCH_RESULTS": str(results), "FAILED": "0",
-                    "RUN_INDEX": "320", "BENCH_WRITERS": "1,2,4,8,16",
-                },
-                capture_output=True, text=True, check=False,
+                ["python3", "-", str(plan_path), ",".join(map(str, FULL_DEFAULT_WRITERS))],
+                input=generator,
+                text=True,
+                capture_output=True,
+                check=False,
+                env={"PATH": os.environ["PATH"], "PYTHONPATH": str(Path(__file__).parent)},
             )
             self.assertEqual(result.returncode, 0, result.stderr)
-            summary = json.loads((results / "summary.json").read_text(encoding="utf-8"))
-            self.assertTrue(summary["complete"])
-            self.assertEqual(summary["runs_planned"], 320)
-            self.assertEqual(summary["runs_completed"], 320)
-            self.assertEqual(summary["writers"], [1, 2, 4, 8, 16])
-            cell = summary["comparison_by_cell"]["w16-batch64"]
-            self.assertEqual(cell["v4_parallel"]["puts_per_second"], 100)
-            self.assertEqual(cell["v8_parallel"]["puts_per_second"], 300)
+            with plan_path.open(encoding="utf-8", newline="") as stream:
+                rows = list(csv.DictReader(stream, delimiter="\t"))
+            self.assertEqual(len(rows), 320)
+            self.assertEqual(rows[0]["workload"], "point")
+            self.assertEqual(rows[0]["batch_size"], "none")
+            self.assertEqual(rows[-1]["writer"], "16")
+            self.assertEqual(rows[-1]["workload"], "batch64")
+            self.assertEqual(rows[-1]["batch_size"], "64")
 
 
 if __name__ == "__main__":

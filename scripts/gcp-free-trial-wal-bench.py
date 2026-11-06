@@ -30,6 +30,13 @@ import time
 from typing import Any
 import uuid
 
+from gcp_wal_matrix import (
+    FULL_DEFAULT_WRITERS,
+    LEGACY_DEFAULT_WRITERS,
+    build_benchmark_plan,
+    validate_writer_counts,
+)
+
 
 MACHINE_TYPE = "c4-standard-8-lssd"
 MACHINE_SPECS = {
@@ -915,8 +922,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--commit", required=True, help="Full 40-character toy-kv-engine commit SHA to benchmark")
     parser.add_argument("--machine-type", choices=tuple(MACHINE_SPECS), default=MACHINE_TYPE,
                         help="C4 Local SSD shape (default: c4-standard-8-lssd)")
-    parser.add_argument("--writers", type=int, nargs="+", choices=(1, 2, 4, 8, 16), default=(1, 4, 8),
-                        help="Writer counts to run (default: 1 4 8)")
+    parser.add_argument("--writers", type=int, nargs="+", choices=(1, 2, 4, 8, 16),
+                        help="Writer counts to run (defaults: 1 4 8 for batch64; 1 2 4 8 16 for full matrix)")
     parser.add_argument("--full-rfc026-matrix", action="store_true",
                         help="Run point/batch8/batch16/batch64 across V4/V7/V8 parallel and V8 Leader")
     parser.add_argument("--network", default="default", help="Existing VPC network (default: default)")
@@ -934,6 +941,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--confirm-free-trial", action="store_true",
                         help="Attest that Billing Overview says Free Trial and you will not upgrade to Paid")
     args = parser.parse_args(argv)
+    if args.writers is None:
+        args.writers = FULL_DEFAULT_WRITERS if args.full_rfc026_matrix else LEGACY_DEFAULT_WRITERS
+    try:
+        args.writers = validate_writer_counts(args.writers)
+    except ValueError as error:
+        parser.error(str(error))
     if not re.fullmatch(r"[0-9a-fA-F]{40}", args.commit):
         parser.error("--commit must be a full 40-character SHA")
     if args.num < 64:
@@ -1371,9 +1384,9 @@ def provision_and_run(
             if scp_result.returncode:
                 raise BenchError(f"Could not copy remote runner: {scp_result.stderr.strip()}")
 
-            remaining_budget = int(deadline_epoch - time.time() - 600)
+            safe_deadline_epoch = int(deadline_epoch - 600)
             remote_command = "sudo -n bash /tmp/run-wal-bench.sh " + shlex.join([
-                args.commit.lower(), str(args.num), args.project, args.zone, instance, str(remaining_budget),
+                args.commit.lower(), str(args.num), args.project, args.zone, instance, str(safe_deadline_epoch),
                 args.machine_type, ",".join(str(writer) for writer in args.writers),
                 "rfc026-full" if args.full_rfc026_matrix else "batch64",
             ])
@@ -1476,12 +1489,14 @@ def main(argv: list[str] | None = None) -> int:
         report["benchmark_commit"] = args.commit.lower()
         report["writer_counts"] = list(args.writers)
         report["benchmark_suite"] = "rfc026-full" if args.full_rfc026_matrix else "batch64"
-        report["format_order_per_writer"] = [
-            ["v4", "v7", "v8", "v8", "v7", "v4"],
-            ["v8", "v7", "v4", "v4", "v7", "v8"],
-        ]
-        report["writes_per_run"] = args.num
-        report["batch_entries"] = 64
+        report["benchmark_plan"] = build_benchmark_plan(
+            full_matrix=args.full_rfc026_matrix,
+            writers=args.writers,
+            machine_type=args.machine_type,
+            machine_spec=MACHINE_SPECS[args.machine_type],
+            num=args.num,
+            commit=args.commit.lower(),
+        )
         report["machine_type"] = args.machine_type
         report["free_trial_attestation"] = bool(args.confirm_free_trial)
         if args.estimated_hourly_cost_usd is not None:

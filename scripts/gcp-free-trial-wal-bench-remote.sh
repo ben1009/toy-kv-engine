@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 if [[ $# -ne 9 ]]; then
-    echo "usage: $0 <commit> <num> <project> <zone> <instance> <runtime-budget-seconds> <machine-type> <writers-csv> <suite>" >&2
+    echo "usage: $0 <commit> <num> <project> <zone> <instance> <safe-deadline-epoch> <machine-type> <writers-csv> <suite>" >&2
     exit 64
 fi
 
@@ -11,7 +11,7 @@ NUM="$2"
 PROJECT="$3"
 ZONE="$4"
 INSTANCE="$5"
-RUNTIME_BUDGET_SECONDS="$6"
+SAFE_DEADLINE_EPOCH="$6"
 MACHINE_TYPE="$7"
 WRITERS_CSV="$8"
 SUITE="$9"
@@ -26,11 +26,17 @@ if (( ${#WRITERS[@]} == 0 )); then
     echo "at least one writer count is required" >&2
     exit 64
 fi
+declare -A SEEN_WRITERS=()
 for writer in "${WRITERS[@]}"; do
     if [[ ! "$writer" =~ ^(1|2|4|8|16)$ ]]; then
         echo "unsupported writer count: $writer" >&2
         exit 64
     fi
+    if [[ -n "${SEEN_WRITERS[$writer]:-}" ]]; then
+        echo "duplicate writer count: $writer" >&2
+        exit 64
+    fi
+    SEEN_WRITERS[$writer]=1
 done
 if [[ "$SUITE" != "batch64" && "$SUITE" != "rfc026-full" ]]; then
     echo "unsupported benchmark suite: $SUITE" >&2
@@ -45,13 +51,12 @@ if [[ ! "$NUM" =~ ^[0-9]+$ ]] || (( NUM < 64 )); then
     echo "num must be >=64" >&2
     exit 64
 fi
-if [[ ! "$RUNTIME_BUDGET_SECONDS" =~ ^[0-9]+$ ]] || (( RUNTIME_BUDGET_SECONDS < 1800 )); then
-    echo "remaining VM runtime budget is too short" >&2
+if [[ ! "$SAFE_DEADLINE_EPOCH" =~ ^[0-9]+$ ]] || (( SAFE_DEADLINE_EPOCH < 1 )); then
+    echo "safe VM deadline must be a positive Unix epoch" >&2
     exit 64
 fi
 
 BOOT_LOG=/var/log/gcp-free-trial-wal-bench.log
-REMOTE_STARTED_EPOCH="$(date +%s)"
 exec > >(tee -a "$BOOT_LOG") 2>&1
 echo "[$(date --iso-8601=seconds)] starting GCP WAL benchmark setup"
 
@@ -154,11 +159,10 @@ runuser -u bench -- env \
     BENCH_REPO_URL="https://github.com/ben1009/toy-kv-engine.git" \
     BENCH_RESULTS="$RESULTS" \
     BENCH_WORK="$WORK" \
-    BENCH_RUNTIME_BUDGET_SECONDS="$RUNTIME_BUDGET_SECONDS" \
+    BENCH_SAFE_DEADLINE_EPOCH="$SAFE_DEADLINE_EPOCH" \
     BENCH_MACHINE_TYPE="$MACHINE_TYPE" \
     BENCH_WRITERS="$WRITERS_CSV" \
     BENCH_SUITE="$SUITE" \
-    BENCH_SCRIPT_STARTED_EPOCH="$REMOTE_STARTED_EPOCH" \
     BENCH_BOOT_LOG="$BOOT_LOG" \
     bash -s <<'BENCH_USER_SCRIPT'
 set -Eeuo pipefail
@@ -194,6 +198,7 @@ fi
 rustup toolchain install "$TOOLCHAIN" --profile minimal
 
 cd "$REPO"
+export PYTHONPATH="$REPO/scripts${PYTHONPATH:+:$PYTHONPATH}"
 cargo "+$TOOLCHAIN" build --locked --release --package kv-engine --features bench --bin write-perf
 BINARY="$REPO/target/release/write-perf"
 BINARY_SHA256="$(sha256sum "$BINARY" | cut -d' ' -f1)"
@@ -203,41 +208,23 @@ printf '%s\n' "$BINARY_SHA256" >"$BENCH_RESULTS/write-perf.sha256"
 cp "$REPO/rust-toolchain" "$BENCH_RESULTS/rust-toolchain.toml"
 
 if [[ "$BENCH_SUITE" == "rfc026-full" ]]; then
-    python3 - "$BENCH_RESULTS/benchmark-plan.json" "$ACTUAL_COMMIT" "$BINARY_SHA256" "$BENCH_WRITERS" "$BENCH_MACHINE_TYPE" <<'PY'
+    python3 - "$BENCH_RESULTS/benchmark-plan.json" "$ACTUAL_COMMIT" "$BINARY_SHA256" \
+        "$BENCH_WRITERS" "$BENCH_MACHINE_TYPE" "$SSD_COUNT" "$SSD_TOTAL_GIB" <<'PY'
 import json
 from pathlib import Path
 import sys
+from gcp_wal_matrix import build_benchmark_plan
 
-path, commit, binary_hash, writers_csv, machine_type = sys.argv[1:]
+path, commit, binary_hash, writers_csv, machine_type, ssd_count, ssd_gib = sys.argv[1:]
 writers = [int(value) for value in writers_csv.split(",")]
-workloads = [
-    {"name": "point", "bench": "wal_concurrent", "batch_entries": 1, "num": 100000},
-    {"name": "batch8", "bench": "wal_batch_concurrent", "batch_entries": 8, "num": 300000},
-    {"name": "batch16", "bench": "wal_batch_concurrent", "batch_entries": 16, "num": 500000},
-    {"name": "batch64", "bench": "wal_batch_concurrent", "batch_entries": 64, "num": 750000},
-]
-orders = [
-    ["v4_parallel", "v7_parallel", "v8_parallel", "v8_leader"],
-    ["v7_parallel", "v8_parallel", "v8_leader", "v4_parallel"],
-    ["v8_parallel", "v8_leader", "v4_parallel", "v7_parallel"],
-    ["v8_leader", "v4_parallel", "v7_parallel", "v8_parallel"],
-]
-plan = {
-    "commit": commit,
-    "binary_sha256": binary_hash,
-    "machine_type": machine_type,
-    "writers": writers,
-    "formats": ["v4_parallel", "v7_parallel", "v8_parallel", "v8_leader"],
-    "workloads": workloads,
-    "repetitions_per_cell": len(orders),
-    "format_orders": orders,
-    "score_runs_planned": len(writers) * len(workloads) * len(orders) * len(orders[0]),
-    "value_bytes": 1024,
-    "compaction": "none",
-    "counterbalanced": True,
-    "runtime_protocol": "single 16-vCPU host; all arms share a RAID0 over two bundled Local SSDs",
-    "qualification_note": "same-host matrix; not a cross-machine or storage-state qualification",
-}
+plan = build_benchmark_plan(
+    full_matrix=True,
+    writers=writers,
+    machine_type=machine_type,
+    machine_spec={"vcpus": int(machine_type.split("-")[2]), "ssd_count": int(ssd_count), "ssd_gib": int(ssd_gib)},
+    commit=commit,
+    binary_sha256=binary_hash,
+)
 Path(path).write_text(json.dumps(plan, indent=2) + "\n", encoding="utf-8")
 PY
 
@@ -248,78 +235,75 @@ mkdir -p "$DB_ROOT"
 RUN_TIMEOUT_SECONDS=900
 FAILED=0
 RUN_INDEX=0
-START_EPOCH="$BENCH_SCRIPT_STARTED_EPOCH"
+RUN_PLAN="$BENCH_RESULTS/rfc026-schedule.tsv"
+python3 - "$RUN_PLAN" "$BENCH_WRITERS" <<'PY'
+import csv
+import sys
+from gcp_wal_matrix import build_rfc026_schedule
 
-for WRITER_COUNT in "${WRITER_COUNTS[@]}"; do
-    for WORKLOAD in point batch8 batch16 batch64; do
-        case "$WORKLOAD" in
-            point) BENCH_NAME=wal_concurrent; BATCH_ENTRIES=1; RUN_NUM=100000; SAMPLE_EVERY=100 ;;
-            batch8) BENCH_NAME=wal_batch_concurrent; BATCH_ENTRIES=8; RUN_NUM=300000; SAMPLE_EVERY=10 ;;
-            batch16) BENCH_NAME=wal_batch_concurrent; BATCH_ENTRIES=16; RUN_NUM=500000; SAMPLE_EVERY=10 ;;
-            batch64) BENCH_NAME=wal_batch_concurrent; BATCH_ENTRIES=64; RUN_NUM=750000; SAMPLE_EVERY=10 ;;
-        esac
-        for REPETITION in 1 2 3 4; do
-            case "$REPETITION" in
-                1) ORDER=(v4_parallel v7_parallel v8_parallel v8_leader) ;;
-                2) ORDER=(v7_parallel v8_parallel v8_leader v4_parallel) ;;
-                3) ORDER=(v8_parallel v8_leader v4_parallel v7_parallel) ;;
-                4) ORDER=(v8_leader v4_parallel v7_parallel v8_parallel) ;;
-            esac
-            for ARM in "${ORDER[@]}"; do
-                NOW="$(date +%s)"
-                ELAPSED=$((NOW - START_EPOCH))
-                if (( ELAPSED + RUN_TIMEOUT_SECONDS + 30 + 300 >= BENCH_RUNTIME_BUDGET_SECONDS )); then
-                    echo "stopping before VM auto-delete deadline; partial RFC 026 matrix retained" >&2
-                    FAILED=1
-                    break 4
-                fi
-                RUN_INDEX=$((RUN_INDEX + 1))
-                NAME="w${WRITER_COUNT}-${WORKLOAD}-r${REPETITION}-${ARM}"
-                RUN_DIR="$BENCH_RESULTS/$NAME"
-                mkdir -p "$RUN_DIR"
-                WAL_MODE=parallel
-                case "$ARM" in
-                    v4_parallel) EXPECTED_VERSION=4 ;;
-                    v7_parallel) EXPECTED_VERSION=7 ;;
-                    v8_parallel) EXPECTED_VERSION=8 ;;
-                    v8_leader) EXPECTED_VERSION=8; WAL_MODE=leader ;;
-                    *) echo "unexpected arm: $ARM" >&2; FAILED=1; break 4 ;;
-                esac
-                COMMAND=("$BINARY" --bench "$BENCH_NAME" --wal --wal-io-mode "$WAL_MODE"
-                    --num "$RUN_NUM" --threads "$WRITER_COUNT" --value-size 1024 --target-sst-size 2147483648
-                    --compaction none --output json --latency-sample-every "$SAMPLE_EVERY" --path "$DB_ROOT/$NAME")
-                if [[ "$WORKLOAD" != point ]]; then
-                    COMMAND+=(--wal-batch-size "$BATCH_ENTRIES")
-                fi
-                if [[ "$ARM" == v7_parallel ]]; then
-                    COMMAND+=(--pitr --pitr-format v7)
-                elif [[ "$ARM" == v8_parallel || "$ARM" == v8_leader ]]; then
-                    COMMAND+=(--pitr --pitr-format v8)
-                fi
-                RUN_ENV=("TOYKV_WAL_TIMELINE=$RUN_DIR/timeline.json" "TOYKV_WAL_TIMELINE_INTERVAL_MS=100")
-                printf '%q ' "${COMMAND[@]}" >"$RUN_DIR/command.sh"
-                printf '\n' >>"$RUN_DIR/command.sh"
-                date -u +%Y-%m-%dT%H:%M:%SZ >"$RUN_DIR/start_utc.txt"
-                RUN_START="$(date +%s.%N)"
-                if (( RUN_INDEX == 1 )); then
-                    echo "WAL_BENCHMARK_STARTED $(date --iso-8601=seconds)" | tee -a "$BENCH_BOOT_LOG"
-                fi
-                set +e
-                timeout --signal=INT --kill-after=30s "$RUN_TIMEOUT_SECONDS" env "${RUN_ENV[@]}" "${COMMAND[@]}" \
-                    >"$RUN_DIR/result.json" 2>"$RUN_DIR/stderr.log"
-                EXIT_CODE=$?
-                set -e
-                RUN_END="$(date +%s.%N)"
-                date -u +%Y-%m-%dT%H:%M:%SZ >"$RUN_DIR/end_utc.txt"
-                DURATION="$(python3 - "$RUN_START" "$RUN_END" <<'PY'
+path, writers_csv = sys.argv[1:]
+schedule = build_rfc026_schedule(int(value) for value in writers_csv.split(","))
+with open(path, "w", encoding="utf-8", newline="") as stream:
+    writer = csv.DictWriter(stream, fieldnames=schedule[0].keys(), delimiter="\t")
+    writer.writeheader()
+    writer.writerows({**item, "batch_size": item["batch_size"] or "none"} for item in schedule)
+PY
+
+while IFS=$'\t' read -r PLAN_INDEX WRITER_COUNT WORKLOAD REPETITION ARM BENCH_NAME BATCH_ENTRIES EXPECTED_BATCH_SIZE RUN_NUM SAMPLE_EVERY; do
+    [[ "$PLAN_INDEX" == "run_index" ]] && continue
+    NOW="$(date +%s)"
+    if (( NOW + RUN_TIMEOUT_SECONDS + 30 + 300 >= BENCH_SAFE_DEADLINE_EPOCH )); then
+        echo "stopping before safe VM deadline; partial RFC 026 matrix retained" >&2
+        FAILED=1
+        break
+    fi
+    RUN_INDEX=$PLAN_INDEX
+    NAME="w${WRITER_COUNT}-${WORKLOAD}-r${REPETITION}-${ARM}"
+    RUN_DIR="$BENCH_RESULTS/$NAME"
+    mkdir -p "$RUN_DIR"
+    WAL_MODE=parallel
+    case "$ARM" in
+        v4_parallel) EXPECTED_VERSION=4 ;;
+        v7_parallel) EXPECTED_VERSION=7 ;;
+        v8_parallel) EXPECTED_VERSION=8 ;;
+        v8_leader) EXPECTED_VERSION=8; WAL_MODE=leader ;;
+        *) echo "unexpected arm: $ARM" >&2; FAILED=1; break ;;
+    esac
+    COMMAND=("$BINARY" --bench "$BENCH_NAME" --wal --wal-io-mode "$WAL_MODE"
+        --num "$RUN_NUM" --threads "$WRITER_COUNT" --value-size 1024 --target-sst-size 2147483648
+        --compaction none --output json --latency-sample-every "$SAMPLE_EVERY" --path "$DB_ROOT/$NAME")
+    if [[ "$WORKLOAD" != point ]]; then
+        COMMAND+=(--wal-batch-size "$BATCH_ENTRIES")
+    fi
+    if [[ "$ARM" == v7_parallel ]]; then
+        COMMAND+=(--pitr --pitr-format v7)
+    elif [[ "$ARM" == v8_parallel || "$ARM" == v8_leader ]]; then
+        COMMAND+=(--pitr --pitr-format v8)
+    fi
+    RUN_ENV=("TOYKV_WAL_TIMELINE=$RUN_DIR/timeline.json" "TOYKV_WAL_TIMELINE_INTERVAL_MS=100")
+    printf '%q ' "${COMMAND[@]}" >"$RUN_DIR/command.sh"
+    printf '\n' >>"$RUN_DIR/command.sh"
+    date -u +%Y-%m-%dT%H:%M:%SZ >"$RUN_DIR/start_utc.txt"
+    RUN_START="$(date +%s.%N)"
+    if (( RUN_INDEX == 1 )); then
+        echo "WAL_BENCHMARK_STARTED $(date --iso-8601=seconds)" | tee -a "$BENCH_BOOT_LOG"
+    fi
+    set +e
+    timeout --signal=INT --kill-after=30s "$RUN_TIMEOUT_SECONDS" env "${RUN_ENV[@]}" "${COMMAND[@]}" \
+        >"$RUN_DIR/result.json" 2>"$RUN_DIR/stderr.log"
+    EXIT_CODE=$?
+    set -e
+    RUN_END="$(date +%s.%N)"
+    date -u +%Y-%m-%dT%H:%M:%SZ >"$RUN_DIR/end_utc.txt"
+    DURATION="$(python3 - "$RUN_START" "$RUN_END" <<'PY'
 from decimal import Decimal
 import sys
 print(Decimal(sys.argv[2]) - Decimal(sys.argv[1]))
 PY
 )"
-                set +e
-                python3 - "$RUN_DIR" "$WRITER_COUNT" "$WORKLOAD" "$REPETITION" "$ARM" "$EXIT_CODE" \
-                    "$DURATION" "$RUN_NUM" "$EXPECTED_VERSION" <<'PY'
+    set +e
+    python3 - "$RUN_DIR" "$WRITER_COUNT" "$WORKLOAD" "$REPETITION" "$ARM" "$EXIT_CODE" \
+        "$DURATION" "$RUN_NUM" "$EXPECTED_VERSION" "$WAL_MODE" "$EXPECTED_BATCH_SIZE" <<'PY'
 import csv
 import json
 import math
@@ -331,6 +315,8 @@ writers = int(sys.argv[2])
 workload, repetition, arm = sys.argv[3], int(sys.argv[4]), sys.argv[5]
 exit_code, duration = int(sys.argv[6]), float(sys.argv[7])
 requested_ops, expected_version = int(sys.argv[8]), int(sys.argv[9])
+expected_mode, expected_batch_size = sys.argv[10], sys.argv[11]
+expected_batch_size = int(expected_batch_size) if expected_batch_size != "none" else None
 record = None
 if exit_code == 0:
     try:
@@ -360,11 +346,24 @@ if record is not None:
         exit_code = 65
         (run_dir / "validation-error.txt").write_text(f"required metric missing/invalid: {error}\n", encoding="utf-8")
         metrics = {"ops": "", "puts_per_second": "", "p99_ms": "", "cpu_seconds": "", "sync_count": ""}
-    if result.get("ops") != requested_ops or params.get("wal_format_version") != expected_version:
+    expected_params = {
+        "num": requested_ops,
+        "threads": writers,
+        "value_size": 1024,
+        "batch_size": expected_batch_size,
+        "wal_format_version": expected_version,
+        "wal_io_mode": expected_mode,
+    }
+    actual_params = {key: params.get(key) for key in expected_params}
+    if workload == "batch64":
+        expected_batch_size = min(64, max(1, (requested_ops + writers - 1) // writers))
+        expected_params["batch_size"] = expected_batch_size
+        actual_params["batch_size"] = params.get("batch_size")
+    if result.get("ops") != requested_ops or actual_params != expected_params:
         exit_code = 65
         (run_dir / "validation-error.txt").write_text(
-            f"expected ops={requested_ops}, format=v{expected_version}; got ops={result.get('ops')}, "
-            f"format={params.get('wal_format_version')}\n", encoding="utf-8")
+            f"expected ops={requested_ops}, params={expected_params}; got ops={result.get('ops')}, "
+            f"params={actual_params}\n", encoding="utf-8")
 
 row = {"writer": writers, "workload": workload, "repetition": repetition, "arm": arm,
        "exit_code": exit_code, **metrics, "duration_seconds": duration}
@@ -374,15 +373,12 @@ with (run_dir.parent / "summary.tsv").open("a", encoding="utf-8", newline="") as
 if exit_code:
     raise SystemExit(exit_code)
 PY
-                VALIDATION_STATUS=$?
-                set -e
-                if (( VALIDATION_STATUS != 0 )); then EXIT_CODE=$VALIDATION_STATUS; fi
-                echo "run=$NAME exit=$EXIT_CODE duration=${DURATION}s"
-                if (( EXIT_CODE != 0 )); then FAILED=1; break 4; fi
-            done
-        done
-    done
-done
+    VALIDATION_STATUS=$?
+    set -e
+    if (( VALIDATION_STATUS != 0 )); then EXIT_CODE=$VALIDATION_STATUS; fi
+    echo "run=$NAME exit=$EXIT_CODE duration=${DURATION}s"
+    if (( EXIT_CODE != 0 )); then FAILED=1; break; fi
+done <"$RUN_PLAN"
 
 EXPECTED_RUNS=$((${#WRITER_COUNTS[@]} * 4 * 4 * 4))
 if (( RUN_INDEX != EXPECTED_RUNS )); then
@@ -396,13 +392,15 @@ import json
 from pathlib import Path
 from statistics import median
 import sys
+from gcp_wal_matrix import RFC026_ARMS, RFC026_WORKLOADS, build_rfc026_schedule, validate_rfc026_rows
 
 root, failed, runs = Path(sys.argv[1]), bool(int(sys.argv[2])), int(sys.argv[3])
 writers = [int(value) for value in sys.argv[4].split(",")]
 rows = list(csv.DictReader((root / "summary.tsv").open(encoding="utf-8"), delimiter="\t"))
-workloads = ("point", "batch8", "batch16", "batch64")
-arms = ("v4_parallel", "v7_parallel", "v8_parallel", "v8_leader")
-planned = len(writers) * len(workloads) * len(arms) * 4
+workloads = tuple(workload["name"] for workload in RFC026_WORKLOADS)
+arms = RFC026_ARMS
+validation = validate_rfc026_rows(rows, writers)
+planned = len(build_rfc026_schedule(writers))
 comparison = []
 by_cell = {}
 for writer in writers:
@@ -443,9 +441,10 @@ with (root / "comparison.tsv").open("w", encoding="utf-8", newline="") as stream
     writer.writerows(comparison)
 
 summary = {
-    "complete": not failed and len(rows) == planned and all(row["exit_code"] == "0" for row in rows),
+    "complete": not failed and runs == planned and validation["complete"],
     "runs_completed": len(rows), "runs_planned": planned, "writers": writers,
     "workloads": list(workloads), "arms": list(arms), "results": rows,
+    "matrix_validation": validation,
     "comparison_by_cell": by_cell,
     "qualification_note": "Same-VM comparison only; no cross-machine or storage-state qualification is implied.",
 }
@@ -456,26 +455,23 @@ PY
     echo "RFC 026 full matrix finished; runs_started=$RUN_INDEX failed=$FAILED"
     if (( FAILED )); then exit 1; fi
 else
-python3 - "$BENCH_RESULTS/benchmark-plan.json" "$BENCH_NUM" "$ACTUAL_COMMIT" "$BINARY_SHA256" <<'PY'
+python3 - "$BENCH_RESULTS/benchmark-plan.json" "$BENCH_NUM" "$ACTUAL_COMMIT" "$BINARY_SHA256" \
+    "$BENCH_WRITERS" "$BENCH_MACHINE_TYPE" "$SSD_COUNT" "$SSD_TOTAL_GIB" <<'PY'
 import json
 from pathlib import Path
 import sys
+from gcp_wal_matrix import build_benchmark_plan
 
-path, number, commit, binary_hash = sys.argv[1:]
-formats = ["v4", "v7", "v8"]
-orders = [["v4", "v7", "v8", "v8", "v7", "v4"], ["v8", "v7", "v4", "v4", "v7", "v8"]]
-plan = {
-    "commit": commit,
-    "binary_sha256": binary_hash,
-    "formats": formats,
-    "writers": [1, 4, 8],
-    "writes_per_run": int(number),
-    "batch_entries": 64,
-    "value_bytes": 1024,
-    "order_blocks": orders,
-    "runs_planned": len(formats) * len([1, 4, 8]) * 4,
-    "runtime_protocol": "one build; balanced V4/V7/V8 order; no storage-state probing",
-}
+path, number, commit, binary_hash, writers_csv, machine_type, ssd_count, ssd_gib = sys.argv[1:]
+plan = build_benchmark_plan(
+    full_matrix=False,
+    writers=(int(value) for value in writers_csv.split(",")),
+    machine_type=machine_type,
+    machine_spec={"vcpus": int(machine_type.split("-")[2]), "ssd_count": int(ssd_count), "ssd_gib": int(ssd_gib)},
+    num=int(number),
+    commit=commit,
+    binary_sha256=binary_hash,
+)
 Path(path).write_text(json.dumps(plan, indent=2) + "\n", encoding="utf-8")
 PY
 
@@ -485,14 +481,10 @@ printf 'writer\tblock\tposition\tformat\texit_code\tops\tputs_per_second\tp99_ms
 DB_ROOT="$BENCH_WORK/databases"
 mkdir -p "$DB_ROOT"
 RUN_TIMEOUT_SECONDS=900
-if (( BENCH_RUNTIME_BUDGET_SECONDS < RUN_TIMEOUT_SECONDS )); then
-    RUN_TIMEOUT_SECONDS=$((BENCH_RUNTIME_BUDGET_SECONDS / 4))
-fi
 FAILED=0
 RUN_INDEX=0
-START_EPOCH="$BENCH_SCRIPT_STARTED_EPOCH"
 
-for WRITERS in 1 4 8; do
+for WRITERS in "${WRITER_COUNTS[@]}"; do
     for BLOCK in 1 2; do
         if (( BLOCK == 1 )); then
             ORDER=(v4 v7 v8 v8 v7 v4)
@@ -501,9 +493,8 @@ for WRITERS in 1 4 8; do
         fi
         for POSITION in 1 2 3 4 5 6; do
             NOW="$(date +%s)"
-            ELAPSED=$((NOW - START_EPOCH))
-            if (( ELAPSED + RUN_TIMEOUT_SECONDS + 30 + 300 >= BENCH_RUNTIME_BUDGET_SECONDS )); then
-                echo "stopping before VM auto-delete deadline; partial matrix retained" >&2
+            if (( NOW + RUN_TIMEOUT_SECONDS + 30 + 300 >= BENCH_SAFE_DEADLINE_EPOCH )); then
+                echo "stopping before safe VM deadline; partial matrix retained" >&2
                 FAILED=1
                 break 3
             fi
@@ -585,11 +576,21 @@ if record is not None:
             f"required benchmark metric is missing or invalid: {error}\n", encoding="utf-8")
         metrics = {"ops": "", "puts_per_second": "", "p99_ms": "", "cpu_seconds": "", "sync_count": ""}
     expected = int(fmt[1:]) if fmt != "v4" else 4
-    if result.get("ops") != requested_ops or params.get("wal_format_version") != expected:
+    effective_batch_size = min(64, max(1, (requested_ops + writers - 1) // writers))
+    expected_params = {
+        "num": requested_ops,
+        "threads": writers,
+        "value_size": 1024,
+        "batch_size": effective_batch_size,
+        "wal_format_version": expected,
+        "wal_io_mode": "parallel",
+    }
+    actual_params = {key: params.get(key) for key in expected_params}
+    if result.get("ops") != requested_ops or actual_params != expected_params:
         exit_code = 65
         (run_dir / "validation-error.txt").write_text(
-            f"expected ops={requested_ops}, format=v{expected}; got ops={result.get('ops')}, "
-            f"format={params.get('wal_format_version')}\n", encoding="utf-8")
+            f"expected ops={requested_ops}, params={expected_params}; got ops={result.get('ops')}, "
+            f"params={actual_params}\n", encoding="utf-8")
 
 row = {"writer": writers, "block": block, "position": position, "format": fmt,
        "exit_code": exit_code, **metrics, "duration_seconds": duration}
@@ -613,15 +614,20 @@ PY
     done
 done
 
-python3 - "$BENCH_RESULTS" "$FAILED" "$RUN_INDEX" <<'PY'
+python3 - "$BENCH_RESULTS" "$FAILED" "$RUN_INDEX" "$BENCH_WRITERS" "$BENCH_NUM" <<'PY'
 import csv
 import json
 from pathlib import Path
 from statistics import median
 import sys
+from gcp_wal_matrix import LEGACY_ARMS, build_batch64_schedule, validate_batch64_rows
 
 root, failed, runs = Path(sys.argv[1]), bool(int(sys.argv[2])), int(sys.argv[3])
+writers = [int(value) for value in sys.argv[4].split(",")]
+requested_ops = int(sys.argv[5])
 rows = list(csv.DictReader((root / "summary.tsv").open(encoding="utf-8"), delimiter="\t"))
+validation = validate_batch64_rows(rows, writers, requested_ops)
+planned = len(build_batch64_schedule(writers))
 metric_fields = {
     "puts_per_second": "median_puts_per_second",
     "p99_ms": "median_p99_ms",
@@ -643,9 +649,9 @@ def summarize(run_rows):
 
 by_writer = {}
 comparison_rows = []
-for writer in (1, 4, 8):
+for writer in writers:
     per_format = {}
-    for fmt in ("v4", "v7", "v8"):
+    for fmt in LEGACY_ARMS:
         selected = [row for row in rows if row["writer"] == str(writer)
                     and row["format"] == fmt and row["exit_code"] == "0"]
         stats = summarize(selected)
@@ -663,7 +669,7 @@ for writer in (1, 4, 8):
                 (current_value / base_value - 1) * 100
                 if base_value not in (None, 0) and current_value is not None else None
             )
-    for fmt in ("v4", "v7", "v8"):
+    for fmt in LEGACY_ARMS:
         row = {"writer": writer, "format": fmt, **per_format[fmt]}
         if fmt == "v4":
             row.update({
@@ -684,11 +690,12 @@ with (root / "comparison.tsv").open("w", encoding="utf-8", newline="") as stream
     output_writer.writerows(comparison_rows)
 
 summary = {
-    "complete": not failed and len(rows) == 36 and all(row["exit_code"] == "0" for row in rows),
+    "complete": not failed and runs == planned and validation["complete"],
     "runs_completed": len(rows),
-    "runs_planned": 36,
-    "writers": [1, 4, 8],
-    "formats": ["v4", "v7", "v8"],
+    "runs_planned": planned,
+    "writers": writers,
+    "formats": list(LEGACY_ARMS),
+    "matrix_validation": validation,
     "results": rows,
     "comparison_by_writer": by_writer,
     "comparison_method": "median of successful repetitions per writer and format; percent changes are versus V4",
