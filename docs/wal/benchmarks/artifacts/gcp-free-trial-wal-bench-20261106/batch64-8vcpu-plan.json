@@ -1,0 +1,37 @@
+{
+  "commit": "6bbfdb7b8c9df5fcb60c542f66d961e6300ada77",
+  "binary_sha256": "492734d4ea5df5f5f83650505b700f1f7fa2b9f582d54930b1e7b36a7dbbfae9",
+  "formats": [
+    "v4",
+    "v7",
+    "v8"
+  ],
+  "writers": [
+    1,
+    4,
+    8
+  ],
+  "writes_per_run": 750000,
+  "batch_entries": 64,
+  "value_bytes": 1024,
+  "order_blocks": [
+    [
+      "v4",
+      "v7",
+      "v8",
+      "v8",
+      "v7",
+      "v4"
+    ],
+    [
+      "v8",
+      "v7",
+      "v4",
+      "v4",
+      "v7",
+      "v8"
+    ]
+  ],
+  "runs_planned": 36,
+  "runtime_protocol": "one build; balanced V4/V7/V8 order; no storage-state probing"
+}

@@ -1,0 +1,77 @@
+{
+  "commit": "bdf9a0455a91fcd1607fd1ff5cf978aa9501aeff",
+  "binary_sha256": "492734d4ea5df5f5f83650505b700f1f7fa2b9f582d54930b1e7b36a7dbbfae9",
+  "machine_type": "c4-standard-16-lssd",
+  "writers": [
+    1,
+    2,
+    4,
+    8,
+    16
+  ],
+  "formats": [
+    "v4_parallel",
+    "v7_parallel",
+    "v8_parallel",
+    "v8_leader"
+  ],
+  "workloads": [
+    {
+      "name": "point",
+      "bench": "wal_concurrent",
+      "batch_entries": 1,
+      "num": 100000
+    },
+    {
+      "name": "batch8",
+      "bench": "wal_batch_concurrent",
+      "batch_entries": 8,
+      "num": 300000
+    },
+    {
+      "name": "batch16",
+      "bench": "wal_batch_concurrent",
+      "batch_entries": 16,
+      "num": 500000
+    },
+    {
+      "name": "batch64",
+      "bench": "wal_batch_concurrent",
+      "batch_entries": 64,
+      "num": 750000
+    }
+  ],
+  "repetitions_per_cell": 4,
+  "format_orders": [
+    [
+      "v4_parallel",
+      "v7_parallel",
+      "v8_parallel",
+      "v8_leader"
+    ],
+    [
+      "v7_parallel",
+      "v8_parallel",
+      "v8_leader",
+      "v4_parallel"
+    ],
+    [
+      "v8_parallel",
+      "v8_leader",
+      "v4_parallel",
+      "v7_parallel"
+    ],
+    [
+      "v8_leader",
+      "v4_parallel",
+      "v7_parallel",
+      "v8_parallel"
+    ]
+  ],
+  "score_runs_planned": 320,
+  "value_bytes": 1024,
+  "compaction": "none",
+  "counterbalanced": true,
+  "runtime_protocol": "single 16-vCPU host; all arms share a RAID0 over two bundled Local SSDs",
+  "qualification_note": "same-host matrix; not a cross-machine or storage-state qualification"
+}

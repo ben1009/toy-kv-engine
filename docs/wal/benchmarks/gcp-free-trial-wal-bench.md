@@ -239,6 +239,12 @@ deletes the VM and temporary firewall rule, so remote results cannot be
 recovered later; incomplete collection or failed teardown returns a nonzero
 status.
 
+The November 6, 2026 capture and sanitized per-run results are documented in the
+[GCP benchmark results report](gcp-free-trial-wal-bench-20261106-results.md).
+It includes the completed 320-run 16-vCPU RFC matrix, the 36-run 8-vCPU
+batch64 comparison, and the six-case PITR catch-up check. These are exploratory
+same-host results and are not device-state-qualified RFC performance results.
+
 ## Offline validation
 
 CI runs the runner tests without cloud credentials or provisioning resources:

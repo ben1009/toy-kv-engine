@@ -1,0 +1,79 @@
+{
+  "check": "pitr-catchup-only",
+  "commit": "bdf9a0455a91fcd1607fd1ff5cf978aa9501aeff",
+  "complete": true,
+  "completed_cases": 6,
+  "exit_code": 0,
+  "expected_cases": 6,
+  "max_source_spool_bytes": 671088640,
+  "operations_per_writer_count": 10000,
+  "results": [
+    {
+      "catchup_seconds": 1.257254513,
+      "mode_order": "pitr-first",
+      "operations": 10000,
+      "pitr_enabled": true,
+      "value_size": 128,
+      "write_seconds": 2.802626656,
+      "writers": 1,
+      "writes_per_second": 3568.081384864984
+    },
+    {
+      "catchup_seconds": null,
+      "mode_order": "pitr-first",
+      "operations": 10000,
+      "pitr_enabled": false,
+      "value_size": 128,
+      "write_seconds": 0.909548672,
+      "writers": 1,
+      "writes_per_second": 10994.463856465287
+    },
+    {
+      "catchup_seconds": null,
+      "mode_order": "pitr-second",
+      "operations": 10000,
+      "pitr_enabled": false,
+      "value_size": 128,
+      "write_seconds": 0.253205938,
+      "writers": 4,
+      "writes_per_second": 39493.54457872153
+    },
+    {
+      "catchup_seconds": 0.586874555,
+      "mode_order": "pitr-second",
+      "operations": 10000,
+      "pitr_enabled": true,
+      "value_size": 128,
+      "write_seconds": 1.022816747,
+      "writers": 4,
+      "writes_per_second": 9776.922434376214
+    },
+    {
+      "catchup_seconds": 0.506992817,
+      "mode_order": "pitr-first",
+      "operations": 10000,
+      "pitr_enabled": true,
+      "value_size": 128,
+      "write_seconds": 0.638945517,
+      "writers": 8,
+      "writes_per_second": 15650.786700800969
+    },
+    {
+      "catchup_seconds": null,
+      "mode_order": "pitr-first",
+      "operations": 10000,
+      "pitr_enabled": false,
+      "value_size": 128,
+      "write_seconds": 0.242010934,
+      "writers": 8,
+      "writes_per_second": 41320.44711665796
+    }
+  ],
+  "source_sha256": "1f1a7896afeea0c4d48d981461ddc5a21fbc4972ff14dcbf7967d77a37546732",
+  "value_size": 128,
+  "writers": [
+    1,
+    4,
+    8
+  ]
+}
