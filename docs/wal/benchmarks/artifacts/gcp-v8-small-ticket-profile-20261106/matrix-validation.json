@@ -1,0 +1,10 @@
+{
+  "planned": 28,
+  "observed": 28,
+  "missing": [],
+  "unexpected": [],
+  "invalid": [],
+  "perf_requested": 7,
+  "perf_nonempty": 7,
+  "valid": true
+}
