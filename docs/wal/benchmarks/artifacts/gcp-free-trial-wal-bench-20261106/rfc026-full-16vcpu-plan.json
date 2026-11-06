@@ -20,25 +20,33 @@
       "name": "point",
       "bench": "wal_concurrent",
       "batch_entries": 1,
-      "num": 100000
+      "batch_size": null,
+      "num": 100000,
+      "sample_every": 100
     },
     {
       "name": "batch8",
       "bench": "wal_batch_concurrent",
       "batch_entries": 8,
-      "num": 300000
+      "batch_size": 8,
+      "num": 300000,
+      "sample_every": 10
     },
     {
       "name": "batch16",
       "bench": "wal_batch_concurrent",
       "batch_entries": 16,
-      "num": 500000
+      "batch_size": 16,
+      "num": 500000,
+      "sample_every": 10
     },
     {
       "name": "batch64",
       "bench": "wal_batch_concurrent",
       "batch_entries": 64,
-      "num": 750000
+      "batch_size": 64,
+      "num": 750000,
+      "sample_every": 10
     }
   ],
   "repetitions_per_cell": 4,

@@ -92,7 +92,6 @@ resource "google_compute_instance" "test" {
   }
 
   service_account {
-    email  = ""
     scopes = []
   }
 
@@ -109,7 +108,7 @@ resource "google_compute_instance" "test" {
 
   lifecycle {
     precondition {
-      condition     = local.machine_type.guest_cpus == var.expected_vcpus
+      condition     = try(local.machine_type.guest_cpus, 0) == var.expected_vcpus
       error_message = "Selected machine type does not match expected_vcpus. Check machine-type availability before applying."
     }
 

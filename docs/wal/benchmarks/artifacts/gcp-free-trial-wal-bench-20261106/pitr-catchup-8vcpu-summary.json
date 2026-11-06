@@ -1,6 +1,6 @@
 {
   "check": "pitr-catchup-only",
-  "commit": "bdf9a0455a91fcd1607fd1ff5cf978aa9501aeff",
+  "requested_commit": "bdf9a0455a91fcd1607fd1ff5cf978aa9501aeff",
   "complete": true,
   "completed_cases": 6,
   "exit_code": 0,
@@ -70,6 +70,19 @@
     }
   ],
   "source_sha256": "1f1a7896afeea0c4d48d981461ddc5a21fbc4972ff14dcbf7967d77a37546732",
+  "source_provenance": {
+    "base_commit": "bdf9a0455a91fcd1607fd1ff5cf978aa9501aeff",
+    "path": "kv-engine/src/bin/pitr-perf.rs",
+    "source_file_sha256": "1f1a7896afeea0c4d48d981461ddc5a21fbc4972ff14dcbf7967d77a37546732",
+    "content_matches_commit": "40ce6f657fda7997fdbea570086889ac47a3a2cd",
+    "requested_commit_source_limit_mib": 384,
+    "captured_source_limit_mib": 640,
+    "source_change": "max_source_spool_bytes changed from 384 MiB to 640 MiB",
+    "binary_build_revision": null,
+    "reproducible_from_requested_commit": false,
+    "performance_qualification_eligible": false,
+    "note": "The recorded source-file hash matches the 640 MiB file at content-matching commit 40ce6f657fda7997fdbea570086889ac47a3a2cd, while the requested commit has a 384 MiB limit. The complete build source revision was not recorded; retain this capture as exploratory data only."
+  },
   "value_size": 128,
   "writers": [
     1,

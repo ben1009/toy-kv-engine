@@ -110,8 +110,9 @@ variable "boot_disk_size_gb" {
   default     = 50
 
   validation {
-    condition     = var.boot_disk_size_gb >= 20 && var.boot_disk_size_gb <= 100
-    error_message = "boot_disk_size_gb must be between 20 and 100 GiB."
+    condition = var.boot_disk_size_gb >= 20 && var.boot_disk_size_gb <= 100 &&
+      var.boot_disk_size_gb == floor(var.boot_disk_size_gb)
+    error_message = "boot_disk_size_gb must be a whole number between 20 and 100 GiB."
   }
 }
 

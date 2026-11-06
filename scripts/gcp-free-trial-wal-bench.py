@@ -45,6 +45,7 @@ MACHINE_SPECS = {
 }
 VM_INSTANCE_QUOTA = "INSTANCES"
 RUNNERS = Path(__file__).with_name("gcp-free-trial-wal-bench-remote.sh")
+MATRIX_MODULE = Path(__file__).with_name("gcp_wal_matrix.py")
 REPO_URL = "https://github.com/ben1009/toy-kv-engine.git"
 MAX_RUNTIME_MINUTES = 180
 MIN_RUNTIME_MINUTES = 60
@@ -1383,6 +1384,18 @@ def provision_and_run(
             append_local_log(key_log, scp_result.stdout + scp_result.stderr)
             if scp_result.returncode:
                 raise BenchError(f"Could not copy remote runner: {scp_result.stderr.strip()}")
+
+            if not MATRIX_MODULE.is_file():
+                raise BenchError(f"Benchmark matrix module is not present in this checkout: {MATRIX_MODULE}")
+            audit_ssh_firewall_rules(
+                gcloud, args.project, args.network, network_region, tag, args.ssh_source_range
+            )
+            matrix_copy = scp_to_vm(
+                ip, MATRIX_MODULE, "/tmp/gcp_wal_matrix.py", key, known_hosts, timeout=120
+            )
+            append_local_log(key_log, matrix_copy.stdout + matrix_copy.stderr)
+            if matrix_copy.returncode:
+                raise BenchError(f"Could not copy benchmark matrix module: {matrix_copy.stderr.strip()}")
 
             safe_deadline_epoch = int(deadline_epoch - 600)
             remote_command = "sudo -n bash /tmp/run-wal-bench.sh " + shlex.join([

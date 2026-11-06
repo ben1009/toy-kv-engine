@@ -189,6 +189,11 @@ if [[ "$ACTUAL_COMMIT" != "$BENCH_COMMIT" ]]; then
     echo "checked out $ACTUAL_COMMIT instead of requested $BENCH_COMMIT" >&2
     exit 1
 fi
+if [[ ! -r /tmp/gcp_wal_matrix.py ]]; then
+    echo "benchmark matrix module was not uploaded" >&2
+    exit 1
+fi
+cp /tmp/gcp_wal_matrix.py "$REPO/scripts/gcp_wal_matrix.py"
 
 TOOLCHAIN="$(sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$REPO/rust-toolchain")"
 if [[ -z "$TOOLCHAIN" ]]; then

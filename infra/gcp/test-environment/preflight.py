@@ -330,7 +330,6 @@ def preflight(project: str, zone: str, machine_type: str, boot_disk_gb: int) -> 
     for metric, required in (
         ("INSTANCES", 1),
         ("IN_USE_ADDRESSES", 1),
-        ("SUBNETWORKS", 1),
     ):
         limit, usage = _regional_quota(region_info, metric)
         available = limit - usage
