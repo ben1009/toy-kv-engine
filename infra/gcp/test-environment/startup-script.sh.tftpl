@@ -1,0 +1,136 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+exec > >(tee -a /var/log/gcp-test-environment-bootstrap.log) 2>&1
+echo "[$(date --iso-8601=seconds)] configuring generic GCP test environment"
+
+TEST_USER='${ssh_username}'
+SSD_COUNT='${local_ssd_count}'
+SSD_MOUNT='${local_ssd_mount}'
+INSTALL_RUST='${install_rust_toolchain}'
+BOOTSTRAP_MARKER=/var/lib/gcp-test-environment/bootstrap-complete
+
+if ! id "$TEST_USER" >/dev/null 2>&1; then
+    useradd --create-home --shell /bin/bash "$TEST_USER"
+fi
+
+if [[ ! -e "$BOOTSTRAP_MARKER" ]]; then
+    apt-get update
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        bpftrace build-essential ca-certificates clang cmake curl e2fsprogs fio git jq \
+        libclang-dev libssl-dev linux-tools-common mdadm nvme-cli pkg-config python3 \
+        python3-venv smartmontools sysstat time trace-cmd util-linux xz-utils
+
+    if apt-cache show linux-tools-gcp >/dev/null 2>&1; then
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends linux-tools-gcp
+    fi
+
+    if [[ "$INSTALL_RUST" == "true" ]]; then
+        runuser -u "$TEST_USER" -- env HOME="/home/$TEST_USER" sh -c \
+            'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal'
+    fi
+
+    install -d -o "$TEST_USER" -g "$TEST_USER" /var/lib/gcp-test-environment
+    touch "$BOOTSTRAP_MARKER"
+fi
+
+mapfile -t SSD_LINKS < <(find /dev/disk/by-id -maxdepth 1 -type l \
+    -name 'google-local-nvme-ssd-[0-9]*' -print | sort -V)
+if (( $${#SSD_LINKS[@]} != SSD_COUNT )); then
+    echo "expected $SSD_COUNT bundled NVMe Local SSD device(s), found $${#SSD_LINKS[@]}" >&2
+    printf '%s\n' "$${SSD_LINKS[@]}" >&2
+    exit 1
+fi
+
+SSD_DEVICES=()
+for ((index = 0; index < SSD_COUNT; index++)); do
+    expected="google-local-nvme-ssd-$index"
+    if [[ "$(basename "$${SSD_LINKS[$index]}")" != "$expected" ]]; then
+        echo "unexpected Local SSD identifier: $${SSD_LINKS[$index]}" >&2
+        exit 1
+    fi
+    device="$(readlink -f "$${SSD_LINKS[$index]}")"
+    if [[ ! -b "$device" ]] || (( $(blockdev --getsize64 "$device") < 375 * 1024 * 1024 * 1024 )); then
+        echo "Local SSD is missing or smaller than 375 GiB: $device" >&2
+        exit 1
+    fi
+    SSD_DEVICES+=("$device")
+done
+
+if (( SSD_COUNT == 1 )); then
+    FILESYSTEM_DEVICE="$${SSD_DEVICES[0]}"
+else
+    FILESYSTEM_DEVICE=/dev/md/test-ssd
+    if [[ ! -b "$FILESYSTEM_DEVICE" ]]; then
+        mdadm --assemble --scan || true
+    fi
+    if [[ ! -b "$FILESYSTEM_DEVICE" ]]; then
+        RAID_MEMBERS=0
+        for device in "$${SSD_DEVICES[@]}"; do
+            if mdadm --examine "$device" >/dev/null 2>&1; then
+                RAID_MEMBERS=$((RAID_MEMBERS + 1))
+            fi
+        done
+        if (( RAID_MEMBERS != 0 )); then
+            echo "found an incomplete or unexpected RAID signature; refusing to reinitialize Local SSDs" >&2
+            exit 1
+        fi
+        for device in "$${SSD_DEVICES[@]}"; do
+            if [[ -n "$(wipefs --no-act --noheadings --output TYPE "$device")" ]]; then
+                echo "Local SSD has existing signatures; refusing to reinitialize $device" >&2
+                exit 1
+            fi
+        done
+        mdadm --create "$FILESYSTEM_DEVICE" --run --assume-clean --level=0 \
+            --raid-devices="$SSD_COUNT" "$${SSD_DEVICES[@]}"
+        udevadm settle
+        mdadm --detail --scan >>/etc/mdadm/mdadm.conf
+        update-initramfs -u
+    fi
+fi
+
+FILESYSTEM_TYPE="$(blkid -p -s TYPE -o value "$FILESYSTEM_DEVICE" 2>/dev/null || true)"
+if [[ -z "$FILESYSTEM_TYPE" ]]; then
+    if [[ "$FILESYSTEM_DEVICE" == /dev/md/* ]]; then
+        for device in "$${SSD_DEVICES[@]}"; do
+            if [[ -n "$(wipefs --no-act --noheadings --output TYPE "$device")" ]]; then
+                echo "Local SSD member has an unexpected signature: $device" >&2
+                exit 1
+            fi
+        done
+    elif [[ -n "$(wipefs --no-act --noheadings --output TYPE "$FILESYSTEM_DEVICE")" ]]; then
+        echo "Local SSD has an unexpected signature; refusing to format it" >&2
+        exit 1
+    fi
+    mkfs.ext4 -F -m 0 -E lazy_itable_init=0,lazy_journal_init=0 "$FILESYSTEM_DEVICE"
+elif [[ "$FILESYSTEM_TYPE" != ext4 ]]; then
+    echo "expected ext4 on $FILESYSTEM_DEVICE, found $FILESYSTEM_TYPE; refusing to reformat" >&2
+    exit 1
+fi
+
+install -d "$SSD_MOUNT"
+FILESYSTEM_UUID="$(blkid -s UUID -o value "$FILESYSTEM_DEVICE")"
+if ! mountpoint -q "$SSD_MOUNT"; then
+    if ! grep -Fq "UUID=$FILESYSTEM_UUID $SSD_MOUNT ext4 " /etc/fstab; then
+        FSTAB_TMP="$(mktemp)"
+        awk -v mount="$SSD_MOUNT" 'NF < 2 || $2 != mount { print }' /etc/fstab >"$FSTAB_TMP"
+        cat "$FSTAB_TMP" >/etc/fstab
+        rm -f "$FSTAB_TMP"
+        printf 'UUID=%s %s ext4 noatime,nofail 0 2\n' "$FILESYSTEM_UUID" "$SSD_MOUNT" >>/etc/fstab
+    fi
+    mount "$SSD_MOUNT"
+fi
+
+install -d -o "$TEST_USER" -g "$TEST_USER" "$SSD_MOUNT/work" "$SSD_MOUNT/results"
+chown "$TEST_USER:$TEST_USER" "$SSD_MOUNT"
+printf '%s\n' \
+    "user=$TEST_USER" \
+    "local_ssd_count=$SSD_COUNT" \
+    "local_ssd_devices=$${SSD_DEVICES[*]}" \
+    "filesystem_device=$FILESYSTEM_DEVICE" \
+    "filesystem_uuid=$FILESYSTEM_UUID" \
+    "mount=$SSD_MOUNT" \
+    "ready_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    >"$SSD_MOUNT/environment.txt"
+chown "$TEST_USER:$TEST_USER" "$SSD_MOUNT/environment.txt"
+echo "[$(date --iso-8601=seconds)] test environment is ready at $SSD_MOUNT"

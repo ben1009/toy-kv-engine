@@ -27,6 +27,11 @@ them into RAID0, and formats only that verified array. The full-matrix mode is
 intended for a 16-vCPU VM and produces a same-host result, not a cross-machine
 or storage-state-qualified performance claim.
 
+For a reusable general-purpose GCP test host managed with Terraform, see the
+[GCP test environment setup](../../../infra/gcp/test-environment/README.md). The
+WAL benchmark runner remains focused on creating and collecting disposable WAL
+benchmark VMs.
+
 ## Free Trial and safety limits
 
 The runner never changes billing, enables APIs, adjusts quotas, or requests
