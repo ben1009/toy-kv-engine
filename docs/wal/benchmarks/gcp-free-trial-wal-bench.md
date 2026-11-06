@@ -1,16 +1,27 @@
 # GCP Free Trial WAL benchmark runner
 
 `scripts/gcp-free-trial-wal-bench.py` provisions a disposable
-`c4-standard-8-lssd` VM, mounts its instance-local Local SSD, builds one pinned
-toy-kv-engine commit, and runs the V4/V7/V8 batch64 matrix with 1, 4, and 8
-writers. It collects the raw JSON, stderr, commands, host metadata, and summary
-before deleting the VM.
+`c4-standard-8-lssd` VM by default, mounts its instance-local Local SSD, builds
+one pinned toy-kv-engine commit, and runs the V4/V7/V8 batch64 matrix with 1, 4,
+and 8 writers. The optional 16-vCPU mode uses `c4-standard-16-lssd`, verifies
+both bundled Local SSDs, and stripes them as RAID0 for the full RFC 026 matrix.
+It collects the raw JSON, stderr, commands, host metadata, and summary before
+deleting the VM.
 
 The matrix has 36 runs: for each writer count, it runs two reversed six-run
 blocks (`V4, V7, V8, V8, V7, V4` and `V8, V7, V4, V4, V7, V8`). V4 uses
 ordinary V4 WAL; V7 and V8 use PITR WAL. Each run uses 750,000 writes by
 default, 1 KiB values, and 64-entry batches. The two blocks reduce order bias;
 the output is a same-VM capture, not a storage-state-qualified V7/V8 comparison.
+
+For the full RFC 026 matrix, `--full-rfc026-matrix` selects point, batch8,
+batch16, and batch64 workloads; V4 Parallel, V7 Parallel, V8 Parallel, and V8
+Leader arms; and four counterbalanced repetitions. Supplying five writer counts
+(1/2/4/8/16) schedules 320 scored runs on one host. The 16-vCPU shape bundles
+two NVMe Local SSDs; the guest verifies both blank, unmounted devices, assembles
+them into RAID0, and formats only that verified array. The full-matrix mode is
+intended for a 16-vCPU VM and produces a same-host result, not a cross-machine
+or storage-state-qualified performance claim.
 
 ## Free Trial and safety limits
 
@@ -23,13 +34,14 @@ explicit operator attestation. Do not upgrade the billing account to Paid.
 
 Before creating any VM or firewall rule, the read-only preflight checks:
 
-- the selected project is active and the Compute Engine and Cloud Quotas APIs
-  are already enabled;
-- the requested zone is up and exposes `c4-standard-8-lssd` as 8 vCPUs with
-  exactly one bundled NVMe Local SSD, using the API's
-  `bundledLocalSsds.partitionCount` and `defaultInterface` fields; this fixed
-  machine type provides 375 GiB, which is checked again on the guest before
-  formatting;
+- the selected project is active, and its read-only Compute Engine and Cloud
+  Quotas requests succeed; these calls verify API availability directly, so
+  preflight does not depend on the separate Service Usage API;
+- the requested zone is up and exposes the selected C4 Local SSD machine type
+  with its expected vCPU count and bundled NVMe Local SSD count, using the API's
+  `bundledLocalSsds.partitionCount` and `defaultInterface` fields; it provides
+  375 GiB (`c4-standard-8-lssd`) or 750 GiB (`c4-standard-16-lssd`), checked
+  again on the guest before formatting;
 - a ready Ubuntu 24.04 boot image is resolved and pinned by image name for the
   VM creation;
 - C4 CPU and applicable Local SSD quota limits cover the new VM after
@@ -38,8 +50,10 @@ Before creating any VM or firewall rule, the read-only preflight checks:
   `SCRATCH` disk attachments on other machine families);
 - at least one regional VM instance quota and one ephemeral external IPv4
   address quota remain;
-- at least 50 GB of regional Hyperdisk Balanced quota remains for the C4 boot
-  disk, at least one global firewall quota remains, and any applicable
+- at least 50 GB of regional `HDB-TOTAL-GB` quota remains for the C4 boot disk,
+  using the Cloud Quotas limit and an inventory of existing Hyperdisk Balanced
+  and Balanced High Availability disks (the latter consume quota at twice their
+  size); at least one global firewall quota remains, and any applicable
   `CPUS_ALL_REGIONS` quota has room.
 
 If quota data, dimensions, or machine-type metadata are missing, the runner
@@ -68,12 +82,11 @@ The VM blocks project-wide SSH keys, has no service account, and receives a
 temporary firewall rule targeted only at its unique network tag; the rule is
 removed during teardown. The VM has a server-side maximum runtime (default 180
 minutes; the allowed range is 60–180 minutes) with automatic deletion, a 50 GB
-auto-delete Hyperdisk Balanced boot disk, and one automatically attached Local
-SSD from the `-lssd` machine type. The runner
-formats only `/dev/disk/by-id/google-local-nvme-ssd-0`, after verifying that
-the symlink resolves to a sufficiently large, unmounted block device with no
-existing filesystem signature. It refuses to guess a device by size or to
-format any other disk.
+auto-delete Hyperdisk Balanced boot disk, and bundled Local SSDs from the
+`-lssd` machine type. The runner verifies the expected Local SSD identifiers
+and checks each device is sufficiently large, unmounted, and free of filesystem
+signatures before formatting. It refuses to guess devices by size or format
+any other disk.
 
 Local SSD data is ephemeral. Results are copied back to the local results
 directory before VM deletion. Collection requires a previously verified SSH
@@ -114,13 +127,13 @@ permissions to create/delete a VM and temporary firewall rule. For a
 custom-mode VPC, pass `--subnet SUBNETWORK_NAME`; preflight verifies that the
 subnetwork belongs to the selected network and requested region.
 
-The active identity needs read access to the project, enabled services, quota
-and Compute Engine inventory; access to C4 machine types and the Ubuntu image;
+The active identity needs read access to the project, quota and Compute Engine
+inventory; access to C4 machine types and the Ubuntu image;
 and permission to create/delete the VM and boot disk, create/delete the
 temporary firewall rule, use the selected network/subnetwork, and read VM
 guest attributes. Applicable IAM permission names include
-`resourcemanager.projects.get`, `serviceusage.services.list`,
-`cloudquotas.quotas.get`, `compute.projects.get`, `compute.zones.get`,
+`resourcemanager.projects.get`, `cloudquotas.quotas.get`,
+`compute.projects.get`, `compute.zones.get`,
 `compute.regions.get`, `compute.machineTypes.get`, `compute.images.get`,
 `compute.images.useReadOnly`, `compute.networks.get`,
 `compute.subnetworks.get`, `compute.instances.list`,
@@ -159,6 +172,30 @@ python3 scripts/gcp-free-trial-wal-bench.py \
   --max-estimated-spend-usd YOUR_SPEND_CEILING \
   --confirm-free-trial
 ```
+
+To run the full counterbalanced RFC 026 matrix on a 16-vCPU machine with the
+16-writer case included:
+
+```bash
+python3 scripts/gcp-free-trial-wal-bench.py \
+  --project YOUR_PROJECT_ID \
+  --zone us-east1-b \
+  --machine-type c4-standard-16-lssd \
+  --writers 1 2 4 8 16 \
+  --full-rfc026-matrix \
+  --commit 0123456789abcdef0123456789abcdef01234567 \
+  --network YOUR_ISOLATED_VPC \
+  --subnet YOUR_SUBNET \
+  --ssh-source-range 203.0.113.10/32 \
+  --estimated-hourly-cost-usd YOUR_CURRENT_ESTIMATE \
+  --max-estimated-spend-usd YOUR_SPEND_CEILING \
+  --confirm-free-trial
+```
+
+The 16-vCPU shape uses two bundled Local SSDs in a guest RAID0. Preflight checks
+that the project has quota for all 16 C4 vCPUs and 750 GB of C4 Local SSD before
+creating a VM. This does not reserve zone capacity or guarantee that a host is
+currently available.
 
 Replace the example commit, CIDR, and cost values. Use a full 40-character
 commit SHA. The two cost arguments are mandatory for a full run: look up

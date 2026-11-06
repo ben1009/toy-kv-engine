@@ -133,7 +133,8 @@ fn run_case_in_root(
                         archive_interval: Duration::from_secs(60),
                         max_segment_bytes: 128 * 1024 * 1024,
                         max_unarchived_bytes: 256 * 1024 * 1024,
-                        max_source_spool_bytes: 384 * 1024 * 1024,
+                        // Leave headroom for PITR migration and recovery reservations.
+                        max_source_spool_bytes: 640 * 1024 * 1024,
                     },
                     runtime: PitrRuntimeOptions {
                         archive_io_bytes_per_second: None,
