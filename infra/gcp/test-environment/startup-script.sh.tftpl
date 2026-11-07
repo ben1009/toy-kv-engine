@@ -78,7 +78,15 @@ for ((index = 0; index < SSD_COUNT; index++)); do
         exit 1
     fi
     device="$(readlink -f "$${SSD_LINKS[$index]}")"
-    if ! test -b "$device" || (( $(blockdev --getsize64 "$device") < 375 * 1024 * 1024 * 1024 )); then
+    if ! test -b "$device"; then
+        echo "Local SSD device is missing: $device" >&2
+        exit 1
+    fi
+    if ! device_bytes="$(blockdev --getsize64 "$device")"; then
+        echo "could not inspect Local SSD size: $device" >&2
+        exit 1
+    fi
+    if [[ ! "$device_bytes" =~ ^[0-9]+$ ]] || (( 10#$device_bytes < 375 * 1024 * 1024 * 1024 )); then
         echo "Local SSD is missing or smaller than 375 GiB: $device" >&2
         exit 1
     fi
@@ -104,7 +112,11 @@ else
             exit 1
         fi
         for device in "$${SSD_DEVICES[@]}"; do
-            if [[ -n "$(wipefs --no-act --noheadings --output TYPE "$device")" ]]; then
+            if ! device_signatures="$(wipefs --no-act --noheadings --output TYPE "$device")"; then
+                echo "could not inspect Local SSD signatures; refusing to reinitialize $device" >&2
+                exit 1
+            fi
+            if [[ -n "$device_signatures" ]]; then
                 echo "Local SSD has existing signatures; refusing to reinitialize $device" >&2
                 exit 1
             fi
@@ -117,11 +129,23 @@ else
     fi
 fi
 
-FILESYSTEM_TYPE="$(blkid -p -s TYPE -o value "$FILESYSTEM_DEVICE" 2>/dev/null || true)"
+FILESYSTEM_TYPE="$(blkid -p -s TYPE -o value "$FILESYSTEM_DEVICE")" || {
+    probe_status=$?
+    # Status 2 can mean no signature. A successful wipefs inspection below
+    # must independently confirm the device is empty before formatting.
+    if (( probe_status != 2 )) || [[ -n "$FILESYSTEM_TYPE" ]]; then
+        echo "could not identify filesystem on $FILESYSTEM_DEVICE (blkid status $probe_status)" >&2
+        exit 1
+    fi
+}
 if [[ -z "$FILESYSTEM_TYPE" ]]; then
     # Check the exported filesystem device. A new RAID array's raw members
     # already have the expected linux_raid_member signatures from mdadm.
-    if [[ -n "$(wipefs --no-act --noheadings --output TYPE "$FILESYSTEM_DEVICE")" ]]; then
+    if ! filesystem_signatures="$(wipefs --no-act --noheadings --output TYPE "$FILESYSTEM_DEVICE")"; then
+        echo "could not inspect signatures on $FILESYSTEM_DEVICE; refusing to format it" >&2
+        exit 1
+    fi
+    if [[ -n "$filesystem_signatures" ]]; then
         echo "Local SSD has an unexpected signature; refusing to format it" >&2
         exit 1
     fi

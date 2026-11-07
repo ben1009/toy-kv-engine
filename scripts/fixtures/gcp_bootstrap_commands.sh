@@ -58,7 +58,17 @@ test() {
     fi
 }
 blockdev() {
-    if (( MOCK_SMALL_DEVICE )); then printf '1\n'; else printf '402653184000\n'; fi
+    if (( ${MOCK_BLOCKDEV_STATUS:-0} != 0 )); then
+        echo "simulated device size inspection failure" >&2
+        return "$MOCK_BLOCKDEV_STATUS"
+    fi
+    if (( MOCK_SMALL_DEVICE )); then
+        printf '1\n'
+    elif [[ ${MOCK_BLOCKDEV_OUTPUT+x} ]]; then
+        printf '%s\n' "$MOCK_BLOCKDEV_OUTPUT"
+    else
+        printf '402653184000\n'
+    fi
 }
 mdadm() {
     case "$1" in
@@ -72,6 +82,10 @@ mdadm() {
 udevadm() { :; }
 update-initramfs() { :; }
 wipefs() {
+    if (( ${MOCK_WIPEFS_STATUS:-0} != 0 )); then
+        echo "simulated signature inspection failure" >&2
+        return "$MOCK_WIPEFS_STATUS"
+    fi
     if [[ "${@: -1}" == /dev/md/test-ssd ]]; then
         printf '%s' "$MOCK_ARRAY_SIGNATURE"
     elif (( MOCK_ARRAY_PRESENT )); then
@@ -82,6 +96,10 @@ wipefs() {
 }
 blkid() {
     if [[ " $* " == *" TYPE "* ]]; then
+        if [[ -n "${MOCK_BLKID_STATUS:-}" ]]; then
+            return "$MOCK_BLKID_STATUS"
+        fi
+        [[ -n "$MOCK_FILESYSTEM" ]] || return 2
         printf '%s' "$MOCK_FILESYSTEM"
     else
         printf 'mock-filesystem-uuid\n'

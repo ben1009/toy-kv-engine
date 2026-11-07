@@ -90,6 +90,42 @@ class GcpBootstrapTests(unittest.TestCase):
         self.assertNotIn("chown", events)
         self.assertEqual(metadata, "")
 
+    def test_device_size_inspection_failure_never_initializes_storage(self):
+        for count in (1, 2):
+            for scenario in ({"MOCK_BLOCKDEV_STATUS": 2}, {"MOCK_BLOCKDEV_OUTPUT": ""},
+                             {"MOCK_BLOCKDEV_OUTPUT": "unreadable"}):
+                with self.subTest(count=count, scenario=scenario):
+                    result, events, metadata, _ = self.run_storage_bootstrap(count, **scenario)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertNotIn("raid-created", events)
+                    self.assertNotIn("formatted", events)
+                    self.assertNotIn("mounted", events)
+                    self.assertEqual(metadata, "")
+
+    def test_signature_inspection_failure_never_initializes_storage(self):
+        for count, array in ((1, 0), (2, 0), (2, 1)):
+            with self.subTest(count=count, array=array):
+                result, events, metadata, _ = self.run_storage_bootstrap(
+                    count, MOCK_ARRAY_PRESENT=array, MOCK_WIPEFS_STATUS=2,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotIn("raid-created", events)
+                self.assertNotIn("formatted", events)
+                self.assertNotIn("mounted", events)
+                self.assertEqual(metadata, "")
+
+    def test_filesystem_probe_errors_never_format_or_publish_ready(self):
+        for count in (1, 2):
+            for status in (4, 8):
+                with self.subTest(count=count, status=status):
+                    result, events, metadata, _ = self.run_storage_bootstrap(
+                        count, MOCK_ARRAY_PRESENT=int(count == 2), MOCK_BLKID_STATUS=status,
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertNotIn("formatted", events)
+                    self.assertNotIn("mounted", events)
+                    self.assertEqual(metadata, "")
+
     def test_tool_installation_marker_is_repeatable_and_never_hides_failure(self):
         source = (ROOT / "infra/gcp/test-environment/startup-script.sh.tftpl").read_text(encoding="utf-8")
         body = source[source.index('if ! id "$TEST_USER"'):source.index("mapfile -t SSD_LINKS")]

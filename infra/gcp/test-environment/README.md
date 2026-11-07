@@ -158,7 +158,7 @@ The public key under `tests/fixtures` belongs only to the offline tests.
 | --- | --- |
 | Capacity preflight | Both VM shapes, applicable quotas, existing CPU/SSD/disk usage, reservations, missing metadata, command failures, and read-only gcloud invocation |
 | Terraform | Hardware checks, cost and Free Trial guards, input bounds, restricted SSH, boot-disk deletion, VM lifetime, resource links, outputs, and mocked apply/cleanup |
-| Bootstrap | One/two SSDs, fresh RAID, reassembly, repeat startup, filesystem preservation, unexpected signatures, missing/undersized devices, mounted UUID verification, download/installer failure and readiness publication |
+| Bootstrap | One/two SSDs, fresh RAID, reassembly, repeat startup, filesystem preservation, unexpected signatures, failed size/signature probes, missing/undersized devices, mounted UUID verification, download/installer failure and readiness publication |
 | Templates and benchmark runner | Actual Terraform rendering for both disk counts and Rust settings, Bash syntax, environment handoff, schedules, result validation and artifact collection |
 
 ## Live-host acceptance check
