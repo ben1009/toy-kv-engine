@@ -161,6 +161,8 @@ runuser -u bench -- env \
     BENCH_WORK="$WORK" \
     BENCH_SAFE_DEADLINE_EPOCH="$SAFE_DEADLINE_EPOCH" \
     BENCH_MACHINE_TYPE="$MACHINE_TYPE" \
+    BENCH_SSD_COUNT="$SSD_COUNT" \
+    BENCH_SSD_TOTAL_GIB="$SSD_TOTAL_GIB" \
     BENCH_WRITERS="$WRITERS_CSV" \
     BENCH_SUITE="$SUITE" \
     BENCH_BOOT_LOG="$BOOT_LOG" \
@@ -214,7 +216,7 @@ cp "$REPO/rust-toolchain" "$BENCH_RESULTS/rust-toolchain.toml"
 
 if [[ "$BENCH_SUITE" == "rfc026-full" ]]; then
     python3 - "$BENCH_RESULTS/benchmark-plan.json" "$ACTUAL_COMMIT" "$BINARY_SHA256" \
-        "$BENCH_WRITERS" "$BENCH_MACHINE_TYPE" "$SSD_COUNT" "$SSD_TOTAL_GIB" <<'PY'
+        "$BENCH_WRITERS" "$BENCH_MACHINE_TYPE" "$BENCH_SSD_COUNT" "$BENCH_SSD_TOTAL_GIB" <<'PY'
 import json
 from pathlib import Path
 import sys
@@ -461,7 +463,7 @@ PY
     if (( FAILED )); then exit 1; fi
 else
 python3 - "$BENCH_RESULTS/benchmark-plan.json" "$BENCH_NUM" "$ACTUAL_COMMIT" "$BINARY_SHA256" \
-    "$BENCH_WRITERS" "$BENCH_MACHINE_TYPE" "$SSD_COUNT" "$SSD_TOTAL_GIB" <<'PY'
+    "$BENCH_WRITERS" "$BENCH_MACHINE_TYPE" "$BENCH_SSD_COUNT" "$BENCH_SSD_TOTAL_GIB" <<'PY'
 import json
 from pathlib import Path
 import sys

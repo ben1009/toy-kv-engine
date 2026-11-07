@@ -14,7 +14,7 @@ ephemeral; its contents do not survive VM deletion or recreation.
 
 ## Requirements
 
-- Terraform 1.6 or later.
+- Terraform 1.7 or later (the bundled tests use provider mocks).
 - Google Cloud CLI authenticated to the intended project, with Application
   Default Credentials available to the Terraform provider.
 - `compute.googleapis.com` and `cloudquotas.googleapis.com` already enabled.
@@ -114,3 +114,59 @@ Destroying or expiring the VM loses Local SSD contents. Copy any needed results
 off the host first. The Terraform cost guard only checks your supplied estimate
 against the configured lifetime; it cannot limit charges for other resources,
 network traffic, or an incorrect estimate.
+
+## Automated checks
+
+The `gcp-bench` CI job installs a checksum-pinned Terraform CLI, verifies
+formatting and the locked provider schema, runs the module's mock-provider
+tests, parses the rendered startup script with Bash, and discovers all
+`scripts/test_gcp*.py` tests. It needs no GCP credentials and creates no cloud
+resources. Run the same checks from the repository root:
+
+```bash
+terraform -chdir=infra/gcp/test-environment fmt -check -recursive
+terraform -chdir=infra/gcp/test-environment init -backend=false -input=false -lockfile=readonly
+terraform -chdir=infra/gcp/test-environment validate
+terraform -chdir=infra/gcp/test-environment test
+bash -n scripts/gcp-free-trial-wal-bench-remote.sh
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_gcp*.py'
+```
+
+These tests require Terraform 1.7 or later for
+[provider mocking](https://developer.hashicorp.com/terraform/language/tests/mocking);
+CI pins 1.17.1. Terraform also reads the test files during initialization and
+validation, so this root requires 1.7 or later even when not running tests.
+Keep `.terraform.lock.hcl` in version control when changing provider versions.
+The public key under `tests/fixtures` belongs only to the offline tests.
+
+| Area | Automated coverage |
+| --- | --- |
+| Capacity preflight | Both VM shapes, applicable quotas, existing CPU/SSD/disk usage, reservations, missing metadata, command failures, and read-only gcloud invocation |
+| Terraform | Hardware checks, cost and Free Trial guards, input bounds, restricted SSH, boot-disk deletion, VM lifetime, resource links, outputs, and mocked apply/cleanup |
+| Bootstrap | One/two SSDs, fresh RAID, reassembly, repeat startup, filesystem preservation, unexpected signatures, missing/undersized devices, tool-install failure and readiness publication |
+| Templates and benchmark runner | Actual Terraform rendering for both disk counts and Rust settings, Bash syntax, environment handoff, schedules, result validation and artifact collection |
+
+## Live-host acceptance check
+
+Offline checks do not verify GCP host capacity, IAM policy, package mirrors,
+actual kernel RAID behavior, or SSH connectivity. After an intentional
+provisioning run, use the printed SSH command to check the host:
+
+```bash
+test -s /mnt/test-ssd/environment.txt
+cat /mnt/test-ssd/environment.txt
+findmnt -n -o SOURCE,FSTYPE,TARGET /mnt/test-ssd
+test -w /mnt/test-ssd/work && test -w /mnt/test-ssd/results
+sudo mdadm --detail /dev/md/test-ssd # Only for hosts with multiple SSDs.
+command -v cc clang cmake fio git jq mdadm nvme python3 trace-cmd bpftrace
+source ~/.cargo/env && rustc --version # When install_rust_toolchain is true.
+```
+
+For a new bootstrap/provider revision, save a small marker file under the
+workspace, reboot the host, reconnect, and verify the marker, mount and
+filesystem UUID are unchanged. When the environment is no longer needed, run
+`terraform destroy -var-file=terraform.tfvars` and confirm the named VM, boot
+disk, SSH rule, subnet and VPC are absent from `gcloud compute` inventory. This
+live check uses the existing Free Trial project; it must not upgrade billing or
+enable services. It is separate from CI so pull requests cannot create billed
+resources automatically.

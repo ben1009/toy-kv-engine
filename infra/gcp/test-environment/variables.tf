@@ -92,8 +92,10 @@ variable "local_ssd_mount" {
   default     = "/mnt/test-ssd"
 
   validation {
-    condition = startswith(var.local_ssd_mount, "/") && var.local_ssd_mount != "/" &&
+    condition = (
+      startswith(var.local_ssd_mount, "/") && var.local_ssd_mount != "/" &&
       can(regex("^/[A-Za-z0-9._/-]+$", var.local_ssd_mount)) && !strcontains(var.local_ssd_mount, "..")
+    )
     error_message = "local_ssd_mount must be a simple non-root absolute path without shell-sensitive characters or '..'."
   }
 }
@@ -110,8 +112,10 @@ variable "boot_disk_size_gb" {
   default     = 50
 
   validation {
-    condition = var.boot_disk_size_gb >= 20 && var.boot_disk_size_gb <= 100 &&
+    condition = (
+      var.boot_disk_size_gb >= 20 && var.boot_disk_size_gb <= 100 &&
       var.boot_disk_size_gb == floor(var.boot_disk_size_gb)
+    )
     error_message = "boot_disk_size_gb must be a whole number between 20 and 100 GiB."
   }
 }
@@ -122,8 +126,10 @@ variable "max_runtime_hours" {
   default     = 24
 
   validation {
-    condition = var.max_runtime_hours >= 1 && var.max_runtime_hours <= 168 &&
+    condition = (
+      var.max_runtime_hours >= 1 && var.max_runtime_hours <= 168 &&
       var.max_runtime_hours == floor(var.max_runtime_hours)
+    )
     error_message = "max_runtime_hours must be a whole number between 1 and 168 hours."
   }
 }

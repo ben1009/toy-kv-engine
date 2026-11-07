@@ -50,7 +50,7 @@ for ((index = 0; index < SSD_COUNT; index++)); do
         exit 1
     fi
     device="$(readlink -f "$${SSD_LINKS[$index]}")"
-    if [[ ! -b "$device" ]] || (( $(blockdev --getsize64 "$device") < 375 * 1024 * 1024 * 1024 )); then
+    if ! test -b "$device" || (( $(blockdev --getsize64 "$device") < 375 * 1024 * 1024 * 1024 )); then
         echo "Local SSD is missing or smaller than 375 GiB: $device" >&2
         exit 1
     fi
@@ -61,10 +61,10 @@ if (( SSD_COUNT == 1 )); then
     FILESYSTEM_DEVICE="$${SSD_DEVICES[0]}"
 else
     FILESYSTEM_DEVICE=/dev/md/test-ssd
-    if [[ ! -b "$FILESYSTEM_DEVICE" ]]; then
+    if ! test -b "$FILESYSTEM_DEVICE"; then
         mdadm --assemble --scan || true
     fi
-    if [[ ! -b "$FILESYSTEM_DEVICE" ]]; then
+    if ! test -b "$FILESYSTEM_DEVICE"; then
         RAID_MEMBERS=0
         for device in "$${SSD_DEVICES[@]}"; do
             if mdadm --examine "$device" >/dev/null 2>&1; then
@@ -91,14 +91,9 @@ fi
 
 FILESYSTEM_TYPE="$(blkid -p -s TYPE -o value "$FILESYSTEM_DEVICE" 2>/dev/null || true)"
 if [[ -z "$FILESYSTEM_TYPE" ]]; then
-    if [[ "$FILESYSTEM_DEVICE" == /dev/md/* ]]; then
-        for device in "$${SSD_DEVICES[@]}"; do
-            if [[ -n "$(wipefs --no-act --noheadings --output TYPE "$device")" ]]; then
-                echo "Local SSD member has an unexpected signature: $device" >&2
-                exit 1
-            fi
-        done
-    elif [[ -n "$(wipefs --no-act --noheadings --output TYPE "$FILESYSTEM_DEVICE")" ]]; then
+    # Check the exported filesystem device. A new RAID array's raw members
+    # already have the expected linux_raid_member signatures from mdadm.
+    if [[ -n "$(wipefs --no-act --noheadings --output TYPE "$FILESYSTEM_DEVICE")" ]]; then
         echo "Local SSD has an unexpected signature; refusing to format it" >&2
         exit 1
     fi

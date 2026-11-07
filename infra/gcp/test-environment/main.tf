@@ -13,7 +13,7 @@ data "google_compute_image" "ubuntu" {
 locals {
   machine_type = one(data.google_compute_machine_types.selected.machine_types)
   local_ssd_count = try(
-    tonumber(local.machine_type.bundled_local_ssds[0].partition_count),
+    tonumber(one(local.machine_type.bundled_local_ssds).partition_count),
     0,
   )
   startup_script = templatefile("${path.module}/startup-script.sh.tftpl", {
@@ -68,11 +68,11 @@ resource "google_compute_instance" "test" {
   deletion_protection       = false
   tags                      = ["gcp-test-environment"]
   metadata = {
-    ssh-keys                  = "${var.ssh_username}:${trimspace(file(var.ssh_public_key_path))}"
-    block-project-ssh-keys    = "TRUE"
-    enable-oslogin            = "FALSE"
-    serial-port-enable        = "FALSE"
-    startup-script            = local.startup_script
+    ssh-keys               = "${var.ssh_username}:${trimspace(file(var.ssh_public_key_path))}"
+    block-project-ssh-keys = "TRUE"
+    enable-oslogin         = "FALSE"
+    serial-port-enable     = "FALSE"
+    startup-script         = local.startup_script
   }
 
   boot_disk {
@@ -113,8 +113,10 @@ resource "google_compute_instance" "test" {
     }
 
     precondition {
-      condition = local.local_ssd_count == var.expected_local_ssd_count &&
-        try(local.machine_type.bundled_local_ssds[0].default_interface, "") == "NVME"
+      condition = (
+        local.local_ssd_count == var.expected_local_ssd_count &&
+        try(one(local.machine_type.bundled_local_ssds).default_interface, "") == "NVME"
+      )
       error_message = "Selected machine type must expose the expected bundled NVMe Local SSDs."
     }
 
