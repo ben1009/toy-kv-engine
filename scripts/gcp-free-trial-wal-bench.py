@@ -30,13 +30,22 @@ import time
 from typing import Any
 import uuid
 
+from gcp_wal_matrix import (
+    FULL_DEFAULT_WRITERS,
+    LEGACY_DEFAULT_WRITERS,
+    build_benchmark_plan,
+    validate_writer_counts,
+)
+
 
 MACHINE_TYPE = "c4-standard-8-lssd"
-EXPECTED_VCPUS = 8
-LOCAL_SSD_GB = 375
-LOCAL_SSD_GIB = 375
+MACHINE_SPECS = {
+    "c4-standard-8-lssd": {"vcpus": 8, "ssd_count": 1, "ssd_gb": 375, "ssd_gib": 375},
+    "c4-standard-16-lssd": {"vcpus": 16, "ssd_count": 2, "ssd_gb": 750, "ssd_gib": 750},
+}
 VM_INSTANCE_QUOTA = "INSTANCES"
 RUNNERS = Path(__file__).with_name("gcp-free-trial-wal-bench-remote.sh")
+MATRIX_MODULE = Path(__file__).with_name("gcp_wal_matrix.py")
 REPO_URL = "https://github.com/ben1009/toy-kv-engine.git"
 MAX_RUNTIME_MINUTES = 180
 MIN_RUNTIME_MINUTES = 60
@@ -65,6 +74,11 @@ class Gcloud:
         try:
             # argv items are not shell-evaluated; this is intentionally not shell=True.
             # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
+            env = os.environ.copy()
+            # Keep the runner read-only with respect to API activation, even
+            # when invoked from an interactive shell. Required APIs are
+            # verified by their own read-only requests during preflight.
+            env["CLOUDSDK_CORE_SHOULD_PROMPT_TO_ENABLE_API"] = "false"
             result = subprocess.run(
                 command,
                 input=input_text,
@@ -74,6 +88,7 @@ class Gcloud:
                 timeout=timeout,
                 check=False,
                 shell=False,
+                env=env,
             )
         except (OSError, subprocess.TimeoutExpired) as error:
             self._log({"started": started, "command": command, "error": str(error)})
@@ -209,6 +224,8 @@ def _quota_kind(info: dict[str, Any]) -> str | None:
     # than in quotaId/metric. quota_limit() filters that dimension below.
     if "localssd" in names:
         return "local_ssd"
+    if "hdbtotalgb" in names or "hyperdiskbalancedtotalstorage" in names:
+        return "hyperdisk_balanced"
     if "cpus" in names:
         return "c4_cpu"
     if "instancesperprojectregion" in names or names.endswith("instances"):
@@ -228,11 +245,16 @@ def quota_limit(
     if not isinstance(quota_infos, list):
         raise BenchError("Cloud Quotas response does not contain a quotaInfos list")
 
-    matches: list[tuple[int, float, dict[str, Any]]] = []
+    matches: list[tuple[int, Any, dict[str, Any]]] = []
     for info in quota_infos:
         if not isinstance(info, dict) or _quota_kind(info) != kind:
             continue
-        for item in info.get("dimensionsInfo", []):
+        # The live Cloud Quotas API returns `dimensionsInfos`; older fixtures
+        # and SDK responses may use the singular spelling.
+        dimension_infos = info.get("dimensionsInfos", info.get("dimensionsInfo", []))
+        if not isinstance(dimension_infos, list):
+            continue
+        for item in dimension_infos:
             if not isinstance(item, dict):
                 continue
             dimensions = {str(key).lower(): str(value) for key, value in (item.get("dimensions") or {}).items()}
@@ -247,21 +269,20 @@ def quota_limit(
             # The deprecated LOCAL_SSD_TOTAL_GB quota is regional rather than
             # family-scoped. Accept it only as a fallback for Local SSD; callers
             # must account for all regional Local SSD usage in that case.
-            if kind != "local_ssd" and not vm_family:
+            if kind == "c4_cpu" and not vm_family:
                 continue
             details = item.get("details") or {}
             raw_limit = details.get("quotaValue", details.get("value", details.get("limit")))
             if raw_limit is None:
                 continue
-            limit = _number(raw_limit, "limit")
             specificity = int("region" in dimensions) + int("vm_family" in dimensions)
-            matches.append((specificity, limit, {
+            matches.append((specificity, raw_limit, {
                 "quota_id": info.get("quotaId"),
                 "metric": info.get("metric"),
                 "dimensions": dimensions,
                 "applicable_locations": applicable,
                 "details": details,
-                "limit": limit,
+                "limit": raw_limit,
             }))
 
     if not matches:
@@ -273,8 +294,9 @@ def quota_limit(
     strongest = [match for match in matches if match[0] == specificity]
     # If the service returns overlapping equally-specific entries, use the
     # smallest value as the conservative effective limit.
-    selected = min(strongest, key=lambda match: match[1])
-    return selected[1], selected[2]
+    parsed = [(_number(raw_limit, "limit"), details) for _, raw_limit, details in strongest]
+    selected_limit, selected_source = min(parsed, key=lambda match: match[0])
+    return selected_limit, selected_source
 
 
 def _resource_zone(instance: dict[str, Any]) -> str:
@@ -306,6 +328,40 @@ def _instance_local_ssd_gib(instance: dict[str, Any]) -> int:
                 raise BenchError(f"Invalid Local SSD diskSizeGb for instance {name}")
             total += int(size)
     return total
+
+
+def _disk_region(disk: dict[str, Any]) -> str | None:
+    region = str(disk.get("region", "")).rstrip("/").split("/")[-1]
+    if region:
+        return region
+    zone = str(disk.get("zone", "")).rstrip("/").split("/")[-1]
+    return zone_region(zone) if zone else None
+
+
+def _hyperdisk_balanced_usage_gb(disks: Any, region: str) -> float:
+    """Estimate HDB-TOTAL-GB use from existing balanced and HA disks."""
+    if not isinstance(disks, list):
+        raise BenchError("Cannot verify the existing Hyperdisk inventory")
+
+    usage_gb = 0.0
+    for disk in disks:
+        if not isinstance(disk, dict):
+            raise BenchError("Cannot verify an existing disk entry")
+        disk_type = str(disk.get("type", "")).rstrip("/").split("/")[-1]
+        if disk_type not in {"hyperdisk-balanced", "hyperdisk-balanced-high-availability"}:
+            continue
+        disk_region = _disk_region(disk)
+        if disk_region is None:
+            raise BenchError(f"Cannot determine the region for Hyperdisk {disk.get('name', '<unnamed>')}")
+        if disk_region != region:
+            continue
+        size_gb = _number(disk.get("sizeGb"), f"Hyperdisk size for {disk.get('name', '<unnamed>')}")
+        if not size_gb.is_integer() or size_gb <= 0:
+            raise BenchError(f"Invalid Hyperdisk size for {disk.get('name', '<unnamed>')}")
+        # Hyperdisk Balanced High Availability consumes twice its capacity
+        # against the shared HDB-TOTAL-GB regional quota.
+        usage_gb += size_gb * (2 if disk_type == "hyperdisk-balanced-high-availability" else 1)
+    return usage_gb
 
 
 def _active_benchmark_instances(instances: list[dict[str, Any]]) -> list[str]:
@@ -356,7 +412,12 @@ def _effective_firewall_rules(response: Any) -> list[dict[str, Any]]:
         rules = response
     elif isinstance(response, dict):
         if not any(key in response for key in ("firewalls", "firewallPolicys", "firewallPolicies")):
-            if any(key in response for key in ("allowed", "action", "match")):
+            if not response:
+                # Compute returns `{}` when a network has no effective
+                # firewall rules or policies. The API request itself has
+                # already succeeded, so this is a valid empty inventory.
+                rules = []
+            elif any(key in response for key in ("allowed", "action", "match")):
                 rules = [response]
             else:
                 raise BenchError("Could not safely interpret effective firewall rules; no VM will be created")
@@ -542,7 +603,15 @@ def audit_ssh_firewall_rules(
         )
 
 
-def preflight(gcloud: Gcloud, project: str, zone: str, network: str, subnet: str | None) -> dict[str, Any]:
+def preflight(
+    gcloud: Gcloud, project: str, zone: str, network: str, subnet: str | None,
+    machine_type: str = MACHINE_TYPE,
+) -> dict[str, Any]:
+    machine_spec = MACHINE_SPECS[machine_type]
+    expected_vcpus = machine_spec["vcpus"]
+    expected_ssd_count = machine_spec["ssd_count"]
+    expected_ssd_gb = machine_spec["ssd_gb"]
+    expected_ssd_gib = machine_spec["ssd_gib"]
     region = zone_region(zone)
     if not shutil.which("gcloud"):
         raise BenchError("gcloud is not installed; install the Google Cloud CLI and authenticate first")
@@ -555,34 +624,29 @@ def preflight(gcloud: Gcloud, project: str, zone: str, network: str, subnet: str
     if project_info.get("projectId") != project or project_info.get("lifecycleState") != "ACTIVE":
         raise BenchError(f"Project {project!r} is not active or did not match the requested project")
 
-    enabled_services = gcloud.json(["services", "list", "--enabled", f"--project={project}"])
-    enabled_names = {service.get("config", {}).get("name") for service in enabled_services}
-    missing = {"compute.googleapis.com", "cloudquotas.googleapis.com"} - enabled_names
-    if missing:
-        raise BenchError(
-            "Required APIs are not already enabled: " + ", ".join(sorted(missing)) + ". "
-            "The runner does not enable APIs or modify billing; enable them manually before retrying."
-        )
-
+    # Verify the required APIs by making the read-only Compute and Cloud
+    # Quotas requests used below. This avoids depending on the separate
+    # Service Usage API endpoint; Gcloud.run disables implicit API enablement,
+    # so disabled or inaccessible APIs still fail closed.
     zone_info = gcloud.json(["compute", "zones", "describe", zone, f"--project={project}"])
     if zone_info.get("status") != "UP":
         raise BenchError(f"Zone {zone} is not UP")
 
     machine = gcloud.json([
-        "compute", "machine-types", "describe", MACHINE_TYPE, f"--zone={zone}", f"--project={project}"
+        "compute", "machine-types", "describe", machine_type, f"--zone={zone}", f"--project={project}"
     ])
-    if int(machine.get("guestCpus", -1)) != EXPECTED_VCPUS:
-        raise BenchError(f"{MACHINE_TYPE} did not report exactly {EXPECTED_VCPUS} vCPUs")
+    if int(machine.get("guestCpus", -1)) != expected_vcpus:
+        raise BenchError(f"{machine_type} did not report exactly {expected_vcpus} vCPUs")
     bundled_local_ssds = machine.get("bundledLocalSsds")
     if (not isinstance(bundled_local_ssds, dict)
-            or bundled_local_ssds.get("partitionCount") != 1
+            or bundled_local_ssds.get("partitionCount") != expected_ssd_count
             or bundled_local_ssds.get("defaultInterface") != "NVME"):
         raise BenchError(
-            f"{MACHINE_TYPE} in {zone} must expose exactly one bundled NVMe Local SSD; "
+            f"{machine_type} in {zone} must expose exactly {expected_ssd_count} bundled NVMe Local SSD(s); "
             f"machine type returned bundledLocalSsds={bundled_local_ssds!r}"
         )
-    # This fixed machine type provides one 375-GiB partition. MachineType
-    # exposes its count/interface; the guest verifies capacity before formatting.
+    # MachineType exposes the bundled Local SSD count/interface; the guest
+    # verifies each device before assembling the benchmark filesystem.
 
     # Resolve the mutable image family once, then create from its immutable
     # image name so every host record can identify the exact boot image.
@@ -612,6 +676,7 @@ def preflight(gcloud: Gcloud, project: str, zone: str, network: str, subnet: str
     ], timeout=180)
     c4_cpu_limit, c4_cpu_source = quota_limit(quota_infos, "c4_cpu", region)
     local_ssd_limit, local_ssd_source = quota_limit(quota_infos, "local_ssd", region)
+    hyperdisk_limit, hyperdisk_source = quota_limit(quota_infos, "hyperdisk_balanced", region)
     local_ssd_family_scoped = "vm_family" in local_ssd_source["dimensions"]
 
     instances = gcloud.json(["compute", "instances", "list", f"--project={project}"], timeout=180)
@@ -683,16 +748,16 @@ def preflight(gcloud: Gcloud, project: str, zone: str, network: str, subnet: str
     c4_cpu_available = c4_cpu_limit - c4_cpu_used
     local_ssd_used = c4_ssd_used if local_ssd_family_scoped else regional_ssd_used
     local_ssd_available = local_ssd_limit - local_ssd_used
-    if c4_cpu_available < EXPECTED_VCPUS:
+    if c4_cpu_available < expected_vcpus:
         raise BenchError(
             f"Insufficient C4 CPU quota in {region}: limit={c4_cpu_limit:g}, "
-            f"current C4 use={c4_cpu_used}, available={c4_cpu_available:g}, need={EXPECTED_VCPUS}."
+            f"current C4 use={c4_cpu_used}, available={c4_cpu_available:g}, need={expected_vcpus}."
         )
-    if local_ssd_available < LOCAL_SSD_GB:
+    if local_ssd_available < expected_ssd_gb:
         raise BenchError(
             f"Insufficient C4 Local SSD quota in {region}: limit={local_ssd_limit:g} GB, "
             f"current Local SSD use={local_ssd_used} GB, available={local_ssd_available:g} GB, "
-            f"need={LOCAL_SSD_GB} GB."
+            f"need={expected_ssd_gb} GB."
         )
 
     region_info = gcloud.json(["compute", "regions", "describe", region, f"--project={project}"])
@@ -722,17 +787,13 @@ def preflight(gcloud: Gcloud, project: str, zone: str, network: str, subnet: str
             f"Insufficient external IPv4 quota in {region}: limit={address_quota['limit']}, "
             f"usage={address_quota['usage']}, need=1."
         )
-    hyperdisk_quota = next((quota for quota in region_info.get("quotas", [])
-                            if _norm(quota.get("metric", "")) == _norm("HDB_TOTAL_GB")), None)
-    if hyperdisk_quota is None:
-        raise BenchError("Could not verify the regional Hyperdisk Balanced capacity quota; no VM will be created")
-    hyperdisk_available = _number(hyperdisk_quota.get("limit"), "Hyperdisk Balanced quota limit") - _number(
-        hyperdisk_quota.get("usage"), "Hyperdisk Balanced quota usage"
-    )
+    hyperdisks = gcloud.json(["compute", "disks", "list", f"--project={project}"])
+    hyperdisk_used = _hyperdisk_balanced_usage_gb(hyperdisks, region)
+    hyperdisk_available = hyperdisk_limit - hyperdisk_used
     if hyperdisk_available < 50:
         raise BenchError(
-            f"Insufficient Hyperdisk Balanced quota in {region}: limit={hyperdisk_quota['limit']} GB, "
-            f"usage={hyperdisk_quota['usage']} GB, available={hyperdisk_available:g} GB, need=50 GB."
+            f"Insufficient Hyperdisk Balanced quota in {region}: limit={hyperdisk_limit:g} GB, "
+            f"inventory use={hyperdisk_used:g} GB, available={hyperdisk_available:g} GB, need=50 GB."
         )
 
     global_project_info = gcloud.json(["compute", "project-info", "describe", f"--project={project}"])
@@ -747,18 +808,18 @@ def preflight(gcloud: Gcloud, project: str, zone: str, network: str, subnet: str
         global_cpu_available = _number(global_cpu_quota.get("limit"), "global CPU quota limit") - _number(
             global_cpu_quota.get("usage"), "global CPU quota usage"
         )
-        if global_cpu_available < EXPECTED_VCPUS:
+        if global_cpu_available < expected_vcpus:
             raise BenchError(
                 f"Insufficient CPUS_ALL_REGIONS quota: limit={global_cpu_quota['limit']}, "
                 f"usage={global_cpu_quota['usage']}, available={global_cpu_available:g}, "
-                f"need={EXPECTED_VCPUS}."
+                f"need={expected_vcpus}."
             )
         global_cpu_report = {
             "applicable": True,
             "limit": _number(global_cpu_quota.get("limit"), "global CPU quota limit"),
             "usage": _number(global_cpu_quota.get("usage"), "global CPU quota usage"),
             "available": global_cpu_available,
-            "required": EXPECTED_VCPUS,
+            "required": expected_vcpus,
         }
     firewall_quota = next((quota for quota in global_quotas
                            if _norm(quota.get("metric", "")) == _norm("FIREWALLS")), None)
@@ -780,10 +841,11 @@ def preflight(gcloud: Gcloud, project: str, zone: str, network: str, subnet: str
         "zone": zone,
         "region": region,
         "zone_status": zone_info.get("status"),
-        "machine_type": MACHINE_TYPE,
+        "machine_type": machine_type,
         "guest_vcpus": int(machine["guestCpus"]),
         "bundled_local_ssds": bundled_local_ssds,
-        "local_ssd_capacity_gib": LOCAL_SSD_GIB,
+        "local_ssd_capacity_gib": expected_ssd_gib,
+        "local_ssd_count": expected_ssd_count,
         "machine_type_local_ssd_verified": True,
         "boot_image": {
             "project": "ubuntu-os-cloud",
@@ -792,7 +854,8 @@ def preflight(gcloud: Gcloud, project: str, zone: str, network: str, subnet: str
         },
         "actual_zonal_capacity_guaranteed": False,
         "capacity_note": (
-            "The zone and machine type support one 375 GB Local SSD and project quotas have room. "
+            f"The zone and machine type support {expected_ssd_count} bundled Local SSD(s) "
+            f"({expected_ssd_gb} GB total) and project quotas have room. "
             "GCP does not guarantee currently free host capacity through this preflight; instance creation "
             "can still fail if the zone is depleted."
         ),
@@ -803,7 +866,7 @@ def preflight(gcloud: Gcloud, project: str, zone: str, network: str, subnet: str
                 "limit": c4_cpu_limit,
                 "inventory_used": c4_cpu_used,
                 "available": c4_cpu_available,
-                "required": EXPECTED_VCPUS,
+                "required": expected_vcpus,
                 "source": c4_cpu_source,
             },
             "c4_local_ssd_gb": {
@@ -811,7 +874,7 @@ def preflight(gcloud: Gcloud, project: str, zone: str, network: str, subnet: str
                 "inventory_used": local_ssd_used,
                 "inventory_scope": "C4" if local_ssd_family_scoped else "region",
                 "available": local_ssd_available,
-                "required": LOCAL_SSD_GB,
+                "required": expected_ssd_gb,
                 "source": local_ssd_source,
             },
             "vm_instances": {
@@ -827,10 +890,11 @@ def preflight(gcloud: Gcloud, project: str, zone: str, network: str, subnet: str
                 "required": 1,
             },
             "hyperdisk_balanced_gb": {
-                "limit": _number(hyperdisk_quota.get("limit"), "Hyperdisk Balanced quota limit"),
-                "usage": _number(hyperdisk_quota.get("usage"), "Hyperdisk Balanced quota usage"),
+                "limit": hyperdisk_limit,
+                "inventory_used": hyperdisk_used,
                 "available": hyperdisk_available,
                 "required": 50,
+                "source": hyperdisk_source,
             },
             "cpus_all_regions": global_cpu_report,
             "firewalls": {
@@ -857,6 +921,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--project", required=True, help="Explicit GCP project ID; no gcloud default is used")
     parser.add_argument("--zone", required=True, help="Zone to verify and use, for example us-central1-a")
     parser.add_argument("--commit", required=True, help="Full 40-character toy-kv-engine commit SHA to benchmark")
+    parser.add_argument("--machine-type", choices=tuple(MACHINE_SPECS), default=MACHINE_TYPE,
+                        help="C4 Local SSD shape (default: c4-standard-8-lssd)")
+    parser.add_argument("--writers", type=int, nargs="+", choices=(1, 2, 4, 8, 16),
+                        help="Writer counts to run (defaults: 1 4 8 for batch64; 1 2 4 8 16 for full matrix)")
+    parser.add_argument("--full-rfc026-matrix", action="store_true",
+                        help="Run point/batch8/batch16/batch64 across V4/V7/V8 parallel and V8 Leader")
     parser.add_argument("--network", default="default", help="Existing VPC network (default: default)")
     parser.add_argument("--subnet", help="Subnetwork name for custom-mode VPCs (must be in the requested region)")
     parser.add_argument("--ssh-source-range", help="Restricted IPv4 CIDR allowed to SSH to this ephemeral VM")
@@ -872,10 +942,18 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--confirm-free-trial", action="store_true",
                         help="Attest that Billing Overview says Free Trial and you will not upgrade to Paid")
     args = parser.parse_args(argv)
+    if args.writers is None:
+        args.writers = FULL_DEFAULT_WRITERS if args.full_rfc026_matrix else LEGACY_DEFAULT_WRITERS
+    try:
+        args.writers = validate_writer_counts(args.writers)
+    except ValueError as error:
+        parser.error(str(error))
     if not re.fullmatch(r"[0-9a-fA-F]{40}", args.commit):
         parser.error("--commit must be a full 40-character SHA")
     if args.num < 64:
         parser.error("--num must be at least 64")
+    if args.full_rfc026_matrix and args.num != 750_000:
+        parser.error("--full-rfc026-matrix uses its fixed per-workload operation counts; omit --num overrides")
     if not MIN_RUNTIME_MINUTES <= args.max_runtime_minutes <= MAX_RUNTIME_MINUTES:
         parser.error(f"--max-runtime-minutes must be between {MIN_RUNTIME_MINUTES} and {MAX_RUNTIME_MINUTES}")
     if (args.estimated_hourly_cost_usd is None) != (args.max_estimated_spend_usd is None):
@@ -1005,16 +1083,26 @@ def collect_artifacts(
 
 
 def _host_key_lines(response: Any, ip: str) -> list[str]:
-    if not isinstance(response, dict):
+    if isinstance(response, list):
+        attributes = []
+        for item in response:
+            if not isinstance(item, dict):
+                continue
+            namespace = str(item.get("namespace", "")).strip("/")
+            key = str(item.get("key", "")).strip("/")
+            if namespace and key:
+                attributes.append({"queryPath": f"{namespace}/{key}", "value": item.get("value", "")})
+    elif isinstance(response, dict):
+        attributes = response.get("guestAttributes", [])
+    else:
         return []
     allowed_algorithms = {
         "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp521",
         "ssh-ed25519", "ssh-rsa",
     }
-    attributes = response.get("guestAttributes", [])
     if not isinstance(attributes, list):
         attributes = []
-    query_value = response.get("queryValue") or {}
+    query_value = response.get("queryValue") or {} if isinstance(response, dict) else {}
     if isinstance(query_value, dict):
         items = query_value.get("items", [])
         if isinstance(items, list):
@@ -1208,11 +1296,12 @@ def provision_and_run(
         try:
             create = [
                 "beta", "compute", "instances", "create", instance,
-                f"--project={args.project}", f"--zone={args.zone}", f"--machine-type={MACHINE_TYPE}",
+                f"--project={args.project}", f"--zone={args.zone}", f"--machine-type={args.machine_type}",
                 f"--image={preflight_result['boot_image']['name']}", "--image-project=ubuntu-os-cloud",
                 "--boot-disk-size=50GB", "--boot-disk-type=hyperdisk-balanced", "--boot-disk-auto-delete",
+                "--boot-disk-provisioned-iops=3000", "--boot-disk-provisioned-throughput=140",
                 f"--max-run-duration={args.max_runtime_minutes}m", "--instance-termination-action=DELETE",
-                "--no-service-account",
+                "--no-service-account", "--no-scopes",
                 f"--network={args.network}", f"--tags={tag}", f"--metadata-from-file=ssh-keys={key_metadata}",
                 "--metadata=block-project-ssh-keys=TRUE,enable-guest-attributes=TRUE,enable-oslogin=FALSE",
                 "--quiet",
@@ -1242,7 +1331,7 @@ def provision_and_run(
 
             write_json(results_dir / "instance.json", {
                 "project": args.project, "zone": args.zone, "instance": instance,
-                "machine_type": MACHINE_TYPE, "external_ip": ip,
+                "machine_type": args.machine_type, "external_ip": ip,
                 "termination_timestamp": instance_info.get("terminationTimestamp"),
                 "auto_delete_deadline_minutes": args.max_runtime_minutes,
             })
@@ -1297,9 +1386,23 @@ def provision_and_run(
             if scp_result.returncode:
                 raise BenchError(f"Could not copy remote runner: {scp_result.stderr.strip()}")
 
-            remaining_budget = int(deadline_epoch - time.time() - 600)
+            if not MATRIX_MODULE.is_file():
+                raise BenchError(f"Benchmark matrix module is not present in this checkout: {MATRIX_MODULE}")
+            audit_ssh_firewall_rules(
+                gcloud, args.project, args.network, network_region, tag, args.ssh_source_range
+            )
+            matrix_copy = scp_to_vm(
+                ip, MATRIX_MODULE, "/tmp/gcp_wal_matrix.py", key, known_hosts, timeout=120
+            )
+            append_local_log(key_log, matrix_copy.stdout + matrix_copy.stderr)
+            if matrix_copy.returncode:
+                raise BenchError(f"Could not copy benchmark matrix module: {matrix_copy.stderr.strip()}")
+
+            safe_deadline_epoch = int(deadline_epoch - 600)
             remote_command = "sudo -n bash /tmp/run-wal-bench.sh " + shlex.join([
-                args.commit.lower(), str(args.num), args.project, args.zone, instance, str(remaining_budget)
+                args.commit.lower(), str(args.num), args.project, args.zone, instance, str(safe_deadline_epoch),
+                args.machine_type, ",".join(str(writer) for writer in args.writers),
+                "rfc026-full" if args.full_rfc026_matrix else "batch64",
             ])
             remaining = max(30, int(deadline - time.monotonic()))
             try:
@@ -1396,15 +1499,19 @@ def main(argv: list[str] | None = None) -> int:
     gcloud = Gcloud(args.project, results_dir / "gcloud-commands.jsonl")
 
     try:
-        report = preflight(gcloud, args.project, args.zone, args.network, args.subnet)
+        report = preflight(gcloud, args.project, args.zone, args.network, args.subnet, args.machine_type)
         report["benchmark_commit"] = args.commit.lower()
-        report["writer_counts"] = [1, 4, 8]
-        report["format_order_per_writer"] = [
-            ["v4", "v7", "v8", "v8", "v7", "v4"],
-            ["v8", "v7", "v4", "v4", "v7", "v8"],
-        ]
-        report["writes_per_run"] = args.num
-        report["batch_entries"] = 64
+        report["writer_counts"] = list(args.writers)
+        report["benchmark_suite"] = "rfc026-full" if args.full_rfc026_matrix else "batch64"
+        report["benchmark_plan"] = build_benchmark_plan(
+            full_matrix=args.full_rfc026_matrix,
+            writers=args.writers,
+            machine_type=args.machine_type,
+            machine_spec=MACHINE_SPECS[args.machine_type],
+            num=args.num,
+            commit=args.commit.lower(),
+        )
+        report["machine_type"] = args.machine_type
         report["free_trial_attestation"] = bool(args.confirm_free_trial)
         if args.estimated_hourly_cost_usd is not None:
             report["cost_guard"] = {

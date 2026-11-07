@@ -10,6 +10,7 @@ in the [RFC directory](../rfcs/).
 | [Backup](backup/) | Incremental backup implementation and benchmarks. |
 | [PITR](pitr/) | Point-in-time recovery implementation and performance. |
 | [Async](async/) | Async lifecycle measurement and scan findings. |
+| [GCP test environment](../infra/gcp/test-environment/README.md) | Terraform setup for a reusable GCP test host with Local SSD and quota preflight. |
 | [Plans and specs](superpowers/) | Focused implementation plans and design specifications. |
 | [Assets](assets/) | Documentation images. |
 

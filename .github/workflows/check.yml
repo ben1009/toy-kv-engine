@@ -93,10 +93,13 @@ jobs:
       - name: cargo check hotpath-profile
         run: cargo check --locked -p kv-engine --features hotpath-profile --bin write-perf
 
-  gcp-bench:
+  gcp-test-environment:
     runs-on: ubuntu-latest
-    name: gcp-bench
-    timeout-minutes: 5
+    name: gcp-test-environment
+    timeout-minutes: 10
+    env:
+      CHECKPOINT_DISABLE: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
     steps:
       - name: Harden Runner
         uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
@@ -105,10 +108,32 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Install Terraform for offline infrastructure checks
+        env:
+          TERRAFORM_VERSION: "1.17.1"
+          TERRAFORM_SHA256: "4638628058e71a55212b1c563712eac03b902128f40740f3dc8174df12135061"
+        run: |
+          terraform_tools="$RUNNER_TEMP/gcp-terraform"
+          mkdir -p "$terraform_tools"
+          curl --fail --silent --show-error --location --retry 3 \
+            --connect-timeout 15 --max-time 120 \
+            -o "$terraform_tools/terraform.zip" \
+            "https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_amd64.zip"
+          echo "$TERRAFORM_SHA256  $terraform_tools/terraform.zip" | sha256sum -c -
+          unzip -q "$terraform_tools/terraform.zip" -d "$terraform_tools"
+          echo "$terraform_tools" >> "$GITHUB_PATH"
+      - name: Check Terraform formatting
+        run: terraform -chdir=infra/gcp/test-environment fmt -check -recursive
+      - name: Initialize locked provider without a remote backend
+        run: terraform -chdir=infra/gcp/test-environment init -backend=false -input=false -lockfile=readonly
+      - name: Validate Terraform schema
+        run: terraform -chdir=infra/gcp/test-environment validate -no-color
+      - name: Test Terraform plans and lifecycle with a mocked provider
+        run: terraform -chdir=infra/gcp/test-environment test -no-color
       - name: Check remote runner syntax
         run: bash -n scripts/gcp-free-trial-wal-bench-remote.sh
-      - name: Check GCP orchestration and result generation offline
-        run: python3 -m unittest discover -s scripts -p test_gcp_free_trial_wal_bench.py
+      - name: Check all GCP preflight, bootstrap, template and benchmark tests offline
+        run: python3 -m unittest discover -s scripts -p 'test_gcp*.py'
 
   typos:
     runs-on: ubuntu-latest

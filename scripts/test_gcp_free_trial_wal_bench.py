@@ -15,6 +15,16 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from gcp_wal_matrix import (
+    FULL_DEFAULT_WRITERS,
+    LEGACY_DEFAULT_WRITERS,
+    build_benchmark_plan,
+    build_batch64_schedule,
+    build_rfc026_schedule,
+    validate_batch64_rows,
+    validate_rfc026_rows,
+)
+
 
 SCRIPT = Path(__file__).with_name("gcp-free-trial-wal-bench.py")
 SPEC = importlib.util.spec_from_file_location("gcp_free_trial_wal_bench", SCRIPT)
@@ -29,8 +39,10 @@ class PreflightGcloud:
     def __init__(self, *, family_scoped=True):
         self.machine = {"guestCpus": 8, "bundledLocalSsds": {"partitionCount": 1, "defaultInterface": "NVME"}}
         self.instances = []
+        self.disks = []
         self.family_scoped = family_scoped
         self.ssd_limit = 750
+        self.json_calls = []
 
     def run(self, command):
         if command != ["auth", "list", "--filter=status:ACTIVE", "--format=value(account)"]:
@@ -38,13 +50,12 @@ class PreflightGcloud:
         return subprocess.CompletedProcess(command, 0, "bench@example.com\n", "")
 
     def json(self, command, *, timeout=120):
+        self.json_calls.append(command)
         if command[:2] == ["projects", "describe"]:
             return {"projectId": "test-project", "lifecycleState": "ACTIVE"}
-        if command[:2] == ["services", "list"]:
-            return [{"config": {"name": name}} for name in ("compute.googleapis.com", "cloudquotas.googleapis.com")]
         if command[:3] == ["compute", "zones", "describe"]:
             return {"status": "UP"}
-        if command[:3] == ["compute", "machine-types", "describe"] and command[3] == BENCH.MACHINE_TYPE:
+        if command[:3] == ["compute", "machine-types", "describe"] and command[3] in BENCH.MACHINE_SPECS:
             return self.machine
         if command[:3] == ["compute", "images", "describe-from-family"]:
             return {"status": "READY", "name": "ubuntu-2404-pinned-image"}
@@ -61,15 +72,24 @@ class PreflightGcloud:
                 {"quotaId": "LOCAL_SSD_TOTAL_GB", "dimensionsInfo": [{
                     "dimensions": ssd_dimensions, "details": {"quotaValue": self.ssd_limit},
                 }]},
+                {"quotaId": "HDB-TOTAL-GB-per-project-region",
+                 "metric": "compute.googleapis.com/hyperdisk_balanced_total_storage",
+                 "dimensionsInfos": [{
+                     "dimensions": {"region": "us-central1"},
+                     "applicableLocations": ["us-central1"],
+                     "details": {"value": "100"},
+                 }]},
             ]
         if command[:3] == ["compute", "instances", "list"]:
             return self.instances
+        if command[:3] == ["compute", "disks", "list"]:
+            return self.disks
         if command[:3] == ["compute", "reservations", "list"]:
             return []
         if command[:3] == ["compute", "regions", "describe"]:
             return {"status": "UP", "quotas": [
                 {"metric": name, "limit": limit, "usage": 0}
-                for name, limit in (("INSTANCES", 10), ("IN_USE_ADDRESSES", 10), ("HDB_TOTAL_GB", 100))
+                for name, limit in (("INSTANCES", 10), ("IN_USE_ADDRESSES", 10))
             ]}
         if command[:3] == ["compute", "project-info", "describe"]:
             return {"quotas": [{"metric": "FIREWALLS", "limit": 10, "usage": 0}]}
@@ -77,7 +97,11 @@ class PreflightGcloud:
 
 
 class ProvisionGcloud:
+    def __init__(self):
+        self.calls = []
+
     def run(self, command, **_kwargs):
+        self.calls.append(command)
         return subprocess.CompletedProcess(command, 0, "--max-run-duration --instance-termination-action", "")
 
     def json(self, command):
@@ -95,15 +119,114 @@ def fake_keygen(command, **_kwargs):
 
 
 class GcpFreeTrialWalBenchTests(unittest.TestCase):
-    def preflight(self, gcloud):
+    def test_writer_defaults_are_suite_specific_and_duplicates_are_rejected(self) -> None:
+        common = ["--project", "project", "--zone", "us-central1-a", "--commit", "a" * 40, "--preflight-only"]
+        legacy = BENCH.parse_args(common)
+        full = BENCH.parse_args([*common, "--full-rfc026-matrix"])
+        self.assertEqual(legacy.writers, LEGACY_DEFAULT_WRITERS)
+        self.assertEqual(full.writers, FULL_DEFAULT_WRITERS)
+        explicit = BENCH.parse_args([*common, "--writers", "2", "16"])
+        self.assertEqual(explicit.writers, (2, 16))
+        with self.assertRaises(SystemExit):
+            BENCH.parse_args([*common, "--writers", "2", "2"])
+
+    def test_benchmark_plan_matches_suite_and_machine_shape(self) -> None:
+        full = build_benchmark_plan(
+            full_matrix=True, writers=FULL_DEFAULT_WRITERS, machine_type="c4-standard-16-lssd",
+            machine_spec={"vcpus": 16, "ssd_count": 2, "ssd_gib": 750},
+        )
+        self.assertEqual(full["score_runs_planned"], 320)
+        self.assertEqual(full["runtime_protocol"], "single 16-vCPU host; RAID0 over 2 Local SSDs")
+        small = build_benchmark_plan(
+            full_matrix=False, writers=(2,), machine_type="c4-standard-8-lssd",
+            machine_spec={"vcpus": 8, "ssd_count": 1, "ssd_gib": 375}, num=128,
+        )
+        self.assertEqual(small["score_runs_planned"], 12)
+        self.assertEqual(small["runtime_protocol"], "single 8-vCPU host; single Local SSD")
+
+    def test_matrix_validators_reject_missing_duplicate_unexpected_failed_and_wrong_ops(self) -> None:
+        full_schedule = build_rfc026_schedule((1,))
+        full_rows = [{
+            "writer": cell["writer"], "workload": cell["workload"], "repetition": cell["repetition"],
+            "arm": cell["arm"], "ops": cell["num"], "exit_code": 0,
+        } for cell in full_schedule]
+        self.assertTrue(validate_rfc026_rows(full_rows, (1,))["complete"])
+        self.assertFalse(validate_rfc026_rows(full_rows[:-1], (1,))["complete"])
+        forked = [*full_rows[:-1], full_rows[0]]
+        result = validate_rfc026_rows(forked, (1,))
+        self.assertFalse(result["complete"])
+        self.assertTrue(result["duplicate_cells"])
+        self.assertTrue(result["missing_cells"])
+        wrong_ops = [*full_rows]
+        wrong_ops[0] = {**wrong_ops[0], "ops": 99}
+        self.assertFalse(validate_rfc026_rows(wrong_ops, (1,))["complete"])
+        unexpected = [*full_rows, {**full_rows[0], "writer": 2}]
+        self.assertFalse(validate_rfc026_rows(unexpected, (1,))["complete"])
+        failed = [*full_rows]
+        failed[0] = {**failed[0], "exit_code": 65}
+        self.assertFalse(validate_rfc026_rows(failed, (1,))["complete"])
+
+        legacy_schedule = build_batch64_schedule((2,))
+        legacy_rows = [{
+            "writer": cell["writer"], "block": cell["block"], "position": cell["position"],
+            "format": cell["arm"], "ops": 128, "exit_code": 0,
+        } for cell in legacy_schedule]
+        self.assertTrue(validate_batch64_rows(legacy_rows, (2,), 128)["complete"])
+        self.assertFalse(validate_batch64_rows(legacy_rows[:-1], (2,), 128)["complete"])
+        legacy_duplicate = [*legacy_rows[:-1], legacy_rows[0]]
+        self.assertFalse(validate_batch64_rows(legacy_duplicate, (2,), 128)["complete"])
+
+    def preflight(self, gcloud, machine_type=BENCH.MACHINE_TYPE):
         with patch.object(BENCH.shutil, "which", return_value="/usr/bin/gcloud"):
-            return BENCH.preflight(gcloud, "test-project", "us-central1-a", "default", None)
+            return BENCH.preflight(gcloud, "test-project", "us-central1-a", "default", None, machine_type)
 
     def test_preflight_accepts_compute_bundled_local_ssd_metadata(self) -> None:
-        report = self.preflight(PreflightGcloud())
+        gcloud = PreflightGcloud()
+        report = self.preflight(gcloud)
         self.assertEqual(report["bundled_local_ssds"], {"partitionCount": 1, "defaultInterface": "NVME"})
         self.assertEqual(report["local_ssd_capacity_gib"], 375)
         self.assertTrue(report["machine_type_local_ssd_verified"])
+        self.assertIn(["compute", "zones", "describe", "us-central1-a", "--project=test-project"],
+                      gcloud.json_calls)
+        self.assertTrue(any(call[:3] == ["quotas", "info", "list"] for call in gcloud.json_calls))
+        self.assertIn(["compute", "disks", "list", "--project=test-project"], gcloud.json_calls)
+        self.assertFalse(any(call[:2] == ["services", "list"] for call in gcloud.json_calls))
+        self.assertEqual(report["quotas"]["hyperdisk_balanced_gb"]["limit"], 100)
+        self.assertEqual(report["quotas"]["hyperdisk_balanced_gb"]["inventory_used"], 0)
+
+    def test_preflight_accepts_16_vcpu_two_ssd_machine(self) -> None:
+        gcloud = PreflightGcloud()
+        gcloud.machine = {
+            "guestCpus": 16,
+            "bundledLocalSsds": {"partitionCount": 2, "defaultInterface": "NVME"},
+        }
+        gcloud.ssd_limit = 1500
+        report = self.preflight(gcloud, "c4-standard-16-lssd")
+        self.assertEqual(report["guest_vcpus"], 16)
+        self.assertEqual(report["local_ssd_count"], 2)
+        self.assertEqual(report["local_ssd_capacity_gib"], 750)
+        self.assertEqual(report["quotas"]["c4_cpu"]["required"], 16)
+        self.assertEqual(report["quotas"]["c4_local_ssd_gb"]["required"], 750)
+
+    def test_preflight_fails_closed_when_compute_api_is_unavailable(self) -> None:
+        class ComputeUnavailable(PreflightGcloud):
+            def json(self, command, *, timeout=120):
+                if command[:3] == ["compute", "zones", "describe"]:
+                    raise BENCH.BenchError("API [compute.googleapis.com] is disabled")
+                return super().json(command, timeout=timeout)
+
+        with self.assertRaisesRegex(BENCH.BenchError, "compute.googleapis.com.*disabled"):
+            self.preflight(ComputeUnavailable())
+
+    def test_preflight_fails_closed_when_cloud_quotas_api_is_unavailable(self) -> None:
+        class CloudQuotasUnavailable(PreflightGcloud):
+            def json(self, command, *, timeout=120):
+                if command[:3] == ["quotas", "info", "list"]:
+                    raise BENCH.BenchError("API [cloudquotas.googleapis.com] is disabled")
+                return super().json(command, timeout=timeout)
+
+        with self.assertRaisesRegex(BENCH.BenchError, "cloudquotas.googleapis.com.*disabled"):
+            self.preflight(CloudQuotasUnavailable())
 
     def test_preflight_rejects_unverified_local_ssd_configuration(self) -> None:
         for bundled in (None, {}, {"partitionCount": 2, "defaultInterface": "NVME"},
@@ -111,7 +234,7 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
             with self.subTest(bundled=bundled):
                 gcloud = PreflightGcloud()
                 gcloud.machine["bundledLocalSsds"] = bundled
-                with self.assertRaisesRegex(BENCH.BenchError, "one bundled NVMe Local SSD"):
+                with self.assertRaisesRegex(BENCH.BenchError, "exactly 1 bundled NVMe Local SSD"):
                     self.preflight(gcloud)
 
     def test_preflight_counts_attached_local_ssds_for_family_and_regional_quotas(self) -> None:
@@ -154,6 +277,74 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
             ],
         }]
         self.assertEqual(BENCH.quota_limit(quotas, "local_ssd", "us-central1")[0], 750)
+
+    def test_quota_limit_accepts_live_plural_dimensions_and_prefers_family_limit(self) -> None:
+        quotas = {"quotaInfos": [
+            {
+                "quotaId": "CPUS_PER_VM_FAMILY-per-project-region",
+                "metric": "compute.googleapis.com/cpus",
+                "dimensionsInfos": [{
+                    "dimensions": {"vm_family": "C4"},
+                    "applicableLocations": ["us-central1"],
+                    "details": {"value": "6000"},
+                }],
+            },
+            {
+                "quotaId": "LOCAL-SSD-TOTAL-GB-PER-VM-FAMILY-per-project-region",
+                "metric": "compute.googleapis.com/local_ssd_total_storage_per_vm_family",
+                "dimensionsInfos": [
+                    {"dimensions": {"vm_family": "C4"}, "applicableLocations": ["us-central1"],
+                     "details": {"value": "6000"}},
+                    {"dimensions": {"vm_family": "N2"}, "applicableLocations": ["us-central1"],
+                     "details": {"value": "6000"}},
+                ],
+            },
+            {
+                "quotaId": "LOCAL-SSD-TOTAL-GB-per-project-region",
+                "metric": "compute.googleapis.com/local_ssd_total_storage",
+                "dimensionsInfos": [{
+                    "applicableLocations": ["us-central1"],
+                    "details": {"value": "-1"},
+                }],
+            },
+            {
+                "quotaId": "HDB-TOTAL-GB-per-project-region",
+                "metric": "compute.googleapis.com/hyperdisk_balanced_total_storage",
+                "dimensionsInfos": [{
+                    "dimensions": {"region": "us-central1"},
+                    "applicableLocations": ["us-central1"],
+                    "details": {"value": "500"},
+                }],
+            },
+        ]}
+
+        self.assertEqual(BENCH.quota_limit(quotas, "c4_cpu", "us-central1")[0], 6000)
+        self.assertEqual(BENCH.quota_limit(quotas, "local_ssd", "us-central1")[0], 6000)
+        self.assertEqual(BENCH.quota_limit(quotas, "hyperdisk_balanced", "us-central1")[0], 500)
+
+    def test_hyperdisk_inventory_counts_balanced_and_doubles_ha_capacity(self) -> None:
+        disks = [
+            {"name": "zonal", "zone": "https://compute/zones/us-central1-a",
+             "type": "https://compute/diskTypes/hyperdisk-balanced", "sizeGb": "30"},
+            {"name": "regional-ha", "region": "https://compute/regions/us-central1",
+             "type": "https://compute/diskTypes/hyperdisk-balanced-high-availability", "sizeGb": "20"},
+            {"name": "other-region", "zone": "https://compute/zones/us-east1-b",
+             "type": "https://compute/diskTypes/hyperdisk-balanced", "sizeGb": "500"},
+            {"name": "local-ssd", "zone": "https://compute/zones/us-central1-a",
+             "type": "https://compute/diskTypes/local-ssd", "sizeGb": "375"},
+        ]
+        self.assertEqual(BENCH._hyperdisk_balanced_usage_gb(disks, "us-central1"), 70)
+
+    def test_preflight_rejects_hyperdisk_quota_without_enough_inventory_headroom(self) -> None:
+        gcloud = PreflightGcloud()
+        gcloud.disks = [{
+            "name": "existing",
+            "zone": "https://compute/zones/us-central1-a",
+            "type": "https://compute/diskTypes/hyperdisk-balanced",
+            "sizeGb": "60",
+        }]
+        with self.assertRaisesRegex(BENCH.BenchError, "available=40 GB, need=50 GB"):
+            self.preflight(gcloud)
 
     def test_legacy_regional_local_ssd_quota_is_accepted(self) -> None:
         quotas = [{
@@ -302,6 +493,7 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
             args = BENCH.argparse.Namespace(
                 project="test-project", zone="us-central1-a", network="default", subnet=None,
                 ssh_source_range="203.0.113.10/32", max_runtime_minutes=60, commit="a" * 40, num=64,
+                machine_type=BENCH.MACHINE_TYPE, writers=(1, 4, 8), full_rfc026_matrix=False,
             )
             disk_full = False
 
@@ -337,7 +529,9 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
             args = BENCH.argparse.Namespace(
                 project="test-project", zone="us-central1-a", network="default", subnet=None,
                 ssh_source_range="203.0.113.10/32", max_runtime_minutes=60, commit="a" * 40, num=64,
+                machine_type=BENCH.MACHINE_TYPE, writers=(1, 4, 8), full_rfc026_matrix=False,
             )
+            gcloud = ProvisionGcloud()
             with (
                 patch.object(BENCH.shutil, "which", return_value="/usr/bin/tool"),
                 patch.object(BENCH, "audit_ssh_firewall_rules"),
@@ -348,9 +542,17 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
                 patch.object(BENCH, "cleanup_gcp_resources", return_value=([], {}, False)) as cleanup,
             ):
                 result = BENCH.provision_and_run(
-                    args, ProvisionGcloud(), Path(temp), {"boot_image": {"name": "pinned"}}
+                    args, gcloud, Path(temp), {"boot_image": {"name": "pinned"}}
                 )
                 self.assertEqual(result, 1)
+                create = next(
+                    call for call in gcloud.calls
+                    if call[:4] == ["beta", "compute", "instances", "create"] and "--help" not in call
+                )
+                self.assertIn("--no-service-account", create)
+                self.assertIn("--no-scopes", create)
+                self.assertIn("--boot-disk-provisioned-iops=3000", create)
+                self.assertIn("--boot-disk-provisioned-throughput=140", create)
                 ssh.assert_not_called()
                 collection.assert_not_called()
                 cleanup.assert_called_once()
@@ -414,6 +616,7 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
 
     def test_effective_firewall_parser_accepts_empty_inventory_and_policy_rules(self) -> None:
         self.assertEqual(BENCH._effective_firewall_rules({"firewalls": [], "firewallPolicys": []}), [])
+        self.assertEqual(BENCH._effective_firewall_rules({}), [])
         policy = {"firewallPolicys": [{"rules": [{"action": "deny"}]}]}
         self.assertEqual(BENCH._effective_firewall_rules(policy), [{"action": "deny"}])
 
@@ -463,9 +666,11 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
         openssh_response = {"guestAttributes": [
             {"queryPath": "hostkeys/ssh-ed25519/0", "value": f"ssh-ed25519 {encoded} vm"},
         ]}
+        gcloud_list_response = [{"namespace": "hostkeys", "key": "ssh-ed25519", "value": encoded}]
         expected = [f"192.0.2.1 ssh-ed25519 {encoded}"]
         self.assertEqual(BENCH._host_key_lines(guest_response, "192.0.2.1"), expected)
         self.assertEqual(BENCH._host_key_lines(openssh_response, "192.0.2.1"), expected)
+        self.assertEqual(BENCH._host_key_lines(gcloud_list_response, "192.0.2.1"), expected)
 
     def test_host_key_parser_rejects_algorithm_mismatch(self) -> None:
         algorithm = b"ssh-ed25519"
@@ -486,8 +691,10 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
                 stdout='[{"metadata":{"private":"secret"}}]',
                 stderr="diagnostic-secret",
             )
-            with patch.object(BENCH.subprocess, "run", return_value=completed):
+            with patch.object(BENCH.subprocess, "run", return_value=completed) as mock_run:
                 gcloud.run(["compute", "instances", "list"])
+            child_env = mock_run.call_args.kwargs["env"]
+            self.assertEqual(child_env["CLOUDSDK_CORE_SHOULD_PROMPT_TO_ENABLE_API"], "false")
             logged = json.loads(path.read_text(encoding="utf-8"))
             self.assertNotIn("secret", path.read_text(encoding="utf-8"))
             self.assertEqual(logged["stdout_bytes"], len(completed.stdout.encode("utf-8")))
@@ -605,7 +812,10 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
                     "process_cpu_user_ms": 10,
                     "process_cpu_system_ms": 5,
                 },
-                "params": {"wal_format_version": 8},
+                "params": {
+                    "num": 64, "threads": 8, "value_size": 1024, "batch_size": 8,
+                    "wal_format_version": 8, "wal_io_mode": "parallel",
+                },
                 "latency": {"p99_ms": 1.2},
             }), encoding="utf-8")
             with (run_dir.parent / "summary.tsv").open("w", encoding="utf-8") as stream:
@@ -614,7 +824,7 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
                     "p99_ms\tcpu_seconds\tsync_count\tduration_seconds\n"
                 )
             result = subprocess.run(
-                ["python3", "-", str(run_dir), "1", "1", "1", "v8", "0", "1.0", "64"],
+                ["python3", "-", str(run_dir), "8", "1", "1", "v8", "0", "1.0", "64"],
                 input=parser,
                 text=True,
                 capture_output=True,
@@ -630,14 +840,30 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
             self.assertEqual(fields[9], "")
             self.assertAlmostEqual(float(fields[10]), 1.0)
 
+            # Batch size is capped by the largest per-writer operation partition.
+            record_path = run_dir / "result.json"
+            record = json.loads(record_path.read_text(encoding="utf-8"))
+            record["params"]["batch_size"] = 64
+            record_path.write_text(json.dumps(record), encoding="utf-8")
+            rejected = subprocess.run(
+                ["python3", "-", str(run_dir), "8", "1", "2", "v8", "0", "1.0", "64"],
+                input=parser,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(rejected.returncode, 65)
+
     def test_remote_summary_completes_with_only_the_benchmark_environment(self) -> None:
         source = Path(__file__).with_name("gcp-free-trial-wal-bench-remote.sh").read_text(encoding="utf-8")
-        start = source.index('python3 - "$BENCH_RESULTS" "$FAILED" "$RUN_INDEX"')
+        start = source.index(
+            'python3 - "$BENCH_RESULTS" "$FAILED" "$RUN_INDEX" "$BENCH_WRITERS" "$BENCH_NUM" <<\'PY\''
+        )
         finish = source.index("\nBENCH_USER_SCRIPT\n", start)
-        script = source[start:finish]
+        script = "if false; then :; else\n" + source[start:finish]
         orders = (("v4", "v7", "v8", "v8", "v7", "v4"), ("v8", "v7", "v4", "v4", "v7", "v8"))
         rows = []
-        for writers in (1, 4, 8):
+        for writers in LEGACY_DEFAULT_WRITERS:
             repetitions = dict.fromkeys(("v4", "v7", "v8"), 0)
             for block, order in enumerate(orders, 1):
                 for position, fmt in enumerate(order, 1):
@@ -665,6 +891,8 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
                     env={
                         "PATH": os.environ["PATH"], "BENCH_RESULTS": str(results),
                         "FAILED": str(int(failed)), "RUN_INDEX": str(len(selected)),
+                        "BENCH_WRITERS": "1,4,8", "BENCH_NUM": "64",
+                        "PYTHONPATH": str(Path(__file__).parent),
                     },
                     capture_output=True, text=True, check=False,
                 )
@@ -689,6 +917,91 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
                     json.loads((results / "remote-exit.json").read_text(encoding="utf-8")),
                     {"failed": failed, "runs_started": len(selected)},
                 )
+
+    def test_full_rfc026_summary_accepts_all_320_runs(self) -> None:
+        source = Path(__file__).with_name("gcp-free-trial-wal-bench-remote.sh").read_text(encoding="utf-8")
+        self.assertIn('IFS=\',\' read -r -a WRITER_COUNTS <<<"$BENCH_WRITERS"', source)
+        self.assertIn('while IFS=$\'\\t\' read -r PLAN_INDEX WRITER_COUNT WORKLOAD REPETITION ARM', source)
+        self.assertIn("build_rfc026_schedule", source)
+        self.assertIn('if (( RUN_INDEX != EXPECTED_RUNS )); then', source)
+        start = source.index('python3 - "$BENCH_RESULTS" "$FAILED" "$RUN_INDEX" "$BENCH_WRITERS"')
+        finish = source.index('\nPY\n    date -u +%Y-%m-%dT%H:%M:%SZ >"$BENCH_RESULTS/finished_utc.txt"', start)
+        script = source[start:finish + len("\nPY")]
+        schedule = build_rfc026_schedule(FULL_DEFAULT_WRITERS)
+        self.assertEqual(len(schedule), 320)
+        rows = []
+        for item in schedule:
+            arm_index = ("v4_parallel", "v7_parallel", "v8_parallel", "v8_leader").index(item["arm"]) + 1
+            rows.append({
+                "writer": item["writer"], "workload": item["workload"],
+                "repetition": item["repetition"], "arm": item["arm"],
+                "exit_code": 0, "ops": item["num"], "puts_per_second": 100 * arm_index,
+                "p99_ms": 4 / arm_index, "cpu_seconds": 1 / arm_index,
+                "sync_count": 10 * arm_index, "duration_seconds": 1,
+            })
+
+        scenarios = (
+            ("complete", rows, 320, True),
+            ("missing", rows[:-1], 319, False),
+            ("duplicate", [*rows[:-1], rows[0]], 320, False),
+        )
+        for name, selected, run_index, expected_complete in scenarios:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temp:
+                results = Path(temp)
+                with (results / "summary.tsv").open("w", encoding="utf-8", newline="") as stream:
+                    writer = csv.DictWriter(stream, fieldnames=rows[0], delimiter="\t")
+                    writer.writeheader()
+                    writer.writerows(selected)
+                result = subprocess.run(
+                    ["bash", "-euc", script],
+                    env={
+                        "PATH": os.environ["PATH"], "PYTHONPATH": str(Path(__file__).parent),
+                        "BENCH_RESULTS": str(results), "FAILED": "0",
+                        "RUN_INDEX": str(run_index), "BENCH_WRITERS": "1,2,4,8,16",
+                    },
+                    capture_output=True, text=True, check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                summary = json.loads((results / "summary.json").read_text(encoding="utf-8"))
+                self.assertEqual(summary["complete"], expected_complete)
+                self.assertEqual(summary["runs_planned"], 320)
+                self.assertEqual(summary["runs_completed"], len(selected))
+                self.assertEqual(summary["writers"], [1, 2, 4, 8, 16])
+                if expected_complete:
+                    cell = summary["comparison_by_cell"]["w16-batch64"]
+                    self.assertEqual(cell["v4_parallel"]["puts_per_second"], 100)
+                    self.assertEqual(cell["v8_parallel"]["puts_per_second"], 300)
+                else:
+                    self.assertFalse(summary["matrix_validation"]["complete"])
+                    if name == "duplicate":
+                        self.assertTrue(summary["matrix_validation"]["duplicate_cells"])
+                        self.assertTrue(summary["matrix_validation"]["missing_cells"])
+
+    def test_remote_rfc026_scheduler_emits_exact_tabular_plan(self) -> None:
+        source = Path(__file__).with_name("gcp-free-trial-wal-bench-remote.sh").read_text(encoding="utf-8")
+        marker = 'python3 - "$RUN_PLAN" "$BENCH_WRITERS" <<\'PY\'\n'
+        start = source.index(marker) + len(marker)
+        finish = source.index("\nPY\n", start)
+        generator = source[start:finish]
+        with tempfile.TemporaryDirectory() as temp:
+            plan_path = Path(temp) / "schedule.tsv"
+            result = subprocess.run(
+                ["python3", "-", str(plan_path), ",".join(map(str, FULL_DEFAULT_WRITERS))],
+                input=generator,
+                text=True,
+                capture_output=True,
+                check=False,
+                env={"PATH": os.environ["PATH"], "PYTHONPATH": str(Path(__file__).parent)},
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            with plan_path.open(encoding="utf-8", newline="") as stream:
+                rows = list(csv.DictReader(stream, delimiter="\t"))
+            self.assertEqual(len(rows), 320)
+            self.assertEqual(rows[0]["workload"], "point")
+            self.assertEqual(rows[0]["batch_size"], "none")
+            self.assertEqual(rows[-1]["writer"], "16")
+            self.assertEqual(rows[-1]["workload"], "batch64")
+            self.assertEqual(rows[-1]["batch_size"], "64")
 
 
 if __name__ == "__main__":
