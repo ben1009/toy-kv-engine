@@ -79,9 +79,11 @@ resource "google_compute_instance" "test" {
     auto_delete = true
 
     initialize_params {
-      image = data.google_compute_image.ubuntu.self_link
-      size  = var.boot_disk_size_gb
-      type  = "hyperdisk-balanced"
+      image                  = data.google_compute_image.ubuntu.self_link
+      size                   = var.boot_disk_size_gb
+      type                   = "hyperdisk-balanced"
+      provisioned_iops       = 3000
+      provisioned_throughput = 140
     }
   }
 

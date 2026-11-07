@@ -40,6 +40,8 @@ run "default_hardware_and_lifetime" {
       google_compute_instance.test.boot_disk[0].auto_delete &&
       google_compute_instance.test.boot_disk[0].initialize_params[0].size == 50 &&
       google_compute_instance.test.boot_disk[0].initialize_params[0].type == "hyperdisk-balanced" &&
+      google_compute_instance.test.boot_disk[0].initialize_params[0].provisioned_iops == 3000 &&
+      google_compute_instance.test.boot_disk[0].initialize_params[0].provisioned_throughput == 140 &&
       !google_compute_instance.test.deletion_protection &&
       google_compute_instance.test.scheduling[0].max_run_duration[0].seconds == 86400 &&
       google_compute_instance.test.scheduling[0].instance_termination_action == "DELETE"
@@ -247,6 +249,36 @@ run "invalid_username" {
 run "root_mount_rejected" {
   command = plan
   variables { local_ssd_mount = "/" }
+  expect_failures = [var.local_ssd_mount]
+}
+
+run "root_mount_dot_alias_rejected" {
+  command = plan
+  variables { local_ssd_mount = "/." }
+  expect_failures = [var.local_ssd_mount]
+}
+
+run "root_mount_dot_slash_alias_rejected" {
+  command = plan
+  variables { local_ssd_mount = "/./" }
+  expect_failures = [var.local_ssd_mount]
+}
+
+run "root_mount_slash_alias_rejected" {
+  command = plan
+  variables { local_ssd_mount = "//" }
+  expect_failures = [var.local_ssd_mount]
+}
+
+run "mount_dot_component_rejected" {
+  command = plan
+  variables { local_ssd_mount = "/mnt/./test" }
+  expect_failures = [var.local_ssd_mount]
+}
+
+run "mount_empty_component_rejected" {
+  command = plan
+  variables { local_ssd_mount = "/mnt//test" }
   expect_failures = [var.local_ssd_mount]
 }
 

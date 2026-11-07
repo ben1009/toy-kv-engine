@@ -93,10 +93,10 @@ variable "local_ssd_mount" {
 
   validation {
     condition = (
-      startswith(var.local_ssd_mount, "/") && var.local_ssd_mount != "/" &&
-      can(regex("^/[A-Za-z0-9._/-]+$", var.local_ssd_mount)) && !strcontains(var.local_ssd_mount, "..")
+      can(regex("^/[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$", var.local_ssd_mount)) &&
+      !contains(split("/", var.local_ssd_mount), ".") && !strcontains(var.local_ssd_mount, "..")
     )
-    error_message = "local_ssd_mount must be a simple non-root absolute path without shell-sensitive characters or '..'."
+    error_message = "local_ssd_mount must be a canonical non-root absolute path without shell-sensitive characters, '.', '..', empty components or a trailing slash."
   }
 }
 

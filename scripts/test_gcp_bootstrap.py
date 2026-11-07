@@ -79,31 +79,66 @@ class GcpBootstrapTests(unittest.TestCase):
                 self.assertNotIn("formatted", events)
                 self.assertEqual(metadata, "")
 
+    def test_mount_from_another_filesystem_never_changes_ownership_or_publishes_ready(self):
+        result, events, metadata, _ = self.run_storage_bootstrap(
+            MOCK_FILESYSTEM="ext4", MOCK_ARRAY_PRESENT=1,
+            MOCK_MOUNTED=1, MOCK_MOUNTED_UUID="boot-filesystem-uuid",
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("expected Local SSD filesystem", result.stderr)
+        self.assertNotIn("formatted", events)
+        self.assertNotIn("chown", events)
+        self.assertEqual(metadata, "")
+
     def test_tool_installation_marker_is_repeatable_and_never_hides_failure(self):
         source = (ROOT / "infra/gcp/test-environment/startup-script.sh.tftpl").read_text(encoding="utf-8")
         body = source[source.index('if ! id "$TEST_USER"'):source.index("mapfile -t SSD_LINKS")]
-        for rust, fail in ((True, False), (False, False), (True, True)):
-            with self.subTest(rust=rust, fail=fail), tempfile.TemporaryDirectory() as temp:
+        for rust, failure, previous in (
+            (True, None, None), (False, None, None), (True, "apt", None),
+            (True, "download", None), (True, "installer", None),
+            (True, None, ("tester", False)), (True, None, ("previous-user", True)),
+        ):
+            with self.subTest(rust=rust, failure=failure, previous=previous), tempfile.TemporaryDirectory() as temp:
                 root = Path(temp)
+                commands = root / "bin"
+                commands.mkdir()
+                downloader = commands / "curl"
+                downloader.write_text(
+                    '#!/usr/bin/env bash\n'
+                    'if [[ "$MOCK_CURL_FAIL" == 1 ]]; then\n'
+                    '    echo "simulated Rust download failure" >&2\n'
+                    '    exit 22\n'
+                    'fi\n'
+                    'printf \'exit %s\\n\' "$MOCK_INSTALLER_EXIT"\n',
+                    encoding="utf-8",
+                )
+                downloader.chmod(0o755)
                 script = (
                     f'set -Eeuo pipefail\nTEST_ROOT={shlex.quote(temp)}\nTEST_USER=tester\n'
                     f'BOOTSTRAP_MARKER="$TEST_ROOT/state/bootstrap-complete"\nINSTALL_RUST={str(rust).lower()}\n'
                     f'source {shlex.quote(str(ROOT / "scripts/fixtures/gcp_bootstrap_commands.sh"))}\n'
-                    + (body + "\n" + body).replace("/var/lib/gcp-test-environment", f"{temp}/state")
                 )
+                if previous:
+                    script += f'TEST_USER={previous[0]}\nINSTALL_RUST={str(previous[1]).lower()}\n' + body + "\n"
+                script += f'TEST_USER=tester\nINSTALL_RUST={str(rust).lower()}\n' + body + "\n" + body
+                script = script.replace("/var/lib/gcp-test-environment", f"{temp}/state")
                 result = subprocess.run(
                     ["bash", "-c", script], text=True, capture_output=True, check=False,
-                    env={**os.environ, "MOCK_USER_EXISTS": "0", "MOCK_PERF_AVAILABLE": "1",
-                         "MOCK_APT_FAIL": str(int(fail))},
+                    env={**os.environ, "PATH": f"{commands}{os.pathsep}{os.environ['PATH']}",
+                         "MOCK_USER_EXISTS": "0", "MOCK_PERF_AVAILABLE": "1",
+                         "MOCK_APT_FAIL": str(int(failure == "apt")),
+                         "MOCK_CURL_FAIL": str(int(failure == "download")),
+                         "MOCK_INSTALLER_EXIT": "42" if failure == "installer" else "0"},
                 )
                 events = (root / "events").read_text()
-                self.assertEqual((root / "state/bootstrap-complete").exists(), not fail)
-                if fail:
-                    self.assertNotEqual(result.returncode, 0)
+                self.assertEqual((root / "state/bootstrap-complete").exists(), failure is None)
+                if failure:
+                    self.assertEqual(result.returncode, {"apt": 1, "download": 22, "installer": 42}[failure])
                 else:
                     self.assertEqual(result.returncode, 0, result.stderr)
-                    self.assertEqual(events.count("apt-get update"), 1)
-                    self.assertEqual(events.count("rustup"), int(rust))
+                    if previous is None:
+                        self.assertEqual(events.count("apt-get update"), 1)
+                    self.assertEqual(events.count("rustup"), int(rust) + int(bool(previous and previous[1])))
 
     def run_filesystem_setup(self, device: str, *, filesystem: str = "", signature: str = ""):
         source = (ROOT / "infra/gcp/test-environment/startup-script.sh.tftpl").read_text(encoding="utf-8")

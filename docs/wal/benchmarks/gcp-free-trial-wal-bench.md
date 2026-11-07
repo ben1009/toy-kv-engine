@@ -65,6 +65,10 @@ Before creating any VM or firewall rule, the read-only preflight checks:
   size); at least one global firewall quota remains, and any applicable
   `CPUS_ALL_REGIONS` quota has room.
 
+The Hyperdisk boot disk explicitly uses the quota-exempt baseline of 3,000 IOPS
+and 140 MiB/s, so no additional performance quota is needed. The WAL workload
+uses Local SSD storage.
+
 If quota data, dimensions, or machine-type metadata are missing, the runner
 fails closed. Existing C4 reservations in the region also stop preflight because
 their quota consumption needs separate accounting. GCP does not expose a

@@ -46,6 +46,11 @@ bundled Local SSD metadata, relevant regional and global quota, existing VM and
 disk usage, and boot-disk quota. It does not create resources or enable APIs.
 It cannot guarantee that GCP currently has free host capacity.
 
+The boot disk explicitly uses 3,000 IOPS and 140 MiB/s, the
+[Hyperdisk Balanced baseline](https://docs.cloud.google.com/compute/docs/disks/hd-types/hyperdisk-balanced#baseline_performance_and_quota).
+These settings consume no performance quota; the preflight checks capacity
+quota. Tests and results use the separate Local SSD workspace.
+
 ```bash
 python3 infra/gcp/test-environment/preflight.py \
   --project YOUR_PROJECT_ID \
@@ -101,6 +106,10 @@ build, profiling, storage, and tracing tools. The startup script records its
 status in `/mnt/test-ssd/environment.txt` and
 `/var/log/gcp-test-environment-bootstrap.log`.
 
+The tool-installation marker records `ssh_username` and `install_rust_toolchain`.
+If either setting changes, the next startup or manual bootstrap rerun installs
+tools for the new configuration before updating that marker.
+
 The VM is configured for server-side deletion after `max_runtime_hours` (24 by
 default, at most 168). The VPC, subnet, and SSH firewall rule remain managed by
 Terraform after the VM expires. Reapply to create a fresh VM, or destroy the
@@ -143,7 +152,7 @@ The public key under `tests/fixtures` belongs only to the offline tests.
 | --- | --- |
 | Capacity preflight | Both VM shapes, applicable quotas, existing CPU/SSD/disk usage, reservations, missing metadata, command failures, and read-only gcloud invocation |
 | Terraform | Hardware checks, cost and Free Trial guards, input bounds, restricted SSH, boot-disk deletion, VM lifetime, resource links, outputs, and mocked apply/cleanup |
-| Bootstrap | One/two SSDs, fresh RAID, reassembly, repeat startup, filesystem preservation, unexpected signatures, missing/undersized devices, tool-install failure and readiness publication |
+| Bootstrap | One/two SSDs, fresh RAID, reassembly, repeat startup, filesystem preservation, unexpected signatures, missing/undersized devices, mounted UUID verification, download/installer failure and readiness publication |
 | Templates and benchmark runner | Actual Terraform rendering for both disk counts and Rust settings, Bash syntax, environment handoff, schedules, result validation and artifact collection |
 
 ## Live-host acceptance check

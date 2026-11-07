@@ -1299,6 +1299,7 @@ def provision_and_run(
                 f"--project={args.project}", f"--zone={args.zone}", f"--machine-type={args.machine_type}",
                 f"--image={preflight_result['boot_image']['name']}", "--image-project=ubuntu-os-cloud",
                 "--boot-disk-size=50GB", "--boot-disk-type=hyperdisk-balanced", "--boot-disk-auto-delete",
+                "--boot-disk-provisioned-iops=3000", "--boot-disk-provisioned-throughput=140",
                 f"--max-run-duration={args.max_runtime_minutes}m", "--instance-termination-action=DELETE",
                 "--no-service-account", "--no-scopes",
                 f"--network={args.network}", f"--tags={tag}", f"--metadata-from-file=ssh-keys={key_metadata}",

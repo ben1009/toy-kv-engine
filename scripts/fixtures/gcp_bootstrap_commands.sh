@@ -4,14 +4,14 @@ id() { (( MOCK_USER_EXISTS )); }
 useradd() { event useradd; MOCK_USER_EXISTS=1; }
 apt-get() { event "apt-get $*"; [[ "$MOCK_APT_FAIL" != 1 ]]; }
 apt-cache() { [[ "$MOCK_PERF_AVAILABLE" == 1 ]]; }
-runuser() { event rustup; }
+runuser() { event rustup; shift 3; "$@"; }
 install() {
     local arg
     for arg in "$@"; do
         [[ "$arg" != "$TEST_ROOT"* ]] || mkdir -p "$arg"
     done
 }
-chown() { :; }
+chown() { event "chown $*"; }
 find() {
     local index
     for ((index = 0; index < MOCK_LINK_COUNT; index++)); do
@@ -60,3 +60,4 @@ blkid() {
 mkfs.ext4() { event "formatted ${@: -1}"; MOCK_FILESYSTEM=ext4; }
 mountpoint() { (( MOCK_MOUNTED )); }
 mount() { event mounted; MOCK_MOUNTED=1; }
+findmnt() { printf '%s\n' "${MOCK_MOUNTED_UUID:-mock-filesystem-uuid}"; }

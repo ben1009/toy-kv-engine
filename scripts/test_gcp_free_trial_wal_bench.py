@@ -551,6 +551,8 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
                 )
                 self.assertIn("--no-service-account", create)
                 self.assertIn("--no-scopes", create)
+                self.assertIn("--boot-disk-provisioned-iops=3000", create)
+                self.assertIn("--boot-disk-provisioned-throughput=140", create)
                 ssh.assert_not_called()
                 collection.assert_not_called()
                 cleanup.assert_called_once()
