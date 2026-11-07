@@ -31,7 +31,7 @@ variables {
 }
 
 run "default_hardware_and_lifetime" {
-  command = plan
+  command = apply
 
   assert {
     condition = (
@@ -43,7 +43,9 @@ run "default_hardware_and_lifetime" {
       google_compute_instance.test.boot_disk[0].initialize_params[0].provisioned_iops == 3000 &&
       google_compute_instance.test.boot_disk[0].initialize_params[0].provisioned_throughput == 140 &&
       !google_compute_instance.test.deletion_protection &&
-      google_compute_instance.test.scheduling[0].max_run_duration[0].seconds == 86400 &&
+      google_compute_instance.test.scheduling[0].termination_time == local.termination_time &&
+      length(google_compute_instance.test.scheduling[0].max_run_duration) == 0 &&
+      timecmp(google_compute_instance.test.scheduling[0].termination_time, timestamp()) > 0 &&
       google_compute_instance.test.scheduling[0].instance_termination_action == "DELETE"
     )
     error_message = "The default host must have the expected storage and a bounded, auto-deleted lifetime."
@@ -59,7 +61,7 @@ run "default_hardware_and_lifetime" {
       one(google_compute_firewall.ssh.allow).protocol == "tcp" &&
       google_compute_instance.test.metadata["block-project-ssh-keys"] == "TRUE" &&
       google_compute_instance.test.metadata["enable-oslogin"] == "FALSE" &&
-      length(google_compute_instance.test.service_account[0].scopes) == 0
+      length(google_compute_instance.test.service_account) == 0
     )
     error_message = "SSH and the dedicated network must remain restricted to the supplied test-host access."
   }
@@ -108,6 +110,7 @@ run "mocked_create_connect_and_cleanup" {
   command = apply
   assert {
     condition = (
+      length(google_compute_instance.test.service_account) == 0 &&
       google_compute_subnetwork.test.network == google_compute_network.test.id &&
       google_compute_instance.test.network_interface[0].subnetwork == google_compute_subnetwork.test.id &&
       output.instance_name == "gcp-test-host" && output.zone == "us-central1-a" &&
@@ -116,6 +119,14 @@ run "mocked_create_connect_and_cleanup" {
     )
     error_message = "The mock apply must connect the managed resources and produce usable lifecycle commands."
   }
+}
+
+run "zone_must_belong_to_region" {
+  command = plan
+  variables {
+    zone = "us-east1-b"
+  }
+  expect_failures = [google_compute_network.test]
 }
 
 run "missing_machine_metadata" {

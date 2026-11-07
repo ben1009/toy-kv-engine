@@ -110,10 +110,12 @@ The tool-installation marker records `ssh_username` and `install_rust_toolchain`
 If either setting changes, the next startup or manual bootstrap rerun installs
 tools for the new configuration before updating that marker.
 
-The VM is configured for server-side deletion after `max_runtime_hours` (24 by
-default, at most 168). The VPC, subnet, and SSH firewall rule remain managed by
-Terraform after the VM expires. Reapply to create a fresh VM, or destroy the
-whole environment when finished:
+The VM is configured for server-side deletion at an absolute deadline derived
+from the first Terraform apply and `max_runtime_hours` (24 by default, at most
+168). Terraform state stores this lifetime anchor; keep that state. Stopping,
+starting, or reapplying the VM does not reset the deadline. To start a new
+environment lifetime, destroy and recreate the environment. The VPC, subnet,
+and SSH firewall rule remain managed by Terraform after the VM expires:
 
 ```bash
 terraform destroy -var-file=terraform.tfvars
@@ -124,9 +126,13 @@ off the host first. The Terraform cost guard only checks your supplied estimate
 against the configured lifetime; it cannot limit charges for other resources,
 network traffic, or an incorrect estimate.
 
+The VM has no attached service account, so workloads on the host cannot obtain
+Google Cloud credentials from its metadata server. SSH access uses the supplied
+public key and the configured Linux account.
+
 ## Automated checks
 
-The `gcp-bench` CI job installs a checksum-pinned Terraform CLI, verifies
+The `gcp-test-environment` CI job installs a checksum-pinned Terraform CLI, verifies
 formatting and the locked provider schema, runs the module's mock-provider
 tests, parses the rendered startup script with Bash, and discovers all
 `scripts/test_gcp*.py` tests. It needs no GCP credentials and creates no cloud

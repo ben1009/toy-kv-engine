@@ -93,9 +93,9 @@ jobs:
       - name: cargo check hotpath-profile
         run: cargo check --locked -p kv-engine --features hotpath-profile --bin write-perf
 
-  gcp-bench:
+  gcp-test-environment:
     runs-on: ubuntu-latest
-    name: gcp-bench
+    name: gcp-test-environment
     timeout-minutes: 10
     env:
       CHECKPOINT_DISABLE: "1"

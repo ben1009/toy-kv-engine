@@ -2,9 +2,39 @@
 event() { printf '%s\n' "$*" >>"$TEST_ROOT/events"; }
 id() { (( MOCK_USER_EXISTS )); }
 useradd() { event useradd; MOCK_USER_EXISTS=1; }
-apt-get() { event "apt-get $*"; [[ "$MOCK_APT_FAIL" != 1 ]]; }
+apt-get() {
+    event "apt-get $*"
+    case "$*" in
+        *linux-tools-gcp*)
+            if (( ${MOCK_APT_PERF_LOCK_FAILURES:-0} > 0 )); then
+                MOCK_APT_PERF_LOCK_FAILURES=$((MOCK_APT_PERF_LOCK_FAILURES - 1))
+                echo "E: Could not get lock /var/lib/dpkg/lock-frontend" >&2
+                return 100
+            fi
+            ;;
+        *" install "*)
+            if (( ${MOCK_APT_INSTALL_LOCK_FAILURES:-0} > 0 )); then
+                MOCK_APT_INSTALL_LOCK_FAILURES=$((MOCK_APT_INSTALL_LOCK_FAILURES - 1))
+                echo "E: Could not get lock /var/lib/dpkg/lock-frontend" >&2
+                return 100
+            fi
+            ;;
+        *" update")
+            if (( ${MOCK_APT_UPDATE_LOCK_FAILURES:-0} > 0 )); then
+                MOCK_APT_UPDATE_LOCK_FAILURES=$((MOCK_APT_UPDATE_LOCK_FAILURES - 1))
+                echo "E: Could not get lock /var/lib/apt/lists/lock" >&2
+                return 100
+            fi
+            ;;
+    esac
+    if [[ "${MOCK_APT_FAIL:-0}" == 1 ]]; then
+        echo "E: package installation failed" >&2
+        return 1
+    fi
+}
 apt-cache() { [[ "$MOCK_PERF_AVAILABLE" == 1 ]]; }
 runuser() { event rustup; shift 3; "$@"; }
+sleep() { event "sleep $*"; }
 install() {
     local arg
     for arg in "$@"; do

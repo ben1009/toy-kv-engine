@@ -22,6 +22,20 @@ locals {
     local_ssd_mount        = var.local_ssd_mount
     ssh_username           = var.ssh_username
   })
+  termination_time = timeadd(
+    terraform_data.environment_lifetime.output,
+    "${var.max_runtime_hours}h",
+  )
+}
+
+# Persist the initial environment timestamp in Terraform state. Ignore later
+# timestamp() changes so restarting or reapplying the VM cannot extend its cap.
+resource "terraform_data" "environment_lifetime" {
+  input = timestamp()
+
+  lifecycle {
+    ignore_changes = [input]
+  }
 }
 
 resource "google_compute_network" "test" {
@@ -30,6 +44,13 @@ resource "google_compute_network" "test" {
   auto_create_subnetworks = false
   routing_mode            = "REGIONAL"
   description             = "Reusable network for interactive GCP test environments"
+
+  lifecycle {
+    precondition {
+      condition     = startswith(var.zone, "${var.region}-")
+      error_message = "zone must belong to the configured region; for example, us-central1-a belongs to us-central1."
+    }
+  }
 }
 
 resource "google_compute_subnetwork" "test" {
@@ -93,16 +114,10 @@ resource "google_compute_instance" "test" {
     access_config {}
   }
 
-  service_account {
-    scopes = []
-  }
-
   scheduling {
-    automatic_restart   = true
-    on_host_maintenance = "TERMINATE"
-    max_run_duration {
-      seconds = var.max_runtime_hours * 3600
-    }
+    automatic_restart           = true
+    on_host_maintenance         = "TERMINATE"
+    termination_time            = local.termination_time
     instance_termination_action = "DELETE"
   }
 

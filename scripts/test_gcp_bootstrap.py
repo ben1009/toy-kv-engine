@@ -137,8 +137,34 @@ class GcpBootstrapTests(unittest.TestCase):
                 else:
                     self.assertEqual(result.returncode, 0, result.stderr)
                     if previous is None:
-                        self.assertEqual(events.count("apt-get update"), 1)
+                        self.assertEqual(events.count("apt-get -o DPkg::Lock::Timeout=60 update"), 1)
                     self.assertEqual(events.count("rustup"), int(rust) + int(bool(previous and previous[1])))
+
+    def test_apt_retries_lock_errors_for_update_and_both_installs(self):
+        source = (ROOT / "infra/gcp/test-environment/startup-script.sh.tftpl").read_text(encoding="utf-8")
+        body = source[source.index('if ! id "$TEST_USER"'):source.index("mapfile -t SSD_LINKS")]
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            script = (
+                f'set -Eeuo pipefail\nTEST_ROOT={shlex.quote(temp)}\nTEST_USER=tester\n'
+                f'BOOTSTRAP_MARKER="$TEST_ROOT/state/bootstrap-complete"\nINSTALL_RUST=false\n'
+                f'source {shlex.quote(str(ROOT / "scripts/fixtures/gcp_bootstrap_commands.sh"))}\n'
+                + body.replace("/var/lib/gcp-test-environment", f"{temp}/state")
+            )
+            result = subprocess.run(
+                ["bash", "-c", script], text=True, capture_output=True, check=False,
+                env={**os.environ, "MOCK_USER_EXISTS": "0", "MOCK_PERF_AVAILABLE": "1",
+                     "MOCK_APT_FAIL": "0", "MOCK_APT_UPDATE_LOCK_FAILURES": "1",
+                     "MOCK_APT_INSTALL_LOCK_FAILURES": "1", "MOCK_APT_PERF_LOCK_FAILURES": "1"},
+            )
+            events = (root / "events").read_text()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        apt_events = [line for line in events.splitlines() if line.startswith("apt-get ")]
+        self.assertEqual(sum(line.endswith(" update") for line in apt_events), 2)
+        self.assertEqual(sum("install -y --no-install-recommends bpftrace" in line for line in apt_events), 2)
+        self.assertEqual(sum("install -y --no-install-recommends linux-tools-gcp" in line for line in apt_events), 2)
+        self.assertEqual(events.count("sleep 10"), 3)
 
     def run_filesystem_setup(self, device: str, *, filesystem: str = "", signature: str = ""):
         source = (ROOT / "infra/gcp/test-environment/startup-script.sh.tftpl").read_text(encoding="utf-8")

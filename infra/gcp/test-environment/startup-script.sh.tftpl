@@ -16,14 +16,41 @@ fi
 
 BOOTSTRAP_CONFIG="$TEST_USER:$INSTALL_RUST"
 if [[ ! -f "$BOOTSTRAP_MARKER" ]] || [[ "$(<"$BOOTSTRAP_MARKER")" != "$BOOTSTRAP_CONFIG" ]]; then
-    apt-get update
-    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    apt_get_with_lock_retry() {
+        local attempt=1 max_attempts=6 status output_file
+        while (( attempt <= max_attempts )); do
+            output_file="$(mktemp)"
+            if apt-get -o DPkg::Lock::Timeout=60 "$@" >"$output_file" 2>&1; then
+                cat "$output_file"
+                rm -f "$output_file"
+                return 0
+            else
+                status=$?
+            fi
+            cat "$output_file" >&2
+            if ! grep -Eiq '(could not get lock|unable to acquire .*lock|waiting for cache lock)' "$output_file"; then
+                rm -f "$output_file"
+                return "$status"
+            fi
+            rm -f "$output_file"
+            if (( attempt == max_attempts )); then
+                echo "apt-get remained blocked by a package lock after $max_attempts attempts" >&2
+                return "$status"
+            fi
+            echo "apt package lock is held; retrying in 10 seconds (attempt $((attempt + 1))/$max_attempts)" >&2
+            sleep 10
+            attempt=$((attempt + 1))
+        done
+    }
+
+    apt_get_with_lock_retry update
+    DEBIAN_FRONTEND=noninteractive apt_get_with_lock_retry install -y --no-install-recommends \
         bpftrace build-essential ca-certificates clang cmake curl e2fsprogs fio git jq \
         libclang-dev libssl-dev linux-tools-common mdadm nvme-cli pkg-config python3 \
         python3-venv smartmontools sysstat time trace-cmd util-linux xz-utils
 
     if apt-cache show linux-tools-gcp >/dev/null 2>&1; then
-        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends linux-tools-gcp
+        DEBIAN_FRONTEND=noninteractive apt_get_with_lock_retry install -y --no-install-recommends linux-tools-gcp
     fi
 
     if [[ "$INSTALL_RUST" == "true" ]]; then

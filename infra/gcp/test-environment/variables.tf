@@ -60,7 +60,10 @@ variable "ssh_source_cidr" {
   type        = string
 
   validation {
-    condition     = can(cidrnetmask(var.ssh_source_cidr)) && tonumber(split("/", var.ssh_source_cidr)[1]) >= 24
+    condition = try(
+      can(cidrnetmask(var.ssh_source_cidr)) && tonumber(split("/", var.ssh_source_cidr)[1]) >= 24,
+      false,
+    )
     error_message = "ssh_source_cidr must be an IPv4 CIDR no broader than /24; /32 is recommended."
   }
 }
@@ -121,7 +124,7 @@ variable "boot_disk_size_gb" {
 }
 
 variable "max_runtime_hours" {
-  description = "Server-enforced VM deletion after this many hours; Terraform network resources remain until destroy."
+  description = "VM deletion deadline relative to the persistent Terraform lifetime anchor; restarts do not reset it."
   type        = number
   default     = 24
 
