@@ -111,6 +111,27 @@ class GcpTestEnvironmentPreflightTests(unittest.TestCase):
                 quota_command = next(cmd for cmd in inventory.commands if cmd[:2] == ["quotas", "info"])
                 self.assertIn("--billing-project=test-project", quota_command)
 
+    def test_unlimited_quota_sentinels_are_reported_without_numeric_limits(self):
+        """Verify unlimited quota reports use explicit flags and null numeric values."""
+        inventory = GcloudInventory()
+        for record in inventory.quotas:
+            record["dimensionsInfos"][0]["details"]["quotaValue"] = -1
+        for response in (inventory.region, inventory.global_info):
+            for item in response["quotas"]:
+                item["limit"] = -1
+
+        report = self.run_preflight(inventory)
+
+        for quota in ("c4_cpu", "local_ssd", "hyperdisk_balanced", "instances",
+                      "in_use_addresses", "networks", "firewalls", "cpus_all_regions"):
+            with self.subTest(quota=quota):
+                details = report["quotas"][quota]
+                self.assertTrue(details["unlimited"])
+                limit_key = "limit_gb" if quota == "hyperdisk_balanced" else "limit"
+                available_key = "available_gb" if quota == "hyperdisk_balanced" else "available"
+                self.assertIsNone(details[limit_key])
+                self.assertIsNone(details[available_key])
+
     def test_insufficient_quota_rejects_provisioning_for_each_resource(self):
         cases = [("cloud", 0, "C4 CPU"), ("cloud", 1, "Local SSD"),
                  ("cloud", 2, "Hyperdisk"), ("regional", 0, "INSTANCES"),
@@ -128,6 +149,7 @@ class GcpTestEnvironmentPreflightTests(unittest.TestCase):
                     self.run_preflight(inventory)
 
     def test_missing_ambiguous_and_invalid_quota_responses_fail_closed(self):
+        """Reject missing, ambiguous, and invalid quota responses."""
         for case in ("missing_cpu", "wrong_family", "negative", "nan", "missing_limit", "duplicate_regional"):
             with self.subTest(case=case):
                 inventory = GcloudInventory()
@@ -137,7 +159,7 @@ class GcpTestEnvironmentPreflightTests(unittest.TestCase):
                     inventory.quotas[0]["dimensionsInfos"][0]["dimensions"]["vm_family"] = "N2"
                 elif case in {"negative", "nan", "missing_limit"}:
                     inventory.quotas[0]["dimensionsInfos"][0]["details"]["quotaValue"] = {
-                        "negative": -1, "nan": "NaN", "missing_limit": None,
+                    "negative": -2, "nan": "NaN", "missing_limit": None,
                     }[case]
                 else:
                     inventory.region["quotas"].append(deepcopy(inventory.region["quotas"][0]))
