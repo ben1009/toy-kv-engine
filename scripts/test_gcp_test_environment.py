@@ -112,6 +112,7 @@ class GcpTestEnvironmentPreflightTests(unittest.TestCase):
                 self.assertIn("--billing-project=test-project", quota_command)
 
     def test_unlimited_quota_sentinels_are_reported_without_numeric_limits(self):
+        """Verify unlimited quota reports use explicit flags and null numeric values."""
         inventory = GcloudInventory()
         for record in inventory.quotas:
             record["dimensionsInfos"][0]["details"]["quotaValue"] = -1
@@ -126,8 +127,10 @@ class GcpTestEnvironmentPreflightTests(unittest.TestCase):
             with self.subTest(quota=quota):
                 details = report["quotas"][quota]
                 self.assertTrue(details["unlimited"])
-                self.assertIsNone(details.get("limit", details.get("limit_gb")))
-                self.assertIsNone(details.get("available", details.get("available_gb")))
+                limit_key = "limit_gb" if quota == "hyperdisk_balanced" else "limit"
+                available_key = "available_gb" if quota == "hyperdisk_balanced" else "available"
+                self.assertIsNone(details[limit_key])
+                self.assertIsNone(details[available_key])
 
     def test_insufficient_quota_rejects_provisioning_for_each_resource(self):
         cases = [("cloud", 0, "C4 CPU"), ("cloud", 1, "Local SSD"),
@@ -146,6 +149,7 @@ class GcpTestEnvironmentPreflightTests(unittest.TestCase):
                     self.run_preflight(inventory)
 
     def test_missing_ambiguous_and_invalid_quota_responses_fail_closed(self):
+        """Reject missing, ambiguous, and invalid quota responses."""
         for case in ("missing_cpu", "wrong_family", "negative", "nan", "missing_limit", "duplicate_regional"):
             with self.subTest(case=case):
                 inventory = GcloudInventory()

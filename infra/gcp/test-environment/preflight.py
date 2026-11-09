@@ -64,6 +64,7 @@ def _number(value: Any, label: str) -> float:
 
 
 def _quota_limit(value: Any, label: str) -> float:
+    """Parse a quota limit, treating Google's -1 sentinel as unlimited."""
     try:
         result = float(value)
     except (TypeError, ValueError) as error:
@@ -75,6 +76,7 @@ def _quota_limit(value: Any, label: str) -> float:
 
 
 def _report_quota_value(value: float) -> float | None:
+    """Convert infinite quota values to null for JSON-compatible reports."""
     return None if math.isinf(value) else value
 
 
@@ -128,6 +130,7 @@ def _quota_records(response: Any) -> list[dict[str, Any]]:
 def _cloud_quota(
     records: list[dict[str, Any]], kind: str, region: str, family: str,
 ) -> tuple[float, dict[str, Any], bool]:
+    """Select the strictest Cloud Quotas record applicable to the requested host."""
     matches: list[tuple[int, float, dict[str, Any]]] = []
     for record in records:
         names = _norm(record.get("quotaId", "")) + _norm(record.get("metric", ""))
@@ -180,6 +183,7 @@ def _cloud_quota(
 
 
 def _regional_quota(region: dict[str, Any], metric: str) -> tuple[float, float]:
+    """Return a unique regional quota's limit and current usage."""
     matches = [
         item for item in region.get("quotas", [])
         if isinstance(item, dict) and _norm(item.get("metric", "")) == _norm(metric)
@@ -192,6 +196,7 @@ def _regional_quota(region: dict[str, Any], metric: str) -> tuple[float, float]:
 
 
 def _global_quota(project_info: dict[str, Any], metric: str) -> tuple[float, float]:
+    """Return a unique project-wide quota's limit and current usage."""
     matches = [
         item for item in project_info.get("quotas", [])
         if isinstance(item, dict) and _norm(item.get("metric", "")) == _norm(metric)
@@ -226,6 +231,7 @@ def _hyperdisk_usage_gb(disks: Any, region: str) -> float:
 
 
 def preflight(project: str, zone: str, machine_type: str, boot_disk_gb: int) -> dict[str, Any]:
+    """Validate cloud, hardware, quota, and billing prerequisites before provisioning."""
     region = _zone_region(zone)
     account_lines = _run_gcloud(
         ["auth", "list", "--filter=status:ACTIVE", "--format=value(account)"], json_output=False
