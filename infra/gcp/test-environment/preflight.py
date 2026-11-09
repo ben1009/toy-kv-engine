@@ -63,6 +63,21 @@ def _number(value: Any, label: str) -> float:
     return result
 
 
+def _quota_limit(value: Any, label: str) -> float:
+    try:
+        result = float(value)
+    except (TypeError, ValueError) as error:
+        raise PreflightError(f"quota response is missing numeric {label}") from error
+    if not math.isfinite(result) or result < -1:
+        raise PreflightError(f"quota response has invalid {label}: {value!r}")
+    # Google Cloud uses -1 to indicate an unlimited quota.
+    return math.inf if result == -1 else result
+
+
+def _report_quota_value(value: float) -> float | None:
+    return None if math.isinf(value) else value
+
+
 def _norm(value: Any) -> str:
     return re.sub(r"[^a-z0-9]", "", str(value).lower())
 
@@ -153,7 +168,7 @@ def _cloud_quota(
                 "dimensions": dimensions,
                 "applicable_locations": locations,
             }
-            matches.append((specificity, _number(raw_limit, f"{kind} quota limit"), source))
+            matches.append((specificity, _quota_limit(raw_limit, f"{kind} quota limit"), source))
     if not matches:
         raise PreflightError(
             f"cannot verify {kind} quota for region={region}, vm_family={family}; "
@@ -171,7 +186,7 @@ def _regional_quota(region: dict[str, Any], metric: str) -> tuple[float, float]:
     ]
     if len(matches) != 1:
         raise PreflightError(f"cannot uniquely verify regional {metric} quota")
-    return _number(matches[0].get("limit"), f"{metric} quota limit"), _number(
+    return _quota_limit(matches[0].get("limit"), f"{metric} quota limit"), _number(
         matches[0].get("usage"), f"{metric} quota usage"
     )
 
@@ -183,7 +198,7 @@ def _global_quota(project_info: dict[str, Any], metric: str) -> tuple[float, flo
     ]
     if len(matches) != 1:
         raise PreflightError(f"cannot uniquely verify global {metric} quota")
-    return _number(matches[0].get("limit"), f"{metric} quota limit"), _number(
+    return _quota_limit(matches[0].get("limit"), f"{metric} quota limit"), _number(
         matches[0].get("usage"), f"{metric} quota usage"
     )
 
@@ -336,7 +351,9 @@ def preflight(project: str, zone: str, machine_type: str, boot_disk_gb: int) -> 
         if available < required:
             raise PreflightError(f"insufficient regional {metric} quota: available={available:g}, need={required}")
         region_quota_report[metric.lower()] = {
-            "limit": limit, "usage": usage, "available": available, "required": required,
+            "limit": _report_quota_value(limit), "usage": usage,
+            "available": _report_quota_value(available), "required": required,
+            "unlimited": math.isinf(limit),
         }
 
     hdb_usage = _hyperdisk_usage_gb(
@@ -357,7 +374,9 @@ def preflight(project: str, zone: str, machine_type: str, boot_disk_gb: int) -> 
         if available < required:
             raise PreflightError(f"insufficient global {metric} quota: available={available:g}, need={required}")
         global_quota_report[metric.lower()] = {
-            "limit": limit, "usage": usage, "available": available, "required": required,
+            "limit": _report_quota_value(limit), "usage": usage,
+            "available": _report_quota_value(available), "required": required,
+            "unlimited": math.isinf(limit),
         }
     global_cpu_records = [
         item for item in global_quotas.get("quotas", [])
@@ -368,7 +387,7 @@ def preflight(project: str, zone: str, machine_type: str, boot_disk_gb: int) -> 
     else:
         if len(global_cpu_records) != 1:
             raise PreflightError("cannot uniquely verify global CPUS_ALL_REGIONS quota")
-        limit = _number(global_cpu_records[0].get("limit"), "global CPU quota limit")
+        limit = _quota_limit(global_cpu_records[0].get("limit"), "global CPU quota limit")
         usage = _number(global_cpu_records[0].get("usage"), "global CPU quota usage")
         available = limit - usage
         if available < vcpus:
@@ -376,8 +395,9 @@ def preflight(project: str, zone: str, machine_type: str, boot_disk_gb: int) -> 
                 f"insufficient global CPU quota: available={available:g}, need={vcpus}"
             )
         global_quota_report["cpus_all_regions"] = {
-            "applicable": True, "limit": limit, "usage": usage,
-            "available": available, "required": vcpus,
+            "applicable": True, "limit": _report_quota_value(limit), "usage": usage,
+            "available": _report_quota_value(available), "required": vcpus,
+            "unlimited": math.isinf(limit),
         }
 
     return {
@@ -397,17 +417,20 @@ def preflight(project: str, zone: str, machine_type: str, boot_disk_gb: int) -> 
         "boot_disk": {"type": BOOT_DISK_TYPE, "size_gb": boot_disk_gb},
         "quotas": {
             "c4_cpu": {
-                "limit": c4_cpu_limit, "inventory_used": cpu_used,
-                "available": family_cpu_available, "required": vcpus, "source": c4_cpu_source,
+                "limit": _report_quota_value(c4_cpu_limit), "inventory_used": cpu_used,
+                "available": _report_quota_value(family_cpu_available), "required": vcpus,
+                "unlimited": math.isinf(c4_cpu_limit), "source": c4_cpu_source,
             },
             "local_ssd": {
-                "limit": local_ssd_limit, "inventory_used": ssd_used,
-                "available": ssd_available, "required": required_ssd_gb,
+                "limit": _report_quota_value(local_ssd_limit), "inventory_used": ssd_used,
+                "available": _report_quota_value(ssd_available), "required": required_ssd_gb,
+                "unlimited": math.isinf(local_ssd_limit),
                 "family_scoped": family_scoped_ssd, "source": local_ssd_source,
             },
             "hyperdisk_balanced": {
-                "limit_gb": hyperdisk_limit, "inventory_used_gb": hdb_usage,
-                "available_gb": hdb_available, "required_gb": boot_disk_gb,
+                "limit_gb": _report_quota_value(hyperdisk_limit), "inventory_used_gb": hdb_usage,
+                "available_gb": _report_quota_value(hdb_available), "required_gb": boot_disk_gb,
+                "unlimited": math.isinf(hyperdisk_limit),
                 "source": hyperdisk_source,
             },
             **region_quota_report,
