@@ -17,6 +17,7 @@ fn main() {
     if !args.iter().any(|a| a == "--child") {
         return; // pass as test when no --child flag
     }
+
     if let Err(e) = child_main(&args) {
         eprintln!("chaos-child: fatal: {e}");
         std::process::exit(1);
@@ -221,6 +222,7 @@ fn publish_v7_completion_marker(
         .map_err(|error| format!("write {operation} completion marker failed: {error}"))?;
     std::fs::rename(&temporary_marker_path, marker_path)
         .map_err(|error| format!("publish {operation} completion marker failed: {error}"))?;
+
     Ok(())
 }
 
@@ -356,6 +358,7 @@ fn run_v7_pitr_crash(
                     .map_err(|_| format!("{name} v7 Parallel writer panicked"))?
                     .map_err(|error| format!("{name} v7 Parallel writer failed: {error:#}"))?;
             }
+
             Ok::<(), String>(())
         })?;
 
@@ -611,6 +614,7 @@ fn run_parallel_wal_crash(engine: &KvEngine, args: &[String]) -> Result<(), Stri
                     .map_err(|_| format!("{name} parallel WAL writer panicked"))?
                     .map_err(|error| format!("{name} parallel WAL writer failed: {error:#}"))?;
             }
+
             Ok::<(), String>(())
         })?;
     } else {

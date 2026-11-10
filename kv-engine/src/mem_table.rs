@@ -93,6 +93,7 @@ fn open_v8_worker_file(
             && metadata.len() >= installed.image_len,
         "v8 WAL worker handle does not refer to the installed Active inode"
     );
+
     Ok(worker_file)
 }
 
@@ -1029,6 +1030,7 @@ impl WriteProfileSnapshot {
         if self.op_count == 0 {
             return 0.0;
         }
+
         self.pitr_seal_bytes as f64 / self.op_count as f64
     }
 
@@ -1154,6 +1156,7 @@ impl WriteProfileSnapshot {
 
     pub fn wal_sync_pct(&self) -> f64 {
         let total = self.total_ms();
+
         if total == 0.0 {
             0.0
         } else {
@@ -1213,6 +1216,7 @@ impl ImmutableRangeTombstoneSet {
     pub fn fragments(&self) -> &Arc<[RangeTombstoneFragment]> {
         self.fragments.get_or_init(|| {
             let frags = fragment_range(&self.raw);
+
             Arc::from(frags)
         })
     }
@@ -1223,6 +1227,7 @@ impl ImmutableRangeTombstoneSet {
     /// avoid duplicating the binary-search logic.
     pub fn newest_covering_ts(&self, user_key: &[u8], read_ts: u64) -> Option<u64> {
         let frags = self.fragments();
+
         crate::range_tombstone::find_newest_covering_ts(frags, user_key, read_ts)
     }
 
@@ -1639,6 +1644,7 @@ impl MemTable {
                 }
             }
         }
+
         Ok(())
     }
 
@@ -1733,6 +1739,7 @@ impl MemTable {
                     installed,
                     max_file_size,
                 )?;
+
                 Ok((writer, None))
             },
         )
@@ -1770,6 +1777,7 @@ impl MemTable {
                     max_file_size,
                     Arc::clone(&owner),
                 )?;
+
                 Ok((writer, Some(owner)))
             },
         )
@@ -2011,6 +2019,7 @@ impl MemTable {
     /// Used after WAL recovery where entries are inserted directly into the skiplist.
     fn rebuild_bloom(&self) {
         let mut buf = Vec::new();
+
         for entry in self.map.iter() {
             Self::maybe_note_ttl_value(&self.has_ttl_entries, entry.value());
             let key = entry.key();
@@ -2069,8 +2078,10 @@ impl MemTable {
         if self.is_empty() || !self.bloom.may_contain_hash(hash) {
             return None;
         }
+
         self.map.get(key).map(|x| {
             let val = x.value();
+
             if !val.is_empty() && val[0] != crate::vlog::KvKind::Tombstone as u8 {
                 val.slice(1..)
             } else {
@@ -2093,6 +2104,7 @@ impl MemTable {
         if self.is_empty() || !self.bloom.may_contain_hash(hash) {
             return None;
         }
+
         self.map.get(key).map(|x| x.value().clone())
     }
 
@@ -2111,6 +2123,7 @@ impl MemTable {
                 b.clear();
                 crate::key::KeySlice::from_slice(encoded_internal_key).decode_user_key_into(&mut b);
                 let h = super::table::bloom::hash_key(&b);
+
                 self.bloom.may_contain_hash(h)
             });
             if !may_contain {
@@ -2142,6 +2155,7 @@ impl MemTable {
         if !self.bloom.may_contain_hash(bloom_hash) {
             return None;
         }
+
         self.map
             .get(encoded_internal_key)
             .map(|x| x.value().clone())
@@ -2196,6 +2210,7 @@ impl MemTable {
                 return Some(val.clone());
             }
         }
+
         None
     }
 
@@ -2213,6 +2228,7 @@ impl MemTable {
         read_ts: u64,
     ) -> Option<(Bytes, Vec<u8>)> {
         let bloom_hash = super::table::bloom::hash_key(user_key);
+
         self.get_versioned_raw_with_key_and_hash(user_key, read_ts, bloom_hash)
     }
 
@@ -2227,6 +2243,7 @@ impl MemTable {
         thread_local! {
             static SEEK_BUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
         }
+
         SEEK_BUF.with(|buf| {
             self.get_versioned_with_buf(user_key, read_ts, bloom_hash, &mut buf.borrow_mut())
         })
@@ -2276,6 +2293,7 @@ impl MemTable {
             }
             return Some((entry.value().clone(), found_key.to_vec()));
         }
+
         None
     }
 
@@ -2309,6 +2327,7 @@ impl MemTable {
                 results.push((orig_idx, value, Bytes::from(found_key)));
             }
         }
+
         results
     }
 
@@ -2335,6 +2354,7 @@ impl MemTable {
                 ids.insert(ptr.file_id);
             }
         }
+
         ids
     }
 
@@ -2373,6 +2393,7 @@ impl MemTable {
         if data.is_empty() {
             return Ok(());
         }
+
         self.publish_raw_batch(data)
     }
 
@@ -2384,6 +2405,7 @@ impl MemTable {
         }
         let ticket = self.write_wal_batch(data)?;
         self.commit_wal_ticket(ticket)?;
+
         self.publish_raw_batch(data)
     }
 
@@ -2401,6 +2423,7 @@ impl MemTable {
         if data.is_empty() {
             return Ok(None);
         }
+
         self.write_wal_batch(data)
     }
 
@@ -2411,6 +2434,7 @@ impl MemTable {
         if data.is_empty() {
             return Ok(None);
         }
+
         self.write_wal_owned_batch(data)
     }
 
@@ -2500,6 +2524,7 @@ impl MemTable {
             wal.is_v8() && wal.is_parallel(),
             "prepared v8 batch requires a Parallel v8 WAL"
         );
+
         wal.preflight_v8_leader_batch(batch, limits)
     }
 
@@ -2527,6 +2552,7 @@ impl MemTable {
             wal.admit_v8_prepared_parallel_batch(prepared, commit_ts, recorded_at)?;
         self.last_ticket
             .fetch_max(ticket + 1, std::sync::atomic::Ordering::Release);
+
         Ok((Some(ticket), Some(frame_job)))
     }
 
@@ -2549,6 +2575,7 @@ impl MemTable {
         }
         #[cfg(not(feature = "bench"))]
         let _ = digest_metrics;
+
         Ok(())
     }
 
@@ -2566,6 +2593,7 @@ impl MemTable {
             wal.is_v7() && wal.is_parallel(),
             "prepared v7 batch requires Parallel WAL"
         );
+
         wal.prepare_v7_parallel_batch(batch, limits)
     }
 
@@ -2582,6 +2610,7 @@ impl MemTable {
             .wal_v7_reservation_owner
             .as_ref()
             .context("v7 WAL has no reservation owner")?;
+
         Ok(owner.reserve_preparation_buffer(buffer_memory_bytes)?)
     }
 
@@ -2874,6 +2903,7 @@ impl MemTable {
         };
         empty.validate()?;
         boundary.active.validate()?;
+
         Ok((empty, boundary.active))
     }
 
@@ -2882,6 +2912,7 @@ impl MemTable {
         if let Some(wal) = &self.wal {
             return wal.v8_image_len();
         }
+
         self.wal_v8_sealed_boundary
             .map(|boundary| boundary.sealed_end)
             .ok_or_else(|| anyhow::anyhow!("memtable has no Active v8 image length"))
@@ -2914,6 +2945,7 @@ impl MemTable {
         if let Some(wal) = &self.wal {
             wal.stop_v7_extent_initialization()?;
         }
+
         Ok(())
     }
 
@@ -3555,6 +3587,7 @@ impl MemTable {
                 let mut p = Vec::with_capacity(1 + v.len());
                 p.push(crate::vlog::KvKind::Inline as u8);
                 p.extend_from_slice(v);
+
                 (*k, p)
             })
             .collect();
@@ -3681,6 +3714,7 @@ impl MemTable {
     /// This allows profiling to accumulate across memtable freezes.
     pub fn set_write_profile(&self, profile: Arc<WriteProfile>) {
         self.write_profile.store(Arc::clone(&profile));
+
         if let Some(wal) = &self.wal {
             wal.set_write_profile(profile);
         }
@@ -3689,6 +3723,7 @@ impl MemTable {
     #[cfg(feature = "bench")]
     pub(crate) fn set_wal_sync_diagnostics_enabled(&self, enabled: bool) -> Result<()> {
         let profile = self.write_profile.load_full();
+
         if let Some(wal) = &self.wal {
             wal.set_wal_sync_diagnostics_enabled(&profile, enabled)
         } else {
@@ -3969,6 +4004,7 @@ impl MemTable {
         // bounds (adding `\0` successor for Included), then delegate.
         let start = Self::bound_to_start(lower);
         let end = Self::bound_to_end(upper);
+
         match (start, end) {
             (Some(ref l), Some(ref e)) => self.range_tombstones.overlaps(l, e, u64::MAX),
             (Some(ref l), None) => self
@@ -4105,6 +4141,7 @@ impl MemTableIterator {
         let Some(ptr) = crate::vlog::ValuePointer::try_decode(&val[1..]) else {
             return Bytes::new();
         };
+
         // With MVCC, vLog entries are keyed by the full encoded internal key
         // (user key + ts). Pass it directly for verification.
         match vlog.read(&ptr, key) {
@@ -4168,6 +4205,7 @@ mod tests {
             incarnation: [23; 16],
         };
         let boundary = create_empty_active_image(path, header)?;
+
         Ok((header, boundary))
     }
 
@@ -4259,10 +4297,12 @@ mod tests {
             LIVE_WAL_V5_LIMITS,
             |replayed| {
                 batches.push(replayed.clone());
+
                 Ok(())
             },
         )?;
         assert_eq!(batches, vec![batch]);
+
         Ok(())
     }
 
@@ -4292,6 +4332,7 @@ mod tests {
         let mut image = header.encode()?.to_vec();
         image.extend_from_slice(&encode_generation_zero_frontier(header.digest()?)?);
         fs::write(path, image)?;
+
         recover_v7(
             path,
             ActiveBoundary {
@@ -4345,6 +4386,7 @@ mod tests {
             max_seal_index_bytes: u64::MAX,
         })?;
         let owner = Arc::new(WalV7ReservationOwner::new(ledger, &installed)?);
+
         MemTable::recover_from_v7_active(7, false, path, installed, max_file_size, owner, io_mode)
     }
 
@@ -4404,6 +4446,7 @@ mod tests {
             let first = first.join().expect("first producer panicked")?;
             assert_eq!(first, (1, Some(0)));
             memtable.commit_wal_ticket(second.1)?;
+
             Ok(())
         })?;
         memtable.wal.as_ref().unwrap().close()?;
@@ -4459,6 +4502,7 @@ mod tests {
             assert_eq!(first, (1, Some(0)));
             assert_eq!(second, (2, Some(1)));
             memtable.commit_wal_ticket(second.1)?;
+
             Ok(())
         })?;
         memtable.wal.as_ref().unwrap().close()?;
@@ -4647,6 +4691,7 @@ mod tests {
                 ..WalV7ResourceCharge::default()
             }
         );
+
         Ok(())
     }
 
@@ -5055,8 +5100,10 @@ mod tests {
                             .map(|(commit_ts, _, ticket)| (commit_ts, ticket)),
                         _ => unreachable!(),
                     };
+
                     append_result.and_then(|(commit_ts, ticket)| {
                         admitted_commit_ts = Some(commit_ts);
+
                         if let Err(error) = memtable.commit_wal_ticket(ticket) {
                             mvcc.poison_commit_ts(commit_ts);
                             Err(error)

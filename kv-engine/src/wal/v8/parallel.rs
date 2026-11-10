@@ -228,6 +228,7 @@ impl WalV8ParallelCoordinator {
         tickets
             .try_reserve_exact(config.max_inflight_tickets)
             .context("reserve v8 Parallel ticket slots")?;
+
         Ok(Self {
             inner: Arc::new(CoordinatorInner {
                 state: Mutex::new(CoordinatorState {
@@ -299,6 +300,7 @@ impl WalV8ParallelCoordinator {
             "v8 DATA group starts outside the admitted window"
         );
         let count = (state.next_ticket - first_ticket).min(u64::try_from(max_tickets)?);
+
         Ok(WalV8DataGroupWindow {
             ticket_end: first_ticket + count,
             closed: state.closed,
@@ -315,6 +317,7 @@ impl WalV8ParallelCoordinator {
         if state.poisoned {
             return Vec::new();
         }
+
         state
             .tickets
             .iter()
@@ -330,6 +333,7 @@ impl WalV8ParallelCoordinator {
         if state.poisoned {
             return Vec::new();
         }
+
         state
             .tickets
             .iter()
@@ -372,6 +376,7 @@ impl WalV8ParallelCoordinator {
                 state.frontier_coalesce_waiters -= 1;
             }
         }
+
         waited
     }
 
@@ -403,6 +408,7 @@ impl WalV8ParallelCoordinator {
             .tickets
             .get(ready_prefix.len())
             .map(TicketState::progress);
+
         WalV8FrontierReadySnapshot {
             ready_prefix,
             admitted_ticket_count: state.tickets.len(),
@@ -430,6 +436,7 @@ impl WalV8ParallelCoordinator {
         }
         state.tickets[index].frames_ready = true;
         signal_change(&self.inner, &mut state);
+
         Ok(())
     }
 
@@ -456,6 +463,7 @@ impl WalV8ParallelCoordinator {
             anyhow::bail!("v8 DATA-write start event is invalid for its ticket")
         }
         state.tickets[index].data_write_started_at = Some(Instant::now());
+
         Ok(())
     }
 
@@ -524,6 +532,7 @@ impl WalV8ParallelCoordinator {
         {
             signal_durability_progress(&self.inner, &mut state);
         }
+
         Ok(ordered_link_hash_cpu_ns)
     }
 
@@ -550,6 +559,7 @@ impl WalV8ParallelCoordinator {
         state.tickets[index].data_complete = true;
         signal_change(&self.inner, &mut state);
         signal_durability_progress(&self.inner, &mut state);
+
         Ok(())
     }
 
@@ -627,6 +637,7 @@ impl WalV8ParallelCoordinator {
         }
         signal_change(&self.inner, &mut state);
         signal_durability_progress(&self.inner, &mut state);
+
         Ok(())
     }
 
@@ -696,6 +707,7 @@ impl WalV8ParallelCoordinator {
             return Err(error).context("publish v8 FRONTIER offset to DATA submitter");
         }
         signal_change(&self.inner, &mut state);
+
         Ok(reservation)
     }
 
@@ -774,12 +786,14 @@ impl WalV8ParallelCoordinator {
         signal_change(&self.inner, &mut state);
         signal_durability_progress(&self.inner, &mut state);
         self.inner.durable_published.notify_all();
+
         Ok(())
     }
 
     /// Stop new admissions and wake packer/durability waiters.
     pub(crate) fn close(&self) {
         let mut state = self.inner.state.lock();
+
         if !state.closed {
             state.closed = true;
             signal_change(&self.inner, &mut state);
@@ -812,6 +826,7 @@ impl WalV8ParallelCoordinator {
     /// advance the first two fields.
     pub(crate) fn published_cursor(&self) -> (u64, u64, u64) {
         let state = self.inner.state.lock();
+
         (
             state.durable_ticket_end,
             state.last_frontier_end,
@@ -840,6 +855,7 @@ impl WalV8ParallelCoordinator {
         }
         let previous_ticket = ticket_end.checked_sub(1)?;
         let index = usize::try_from(previous_ticket.checked_sub(state.durable_ticket_end)?).ok()?;
+
         state.tickets.get(index)?.prefix_digest_after
     }
 
@@ -853,6 +869,7 @@ impl WalV8ParallelCoordinator {
     #[cfg(feature = "bench")]
     pub(crate) fn with_next_ticket<T>(&self, update: impl FnOnce(u64) -> T) -> T {
         let state = self.inner.state.lock();
+
         update(state.next_ticket)
     }
 
@@ -882,6 +899,7 @@ impl WalV8ParallelCoordinator {
             ticket_end <= state.next_ticket,
             "v8 durability driver names an unassigned ticket"
         );
+
         loop {
             ensure!(!state.poisoned, "v8 Parallel coordinator is poisoned");
             if state.durable_ticket_end >= ticket_end {
@@ -936,6 +954,7 @@ impl WalV8ParallelCoordinator {
                 state.durability_waiters -= 1;
             }
         }
+
         WalV8CoordinatorWake {
             change_generation: state.durability_generation,
             closed: state.closed,
@@ -959,6 +978,7 @@ impl WalV8ParallelCoordinator {
         if state.change_generation == observed_generation && !state.closed && !state.poisoned {
             self.inner.changed.wait_for(&mut state, timeout);
         }
+
         WalV8CoordinatorWake {
             change_generation: state.change_generation,
             closed: state.closed,
@@ -990,6 +1010,7 @@ impl WalV8ParallelCoordinator {
             "v8 preparation reservation window is full"
         );
         state.reserved_preparation_bytes = new_preparation_bytes;
+
         Ok(WalV8PreparationReservation {
             coordinator: self.clone(),
             bytes,
@@ -1209,6 +1230,7 @@ impl Drop for WalV8ParallelAdmissionGuard {
 impl WalV8ParallelCoordinator {
     fn poison_ticket_if_pending(&self, ticket: u64) {
         let mut state = self.inner.state.lock();
+
         if ticket >= state.durable_ticket_end {
             poison_locked(&self.inner, &mut state);
         }
@@ -1286,6 +1308,7 @@ fn fold_ready_digests(state: &mut CoordinatorState) -> Result<()> {
         state.folded_ticket_end = next_ticket;
         state.folded_prefix_digest = prefix_digest;
     }
+
     Ok(())
 }
 
@@ -1309,6 +1332,7 @@ fn validate_plan(plan: WalV8AdmissionPlan) -> Result<()> {
         expected_frame_bytes == plan.frame_buffer_bytes,
         "v8 admission frame buffer length differs from its fragment count"
     );
+
     Ok(())
 }
 
@@ -1341,6 +1365,7 @@ mod tests {
 
     fn header() -> WalV8Header {
         let archive_epoch_id = ArchiveEpochId([0x22; 16]);
+
         WalV8Header {
             timeline_id: TimelineId([0x11; 16]),
             archive_epoch_id,
@@ -1363,6 +1388,7 @@ mod tests {
         max_file_size: u64,
     ) -> Result<WalV8ParallelCoordinator> {
         let wal_header = header();
+
         WalV8ParallelCoordinator::new(
             wal_header,
             WalV8ParallelConfig {
@@ -1422,6 +1448,7 @@ mod tests {
         if mark_data_complete {
             coordinator.mark_data_complete(assignment.segment_ticket)?;
         }
+
         Ok(())
     }
 
@@ -1448,6 +1475,7 @@ mod tests {
         drop(first_admitted);
         drop(second_admitted);
         assert!(coordinator.is_poisoned());
+
         Ok(())
     }
 
@@ -1460,6 +1488,7 @@ mod tests {
             );
             std::thread::yield_now();
         }
+
         Ok(())
     }
 
@@ -1477,6 +1506,7 @@ mod tests {
         assert!(coordinator.coalesce_frontier_ready(Duration::from_millis(1)));
         assert_eq!(coordinator.frontier_ready_prefix().len(), 1);
         assert_eq!(coordinator.durable_ticket_end(), 0);
+
         Ok(())
     }
 
@@ -1503,6 +1533,7 @@ mod tests {
         assert_eq!(coordinator.frontier_ready_prefix().len(), 2);
         assert_eq!(coordinator.durable_ticket_end(), 0);
         assert!(!coordinator.coalesce_frontier_ready(Duration::from_secs(1)));
+
         Ok(())
     }
 
@@ -1530,6 +1561,7 @@ mod tests {
             waiter.join().expect("frontier coalescer panicked");
             assert_eq!(coordinator.durable_ticket_end(), 0);
         }
+
         Ok(())
     }
 
@@ -1591,6 +1623,7 @@ mod tests {
             reservation.frame_offset + FRAME_LEN_U64
         );
         assert!(coordinator.admitted_window().is_empty());
+
         Ok(())
     }
 
@@ -1616,6 +1649,7 @@ mod tests {
         let reservation = coordinator.reserve_frontier(1)?;
         coordinator.publish_durable_frontier(reservation)?;
         encoded.disarm_after_durable();
+
         Ok(())
     }
 
@@ -1673,6 +1707,7 @@ mod tests {
         first.disarm_after_durable();
         second.disarm_after_durable();
         drop(preparation);
+
         Ok(())
     }
 
@@ -1715,6 +1750,7 @@ mod tests {
         coordinator.publish_durable_frontier(reservation)?;
         encoded.disarm_after_durable();
         assert_eq!(coordinator.durable_prefix_digest(), expected_prefix);
+
         Ok(())
     }
 
@@ -1728,6 +1764,7 @@ mod tests {
             !ticket.frames_ready && ticket.digest_ready.is_none() && !ticket.data_complete
         }));
         assert!(admit(&batch(20), &coordinator).is_err());
+
         Ok(())
     }
 
@@ -1744,6 +1781,7 @@ mod tests {
         assert!(coordinator.frontier_ready_prefix().is_empty());
         assert!(coordinator.reserve_frontier(1).is_err());
         encoded.disarm_after_durable();
+
         Ok(())
     }
 
@@ -1757,6 +1795,7 @@ mod tests {
         assert!(coordinator.is_poisoned());
         assert!(coordinator.frontier_ready_prefix().is_empty());
         encoded.disarm_after_durable();
+
         Ok(())
     }
 
@@ -1851,6 +1890,7 @@ mod tests {
         assert!(!coordinator.is_poisoned());
         assert_eq!(coordinator.durable_ticket_end(), 4);
         assert_eq!(coordinator.durable_prefix_digest(), prefix_four);
+
         Ok(())
     }
 
@@ -1883,6 +1923,7 @@ mod tests {
         second_encoded.disarm_after_durable();
         assert_eq!(coordinator.durable_ticket_end(), 2);
         assert!(!coordinator.is_poisoned());
+
         Ok(())
     }
 
@@ -1914,6 +1955,7 @@ mod tests {
         third_encoded.disarm_after_durable();
         assert_eq!(coordinator.durable_ticket_end(), 3);
         assert!(!coordinator.is_poisoned());
+
         Ok(())
     }
 
@@ -1945,6 +1987,7 @@ mod tests {
                 .recv()
                 .context("wait for second test ticket durability")?;
             encoded.disarm_after_durable();
+
             Ok(())
         });
 
@@ -1981,6 +2024,7 @@ mod tests {
             .map_err(|_| anyhow::anyhow!("admission waiter panicked"))??;
         assert_eq!(coordinator.durable_ticket_end(), 2);
         assert!(!coordinator.is_poisoned());
+
         Ok(())
     }
 
@@ -2004,6 +2048,7 @@ mod tests {
             result_tx
                 .send(result.map_err(|error| error.to_string()))
                 .context("publish closed admission result")?;
+
             Ok(())
         });
 
@@ -2027,6 +2072,7 @@ mod tests {
         waiter
             .join()
             .map_err(|_| anyhow::anyhow!("admission waiter panicked"))??;
+
         Ok(())
     }
 
@@ -2068,6 +2114,7 @@ mod tests {
         assert_eq!(coordinator.next_ticket(), 1);
         drop(admitted);
         assert!(coordinator.is_poisoned());
+
         Ok(())
     }
 
@@ -2088,6 +2135,7 @@ mod tests {
         assert_eq!(coordinator.next_ticket(), 0);
         assert!(coordinator.admitted_window().is_empty());
         assert!(!coordinator.is_poisoned());
+
         Ok(())
     }
 
@@ -2109,6 +2157,7 @@ mod tests {
         assert!(coordinator.is_poisoned());
         assert!(coordinator.frontier_ready_prefix().is_empty());
         encoded.disarm_after_durable();
+
         Ok(())
     }
 
@@ -2126,6 +2175,7 @@ mod tests {
         let batch = batch(10);
         assert!(admit(&batch, &coordinator).is_err());
         assert_eq!(coordinator.next_ticket(), 0);
+
         Ok(())
     }
 
@@ -2138,6 +2188,7 @@ mod tests {
             );
             std::thread::yield_now();
         }
+
         Ok(())
     }
 
@@ -2171,6 +2222,7 @@ mod tests {
         let frontier = coordinator.reserve_frontier(1)?;
         coordinator.publish_durable_frontier(frontier)?;
         encoded.disarm_after_durable();
+
         Ok(())
     }
 
@@ -2210,6 +2262,7 @@ mod tests {
         coordinator.publish_durable_frontier(frontier)?;
         first_encoded.disarm_after_durable();
         second_encoded.disarm_after_durable();
+
         Ok(())
     }
 
@@ -2238,6 +2291,7 @@ mod tests {
             .join()
             .expect("durable-publication subscriber panicked");
         encoded.disarm_after_durable();
+
         Ok(())
     }
 
@@ -2264,6 +2318,7 @@ mod tests {
             assert_eq!(wake.closed, !poison);
             waiter.join().expect("lifecycle subscriber panicked");
         }
+
         Ok(())
     }
 
@@ -2292,6 +2347,7 @@ mod tests {
         coordinator.publish_durable_frontier(frontier)?;
         first_encoded.disarm_after_durable();
         second_encoded.disarm_after_durable();
+
         Ok(())
     }
 
@@ -2304,6 +2360,7 @@ mod tests {
             );
             std::thread::yield_now();
         }
+
         Ok(())
     }
 
@@ -2344,6 +2401,7 @@ mod tests {
         driver.complete();
         drop(driver);
         assert!(!coordinator.is_poisoned());
+
         Ok(())
     }
 
@@ -2388,6 +2446,7 @@ mod tests {
         drop(second_driver);
         assert_eq!(coordinator.durable_ticket_end(), 2);
         assert!(!coordinator.is_poisoned());
+
         Ok(())
     }
 
@@ -2419,6 +2478,7 @@ mod tests {
         follower.join().expect("poisoned follower panicked");
         assert!(coordinator.is_poisoned());
         assert_eq!(coordinator.durable_ticket_end(), 0);
+
         Ok(())
     }
 
@@ -2440,6 +2500,7 @@ mod tests {
         assert_eq!(coordinator.durable_ticket_end(), 1);
         assert!(!coordinator.is_poisoned());
         assert!(coordinator.acquire_durability_driver(1)?.is_none());
+
         Ok(())
     }
 
@@ -2471,6 +2532,7 @@ mod tests {
             coordinator.published_cursor(),
             (2, frontier.frame_offset + FRAME_LEN_U64, 2)
         );
+
         Ok(())
     }
 }

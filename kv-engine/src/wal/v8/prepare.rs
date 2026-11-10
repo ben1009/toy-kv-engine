@@ -108,6 +108,7 @@ impl<'a, R> PreparedWalV8Batch<'a, R> {
         let frame_buffer_bytes = usize::try_from(fragment_count)?
             .checked_mul(codec::WAL_V8_FRAME_LEN)
             .context("v8 DATA frame buffer length overflows")?;
+
         Ok(PreparedWalV8Batch {
             canonical,
             limits,
@@ -146,6 +147,7 @@ impl<'a, R> PreparedWalV8Batch<'a, R> {
     {
         let commit_ts = self.commit_ts;
         let recorded_at = self.recorded_at;
+
         self.admit_with_metadata(commit_ts, recorded_at, publisher)
     }
 
@@ -222,6 +224,7 @@ fn validate_assignment(assignment: WalV8BatchAssignment, plan: WalV8AdmissionPla
         .first_data_offset
         .checked_add(u64::try_from(plan.frame_buffer_bytes)?)
         .context("v8 DATA allocation end overflows")?;
+
     Ok(())
 }
 
@@ -394,6 +397,7 @@ impl<G: WalV8AdmissionGuard> EncodedWalV8Batch<G> {
         if result.is_err() {
             self.admission_guard.poison();
         }
+
         result
     }
 
@@ -545,6 +549,7 @@ mod tests {
             self.admitted_tickets
                 .lock()
                 .push(self.assignment.segment_ticket);
+
             Ok((
                 self.assignment,
                 TestAdmissionGuard {
@@ -602,6 +607,7 @@ mod tests {
 
     fn prepare_and_encode(batch: &WalBatch) -> Result<EncodedWalV8Batch<TestAdmissionGuard>> {
         let publisher = TestPublisher::new(WAL_V8_DATA_START);
+
         preflight(batch)?.admit(&publisher)?.encode()
     }
 
@@ -690,6 +696,7 @@ mod tests {
             crate::pitr::LIVE_WAL_V5_LIMITS,
             |bytes| {
                 reserved_bytes = Some(bytes);
+
                 Ok(TestPreparationReservation { _bytes: bytes })
             },
         )?;
@@ -765,6 +772,7 @@ mod tests {
         );
         encoded.disarm_after_durable();
         assert!(!publisher.is_poisoned());
+
         Ok(())
     }
 
@@ -839,6 +847,7 @@ mod tests {
             assert_eq!(logical, encoded.as_bytes());
             encoded.disarm_after_durable();
         }
+
         Ok(())
     }
 
@@ -856,6 +865,7 @@ mod tests {
             assert_eq!(publisher.group_window(), vec![3]);
             assert!(publisher.is_poisoned());
         }
+
         Ok(())
     }
 
@@ -869,6 +879,7 @@ mod tests {
 
         drop(admitted);
         assert!(publisher.is_poisoned());
+
         Ok(())
     }
 
@@ -880,6 +891,7 @@ mod tests {
 
         assert!(encoded.encode_data_frames_into(&mut []).is_err());
         assert!(publisher.is_poisoned());
+
         Ok(())
     }
 }

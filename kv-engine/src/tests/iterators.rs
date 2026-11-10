@@ -77,6 +77,7 @@ fn test_task1_empty_memtable_iter() {
             memtable.for_testing_scan_slice(Bound::Included(b"key1"), Bound::Included(b"key2"));
         assert!(!iter.is_valid());
     }
+
     {
         let iter = memtable.for_testing_scan_slice(Bound::Unbounded, Bound::Unbounded);
         assert!(!iter.is_valid());
@@ -301,6 +302,7 @@ fn test_task4_integration() {
         iter.next().unwrap();
         assert!(!iter.is_valid());
     }
+
     {
         let mut iter = storage
             .scan(Bound::Included(b"2"), Bound::Included(b"3"))

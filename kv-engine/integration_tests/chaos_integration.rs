@@ -81,11 +81,13 @@ fn run_chaos_scenario_with_wal_mode(
     let stdout_handle = std::thread::spawn(move || {
         let mut buf = String::new();
         let _ = child_stdout_buf.read_to_string(&mut buf);
+
         buf
     });
     let stderr_handle = std::thread::spawn(move || {
         let mut buf = String::new();
         let _ = child_stderr_buf.read_to_string(&mut buf);
+
         buf
     });
 
@@ -394,11 +396,13 @@ fn failpoint_v7_parallel_pitr_crash_recovery_install_rename_boundaries() {
     let stdout_handle = std::thread::spawn(move || {
         let mut output = String::new();
         let _ = child_stdout.read_to_string(&mut output);
+
         output
     });
     let stderr_handle = std::thread::spawn(move || {
         let mut output = String::new();
         let _ = child_stderr.read_to_string(&mut output);
+
         output
     });
 
@@ -1640,7 +1644,7 @@ fn failpoint_v7_empty_successor_directory_sync_failure_reopens() {
         "post-rename failure must not leave the temporary image behind"
     );
 
-    drop(engine);
+    drop_parallel_pitr_and_wait_for_unlock(engine, &db_path);
     let recovered = open_and_resume_parallel_pitr(&db_path, &repository);
     assert_empty_v7_active_image(&successor_path);
     assert_eq!(
@@ -1700,7 +1704,7 @@ fn failpoint_v7_empty_successor_rename_failure_reopens() {
         "write admission must stay closed until the authorized successor is installed"
     );
 
-    drop(engine);
+    drop_parallel_pitr_and_wait_for_unlock(engine, &db_path);
     let recovered = open_and_resume_parallel_pitr(&db_path, &repository);
     assert_empty_v7_active_image(&successor_path);
     assert_eq!(
@@ -1760,7 +1764,7 @@ fn failpoint_v7_empty_successor_file_sync_failure_reopens() {
         "write admission must stay closed until the authorized successor is installed"
     );
 
-    drop(engine);
+    drop_parallel_pitr_and_wait_for_unlock(engine, &db_path);
     let recovered = open_and_resume_parallel_pitr(&db_path, &repository);
     assert_empty_v7_active_image(&successor_path);
     assert_eq!(
@@ -1821,7 +1825,7 @@ fn failpoint_v7_empty_successor_segment_sealed_sync_failure_reopens() {
         "write admission must stay closed after uncertain SegmentSealed publication"
     );
 
-    drop(engine);
+    drop_parallel_pitr_and_wait_for_unlock(engine, &db_path);
     let recovered = open_and_resume_parallel_pitr(&db_path, &repository);
     assert_empty_v7_active_image(&successor_path);
     assert_eq!(
@@ -2114,6 +2118,7 @@ fn v7_manifest_authorized_empty_successor_corruption_fails_open() {
             .try_exists()
             .expect("check manifest snapshot presence")
             .then(|| std::fs::read(&path).expect("read manifest snapshot"));
+
         (path, image)
     });
     assert!(
@@ -3431,6 +3436,7 @@ fn failpoint_v7_parallel_pitr_checkpoint_captures_its_fixed_cutoff() {
 #[cfg(target_os = "linux")]
 fn lock_v7_async_checkpoint_failpoint() -> parking_lot::MutexGuard<'static, ()> {
     static LOCK: std::sync::OnceLock<parking_lot::Mutex<()>> = std::sync::OnceLock::new();
+
     LOCK.get_or_init(|| parking_lot::Mutex::new(())).lock()
 }
 
@@ -5205,7 +5211,34 @@ fn prepare_empty_v7_parallel_pitr(
     }
     assert_eq!(status.active_wal_format_version, Some(7));
     assert_eq!(status.active_wal_io_mode, Some(PitrWalIoMode::Parallel));
+
     engine
+}
+
+#[cfg(target_os = "linux")]
+fn drop_parallel_pitr_and_wait_for_unlock(
+    engine: std::sync::Arc<KvEngine>,
+    db_path: &std::path::Path,
+) {
+    // Drop detaches background workers. Wait for their ownership lock without
+    // running close(), whose syncs would alter the injected recovery state.
+    drop(engine);
+    let lock_file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(db_path.join(".wal-v7-open.lock"))
+        .expect("open PITR ownership lock after dropping the engine");
+    let deadline = Instant::now() + Duration::from_secs(10);
+
+    loop {
+        match lock_file.try_lock() {
+            Ok(()) => return,
+            Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("wait for detached PITR workers to release the WAL lock: {error}"),
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -5231,6 +5264,7 @@ fn open_and_resume_parallel_pitr(
         matches!(outcome, PitrResumeOutcome::Resumed),
         "PITR resume must complete reconciliation, got {outcome:?}"
     );
+
     engine
 }
 
@@ -5724,11 +5758,13 @@ fn kill_pitr_child_at_crash_point_with_mode(
     let stdout_handle = std::thread::spawn(move || {
         let mut output = String::new();
         let _ = child_stdout.read_to_string(&mut output);
+
         output
     });
     let stderr_handle = std::thread::spawn(move || {
         let mut output = String::new();
         let _ = child_stderr.read_to_string(&mut output);
+
         output
     });
 
@@ -5781,6 +5817,7 @@ fn find_v7_pitr_wal(db_path: &std::path::Path) -> PathBuf {
         });
     let path = paths.next().expect("find Active v7 PITR WAL");
     assert!(paths.next().is_none(), "expected one Active v7 PITR WAL");
+
     path
 }
 
@@ -5802,6 +5839,7 @@ fn latest_persisted_active_boundary(manifest_path: &std::path::Path) -> (u64, u6
         })
         .next_back()
         .expect("find persisted ActiveBoundaryAdvanced record");
+
     (
         boundary["ticket_end"]
             .as_u64()
@@ -5982,6 +6020,7 @@ fn corrupt_v7_fallback_candidate(
     wal.sync_all()
         .expect("persist speculative candidate corruption");
     drop(wal);
+
     std::fs::read(active_wal_path).expect("read WAL with speculative tail marker")
 }
 
@@ -6003,6 +6042,7 @@ fn append_speculative_frontier_after_zero_tail(
         .enumerate()
         .filter_map(|(frame_index, frame)| {
             let frame_offset = frame_index * FRAME_LEN;
+
             (frame_offset >= HEADER_LEN
                 && frame[..8] == *b"TKVW7FR1"
                 && u16::from_be_bytes([frame[10], frame[11]]) == 2)
@@ -6046,6 +6086,7 @@ fn append_speculative_frontier_after_zero_tail(
                 .expect("open Active WAL to create a zero-filled speculative tail")
                 .set_len(u64::try_from(new_len).expect("test WAL length fits u64"))
                 .expect("extend Active WAL with a zero-filled speculative tail");
+
             offset
         });
 
@@ -6145,11 +6186,13 @@ fn run_parallel_wal_crash_case(
     let stdout_handle = std::thread::spawn(move || {
         let mut output = String::new();
         let _ = child_stdout.read_to_string(&mut output);
+
         output
     });
     let stderr_handle = std::thread::spawn(move || {
         let mut output = String::new();
         let _ = child_stderr.read_to_string(&mut output);
+
         output
     });
 

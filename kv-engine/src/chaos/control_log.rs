@@ -252,6 +252,7 @@ impl ControlLogReader {
                 possibly_visible.push(op_id);
             }
         }
+
         (committed, possibly_visible)
     }
 

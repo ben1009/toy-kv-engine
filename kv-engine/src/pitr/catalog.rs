@@ -176,6 +176,7 @@ impl SegmentMetadata {
         if self.key.archive_epoch_id != self.anchor_epoch() {
             bail!("segment anchor epoch mismatch");
         }
+
         Ok(())
     }
 
@@ -502,6 +503,7 @@ pub(crate) fn encode_catalog_with_limits(
         );
         output.extend_from_slice(&frame);
     }
+
     Ok(output)
 }
 
@@ -701,6 +703,7 @@ fn encode_record(record: &PitrCatalogRecord) -> Result<Vec<u8>> {
             put_bytes(&mut out, &snapshot.backup_catalog_digest);
         }
     }
+
     Ok(out)
 }
 
@@ -941,6 +944,7 @@ fn validate_replay(records: &[PitrCatalogRecord], max_decoded_state_bytes: usize
             "catalog decoded-state limit exceeded"
         );
     }
+
     Ok(())
 }
 
@@ -1190,6 +1194,7 @@ impl ReplayValidator {
                 );
             }
         }
+
         Ok(())
     }
 
@@ -1202,6 +1207,7 @@ impl ReplayValidator {
         } else {
             self.repository_id = Some(repository_id);
         }
+
         Ok(())
     }
 }
@@ -1343,6 +1349,7 @@ fn decode_immutable_boundary(
         wal_digest: cursor.fixed()?,
     };
     boundary.validate()?;
+
     Ok(boundary)
 }
 
@@ -2325,6 +2332,7 @@ mod tests {
             backup_catalog_high_water: 0,
             backup_catalog_digest: [0; 32],
         };
+
         for (record, common_owned_bytes, decoder_base_bytes) in [
             (
                 PitrCatalogRecord::CommitSegment { metadata: segment },
@@ -2404,6 +2412,7 @@ mod tests {
                 segment.first_commit_ts = Some(segment_id);
                 segment.last_commit_ts = Some(segment_id);
                 predecessor = ChainAnchor::Segment(segment.anchor);
+
                 PitrCatalogRecord::CommitSegment { metadata: segment }
             })
             .collect();

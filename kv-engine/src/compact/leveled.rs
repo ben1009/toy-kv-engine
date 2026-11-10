@@ -54,6 +54,7 @@ impl LeveledCompactionController {
                 .map(|sst| sst.table_size())
                 .sum::<u64>();
         }
+
         size
     }
 

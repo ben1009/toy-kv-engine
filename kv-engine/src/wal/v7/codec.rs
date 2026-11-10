@@ -163,6 +163,7 @@ impl WalV7FrameKind {
                 "invalid v7 FRONTIER frame body length"
             ),
         }
+
         Ok(())
     }
 
@@ -197,6 +198,7 @@ impl WalV7FrameKind {
                 }
             }
         }
+
         Ok(())
     }
 }
@@ -234,6 +236,7 @@ impl WalV7DataFragmentHeader {
         body.extend_from_slice(&self.fragment_count.to_be_bytes());
         body.extend_from_slice(&self.batch_bytes.to_be_bytes());
         body.extend_from_slice(payload);
+
         Ok(body)
     }
 
@@ -253,6 +256,7 @@ impl WalV7DataFragmentHeader {
         };
         let payload = &input[WAL_V7_DATA_FRAGMENT_HEADER_LEN..];
         header.validate_payload_len(payload.len())?;
+
         Ok((header, payload))
     }
 
@@ -288,6 +292,7 @@ impl WalV7DataFragmentHeader {
             payload_len == expected_payload_len,
             "v7 DATA fragment payload length does not match its index"
         );
+
         Ok(())
     }
 }
@@ -315,6 +320,7 @@ impl WalV7LogicalBatchHeader {
     ) -> Result<[u8; WAL_V7_LOGICAL_BATCH_HEADER_LEN]> {
         validate_v7_batch_limits(limits)?;
         self.validate(data.len(), limits)?;
+
         self.encode_with_data_crc(data.len(), crc32fast::hash(data), limits)
     }
 
@@ -338,6 +344,7 @@ impl WalV7LogicalBatchHeader {
         output[36..40].copy_from_slice(&data_crc.to_be_bytes());
         let header_crc = crc32fast::hash(&output[..40]);
         output[40..44].copy_from_slice(&header_crc.to_be_bytes());
+
         Ok(output)
     }
 
@@ -391,6 +398,7 @@ impl WalV7LogicalBatchHeader {
             input[44..48].iter().all(|byte| *byte == 0),
             "nonzero v7 logical batch reserved field"
         );
+
         Ok(header)
     }
 
@@ -416,6 +424,7 @@ impl WalV7LogicalBatchHeader {
             self.recorded_at_nanos < 1_000_000_000,
             "v7 recorded_at nanos out of range"
         );
+
         Ok(())
     }
 }
@@ -490,6 +499,7 @@ impl EncodedWalV7LogicalBatch {
         );
         let (fragment_count, output_len) =
             validate_data_frame_output(first_frame_offset, self.output.len(), output.len())?;
+
         encode_data_frame_sequence(
             header_digest,
             first_frame_offset,
@@ -533,6 +543,7 @@ impl EncodedWalV7Entries {
         }
         .encode_with_data_crc(data_len, self.entry_stream_crc, self.limits)?;
         self.output[..WAL_V7_LOGICAL_BATCH_HEADER_LEN].copy_from_slice(&header);
+
         Ok(EncodedWalV7LogicalBatch {
             output: self.output,
             segment_ticket,
@@ -551,6 +562,7 @@ impl PreparedWalV7LogicalBatch<'_> {
         recorded_at: RecordedAt,
     ) -> Result<Vec<u8>> {
         let commit_ts = self.batch.commit_ts;
+
         self.encode_with_metadata(segment_ticket, commit_ts, recorded_at)
     }
 
@@ -588,6 +600,7 @@ impl PreparedWalV7LogicalBatch<'_> {
             written == entry_stream_len,
             "v7 logical batch entry stream length changed while encoding"
         );
+
         Ok(EncodedWalV7Entries {
             output,
             entry_stream_crc,
@@ -633,6 +646,7 @@ fn validate_v7_batch_limits(limits: WalV5Limits) -> Result<()> {
         limits.max_batch_data_bytes <= u32::MAX as usize,
         "v7 batch byte limit exceeds wire format"
     );
+
     Ok(())
 }
 
@@ -663,6 +677,7 @@ fn encode_frame(
 ) -> Result<[u8; WAL_V7_FRAME_LEN]> {
     let mut output = [0_u8; WAL_V7_FRAME_LEN];
     encode_frame_into(&mut output, kind, header_digest, frame_offset, body)?;
+
     Ok(output)
 }
 
@@ -677,6 +692,7 @@ fn encode_frame_into(
     initialize_frame(output, kind, header_digest, frame_offset, body.len())?;
     output[WAL_V7_FRAME_HEADER_LEN..WAL_V7_FRAME_HEADER_LEN + body.len()].copy_from_slice(body);
     finish_frame(output);
+
     Ok(())
 }
 
@@ -697,6 +713,7 @@ fn initialize_frame(
     output[16..48].copy_from_slice(&header_digest);
     output[48..56].copy_from_slice(&frame_offset.to_be_bytes());
     output[56..60].copy_from_slice(&(body_len as u32).to_be_bytes());
+
     Ok(())
 }
 
@@ -744,6 +761,7 @@ pub(crate) fn encode_data_frames_into(
         header.segment_ticket == segment_ticket,
         "v7 logical batch ticket does not match its DATA frame assignment"
     );
+
     encode_data_frame_sequence(
         header_digest,
         first_frame_offset,
@@ -861,6 +879,7 @@ pub(crate) fn encode_generation_zero_frontier(
         previous_frontier_offset: 0,
         previous_frontier_digest: [0; 32],
     };
+
     encode_frame(
         WalV7FrameKind::Frontier,
         header_digest,
@@ -890,6 +909,7 @@ pub(crate) fn encode_frontier_successor(
         frame_offset,
         header_digest,
     )?;
+
     Ok(output)
 }
 
@@ -917,6 +937,7 @@ pub(crate) fn encode_frontier_successor_into(
         frame_offset,
         &header_digest,
     )?;
+
     encode_frame_into(
         output,
         WalV7FrameKind::Frontier,
@@ -1016,6 +1037,7 @@ pub(crate) fn decode_frontier_successor(
         expected_header_digest,
     )?;
     let record_digest = frame_record_digest(input)?;
+
     Ok((frontier, record_digest))
 }
 
@@ -1024,6 +1046,7 @@ pub(crate) fn frame_record_digest(frame: &[u8]) -> Result<[u8; 32]> {
         frame.len() == WAL_V7_FRAME_LEN,
         "invalid v7 WAL frame length"
     );
+
     Ok(Sha256::digest(frame).into())
 }
 
@@ -1048,6 +1071,7 @@ impl WalV7Frontier {
         output[32..64].copy_from_slice(&self.prefix_digest);
         output[64..72].copy_from_slice(&self.previous_frontier_offset.to_be_bytes());
         output[72..104].copy_from_slice(&self.previous_frontier_digest);
+
         output
     }
 
@@ -1056,6 +1080,7 @@ impl WalV7Frontier {
             input.len() == WAL_V7_FRONTIER_BODY_LEN,
             "invalid v7 FRONTIER body length"
         );
+
         Ok(Self {
             generation: u64::from_be_bytes(input[0..8].try_into()?),
             ticket_end: u64::from_be_bytes(input[8..16].try_into()?),
@@ -1086,6 +1111,7 @@ impl WalV7Frontier {
                 && self.previous_frontier_digest == [0; 32],
             "invalid v7 generation-zero FRONTIER"
         );
+
         Ok(())
     }
 
@@ -1130,6 +1156,7 @@ impl WalV7Frontier {
                 && self.previous_frontier_digest == *previous_frame_digest,
             "v7 FRONTIER predecessor binding mismatch"
         );
+
         Ok(())
     }
 
@@ -1147,6 +1174,7 @@ impl WalV7Frontier {
                 && self.durable_end.is_multiple_of(WAL_V7_FRAME_LEN as u64),
             "invalid v7 FRONTIER physical bounds"
         );
+
         Ok(())
     }
 }
@@ -1160,6 +1188,7 @@ fn validate_frame_offset(frame_offset: u64) -> Result<()> {
     frame_offset
         .checked_add(WAL_V7_FRAME_LEN as u64)
         .ok_or_else(|| anyhow::anyhow!("v7 WAL frame end overflows"))?;
+
     Ok(())
 }
 
@@ -1167,6 +1196,7 @@ fn frame_crc(frame: &[u8]) -> u32 {
     let mut crc = crc32fast::Hasher::new();
     crc.update(&frame[..60]);
     crc.update(&frame[64..]);
+
     crc.finalize()
 }
 
@@ -1219,6 +1249,7 @@ mod tests {
             0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2d,
             0x2e, 0x2f,
         ]);
+
         WalV7Header {
             timeline_id: TimelineId([
                 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d,
@@ -1237,10 +1268,12 @@ mod tests {
     fn decode_hex(value: &str) -> Vec<u8> {
         let (pairs, remainder) = value.as_bytes().as_chunks::<2>();
         assert!(remainder.is_empty(), "golden vector has an incomplete byte");
+
         pairs
             .iter()
             .map(|pair| {
                 let pair = std::str::from_utf8(pair).expect("golden vector is ASCII");
+
                 u8::from_str_radix(pair, 16).expect("golden vector contains valid hex")
             })
             .collect()
@@ -1269,6 +1302,7 @@ mod tests {
         expected[56..60].copy_from_slice(&(body.len() as u32).to_be_bytes());
         expected[60..64].copy_from_slice(&crc);
         expected[64..64 + body.len()].copy_from_slice(body);
+
         expected
     }
 
@@ -1281,6 +1315,7 @@ mod tests {
         let mut frame = golden_frame(kind, header_digest, frame_offset, body, [0; 4]);
         let crc = frame_crc(&frame);
         frame[60..64].copy_from_slice(&crc.to_be_bytes());
+
         frame
     }
 
@@ -1297,6 +1332,7 @@ mod tests {
         body.extend_from_slice(&fragment_count.to_be_bytes());
         body.extend_from_slice(&batch_bytes.to_be_bytes());
         body.resize(WAL_V7_DATA_FRAGMENT_HEADER_LEN + payload_len, 0xaa);
+
         body
     }
 
@@ -1448,6 +1484,7 @@ mod tests {
             decode_frame_structural(&data_frame, 8192, &header_digest)?.body,
             data_body
         );
+
         Ok(())
     }
 
@@ -1741,6 +1778,7 @@ mod tests {
             )?,
             batch_header
         );
+
         Ok(())
     }
 
@@ -1881,6 +1919,7 @@ mod tests {
                 }
             }
         }
+
         Ok(())
     }
 
@@ -1932,6 +1971,7 @@ mod tests {
             );
             assert!(output.iter().all(|byte| *byte == 0xa5));
         }
+
         Ok(())
     }
 
@@ -2118,6 +2158,7 @@ mod tests {
         ] {
             assert_eq!(data_fragment_count(batch_bytes), Some(expected_count));
         }
+
         for batch_bytes in [0, 48, 4_294_967_344, u64::MAX] {
             assert_eq!(data_fragment_count(batch_bytes), None);
         }
@@ -2171,6 +2212,7 @@ mod tests {
                 decode_frame_structural(&malformed_frame, frame_offset, &header_digest).is_err()
             );
         }
+
         Ok(())
     }
 
@@ -2292,6 +2334,7 @@ mod tests {
             ..limits
         };
         assert!(header.encode(&entry_stream, small_limits).is_err());
+
         Ok(())
     }
 
@@ -2345,6 +2388,7 @@ mod tests {
             )
             .is_err()
         );
+
         Ok(())
     }
 
@@ -2431,6 +2475,7 @@ mod tests {
             )
             .is_err()
         );
+
         Ok(())
     }
 
@@ -2512,6 +2557,7 @@ mod tests {
         )?;
         assert_eq!(decoded_candidate, valid_candidate);
         assert_eq!(decoded_digest, frame_record_digest(&valid_candidate_frame)?);
+
         Ok(())
     }
 }

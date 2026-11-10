@@ -171,6 +171,7 @@ impl WalV7FrontierPrefixVerification {
                 reason: bounded_reason(error),
             });
         }
+
         Ok(())
     }
 }
@@ -235,6 +236,7 @@ impl WalV7ActiveAnchorRequirements {
                 ));
             }
         }
+
         Ok(requirements)
     }
 
@@ -947,6 +949,7 @@ fn validate_anchor_identity(anchor: &ActiveBoundary, header: WalV7Header) -> Res
             && anchor.incarnation == header.incarnation,
         "Active v7 durable anchor identifies a different WAL segment"
     );
+
     Ok(())
 }
 
@@ -1003,6 +1006,7 @@ fn verify_active_anchor_prefix(
         anchor.durable_end == expected_durable_end,
         "Active v7 durable anchor does not match its exact physical prefix"
     );
+
     Ok(())
 }
 
@@ -1013,6 +1017,7 @@ fn candidate_covers_anchor(candidate: &WalV7FrontierCandidate, anchor: &ActiveBo
     {
         return false;
     }
+
     if candidate.frontier.ticket_end == anchor.ticket_end {
         candidate.frontier.durable_end == anchor.durable_end
             && candidate.frontier.last_commit_ts == anchor.last_commit_ts
@@ -1047,6 +1052,7 @@ fn verify_immutable_wal_digest<R: Read + Seek>(
         actual_digest == expected_digest,
         "immutable v7 WAL image digest mismatch"
     );
+
     Ok(())
 }
 
@@ -1172,6 +1178,7 @@ fn verify_candidate_prefix(
         frame_record_digest(&encoded)? == candidate.frame_digest,
         "v7 candidate marker digest does not match its canonical frontier"
     );
+
     Ok(())
 }
 
@@ -1191,6 +1198,7 @@ fn prefix_predecessor(
         predecessor.chain_breaks_through == 0,
         "v7 FRONTIER prefix contains a fork or orphan control frame"
     );
+
     Ok(predecessor)
 }
 
@@ -1239,6 +1247,7 @@ fn validate_named_frontier_prefix(
         frontier.durable_end == expected_durable_end,
         "v7 FRONTIER durable_end does not match its DATA and control prefix"
     );
+
     Ok(())
 }
 
@@ -1247,6 +1256,7 @@ fn read_frame<R: Read>(reader: &mut R, frame_offset: u64) -> Result<[u8; WAL_V7_
     reader
         .read_exact(&mut frame)
         .with_context(|| format!("read v7 WAL frame at {frame_offset}"))?;
+
     Ok(frame)
 }
 
@@ -1265,6 +1275,7 @@ fn frontier_candidate(
         return Ok(None);
     }
     let frontier = WalV7Frontier::decode_body(&frame.body)?;
+
     Ok(Some(WalV7FrontierCandidate {
         frame_offset: frame.frame_offset,
         frontier,
@@ -1309,6 +1320,7 @@ mod tests {
         let frame = encode_generation_zero_frontier(HEADER_DIGEST)?;
         let decoded = decode_frame_structural(&frame, HEADER_LEN_U64, &HEADER_DIGEST)?;
         let frontier = WalV7Frontier::decode_body(&decoded.body)?;
+
         Ok((frontier, frame_record_digest(&frame)?))
     }
 
@@ -1338,11 +1350,13 @@ mod tests {
             frame_offset,
             HEADER_DIGEST,
         )?;
+
         Ok((frame, frontier))
     }
 
     fn test_header() -> WalV7Header {
         let archive_epoch_id = ArchiveEpochId([0x22; 16]);
+
         WalV7Header {
             timeline_id: TimelineId([0x11; 16]),
             archive_epoch_id,
@@ -1386,6 +1400,7 @@ mod tests {
         let generation_zero_digest = frame_record_digest(&generation_zero_frame)?;
         let mut image = header_bytes.to_vec();
         install_frame(&mut image, HEADER_LEN_U64, &generation_zero_frame)?;
+
         Ok(TestWalImage {
             image,
             header_digest,
@@ -1468,6 +1483,7 @@ mod tests {
         let batch_end = frame_offset
             .checked_add(frame_span)
             .ok_or_else(|| anyhow::anyhow!("test batch end overflows"))?;
+
         Ok((batch_end, logical_batch))
     }
 
@@ -1495,6 +1511,7 @@ mod tests {
         )?;
         let digest = frame_record_digest(&frame)?;
         install_frame(image, spec.frame_offset, &frame)?;
+
         Ok((frontier, digest))
     }
 
@@ -1504,6 +1521,7 @@ mod tests {
         for batch in batches {
             hasher.update(batch);
         }
+
         hasher.finalize().into()
     }
 
@@ -1512,6 +1530,7 @@ mod tests {
         let mut reader = Cursor::new(image);
         let discovery =
             discover_frontier_candidates(&mut reader, u64::try_from(image.len())?, &header_digest)?;
+
         verify_frontier_candidate_prefixes(
             &mut reader,
             u64::try_from(image.len())?,
@@ -1586,6 +1605,7 @@ mod tests {
         )?;
 
         let header = test_header();
+
         Ok((
             image,
             boundary_for(frontier_one, header),
@@ -1595,6 +1615,7 @@ mod tests {
 
     fn discover_image(image: &[u8]) -> Result<WalV7FrontierDiscovery> {
         let mut reader = Cursor::new(image);
+
         discover_frontier_candidates(
             &mut reader,
             u64::try_from(image.len())?,
@@ -1627,6 +1648,7 @@ mod tests {
             selection.diagnostics.selected_frame_offset,
             selection.candidate.frame_offset
         );
+
         Ok(())
     }
 
@@ -1687,6 +1709,7 @@ mod tests {
                 }
             }
         }
+
         Ok(())
     }
 
@@ -1733,6 +1756,7 @@ mod tests {
         )
         .expect_err("an equal-ticket candidate cannot satisfy different physical anchor ends");
         assert!(error.to_string().contains("satisfies all durable anchors"));
+
         Ok(())
     }
 
@@ -1775,6 +1799,7 @@ mod tests {
         )
         .expect_err("Active recovery cannot fall below a broken durable anchor");
         assert!(error.to_string().contains("durable anchor"));
+
         Ok(())
     }
 
@@ -1797,6 +1822,7 @@ mod tests {
         .expect_err("a durable anchor cannot authorize a different WAL incarnation");
 
         assert!(error.to_string().contains("different WAL segment"));
+
         Ok(())
     }
 
@@ -1834,6 +1860,7 @@ mod tests {
         )
         .expect_err("the durable source authority must bind the header predecessor");
         assert!(error.to_string().contains("authoritative segment identity"));
+
         Ok(())
     }
 
@@ -1913,6 +1940,7 @@ mod tests {
         )
         .expect_err("Sealed recovery must reject bytes outside its fixed image");
         assert!(error.to_string().contains("length differs"));
+
         Ok(())
     }
 
@@ -1992,6 +2020,7 @@ mod tests {
                 "immutable recovery failed for an unexpected reason: {error:#}"
             );
         }
+
         Ok(())
     }
 
@@ -2060,6 +2089,7 @@ mod tests {
                 "immutable recovery failed for an unexpected reason: {error:#}"
             );
         }
+
         Ok(())
     }
 
@@ -2094,6 +2124,7 @@ mod tests {
         assert_eq!(selection.active_boundary, active);
         assert_eq!(selection.candidate.frontier.prefix_digest, header_digest);
         assert_eq!(selection.candidate.frame_offset, HEADER_LEN_U64);
+
         Ok(())
     }
 
@@ -2163,6 +2194,7 @@ mod tests {
             verified.verified_candidates[0].frontier, frontier_two,
             "discovery order keeps the newest physical marker first"
         );
+
         Ok(())
     }
 
@@ -2265,6 +2297,7 @@ mod tests {
             "a newer frontier cannot skip the torn B frame even though later C is valid"
         );
         assert!(verified.rejected_candidate_count > 0);
+
         Ok(())
     }
 
@@ -2323,6 +2356,7 @@ mod tests {
         }));
         assert!(verified.rejected_candidates.is_empty());
         assert_eq!(verified.rejected_candidate_count, 0);
+
         Ok(())
     }
 
@@ -2414,6 +2448,7 @@ mod tests {
                 .any(|candidate| candidate.frontier == frontier_two)
         );
         assert!(verified.rejected_candidate_count > 0);
+
         Ok(())
     }
 
@@ -2485,6 +2520,7 @@ mod tests {
                 .any(|candidate| candidate.frame_offset == frontier_offset),
             "whole-prefix verification must reject the locally valid sibling"
         );
+
         Ok(())
     }
 
@@ -2589,6 +2625,7 @@ mod tests {
             [frontier_offset, HEADER_LEN_U64]
         );
         assert_eq!(discovery.scanned_frame_count, 256);
+
         Ok(())
     }
 

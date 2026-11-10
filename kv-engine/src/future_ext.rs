@@ -21,6 +21,7 @@ fn with_runtime<T>(f: impl FnOnce(&tokio::runtime::Runtime) -> T) -> T {
                     .expect("build thread-local tokio runtime"),
             );
         }
+
         f(opt.as_ref().unwrap())
     })
 }

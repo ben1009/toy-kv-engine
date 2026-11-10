@@ -552,6 +552,7 @@ mod tests {
 
     fn eligible_migration_capacity() -> V7MigrationCapacity {
         let segment_bytes = MINIMUM_NONEMPTY_V7_SEGMENT_BYTES;
+
         assess_v7_migration_capacity(
             &config(segment_bytes, 256 * 1024),
             WAL_V5_HEADER_LEN as u64,
@@ -588,6 +589,7 @@ mod tests {
 
     fn invalid_assessment_error(capacity: V7MigrationCapacity) -> V7MigrationReservationError {
         let ledger = resource_ledger(u64::MAX, u64::MAX);
+
         reserve_v7_migration_transition(capacity, &ledger)
             .err()
             .unwrap()
@@ -595,6 +597,7 @@ mod tests {
 
     fn invalid_v8_assessment_error(capacity: V8MigrationCapacity) -> V8MigrationReservationError {
         let ledger = resource_ledger(u64::MAX, u64::MAX);
+
         reserve_v8_migration_transition(capacity, &ledger)
             .err()
             .unwrap()
@@ -1287,6 +1290,7 @@ mod tests {
             )
             .is_err()
         );
+
         for invalid_legacy_bytes in [
             WAL_V5_HEADER_LEN as u64 - 1,
             crate::wal::MAX_WAL_FILE_SIZE + 1,

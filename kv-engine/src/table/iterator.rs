@@ -191,6 +191,9 @@ impl StorageIterator for SsTableIterator {
                     return &[];
                 }
                 // Check cache first (safe: only accessed from this iterator)
+                // SAFETY: UnsafeCell permits interior access; this iterator is not Sync, and
+                // exclusive operations such as next, seek_to_first, and seek_to_key cannot run
+                // while the returned value still borrows this iterator.
                 let cache = unsafe { &*self.deref_cache.get() };
                 if let Some((cached_key, cached_val)) = cache
                     && cached_key.as_key_slice().raw_ref() == self.blk_iter.key().raw_ref()
@@ -208,12 +211,18 @@ impl StorageIterator for SsTableIterator {
                     .read(&ptr, &vlog_key)
                     .expect("SsTableIterator: failed to read value from vLog");
                 let val = bytes.to_vec();
+                // SAFETY: a cache miss can only follow a key change through an exclusive iterator
+                // operation such as next, seek_to_first, or seek_to_key, so no slice returned by
+                // value can still borrow the old cache.
                 let cache_mut = unsafe { &mut *self.deref_cache.get() };
                 *cache_mut = Some((self.blk_iter.key().to_key_vec().into_key_bytes(), val));
                 &cache_mut.as_ref().unwrap().1
             }
             Some(KvKind::ValuePointer) => {
                 // Check cache first (safe: only accessed from this iterator)
+                // SAFETY: UnsafeCell permits interior access; this iterator is not Sync, and
+                // exclusive operations such as next, seek_to_first, and seek_to_key cannot run
+                // while the returned value still borrows this iterator.
                 let cache = unsafe { &*self.deref_cache.get() };
                 if let Some((cached_key, cached_val)) = cache
                     && cached_key.as_key_slice().raw_ref() == self.blk_iter.key().raw_ref()
@@ -235,6 +244,9 @@ impl StorageIterator for SsTableIterator {
                     .expect("SsTableIterator: failed to read value from vLog");
                 let val = bytes.to_vec();
                 // Update cache (safe: single-threaded, only written here)
+                // SAFETY: a cache miss can only follow a key change through an exclusive iterator
+                // operation such as next, seek_to_first, or seek_to_key, so no slice returned by
+                // value can still borrow the old cache.
                 let cache_mut = unsafe { &mut *self.deref_cache.get() };
                 *cache_mut = Some((self.blk_iter.key().to_key_vec().into_key_bytes(), val));
                 &cache_mut.as_ref().unwrap().1

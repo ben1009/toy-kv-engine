@@ -88,6 +88,7 @@ fn bench_ordered_map_publish(c: &mut Criterion) {
                         }
                         black_box(map.len());
                     }
+
                     start.elapsed()
                 });
             },
@@ -106,6 +107,7 @@ fn bench_ordered_map_publish(c: &mut Criterion) {
                         }
                         black_box(map.len());
                     }
+
                     start.elapsed()
                 });
             },
@@ -187,6 +189,7 @@ fn seek_bound_ref(memtable: &MemTable, user_key: &[u8], read_ts: u64) -> Option<
         }
         return Some(entry.value().clone());
     }
+
     None
 }
 
@@ -211,6 +214,7 @@ fn seek_bytes_alloc(memtable: &MemTable, user_key: &[u8], read_ts: u64) -> Optio
         }
         return Some(entry.value().clone());
     }
+
     None
 }
 
@@ -228,6 +232,7 @@ fn make_publish_entries(key_size: usize, entries: usize) -> Vec<(Bytes, Bytes)> 
         .map(|i| {
             let key = key::encode_internal_key(&make_key(key_size, i), i as u64 + 1);
             let value = Bytes::from_static(&[kv_engine::vlog::KvKind::Tombstone as u8]);
+
             (Bytes::from(key), value)
         })
         .collect()

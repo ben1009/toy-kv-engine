@@ -123,36 +123,70 @@ pub enum WalIoMode {
 /// alignment 1, but O_DIRECT requires 4096-byte alignment. Dropping a
 /// Vec backed by a 4096-aligned allocation is undefined behavior.
 ///
-/// Buffers are pooled via [`ArrayQueue`] and recycled across writes. On error,
-/// buffers are returned to the pool (not dropped) to prevent pool exhaustion.
-/// If the pool is full, the buffer is dropped (freed) — this is safe because
-/// `Drop` calls `libc::free` on the `posix_memalign` allocation.
+/// Buffers can be pooled via [`ArrayQueue`] and recycled across writes. The
+/// allocation is freed with `libc::free` when the buffer is dropped.
 pub(crate) struct DirectBuf {
-    ptr: *mut u8,
+    allocation: DirectBufAllocation,
     len: usize,
+}
+
+/// Owns an aligned allocation without exposing its uninitialized bytes.
+/// Producers can allocate before admission and initialize after releasing the
+/// MVCC sequencer. Dropping an unused allocation frees it immediately.
+pub(crate) struct DirectBufAllocation {
+    ptr: *mut u8,
     cap: usize,
 }
 
-// SAFETY: DirectBuf owns its allocation exclusively. The raw pointer is not
-// aliased. Send is required for transfer via ArrayQueue.
-unsafe impl Send for DirectBuf {}
+// SAFETY: DirectBufAllocation owns its allocation exclusively and exposes no
+// borrowed bytes. Moving it between threads preserves that ownership.
+unsafe impl Send for DirectBufAllocation {}
 
-impl DirectBuf {
+impl DirectBufAllocation {
     pub(crate) fn new(size: usize) -> Self {
         // Cap must be 4KB-aligned to prevent io_uring out-of-bounds reads.
         // align_up() rounds write sizes to 4KB; if cap is smaller, io_uring
         // reads past the allocation.
-        let cap = Self::align_up(size.max(4096));
+        let cap = DirectBuf::align_up(size.max(4096));
         let mut ptr: *mut libc::c_void = std::ptr::null_mut();
+        // SAFETY: ptr is a valid out-pointer, 4096 is a supported alignment, and cap is nonzero.
         let ret = unsafe { libc::posix_memalign(&mut ptr, 4096, cap) };
         // posix_memalign failure is OOM — recovery is impossible at this point.
         assert_eq!(ret, 0, "posix_memalign failed (OOM)");
 
         Self {
             ptr: ptr as *mut u8,
-            len: 0,
             cap,
         }
+    }
+
+    pub(crate) fn cap(&self) -> usize {
+        self.cap
+    }
+
+    pub(crate) fn initialize(self) -> DirectBuf {
+        // SAFETY: self exclusively owns the allocation of `cap` bytes.
+        // Initializing it once lets the buffer expose ordinary `u8` slices;
+        // subsequent writes preserve initialization.
+        unsafe { std::ptr::write_bytes(self.ptr, 0, self.cap) };
+
+        DirectBuf {
+            allocation: self,
+            len: 0,
+        }
+    }
+}
+
+impl Drop for DirectBufAllocation {
+    fn drop(&mut self) {
+        // SAFETY: self uniquely owns the allocation returned by posix_memalign.
+        unsafe { libc::free(self.ptr as *mut libc::c_void) };
+    }
+}
+
+impl DirectBuf {
+    pub(crate) fn new(size: usize) -> Self {
+        DirectBufAllocation::new(size).initialize()
     }
 
     /// Round `size` up to the next 4KB boundary (O_DIRECT alignment requirement).
@@ -161,8 +195,9 @@ impl DirectBuf {
     }
 
     fn write_u8_at(&mut self, pos: usize, value: u8) {
-        debug_assert!(pos < self.cap);
-        unsafe { *self.ptr.add(pos) = value };
+        debug_assert!(pos < self.allocation.cap);
+        // SAFETY: the allocation is owned by self, and encoder callers keep pos within cap.
+        unsafe { *self.allocation.ptr.add(pos) = value };
     }
 
     fn write_u32_be_at(&mut self, pos: usize, value: u32) {
@@ -173,50 +208,49 @@ impl DirectBuf {
         self.write_at(pos, &value.to_be_bytes());
     }
 
-    /// The whole allocation as a slice, for encoders that write their own
-    /// layout into it.
-    ///
-    /// The slice is not entirely trustworthy: a fresh allocation from
-    /// `posix_memalign` is uninitialised, and a recycled buffer's only
-    /// known-initialised region is the one its previous [`set_len`] exposed -
-    /// beyond that its bytes are either stale from an earlier batch or never
-    /// written at all, and neither may be read. The caller must therefore write
-    /// every byte it later exposes, which is why this is `pub(crate)` and its
-    /// one caller is the batch encoder.
+    /// The whole initialized allocation as a slice, for encoders and I/O
+    /// operations that need a mutable byte buffer.
     pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] {
-        // SAFETY: the allocation is `cap` bytes and is owned by this struct.
-        // Forming the reference is sound for `u8` - every bit pattern is a valid
-        // `u8` - and the documented contract moves the initialisation duty to
-        // the caller.
-        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.cap) }
+        // SAFETY: `initialize` initializes all `cap` bytes, and later writes only
+        // replace initialized bytes without invalidating the allocation.
+        unsafe { std::slice::from_raw_parts_mut(self.allocation.ptr, self.allocation.cap) }
     }
 
     pub(crate) fn write_at(&mut self, pos: usize, bytes: &[u8]) {
-        debug_assert!(pos + bytes.len() <= self.cap);
+        debug_assert!(pos + bytes.len() <= self.allocation.cap);
 
+        // SAFETY: self owns the destination range, and internal encoders pass in-bounds
+        // positions. Borrowing prevents bytes from aliasing the mutable allocation.
         unsafe {
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.ptr.add(pos), bytes.len());
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                self.allocation.ptr.add(pos),
+                bytes.len(),
+            );
         }
     }
 
     pub(crate) fn zero_range(&mut self, start: usize, end: usize) {
         debug_assert!(start <= end);
-        debug_assert!(end <= self.cap);
+        debug_assert!(end <= self.allocation.cap);
 
+        // SAFETY: self owns the allocation and encoder callers pass an ordered in-bounds range.
         unsafe {
-            std::ptr::write_bytes(self.ptr.add(start), 0, end - start);
+            std::ptr::write_bytes(self.allocation.ptr.add(start), 0, end - start);
         }
     }
 
     pub(crate) fn initialized_slice(&self, start: usize, end: usize) -> &[u8] {
         debug_assert!(start <= end);
-        debug_assert!(end <= self.cap);
+        debug_assert!(end <= self.allocation.cap);
 
-        unsafe { std::slice::from_raw_parts(self.ptr.add(start), end - start) }
+        // SAFETY: `initialize` initializes the whole allocation and later writes preserve
+        // initialization.
+        unsafe { std::slice::from_raw_parts(self.allocation.ptr.add(start), end - start) }
     }
 
     fn as_ptr(&self) -> *const u8 {
-        self.ptr
+        self.allocation.ptr
     }
 
     fn len(&self) -> usize {
@@ -224,7 +258,7 @@ impl DirectBuf {
     }
 
     pub(crate) fn cap(&self) -> usize {
-        self.cap
+        self.allocation.cap
     }
 
     pub(crate) fn set_len(&mut self, len: usize) {
@@ -233,12 +267,6 @@ impl DirectBuf {
 
     fn clear(&mut self) {
         self.len = 0;
-    }
-}
-
-impl Drop for DirectBuf {
-    fn drop(&mut self) {
-        unsafe { libc::free(self.ptr as *mut libc::c_void) };
     }
 }
 
@@ -699,6 +727,7 @@ impl Wal {
                 let _ = pool.push(DirectBuf::new(BUFFER_POOL_BUF_SIZE));
             }
         }
+
         pool
     }
 
@@ -893,6 +922,8 @@ impl Wal {
             let direct_file = self.direct_file.as_ref().unwrap();
             let fd = direct_file.as_raw_fd();
             let alloc_len = new_size - file_size;
+            // SAFETY: direct_file owns a live descriptor and fallocate receives only integer
+            // offsets.
             let ret = unsafe {
                 libc::fallocate(fd, 0, file_size as libc::off_t, alloc_len as libc::off_t)
             };
@@ -1128,6 +1159,7 @@ impl Wal {
             WalIoPath::Parallel => WalIoMode::Parallel,
             WalIoPath::Buffered => anyhow::bail!("v4 WAL requires direct I/O"),
         };
+
         Self::create_with_io_mode(path, io_mode)
     }
 
@@ -1535,6 +1567,7 @@ impl Wal {
         if leader_poisoned || parallel_poisoned {
             self.poisoned.store(true, Ordering::Release);
         }
+
         self.poisoned.load(Ordering::Acquire)
     }
 
@@ -1550,6 +1583,7 @@ impl Wal {
         if let Some(writer) = &self.v8_parallel {
             return writer.active_boundaries();
         }
+
         self.v8_leader
             .as_ref()
             .context("v8 WAL has no Active writer")?
@@ -1562,6 +1596,7 @@ impl Wal {
         if let Some(writer) = &self.v8_parallel {
             return writer.image_len();
         }
+
         self.v8_leader
             .as_ref()
             .context("v8 WAL has no Active writer")?
@@ -1591,6 +1626,7 @@ impl Wal {
         if let Some(runtime) = &self.parallel_runtime {
             runtime.stop_v7_extent_initialization()?;
         }
+
         Ok(())
     }
 
@@ -1754,6 +1790,7 @@ impl Wal {
         }
 
         let error = error.downcast_ref::<v7::admission::WalV7ReservationError>()?;
+
         Some(match error {
             v7::admission::WalV7ReservationError::LogicalWalLimit
             | v7::admission::WalV7ReservationError::SourceSpoolLimit { .. }
@@ -1791,6 +1828,7 @@ impl Wal {
         if let Some(writer) = &self.v8_leader {
             writer.lock().set_write_profile(Arc::clone(&profile));
         }
+
         #[cfg(feature = "bench")]
         if let Some(writer) = &self.v8_parallel {
             writer.set_write_profile(Arc::clone(&profile));
@@ -1984,6 +2022,7 @@ impl Wal {
         if let Some(profile) = profile {
             profile.record_wal_enqueue_ns(enqueue_start.elapsed().as_nanos() as u64);
         }
+
         Ok(ticket)
     }
 
@@ -2007,6 +2046,7 @@ impl Wal {
             !self.poisoned.load(Ordering::Acquire),
             "WAL is poisoned due to a previous I/O error"
         );
+
         self.parallel_runtime
             .as_ref()
             .context("v7 WAL has no Parallel runtime")?
@@ -2058,6 +2098,7 @@ impl Wal {
             .as_ref()
             .context("v7 WAL has no Parallel runtime")?;
         let previous_ticket = self.next_ticket.load(Ordering::Acquire);
+
         match runtime.put_v7_prepared_batch(prepared, commit_ts, recorded_at) {
             Ok((ticket, first_data_offset, frame_job)) => {
                 if ticket != previous_ticket {
@@ -2126,6 +2167,7 @@ impl Wal {
             "WAL is poisoned due to a previous I/O error"
         );
         let previous_ticket = self.next_ticket.load(Ordering::Acquire);
+
         match runtime.put_v7_batch(batch, limits) {
             Ok((ticket, first_data_offset, frame_job)) => {
                 if ticket != previous_ticket {
@@ -2284,6 +2326,7 @@ impl Wal {
         if let Some(writer) = &self.v8_parallel {
             return writer.preflight_batch(batch, limits);
         }
+
         self.v8_leader
             .as_ref()
             .context("v8 WAL has no recovered Active writer")?
@@ -2329,6 +2372,7 @@ impl Wal {
             .fetch_max(data_end, Ordering::Release);
         let mut reserved_end = self.pitr_reserved_end.lock();
         *reserved_end = (*reserved_end).max(data_end);
+
         Ok((assignment.segment_ticket, job))
     }
 
@@ -2358,6 +2402,7 @@ impl Wal {
             .durable_ticket
             .store(ticket_end, Ordering::Release);
         self.next_ticket.store(ticket_end, Ordering::Release);
+
         Ok(commit.ticket)
     }
 
@@ -2372,11 +2417,13 @@ impl Wal {
                 ticket < durable_ticket_end,
                 "v8 Parallel append returned before its ticket became durable"
             );
+
             Ok(ticket)
         })();
         if result.is_err() {
             self.poisoned.store(true, Ordering::Release);
         }
+
         result
     }
 
@@ -2396,6 +2443,7 @@ impl Wal {
             .fetch_max(ticket_end, Ordering::Release);
         self.next_ticket
             .fetch_max(admitted_ticket_end, Ordering::Release);
+
         ticket_end
     }
 
@@ -2407,6 +2455,7 @@ impl Wal {
         if writer.is_poisoned() {
             self.poisoned.store(true, Ordering::Release);
         }
+
         if error.downcast_ref::<v8::leader::WalV8LeaderCapacityError>()
             == Some(&v8::leader::WalV8LeaderCapacityError::RotationRequired)
         {
@@ -2442,6 +2491,7 @@ impl Wal {
             .durable_ticket
             .store(ticket_end, Ordering::Release);
         self.next_ticket.store(ticket_end, Ordering::Release);
+
         Ok(())
     }
 
@@ -2530,6 +2580,7 @@ impl Wal {
             return Err(error);
         }
         self.refresh_v8_parallel_cursor(writer);
+
         Ok(())
     }
 
@@ -2648,6 +2699,7 @@ impl Wal {
                         )?,
                 }
             }
+
             Ok(())
         })?;
         let valid_file_len = crate::pitr::WAL_V5_HEADER_LEN + offset;
@@ -2656,6 +2708,7 @@ impl Wal {
             f.set_len(valid_file_len as u64)?;
             f.sync_all()?;
         }
+
         Ok((f, max_ts))
     }
 
@@ -2768,6 +2821,7 @@ impl Wal {
             recover_batch(decoded)?;
             offset = logical_end;
         }
+
         Ok((offset, max_ts))
     }
 
@@ -2791,6 +2845,7 @@ impl Wal {
                 None => return false,
             };
         }
+
         false
     }
 
@@ -3451,6 +3506,7 @@ impl Wal {
         if let Some(writer) = &self.v8_leader {
             return self.wait_for_v8_leader(writer, Some(ticket));
         }
+
         anyhow::bail!("native durability waits require a parallel WAL runtime")
     }
 
@@ -3621,6 +3677,7 @@ impl Wal {
         if ticket == 0 {
             return Ok(());
         }
+
         self.submit_and_commit(ticket - 1)
     }
 
@@ -3979,6 +4036,7 @@ impl Wal {
 
     fn poisoned_error(&self) -> anyhow::Error {
         let state = self.completion_state.mutex.lock();
+
         state
             .last_error
             .as_ref()
@@ -4278,6 +4336,8 @@ impl Wal {
                 profile.record_wal_sync(1);
             }
             loop {
+                // SAFETY: direct_file owns a live descriptor and fdatasync retains no pointers
+                // after returning.
                 let ret = unsafe { libc::fdatasync(fd) };
                 if ret == 0 {
                     break;

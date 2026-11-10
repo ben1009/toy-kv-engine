@@ -107,6 +107,7 @@ impl StorageIterator for MockIterator {
         {
             panic!("invalid access after next returns an error!");
         }
+
         KeySlice::for_testing_from_slice_no_ts(self.data[self.index].0.as_ref())
     }
 
@@ -116,6 +117,7 @@ impl StorageIterator for MockIterator {
         {
             panic!("invalid access after next returns an error!");
         }
+
         self.data[self.index].1.as_ref()
     }
 
@@ -125,6 +127,7 @@ impl StorageIterator for MockIterator {
         {
             panic!("invalid access after next returns an error!");
         }
+
         self.index < self.data.len()
     }
 }
@@ -261,6 +264,7 @@ pub fn generate_sst_with_ts(
             )
             .unwrap();
     }
+
     builder.build(id, block_cache, path.as_ref()).unwrap()
 }
 
@@ -530,6 +534,7 @@ pub fn construct_merge_iterator_over_storage(
             ));
         }
     }
+
     MergeIterator::create(iters)
 }
 

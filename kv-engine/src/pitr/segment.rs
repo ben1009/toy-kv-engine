@@ -235,6 +235,7 @@ impl PitrSegmentManager {
         }
 
         manager.recompute_reserved()?;
+
         Ok(manager)
     }
 
@@ -617,6 +618,7 @@ impl PitrSegmentManager {
             }
         }
         self.v7_reservation_owners.insert(segment_id, owner);
+
         Ok(())
     }
 
@@ -634,6 +636,7 @@ impl PitrSegmentManager {
         if let Some(resources) = &self.v7_retained_resources {
             resources.release_segment(segment_id);
         }
+
         Ok(())
     }
 
@@ -650,6 +653,7 @@ impl PitrSegmentManager {
                     }
                 })
                 .ok_or_else(|| anyhow::anyhow!("source spool accounting overflow"))?;
+
             Ok::<_, anyhow::Error>(bytes)
         })?;
         self.source_spool_reserved = segments
@@ -902,6 +906,7 @@ impl PitrSegmentManager {
                     .checked_add(seal_reservation)
                     .ok_or_else(|| anyhow::anyhow!("source spool accounting overflow"))?;
                 charges.insert(segment_id, charge);
+
                 Ok::<_, anyhow::Error>(charges)
             },
         )?;
@@ -1043,6 +1048,7 @@ pub(crate) fn install_pitr_file_no_replace_with_faults(
         }
         let from = CString::new(temp_name.as_bytes())?;
         let to = CString::new(file_name.as_bytes())?;
+        // SAFETY: parent_file is open and both NUL-terminated names remain valid for the syscall.
         let rename = unsafe {
             libc::syscall(
                 libc::SYS_renameat2,
@@ -1146,6 +1152,7 @@ pub(crate) fn filesystem_allocation_reservation(
         .checked_add(allocation_unit - 1)
         .ok_or_else(|| anyhow::anyhow!("PITR source allocation reservation overflows"))?
         / allocation_unit;
+
     blocks
         .checked_mul(allocation_unit)
         .ok_or_else(|| anyhow::anyhow!("PITR source allocation reservation overflows"))
@@ -1184,6 +1191,7 @@ pub(crate) fn cleanup_pitr_temp_files(dir: impl AsRef<std::path::Path>) -> Resul
     if removed > 0 {
         std::fs::File::open(dir)?.sync_all()?;
     }
+
     Ok(removed)
 }
 

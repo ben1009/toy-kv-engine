@@ -104,6 +104,7 @@ impl PersistenceModel {
             },
         );
         self.cached_paths.insert(path.to_owned(), inode);
+
         Ok(inode)
     }
 
@@ -126,6 +127,7 @@ impl PersistenceModel {
         {
             self.recovery_install_candidate = None;
         }
+
         Ok(())
     }
 
@@ -139,6 +141,7 @@ impl PersistenceModel {
         file.stable.clone_from(&file.cached);
         file.successful_syncs += 1;
         file.successful_sync_generation = Some(process_generation);
+
         Ok(())
     }
 
@@ -166,6 +169,7 @@ impl PersistenceModel {
             }
             file.stable[range.clone()].copy_from_slice(&file.cached[range.clone()]);
         }
+
         Ok(())
     }
 
@@ -185,6 +189,7 @@ impl PersistenceModel {
                         })
                 });
         self.stable_paths.clone_from(&self.cached_paths);
+
         if active_replaced
             && self.cached_paths.contains_key(ACTIVE_WAL_PATH)
             && self.recovery_install_pending
@@ -240,6 +245,7 @@ impl PersistenceModel {
         {
             self.recovery_install_candidate = Some((self.process_generation, inode));
         }
+
         Ok(replaced)
     }
 
@@ -252,6 +258,7 @@ impl PersistenceModel {
             .collect();
         let before = self.files.len();
         self.files.retain(|inode, _| referenced.contains(inode));
+
         before - self.files.len()
     }
 
@@ -263,6 +270,7 @@ impl PersistenceModel {
         // Unlink changes only the cached directory. A stable directory entry
         // continues to pin the inode until a later successful directory sync.
         self.cached_paths.remove(ACTIVE_WAL_PATH);
+
         Ok(self.cleanup_unreferenced_inodes())
     }
 
@@ -282,6 +290,7 @@ impl PersistenceModel {
     fn path_bytes(&self, path: &str, view: ImageView) -> Option<&[u8]> {
         let inode = self.path_inode(path, view)?;
         let file = self.files.get(&inode)?;
+
         Some(match view {
             ImageView::Cached => &file.cached,
             ImageView::Stable => &file.stable,
@@ -330,6 +339,7 @@ impl PersistenceModel {
         if verify_active_anchor(bytes, anchor).is_err() {
             return false;
         }
+
         recovered.frontier.ticket_end >= anchor.ticket_end
             && recovered.frontier.durable_end >= anchor.durable_end
             && recovered.frontier.last_commit_ts >= anchor.last_commit_ts
@@ -404,6 +414,7 @@ impl SerialHarness {
             self.writer.phase = CommitPhase::Poisoned;
             anyhow::bail!("v7 serial writer no longer owns the canonical Active WAL");
         }
+
         Ok(())
     }
 
@@ -450,6 +461,7 @@ impl SerialHarness {
         physical_hash.update(header.encode()?);
         physical_hash.update(generation_zero_frame);
         let process_generation = disk.process_generation;
+
         Ok(Self {
             disk,
             writer: SerialWriter {
@@ -544,6 +556,7 @@ impl SerialHarness {
                     .all(|pair| pair[0] < pair[1]),
             "recovery model ACK history is not an ordered subset of the installed prefix"
         );
+
         Ok(Self {
             disk,
             writer: SerialWriter {
@@ -574,6 +587,7 @@ impl SerialHarness {
 
     fn commit(&mut self, data: &[u8], commit_ts: u64) -> Result<()> {
         let pending = self.begin_commit(data, commit_ts)?;
+
         self.finish_commit(pending)
     }
 
@@ -733,6 +747,7 @@ impl SerialHarness {
 
     fn finish_commit(&mut self, pending: PendingCommit) -> Result<()> {
         self.sync_pending_commit(&pending)?;
+
         self.publish_commit(pending)
     }
 
@@ -750,6 +765,7 @@ impl SerialHarness {
         self.writer.phase = CommitPhase::Synced {
             ticket: pending.ticket,
         };
+
         Ok(())
     }
 
@@ -762,6 +778,7 @@ impl SerialHarness {
         self.writer.phase = CommitPhase::Poisoned;
         self.disk
             .fdatasync_interrupted(self.writer.inode, persisted_ranges)?;
+
         Ok(())
     }
 
@@ -809,6 +826,7 @@ impl SerialHarness {
         self.history.acknowledged_tickets.push(pending.ticket);
         self.writer.retained_reservations.push(reservation);
         self.writer.phase = CommitPhase::Idle;
+
         Ok(())
     }
 }
@@ -877,6 +895,7 @@ fn recover_latest(image: &[u8]) -> Result<VerifiedBoundary> {
         }
         candidate_offset -= WAL_V7_FRAME_LEN;
     }
+
     Ok(fallback)
 }
 
@@ -981,6 +1000,7 @@ fn verify_candidate(
         previous_frontier_offset,
         logical_hash.finalize().into(),
     )?;
+
     Ok(VerifiedBoundary {
         frame_offset: candidate_offset,
         frontier,
@@ -1075,6 +1095,7 @@ fn decode_model_batch(
         "model commit timestamps are not increasing"
     );
     let decoded_batch = decode_model_entry_stream(logical_header, data)?;
+
     Ok((logical_header, batch_bytes, decoded_batch, next_offset))
 }
 
@@ -1093,6 +1114,7 @@ fn encode_model_entry_stream(value: &[u8], commit_ts: u64) -> Result<Vec<u8>> {
         }],
     };
     let encoded = crate::pitr::encode_v5_batch(&batch, LIVE_WAL_V5_LIMITS)?;
+
     Ok(v5_entry_stream(&encoded)?.to_vec())
 }
 
@@ -1115,6 +1137,7 @@ fn v5_entry_stream(encoded_batch: &[u8]) -> Result<&[u8]> {
         data_end <= encoded_batch.len(),
         "model v5 entry stream is truncated"
     );
+
     Ok(&encoded_batch[data_start..data_end])
 }
 
@@ -1141,6 +1164,7 @@ fn validate_recorded_time_order(
         ensure!(current >= previous, "model WAL recorded times regress");
     }
     *previous = Some(current);
+
     Ok(())
 }
 
@@ -1162,6 +1186,7 @@ fn verify_boundary_contents(
             && frontier.durable_end == last_data_end.max(previous_frontier_end),
         "model FRONTIER does not describe the verified logical prefix"
     );
+
     Ok(())
 }
 
@@ -1277,6 +1302,7 @@ fn verify_active_anchor(image: &[u8], anchor: ActiveAnchor) -> Result<()> {
             && anchor.prefix_digest == anchor_digest,
         "model Active anchor does not match its verified WAL prefix"
     );
+
     Ok(())
 }
 
@@ -1286,11 +1312,13 @@ fn frame_at(image: &[u8], offset: u64) -> Result<&[u8]> {
         .checked_add(WAL_V7_FRAME_LEN)
         .ok_or_else(|| anyhow::anyhow!("model frame range overflows"))?;
     ensure!(end <= image.len(), "model frame is incomplete");
+
     Ok(&image[start..end])
 }
 
 fn model_header() -> WalV7Header {
     let archive_epoch_id = ArchiveEpochId([0x31; 16]);
+
     WalV7Header {
         timeline_id: TimelineId([0x21; 16]),
         archive_epoch_id,
@@ -1340,6 +1368,7 @@ mod tests {
                 TEMP_DIRECTORY_SEQUENCE.fetch_add(1, Ordering::Relaxed)
             ));
             fs::create_dir(&path)?;
+
             Ok(Self(path))
         }
     }
@@ -1352,6 +1381,7 @@ mod tests {
 
     fn active_boundary(frontier: WalV7Frontier) -> ActiveBoundary {
         let header = model_header();
+
         ActiveBoundary {
             timeline_id: header.timeline_id.0,
             archive_epoch_id: header.archive_epoch_id.0,
@@ -1367,6 +1397,7 @@ mod tests {
 
     fn manifest_boundary(anchor: ActiveAnchor) -> ActiveBoundary {
         let header = model_header();
+
         ActiveBoundary {
             timeline_id: header.timeline_id.0,
             archive_epoch_id: header.archive_epoch_id.0,
@@ -1386,6 +1417,7 @@ mod tests {
         let frame = encode_generation_zero_frontier(header_digest)?;
         let decoded = decode_frame_structural(&frame, WAL_V7_HEADER_LEN as u64, &header_digest)?;
         let frontier = WalV7Frontier::decode_body(&decoded.body)?;
+
         Ok((frame, frontier, frame_record_digest(&frame)?))
     }
 
@@ -1437,6 +1469,7 @@ mod tests {
                 .ok_or_else(|| anyhow::anyhow!("fixture DATA offset overflows"))?;
             frames.push(encode_data_frame(header_digest, offset, &body)?);
         }
+
         Ok((frames, logical_batch))
     }
 
@@ -1452,6 +1485,7 @@ mod tests {
         for batch in batches {
             hash.update(batch);
         }
+
         hash.finalize().into()
     }
 
@@ -1467,6 +1501,7 @@ mod tests {
         let header = WalV7Header::decode(&header_bytes)?;
         let header_digest = header.digest()?;
         let discovery = discover_frontier_candidates(&mut file, file_len, &header_digest)?;
+
         select_recovery_candidate(
             &mut file,
             file_len,
@@ -1486,6 +1521,7 @@ mod tests {
         let mut image = header_bytes.to_vec();
         image.extend_from_slice(&generation_zero_frame);
         image.extend_from_slice(b"partial tail");
+
         Ok((image, active_boundary(generation_zero)))
     }
 
@@ -1528,6 +1564,7 @@ mod tests {
             header_digest,
         )?;
         image.extend_from_slice(&frontier_frame);
+
         Ok((image, active_boundary(frontier)))
     }
 
@@ -1574,6 +1611,7 @@ mod tests {
             frontier_offset,
             header_digest,
         )?);
+
         Ok((image, active_boundary(frontier)))
     }
 
@@ -1642,11 +1680,13 @@ mod tests {
             header_digest,
         )?;
         image.extend_from_slice(&second_frontier_frame);
+
         Ok((image, active_boundary(second_frontier)))
     }
 
     fn assert_batch_values(batches: &[WalBatch], expected_values: &[&[u8]]) {
         assert_eq!(batches.len(), expected_values.len());
+
         for (batch, value) in batches.iter().zip(expected_values) {
             assert_eq!(
                 batch.entries,
@@ -1662,6 +1702,7 @@ mod tests {
         let logical_len = WAL_V7_LOGICAL_BATCH_HEADER_LEN
             .checked_add(encode_model_entry_stream(value, 1)?.len())
             .ok_or_else(|| anyhow::anyhow!("model logical batch length overflows"))?;
+
         Ok(WalV7ResourceCharge::for_batch(u64::try_from(logical_len)?)?.buffer_memory_bytes)
     }
 
@@ -1810,6 +1851,7 @@ mod tests {
         let physical_digest: [u8; 32] = harness.writer.physical_hash.clone().finalize().into();
         assert_eq!(reopened.image_digest(), physical_digest);
         assert_eq!(reopened.last_recorded_at, harness.writer.last_recorded_at);
+
         Ok(())
     }
 
@@ -1838,6 +1880,7 @@ mod tests {
             previous_frontier_offset: WAL_V7_HEADER_LEN as u64,
             previous_frontier_digest: generation_zero_digest,
         };
+
         encode_frontier_successor(
             frontier,
             generation_zero,
@@ -1907,6 +1950,7 @@ mod tests {
         disk.publish_active_anchor(mismatched_anchor);
         disk.sync_manifest_success();
         assert!(!disk.service_ready_for(ACTIVE_WAL_PATH, inode));
+
         Ok(())
     }
 
@@ -1929,6 +1973,7 @@ mod tests {
         assert_eq!(recover_latest(stable)?.frontier.ticket_end, 1);
         assert_eq!(harness.disk.stable_active_anchor(), Some(anchor));
         assert!(harness.disk.service_ready_for(ACTIVE_WAL_PATH, inode));
+
         Ok(())
     }
 
@@ -2025,6 +2070,7 @@ mod tests {
             )
             .is_err()
         );
+
         Ok(())
     }
 
@@ -2083,6 +2129,7 @@ mod tests {
             assert_eq!(recover_latest(stable)?.frontier.ticket_end, 1);
             assert_eq!(harness.history.acknowledged_tickets, [0]);
         }
+
         Ok(())
     }
 
@@ -2136,6 +2183,7 @@ mod tests {
         let mut damaged = stable.to_vec();
         damaged[WAL_V7_HEADER_LEN] ^= 0x80;
         assert!(recover_latest(&damaged).is_err());
+
         Ok(())
     }
 
@@ -2196,6 +2244,7 @@ mod tests {
             history_before
         );
         assert_eq!(harness.writer.resource_ledger.snapshot(), expected_charge);
+
         Ok(())
     }
 
@@ -2229,6 +2278,7 @@ mod tests {
             );
             assert_eq!(harness.writer.next_ticket, ticket + 1);
         }
+
         Ok(())
     }
 
@@ -2270,6 +2320,7 @@ mod tests {
             )?,
             WalV7FrameKind::Frontier
         );
+
         Ok(())
     }
 
@@ -2288,6 +2339,7 @@ mod tests {
         let recovered = recover_latest(stable)?;
         assert_eq!(recovered.frontier.ticket_end, 1);
         assert_eq!(recovered.frame_offset, pending.frontier_offset);
+
         Ok(())
     }
 
@@ -2335,6 +2387,7 @@ mod tests {
                 }]
             );
         }
+
         Ok(())
     }
 
@@ -2357,6 +2410,7 @@ mod tests {
             .path_bytes(ACTIVE_WAL_PATH, ImageView::Stable)
             .expect("initial Active WAL is installed");
         assert_eq!(recover_latest(stable)?.frontier.ticket_end, 0);
+
         Ok(())
     }
 
@@ -2394,6 +2448,7 @@ mod tests {
                 .expect("acknowledged Active prefix remains installed");
             assert_eq!(recover_latest(stable)?.frontier.ticket_end, 1);
         }
+
         Ok(())
     }
 
@@ -2479,6 +2534,7 @@ mod tests {
                 );
             }
         }
+
         Ok(())
     }
 
@@ -2571,6 +2627,7 @@ mod tests {
                 );
             }
         }
+
         Ok(())
     }
 
@@ -2634,12 +2691,14 @@ mod tests {
             .expect("active path survives power loss");
         assert_eq!(recover_latest(after_power_loss)?.frontier.ticket_end, 1);
         assert_eq!(harness.history.acknowledged_tickets, [0]);
+
         Ok(())
     }
 
     #[test]
     fn empty_recovery_normalizes_twice_then_appends_and_reopens() -> Result<()> {
         let (image, anchor) = empty_image_with_torn_tail()?;
+
         normalize_twice_continue_and_reopen(image, anchor, &[], &[])
     }
 
@@ -2660,6 +2719,7 @@ mod tests {
                 .stable_active_anchor()
                 .expect("creation persisted the Active anchor"),
         );
+
         // The recovery helper reopens with only one frame of buffer capacity,
         // which must not be consumed by the larger persisted batch.
         normalize_twice_continue_and_reopen(image, anchor, &[&value, b"small"], &[0, 1])
@@ -2742,6 +2802,7 @@ mod tests {
                 assert_eq!(harness.history.acknowledged_tickets, [0, 1, 2]);
             }
         }
+
         normalize_twice_continue_and_reopen(image, anchor, &[b"first", b"second"], &[0, 1])
     }
 
@@ -2934,6 +2995,7 @@ mod tests {
         );
         assert_eq!(recover_latest(&normalized_image)?.frontier.ticket_end, 0);
         assert!(!disk.service_ready_for(ACTIVE_WAL_PATH, second_temp));
+
         Ok(())
     }
 }

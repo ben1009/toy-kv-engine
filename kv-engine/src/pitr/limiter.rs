@@ -69,6 +69,7 @@ impl PitrArchiveLimiter {
         if options.bytes_per_second.is_none() {
             state.fractional_credit = 0;
         }
+
         Ok(())
     }
 
@@ -211,6 +212,7 @@ fn duration_from_nanos(nanos: u128) -> Duration {
     if seconds > u128::from(u64::MAX) {
         return Duration::MAX;
     }
+
     Duration::new(seconds as u64, (nanos % 1_000_000_000) as u32)
 }
 

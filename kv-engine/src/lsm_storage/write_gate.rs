@@ -40,6 +40,7 @@ impl ActiveMemtableGate {
     pub(crate) async fn read_async(&self) -> MemtableLease {
         let notification = self.available.notified();
         tokio::pin!(notification);
+
         loop {
             notification.as_mut().enable();
             if let Some(_guard) = self.lock.try_read() {
@@ -93,6 +94,7 @@ impl Drop for MemtableLease {
         *count = count
             .checked_sub(1)
             .expect("live lease owns its registration");
+
         if *count == 0 {
             self.leases.drained.notify_all();
         }

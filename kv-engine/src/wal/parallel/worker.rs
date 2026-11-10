@@ -66,6 +66,7 @@ impl WalIoEvent<'_> {
         {
             self.during_sync
         }
+
         #[cfg(not(feature = "bench"))]
         {
             false
@@ -86,6 +87,7 @@ impl WalIoEvent<'_> {
         {
             self.diagnostics_enabled.then(Instant::now)
         }
+
         #[cfg(not(feature = "bench"))]
         {
             None
@@ -97,6 +99,7 @@ impl WalIoEvent<'_> {
         {
             self.event_at
         }
+
         #[cfg(not(feature = "bench"))]
         {
             None
@@ -256,6 +259,7 @@ impl WalSyncProgress {
                 event_at: None,
             }
         }
+
         #[cfg(not(feature = "bench"))]
         {
             WalIoEvent {
@@ -406,6 +410,7 @@ impl WalSyncProgress {
                 ..SyncProgressSnapshot::default()
             }
         }
+
         #[cfg(not(feature = "bench"))]
         {
             let _ = (target, durable_frontier);
@@ -421,6 +426,7 @@ impl WalSyncProgress {
         let diagnostics_enabled = self
             .profile()
             .is_some_and(|profile| profile.wal_sync_diagnostics_enabled());
+
         if diagnostics_enabled {
             let _event_gate = self.io_event_gate.lock();
             let mut state = self.state.lock();
@@ -518,6 +524,7 @@ impl WalSyncProgress {
                 Some(finished_at),
             )
         }
+
         #[cfg(not(feature = "bench"))]
         {
             let _ = (started_at, finished_at);
@@ -624,6 +631,7 @@ impl<B> WriteGroupBuffers<B> {
 impl<B> From<Vec<WriteBuffer<B>>> for WriteGroupBuffers<B> {
     fn from(writes: Vec<WriteBuffer<B>>) -> Self {
         let mut writes = writes.into_iter();
+
         Self {
             first: writes.next(),
             rest: writes.collect(),
@@ -662,6 +670,7 @@ impl<B> WriteGroup<B> {
             .file_offset
             .checked_add(last_write.write_len as u64)
             .ok_or(WorkerError::InvalidWriteRange)?;
+
         Self::new_with_frontiers(tickets, writes, first_offset..allocation_end, &[])
     }
 
@@ -1280,6 +1289,7 @@ impl<B: WorkerBuffer> WorkerCore<B> {
         } else {
             self.stage_cursor % self.group_order.len()
         };
+
         events
     }
 
@@ -1338,6 +1348,7 @@ impl<B: WorkerBuffer> WorkerCore<B> {
     #[cfg(feature = "chaos-testing")]
     fn request_ticket_start(&self, request_id: RequestId) -> Option<u64> {
         let write = self.writes.get(&request_id)?;
+
         self.groups
             .get(&write.group_id)
             .map(|group| group.tickets.start)
@@ -1391,6 +1402,7 @@ impl<B: WorkerBuffer> WorkerCore<B> {
         debug_assert_eq!(self.group_order.len(), self.groups.len());
         debug_assert!(self.staged_sqes + self.outstanding_sqes <= MAX_OUTSTANDING_SQES);
         debug_assert!(self.stage_cursor < self.group_order.len().max(1));
+
         for pair in self.group_order.iter().collect::<Vec<_>>().windows(2) {
             let first = self.groups.get(pair[0]).expect("ordered group exists");
             let second = self.groups.get(pair[1]).expect("ordered group exists");
@@ -1457,6 +1469,7 @@ struct WorkerWake {
 
 impl WorkerWake {
     fn new() -> io::Result<Self> {
+        // SAFETY: eventfd receives only integer arguments and returns a new descriptor or -1.
         let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
         if fd < 0 {
             return Err(io::Error::last_os_error());
@@ -1464,6 +1477,7 @@ impl WorkerWake {
 
         // SAFETY: eventfd returned a fresh descriptor, now owned by this value.
         Ok(Self {
+            // SAFETY: eventfd succeeded, so fd is a new descriptor transferred to this OwnedFd.
             fd: unsafe { OwnedFd::from_raw_fd(fd) },
             pending: AtomicBool::new(false),
             waiting_for_progress: AtomicBool::new(false),
@@ -1478,6 +1492,7 @@ impl WorkerWake {
         if !self.waiting_for_progress.load(Ordering::SeqCst) {
             return Ok(false);
         }
+
         self.signal()
     }
 
@@ -1490,6 +1505,7 @@ impl WorkerWake {
         }
 
         let value = 1_u64;
+
         loop {
             // SAFETY: eventfd requires an eight-byte write; `value` remains
             // valid for the duration of this call.
@@ -1521,6 +1537,7 @@ impl WorkerWake {
 
     fn drain(&self) -> io::Result<()> {
         let mut value = 0_u64;
+
         loop {
             // SAFETY: eventfd requires an eight-byte read into live storage.
             let read = unsafe {
@@ -1778,6 +1795,7 @@ impl<B: WorkerBuffer> IoWorkerClient<B> {
             self.slots.available.wait(&mut state);
         }
         ensure!(!state.closed, "WAL I/O worker is closed");
+
         if let Some(id) = state.next_group_id.checked_add(1) {
             let group_id = GroupId(state.next_group_id);
             state.next_group_id = id;
@@ -2099,6 +2117,7 @@ fn enqueue_group_command<B: WorkerBuffer>(
 
 fn close_group_admission(slots: &GroupSlots) {
     let mut state = slots.state.lock();
+
     if !state.closed {
         state.closed = true;
         slots.available.notify_all();
@@ -2142,10 +2161,12 @@ fn submit_staged_writes<B: WorkerBuffer>(
         if result.is_ok() {
             submitted_at = timestamp();
         }
+
         result
     })
     .context("failed to submit WAL writes to io_uring")?;
     mark_submitted_prefix(submitted, staged, core)?;
+
     Ok((submitted, submitted_at))
 }
 
@@ -2175,6 +2196,7 @@ fn wait_for_worker_progress(
     let ready = loop {
         // A timeout is only a fallback if eventfd signaling fails after a
         // command was queued; normal progress is driven by readiness.
+        // SAFETY: fds points to initialized pollfd entries and poll does not retain the pointer.
         let ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, 1000) };
         if ready >= 0 {
             break Ok(());
@@ -2196,6 +2218,7 @@ fn wait_for_worker_progress(
     if command_ready {
         wake.drain()?;
     }
+
     Ok(command_ready)
 }
 
@@ -2415,6 +2438,7 @@ mod tests {
                 )
             })
             .collect();
+
         WriteGroup::new(tickets, writes).expect("valid group")
     }
 
@@ -2425,6 +2449,7 @@ mod tests {
             .map(|submission| {
                 assert!(!submission.buffer_ptr.is_null());
                 let _identity = (submission.group_id, submission.buffer_id);
+
                 submission.request_id
             })
             .collect::<Vec<_>>();
@@ -3288,6 +3313,7 @@ mod tests {
         let sync_progress = WalSyncProgress::default();
         flush_staged_writes(&mut ring_staged, &mut core, &sync_progress, || {
             submit_attempts += 1;
+
             Ok(submission_counts.next().expect("expected partial submit"))
         })
         .expect("flush partial submissions before polling CQEs");
@@ -3393,6 +3419,7 @@ mod tests {
 
         let result = retry_interrupted(|| {
             attempts += 1;
+
             if attempts < 3 {
                 Err(std::io::Error::from(std::io::ErrorKind::Interrupted))
             } else {
@@ -3589,6 +3616,7 @@ mod tests {
             if let Ok(WorkerCommand::Shutdown(reply)) = command_rx.recv() {
                 drop(reply);
             }
+
             Ok(())
         });
         let slots = Arc::new(GroupSlots {

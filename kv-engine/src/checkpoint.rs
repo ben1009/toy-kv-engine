@@ -266,6 +266,7 @@ impl KvEngine {
         options: CheckpointOptions,
     ) -> Result<CheckpointStats> {
         let _lifecycle_guard = self.inner.lifecycle.admit_write()?;
+
         self.inner
             .create_checkpoint_with_options(target_dir, options)
     }
@@ -291,6 +292,7 @@ impl KvEngine {
             .blocking
             .run_result(move || {
                 let _guard = guard;
+
                 inner.create_checkpoint_with_options(target_dir, options)
             })
             .await
@@ -337,6 +339,7 @@ impl LsmStorageInner {
                     "checkpoint.after_capture_boundary_before_copy"
                 );
             }
+
             self.publish_prepared_checkpoint(&target_dir, &tmp_dir, &options, prepared)
         })();
 
@@ -453,6 +456,7 @@ impl LsmStorageInner {
             {
                 *pitr_state = Some(crate::pitr::manifest::PitrState::default());
             }
+
             Ok(capture)
         };
         if let Some(engine) = self.weak_engine.get().and_then(std::sync::Weak::upgrade) {
@@ -716,6 +720,7 @@ impl LsmStorageInner {
         };
         let vlog_pin_guard = self.vlog.as_ref().map(|vlog| {
             vlog.pin_files_for_checkpoint(&vlog_ids);
+
             VlogCheckpointPinGuard {
                 vlog,
                 file_ids: vlog_ids.clone(),
@@ -773,6 +778,7 @@ impl LsmStorageInner {
                 )?);
             }
         }
+
         Ok(metadata)
     }
 }
@@ -794,6 +800,7 @@ pub(crate) fn hash_immutable_file(
         }
         hasher.update(&buf[..read]);
     }
+
     Ok(ImmutableFileMetadata {
         kind,
         file_id,
@@ -824,6 +831,7 @@ fn open_immutable_source(path: &Path) -> Result<File> {
             .context("failed to open immutable source without following symlinks");
     }
     crate::backup::ensure_regular_file(fd)?;
+
     // SAFETY: fd is valid after the successful openat above.
     Ok(unsafe { File::from_raw_fd(fd) })
 }
@@ -1378,6 +1386,7 @@ fn rename_no_replace_platform(from: &Path, to: &Path) -> Result<()> {
     let to_path = to.to_path_buf();
     let from = CString::new(from.as_os_str().as_bytes())?;
     let to = CString::new(to.as_os_str().as_bytes())?;
+    // SAFETY: both paths are live NUL-terminated strings for the duration of the syscall.
     let result = unsafe {
         libc::syscall(
             libc::SYS_renameat2,

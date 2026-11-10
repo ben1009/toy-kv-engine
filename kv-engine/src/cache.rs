@@ -361,6 +361,7 @@ impl ValueCache {
         if raw > u16::MAX as usize || raw > self.weight_budget as usize {
             return None;
         }
+
         Some(raw.max(1) as u16)
     }
 
@@ -429,6 +430,7 @@ mod tests {
         // miss — closure runs
         let b1 = cache.get_or_insert(1, 0, || {
             calls.fetch_add(1, Ordering::Relaxed);
+
             make_block(b"hello")
         });
         assert_eq!(&b1.data[..], b"hello");
@@ -437,6 +439,7 @@ mod tests {
         // hit — closure does NOT run
         let b2 = cache.get_or_insert(1, 0, || {
             calls.fetch_add(1, Ordering::Relaxed);
+
             make_block(b"WRONG")
         });
         assert_eq!(&b2.data[..], b"hello");
@@ -525,12 +528,15 @@ mod tests {
                 let cache = cache.clone();
                 let calls = calls.clone();
                 let barrier = barrier.clone();
+
                 std::thread::spawn(move || {
                     barrier.wait();
+
                     cache.get_or_insert(1, 0, || {
                         calls.fetch_add(1, Ordering::Relaxed);
                         // Simulate disk latency
                         std::thread::sleep(std::time::Duration::from_millis(50));
+
                         make_block(b"data")
                     })
                 })
@@ -557,8 +563,10 @@ mod tests {
                 let cache = cache.clone();
                 let calls = calls.clone();
                 let barrier = barrier.clone();
+
                 std::thread::spawn(move || {
                     barrier.wait();
+
                     cache.try_get_with::<_, &str>(1, 0, || {
                         calls.fetch_add(1, Ordering::Relaxed);
                         std::thread::sleep(std::time::Duration::from_millis(20));
@@ -596,8 +604,10 @@ mod tests {
                 let cache = cache.clone();
                 let calls = calls.clone();
                 let barrier = barrier.clone();
+
                 std::thread::spawn(move || {
                     barrier.wait();
+
                     cache.try_get_with::<_, &str>(1, 0, || {
                         calls.fetch_add(1, Ordering::Relaxed);
                         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -788,6 +798,7 @@ mod tests {
             .map(|t| {
                 let cache = cache.clone();
                 let barrier = barrier.clone();
+
                 std::thread::spawn(move || {
                     barrier.wait();
                     // Each thread inserts into a different file_id.
@@ -804,6 +815,7 @@ mod tests {
         for h in handles {
             h.join().unwrap();
         }
+
         // All files were invalidated — cache should be empty.
         for t in 0..4u32 {
             for i in 0..50u64 {

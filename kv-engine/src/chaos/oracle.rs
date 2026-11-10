@@ -115,6 +115,7 @@ impl ReferenceState {
                 let entry = latest_ops
                     .entry(k.to_vec())
                     .or_insert((rec.op_id, is_committed));
+
                 if rec.op_id > entry.0 {
                     *entry = (rec.op_id, is_committed);
                 }

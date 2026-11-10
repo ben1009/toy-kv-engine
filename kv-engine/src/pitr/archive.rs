@@ -128,6 +128,7 @@ pub(crate) struct ArchiveLockGuard {
 #[cfg(target_os = "linux")]
 impl Drop for ArchiveLockGuard {
     fn drop(&mut self) {
+        // SAFETY: self.lock owns a live descriptor; flock does not retain pointers after returning.
         let _ = unsafe { libc::flock(self.lock.as_raw_fd(), libc::LOCK_UN) };
     }
 }
@@ -142,6 +143,7 @@ impl ArchiveObjectStager {
     /// either thread's `LOCK_UN` would release it while the other still assumed it held the lock.
     fn acquire_repository_lock(root: &File) -> anyhow::Result<File> {
         let name = CString::new(REPOSITORY_LOCK_FILE)?;
+        // SAFETY: root is open and name is a live NUL-terminated string.
         let fd = unsafe {
             libc::openat(
                 root.as_raw_fd(),
@@ -151,6 +153,8 @@ impl ArchiveObjectStager {
             )
         };
         anyhow::ensure!(fd >= 0, std::io::Error::last_os_error());
+        // SAFETY: successful openat returned a new descriptor whose ownership transfers to this
+        // File.
         let lock = unsafe { File::from_raw_fd(fd) };
         crate::backup::ensure_regular_file(lock.as_raw_fd())?;
         let result = loop {
@@ -177,6 +181,7 @@ impl ArchiveObjectStager {
     /// would otherwise block on that must use this.
     fn try_acquire_repository_lock(root: &File) -> anyhow::Result<Option<File>> {
         let name = CString::new(REPOSITORY_LOCK_FILE)?;
+        // SAFETY: root is open and name is a live NUL-terminated string.
         let fd = unsafe {
             libc::openat(
                 root.as_raw_fd(),
@@ -186,6 +191,8 @@ impl ArchiveObjectStager {
             )
         };
         anyhow::ensure!(fd >= 0, std::io::Error::last_os_error());
+        // SAFETY: successful openat returned a new descriptor whose ownership transfers to this
+        // File.
         let lock = unsafe { File::from_raw_fd(fd) };
         crate::backup::ensure_regular_file(lock.as_raw_fd())?;
         let result = loop {
@@ -211,6 +218,7 @@ impl ArchiveObjectStager {
         let root = root.as_ref().to_path_buf();
         let root_fd = open_dir(&root)?;
         let wal_name = CString::new("wal")?;
+        // SAFETY: root_fd is an open directory descriptor and wal_name is a live C string.
         let created = unsafe { libc::mkdirat(root_fd.as_raw_fd(), wal_name.as_ptr(), 0o700) } == 0;
         if !created {
             let error = std::io::Error::last_os_error();
@@ -239,6 +247,7 @@ impl ArchiveObjectStager {
                         continue;
                     }
                     let name = CString::new(name)?;
+                    // SAFETY: wal_fd is an open directory descriptor and name is a live C string.
                     let result = unsafe { libc::unlinkat(wal_fd.as_raw_fd(), name.as_ptr(), 0) };
                     if result != 0
                         && std::io::Error::last_os_error().kind() != std::io::ErrorKind::NotFound
@@ -255,6 +264,7 @@ impl ArchiveObjectStager {
         if created {
             sync_fd(&root_fd)?;
         }
+
         Ok(Self {
             root: root_fd,
             wal_dir: wal_fd,
@@ -371,6 +381,7 @@ impl ArchiveObjectStager {
             }) {
                 std::thread::yield_now();
             }
+
             Ok(())
         };
         publish_one_chunked(
@@ -463,6 +474,7 @@ impl ArchiveObjectStager {
                 "archive object length exceeds expected size"
             );
         }
+
         Ok(bytes)
     }
 }
@@ -497,6 +509,7 @@ fn publish_one_chunked(
             temp.write_all(chunk)?;
         }
         temp.sync_all()?;
+        // SAFETY: directory is open and both NUL-terminated names remain valid for the syscall.
         let rename = unsafe {
             libc::syscall(
                 libc::SYS_renameat2,
@@ -528,17 +541,20 @@ fn publish_one_chunked(
                 unsafe { libc::_exit(137) }
             }
         }
+
         Ok(())
     })();
     drop(temp);
 
     if !temp_consumed {
+        // SAFETY: directory is open and temp_name is a live C string.
         let unlink = unsafe { libc::unlinkat(directory.as_raw_fd(), temp_name.as_ptr(), 0) };
         if unlink != 0 && result.is_ok() {
             return Err(std::io::Error::last_os_error().into());
         }
         sync_fd(directory)?;
     }
+
     result
 }
 
@@ -564,6 +580,7 @@ fn read_bounded_file(
         }
         bytes.extend_from_slice(&buffer[..read]);
     }
+
     Ok(bytes)
 }
 
@@ -581,6 +598,7 @@ fn write_chunked(
         }
         file.write_all(chunk)?;
     }
+
     Ok(())
 }
 
@@ -589,6 +607,7 @@ fn create_temp(directory: &File, name: &str) -> anyhow::Result<(CString, File)> 
     for _ in 0..64 {
         let sequence = STAGE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let temp_name = CString::new(format!(".{name}.tmp-{}-{sequence}", std::process::id()))?;
+        // SAFETY: directory is open and temp_name is a live C string.
         let fd = unsafe {
             libc::openat(
                 directory.as_raw_fd(),
@@ -598,6 +617,7 @@ fn create_temp(directory: &File, name: &str) -> anyhow::Result<(CString, File)> 
             )
         };
         if fd >= 0 {
+            // SAFETY: openat succeeded, so fd is a new descriptor transferred to this File.
             return Ok((temp_name, unsafe { File::from_raw_fd(fd) }));
         }
         let error = std::io::Error::last_os_error();
@@ -605,6 +625,7 @@ fn create_temp(directory: &File, name: &str) -> anyhow::Result<(CString, File)> 
             return Err(error.into());
         }
     }
+
     anyhow::bail!("failed to allocate unique archive staging name")
 }
 
@@ -648,6 +669,7 @@ fn is_archive_temp_name(name: &str) -> bool {
 
 #[cfg(target_os = "linux")]
 fn open_existing(directory: &File, name: &CString) -> anyhow::Result<File> {
+    // SAFETY: directory is open and name is a live NUL-terminated string.
     let fd = unsafe {
         libc::openat(
             directory.as_raw_fd(),
@@ -656,9 +678,13 @@ fn open_existing(directory: &File, name: &CString) -> anyhow::Result<File> {
         )
     };
     anyhow::ensure!(fd >= 0, std::io::Error::last_os_error());
+    // SAFETY: openat succeeded, so fd is a new descriptor transferred to this File.
     let file = unsafe { File::from_raw_fd(fd) };
+    // SAFETY: libc::stat is a plain C struct whose fields are valid when zero-initialized.
     let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
     anyhow::ensure!(
+        // SAFETY: file owns a live descriptor and stat points to an initialized writable
+        // libc::stat.
         unsafe { libc::fstat(file.as_raw_fd(), &mut stat) } == 0,
         std::io::Error::last_os_error()
     );
@@ -672,6 +698,8 @@ fn open_existing(directory: &File, name: &CString) -> anyhow::Result<File> {
 
 #[cfg(target_os = "linux")]
 fn open_dir(path: &Path) -> anyhow::Result<File> {
+    // SAFETY: the temporary CString remains alive through open and the path bytes are
+    // NUL-terminated.
     let fd = unsafe {
         libc::open(
             CString::new(path.as_os_str().as_bytes())?.as_ptr(),
@@ -680,12 +708,14 @@ fn open_dir(path: &Path) -> anyhow::Result<File> {
     };
     anyhow::ensure!(fd >= 0, std::io::Error::last_os_error());
 
+    // SAFETY: open succeeded, so fd is a new descriptor transferred to this File.
     Ok(unsafe { File::from_raw_fd(fd) })
 }
 
 #[cfg(target_os = "linux")]
 fn open_dir_at(parent: &File, name: &str) -> anyhow::Result<File> {
     let name = CString::new(name)?;
+    // SAFETY: parent is open and name is a live NUL-terminated string.
     let fd = unsafe {
         libc::openat(
             parent.as_raw_fd(),
@@ -695,12 +725,14 @@ fn open_dir_at(parent: &File, name: &str) -> anyhow::Result<File> {
     };
     anyhow::ensure!(fd >= 0, std::io::Error::last_os_error());
 
+    // SAFETY: openat succeeded, so fd is a new descriptor transferred to this File.
     Ok(unsafe { File::from_raw_fd(fd) })
 }
 
 #[cfg(target_os = "linux")]
 fn sync_fd(file: &File) -> anyhow::Result<()> {
     anyhow::ensure!(
+        // SAFETY: file owns a live descriptor and fsync retains no pointers after returning.
         unsafe { libc::fsync(file.as_raw_fd()) } == 0,
         std::io::Error::last_os_error()
     );
@@ -922,6 +954,7 @@ pub(crate) fn decode_v8_archive_batches(
         wal_len == seal.boundary.sealed_end,
         "v8 archive WAL length differs from its immutable seal"
     );
+
     seal.decode_wal_batches(wal, limits)
 }
 
@@ -933,6 +966,7 @@ pub(crate) fn decode_v7_archive_batches(
     limits: crate::pitr::WalV5Limits,
 ) -> anyhow::Result<Vec<crate::pitr::WalBatch>> {
     let seal = decode_v7_archive_seal(metadata, seal_bytes)?;
+
     seal.decode_wal_batches(wal, limits)
 }
 
@@ -1131,6 +1165,7 @@ mod tests {
             seal_digest,
             source_identity: source_identity.finalize().into(),
         };
+
         (metadata, wal, seal_bytes)
     }
 
@@ -1318,6 +1353,7 @@ mod tests {
             seal_digest,
             source_identity: source_identity.finalize().into(),
         };
+
         (metadata, wal, seal_bytes, batch)
     }
 
@@ -1478,6 +1514,7 @@ mod tests {
             .unwrap();
         // SAFETY: `held` owns a valid descriptor for the LOCK file.
         assert_eq!(
+            // SAFETY: held owns a live descriptor and flock retains no pointers after returning.
             unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
             0
         );
@@ -1680,6 +1717,7 @@ mod tests {
                     (SegmentId(9), ArchiveObjectKind::Seal) => second_seal.clone(),
                     _ => unreachable!("unexpected mixed-version restore source"),
                 };
+
                 (object, bytes)
             })
             .collect::<Vec<_>>();
@@ -2049,6 +2087,7 @@ mod tests {
                     (5, ArchiveObjectKind::Seal) => proof_seal.clone(),
                     _ => unreachable!("unexpected restore source"),
                 };
+
                 (object, bytes)
             })
             .collect::<Vec<_>>();
@@ -2670,6 +2709,7 @@ mod tests {
             .unwrap();
         let fifo = root.join("wal").join(&prepared.wal_name);
         let fifo = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: fifo is a live NUL-terminated path string for the duration of mkfifo.
         assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
         assert!(stager.publish(&prepared, &wal_bytes(), b"seal").is_err());
         std::fs::remove_dir_all(root).unwrap();

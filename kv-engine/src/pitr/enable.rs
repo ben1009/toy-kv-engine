@@ -139,11 +139,13 @@ impl PitrEnableCoordinator {
 
         if let Err(error) = (|| {
             segments.begin_sealing(logical_length, successor_spool_bytes)?;
+
             segments.mark_sealed(boundary_segment_id)
         })() {
             let _ = barrier.abort_rotation_admission(sequencer);
             return Err(error);
         }
+
         segments.pending_successor_id()
     }
 
@@ -415,6 +417,7 @@ fn next_identity(
             return Ok(identity);
         }
     }
+
     anyhow::bail!("PITR identity generation exhausted redraw attempts")
 }
 

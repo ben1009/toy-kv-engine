@@ -174,6 +174,7 @@ impl RangeTombstoneSet {
         Box::new(self.raw.range(..bound_key).filter_map(move |entry| {
             let key = entry.key();
             let tomb_end = entry.value();
+
             // Two ranges [a, b) and [c, d) overlap iff a < d && c < b.
             // The a < d check is handled by the range bound above.
             if start < tomb_end.as_ref() {
@@ -249,6 +250,7 @@ impl RangeTombstoneSet {
                 _ => {}
             }
         }
+
         true
     }
 
@@ -270,6 +272,7 @@ impl RangeTombstoneSet {
         if !self.dirty.load(Ordering::Acquire) {
             return self.cached_fragments.load_full();
         }
+
         // Atomically clear dirty with AcqRel ordering. This establishes a
         // happens-before relationship with any concurrent add() that set
         // dirty=true, ensuring their SkipMap inserts are visible to our read.
@@ -713,6 +716,7 @@ pub fn gc_range_fragments(
 ) -> Vec<RangeTombstoneFragment> {
     fragments.retain_mut(|frag| {
         frag.covering_ts.retain(|&ts| ts > watermark);
+
         !frag.covering_ts.is_empty()
     });
 

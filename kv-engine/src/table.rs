@@ -938,6 +938,8 @@ impl SsTable {
         }
 
         let fd = self.file.as_raw_fd();
+
+        // SAFETY: self.file owns a live descriptor and posix_fadvise receives only integer offsets.
         unsafe {
             libc::posix_fadvise(
                 fd,
@@ -1325,6 +1327,7 @@ impl SsTable {
             frags.windows(2).all(|w| w[0].start <= w[1].start),
             "fragments must be sorted by start"
         );
+
         Some((frags[0].start.as_ref(), frags[frags.len() - 1].end.as_ref()))
     }
 
@@ -1452,6 +1455,7 @@ impl SsTable {
         };
 
         debug_assert!(prefix.len() >= filter.prefix_len);
+
         filter
             .bloom
             .may_contain(bloom::hash_key(&prefix[..filter.prefix_len]))

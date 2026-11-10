@@ -12,6 +12,7 @@ pub(crate) fn thread_cpu_time_ns() -> u64 {
     }
     // SAFETY: the successful `clock_gettime` call initialized `time`.
     let time = unsafe { time.assume_init() };
+
     u64::try_from(time.tv_sec)
         .unwrap_or(u64::MAX)
         .saturating_mul(1_000_000_000)
@@ -156,11 +157,13 @@ impl WalV8EntryHasher {
                 .saturating_add(thread_cpu_time_ns().saturating_sub(started));
         }
         self.encoded_len = next_len;
+
         Ok(())
     }
 
     pub(crate) fn finish(self) -> Result<WalV8Digest> {
         self.validate_complete()?;
+
         Ok(*self.hasher.finalize().as_bytes())
     }
 
@@ -182,6 +185,7 @@ impl WalV8EntryHasher {
         };
         #[cfg(not(feature = "bench"))]
         let metrics = WalV8DigestMetrics;
+
         Ok((digest, metrics))
     }
 
@@ -191,6 +195,7 @@ impl WalV8EntryHasher {
             self.encoded_len == self.expected_len,
             "v8 entry stream length does not match its preflighted length"
         );
+
         Ok(())
     }
 }
@@ -254,6 +259,7 @@ fn hash_parts(domain: &[u8], parts: &[&[u8]]) -> WalV8Digest {
     for part in parts {
         hasher.update(part);
     }
+
     *hasher.finalize().as_bytes()
 }
 
@@ -267,6 +273,7 @@ mod tests {
 
     fn hex<const N: usize>(value: &str) -> [u8; N] {
         assert_eq!(value.len(), N * 2);
+
         std::array::from_fn(|index| {
             u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).unwrap()
         })
@@ -278,6 +285,7 @@ mod tests {
         for chunk in data.chunks(chunk_len) {
             hasher.update(chunk)?;
         }
+
         hasher.finish()
     }
 
@@ -315,6 +323,7 @@ mod tests {
             advance_prefix(&p0, 0, 64, &b0),
             hex("b0d28130323ebce6e10591137ab6623bdb6533e9863b39ef56e9b0d6f59f2d53")
         );
+
         Ok(())
     }
 
@@ -331,6 +340,7 @@ mod tests {
             *byte = 0x30 + index as u8;
         }
         header[144..148].copy_from_slice(&[0xb9, 0x7f, 0xe4, 0xf2]);
+
         header
     }
 
@@ -357,6 +367,7 @@ mod tests {
             entries,
             LIVE_WAL_V5_LIMITS,
         )?;
+
         Ok(decoded)
     }
 
@@ -446,6 +457,7 @@ mod tests {
         let changed_b0 = batch_digest(&changed_q0, &changed_e0);
         assert_ne!(changed_b0, b0);
         assert_ne!(advance_prefix(&p0, 0, 64, &changed_b0), p1);
+
         Ok(())
     }
 
@@ -512,6 +524,7 @@ mod tests {
                 );
             }
         }
+
         Ok(())
     }
 
@@ -535,6 +548,7 @@ mod tests {
         overflow.encoded_len = u64::MAX;
         assert!(overflow.update(&[1]).is_err());
         assert!(overflow.finish().is_err());
+
         Ok(())
     }
 

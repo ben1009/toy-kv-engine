@@ -203,6 +203,7 @@ impl ValuePointer {
                 Self::encoded_size()
             ));
         }
+
         Ok(Self {
             file_id: buf.get_u32_le(),
             offset: buf.get_u64_le(),
@@ -822,6 +823,7 @@ impl ValueLog {
         for file_id in &file_ids {
             self.schedule_deletion(*file_id);
         }
+
         file_ids
     }
 
@@ -1184,6 +1186,7 @@ impl ValueLog {
                 vlog_total_bytes += meta.len();
             }
         }
+
         Ok(ValueLogStats {
             vlog_total_bytes,
             vlog_file_count,

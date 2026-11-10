@@ -314,6 +314,7 @@ fn generate_multi_version_sst(dir: &tempfile::TempDir, block_size: usize) -> SsT
             .add_raw(KeyVec::from_user_key_ts(uk, *ts).as_key_slice(), val)
             .unwrap();
     }
+
     builder
         .build_for_test(dir.path().join("multi_version.sst"))
         .unwrap()

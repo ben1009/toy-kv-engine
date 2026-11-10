@@ -83,6 +83,7 @@ pub(crate) fn read_seal_sidecar(
 ) -> Result<(SealSidecarFormat, Vec<u8>)> {
     let file =
         File::open(path).with_context(|| format!("open PITR seal sidecar {}", path.display()))?;
+
     read_seal_file_inner(file, max_segment_bytes, None, None)
 }
 
@@ -108,6 +109,7 @@ pub(crate) fn read_seal_sidecar_for_format_with_limit(
 ) -> Result<(SealSidecarFormat, Vec<u8>)> {
     let file =
         File::open(path).with_context(|| format!("open PITR seal sidecar {}", path.display()))?;
+
     read_seal_file_inner(
         file,
         max_segment_bytes,
@@ -187,12 +189,14 @@ fn read_seal_file_inner(
             && u64::try_from(bytes.len())? == sidecar_len,
         "PITR source seal sidecar changed while reading"
     );
+
     Ok((format, bytes))
 }
 
 fn v7_max_entry_count(wal_bytes: u64) -> Result<usize> {
     let fixed_bytes = u64::try_from(WAL_V7_HEADER_LEN + 2 * WAL_V7_FRAME_LEN)?;
     let data_bytes = wal_bytes.saturating_sub(fixed_bytes);
+
     usize::try_from(data_bytes / WAL_V7_FRAME_LEN as u64).map_err(Into::into)
 }
 
@@ -210,6 +214,7 @@ fn v8_max_entry_count(wal_bytes: u64) -> Result<usize> {
     let fixed_bytes = u64::try_from(
         crate::wal::v8::WAL_V8_HEADER_LEN + 2 * crate::wal::v8::codec::WAL_V8_FRAME_LEN,
     )?;
+
     usize::try_from(
         wal_bytes.saturating_sub(fixed_bytes) / crate::wal::v8::codec::WAL_V8_FRAME_LEN as u64,
     )
@@ -246,6 +251,7 @@ impl V5Seal {
             .checked_sub(WAL_V5_HEADER_LEN as u64)
             .ok_or_else(|| anyhow::anyhow!("maximum PITR WAL size is below its header"))?;
         let max_entries = usize::try_from(max_wal_bytes / WAL_V5_ALIGNMENT as u64)?;
+
         HEADER_BYTES
             .checked_add(
                 max_entries
@@ -271,6 +277,7 @@ impl V5Seal {
         let index_bytes = max_entries
             .checked_mul(ENTRY_BYTES as u64)
             .ok_or_else(|| anyhow::anyhow!("PITR seal index size overflows"))?;
+
         (HEADER_BYTES as u64)
             .checked_add(index_bytes)
             .ok_or_else(|| anyhow::anyhow!("PITR seal sidecar size overflows"))
@@ -565,6 +572,7 @@ pub(crate) struct V7Seal {
 impl V7Seal {
     pub(crate) fn encoded_len_for_entry_count(entry_count: u64) -> Result<u64> {
         let entry_count = usize::try_from(entry_count)?;
+
         u64::try_from(v7_max_seal_bytes(entry_count)?).map_err(Into::into)
     }
 
@@ -664,6 +672,7 @@ impl V7Seal {
         let maximum_ticket_end = max_sealable_end
             .saturating_sub((WAL_V7_HEADER_LEN + 2 * WAL_V7_FRAME_LEN) as u64)
             / WAL_V7_FRAME_LEN as u64;
+
         Self::preparation_memory_bytes(max_sealable_end, maximum_ticket_end)
     }
 
@@ -676,6 +685,7 @@ impl V7Seal {
             max_segment_bytes <= crate::wal::MAX_WAL_FILE_SIZE,
             "persisted v7 PITR segment limit exceeds the WAL format limit"
         );
+
         v7_max_seal_bytes(v7_max_entry_count(max_segment_bytes)?)
     }
 
@@ -921,8 +931,10 @@ impl V7Seal {
                 .try_reserve(1)
                 .map_err(|error| anyhow::anyhow!("reserve v7 PITR restore batches: {error}"))?;
             batches.push(batch);
+
             Ok(())
         })?;
+
         Ok(batches)
     }
 
@@ -933,6 +945,7 @@ impl V7Seal {
         visit_batch: impl FnMut(WalBatch) -> Result<()>,
     ) -> Result<()> {
         let mut reader = std::io::Cursor::new(wal);
+
         self.verify_wal_reader_with_batch_visitor(
             &mut reader,
             u64::try_from(wal.len())?,
@@ -1003,6 +1016,7 @@ impl V7Seal {
             entry_index = entry_index
                 .checked_add(1)
                 .ok_or_else(|| anyhow::anyhow!("v7 PITR seal entry index overflows"))?;
+
             visit_batch(batch)
         })?;
         ensure!(
@@ -1123,6 +1137,7 @@ impl V7Seal {
                 "v7 PITR seal predecessor digest is empty"
             ),
         }
+
         Ok(())
     }
 }
@@ -1150,6 +1165,7 @@ pub(crate) struct V8Seal {
 impl V8Seal {
     pub(crate) fn encoded_len_for_entry_count(entry_count: u64) -> Result<u64> {
         let entry_count = usize::try_from(entry_count)?;
+
         u64::try_from(v8_max_seal_bytes(entry_count)?).map_err(Into::into)
     }
 
@@ -1171,6 +1187,7 @@ impl V8Seal {
             max_segment_bytes <= crate::wal::MAX_WAL_FILE_SIZE,
             "persisted v8 PITR segment limit exceeds the WAL format limit"
         );
+
         v8_max_seal_bytes(v8_max_entry_count(max_segment_bytes)?)
     }
 
@@ -1201,6 +1218,7 @@ impl V8Seal {
         // canonical re-encoding at once, so reserve the two additional fixed
         // headers as well as the separately accounted ticket index above.
         let additional_sidecar_headers = u64::try_from(2 * V8_HEADER_BYTES)?;
+
         shared_scan_and_decode
             .checked_add(ticket_index_bytes)
             .and_then(|bytes| bytes.checked_add(additional_sidecar_headers))
@@ -1230,6 +1248,7 @@ impl V8Seal {
                 .checked_add(2 * crate::wal::v8::codec::WAL_V8_FRAME_LEN)
                 .ok_or_else(|| anyhow::anyhow!("v8 PITR ticket bound overflows"))?,
         )?) / frame_len;
+
         Self::validation_memory_bytes(max_sealable_end, maximum_ticket_end)
     }
 
@@ -1569,6 +1588,7 @@ impl V8Seal {
     /// Verify the complete frozen WAL image against this sidecar.
     pub(crate) fn verify_wal(&self, wal: &[u8]) -> Result<()> {
         let mut reader = std::io::Cursor::new(wal);
+
         self.verify_wal_from_reader(&mut reader, u64::try_from(wal.len())?)
     }
 
@@ -1701,9 +1721,11 @@ impl V8Seal {
                     .try_reserve(1)
                     .map_err(|error| anyhow::anyhow!("reserve v8 PITR restore batches: {error}"))?;
                 batches.push(batch);
+
                 Ok(())
             },
         )?;
+
         Ok(batches)
     }
 }
@@ -1850,6 +1872,7 @@ pub(crate) fn build_v7_seal(
     predecessor: ChainAnchor,
 ) -> Result<(V7Seal, Vec<u8>)> {
     let mut reader = std::io::Cursor::new(wal);
+
     build_v7_seal_from_reader(&mut reader, u64::try_from(wal.len())?, active, predecessor)
 }
 
@@ -1977,9 +2000,11 @@ fn collect_v7_seal_entries<R: Read + Seek>(
                 .try_reserve(1)
                 .map_err(|error| anyhow::anyhow!("grow v7 PITR seal index: {error}"))?;
             entries.push(entry);
+
             Ok(())
         },
     )?;
+
     Ok(entries)
 }
 
@@ -1990,6 +2015,7 @@ fn walk_v7_seal_entries(
     visit_batch: impl FnMut(V7SealEntry, WalBatch) -> Result<()>,
 ) -> Result<()> {
     let mut reader = std::io::Cursor::new(wal);
+
     walk_v7_seal_entries_from_reader(
         &mut reader,
         u64::try_from(wal.len())?,
@@ -2144,6 +2170,7 @@ fn walk_v7_seal_entries_from_reader<R: Read + Seek>(
         offset == terminal_offset,
         "v7 PITR WAL has bytes between batches and terminal FRONTIER"
     );
+
     Ok(())
 }
 
@@ -2166,6 +2193,7 @@ fn read_v7_seal_frame<R: Read + Seek>(
     reader
         .read_exact(&mut frame)
         .with_context(|| format!("read v7 PITR WAL frame at {frame_offset}"))?;
+
     Ok(frame)
 }
 
@@ -2206,6 +2234,7 @@ pub(crate) fn walk_v5_segment(
             }
         }
     }
+
     Ok((offset as u64, entries))
 }
 
@@ -2267,6 +2296,7 @@ mod tests {
                     "read beyond first oversized DATA fragment",
                 ));
             }
+
             self.cursor.read(buffer)
         }
     }
@@ -2392,6 +2422,7 @@ mod tests {
             last_commit_ts: batches.last().map_or(0, |(commit_ts, _)| *commit_ts),
             prefix_digest: logical_hasher.finalize().into(),
         };
+
         Ok((image, header, active))
     }
 
@@ -2421,6 +2452,7 @@ mod tests {
             terminal_frontier_digest: [0x55; 32],
             wal_digest: [0x66; 32],
         };
+
         Ok(V8Seal {
             header,
             boundary,
@@ -2583,6 +2615,7 @@ mod tests {
         let mut source_identity = Sha256::new();
         source_identity.update(wal_digest);
         source_identity.update(seal_digest);
+
         Ok(crate::pitr::catalog::SegmentMetadata {
             key: crate::pitr::catalog::SegmentKey {
                 repository_id: [9; 16],
@@ -2897,6 +2930,7 @@ mod tests {
         let mut damaged_wal = wal.clone();
         damaged_wal[2 * WAL_V7_FRAME_LEN + 100] ^= 1;
         assert!(seal.verify_wal(&damaged_wal).is_err());
+
         Ok(())
     }
 
@@ -3028,6 +3062,7 @@ mod tests {
         assert_eq!(seal.boundary.sealed_end, 2 * WAL_V7_FRAME_LEN as u64);
         assert_eq!(V7Seal::decode(&bytes, crate::wal::MAX_WAL_FILE_SIZE)?, seal);
         seal.verify_wal(&wal)?;
+
         Ok(())
     }
 
@@ -3196,6 +3231,7 @@ mod tests {
         wal[usize::try_from(first_data_offsets[1])? + WAL_V7_FRAME_LEN] ^= 1;
         let error = walk_v7_seal_entries(&wal, header, limits, |_, _| Ok(())).unwrap_err();
         assert!(error.to_string().contains("exceeds configured byte limit"));
+
         Ok(())
     }
 
@@ -3215,6 +3251,7 @@ mod tests {
         let header_crc = crc32fast::hash(&nonzero_reserved[8..316]);
         nonzero_reserved[316..320].copy_from_slice(&header_crc.to_be_bytes());
         assert!(V7Seal::decode(&nonzero_reserved, crate::wal::MAX_WAL_FILE_SIZE).is_err());
+
         Ok(())
     }
 
@@ -3232,6 +3269,7 @@ mod tests {
         bytes[316..320].copy_from_slice(&header_crc.to_be_bytes());
 
         assert!(V7Seal::decode(&bytes, crate::wal::MAX_WAL_FILE_SIZE).is_err());
+
         Ok(())
     }
 
@@ -3262,6 +3300,7 @@ mod tests {
                 .to_string()
                 .contains("persisted segment sidecar limit")
         );
+
         Ok(())
     }
 
@@ -3300,6 +3339,7 @@ mod tests {
                 .to_string()
                 .contains("seal index exceeds its sealed image capacity")
         );
+
         Ok(())
     }
 
@@ -3352,6 +3392,7 @@ mod tests {
             seal,
             "the exact sealed image length permits the one-batch seal"
         );
+
         Ok(())
     }
 
@@ -3383,6 +3424,7 @@ mod tests {
                 .to_string()
                 .contains("header checksum mismatch")
         );
+
         Ok(())
     }
 
@@ -3396,6 +3438,7 @@ mod tests {
                 .to_string()
                 .contains("prefix digest differs from its header")
         );
+
         Ok(())
     }
 
@@ -3430,6 +3473,7 @@ mod tests {
                 .to_string()
                 .contains("nonzero v8 PITR seal index reserved field")
         );
+
         Ok(())
     }
 
@@ -3467,6 +3511,7 @@ mod tests {
             .to_string()
             .contains("exceeds its format size limit")
         );
+
         Ok(())
     }
 
@@ -3494,6 +3539,7 @@ mod tests {
             crate::pitr::LIVE_WAL_V5_LIMITS,
             |batch| {
                 replayed.push(batch);
+
                 Ok(())
             },
         )?;
@@ -3525,6 +3571,7 @@ mod tests {
         let terminal_offset = usize::try_from(seal.boundary.active.durable_end)?;
         corrupt_terminal[terminal_offset + 80] ^= 1;
         assert!(seal.verify_wal(&corrupt_terminal).is_err());
+
         Ok(())
     }
 
@@ -3561,6 +3608,7 @@ mod tests {
                 nanos: 500_000_000,
             })
         );
+
         Ok(())
     }
 }

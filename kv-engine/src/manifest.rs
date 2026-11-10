@@ -634,6 +634,7 @@ mod v8_compatibility_guard_tests {
 
     fn read_records(path: &std::path::Path) -> Vec<ManifestRecord> {
         let bytes = std::fs::read(path).unwrap();
+
         serde_json::Deserializer::from_slice(&bytes)
             .into_iter::<ManifestRecord>()
             .collect::<serde_json::Result<Vec<_>>>()
@@ -1240,6 +1241,7 @@ impl Manifest {
             v8_compatibility_generation: AtomicU64::new(v8_compatibility_generation),
             v8_compatibility_snapshot_lock: Mutex::new(()),
         };
+
         Ok((manifest, records))
     }
 
@@ -1361,6 +1363,7 @@ impl Manifest {
             self.v8_compatibility_guard_ready(),
             "v8 compatibility guard publication did not reach a durable state"
         );
+
         Ok(())
     }
 
@@ -1481,6 +1484,7 @@ impl Manifest {
             guard_file.write_all(&guard_log_bytes)?;
             Self::sync_file(&guard_file, &self.path)
                 .context("failed to sync v8 guard manifest temporary")?;
+
             Ok(())
         })() {
             self.mark_durability_uncertain();
@@ -1606,6 +1610,7 @@ impl Manifest {
                 unsafe { libc::_exit(137) }
             }
             Self::sync_parent_directory(path)?;
+
             Ok(file)
         })();
         if result.is_err() {
@@ -1620,6 +1625,7 @@ impl Manifest {
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
             .unwrap_or(Path::new("."));
+
         File::open(directory)
             .context("failed to open recovered manifest directory")?
             .sync_all()
@@ -1944,6 +1950,7 @@ impl Manifest {
             // Recovery must rewrite accepted bytes before mutations resume.
             self.mark_durability_uncertain();
         }
+
         result
     }
 
@@ -1970,6 +1977,7 @@ impl Manifest {
             !self.durability_uncertain.load(Ordering::Acquire),
             "manifest durability is uncertain; reopen required"
         );
+
         Ok(())
     }
 

@@ -29,6 +29,7 @@ fn make_index(n: usize, key_size: usize, value_size: usize) -> VlogIndex {
     for i in 0..n {
         idx.add_entry((i as u64) * 100, make_key(i, key_size), value_size as u32);
     }
+
     idx
 }
 
@@ -60,6 +61,7 @@ fn bench_save(c: &mut Criterion) {
                 |dir| {
                     let path = dir.path().join("bench.vidx");
                     idx.save(&path).unwrap();
+
                     dir // keep TempDir alive to avoid measuring cleanup
                 },
                 criterion::BatchSize::SmallInput,

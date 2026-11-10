@@ -494,6 +494,7 @@ impl<'a> GarbageCollector<'a> {
 
         let result = (|| -> Result<Option<GcResult>> {
             let analysis = self.analyze_file(file_id)?;
+
             self.compact_file(&analysis)
         })();
 

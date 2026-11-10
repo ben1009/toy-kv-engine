@@ -214,6 +214,7 @@ mod tests {
         let encoded = KeySlice::for_testing_from_slice_with_ts(key, ts);
 
         builder.add(encoded.as_key_slice(), b"v").unwrap();
+
         Arc::new(
             builder
                 .build(sst_id, None, storage.path_of_sst(sst_id))
@@ -234,6 +235,7 @@ mod tests {
         builder
             .add_with_ttl(encoded.as_key_slice(), &value)
             .unwrap();
+
         Arc::new(
             builder
                 .build(sst_id, None, storage.path_of_sst(sst_id))
@@ -252,6 +254,7 @@ mod tests {
             let encoded = KeySlice::for_testing_from_slice_with_ts(key, ts);
             builder.add(encoded.as_key_slice(), b"v").unwrap();
         }
+
         Arc::new(
             builder
                 .build(sst_id, None, storage.path_of_sst(sst_id))
@@ -273,6 +276,7 @@ mod tests {
                 .add_with_ttl(encoded.as_key_slice(), &value)
                 .unwrap();
         }
+
         Arc::new(
             builder
                 .build(sst_id, None, storage.path_of_sst(sst_id))
@@ -443,6 +447,7 @@ mod tests {
         let task = storage
             .generate_mvcc_gc_task(storage.state.load().as_ref())
             .expect("expected GC task");
+
         match task {
             CompactionTask::Leveled(task) => {
                 assert_eq!(task.upper_level, Some(1));
@@ -515,6 +520,7 @@ mod tests {
         let task = storage
             .generate_mvcc_gc_task(storage.state.load().as_ref())
             .expect("expected GC task");
+
         match task {
             CompactionTask::Leveled(task) => {
                 assert_eq!(task.upper_level, Some(1));
@@ -559,6 +565,7 @@ mod tests {
         let task = storage
             .generate_mvcc_gc_task(storage.state.load().as_ref())
             .expect("expected GC task");
+
         match task {
             CompactionTask::Leveled(task) => {
                 assert_eq!(task.upper_level, Some(1));
@@ -604,6 +611,7 @@ mod tests {
         let task = storage
             .generate_mvcc_gc_task(storage.state.load().as_ref())
             .expect("expected GC task");
+
         match task {
             CompactionTask::Leveled(task) => {
                 assert_eq!(task.upper_level, Some(1));
@@ -662,6 +670,7 @@ mod tests {
         let task = storage
             .generate_mvcc_gc_task(storage.state.load().as_ref())
             .expect("expected GC task");
+
         match task {
             CompactionTask::Leveled(task) => {
                 assert_eq!(task.upper_level, Some(1));
@@ -708,6 +717,7 @@ mod tests {
         let task = storage
             .generate_mvcc_gc_task(storage.state.load().as_ref())
             .expect("expected GC task");
+
         match task {
             CompactionTask::Leveled(task) => {
                 assert_eq!(task.upper_level, Some(1));
@@ -906,6 +916,7 @@ mod tests {
         let task = storage
             .generate_mvcc_gc_task(storage.state.load().as_ref())
             .expect("expected GC task");
+
         match task {
             CompactionTask::Tiered(task) => {
                 assert_eq!(task.tiers, vec![(7, vec![])]);
@@ -1006,6 +1017,7 @@ mod tests {
         let task = storage
             .generate_mvcc_gc_task(storage.state.load().as_ref())
             .expect("expected GC task");
+
         match task {
             CompactionTask::Simple(task) => {
                 assert_eq!(task.upper_level, Some(1));
@@ -1075,6 +1087,7 @@ mod tests {
         let task = storage
             .generate_mvcc_gc_task(storage.state.load().as_ref())
             .expect("expected GC task");
+
         match task {
             CompactionTask::Tiered(task) => {
                 assert_eq!(task.tiers, vec![(1, vec![sst_id])]);
@@ -1200,6 +1213,7 @@ impl CompactionController {
                 snapshot.levels[0].1.sort_by(|a, b| {
                     let a_key = snapshot.sstables.get(a).and_then(|sst| sst.first_key());
                     let b_key = snapshot.sstables.get(b).and_then(|sst| sst.first_key());
+
                     match (a_key, b_key) {
                         (Some(ak), Some(bk)) => ak.cmp(bk),
                         _ => a.cmp(b),
@@ -1440,6 +1454,7 @@ impl LsmStorageInner {
         if let Some(verifier) = setsum_verifier.as_ref() {
             verifier.verify()?;
         }
+
         Ok((
             ret,
             all_vlog_ids,
@@ -1454,6 +1469,7 @@ impl LsmStorageInner {
         builder.set_collect_blocks(should_backfill);
 
         builder.set_prefix_bloom_options(Some(self.options.prefix_bloom.clone()));
+
         builder
     }
 
@@ -1519,6 +1535,7 @@ impl LsmStorageInner {
             key_ts,
             is_tombstone,
         } = decision;
+
         match watermark {
             Some(wm) => {
                 if decoded_user_key != entry_state.prev_user_key.as_slice() {
@@ -2003,6 +2020,7 @@ impl LsmStorageInner {
                 return false;
             }
         }
+
         true
     }
 
@@ -2022,6 +2040,7 @@ impl LsmStorageInner {
                 metadata,
             ));
         }
+
         Ok(ManifestRecord::GcCompaction(
             result.old_file_id,
             result.new_file_id,
@@ -2035,6 +2054,7 @@ impl LsmStorageInner {
         file_id: u32,
     ) {
         let gc = GarbageCollector::new(vlog, inner, vlog.options.gc_threshold_ratio);
+
         match gc.gc_file(file_id) {
             std::result::Result::Ok(Some(result)) => {
                 let persisted = Self::record_gc_compaction(
@@ -2158,6 +2178,7 @@ impl LsmStorageInner {
         ids.sort_unstable();
 
         ids.dedup();
+
         ids
     }
 
@@ -2174,6 +2195,7 @@ impl LsmStorageInner {
 
     fn sst_has_expired_ttl_entries(sst: &SsTable, now_secs: u64) -> bool {
         let ttl_meta = &sst.ttl_metadata;
+
         ttl_meta.ttl_entry_count > 0 && ttl_meta.min_ttl_expire_ts <= now_secs
     }
 
@@ -2189,6 +2211,7 @@ impl LsmStorageInner {
                 let last = sst.last_key()?;
                 let first_user = first.encoded_user_key();
                 let last_user = last.encoded_user_key();
+
                 Some((first_user, last_user))
             })
             .collect::<Vec<_>>();
@@ -2208,6 +2231,7 @@ impl LsmStorageInner {
                 current_end = end;
             }
         }
+
         false
     }
 
@@ -2265,6 +2289,7 @@ impl LsmStorageInner {
         sst_ids.sort_unstable();
 
         sst_ids.dedup();
+
         if self.try_reserve_ssts(&sst_ids) {
             Some(ReservedSsts {
                 inner: self,
@@ -2281,6 +2306,7 @@ impl LsmStorageInner {
         let mut reserved_ids = input_sst_ids.clone();
 
         reserved_ids.extend(self.collect_input_range_only_ids(task, target_level, &input_sst_ids));
+
         self.reserve_ssts(reserved_ids)
     }
 
@@ -2401,6 +2427,7 @@ impl LsmStorageInner {
                 {
                     return None;
                 }
+
                 Some((
                     id,
                     is_range_only,
@@ -2416,6 +2443,7 @@ impl LsmStorageInner {
                 ))
             })
             .max_by(|a, b| a.2.cmp(&b.2))?;
+
         Some(CompactionTask::Leveled(if best.1 {
             LeveledCompactionTask {
                 upper_level: Some(bottom_level_num),
@@ -2474,6 +2502,7 @@ impl LsmStorageInner {
         if !has_expired_ttl && !(has_old_versions && (has_overlap || bottom_level_ids.is_empty())) {
             return None;
         }
+
         Some(CompactionTask::Simple(SimpleLeveledCompactionTask {
             upper_level: Some(bottom_level_num),
             upper_level_sst_ids: bottom_level_ids.to_vec(),
@@ -2522,6 +2551,7 @@ impl LsmStorageInner {
         if !has_expired_ttl && !(has_old_versions && (has_overlap || bottom_level_ids.is_empty())) {
             return None;
         }
+
         Some(CompactionTask::Tiered(TieredCompactionTask {
             tiers: vec![(bottom_level_num, bottom_level_ids.to_vec())],
             bottom_tier_included: true,

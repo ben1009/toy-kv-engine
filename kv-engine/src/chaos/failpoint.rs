@@ -201,6 +201,7 @@ pub(crate) fn parallel_wal_negative_cqe_result(ticket_start: u64) -> Option<i32>
             .is_ok()
             .then_some(-libc::EIO)
     });
+
     None
 }
 
@@ -212,6 +213,7 @@ pub(crate) fn parallel_wal_short_cqe_result(ticket_start: u64) -> Option<i32> {
             .is_ok()
             .then_some(0)
     });
+
     None
 }
 
@@ -405,6 +407,7 @@ pub(crate) fn parallel_wal_group_completion_error(ticket_start: u64) -> Option<S
         ticket_start > 0,
         |_| Some("injected parallel WAL group write failure".to_owned())
     );
+
     None
 }
 

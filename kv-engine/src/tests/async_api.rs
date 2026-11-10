@@ -89,6 +89,7 @@ fn seeded_parallel_scan_engine() -> (TempDir, Arc<KvEngine>) {
                     "value-{shard:02}-{i:03}-payload-{:0>96}",
                     shard * 1_000 + i
                 ));
+
                 (key, value)
             })
             .collect::<Vec<_>>();
@@ -128,6 +129,7 @@ fn seeded_parallel_prefix_scan_engine() -> (TempDir, Arc<KvEngine>) {
                     "value-{shard:02}-{i:03}-payload-{:0>96}",
                     shard * 1_000 + i
                 ));
+
                 (key, value)
             })
             .collect::<Vec<_>>();
@@ -143,6 +145,7 @@ fn seeded_parallel_prefix_scan_engine() -> (TempDir, Arc<KvEngine>) {
     snapshot.levels[0].1.sort_by(|a, b| {
         let a_key = snapshot.sstables[a].first_key();
         let b_key = snapshot.sstables[b].first_key();
+
         a_key.cmp(&b_key)
     });
     engine.inner.state.store(Arc::new(snapshot));
@@ -156,6 +159,7 @@ fn flush_no_compaction_l0_to_l1(engine: &Arc<KvEngine>) {
     level_ids.sort_by(|a, b| {
         let a_key = snapshot.sstables[a].first_key();
         let b_key = snapshot.sstables[b].first_key();
+
         a_key.cmp(&b_key)
     });
     snapshot.levels[0].1 = level_ids;
@@ -377,6 +381,7 @@ fn cancelled_async_checkpoint_keeps_close_waiting_until_blocking_work_finishes()
             .keys()
             .copied()
             .collect::<Vec<_>>();
+
         !sst_ids.is_empty()
             && sst_ids.iter().all(|sst_id| {
                 engine
@@ -1678,6 +1683,7 @@ fn txn_async_commit_waits_for_an_admitted_mutation_before_capturing_inputs() {
         .max_blocking_threads(1)
         .build()
         .expect("runtime");
+
     for delete in [false, true] {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut options = LsmStorageOptions::default_for_test();

@@ -85,6 +85,7 @@ impl WalV8FrontierDiscovery {
                     .collect(),
             });
         }
+
         Ok(())
     }
 }
@@ -324,6 +325,7 @@ pub(crate) fn select_active_candidate<R: Read + Seek>(
         limits,
         SelectionPayload::RecoveryBatches,
     )?;
+
     Ok(selection)
 }
 
@@ -368,6 +370,7 @@ pub(crate) fn select_active_candidate_for_validation<R: Read + Seek>(
         limits,
         SelectionPayload::ValidationOnly,
     )?;
+
     Ok(selection)
 }
 
@@ -389,6 +392,7 @@ pub(crate) fn select_active_candidate_for_seal<R: Read + Seek>(
         limits,
         SelectionPayload::SealIndex,
     )?;
+
     Ok(WalV8SealSelection {
         header: selection.header,
         candidate: selection.candidate,
@@ -946,6 +950,7 @@ fn select_active_candidate_inner<R: Read + Seek>(
     } else {
         retained_frontier(&frontiers, candidate.frontier.durable_end)?
     };
+
     Ok((
         WalV8RecoverySelection {
             header,
@@ -1030,6 +1035,7 @@ fn decode_selected_batches<R: Read + Seek>(
             && last_checkpoint.last_commit_ts == frontier.last_commit_ts,
         "selected v8 batches do not reproduce the accepted FRONTIER"
     );
+
     Ok(batches)
 }
 
@@ -1087,6 +1093,7 @@ pub(crate) fn replay_selected_batches<R: Read + Seek>(
         prefix_digest == selection.active_boundary.prefix_digest,
         "streamed v8 batches do not reproduce the accepted FRONTIER"
     );
+
     Ok(())
 }
 
@@ -1192,6 +1199,7 @@ fn decode_batch_at<R: Read + Seek>(
         entry_bytes,
         limits,
     )?;
+
     Ok((logical_bytes, batch))
 }
 
@@ -1229,6 +1237,7 @@ fn validate_frontier_prefix(
         predecessor_end <= frontier.durable_end && frontier.durable_end <= frame_offset,
         "v8 FRONTIER has invalid physical prefix bounds"
     );
+
     Ok(())
 }
 
@@ -1269,6 +1278,7 @@ fn validate_candidate(
         frame_record_digest(&encoded)? == candidate.frame_digest,
         "v8 candidate FRONTIER differs from its canonical predecessor chain"
     );
+
     Ok(())
 }
 
@@ -1309,6 +1319,7 @@ fn validate_anchor_prefix(
         anchor.durable_end == checkpoint.data_end.max(predecessor_end),
         "v8 Active anchor does not match its exact physical prefix"
     );
+
     Ok(())
 }
 
@@ -1320,6 +1331,7 @@ fn candidate_covers_anchor(candidate: &WalV8FrontierCandidate, anchor: &ActiveBo
     {
         return false;
     }
+
     if frontier.ticket_end == anchor.ticket_end {
         frontier.durable_end == anchor.durable_end
             && frontier.last_commit_ts == anchor.last_commit_ts
@@ -1337,6 +1349,7 @@ fn retained_frontier(frontiers: &[PrefixFrontier], durable_end: u64) -> Result<P
             .is_some_and(|end| end <= durable_end)
     });
     ensure!(count > 0, "v8 retained prefix omits generation zero");
+
     Ok(frontiers[count - 1])
 }
 
@@ -1348,6 +1361,7 @@ fn read_frame<R: Read + Seek>(reader: &mut R, offset: u64) -> Result<[u8; FRAME_
     reader
         .read_exact(&mut bytes)
         .with_context(|| format!("read v8 WAL frame at {offset}"))?;
+
     Ok(bytes)
 }
 
@@ -1383,6 +1397,7 @@ mod tests {
 
     fn test_header() -> WalV8Header {
         let archive_epoch_id = ArchiveEpochId([0x22; 16]);
+
         WalV8Header {
             timeline_id: TimelineId([0x11; 16]),
             archive_epoch_id,
@@ -1401,6 +1416,7 @@ mod tests {
             image.resize(end, 0);
         }
         image[start..end].copy_from_slice(frame);
+
         Ok(())
     }
 
@@ -1423,6 +1439,7 @@ mod tests {
         let generation_zero_digest = frame_record_digest(&generation_zero_frame)?;
         let mut image = header_bytes.to_vec();
         install_frame(&mut image, HEADER_LEN_U64, &generation_zero_frame)?;
+
         Ok((
             image,
             physical_header_digest,
@@ -1513,6 +1530,7 @@ mod tests {
                     .context("test DATA end overflows")?,
             )
             .context("test DATA end overflows")?;
+
         Ok((end, batch, batch_digest, logical_batch_len))
     }
 
@@ -1562,11 +1580,13 @@ mod tests {
         )?;
         let frame_digest = frame_record_digest(&frame)?;
         install_frame(image, frame_offset, &frame)?;
+
         Ok((frontier, frame_digest))
     }
 
     fn active_boundary(frontier: WalV8Frontier) -> ActiveBoundary {
         let header = test_header();
+
         ActiveBoundary {
             timeline_id: header.timeline_id.0,
             archive_epoch_id: header.archive_epoch_id.0,
@@ -1651,6 +1671,7 @@ mod tests {
         physical_header_digest: &[u8; 32],
     ) -> Result<WalV8FrontierDiscovery> {
         let mut reader = Cursor::new(image);
+
         discover_frontier_candidates(
             &mut reader,
             u64::try_from(image.len())?,
@@ -1666,6 +1687,7 @@ mod tests {
     ) -> Result<WalV8RecoverySelection> {
         let mut reader = Cursor::new(image);
         let discovered = discovery(image, physical_header_digest)?;
+
         select_active_candidate(
             &mut reader,
             u64::try_from(image.len())?,
@@ -1687,9 +1709,11 @@ mod tests {
             LIVE_WAL_V5_LIMITS,
             |batch| {
                 batches.push(batch.clone());
+
                 Ok(())
             },
         )?;
+
         Ok(batches)
     }
 
@@ -1703,6 +1727,7 @@ mod tests {
             if self.cursor.position() == self.fail_at {
                 return Err(io::Error::other("injected recovery read failure"));
             }
+
             self.cursor.read(buffer)
         }
     }
@@ -1738,6 +1763,7 @@ mod tests {
         let mut bad_anchor = anchor;
         bad_anchor.prefix_digest[0] ^= 1;
         assert!(select(&image.bytes, &image.physical_header_digest, &[bad_anchor],).is_err());
+
         Ok(())
     }
 
@@ -1766,6 +1792,7 @@ mod tests {
             LIVE_WAL_V5_LIMITS,
             |batch| {
                 replayed.push(batch);
+
                 Ok(())
             },
         )?;
@@ -1776,6 +1803,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [10, 20]
         );
+
         Ok(())
     }
 
@@ -1815,6 +1843,7 @@ mod tests {
             .is_err(),
             "fallback must still reject a damaged hard anchor"
         );
+
         Ok(())
     }
 
@@ -1832,6 +1861,7 @@ mod tests {
 
         assert_eq!(selected.candidate.frontier, image.first_frontier);
         assert_eq!(selected.diagnostics, WalV8RecoveryDiagnostics::default());
+
         Ok(())
     }
 
@@ -1873,6 +1903,7 @@ mod tests {
                 ))
             );
         }
+
         Ok(())
     }
 
@@ -1904,6 +1935,7 @@ mod tests {
         )
         .expect_err("a partial-frame header read failure must remain fatal");
         assert!(format!("{error:#}").contains("injected recovery read failure"));
+
         Ok(())
     }
 
@@ -1932,6 +1964,7 @@ mod tests {
         )?;
         assert_eq!(selected.candidate.frame_offset, relocated_offset);
         assert_eq!(selected.diagnostics, WalV8RecoveryDiagnostics::default());
+
         Ok(())
     }
 
@@ -1961,6 +1994,7 @@ mod tests {
                 .diagnostics
                 .rejected_newer_frontiers_may_be_truncated
         );
+
         Ok(())
     }
 
@@ -2009,6 +2043,7 @@ mod tests {
                 .iter()
                 .all(|candidate| candidate.reason.contains("logical prefix digest mismatch"))
         );
+
         Ok(())
     }
 
@@ -2033,6 +2068,7 @@ mod tests {
         };
 
         assert!(format!("{error:#}").contains("injected recovery read failure"));
+
         Ok(())
     }
 
@@ -2115,6 +2151,7 @@ mod tests {
         assert_eq!(reopened.candidate.frontier, installed.frontier);
         assert_eq!(reopened.batches.len(), 1);
         assert_eq!(reopened.diagnostics, WalV8RecoveryDiagnostics::default());
+
         Ok(())
     }
 
@@ -2344,6 +2381,7 @@ mod tests {
                 );
             }
         }
+
         Ok(())
     }
 
@@ -2429,6 +2467,7 @@ mod tests {
             assert_eq!(recovered.seal_bytes, seal_bytes);
             assert_eq!(std::fs::read(&wal_path)?, fixture.bytes);
         }
+
         Ok(())
     }
 
@@ -2556,6 +2595,7 @@ mod tests {
             assert_eq!(reopened.frontier, recovered.frontier);
             assert_eq!(installed_batches(&wal_path, &reopened)?, recovered_batches);
         }
+
         Ok(())
     }
 
@@ -2637,6 +2677,7 @@ mod tests {
             assert_eq!(recovered.frontier.ticket_end, 1);
             assert_eq!(installed_batches(&wal_path, &recovered)?[0].commit_ts, 10);
         }
+
         Ok(())
     }
 
@@ -2700,6 +2741,7 @@ mod tests {
             ..active_boundary(first_frontier)
         };
         assert!(select(&bytes, &physical_header_digest, &[anchor]).is_err());
+
         Ok(())
     }
 }

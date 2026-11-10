@@ -99,6 +99,7 @@ impl<T> PitrTask<T> {
             if worker_control.cancelled.load(Ordering::Acquire) {
                 return Err(anyhow::anyhow!("PITR task cancelled before execution"));
             }
+
             operation(PitrCancellationHandle {
                 control: worker_control,
             })
@@ -942,6 +943,7 @@ impl VerifyPitrOptions {
                 "PITR verification sample count exceeds the configured maximum"
             );
         }
+
         Ok(())
     }
 }
@@ -1134,6 +1136,7 @@ pub(crate) fn verification_query_digest(options: VerifyPitrOptions) -> Result<[u
             }
         }
     }
+
     Ok(digest.finalize().into())
 }
 

@@ -86,6 +86,7 @@ fn generate_block() -> Block {
         let value = value_of(idx);
         assert!(builder.add(key.as_key_slice(), &value[..]).unwrap());
     }
+
     builder.build()
 }
 
@@ -245,6 +246,7 @@ fn test_block_builder_key_at_long_keys() {
             // Pad to ~200 bytes so chunks_exact(128) iterates at least once.
             k.extend(format!("key_{:03}_", i).as_bytes());
             k.resize(200, b'x');
+
             k
         })
         .collect();

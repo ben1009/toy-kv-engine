@@ -188,6 +188,7 @@ impl PitrSpoolAccountant {
             state.admission_open = true;
             return false;
         }
+
         true
     }
 
@@ -335,6 +336,7 @@ impl SealBoundaryCoordinator {
         if self.active_request.is_none() {
             self.active_request = self.pending.take();
         }
+
         self.active_request
     }
 
@@ -788,6 +790,7 @@ mod tests {
         let waiter = std::thread::spawn(move || {
             let mut coordinator = SealBoundaryCoordinator::new(thread_accounting);
             let result = coordinator.stop_admission_for_base(9, &thread_sequencer);
+
             (coordinator, result)
         });
         while accounting.admission_is_open() || sequencer.commit_admission_is_open() {

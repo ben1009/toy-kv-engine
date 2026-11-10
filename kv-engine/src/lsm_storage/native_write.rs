@@ -74,6 +74,7 @@ impl LsmStorageInner {
                     .blocking
                     .run_result(move || {
                         let _admission = admission;
+
                         inner.mvcc_write_batch(&entries)
                     })
                     .await;
@@ -88,6 +89,7 @@ impl LsmStorageInner {
                 self.blocking
                     .run_result(move || {
                         let _admission = append_admission;
+
                         append_mvcc
                             .write_batch_wal_only_native(
                                 &append_entries,
@@ -168,6 +170,7 @@ impl LsmStorageInner {
                         self.blocking
                             .run_result_with_reserved_capacity(move || {
                                 let _admission = flush_admission;
+
                                 flush_inner.flush_immutable_for_source_spool_pressure()
                             })
                             .await
@@ -281,6 +284,7 @@ impl LsmStorageInner {
                     .blocking
                     .run_result(move || {
                         let _admission = admission;
+
                         inner.try_freeze_memtable()
                     })
                     .await;
@@ -329,6 +333,7 @@ impl LsmStorageInner {
                     .blocking
                     .run_result(move || {
                         let _admission = admission;
+
                         inner.write_batch(&batch)
                     })
                     .await;
@@ -364,6 +369,7 @@ impl LsmStorageInner {
                                 )
                             })
                         });
+
                     // Keep commit poisoning first, then release its buffers,
                     // memtable lease, and lifecycle admission if the async
                     // waiter disappears before receiving this result.
@@ -410,6 +416,7 @@ impl LsmStorageInner {
                         self.blocking
                             .run_result_with_reserved_capacity(move || {
                                 let _admission = flush_admission;
+
                                 flush_inner.flush_immutable_for_source_spool_pressure()
                             })
                             .await
@@ -490,6 +497,7 @@ impl LsmStorageInner {
                                 &memtable,
                                 &mut retries,
                             )?;
+
                             Ok::<_, anyhow::Error>(retries)
                         })
                         .await?;
@@ -524,6 +532,7 @@ impl LsmStorageInner {
                 .blocking
                 .run_result(move || {
                     let _admission = admission;
+
                     inner.try_freeze_memtable()
                 })
                 .await;
@@ -571,6 +580,7 @@ impl NativeWritePause {
     fn wait_for_blocking_release(&self) {
         let (released, condition) = &self.blocking_release;
         let mut released = released.lock().unwrap();
+
         while !*released {
             released = condition.wait(released).unwrap();
         }
@@ -581,6 +591,7 @@ impl NativeWritePause {
 impl LsmStorageInner {
     async fn pause_native_write(&self, stage: NativeWriteStage, timestamp: u64) {
         let pause = self.native_write_pause.lock().clone();
+
         if let Some(pause) = pause
             && pause.stage == stage
             && !pause.fired.swap(true, std::sync::atomic::Ordering::AcqRel)
@@ -595,6 +606,7 @@ impl LsmStorageInner {
 
     pub(crate) fn pause_native_write_blocking(&self, stage: NativeWriteStage, timestamp: u64) {
         let pause = self.native_write_pause.lock().clone();
+
         if let Some(pause) = pause
             && pause.stage == stage
             && !pause.fired.swap(true, std::sync::atomic::Ordering::AcqRel)

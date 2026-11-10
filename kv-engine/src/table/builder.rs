@@ -226,6 +226,7 @@ impl SsTableBuilder {
         {
             self.referenced_vlog_ids.push(ptr.file_id);
         }
+
         self.add_inner(key, raw_value)
     }
 
@@ -424,6 +425,7 @@ impl SsTableBuilder {
                 });
             }
         }
+
         if filters.is_empty() {
             None
         } else {

@@ -120,6 +120,7 @@ impl RunConfig {
         if common.cache_capacity == 0 {
             bail!("--cache-capacity must be greater than 0");
         }
+
         Ok(Self {
             path: common.path.clone(),
             compaction: common.compaction,
@@ -339,6 +340,7 @@ fn run_measure_open_close(args: MeasureOpenCloseArgs) -> Result<()> {
         record.sst_files = sst_files;
         record.vlog_files = vlog_files;
     }
+
     emit_measure(args.common.output, &records)
 }
 
