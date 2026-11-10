@@ -454,6 +454,7 @@ impl Transaction {
         preparation: Option<tokio::sync::OwnedSemaphorePermit>,
     ) -> Result<()> {
         let mut preparation = preparation;
+
         self.commit_with_native_preparation_mode(&mut preparation, false, false)?
             .into_result()
     }
@@ -498,6 +499,7 @@ impl Transaction {
                 } else {
                     crate::mvcc::BatchEntryKind::PutRaw
                 };
+
                 (e.key().clone(), val.clone(), kind)
             })
             .collect();
@@ -684,6 +686,7 @@ impl Transaction {
                                 true,
                                 already_claimed,
                             );
+
                             (result, attempt_preparation)
                         })
                         .await;
@@ -741,6 +744,7 @@ async fn acquire_native_preparation(
         let state = inner.state.load();
         state.memtable.uses_v7_wal() && state.memtable.uses_parallel_wal()
     };
+
     if uses_native_v7 {
         Ok(Some(
             inner
@@ -767,6 +771,7 @@ pub(crate) async fn wait_for_v7_source_spool_capacity(
         return blocking
             .run_result_with_reserved_capacity(move || {
                 let mut retries = 0;
+
                 if allow_lifecycle_closing {
                     inner.retry_after_capacity_error_admitted(
                         source_spool_error,
@@ -857,6 +862,7 @@ pub(crate) async fn wait_for_v7_source_spool_capacity(
                         .context("failed to flush immutable memtables during close-time source-spool recovery")?;
                 }
                 engine.reconcile_pitr_obligations_for_source_spool_wait()?;
+
                 // Keep the bounded close-time check with cleanup so the caller's
                 // runtime does not need a timer driver.
                 Ok::<_, anyhow::Error>(owner.wait_for_source_spool_change_for(
@@ -874,6 +880,7 @@ pub(crate) async fn wait_for_v7_source_spool_capacity(
         }
         Ok(())
     }
+
     #[cfg(not(target_os = "linux"))]
     {
         Err(source_spool_error

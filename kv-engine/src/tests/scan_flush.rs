@@ -20,6 +20,7 @@ fn wal_files_in_dir(path: &std::path::Path) -> Vec<std::path::PathBuf> {
             wals.push(p);
         }
     }
+
     wals
 }
 

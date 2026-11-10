@@ -105,6 +105,7 @@ impl Capture {
                     }
                     points.push(CounterPoint::capture(&sampler_engine)?);
                 }
+
                 Ok(points)
             })?;
 
@@ -148,6 +149,7 @@ impl Capture {
             .as_ref()
             .map(|helper| {
                 let after = extent_snapshot(helper, &self.database, true)?;
+
                 Ok::<_, anyhow::Error>(serde_json::json!({
                     "before": self.initial_extents.take(),
                     "after": after,
@@ -161,6 +163,7 @@ impl Capture {
                 .all(|span| span.start_ns < span.end_ns && span.puts > 0),
             "invalid benchmark request span"
         );
+
         Ok(Output {
             destination: std::mem::take(&mut self.destination),
             interval_ms: self.interval_ms,
@@ -246,6 +249,7 @@ pub(super) fn monotonic_ns() -> Result<u64> {
 
         Ok(value.tv_sec as u64 * 1_000_000_000 + value.tv_nsec as u64)
     }
+
     #[cfg(not(target_os = "linux"))]
     anyhow::bail!("WAL timeline capture requires Linux CLOCK_MONOTONIC")
 }
@@ -259,6 +263,7 @@ mod tests {
         assert_eq!(interval_ms(None).unwrap(), 1000);
         assert_eq!(interval_ms(Some("100")).unwrap(), 100);
         assert_eq!(interval_ms(Some("5000")).unwrap(), 5000);
+
         for value in ["0", "99", "5001", "-1", "invalid"] {
             assert!(interval_ms(Some(value)).is_err());
         }

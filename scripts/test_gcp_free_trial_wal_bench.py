@@ -12,6 +12,7 @@ import struct
 import subprocess
 import stat
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -23,6 +24,13 @@ from gcp_wal_matrix import (
     build_rfc026_schedule,
     validate_batch64_rows,
     validate_rfc026_rows,
+)
+from gcp_wal_profile_runner import (
+    _run_one as run_profile_one,
+    build_profile_plan,
+    build_profile_schedule,
+    run_suite as run_profile_suite,
+    validate_profile_rows,
 )
 
 
@@ -127,8 +135,46 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
         self.assertEqual(full.writers, FULL_DEFAULT_WRITERS)
         explicit = BENCH.parse_args([*common, "--writers", "2", "16"])
         self.assertEqual(explicit.writers, (2, 16))
+        profile = BENCH.parse_args([*common, "--v8-small-ticket-profile"])
+        self.assertEqual(profile.writers, (1, 8, 16))
+        retained_profile = BENCH.parse_args([
+            *common, "--v8-small-ticket-profile", "--keep-vm-after-run",
+        ])
+        self.assertTrue(retained_profile.keep_vm_after_run)
+        profile_subset = BENCH.parse_args([*common, "--v8-small-ticket-profile", "--writers", "8"])
+        self.assertEqual(profile_subset.writers, (8,))
         with self.assertRaises(SystemExit):
             BENCH.parse_args([*common, "--writers", "2", "2"])
+        with self.assertRaises(SystemExit):
+            BENCH.parse_args([*common, "--v8-small-ticket-profile", "--full-rfc026-matrix"])
+
+    def test_vm_retention_requires_successful_run_and_collected_artifacts(self) -> None:
+        args = BENCH.argparse.Namespace(keep_vm_after_run=True)
+        complete = {"created": True, "benchmark_started": True, "collected": True}
+        self.assertTrue(BENCH.should_retain_vm(args, 0, complete))
+        self.assertFalse(BENCH.should_retain_vm(args, 1, complete))
+        self.assertFalse(BENCH.should_retain_vm(args, 0, {**complete, "collected": False}))
+        self.assertFalse(BENCH.should_retain_vm(
+            BENCH.argparse.Namespace(keep_vm_after_run=False), 0, complete,
+        ))
+
+    def test_retained_vm_reconnect_instructions_include_quoted_firewall_cleanup(self) -> None:
+        project = "project name"
+        firewall = "temporary ssh rule; echo unsafe"
+        instructions = BENCH.retained_vm_reconnect_instructions(
+            termination_timestamp="2026-11-10T08:00:00Z",
+            network="default",
+            subnet="default",
+            firewall=firewall,
+            project=project,
+            connect_command="ssh -i retained-key bench@192.0.2.1",
+        )
+
+        cleanup_prefix = "Delete the temporary SSH firewall rule after the VM is gone: "
+        cleanup_line = next(line for line in instructions.splitlines() if line.startswith(cleanup_prefix))
+        self.assertEqual(BENCH.shlex.split(cleanup_line.removeprefix(cleanup_prefix)), [
+            "gcloud", "compute", "firewall-rules", "delete", firewall, f"--project={project}", "--quiet",
+        ])
 
     def test_benchmark_plan_matches_suite_and_machine_shape(self) -> None:
         full = build_benchmark_plan(
@@ -143,6 +189,415 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
         )
         self.assertEqual(small["score_runs_planned"], 12)
         self.assertEqual(small["runtime_protocol"], "single 8-vCPU host; single Local SSD")
+
+        profile = build_profile_plan(
+            (1, 8, 16), machine_type="c4-standard-16-lssd",
+            machine_spec={"vcpus": 16, "ssd_count": 2, "ssd_gib": 750}, commit="a" * 40,
+        )
+        self.assertEqual(profile["runs_planned"], 28)
+        self.assertEqual(profile["perf_captures_planned"], 7)
+        self.assertTrue(profile["diagnostic_only"])
+
+    def test_small_ticket_profile_schedule_and_completeness_validation(self) -> None:
+        schedule = build_profile_schedule((1, 8, 16))
+        self.assertEqual(len(schedule), 28)
+        self.assertEqual(sum(row["perf_capture"] for row in schedule), 7)
+        self.assertTrue(all(row["writer"] == 1 for row in schedule if row["arm"] == "v8_leader"))
+        rows = [{
+            "writer": row["writer"], "workload": row["workload"], "arm": row["arm"],
+            "exit_code": 0, "ops": row["num"],
+        } for row in schedule]
+        self.assertTrue(validate_profile_rows(rows, (1, 8, 16))["complete"])
+        self.assertFalse(validate_profile_rows(rows[:-1], (1, 8, 16))["complete"])
+        duplicate = [*rows[:-1], rows[0]]
+        validation = validate_profile_rows(duplicate, (1, 8, 16))
+        self.assertFalse(validation["complete"])
+        self.assertTrue(validation["duplicate_cells"])
+        invalid_updates = [{"exit_code": 1}, {"ops": rows[0]["ops"] - 1}]
+        for field in ("writer", "exit_code", "ops"):
+            value = rows[0][field]
+            invalid_updates.extend({field: invalid} for invalid in (
+                str(value), float(value), value + 0.5, float("inf"), bool(value),
+            ))
+        for invalid_fields in invalid_updates:
+            with self.subTest(invalid_fields=invalid_fields):
+                invalid_row = {**rows[0], **invalid_fields}
+                invalid_rows = [invalid_row, *rows[1:]]
+                validation = validate_profile_rows(invalid_rows, (1, 8, 16))
+                self.assertFalse(validation["complete"])
+                self.assertEqual(validation["observed"], len(invalid_rows))
+                self.assertEqual(validation["invalid_rows"], [invalid_row])
+
+    def test_small_ticket_profile_runner_executes_schedule_without_gcp(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            fake_binary = root / "write-perf"
+            fake_binary.write_text("""#!/usr/bin/env python3
+import json
+import sys
+
+args = sys.argv[1:]
+def value(name, default=None):
+    try: return args[args.index(name) + 1]
+    except ValueError: return default
+
+version = value('--pitr-format', 'v4')
+record = {
+    'params': {
+        'num': int(value('--num')), 'threads': int(value('--threads')),
+        'value_size': int(value('--value-size')), 'batch_size': int(value('--wal-batch-size'))
+            if value('--wal-batch-size') else None,
+        'wal_format_version': int(version[1:]), 'wal_io_mode': value('--wal-io-mode'),
+    },
+    'result': {
+        'ops': int(value('--num')), 'ops_per_sec': 1000.0,
+        'process_cpu_user_ms': 10, 'process_cpu_system_ms': 5,
+        'wal_pipeline': {'sync_count': 12},
+    },
+    'latency': {'p99_ms': 1.25},
+}
+print(json.dumps(record))
+""", encoding="utf-8")
+            fake_binary.chmod(0o755)
+            results = root / "results"
+            with patch("gcp_wal_profile_runner.shutil.which", return_value=None):
+                summary = run_profile_suite(
+                    binary=fake_binary, results_dir=results, db_root=root / "dbs",
+                    writers=(1,), safe_deadline_epoch=int(time.time()) + 3600,
+                    timeout_seconds=5,
+                )
+            self.assertTrue(summary["complete"])
+            self.assertEqual(summary["runs_planned"], 12)
+            self.assertEqual(summary["runs_completed"], 12)
+            self.assertEqual(summary["perf_captures_completed"], 0)
+            with (results / "summary.tsv").open(encoding="utf-8") as stream:
+                self.assertEqual(len(list(csv.DictReader(stream, delimiter="\t"))), 12)
+
+    def test_remote_profile_suite_builds_hotpath_binary_and_invokes_uploaded_runner(self) -> None:
+        source = Path(__file__).with_name("gcp-free-trial-wal-bench-remote.sh").read_text(encoding="utf-8")
+        self.assertIn('INSTALL_PACKAGES+=(linux-tools-common linux-tools-gcp)', source)
+        self.assertIn('BENCH_FEATURES=bench,hotpath-profile', source)
+        self.assertIn('cp /tmp/gcp-wal-profile-runner.py "$REPO/scripts/gcp_wal_profile_runner.py"', source)
+        self.assertIn('PYTHONPATH="$REPO/scripts${PYTHONPATH:+:$PYTHONPATH}"', source)
+        self.assertIn('python3 "$REPO/scripts/gcp_wal_profile_runner.py"', source)
+        self.assertIn('"v8-small-ticket-profile"', source)
+
+    def test_remote_profile_probe_allows_missing_or_broken_perf(self) -> None:
+        source = Path(__file__).with_name("gcp-free-trial-wal-bench-remote.sh").read_text(encoding="utf-8")
+        start = source.index(
+            'if [[ "$BENCH_SUITE" == "v8-small-ticket-profile" ]]; then\n',
+            source.index('BENCH_FEATURES=bench,hotpath-profile'),
+        )
+        finish = source.index('\ncargo "+$TOOLCHAIN" build', start)
+        probe = source[start:finish]
+
+        for perf_status in (None, 1, 0):
+            with self.subTest(perf_status=perf_status), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                bin_dir = root / "bin"
+                bin_dir.mkdir()
+                if perf_status is not None:
+                    perf = bin_dir / "perf"
+                    perf.write_text(
+                        f"#!/bin/sh\nprintf 'perf probe output\\n'\nexit {perf_status}\n",
+                        encoding="utf-8",
+                    )
+                    perf.chmod(0o755)
+                result = subprocess.run(
+                    ["/bin/bash", "-euc", probe],
+                    env={
+                        "PATH": str(bin_dir), "BENCH_RESULTS": str(root),
+                        "BENCH_SUITE": "v8-small-ticket-profile",
+                    },
+                    text=True, capture_output=True, check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertTrue((root / "perf-version.txt").read_text(encoding="utf-8").strip())
+                if perf_status != 0:
+                    self.assertIn("continuing", result.stderr)
+
+    def test_small_ticket_profile_preserves_failure_status_with_usable_json(self) -> None:
+        row = build_profile_schedule((1,))[0]
+        record = {
+            "params": {
+                "num": row["num"], "threads": 1, "value_size": 1024,
+                "batch_size": None, "wal_format_version": 7, "wal_io_mode": "parallel",
+            },
+            "result": {
+                "ops": row["num"], "ops_per_sec": 1000.0,
+                "process_cpu_user_ms": 10, "process_cpu_system_ms": 5,
+                "wal_pipeline": {"sync_count": 12},
+            },
+            "latency": {"p99_ms": 1.25},
+        }
+        for process_status in (1, 124):
+            with self.subTest(process_status=process_status), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+
+                def fail_after_json(command, **kwargs):
+                    json.dump(record, kwargs["stdout"])
+                    return subprocess.CompletedProcess(command, process_status)
+
+                with (
+                    patch("gcp_wal_profile_runner.shutil.which", return_value="/fake/perf"),
+                    patch("gcp_wal_profile_runner.subprocess.run", side_effect=fail_after_json),
+                ):
+                    metadata = run_profile_one(
+                        row, binary=root / "write-perf", result_root=root / "results",
+                        db_root=root / "dbs", timeout_seconds=5,
+                    )
+                self.assertEqual(metadata["exit_code"], process_status)
+                self.assertEqual(metadata["perf_status"], f"record_failed:{process_status}")
+                self.assertEqual(metadata["ops"], row["num"])
+                self.assertEqual(metadata["puts_per_second"], 1000.0)
+                self.assertEqual(metadata["p99_ms"], 1.25)
+                self.assertEqual(metadata["cpu_seconds"], 0.015)
+                self.assertEqual(metadata["sync_count"], 12)
+                self.assertEqual(validate_profile_rows([metadata], (1,))["invalid_rows"], [metadata])
+
+    def test_small_ticket_profile_preserves_capture_after_report_failure(self) -> None:
+        row = build_profile_schedule((1,))[0]
+        record = {
+            "params": {
+                "num": row["num"], "threads": 1, "value_size": 1024,
+                "batch_size": None, "wal_format_version": 7, "wal_io_mode": "parallel",
+            },
+            "result": {
+                "ops": row["num"], "ops_per_sec": 1000.0,
+                "process_cpu_user_ms": 10, "process_cpu_system_ms": 5,
+                "wal_pipeline": {"sync_count": 12},
+            },
+            "latency": {"p99_ms": 1.25},
+        }
+        for failure in ("timeout", "os_error", "nonzero_exit"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+
+                def record_then_fail_report(command, **kwargs):
+                    if "record" in command:
+                        json.dump(record, kwargs["stdout"])
+                        Path(command[command.index("-o") + 1]).write_bytes(b"perf capture")
+                        return subprocess.CompletedProcess(command, 0)
+                    self.assertIn("report", command)
+                    if failure == "timeout":
+                        raise subprocess.TimeoutExpired(command, 120)
+                    if failure == "os_error":
+                        raise OSError("perf report unavailable")
+                    return subprocess.CompletedProcess(command, 1, "", "report failed")
+
+                with (
+                    patch("gcp_wal_profile_runner.build_profile_schedule", return_value=[row]),
+                    patch("gcp_wal_profile_runner.shutil.which", return_value="/fake/perf"),
+                    patch("gcp_wal_profile_runner.subprocess.run", side_effect=record_then_fail_report),
+                    patch("builtins.print"),
+                ):
+                    summary = run_profile_suite(
+                        binary=root / "write-perf", results_dir=root / "results", db_root=root / "dbs",
+                        writers=(1,), safe_deadline_epoch=int(time.time()) + 3600, timeout_seconds=5,
+                    )
+                self.assertTrue(summary["complete"])
+                self.assertEqual(summary["perf_captures_completed"], 1)
+                self.assertTrue(summary["perf_capture_complete"])
+                metadata = summary["results"][0]
+                self.assertEqual(metadata["exit_code"], 0)
+                self.assertTrue(metadata["perf_status"].startswith("report_failed:"))
+                self.assertEqual(metadata["ops"], row["num"])
+                self.assertEqual(metadata["puts_per_second"], 1000.0)
+                self.assertEqual(metadata["cpu_seconds"], 0.015)
+                run_dir = root / "results" / "w1-point-v7_parallel"
+                self.assertTrue((run_dir / "perf.data").stat().st_size)
+                self.assertTrue((run_dir / "perf-report.txt").read_text(encoding="utf-8"))
+
+    def test_small_ticket_profile_finishes_suite_after_malformed_json(self) -> None:
+        schedule = build_profile_schedule((1,))[:2]
+        first = schedule[0]
+        valid_record = {
+            "params": {
+                "num": first["num"], "threads": 1, "value_size": 1024,
+                "batch_size": None, "wal_format_version": 7, "wal_io_mode": "parallel",
+            },
+            "result": {
+                "ops": first["num"], "ops_per_sec": 1000.0,
+                "process_cpu_user_ms": 10, "process_cpu_system_ms": 5,
+                "wal_pipeline": {"sync_count": 12},
+            },
+            "latency": {"p99_ms": 1.25},
+        }
+        next_record = {
+            **valid_record,
+            "params": {**valid_record["params"], "wal_format_version": 8},
+        }
+        invalid_records = [
+            ("null", None),
+            ("array", []),
+            ("result", {**valid_record, "result": []}),
+            ("params", {**valid_record, "params": []}),
+            ("latency", {**valid_record, "latency": []}),
+            ("pipeline", {**valid_record, "result": {**valid_record["result"], "wal_pipeline": [1]}}),
+            ("ops_string", {**valid_record, "result": {**valid_record["result"], "ops": "invalid"}}),
+            ("ops_numeric_string", {**valid_record, "result": {**valid_record["result"], "ops": str(first["num"])}}),
+            ("ops_float", {**valid_record, "result": {**valid_record["result"], "ops": float(first["num"])}}),
+            ("ops_fractional", {**valid_record, "result": {**valid_record["result"], "ops": first["num"] + 0.5}}),
+            ("ops_bool", {**valid_record, "result": {**valid_record["result"], "ops": True}}),
+            ("ops_null", {**valid_record, "result": {**valid_record["result"], "ops": None}}),
+            ("ops_overflow", {**valid_record, "result": {**valid_record["result"], "ops": float("inf")}}),
+            ("cpu_overflow", {**valid_record, "result": {**valid_record["result"], "process_cpu_user_ms": 10 ** 400}}),
+        ]
+        for label, invalid_record in invalid_records:
+            for process_status in (0, 124):
+                with self.subTest(payload=label, process_status=process_status), tempfile.TemporaryDirectory() as temp:
+                    root = Path(temp)
+                    records = iter(((invalid_record, process_status), (next_record, 0)))
+
+                    def emit_records(command, **kwargs):
+                        record, status = next(records)
+                        json.dump(record, kwargs["stdout"])
+                        return subprocess.CompletedProcess(command, status)
+
+                    with (
+                        patch("gcp_wal_profile_runner.build_profile_schedule", return_value=schedule),
+                        patch("gcp_wal_profile_runner.shutil.which", return_value=None),
+                        patch("gcp_wal_profile_runner.subprocess.run", side_effect=emit_records),
+                        patch("builtins.print"),
+                    ):
+                        summary = run_profile_suite(
+                            binary=root / "write-perf", results_dir=root / "results", db_root=root / "dbs",
+                            writers=(1,), safe_deadline_epoch=int(time.time()) + 3600, timeout_seconds=5,
+                        )
+                    self.assertFalse(summary["complete"])
+                    self.assertEqual(summary["runs_completed"], 2)
+                    self.assertEqual(summary["results"][0]["exit_code"], process_status or 65)
+                    self.assertEqual(summary["results"][1]["exit_code"], 0)
+                    self.assertEqual(summary["results"][1]["ops"], schedule[1]["num"])
+                    result_root = root / "results"
+                    validation_error = result_root / "w1-point-v7_parallel" / "validation-error.txt"
+                    self.assertTrue(validation_error.read_text(encoding="utf-8"))
+                    saved_summary = json.loads((result_root / "summary.json").read_text(encoding="utf-8"))
+                    self.assertEqual(saved_summary["runs_completed"], 2)
+                    remote_exit = json.loads((result_root / "remote-exit.json").read_text(encoding="utf-8"))
+                    self.assertEqual(remote_exit, {"failed": True, "runs_started": 2})
+
+    def test_small_ticket_profile_perf_child_uses_caller_identity_and_fresh_fallback(self) -> None:
+        row = build_profile_schedule((1,))[0]
+        record = {
+            "params": {
+                "num": row["num"], "threads": 1, "value_size": 1024,
+                "batch_size": None, "wal_format_version": 7, "wal_io_mode": "parallel",
+            },
+            "result": {
+                "ops": row["num"], "ops_per_sec": 1000.0,
+                "process_cpu_user_ms": 10, "process_cpu_system_ms": 5,
+                "wal_pipeline": {"sync_count": 12},
+            },
+            "latency": {"p99_ms": 1.25},
+        }
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            db_path = root / "dbs" / "w1-point-v7_parallel"
+
+            def record_then_retry(command, **kwargs):
+                if "record" in command:
+                    child = command[command.index("--") + 1:]
+                    expected = [
+                        "setpriv", "--reuid", "1234", "--regid", "2345",
+                        "--init-groups", "--reset-env", "--", "env",
+                    ]
+                    self.assertEqual(child[:len(expected)], expected)
+                    self.assertIn(str(root / "write-perf"), child)
+                    db_path.mkdir(parents=True)
+                    (db_path / "partial.wal").write_bytes(b"unfinished batch")
+                    return subprocess.CompletedProcess(command, 1)
+                self.assertNotIn("sudo", command)
+                self.assertFalse(db_path.exists(), "fallback must start with a fresh database")
+                json.dump(record, kwargs["stdout"])
+                return subprocess.CompletedProcess(command, 0)
+
+            with (
+                patch("gcp_wal_profile_runner.shutil.which", return_value="/fake/perf"),
+                patch("gcp_wal_profile_runner.os.getuid", return_value=1234),
+                patch("gcp_wal_profile_runner.os.getgid", return_value=2345),
+                patch("gcp_wal_profile_runner.subprocess.run", side_effect=record_then_retry) as execute,
+            ):
+                metadata = run_profile_one(
+                    row, binary=root / "write-perf", result_root=root / "results",
+                    db_root=root / "dbs", timeout_seconds=5,
+                )
+            self.assertEqual(execute.call_count, 2)
+            self.assertEqual(metadata["exit_code"], 0)
+            self.assertEqual(metadata["ops"], row["num"])
+            self.assertEqual(metadata["perf_status"], "record_failed:1")
+
+    def test_small_ticket_profile_stops_fallback_when_database_cleanup_fails(self) -> None:
+        row = build_profile_schedule((1,))[0]
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            db_path = root / "dbs" / "w1-point-v7_parallel"
+
+            def interrupted_record(command, **kwargs):
+                self.assertIn("record", command)
+                db_path.mkdir(parents=True)
+                (db_path / "partial.wal").write_bytes(b"unfinished batch")
+                return subprocess.CompletedProcess(command, 1)
+
+            def fail_to_remove(path, ignore_errors=False):
+                self.assertEqual(path, db_path)
+                if not ignore_errors:
+                    raise PermissionError("partial database cleanup denied")
+
+            with (
+                patch("gcp_wal_profile_runner.build_profile_schedule", return_value=[row]),
+                patch("gcp_wal_profile_runner.shutil.which", return_value="/fake/perf"),
+                patch("gcp_wal_profile_runner.shutil.rmtree", side_effect=fail_to_remove),
+                patch("gcp_wal_profile_runner.subprocess.run", side_effect=interrupted_record) as execute,
+                patch("builtins.print"),
+            ):
+                summary = run_profile_suite(
+                    binary=root / "write-perf", results_dir=root / "results", db_root=root / "dbs",
+                    writers=(1,), safe_deadline_epoch=int(time.time()) + 3600, timeout_seconds=5,
+                )
+            self.assertEqual(execute.call_count, 1)
+            self.assertFalse(summary["complete"])
+            self.assertEqual(summary["results"][0]["exit_code"], 70)
+            self.assertIn("partial database cleanup denied", summary["results"][0]["error"])
+            self.assertTrue((root / "results" / "remote-exit.json").is_file())
+
+    def test_small_ticket_profile_fallback_shares_the_original_timeout(self) -> None:
+        row = build_profile_schedule((1,))[0]
+        for perf_duration in (3, 900, 930):
+            with self.subTest(perf_duration=perf_duration), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                clock = [1000.0]
+                attempts = []
+
+                def fail_command(command, **kwargs):
+                    attempts.append((command, kwargs["timeout"]))
+                    if len(attempts) == 1:
+                        clock[0] += perf_duration
+                        status = 124 if perf_duration >= 900 else 1
+                    else:
+                        status = 2
+                    return subprocess.CompletedProcess(command, status)
+
+                with (
+                    patch("gcp_wal_profile_runner.shutil.which", return_value="/fake/perf"),
+                    patch("gcp_wal_profile_runner.time.monotonic", side_effect=lambda: clock[0]),
+                    patch("gcp_wal_profile_runner.subprocess.run", side_effect=fail_command),
+                ):
+                    metadata = run_profile_one(
+                        row, binary=root / "write-perf", result_root=root / "results",
+                        db_root=root / "dbs", timeout_seconds=900,
+                    )
+                self.assertEqual(float(attempts[0][0][3]), 900.0)
+                self.assertEqual(attempts[0][1], 945.0)
+                if perf_duration < 900:
+                    self.assertEqual(len(attempts), 2)
+                    self.assertEqual(float(attempts[1][0][3]), 900.0 - perf_duration)
+                    self.assertEqual(attempts[1][1], 945.0 - perf_duration)
+                    self.assertEqual(metadata["exit_code"], 2)
+                else:
+                    self.assertEqual(len(attempts), 1)
+                    self.assertEqual(metadata["exit_code"], 124)
+                self.assertEqual(metadata["perf_status"], f"record_failed:{124 if perf_duration >= 900 else 1}")
 
     def test_matrix_validators_reject_missing_duplicate_unexpected_failed_and_wrong_ops(self) -> None:
         full_schedule = build_rfc026_schedule((1,))

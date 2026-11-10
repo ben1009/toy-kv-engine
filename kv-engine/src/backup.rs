@@ -483,6 +483,7 @@ impl Future for BackupTask {
         if let Some(result) = self.ready.take() {
             return Poll::Ready(result);
         }
+
         match Pin::new(
             self.handle
                 .as_mut()
@@ -733,6 +734,7 @@ fn recover_pitr_purge_transaction(root: &OwnedFd) -> Result<()> {
     );
     let backup_temp_name = CString::new("BACKUP_CATALOG_LOG.recover.tmp")?;
     let backup_target_name = CString::new("BACKUP_CATALOG_LOG")?;
+    // SAFETY: root is an open directory descriptor and both names are live C strings.
     let backup_fd = unsafe {
         libc::openat(
             root.as_raw_fd(),
@@ -742,10 +744,12 @@ fn recover_pitr_purge_transaction(root: &OwnedFd) -> Result<()> {
         )
     };
     ensure!(backup_fd >= 0, std::io::Error::last_os_error());
+    // SAFETY: successful openat returned a new descriptor whose ownership transfers to this File.
     let mut backup_temp = unsafe { File::from_raw_fd(backup_fd) };
     backup_temp.write_all(backup_successor)?;
     backup_temp.sync_all()?;
     ensure!(
+        // SAFETY: root is open and both renameat names remain valid for the duration of the call.
         unsafe {
             libc::renameat(
                 root.as_raw_fd(),
@@ -758,6 +762,7 @@ fn recover_pitr_purge_transaction(root: &OwnedFd) -> Result<()> {
     );
     let temp_name = CString::new("PITR_CATALOG_LOG.recover.tmp")?;
     let target_name = CString::new("PITR_CATALOG_LOG")?;
+    // SAFETY: root is an open directory descriptor and temp_name is a live C string.
     let fd = unsafe {
         libc::openat(
             root.as_raw_fd(),
@@ -767,10 +772,12 @@ fn recover_pitr_purge_transaction(root: &OwnedFd) -> Result<()> {
         )
     };
     ensure!(fd >= 0, std::io::Error::last_os_error());
+    // SAFETY: successful openat returned a new descriptor whose ownership transfers to this File.
     let mut temp = unsafe { File::from_raw_fd(fd) };
     temp.write_all(successor)?;
     temp.sync_all()?;
     ensure!(
+        // SAFETY: root is open and both renameat names remain valid for the duration of the call.
         unsafe {
             libc::renameat(
                 root.as_raw_fd(),
@@ -792,6 +799,7 @@ fn recover_pitr_purge_transaction(root: &OwnedFd) -> Result<()> {
     }
     fsync_fd(root)?;
     let descriptor_name = CString::new(PITR_PURGE_TXN_FILE)?;
+    // SAFETY: root is an open directory descriptor and descriptor_name is a live C string.
     let result = unsafe { libc::unlinkat(root.as_raw_fd(), descriptor_name.as_ptr(), 0) };
     ensure!(
         result == 0 || std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound,
@@ -1032,6 +1040,7 @@ impl BackupRepository {
             catalog.sync_all()?;
             fsync_fd(&root)?;
         }
+
         Ok(Self {
             root,
             _lock: lock,
@@ -1103,6 +1112,7 @@ impl BackupRepository {
                 "backup engine manifest checksum mismatch"
             );
         }
+
         Ok(replay.committed_backup_ids)
     }
 
@@ -1172,6 +1182,7 @@ impl BackupRepository {
                 new_object_bytes: envelope.new_object_bytes,
             });
         }
+
         Ok(result)
     }
 
@@ -1380,6 +1391,7 @@ impl BackupRepository {
                 "restored object identity mismatch"
             );
         }
+
         Ok(())
     }
 
@@ -1398,6 +1410,7 @@ impl BackupRepository {
             file.write_all(bytes)?;
             file.sync_all()?;
         }
+
         fsync_fd(target_dir)
     }
 
@@ -1435,6 +1448,7 @@ impl BackupRepository {
         if result != 0 {
             return Err(std::io::Error::last_os_error().into());
         }
+
         match fsync_fd(parent) {
             Ok(()) => Ok(None),
             Err(error) => match error.downcast::<std::io::Error>() {
@@ -1463,6 +1477,7 @@ impl BackupRepository {
         }
         let from = CString::new(staging)?;
         let to = CString::new(target)?;
+        // SAFETY: parent is open and both NUL-terminated names remain valid for the syscall.
         let result = unsafe {
             libc::syscall(
                 libc::SYS_renameat2,
@@ -1500,6 +1515,7 @@ impl BackupRepository {
                 }),
             };
         }
+
         match fsync_fd(parent) {
             Ok(()) => Ok(PitrRestorePublication::Durable),
             Err(error) => Ok(PitrRestorePublication::PublishedButNotDurable(match error
@@ -1658,6 +1674,7 @@ impl BackupRepository {
                 Err(error) => return Err(error),
             }
         }
+
         bail!("failed to allocate unique restore staging directory")
     }
 
@@ -1841,6 +1858,7 @@ impl BackupRepository {
                 continue;
             }
             let name = CString::new(name.as_str())?;
+            // SAFETY: files is an open directory descriptor and name is a live C string.
             let result = unsafe { libc::unlinkat(files.as_raw_fd(), name.as_ptr(), 0) };
             if result != 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::NotFound
             {
@@ -1850,6 +1868,7 @@ impl BackupRepository {
         if let Err(error) = fsync_fd(&files) {
             first_error.get_or_insert(error);
         }
+
         first_error.map_or(Ok(()), Err)
     }
 
@@ -1904,6 +1923,7 @@ impl BackupRepository {
         if envelope.version >= 2 {
             validate_restore_snapshot_objects(&envelope, &snapshot_bytes)?;
         }
+
         Ok(())
     }
 
@@ -1916,6 +1936,7 @@ impl BackupRepository {
             self.verify(*id)
                 .with_context(|| format!("backup {id} failed verification"))?;
         }
+
         Ok(())
     }
 
@@ -2277,6 +2298,7 @@ impl BackupRepository {
                 orphan = orphan.saturating_add(bytes);
             }
         }
+
         Ok((staging, orphan))
     }
 
@@ -2333,6 +2355,7 @@ impl BackupRepository {
                 crate::pitr::catalog::PitrCatalogRecord::CoverageBreak(_) => {}
             }
         }
+
         self.load_pitr_base_intervals_for_segments(selector, &segments)
     }
 
@@ -2665,6 +2688,7 @@ impl BackupRepository {
                     .entry(interval.timeline_id)
                     .and_modify(|known| *known = (*known).max(end))
                     .or_insert(end);
+
                 (end >= cutoff).then_some(interval.timeline_id)
             })
             .collect::<HashSet<_>>();
@@ -2758,6 +2782,7 @@ impl BackupRepository {
                             anchor.segment_id.0.saturating_add(1)
                         }
                     };
+
                     if rank(boundary) < rank(*known) {
                         *known = boundary;
                     }
@@ -2883,6 +2908,7 @@ impl BackupRepository {
             }
         }
         let descriptor_name = CString::new(PITR_PURGE_TXN_FILE)?;
+        // SAFETY: root is open and descriptor_name is a live C string.
         let descriptor_fd = unsafe {
             libc::openat(
                 self.root.as_raw_fd(),
@@ -2892,6 +2918,8 @@ impl BackupRepository {
             )
         };
         ensure!(descriptor_fd >= 0, std::io::Error::last_os_error());
+        // SAFETY: successful openat returned a new descriptor whose ownership transfers to this
+        // File.
         let mut descriptor = unsafe { File::from_raw_fd(descriptor_fd) };
         descriptor.write_all(PITR_PURGE_TXN_MAGIC)?;
         descriptor.write_all(&backup_catalog_high_water.to_be_bytes())?;
@@ -3007,6 +3035,8 @@ impl BackupRepository {
             for name in unreferenced_backup_objects {
                 validate_object_before_reclaim(&objects_dir, &name)?;
                 let name_c = CString::new(name.as_str())?;
+                // SAFETY: objects_dir is an open directory descriptor and name_c is a live C
+                // string.
                 let result = unsafe { libc::unlinkat(objects_dir.as_raw_fd(), name_c.as_ptr(), 0) };
                 ensure!(
                     result == 0
@@ -3062,6 +3092,7 @@ impl BackupRepository {
                 };
                 let size = std::fs::File::from(file).metadata()?.len();
                 let name_c = CString::new(name.as_str())?;
+                // SAFETY: wal_dir is an open directory descriptor and name_c is a live C string.
                 let result = unsafe { libc::unlinkat(wal_dir.as_raw_fd(), name_c.as_ptr(), 0) };
                 if result == 0 {
                     deleted_bytes = deleted_bytes.saturating_add(size);
@@ -3370,6 +3401,7 @@ impl BackupRepository {
                 }
             }
         }
+
         Ok(selected.map(|(_, backup_id)| backup_id))
     }
 
@@ -3477,6 +3509,7 @@ impl BackupRepository {
                 Sha256::digest(&seal).as_slice() == metadata.seal_digest,
                 "PITR restore seal digest mismatch"
             );
+
             crate::pitr::restore::decode_restore_segment_batches(
                 &wal,
                 &seal,
@@ -4218,6 +4251,7 @@ impl BackupRepository {
             crate::chaos::failpoint::fail_point!("backup.purge.before_root_fsync", |_| {
                 Err(anyhow!("injected backup purge root fsync failure"))
             });
+
             fsync_fd(root)
         }
 
@@ -4225,6 +4259,7 @@ impl BackupRepository {
             self.usable.store(false, Ordering::Release);
             return Err(error);
         }
+
         Ok(())
     }
 
@@ -4325,6 +4360,7 @@ impl BackupRepository {
                 source: error,
             }));
         }
+
         Ok(())
     }
 
@@ -4578,6 +4614,7 @@ fn cleanup_stale_catalog_temps(root: &OwnedFd) -> Result<()> {
     if removed {
         fsync_fd(root)?;
     }
+
     Ok(())
 }
 
@@ -4766,6 +4803,7 @@ fn validate_replay_backups(
             }
         }
     }
+
     Ok(())
 }
 
@@ -4851,6 +4889,7 @@ impl Drop for RestoreStagingCleanup<'_> {
         if self.name.is_empty() {
             return;
         }
+
         if let Ok(name) = CString::new(self.name.as_str()) {
             if let Ok(staging) = openat_no_follow(
                 self.parent,
@@ -5027,6 +5066,7 @@ fn ensure_backup_without_engine_owner_can_use_generic_path(
         pitr_mode != crate::pitr::manifest::PitrMode::Enabled,
         "enabled PITR backup boundary capture requires the retained KvEngine owner"
     );
+
     Ok(())
 }
 
@@ -5136,6 +5176,7 @@ impl crate::lsm_storage::KvEngine {
                             worker_inner.pitr_state.lock().mode,
                         )?;
                     }
+
                     worker_inner.create_backup_inner_with_cancellation(
                         options,
                         Some(&worker_control.cancelled),
@@ -5227,6 +5268,7 @@ impl crate::lsm_storage::KvEngine {
                         inner.pitr_state.lock().mode,
                     )?;
                 }
+
                 inner.create_backup_inner(options)
             })
             .await
@@ -5258,6 +5300,7 @@ impl crate::lsm_storage::KvEngine {
                         inner.pitr_state.lock().mode,
                     )?;
                 }
+
                 match inner.create_backup_inner(options) {
                     Ok(info) => Ok(BackupOutcome::Committed(info)),
                     Err(error) => backup_outcome_from_error(repository, error),
@@ -5450,6 +5493,7 @@ fn cleanup_staging_backup(root: &OwnedFd, staging: &str) -> Result<()> {
     if let Err(error) = fsync_fd(&backups) {
         first_error.get_or_insert(error);
     }
+
     first_error.map_or(Ok(()), Err)
 }
 
@@ -5492,6 +5536,7 @@ fn remove_backup_directory(backups: &OwnedFd, id: u64) -> Result<()> {
             return Err(error.into());
         }
     }
+
     Ok(())
 }
 
@@ -5519,6 +5564,7 @@ fn remove_uncommitted_backup_orphans(
     if removed {
         fsync_fd(backups)?;
     }
+
     Ok(())
 }
 
@@ -5667,6 +5713,7 @@ fn validate_backup_objects(envelope: &BackupMetadata) -> Result<()> {
         );
         previous_name = Some(&object.object_name);
     }
+
     Ok(())
 }
 
@@ -5810,6 +5857,7 @@ fn validate_backup_objects_on_disk(root: &OwnedFd, envelope: &BackupMetadata) ->
             "repository object checksum mismatch"
         );
     }
+
     Ok(())
 }
 
@@ -5836,6 +5884,7 @@ fn validate_backup_object_metadata_on_disk(
             "repository object size mismatch"
         );
     }
+
     Ok(())
 }
 
@@ -5934,6 +5983,7 @@ fn pitr_repository_view_digest(
         digest.update(backup.backup_id.to_be_bytes());
         digest.update(backup.backup_metadata_checksum);
     }
+
     digest.finalize().into()
 }
 
@@ -5960,6 +6010,7 @@ impl crate::lsm_storage::LsmStorageInner {
         {
             *pitr_state = Some(crate::pitr::manifest::PitrState::default());
         }
+
         self.hash_checkpoint_capture(capture)
     }
 
@@ -6097,6 +6148,7 @@ impl<'a> RepositoryRelockGuard<'a> {
         if result.is_err() {
             self.usable.store(false, Ordering::Release);
         }
+
         result
     }
 }
@@ -6162,6 +6214,7 @@ pub(crate) fn open_directory_no_follow(path: &std::path::Path) -> Result<OwnedFd
         // SAFETY: `fd` is valid after the successful openat above.
         current = unsafe { OwnedFd::from_raw_fd(fd) };
     }
+
     Ok(current)
 }
 
@@ -6216,6 +6269,7 @@ fn install_repository_identity(root: &OwnedFd) -> Result<()> {
         return Err(std::io::Error::last_os_error())
             .context("failed to install repository identity");
     }
+
     fsync_fd(root)
 }
 
@@ -6232,6 +6286,7 @@ fn cleanup_repository_identity_temp(root: &OwnedFd) -> Result<()> {
         }
         return Ok(());
     }
+
     fsync_fd(root)
 }
 
@@ -6262,6 +6317,7 @@ pub(crate) fn openat_no_follow(
         return Err(std::io::Error::last_os_error())
             .context("failed to open repository component without following symlinks");
     }
+
     // SAFETY: fd is valid because openat returned non-negative.
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
@@ -6284,6 +6340,7 @@ pub(crate) fn mkdirat_no_follow(parent: &OwnedFd, name: &str, mode: u32) -> Resu
             "failed to create repository directory: {error}"
         );
     }
+
     openat_no_follow(
         parent,
         name.to_str().unwrap(),
@@ -6296,6 +6353,7 @@ pub(crate) fn mkdirat_no_follow(parent: &OwnedFd, name: &str, mode: u32) -> Resu
 pub(crate) fn fsync_fd(fd: &OwnedFd) -> Result<()> {
     // SAFETY: fd is a valid descriptor owned by the caller.
     let result = loop {
+        // SAFETY: fd remains a live descriptor for the duration of this fsync call.
         let result = unsafe { libc::fsync(fd.as_raw_fd()) };
         if result == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
             break result;
@@ -6305,6 +6363,7 @@ pub(crate) fn fsync_fd(fd: &OwnedFd) -> Result<()> {
     if result != 0 {
         return Err(std::io::Error::last_os_error().into());
     }
+
     Ok(())
 }
 
@@ -6668,6 +6727,7 @@ impl Drop for TempObjectCleanup<'_> {
         if self.name.is_empty() {
             return;
         }
+
         if let Ok(name) = CString::new(self.name.as_str()) {
             // SAFETY: directory is trusted and name is the exact generated
             // temporary basename.
@@ -6799,18 +6859,21 @@ impl Drop for BootstrapStagingCleanup<'_> {
         };
         for name in ["LOCK", "BACKUP_CATALOG_LOG", REPOSITORY_ID_FILE] {
             let name = CString::new(name).unwrap();
+            // SAFETY: staging is an open directory descriptor and name is a live C string.
             unsafe {
                 libc::unlinkat(staging.as_raw_fd(), name.as_ptr(), 0);
             }
         }
         for name in ["objects", "backups"] {
             let name = CString::new(name).unwrap();
+            // SAFETY: staging is an open directory descriptor and name is a live C string.
             unsafe {
                 libc::unlinkat(staging.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR);
             }
         }
         let name = CString::new(self.name.as_str()).unwrap();
 
+        // SAFETY: parent is an open directory descriptor and name is a live C string.
         unsafe {
             libc::unlinkat(self.parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR);
         }
@@ -6826,6 +6889,7 @@ fn mkdirat_exclusive(parent: &OwnedFd, name: &str, mode: u32) -> Result<OwnedFd>
     if result != 0 {
         return Err(std::io::Error::last_os_error().into());
     }
+
     openat_no_follow(
         parent,
         name.to_str()?,
@@ -6996,6 +7060,7 @@ pub(crate) fn read_catalog_records(mut file: impl Read) -> Result<CatalogFrames>
         });
         offset = end;
     }
+
     Ok(CatalogFrames {
         frames,
         last_complete_offset: offset as u64,
@@ -7320,6 +7385,7 @@ fn check_pitr_cancellation(cancellation: Option<&std::sync::atomic::AtomicBool>)
     if cancellation.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire)) {
         anyhow::bail!("PITR restore cancelled before finalization")
     }
+
     Ok(())
 }
 
@@ -8013,6 +8079,7 @@ mod tests {
             restore_unlock_test_hook::wait();
             cancelled.store(true, Ordering::Release);
             restore_unlock_test_hook::release();
+
             worker.join().unwrap().unwrap_err()
         });
         assert!(

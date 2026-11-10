@@ -17,6 +17,7 @@ fn make_entries(count: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
         .map(|i| {
             let key = format!("key_{:08}", i).into_bytes();
             let value = vec![0u8; 100]; // 100-byte values
+
             (key, value)
         })
         .collect()
@@ -91,6 +92,7 @@ fn bench_wal_multi_thread(c: &mut Criterion) {
                     let handles: Vec<_> = (0..num_threads)
                         .map(|i| {
                             let wal = Arc::clone(&wal);
+
                             std::thread::spawn(move || {
                                 let entries = make_entries(10);
                                 let refs: Vec<(&[u8], &[u8])> = entries
@@ -103,6 +105,7 @@ fn bench_wal_multi_thread(c: &mut Criterion) {
                             })
                         })
                         .collect();
+
                     for h in handles {
                         h.join().unwrap();
                     }
@@ -125,6 +128,7 @@ fn bench_wal_multi_thread(c: &mut Criterion) {
                     let handles: Vec<_> = (0..num_threads)
                         .map(|i| {
                             let wal = Arc::clone(&wal);
+
                             std::thread::spawn(move || {
                                 let entries = make_entries(10);
                                 let refs: Vec<(&[u8], &[u8])> = entries
@@ -137,6 +141,7 @@ fn bench_wal_multi_thread(c: &mut Criterion) {
                             })
                         })
                         .collect();
+
                     for h in handles {
                         h.join().unwrap();
                     }

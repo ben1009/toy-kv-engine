@@ -118,6 +118,7 @@ impl PreparedV7PitrSeal<'_> {
             .reservation
             .take()
             .ok_or_else(|| anyhow!("v7 PITR seal reservation is missing"))?;
+
         Ok((self.seal, self.wal_path, self.seal_path, reservation))
     }
 
@@ -171,6 +172,7 @@ impl PreparedV8PitrSeal<'_> {
             .reservation
             .take()
             .ok_or_else(|| anyhow!("v8 PITR seal reservation is missing"))?;
+
         Ok((self.seal, self.wal_path, self.seal_path, reservation))
     }
 
@@ -233,6 +235,7 @@ fn unsupported_v7_to_v8_migration_source(state: &crate::pitr::manifest::PitrStat
             let migration_intended_v8 = obligation
                 .migration_successor_boundary
                 .is_some_and(|boundary| boundary.wal_format == PitrWalFormat::V8);
+
             obligation.state == ObligationState::Sealing
                 && obligation.wal_format == PitrWalFormat::V7
                 && migration_intended_v8
@@ -485,6 +488,7 @@ impl LsmStorageState {
         additions: impl IntoIterator<Item = ImmutableFileMetadata>,
     ) -> Result<()> {
         self.immutable_file_metadata.retain(|entry| keep(entry));
+
         self.merge_immutable_file_metadata(additions)
     }
 
@@ -497,6 +501,7 @@ impl LsmStorageState {
         metadata.extend(additions);
         let mut seen = HashSet::new();
         metadata.retain(|entry| seen.insert(entry.identity()));
+
         self.set_immutable_file_metadata(metadata)
     }
 
@@ -549,6 +554,7 @@ impl LsmStorageState {
         };
         let levels = init_levels(&options.compaction_options);
         let range_only_ssts = init_levels(&options.compaction_options);
+
         Self {
             memtable: Arc::new(MemTable::create(0, vlog_enabled)),
             imm_memtables: Vec::new(),
@@ -1035,6 +1041,7 @@ impl ManifestRecoveryState<'_> {
 
     fn replay_flush_v2(&mut self, id: usize, vlog_ids: Vec<u32>) {
         self.replay_flush(id);
+
         if !vlog_ids.is_empty() {
             self.recovered_vlog_refs.insert(id, vlog_ids);
         }
@@ -1178,6 +1185,7 @@ impl ManifestRecoveryState<'_> {
         self.state
             .range_only_ssts
             .retain(|(_, ids)| !ids.is_empty());
+
         if let Some((_, existing)) = self
             .state
             .range_only_ssts
@@ -1307,6 +1315,7 @@ impl ManifestRecoveryState<'_> {
             self.pitr_state = pitr_state;
         }
         self.manifest_format_version = snapshot.format_version;
+
         Ok(())
     }
 }
@@ -1579,6 +1588,7 @@ impl InstalledCompactionFilter {
         if ts > self.cutoff_ts {
             return false;
         }
+
         match &self.kind {
             CompactionFilterKind::Prefix(prefix) => user_key.starts_with(prefix),
         }
@@ -1619,6 +1629,7 @@ pub(crate) struct SnapshotTrackerGuard {
 impl SnapshotTracker {
     fn register(self: &Arc<Self>, read_ts: u64) -> SnapshotTrackerGuard {
         *self.active.lock().entry(read_ts).or_default() += 1;
+
         SnapshotTrackerGuard {
             tracker: Arc::clone(self),
             read_ts,
@@ -1627,6 +1638,7 @@ impl SnapshotTracker {
 
     fn stats(&self) -> SnapshotStats {
         let active = self.active.lock();
+
         SnapshotStats {
             active_snapshots: active.values().sum(),
             oldest_pinned_read_ts: active.first_key_value().map(|(ts, _)| *ts),
@@ -1642,6 +1654,7 @@ impl Drop for SnapshotTrackerGuard {
             .get_mut(&self.read_ts)
             .expect("snapshot tracker underflow");
         *count -= 1;
+
         if *count == 0 {
             active.remove(&self.read_ts);
         }
@@ -1826,6 +1839,7 @@ pub(crate) fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
     while len > 0 && prefix[len - 1] == 0xff {
         len -= 1;
     }
+
     if len == 0 {
         None
     } else {
@@ -1936,6 +1950,7 @@ impl LifecycleHandle {
     fn admit(&self, kind: AdmissionKind) -> Result<AdmissionGuard> {
         self.ensure_open()?;
         self.0.increment(kind);
+
         if self.0.is_open() {
             Ok(AdmissionGuard {
                 lifecycle: self.clone(),
@@ -1981,6 +1996,7 @@ impl LifecycleHandle {
 
     pub(crate) fn wait_for_quiescence(&self) {
         let mut lock = self.0.wait_lock.lock();
+
         while !self.0.is_quiescent() {
             self.0.wait_cv.wait(&mut lock);
         }
@@ -1993,6 +2009,7 @@ impl LifecycleHandle {
             .store(true, Ordering::Release);
 
         let mut lock = self.0.wait_lock.lock();
+
         while self.0.active_writes.load(Ordering::Acquire) != 0 {
             self.0.wait_cv.wait(&mut lock);
         }
@@ -2000,6 +2017,7 @@ impl LifecycleHandle {
 
     pub(crate) fn wait_for_transactions(&self) {
         let mut lock = self.0.wait_lock.lock();
+
         while self.0.active_txns.load(Ordering::Acquire) != 0 {
             self.0.wait_cv.wait(&mut lock);
         }
@@ -2007,6 +2025,7 @@ impl LifecycleHandle {
 
     pub(crate) fn wait_for_closed(&self) {
         let mut lock = self.0.wait_lock.lock();
+
         while !self.is_closed() {
             self.0.wait_cv.wait(&mut lock);
         }
@@ -2082,6 +2101,7 @@ impl LifecycleState {
             AdmissionKind::Scan => self.active_scans.fetch_sub(1, Ordering::AcqRel) == 1,
             AdmissionKind::Txn => self.active_txns.fetch_sub(1, Ordering::AcqRel) == 1,
         };
+
         if notify && self.state.load(Ordering::Acquire) == LIFECYCLE_CLOSING {
             let _lock = self.wait_lock.lock();
             self.wait_cv.notify_all();
@@ -2281,6 +2301,7 @@ async fn run_periodic_background_task<F>(
     let mut interval = tokio::time::interval(Duration::from_millis(50));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     interval.tick().await;
+
     loop {
         if shutdown.load(Ordering::Acquire) != 0 {
             return;
@@ -2410,6 +2431,7 @@ fn pitr_enable_request_id(state: &crate::pitr::manifest::PitrState) -> [u8; 16] 
     digest.update(state.repository_id.unwrap_or([0; 16]));
     digest.update(state.timeline_id.unwrap_or([0; 16]));
     digest.update(state.archive_epoch_id.unwrap_or([0; 16]));
+
     digest.finalize()[..16].try_into().unwrap()
 }
 
@@ -2421,6 +2443,7 @@ fn pitr_enable_manifest_outcome(
     state: &crate::pitr::manifest::PitrState,
 ) -> Result<crate::pitr::api::EnablePitrOutcome> {
     let request_id = pitr_enable_request_id(state);
+
     match error.downcast::<PitrManifestPublicationError>() {
         Ok(PitrManifestPublicationError::PublishedButNotDurable(error)) => Ok(
             crate::pitr::api::EnablePitrOutcome::SourceManifestPublishedButNotDurable {
@@ -2450,6 +2473,7 @@ fn check_pitr_cancellation(cancellation: Option<&std::sync::atomic::AtomicBool>)
     if cancellation.is_some_and(|flag| flag.load(Ordering::Acquire)) {
         anyhow::bail!("PITR operation cancelled before finalization");
     }
+
     Ok(())
 }
 
@@ -2521,6 +2545,7 @@ impl KvEngine {
     pub(crate) fn lock_v8_compatibility_publication(&self) -> V8CompatibilityPublicationGuards<'_> {
         let operation_guard = self.pitr_operation_lock.lock();
         let barrier_guard = self.pitr_barrier_lock.lock();
+
         V8CompatibilityPublicationGuards {
             inner: self.inner.as_ref(),
             _operation_guard: operation_guard,
@@ -2566,6 +2591,7 @@ impl KvEngine {
             | crate::pitr::manifest::PitrMode::ReconciliationRequired
             | crate::pitr::manifest::PitrMode::Enabled => {}
         }
+
         self.close_storage()
     }
 
@@ -2646,6 +2672,7 @@ impl KvEngine {
                             })
                             .and_then(|boundaries| {
                                 drop(active_memtable_guard);
+
                                 Self::persist_active_boundary(
                                     &self.inner,
                                     &self.pitr_manifest_state,
@@ -2673,6 +2700,7 @@ impl KvEngine {
                 active_wal_synced,
             )
         }
+
         #[cfg(not(target_os = "linux"))]
         {
             self.close_storage()
@@ -2799,6 +2827,7 @@ impl KvEngine {
             options.enable_wal,
             "repairing requires enable_wal: a database opened without WAL does not recover memtables"
         );
+
         Self::open_inner(path, options, true, crate::wal::WalIoMode::default())
     }
 
@@ -2894,6 +2923,7 @@ impl KvEngine {
         {
             engine.resume_pitr(repository)?;
         }
+
         Ok((engine, repaired_memtable_ids))
     }
 
@@ -2912,6 +2942,7 @@ impl KvEngine {
         let Some(segment_id) = LsmStorageInner::pitr_segment_of(&active_memtable) else {
             return false;
         };
+
         self.pitr_manifest_state
             .lock()
             .obligations
@@ -2977,6 +3008,7 @@ impl KvEngine {
             .as_ref()
             .cloned()
             .ok_or_else(|| anyhow!("PITR is not enabled on this engine"))?;
+
         controller.update(&options, std::time::Instant::now())
     }
 
@@ -3335,6 +3367,7 @@ impl KvEngine {
         state: crate::pitr::manifest::PitrState,
     ) -> Result<()> {
         let runtime = crate::pitr::api::PitrRuntimeOptions::default();
+
         self.resume_pitr_lifecycle_with_runtime(state, &runtime)
     }
 
@@ -3578,6 +3611,7 @@ impl KvEngine {
                 status.next_cursor = page.next_cursor;
             }
         }
+
         Ok(status)
     }
 
@@ -3600,6 +3634,7 @@ impl KvEngine {
             .config
             .as_ref()
             .ok_or_else(|| anyhow!("Active legacy PITR WAL has no persisted configuration"))?;
+
         match self.pitr_v7_migration_capacity_snapshot(config, active_segment_id, active, None) {
             Ok(capacity) => Ok(Some(capacity)),
             // Reclamation can unlink a sampled source between read_dir and
@@ -4405,6 +4440,7 @@ impl KvEngine {
         self.seal_rotate_v7_active_wal(source_segment_id, successor_segment_id)
             .context("install the default v8 PITR successor")?;
         drop(intent);
+
         Ok(true)
     }
 
@@ -4418,6 +4454,7 @@ impl KvEngine {
     pub fn wait_for_pitr_benchmark_maintenance(&self) -> Result<()> {
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         let mut settled_since = None;
+
         loop {
             self.inner.maybe_queue_pitr_maintenance(true)?;
             let maintenance_queued = self.inner.pitr_maintenance_queued.load(Ordering::Acquire);
@@ -4500,6 +4537,7 @@ impl KvEngine {
             allocation_unit,
         )?;
         capacity.ensure_eligible()?;
+
         Ok(capacity)
     }
 
@@ -4544,6 +4582,7 @@ impl KvEngine {
                 capacity.source_spool_limit_bytes,
             );
         }
+
         Ok(())
     }
 
@@ -4592,6 +4631,7 @@ impl KvEngine {
             .ensure_pitr_repository_identity()
             .context("load PITR repository identity during resume")?;
         *self.pitr_repository_path.lock() = Some(options.repository.clone());
+
         crate::pitr::enable::PitrEnableCoordinator::request_from_public(options, repository_id)
     }
 
@@ -4955,6 +4995,7 @@ impl KvEngine {
                 },
             ));
         }
+
         Ok(crate::pitr::api::PitrResumeOutcome::Resumed)
     }
 
@@ -5012,6 +5053,7 @@ impl KvEngine {
         let PitrV7MigrationCapacityDecision::Deferred(reason) = capacity.decision else {
             return None;
         };
+
         Some(format!(
             "PITR v7 migration deferred on resume: database_path={}, active_segment_id={active_segment_id:?}, reason={reason:?}, required_transition_bytes={}, required_total_bytes={}, available_capacity_bytes={}, source_spool_limit_bytes={}; keeping Active legacy WAL format {wal_format_version:?} on Leader I/O",
             database_path.display(),
@@ -5195,6 +5237,7 @@ impl KvEngine {
     ) -> Result<crate::pitr::manifest::PitrState> {
         let (state, _migration_reservation) =
             self.resume_v7_successor_install_with_reservation(state, None)?;
+
         Ok(state)
     }
 
@@ -6160,6 +6203,7 @@ impl KvEngine {
                     let mut reconciled = segments.clone();
                     let releases = reconciled
                         .reconcile_obligations(&previous_obligations, &state.obligations)?;
+
                     Ok::<_, anyhow::Error>((reconciled, releases))
                 })
                 .transpose()?;
@@ -6181,6 +6225,7 @@ impl KvEngine {
                 application?;
             }
         }
+
         Ok(state)
     }
 
@@ -6215,6 +6260,7 @@ impl KvEngine {
         // Also sync on retry when a previous pass unlinked the files but failed
         // before its directory sync. Absence alone does not prove durable cleanup.
         self.inner.sync_dir()?;
+
         Ok(true)
     }
 
@@ -6530,6 +6576,7 @@ impl KvEngine {
                 selected = Some((metadata, wal_path, path));
             }
         }
+
         selected.ok_or_else(|| anyhow!("sealed PITR source sidecar is missing"))
     }
 
@@ -6670,6 +6717,7 @@ impl KvEngine {
         // this lock, so they are ordered against the maintenance body rather than
         // against this.
         let _operation_guard = self.pitr_operation_lock.lock();
+
         self.create_recovery_point_inner(true)
     }
 
@@ -6679,10 +6727,12 @@ impl KvEngine {
         self: &Arc<Self>,
     ) -> crate::pitr::api::PitrTask<crate::pitr::api::RecoveryPointOutcome> {
         let engine = Arc::clone(self);
+
         crate::pitr::api::PitrTask::spawn_cancellable(move |cancellation| {
             // Same serialization as the synchronous entry; see
             // `create_recovery_point` for why the lock lives at the entry.
             let _operation_guard = engine.pitr_operation_lock.lock();
+
             engine.create_recovery_point_inner_cancellable(true, Some(cancellation.control()))
         })
     }
@@ -6702,6 +6752,7 @@ impl KvEngine {
         cancellation: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<crate::pitr::api::RecoveryPointOutcome> {
         let _barrier = self.pitr_barrier_lock.lock();
+
         self.create_recovery_point_locked_cancellable(
             resume_admission_on_success,
             cancellation,
@@ -6724,6 +6775,7 @@ impl KvEngine {
                 wal_format == Some(crate::pitr::manifest::PitrWalFormat::V7),
                 "v7 checkpoint boundary requires an Active v7 PITR WAL"
             );
+
             capture()
         })
     }
@@ -6817,6 +6869,7 @@ impl KvEngine {
                         .versioned_wal_requires_recovery(),
                     "Active versioned PITR WAL is poisoned; reopen the database before writing"
                 );
+
                 Ok(())
             })();
             if let Err(health_error) = health {
@@ -6829,6 +6882,7 @@ impl KvEngine {
             }
             sequencer.resume_commit_admission();
         }
+
         captured
     }
 
@@ -7665,6 +7719,7 @@ impl KvEngine {
                     reclaimed.mark_archived(active_segment_id)?;
                     reclaimed.mark_reclaimable(active_segment_id)?;
                     reclaimed.release_archive_pin(active_segment_id)?;
+
                     Ok::<_, anyhow::Error>(reclaimed)
                 })
                 .transpose()?;
@@ -8077,6 +8132,7 @@ impl KvEngine {
                         reclaimed.mark_archived(active_segment_id)?;
                         reclaimed.mark_reclaimable(active_segment_id)?;
                         reclaimed.release_archive_pin(active_segment_id)?;
+
                         Ok::<_, anyhow::Error>(reclaimed)
                     })
                     .transpose()?;
@@ -8117,6 +8173,7 @@ impl KvEngine {
         if !durable && admission_released_for_archive {
             let _ = sequencer.stop_commit_admission_and_capture();
         }
+
         result
     }
 
@@ -8364,6 +8421,7 @@ impl KvEngine {
             *self.pitr_scheduler_delay.lock() =
                 std::time::Instant::now().saturating_duration_since(deadline);
         }
+
         match self.create_recovery_point_locked(true)? {
             crate::pitr::api::RecoveryPointOutcome::Durable(_) => Ok(()),
             crate::pitr::api::RecoveryPointOutcome::CommitPublishedButNotDurable {
@@ -8527,6 +8585,7 @@ impl KvEngine {
                 }),
             "PITR archive obligations remain pending before forced freeze"
         );
+
         Ok(())
     }
 
@@ -8603,6 +8662,7 @@ impl KvEngine {
         self: &Arc<Self>,
     ) -> crate::pitr::api::PitrTask<crate::pitr::api::PitrCloseOutcome> {
         let engine = Arc::clone(self);
+
         crate::pitr::api::PitrTask::spawn(move || engine.close_pitr())
     }
 
@@ -8890,6 +8950,7 @@ impl KvEngine {
                     .ok_or_else(|| anyhow!("PITR archiver is not attached"))?,
             ),
         };
+
         archiver.archiver_mut().archive_segment_from_paths(
             metadata,
             wal_path,
@@ -8918,6 +8979,7 @@ impl KvEngine {
                     .ok_or_else(|| anyhow!("PITR archiver is not attached"))?,
             ),
         };
+
         match cancellation {
             Some(cancellation) => archiver
                 .archiver_mut()
@@ -9241,6 +9303,7 @@ impl KvEngine {
         options: &crate::backup::BackupOptions,
     ) -> Result<Option<crate::backup::BackupInfo>> {
         let _lifecycle_guard = self.inner.lifecycle.admit_write()?;
+
         self.create_pitr_base_for_backup_admitted(options, None, None, None)
     }
 
@@ -9307,6 +9370,7 @@ impl KvEngine {
                 .ok_or_else(|| anyhow!("PITR backup requires MVCC"))?
                 .resume_commit_admission();
         }
+
         result.map(Some)
     }
 
@@ -9439,6 +9503,7 @@ impl KvEngine {
                 "PITR restore timestamp advance is blocked"
             );
         }
+
         Ok(())
     }
 
@@ -9554,6 +9619,7 @@ impl KvEngine {
 
         let result = inner.sync();
         drop(lifecycle_guard);
+
         result
     }
 
@@ -9673,6 +9739,7 @@ impl KvEngine {
 
         *inner.pitr_state.lock() = next_state.clone();
         *pitr_manifest_state.lock() = next_state;
+
         Ok(())
     }
 
@@ -9695,6 +9762,7 @@ impl KvEngine {
     /// a recovery-point boundary before its memtable is flushed.
     pub fn force_flush(&self) -> Result<()> {
         let _guard = self.inner.lifecycle.admit_write()?;
+
         crate::profile_scope!("kv.force_flush", self.inner.force_flush())
     }
 
@@ -9865,6 +9933,7 @@ impl KvEngine {
         let Some(ref vlog) = self.inner.vlog else {
             return Err(anyhow::anyhow!("value separation is not enabled"));
         };
+
         vlog.stats()
     }
 
@@ -10010,6 +10079,7 @@ impl KvEngine {
     /// WAL has admitted a ticket.
     pub fn set_wal_sync_diagnostics_enabled(&self, enabled: bool) -> Result<()> {
         let _active_memtable = self.inner.active_memtable_lock.read();
+
         self.inner
             .state
             .load()
@@ -10104,6 +10174,7 @@ impl KvEngine {
         options: crate::pitr::api::PitrOptions,
     ) -> crate::pitr::api::PitrTask<crate::pitr::api::EnablePitrOutcome> {
         let engine = Arc::clone(self);
+
         crate::pitr::api::PitrTask::spawn(move || engine.enable_pitr(options))
     }
 
@@ -10134,6 +10205,7 @@ impl KvEngine {
         self: &Arc<Self>,
     ) -> crate::pitr::api::PitrTask<crate::pitr::api::DisablePitrOutcome> {
         let engine = Arc::clone(self);
+
         crate::pitr::api::PitrTask::spawn(move || engine.disable_pitr_allow_gap())
     }
 
@@ -10144,6 +10216,7 @@ impl KvEngine {
         options: crate::pitr::api::PitrStatusOptions,
     ) -> crate::pitr::api::PitrTask<crate::pitr::api::PitrStatus> {
         let engine = Arc::clone(self);
+
         crate::pitr::api::PitrTask::spawn(move || engine.pitr_status(options))
     }
 
@@ -10269,6 +10342,7 @@ impl KvEngine {
         {
             engine.resume_pitr(repository)?;
         }
+
         Ok(engine)
     }
 
@@ -10312,10 +10386,12 @@ impl KvEngine {
         let guard = self.inner.lifecycle.admit_write()?;
         let inner = self.inner.clone();
         let key = Bytes::copy_from_slice(key);
+
         self.inner
             .blocking
             .run_result(move || {
                 let _guard = guard;
+
                 inner.get(&key)
             })
             .await
@@ -10334,11 +10410,13 @@ impl KvEngine {
         };
         let inner = self.inner.clone();
         let kk: Vec<Vec<u8>> = keys.iter().map(|k| k.to_vec()).collect();
+
         self.inner
             .blocking
             .run(move || {
                 let _guard = guard;
                 let refs: Vec<&[u8]> = kk.iter().map(|k| k.as_slice()).collect();
+
                 inner.batch_get(&refs)
             })
             .await
@@ -10359,10 +10437,12 @@ impl KvEngine {
         let inner = self.inner.clone();
         let key = key.to_vec();
         let value = value.to_vec();
+
         self.inner
             .blocking
             .run_result(move || {
                 let _guard = guard;
+
                 inner.put_admitted(&key, &value)
             })
             .await
@@ -10397,10 +10477,12 @@ impl KvEngine {
         let inner = self.inner.clone();
         let key = key.to_vec();
         let value = value.to_vec();
+
         self.inner
             .blocking
             .run_result(move || {
                 let _guard = guard;
+
                 inner.put_with_ttl_admitted(&key, &value, ttl)
             })
             .await
@@ -10414,10 +10496,12 @@ impl KvEngine {
         let guard = self.inner.lifecycle.admit_write()?;
         let inner = self.inner.clone();
         let key = key.to_vec();
+
         self.inner
             .blocking
             .run_result(move || {
                 let _guard = guard;
+
                 inner.delete_admitted(&key)
             })
             .await
@@ -10547,10 +10631,12 @@ impl KvEngine {
                 }
             })
             .collect();
+
         self.inner
             .blocking
             .run_result(move || {
                 let _guard = guard;
+
                 inner.write_batch_admitted(&owned)
             })
             .await
@@ -10566,6 +10652,7 @@ impl KvEngine {
         let pitr_manifest_state = Arc::clone(&self.pitr_manifest_state);
         #[cfg(target_os = "linux")]
         let pitr_publication_unknown = Arc::clone(&self.pitr_publication_unknown);
+
         self.inner
             .blocking
             .run_result(move || {
@@ -10596,6 +10683,7 @@ impl KvEngine {
         let lower_owned = lower.map(Bytes::copy_from_slice);
         let upper_owned = upper.map(Bytes::copy_from_slice);
         let blocking = self.inner.blocking.clone();
+
         self.inner
             .blocking
             .run(move || {
@@ -10626,6 +10714,7 @@ impl KvEngine {
         let inner = self.inner.clone();
         let prefix = Bytes::copy_from_slice(prefix);
         let blocking = self.inner.blocking.clone();
+
         self.inner
             .blocking
             .run(move || {
@@ -10674,6 +10763,7 @@ impl KvEngine {
             Some(upper) => Bound::Excluded(upper.as_slice()),
             None => Bound::Unbounded,
         };
+
         self.inner
             .scan_parallel_async_internal(lower, upper, Some(prefix), None, options)
             .await
@@ -10682,6 +10772,7 @@ impl KvEngine {
     /// Async new txn.
     pub fn new_txn_async(&self) -> Result<Arc<crate::mvcc::txn::Transaction>> {
         let guard = self.inner.lifecycle.admit_txn()?;
+
         self.inner.new_txn_with_guard(guard)
     }
 
@@ -10689,6 +10780,7 @@ impl KvEngine {
     pub async fn force_flush_async(&self) -> Result<()> {
         let guard = self.inner.lifecycle.admit_write()?;
         let inner = self.inner.clone();
+
         self.inner
             .blocking
             .run_result(move || {
@@ -10703,6 +10795,7 @@ impl KvEngine {
     pub async fn drain_flush_async(&self) -> Result<()> {
         let guard = self.inner.lifecycle.admit_write()?;
         let inner = self.inner.clone();
+
         self.inner
             .blocking
             .run_result(move || {
@@ -10721,10 +10814,12 @@ impl KvEngine {
     pub async fn force_full_compaction_async(&self) -> Result<()> {
         let guard = self.inner.lifecycle.admit_write()?;
         let inner = self.inner.clone();
+
         self.inner
             .blocking
             .run_result(move || {
                 let _guard = guard;
+
                 inner.force_full_compaction()
             })
             .await
@@ -10734,10 +10829,12 @@ impl KvEngine {
     pub async fn remove_compaction_filter_async(&self, id: u64) -> Result<bool> {
         let guard = self.inner.lifecycle.admit_write()?;
         let inner = self.inner.clone();
+
         self.inner
             .blocking
             .run_result(move || {
                 let _guard = guard;
+
                 inner.remove_compaction_filter(id)
             })
             .await
@@ -10904,6 +11001,7 @@ async fn run_parallel_scan_coordinator(coordinator: ParallelScanCoordinator) {
             tx,
         ));
     }
+
     for handle in handles {
         let _ = handle.await;
     }
@@ -10955,6 +11053,7 @@ impl ParallelScanBatch {
         rows.extend(other.rows.by_ref().map(|mut row| {
             row.key_offset += base_offset;
             row.value_offset += base_offset;
+
             row
         }));
 
@@ -11005,6 +11104,7 @@ impl ParallelScanChunk {
 
     pub fn into_rows(self) -> impl Iterator<Item = (Bytes, Bytes)> {
         let payload = self.payload;
+
         self.rows.map(move |row| {
             (
                 payload.slice(row.key_offset..row.key_offset + row.key_len),
@@ -11105,6 +11205,7 @@ impl ParallelScan {
 impl Drop for ParallelScan {
     fn drop(&mut self) {
         self.shared.cancelled.store(true, Ordering::Release);
+
         for rx in &mut self.shard_rxs {
             rx.close();
         }
@@ -11197,6 +11298,7 @@ impl LsmStorageInner {
         }
 
         let mut reserved = self.reserved_ssts.lock();
+
         for id in sst_ids {
             reserved.remove(id);
         }
@@ -11343,6 +11445,7 @@ impl LsmStorageInner {
     ) -> tokio::task::JoinHandle<()> {
         let inner = Arc::clone(self);
         let blocking = self.blocking.clone();
+
         tokio::spawn(async move {
             let error_tx = tx.clone();
             let result = blocking
@@ -11618,6 +11721,7 @@ impl LsmStorageInner {
             Bound::Excluded(upper) => key < upper,
             Bound::Unbounded => true,
         };
+
         above_lower && below_upper
     }
 
@@ -11652,6 +11756,7 @@ impl LsmStorageInner {
              empty v4 WAL; refusing to destroy it",
             wal_path.display()
         );
+
         std::fs::remove_file(wal_path)
             .with_context(|| format!("failed to remove orphaned WAL {}", wal_path.display()))
     }
@@ -11778,6 +11883,7 @@ impl LsmStorageInner {
             state.active_boundary.is_some(),
             "PITR manifest is missing the Active v7 boundary"
         );
+
         Self::decode_v7_active_header_for_state(state, bytes)
     }
 
@@ -11841,6 +11947,7 @@ impl LsmStorageInner {
             state.active_boundary.is_some(),
             "PITR manifest is missing the Active v8 boundary"
         );
+
         Self::decode_v8_active_header_for_state(state, bytes)
     }
 
@@ -11866,6 +11973,7 @@ impl LsmStorageInner {
         });
         state.legacy_v7_boundary_recovery = false;
         state.validate_for_status()?;
+
         Ok(())
     }
 
@@ -12157,6 +12265,7 @@ impl LsmStorageInner {
             decoded_segment_id == segment_id,
             "PITR source seal filename does not match its segment ID"
         );
+
         Ok(())
     }
 
@@ -12501,6 +12610,7 @@ impl LsmStorageInner {
             installed_image == canonical_image,
             "existing unregistered Active v{format} successor differs from its canonical empty image"
         );
+
         Ok(())
     }
 
@@ -12537,6 +12647,7 @@ impl LsmStorageInner {
             source_file_len <= crate::wal::MAX_WAL_FILE_SIZE,
             "Active v8 WAL source exceeds the WAL format limit"
         );
+
         crate::pitr::seal::V8Seal::max_validation_memory_bytes(
             max_segment_bytes.max(source_file_len),
         )
@@ -12754,6 +12865,7 @@ impl LsmStorageInner {
     ) -> Result<u64> {
         let (segments, staging, unattributed) =
             Self::pitr_source_allocations(database_path, Some(active_segment_id))?;
+
         segments.values().try_fold(
             staging
                 .checked_add(unattributed)
@@ -12772,6 +12884,7 @@ impl LsmStorageInner {
     ) -> Result<(BTreeMap<u64, u64>, u64, u64)> {
         let active_recovery_prefix = active_segment_id.map(|active_segment_id| {
             let active_wal_name = format!("pitr-{active_segment_id:020}.wal");
+
             crate::wal::v7::install::recovery_temp_prefix(std::ffi::OsStr::new(&active_wal_name))
         });
         let mut by_segment = BTreeMap::new();
@@ -12898,6 +13011,7 @@ impl LsmStorageInner {
             "PITR source path {} is not a regular file",
             path.display()
         );
+
         Self::filesystem_allocated_bytes(&metadata)
     }
 
@@ -12913,6 +13027,7 @@ impl LsmStorageInner {
     #[cfg(target_os = "linux")]
     fn release_recovered_v7_startup_staging(&self) {
         let state = self.state.load();
+
         for memtable in std::iter::once(state.memtable.as_ref())
             .chain(state.imm_memtables.iter().map(AsRef::as_ref))
         {
@@ -14242,6 +14357,7 @@ impl LsmStorageInner {
                                             == crate::pitr::manifest::PitrWalFormat::V8,
                                     "v8 Sealing obligation differs from its Active manifest authority"
                                 );
+
                                 Ok(immutable_boundary)
                             })
                             .transpose()?;
@@ -14400,6 +14516,7 @@ impl LsmStorageInner {
                                     // charge with persistent image and workspace charges
                                     // before the writer becomes reachable.
                                     drop(recovery_workspace);
+
                                     Ok(Arc::new(
                                         crate::wal::v8::resource::WalV8ReservationOwner::new_with_retained_resources(
                                             retained_resources,
@@ -14555,6 +14672,7 @@ impl LsmStorageInner {
                         range_only_ids.push(*id);
                         return false;
                     }
+
                     true
                 });
                 if !range_only_ids.is_empty() {
@@ -15055,6 +15173,7 @@ impl LsmStorageInner {
         &self,
     ) -> (Vec<InstalledCompactionFilter>, u64) {
         let registry = self.compaction_filters.lock();
+
         (
             registry.snapshot_filters(),
             registry.next_compaction_filter_id,
@@ -15067,8 +15186,10 @@ impl LsmStorageInner {
         let _state_lock = self.state_lock.lock();
         let cutoff_ts = self.mvcc.as_ref().map_or(0, |mvcc| {
             let _write_guard = mvcc.write_lock.lock();
+
             mvcc.latest_commit_ts()
         });
+
         self.add_compaction_filter_inner(&_state_lock, compaction_filter, cutoff_ts)
     }
 
@@ -15087,6 +15208,7 @@ impl LsmStorageInner {
                 mvcc.latest_commit_ts()
             );
         }
+
         self.add_compaction_filter_inner(&_state_lock, compaction_filter, cutoff_ts)
     }
 
@@ -15155,6 +15277,7 @@ impl LsmStorageInner {
 
     pub fn compaction_filter_stats(&self) -> CompactionFilterStats {
         let filters_active = self.compaction_filters.lock().active_filters.len();
+
         self.filter_stats.snapshot(filters_active)
     }
 
@@ -15295,6 +15418,7 @@ impl LsmStorageInner {
         }
 
         let batch_ctx = self.build_batch_get_context(&state, keys, mvcc_read_ts, n);
+
         match batch_ctx {
             Ok(batch_ctx) => self.batch_get_lookup_all(
                 &batch_ctx,
@@ -15463,6 +15587,7 @@ impl LsmStorageInner {
                     best_ts = best_ts.max(imm.newest_covering_ts(user_key, read_ts_for_range));
                 }
             }
+
             best_ts
         };
 
@@ -15512,6 +15637,7 @@ impl LsmStorageInner {
                     break;
                 }
             }
+
             best_ts
         };
 
@@ -15836,6 +15962,7 @@ impl LsmStorageInner {
                 }
             }
         }
+
         None
     }
 
@@ -15878,6 +16005,7 @@ impl LsmStorageInner {
                 }
             }
         }
+
         memtable_rt
     }
 
@@ -15889,6 +16017,7 @@ impl LsmStorageInner {
         memtable_rt: Option<u64>,
     ) -> Option<u64> {
         let sst_range_ts = self.newest_sst_range_ts(state, uk, read_ts_for_range);
+
         memtable_rt.max(sst_range_ts)
     }
 
@@ -15916,6 +16045,7 @@ impl LsmStorageInner {
         {
             return Ok(None);
         }
+
         match kind {
             KvKind::ValuePointer | KvKind::TtlValuePointer => self.resolve_vlog_value_bytes(
                 key,
@@ -15934,6 +16064,7 @@ impl LsmStorageInner {
         if prefixed.is_empty() {
             return Ok(None);
         }
+
         match KvKind::from_u8(prefixed[0]) {
             Some(KvKind::ValuePointer) => {
                 let ptr = ValuePointer::try_decode(&prefixed[1..]).ok_or_else(|| {
@@ -16008,6 +16139,7 @@ impl LsmStorageInner {
         if raw.is_empty() {
             return (Some(raw), KvKind::Inline, None);
         }
+
         match KvKind::from_u8(raw[0]) {
             Some(KvKind::ValuePointer) => (Some(raw), KvKind::ValuePointer, None),
             Some(KvKind::Tombstone) => (None, KvKind::Tombstone, None),
@@ -16041,6 +16173,7 @@ impl LsmStorageInner {
     /// Used by GC to determine if a key still points to a specific vLog entry.
     pub(crate) fn get_with_kind(&self, key: &[u8]) -> Result<(Option<Bytes>, KvKind, Option<u64>)> {
         let state = self.state.load();
+
         self.get_with_kind_inner(&state, key)
     }
 
@@ -16083,6 +16216,7 @@ impl LsmStorageInner {
         for imm in &state.imm_memtables {
             ids.extend(imm.collect_vlog_file_ids());
         }
+
         ids
     }
 
@@ -16113,6 +16247,7 @@ impl LsmStorageInner {
         if let Some(raw) = self.lookup_exact_version_in_l0_ssts(state, encoded, bloom_hash)? {
             return Ok(Some(raw));
         }
+
         self.lookup_exact_version_in_leveled_ssts(state, encoded, bloom_hash)
     }
 
@@ -16146,6 +16281,7 @@ impl LsmStorageInner {
         for (_, sst_ids) in &state.levels {
             let idx = sst_ids.partition_point(|id| {
                 let sst = state.sstables.get(id).expect("SST must exist");
+
                 match sst.first_key() {
                     Some(fk) => fk.encoded_user_key() <= user_key_prefix,
                     None => false, // range-only SST: sort before all others
@@ -16490,6 +16626,7 @@ impl LsmStorageInner {
             }
             _ => {}
         }
+
         true
     }
 
@@ -16599,6 +16736,7 @@ impl LsmStorageInner {
         if let Bound::Included(key) | Bound::Excluded(key) = lower {
             rt_iter.seek_to(key);
         }
+
         Some(rt_iter)
     }
 
@@ -16631,6 +16769,7 @@ impl LsmStorageInner {
             mvcc.poison_commit_ts(commit_ts);
             return Err(error);
         }
+
         Ok(())
     }
 
@@ -16658,11 +16797,13 @@ impl LsmStorageInner {
             mvcc.poison_commit_ts(ts);
             return Err(error);
         }
+
         Ok(())
     }
 
     fn use_owned_batch_publish(entries: usize) -> bool {
         const OWNED_PUBLISH_MIN_BATCH: usize = 512;
+
         entries >= OWNED_PUBLISH_MIN_BATCH
     }
 
@@ -16680,6 +16821,7 @@ impl LsmStorageInner {
             }
             return Err(error);
         }
+
         Ok(())
     }
 
@@ -16689,6 +16831,7 @@ impl LsmStorageInner {
         entries: &[(bytes::Bytes, bytes::Bytes, crate::mvcc::BatchEntryKind)],
     ) -> Result<()> {
         let mut preparation = None;
+
         self.mvcc_write_batch_with_native_preparation(entries, &mut preparation, false, false)?
             .into_result()
     }
@@ -16865,6 +17008,7 @@ impl LsmStorageInner {
                 entries.push((start.as_ref(), end.as_ref()));
             }
         }
+
         entries
     }
 
@@ -17000,6 +17144,7 @@ impl LsmStorageInner {
             .and_then(|bytes| bytes.checked_add(range_ref_bytes))
             .and_then(|bytes| bytes.checked_add(fixed_container_bytes))
             .context("range tombstone preparation size overflows")?;
+
         u64::try_from(total).context("range tombstone preparation size exceeds u64")
     }
 
@@ -17012,6 +17157,7 @@ impl LsmStorageInner {
         self.validate_range_batch_entries(&entries)?;
 
         let mut retries = 0;
+
         loop {
             let expected_memtable = self.state.load().memtable.clone();
             match self.range_batch_write_attempt(&entries) {
@@ -17123,6 +17269,7 @@ impl LsmStorageInner {
                 }
             }
         }
+
         data
     }
 
@@ -17236,6 +17383,7 @@ impl LsmStorageInner {
             }
             previous = key;
         }
+
         true
     }
 
@@ -17294,6 +17442,7 @@ impl LsmStorageInner {
                 }
             }
         }
+
         data
     }
 
@@ -17318,6 +17467,7 @@ impl LsmStorageInner {
                 }
             }
         }
+
         write_set
     }
 
@@ -17454,6 +17604,7 @@ impl LsmStorageInner {
             let imm_ts = m
                 .imm_range_tombstones()
                 .and_then(|imm| imm.newest_covering_ts(user_key, read_ts));
+
             best_ts.max(imm_ts)
         })
     }
@@ -17489,6 +17640,7 @@ impl LsmStorageInner {
                 }
             }
         }
+
         best_ts
     }
 
@@ -17780,6 +17932,7 @@ impl LsmStorageInner {
                 if lk.encoded_user_key() < search_prefix {
                     return None;
                 }
+
                 Some(*hint + 1)
             };
             let idx = try_hint().unwrap_or_else(|| {
@@ -17788,6 +17941,7 @@ impl LsmStorageInner {
                         .sstables
                         .get(id)
                         .expect("SST must exist in sstables map");
+
                     match sst.first_key() {
                         Some(fk) => fk.encoded_user_key() <= search_prefix,
                         None => false,
@@ -17897,6 +18051,7 @@ impl LsmStorageInner {
                 if lk.raw_ref() < key {
                     return None;
                 }
+
                 Some(*hint + 1)
             };
             let idx = try_hint().unwrap_or_else(|| {
@@ -17961,6 +18116,7 @@ impl LsmStorageInner {
         let mut buf = Vec::with_capacity(1 + value.len() + usize::from(shared_bytes));
         buf.push(kind as u8);
         buf.extend_from_slice(value);
+
         buf
     }
 
@@ -17975,6 +18131,7 @@ impl LsmStorageInner {
         buf.push(kind as u8);
         buf.extend_from_slice(&expire_at_secs.to_be_bytes());
         buf.extend_from_slice(value);
+
         buf
     }
 
@@ -17991,6 +18148,7 @@ impl LsmStorageInner {
         new_kind: KvKind,
     ) -> Result<bool> {
         let mut retries = 0;
+
         loop {
             let expected_memtable = self.state.load().memtable.clone();
             match self.compare_and_set_with_kind_once(key, old, old_kind, new, new_kind) {
@@ -18045,6 +18203,7 @@ impl LsmStorageInner {
         entries: &[CasEntry],
     ) -> Result<Vec<bool>> {
         let mut retries = 0;
+
         loop {
             let expected_memtable = self.state.load().memtable.clone();
             match self.compare_and_set_batch_with_kind_once(entries) {
@@ -18139,6 +18298,7 @@ impl LsmStorageInner {
         let state = self.state.load_full();
 
         let candidates = self.collect_versioned_cas_candidates(entries)?;
+
         self.apply_versioned_cas_writes(&state, entries, candidates)
     }
 
@@ -18410,6 +18570,7 @@ impl LsmStorageInner {
         if self.write_batch_profile_log_every == 0 {
             return;
         }
+
         if self
             .write_batch_profile_log_started
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -18674,6 +18835,7 @@ impl LsmStorageInner {
         if !crate::wal::Wal::is_retryable_full_error(&error) {
             return Err(error);
         }
+
         self.rotate_after_wal_full(error, expected_memtable, retries, allow_lifecycle_closing)
     }
 
@@ -18681,6 +18843,7 @@ impl LsmStorageInner {
         if self.state.load().imm_memtables.is_empty() {
             return Ok(());
         }
+
         self.force_flush_next_imm_memtable()
     }
 
@@ -18697,6 +18860,7 @@ impl LsmStorageInner {
         drop(storage_state);
 
         let pitr_state = self.pitr_state.lock().clone();
+
         active_has_data
             || has_immutable
             || self.pitr_maintenance_needs_reconciliation(&pitr_state)
@@ -18714,6 +18878,7 @@ impl LsmStorageInner {
         drop(storage_state);
 
         let pitr_state = self.pitr_state.lock().clone();
+
         !self.pitr_maintenance_needs_reconciliation(&pitr_state)
             && !owner.has_in_flight_source_spool_work()
     }
@@ -18793,10 +18958,12 @@ impl LsmStorageInner {
             return true;
         }
         let storage_state = self.state.load();
+
         state.obligations.iter().any(|(&segment_id, obligation)| {
             if obligation.state != ObligationState::Reclaimable {
                 return true;
             }
+
             // A flushed source may still need unlink/directory-sync retry even
             // when archival is durable and the successor has no writes. Live
             // memtables retain their sources until the flush path retires them.
@@ -18880,6 +19047,7 @@ impl LsmStorageInner {
         if result.is_err() {
             self.pitr_maintenance_queued.store(false, Ordering::Release);
         }
+
         result
     }
 
@@ -18904,6 +19072,7 @@ impl LsmStorageInner {
         allow_lifecycle_closing: bool,
     ) -> Result<()> {
         let mut retries = 0;
+
         loop {
             let expected_memtable = self.state.load().memtable.clone();
             match self.put_once(key, value) {
@@ -19012,6 +19181,7 @@ impl LsmStorageInner {
             }
         }
         drop(_commit_guard);
+
         self.try_freeze_memtable()
     }
 
@@ -19037,6 +19207,7 @@ impl LsmStorageInner {
         allow_lifecycle_closing: bool,
     ) -> Result<()> {
         let mut retries = 0;
+
         loop {
             let expected_memtable = self.state.load().memtable.clone();
             match self.put_with_ttl_once(key, value, ttl) {
@@ -19138,6 +19309,7 @@ impl LsmStorageInner {
             }
         }
         drop(_commit_guard);
+
         self.try_freeze_memtable()
     }
 
@@ -19156,6 +19328,7 @@ impl LsmStorageInner {
         allow_lifecycle_closing: bool,
     ) -> Result<()> {
         let mut retries = 0;
+
         loop {
             let expected_memtable = self.state.load().memtable.clone();
             match self.delete_once(key) {
@@ -19254,6 +19427,7 @@ impl LsmStorageInner {
             }
         }
         drop(_commit_guard);
+
         self.try_freeze_memtable()
     }
 
@@ -19277,6 +19451,7 @@ impl LsmStorageInner {
         Self::validate_key_size(end)?;
 
         let mut retries = 0;
+
         loop {
             let expected_memtable = self.state.load().memtable.clone();
             match self.delete_range_once(start, end) {
@@ -19290,6 +19465,7 @@ impl LsmStorageInner {
 
     fn delete_range_once(&self, start: &[u8], end: &[u8]) -> Result<()> {
         self.range_batch_write_attempt(&[(start, end)])?;
+
         self.try_freeze_memtable()
     }
 
@@ -19453,6 +19629,7 @@ impl LsmStorageInner {
         if let Some(updated_state) = updated_state {
             self.state.store(Arc::new(updated_state));
         }
+
         Ok(())
     }
 
@@ -19522,6 +19699,7 @@ impl LsmStorageInner {
             immutable_file_metadata: metadata.clone(),
             pitr_state: Some(self.pitr_state.lock().clone()),
         };
+
         Ok((record, metadata))
     }
 
@@ -19643,6 +19821,7 @@ impl LsmStorageInner {
             !self.state.load().memtable.uses_v7_wal() && !self.state.load().memtable.uses_v8_wal(),
             "ordinary memtable freeze cannot rotate an Active versioned PITR WAL"
         );
+
         self.ensure_memtable_rotation_runtime_healthy()
     }
 
@@ -19666,6 +19845,7 @@ impl LsmStorageInner {
         // WAL alone does not prove all memtable entries became visible; keep
         // the active WAL for recovery instead of persisting that hidden data.
         self.ensure_memtable_rotation_healthy()?;
+
         self.install_memtable_successor_locked(new_memtable)
     }
 
@@ -19701,6 +19881,7 @@ impl LsmStorageInner {
             "v7 Sealing transition requires stopped commit admission"
         );
         self.ensure_memtable_rotation_runtime_healthy()?;
+
         self.install_memtable_successor_locked(new_memtable)
     }
 
@@ -19741,6 +19922,7 @@ impl LsmStorageInner {
             "v8 Sealing transition requires stopped commit admission"
         );
         self.ensure_memtable_rotation_runtime_healthy()?;
+
         self.install_memtable_successor_locked(new_memtable)
     }
 
@@ -19777,6 +19959,7 @@ impl LsmStorageInner {
         // while we swap it out. This prevents writes to a memtable that has been
         // frozen and potentially flushed.
         let guard = self.active_memtable_lock.write();
+
         self.force_freeze_with_new_memtable_locked(new_memtable, &guard)
     }
 
@@ -19784,6 +19967,7 @@ impl LsmStorageInner {
     /// the `_state_lock_observer` will be dropped after `force_freeze_memtable` called
     pub fn force_freeze_memtable(&self, _state_lock_observer: &MutexGuard<'_, ()>) -> Result<()> {
         let active_memtable_guard = self.active_memtable_lock.write();
+
         self.force_freeze_memtable_with_active_guard(_state_lock_observer, &active_memtable_guard)
     }
 
@@ -20533,6 +20717,7 @@ impl LsmStorageInner {
                     "installed v8 successor image changed before reservation transfer"
                 );
                 let allocated_bytes = Self::filesystem_allocated_bytes(&metadata)?;
+
                 Ok(Arc::new(
                     crate::wal::v8::resource::WalV8ReservationOwner::new_with_retained_resources(
                         Arc::clone(&retained_resources),
@@ -20980,6 +21165,7 @@ impl LsmStorageInner {
             bytes.len() <= crate::pitr::seal::V8Seal::max_encoded_len(max_segment_bytes)?,
             "v8 PITR seal sidecar exceeds the persisted segment limit"
         );
+
         Ok(PreparedV8PitrSeal {
             seal,
             wal_path,
@@ -21078,6 +21264,7 @@ impl LsmStorageInner {
             .context("sync exact frozen v8 WAL image after durable SealStarted")?;
         crate::pitr::segment::install_pitr_file_no_replace(&prepared.seal_path, &prepared.bytes)?;
         prepared.installed = true;
+
         Ok(())
     }
 
@@ -21300,6 +21487,7 @@ impl LsmStorageInner {
             bytes.len() <= crate::pitr::seal::V7Seal::max_encoded_len(max_segment_bytes)?,
             "v7 PITR seal sidecar exceeds the persisted segment limit"
         );
+
         Ok(PreparedV7PitrSeal {
             seal,
             wal_path,
@@ -21406,6 +21594,7 @@ impl LsmStorageInner {
             .context("sync exact frozen v7 WAL image after durable SealStarted")?;
         crate::pitr::segment::install_pitr_file_no_replace(&prepared.seal_path, &prepared.bytes)?;
         prepared.installed = true;
+
         Ok(())
     }
 
@@ -21645,6 +21834,7 @@ impl LsmStorageInner {
                     if source_identity == (current.timeline_id, current.archive_epoch_id) {
                         segments.retire_v7_reservation_owner_after_cleanup(segment_id)?;
                     }
+
                     Ok(())
                 })?;
             }
@@ -21868,6 +22058,7 @@ mod tests {
                         }),
                 },
             );
+
             state
         }
 
@@ -22075,6 +22266,7 @@ mod tests {
         drop(intent);
         drop(guards);
         engine.close_storage()?;
+
         Ok(())
     }
 
@@ -22370,6 +22562,7 @@ mod tests {
 
         drop(guards);
         engine.close_storage()?;
+
         Ok(())
     }
 
@@ -22381,6 +22574,7 @@ mod tests {
         let mut file = std::fs::File::create(path)?;
         file.write_all(&bytes)?;
         file.sync_all()?;
+
         Ok(())
     }
 
@@ -22700,6 +22894,7 @@ mod tests {
             wal_digest: [4; 32],
             seal_digest: [5; 32],
         };
+
         crate::pitr::manifest::replay_pitr_records([
             crate::pitr::manifest::PitrManifestRecord::EnableIntent {
                 repository_id: [1; 16],
@@ -22776,6 +22971,7 @@ mod tests {
 
         assert!(!archived.obligations.contains_key(&1));
         assert_eq!(archived.obligations[&2].state, ObligationState::Archived);
+
         Ok(())
     }
 
@@ -23570,6 +23766,7 @@ mod tests {
         std::thread::scope(|scope| {
             let reconciliation = scope.spawn(|| {
                 let _barrier = engine.pitr_barrier_lock.lock();
+
                 engine.reconcile_durable_archive_obligations(state)
             });
             // Reconciliation takes the manager lock after its first health
@@ -24234,6 +24431,7 @@ mod tests {
         );
         engine.put(b"after-capacity-returns", b"value")?;
         engine.close_storage()?;
+
         Ok(())
     }
 
@@ -24292,6 +24490,7 @@ mod tests {
 
         std::fs::remove_file(bad_source_path)?;
         engine.close_storage()?;
+
         Ok(())
     }
 
@@ -25136,6 +25335,7 @@ mod tests {
         assert!(engine.pitr_v8_pending_resume.lock().is_none());
         engine.close()?;
         assert!(engine.run_pitr_maintenance(segment_id).is_err());
+
         Ok(())
     }
 
@@ -25198,6 +25398,7 @@ mod tests {
         assert!(!backup_path.exists());
 
         engine.close()?;
+
         Ok(())
     }
 
@@ -25737,6 +25938,7 @@ mod tests {
         drop(state_lock);
         engine.close()?;
         drop(reservation);
+
         Ok(())
     }
 
@@ -26032,6 +26234,7 @@ mod tests {
             std::fs::metadata(&wal_path)?.len() > header_end,
             "strict Sealing recovery must retain the frozen DATA and FRONTIER image"
         );
+
         Ok(())
     }
 
@@ -26467,6 +26670,7 @@ mod tests {
     ) -> anyhow::Result<(LsmStorageOptions, std::path::PathBuf)> {
         let (options, source_wal, _) =
             v7_recovery_point_transition_test_database(directory, false, true, true, true)?;
+
         Ok((options, source_wal))
     }
 
@@ -26482,6 +26686,7 @@ mod tests {
             true,
             true,
         )?;
+
         Ok((options, source_wal))
     }
 
@@ -27066,6 +27271,7 @@ mod tests {
                 assert_eq!(source.parallel_wal_is_closed(), None);
                 assert_eq!(source.has_ring(), None);
                 assert!(source.wal_v7_reservation_owner().is_none());
+
                 Ok(())
             }
 
@@ -27140,6 +27346,7 @@ mod tests {
         let inline_value = |value: &[u8]| {
             let mut encoded = vec![crate::vlog::KvKind::Inline as u8];
             encoded.extend_from_slice(value);
+
             encoded
         };
         let source_recorded_at = RecordedAt {
@@ -28567,6 +28774,7 @@ mod tests {
             "reclaiming both the sidecar and pending successor releases their spool reservations"
         );
         engine.close_storage()?;
+
         Ok(())
     }
 
@@ -28936,6 +29144,7 @@ mod tests {
         assert!(!successor_path.exists());
         assert!(engine.load_pitr_source_segment(&state, segment_id).is_err());
         engine.close_storage()?;
+
         Ok(())
     }
 
@@ -29357,6 +29566,7 @@ mod tests {
             LsmStorageInner::validate_reclaimable_pitr_seal_sidecar(&state, segment_id, &seal_path)
                 .expect_err("a legacy seal must be bounded by the manifest WAL image");
         assert!(error.to_string().contains("exceeds its format size limit"));
+
         Ok(())
     }
 
@@ -29675,6 +29885,7 @@ mod tests {
                     boundary.sealed_end,
                     header.segment_id.0,
                 )?;
+
                 segments.retain_v7_reservation_owner(header.segment_id.0, owner)
             })?;
             assert_eq!(
@@ -30322,6 +30533,7 @@ mod tests {
                     return Ok(false);
                 }
             }
+
             Ok(true)
         }
 
@@ -30527,6 +30739,7 @@ mod tests {
             (&b"sync-batch-a"[..], Some(&b"batch-a"[..])),
             (&b"sync-batch-b"[..], Some(&b"batch-b"[..])),
         ];
+
         v7_sync_publication_barrier_case(
             "point batch",
             KvEngine::close,
@@ -30556,6 +30769,7 @@ mod tests {
             (&b"sync-txn-a"[..], Some(&b"txn-a"[..])),
             (&b"sync-txn-b"[..], Some(&b"txn-b"[..])),
         ];
+
         v7_sync_publication_barrier_case(
             "serializable transaction",
             KvEngine::close,
@@ -30571,6 +30785,7 @@ mod tests {
                 );
                 transaction.put(b"sync-txn-a", b"txn-a")?;
                 transaction.put(b"sync-txn-b", b"txn-b")?;
+
                 transaction.commit()
             },
         )
@@ -30587,6 +30802,7 @@ mod tests {
             (&b"sync-close-baseline"[..], Some(&b"kept"[..])),
             (&b"sync-ttl"[..], Some(&b"ttl-value"[..])),
         ];
+
         v7_sync_publication_barrier_case(
             "TTL put",
             KvEngine::close,
@@ -30615,6 +30831,7 @@ mod tests {
             (&b"sync-close-baseline"[..], Some(&b"kept"[..])),
             (&b"sync-close-delete-target"[..], None),
         ];
+
         v7_sync_publication_barrier_case(
             "point delete",
             KvEngine::close,
@@ -30641,6 +30858,7 @@ mod tests {
             (&b"sync-close-range-b"[..], None),
             (&b"sync-close-range-z"[..], Some(&b"z"[..])),
         ];
+
         v7_sync_publication_barrier_case(
             "range delete batch",
             KvEngine::close,
@@ -30673,6 +30891,7 @@ mod tests {
             (&b"sync-close-range-b"[..], None),
             (&b"sync-close-range-z"[..], Some(&b"z"[..])),
         ];
+
         v7_sync_publication_barrier_case(
             "direct range delete",
             KvEngine::close,
@@ -30695,6 +30914,7 @@ mod tests {
             (&b"sync-close-baseline"[..], Some(&b"kept"[..])),
             (&b"sync-barrier-durable"[..], Some(&b"published"[..])),
         ];
+
         v7_sync_publication_barrier_case(
             "sync",
             KvEngine::sync,
@@ -30717,6 +30937,7 @@ mod tests {
             (&b"sync-close-baseline"[..], Some(&b"kept"[..])),
             (&b"sync-async-barrier-durable"[..], Some(&b"published"[..])),
         ];
+
         v7_sync_publication_barrier_case(
             "async sync",
             sync_async_for_test,
@@ -30918,6 +31139,7 @@ mod tests {
             Some(Bytes::from_static(b"durable"))
         );
         reopened.close_storage()?;
+
         Ok(())
     }
 
@@ -30976,6 +31198,7 @@ mod tests {
                 .expect("simultaneous capacity retry gate mutex poisoned");
             state.0 += 1;
             changed.notify_all();
+
             while !state.1 {
                 state = changed
                     .wait(state)
@@ -31044,6 +31267,7 @@ mod tests {
             assert_eq!(reopened.get(key)?, Some(Bytes::from_static(b"value")));
         }
         reopened.close_storage()?;
+
         Ok(())
     }
 
@@ -31214,6 +31438,7 @@ mod tests {
         );
 
         engine.close_storage()?;
+
         Ok(())
     }
 
@@ -31225,6 +31450,7 @@ mod tests {
         use crate::wal::v7::admission::WalV7ResourceCharge;
 
         let next_batch = WalV7ResourceCharge::for_batch(128)?.source_spool_bytes;
+
         reserve_v7_source_spool_headroom(engine, owner, next_batch - 1)
     }
 
@@ -31252,6 +31478,7 @@ mod tests {
             .checked_sub(charged)
             .and_then(|remaining| remaining.checked_sub(headroom_bytes))
             .ok_or_else(|| anyhow::anyhow!("v7 fixture has insufficient source-spool headroom"))?;
+
         owner
             .reserve_preparation_resources(WalV7ResourceCharge {
                 source_spool_bytes: reservation_bytes,
@@ -31329,6 +31556,7 @@ mod tests {
         drop(source);
 
         let held = reserve_all_but_one_v7_batch_of_source_spool(engine, &active_owner)?;
+
         Ok((active_owner, source_wal, held))
     }
 
@@ -31369,6 +31597,7 @@ mod tests {
         );
         drop(held);
         engine.close_storage()?;
+
         Ok(())
     }
 
@@ -31406,6 +31635,7 @@ mod tests {
         );
         drop(held);
         engine.close_async().await?;
+
         Ok(())
     }
 
@@ -31466,6 +31696,7 @@ mod tests {
             Some(Bytes::from_static(b"value"))
         );
         engine.close_async().await?;
+
         Ok(())
     }
 
@@ -31526,6 +31757,7 @@ mod tests {
         );
         assert_eq!(active.wal_batch_count(), Some(initial_ticket + 1));
         engine.close_storage()?;
+
         Ok(())
     }
 
@@ -31606,6 +31838,7 @@ mod tests {
             Some(Bytes::from_static(b"value"))
         );
         reopened.close_storage()?;
+
         Ok(())
     }
 
@@ -31852,6 +32085,7 @@ mod tests {
             "source-spool waiter should unwind after close begins"
         );
         drop(held);
+
         Ok(())
     }
 
@@ -31860,6 +32094,7 @@ mod tests {
     fn v7_native_async_source_spool_wait_does_not_block_close_without_time_driver()
     -> anyhow::Result<()> {
         let runtime = tokio::runtime::Builder::new_current_thread().build()?;
+
         runtime.block_on(async {
             let directory = tempdir()?;
             let options = v7_recovery_test_database(directory.path())?;
@@ -31897,6 +32132,7 @@ mod tests {
                 let close_result = close_rx
                     .recv_timeout(std::time::Duration::from_secs(5))
                     .map_err(|_| anyhow::anyhow!("v7 close waited for a source-spool writer"))?;
+
                 Ok::<_, anyhow::Error>(close_result)
             })
             .await??;
@@ -32094,6 +32330,7 @@ mod tests {
                     blocking
                         .run_result_with_reserved_capacity(move || {
                             drop(held);
+
                             Ok::<_, anyhow::Error>(())
                         })
                         .await
@@ -32111,6 +32348,7 @@ mod tests {
             );
             engine.close()?;
         }
+
         Ok(())
     }
 
@@ -32693,6 +32931,7 @@ mod tests {
             });
             std::future::poll_fn(|context| {
                 assert!(queued.as_mut().poll(context).is_pending());
+
                 std::task::Poll::Ready(())
             })
             .await;
@@ -32740,6 +32979,7 @@ mod tests {
             Some(Bytes::from_static(b"value"))
         );
         reopened.close_storage()?;
+
         Ok(())
     }
 
@@ -33051,6 +33291,7 @@ mod tests {
             Some(Bytes::from_static(b"value"))
         );
         reopened.close_storage()?;
+
         Ok(())
     }
 
@@ -33125,6 +33366,7 @@ mod tests {
             });
             std::future::poll_fn(|context| {
                 assert!(queued.as_mut().poll(context).is_pending());
+
                 std::task::Poll::Ready(())
             })
             .await;
@@ -33245,6 +33487,7 @@ mod tests {
     #[test]
     fn v7_transactions_retry_capacity_by_rotating_active_segment() -> anyhow::Result<()> {
         v7_transaction_capacity_retry_succeeds(false, false)?;
+
         v7_transaction_capacity_retry_succeeds(true, true)
     }
 
@@ -33384,6 +33627,7 @@ mod tests {
             let mut commit = Box::pin(commit);
             std::future::poll_fn(|context| {
                 assert!(commit.as_mut().poll(context).is_pending());
+
                 std::task::Poll::Ready(())
             })
             .await;
@@ -33406,6 +33650,7 @@ mod tests {
             });
             std::future::poll_fn(|context| {
                 assert!(queued.as_mut().poll(context).is_pending());
+
                 std::task::Poll::Ready(())
             })
             .await;
@@ -33526,6 +33771,7 @@ mod tests {
     #[test]
     fn failpoint_v7_transaction_capacity_rotation_reruns_occ() -> anyhow::Result<()> {
         v7_transaction_capacity_rotation_reruns_occ(false)?;
+
         v7_transaction_capacity_rotation_reruns_occ(true)
     }
 
@@ -33641,6 +33887,7 @@ mod tests {
     fn failpoint_v7_async_transaction_cancellation_during_capacity_retry_keeps_commit_owned()
     -> anyhow::Result<()> {
         v7_async_transaction_capacity_retry_is_owned_through_close(false)?;
+
         v7_async_transaction_capacity_retry_is_owned_through_close(true)
     }
 
@@ -33755,6 +34002,7 @@ mod tests {
             Some(Bytes::from_static(b"durable"))
         );
         reopened.close_async().await?;
+
         Ok(())
     }
 
@@ -33912,6 +34160,7 @@ mod tests {
             let (resume_started_tx, resume_started_rx) = mpsc::channel();
             let resuming = std::thread::spawn(move || {
                 resume_started_tx.send(()).unwrap();
+
                 resuming_engine.resume_pitr(repository)
             });
             resume_started_rx.recv_timeout(Duration::from_secs(5))?;
@@ -34054,6 +34303,7 @@ mod tests {
         let exclusive = std::thread::spawn(move || {
             let _guard = exclusive_inner.active_memtable_lock.write();
             held_tx.send(()).unwrap();
+
             // Bound a regression that blocks the current-thread executor while
             // trying to acquire a synchronous read guard behind this writer.
             release_rx.recv_timeout(Duration::from_secs(5))
@@ -34133,6 +34383,7 @@ mod tests {
                         matches!(outcome, crate::pitr::api::RecoveryPointOutcome::Durable(_)),
                         "recovery point was not durable"
                     );
+
                     Ok(())
                 })
             };
@@ -34664,6 +34915,7 @@ mod tests {
         );
 
         engine.close_storage()?;
+
         Ok(())
     }
 
@@ -35141,6 +35393,7 @@ mod tests {
         for asynchronous in [false, true] {
             v7_checkpoint_drains_durable_unpublished_write_and_captures_it_case(asynchronous)?;
         }
+
         Ok(())
     }
 
@@ -35325,6 +35578,7 @@ mod tests {
                 asynchronous,
             )?;
         }
+
         Ok(())
     }
 
@@ -35337,6 +35591,7 @@ mod tests {
                 asynchronous,
             )?;
         }
+
         Ok(())
     }
 
@@ -38088,6 +38343,13 @@ mod tests {
             },
         )
         .unwrap();
+        // Seed the database before PITR starts: its worker can stop commit
+        // admission briefly while installing a barrier.
+        for index in 0..64_u32 {
+            engine
+                .put(format!("key-{index:03}").as_bytes(), b"value")
+                .unwrap();
+        }
         engine
             .enable_pitr(crate::pitr::api::PitrOptions {
                 repository: repository.clone(),
@@ -38100,11 +38362,6 @@ mod tests {
                 runtime: crate::pitr::api::PitrRuntimeOptions::default(),
             })
             .unwrap();
-        for index in 0..64_u32 {
-            engine
-                .put(format!("key-{index:03}").as_bytes(), b"value")
-                .unwrap();
-        }
 
         let runtime = std::sync::Arc::new(
             tokio::runtime::Builder::new_current_thread()
@@ -38370,6 +38627,7 @@ mod tests {
                     .strip_suffix(".wal")?
                     .parse()
                     .ok()?;
+
                 Some((segment_id, path))
             })
             .collect();
@@ -39366,6 +39624,7 @@ mod tests {
             assert_eq!(restored.get(b"after-reopen")?, None);
             restored.close()?;
         }
+
         Ok(())
     }
 
@@ -39424,6 +39683,7 @@ mod tests {
                 reopened.close()?;
             }
         }
+
         Ok(())
     }
 
@@ -39478,6 +39738,7 @@ mod tests {
             Some(b"still-writable".as_slice())
         );
         reopened.close()?;
+
         Ok(())
     }
 
@@ -39530,6 +39791,7 @@ mod tests {
         );
         engine.put(b"ordinary", b"still-writable")?;
         engine.close()?;
+
         Ok(())
     }
 
@@ -39821,6 +40083,7 @@ mod tests {
             .unwrap()
             .resume_commit_admission();
         engine.close()?;
+
         Ok(())
     }
 
@@ -39930,6 +40193,7 @@ mod tests {
                     snapshot_tree(root, &path, entries)?;
                 }
             }
+
             Ok(())
         }
 
@@ -39954,6 +40218,7 @@ mod tests {
                 },
             );
             snapshot_tree(root, root, &mut entries)?;
+
             Ok(entries)
         }
 
@@ -39972,6 +40237,7 @@ mod tests {
                 None if path.try_exists()? => std::fs::remove_file(path)?,
                 None => {}
             }
+
             Ok(())
         }
 
@@ -40010,6 +40276,7 @@ mod tests {
         ]
         .map(|name| {
             let path = database_path.join(name);
+
             if path.try_exists()? {
                 Ok(Some(std::fs::read(path)?))
             } else {
@@ -40260,6 +40527,7 @@ mod tests {
                 && (identifies_expected_v8_record || rejects_before_v8_guard),
             "pre-v8 CLI failed for a reason other than rejecting the expected v8 or legacy manifest record: {diagnostic}"
         );
+
         Ok(())
     }
 
@@ -41116,6 +41384,7 @@ mod tests {
             base_backup_id: None,
         };
         engine.close().unwrap();
+
         for (index, target) in targets.into_iter().enumerate() {
             let repository = crate::backup::BackupRepository::open(&repository_path).unwrap();
             let destination = dir.path().join(format!("restored-{index}"));
@@ -42127,6 +42396,7 @@ mod tests {
         source_segment_id: u64,
     ) -> anyhow::Result<()> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+
         loop {
             let state = engine.pitr_manifest_state.lock().clone();
             let archived = state.active_segment_id == Some(source_segment_id + 1)
@@ -42163,6 +42433,7 @@ mod tests {
         source_segment_id: u64,
     ) -> anyhow::Result<()> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+
         loop {
             let state = engine.pitr_manifest_state.lock().clone();
             let archived = state.active_segment_id == Some(source_segment_id + 1)
@@ -43195,6 +43466,7 @@ mod tests {
                         },
                     },
                 )?;
+
                 Ok(())
             })
             .unwrap();

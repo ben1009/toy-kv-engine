@@ -260,6 +260,7 @@ impl WalFormatDescriptor {
             descriptor.reader_implemented,
             "unsupported WAL version: got {version} (format is registered but recovery is not implemented)"
         );
+
         Ok(descriptor)
     }
 
@@ -268,6 +269,7 @@ impl WalFormatDescriptor {
             .ok_or_else(|| anyhow::anyhow!("unsupported WAL version: got {version}"))?;
         descriptor.validate_version(version)?;
         descriptor.validate_writer_contract(version)?;
+
         Ok(descriptor)
     }
 
@@ -277,6 +279,7 @@ impl WalFormatDescriptor {
             "WAL format registry mismatch for version {version}: descriptor declares {:?}",
             self.version
         );
+
         Ok(())
     }
 
@@ -320,6 +323,7 @@ impl WalFormatDescriptor {
                 );
             }
         }
+
         Ok(())
     }
 

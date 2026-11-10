@@ -40,6 +40,7 @@ pub(crate) fn pitr_base_compatibility_digest(
     if value_separation_enabled {
         compatibility.update(crate::vlog::VLOG_FORMAT_VERSION.to_be_bytes());
     }
+
     compatibility.finalize().into()
 }
 
@@ -166,6 +167,7 @@ impl PitrBaseMetadata {
                 );
             }
         }
+
         Ok(())
     }
 }

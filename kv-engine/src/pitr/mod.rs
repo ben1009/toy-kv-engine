@@ -428,6 +428,7 @@ pub(crate) fn canonical_batch(batch: &WalBatch, limits: WalV5Limits) -> Result<C
     {
         return Ok(Cow::Borrowed(batch));
     }
+
     Ok(Cow::Owned(batch.canonicalized()?))
 }
 
@@ -511,6 +512,7 @@ impl<'a> CanonicalWalEntryStream<'a> {
         let bytes = point_count
             .checked_mul(std::mem::size_of::<(&[u8], usize)>())
             .context("v5 canonical point index size overflows")?;
+
         u64::try_from(bytes).context("v5 canonical point index size exceeds u64")
     }
 
@@ -534,6 +536,7 @@ impl<'a> CanonicalWalEntryStream<'a> {
         if batch.entries.len() <= 1 {
             return Ok(0);
         }
+
         Ok(batch
             .entries
             .iter()
@@ -964,6 +967,7 @@ pub(crate) fn decode_v5_batch(
         decoded_batch.canonicalized()?.entries == decoded_batch.entries,
         "v5 batch is not canonical"
     );
+
     Ok(DecodedBatch {
         batch: decoded_batch,
         data_end,
@@ -987,6 +991,7 @@ pub(crate) fn decode_wal_entry_stream(
         decoded_batch.canonicalized()?.entries == decoded_batch.entries,
         "WAL batch is not canonical"
     );
+
     Ok(decoded_batch)
 }
 
@@ -1148,6 +1153,7 @@ fn batch_data_len(batch: &WalBatch, limits: WalV5Limits) -> Result<usize> {
             "v5 batch data exceeds configured limit"
         );
     }
+
     Ok(data_len)
 }
 
@@ -1305,6 +1311,7 @@ mod tests {
         let (written, crc) = stream.encode_into_with_observer(&mut encoded, |chunk| {
             chunks.push(chunk.len());
             observed.extend_from_slice(chunk);
+
             Ok(())
         })?;
 

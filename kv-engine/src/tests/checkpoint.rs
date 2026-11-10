@@ -784,6 +784,7 @@ fn checkpoint_pins_vlogs_until_copy_finishes_during_reclaim() {
 
     wait_until(Duration::from_secs(2), || {
         let vlog = engine.inner.vlog.as_ref().unwrap();
+
         pinned_vlogs
             .iter()
             .all(|file_id| vlog.is_file_pinned_for_checkpoint(*file_id))
@@ -934,6 +935,7 @@ fn checkpoint_stats_match_file_set() {
         .unwrap()
         .filter_map(|entry| {
             let entry = entry.unwrap();
+
             entry
                 .path()
                 .extension()
@@ -972,6 +974,7 @@ fn checkpoint_data_files(checkpoint_path: &std::path::Path) -> Vec<PathBuf> {
         .unwrap()
         .filter_map(|entry| {
             let path = entry.unwrap().path();
+
             path.extension()
                 .is_some_and(|extension| extension == "sst")
                 .then_some(path)
@@ -981,6 +984,7 @@ fn checkpoint_data_files(checkpoint_path: &std::path::Path) -> Vec<PathBuf> {
     if vlog_dir.exists() {
         files.extend(fs::read_dir(vlog_dir).unwrap().filter_map(|entry| {
             let path = entry.unwrap().path();
+
             path.extension()
                 .is_some_and(|extension| extension == "vlog" || extension == "vidx")
                 .then_some(path)
@@ -996,6 +1000,7 @@ fn vlog_file_ids(vlog_dir: &std::path::Path, extension: &str) -> Vec<u32> {
         .unwrap()
         .filter_map(|entry| {
             let path = entry.unwrap().path();
+
             (path.extension().is_some_and(|ext| ext == extension))
                 .then(|| path.file_stem().unwrap().to_string_lossy().parse().unwrap())
         })
@@ -1057,6 +1062,7 @@ fn checkpoint_tmp_with_marker(
     fs::read_dir(parent).ok()?.find_map(|entry| {
         let path = entry.ok()?.path();
         let name = path.file_name()?.to_string_lossy();
+
         (name.starts_with(&format!("{target_name}.checkpoint-")) && path.join(marker).exists())
             .then_some(path)
     })
@@ -1070,6 +1076,7 @@ fn checkpoint_tmp_count(parent: &std::path::Path, target_name: &str) -> usize {
         .filter(|entry| {
             let name = entry.file_name();
             let name = name.to_string_lossy();
+
             name.starts_with(&format!("{target_name}.checkpoint-")) && name.ends_with(".tmp")
         })
         .count()
@@ -1113,6 +1120,7 @@ fn hold_checkpoint_lock(path: &std::path::Path) -> fs::File {
         .truncate(false)
         .open(path)
         .unwrap();
+    // SAFETY: file owns a live descriptor and flock retains no pointers after returning.
     let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     assert_eq!(result, 0);
 

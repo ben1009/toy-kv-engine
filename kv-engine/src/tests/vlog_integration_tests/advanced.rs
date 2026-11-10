@@ -401,6 +401,7 @@ fn test_gc_batch_cas() {
             Some(Bytes::from(vec![b'z'; 64]))
         );
     }
+
     // Verify non-overwritten keys retain original values
     for i in 5..10 {
         let key = format!("key_{:04}", i);

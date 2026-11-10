@@ -308,6 +308,7 @@ impl AdmissionController {
 
     fn admit_locked(&self, prepared: &PreparedBatch) -> Result<u64, AdmissionError> {
         let mut state = self.admission.lock();
+
         loop {
             if state.poisoned {
                 return Err(AdmissionError::Poisoned);
@@ -378,6 +379,7 @@ impl AdmissionController {
         let mut state = self.admission.lock();
         state.open = false;
         self.queue_available.notify_all();
+
         state.next_ticket
     }
 
@@ -399,6 +401,7 @@ impl AdmissionController {
         for batch in queued {
             buffers.release(batch.buffer_id)?;
         }
+
         Ok(tickets)
     }
 
@@ -413,6 +416,7 @@ impl AdmissionController {
     fn file_frontiers(&self) -> (u64, u64, u64) {
         let admission = self.admission.lock();
         let packer = self.packer.lock();
+
         (
             admission.admitted_end,
             packer.reserved_end,
@@ -422,6 +426,7 @@ impl AdmissionController {
 
     fn buffer_snapshot(&self) -> (u64, u64, usize) {
         let buffers = self.buffers.lock();
+
         (
             buffers.active_bytes,
             buffers.extra_resident_bytes,
@@ -537,6 +542,7 @@ impl AdmissionController {
         if let (Some(last_first), Some(first_second)) = (first.last(), second.first()) {
             debug_assert_eq!(last_first.ticket + 1, first_second.ticket);
         }
+
         for pair in second.windows(2) {
             debug_assert_eq!(pair[0].ticket + 1, pair[1].ticket);
         }
@@ -549,6 +555,7 @@ impl AdmissionController {
         debug_assert!(admission.admitted_end <= MAX_WAL_FILE_SIZE);
         debug_assert!(WAL_HEADER_END <= packer.preallocated_end);
         debug_assert!(packer.preallocated_end <= MAX_WAL_FILE_SIZE);
+
         if !admission.poisoned {
             debug_assert_eq!(
                 packer.reserved_end
@@ -1016,12 +1023,14 @@ mod tests {
             let writer_barrier = Arc::clone(&barrier);
             let writer = thread::spawn(move || {
                 writer_barrier.wait();
+
                 writer_controller.admit(prepared)
             });
             let sync_controller = Arc::clone(&controller);
             let sync_barrier = Arc::clone(&barrier);
             let sync = thread::spawn(move || {
                 sync_barrier.wait();
+
                 sync_controller.capture_sync_cutoff()
             });
 
@@ -1057,12 +1066,14 @@ mod tests {
             let writer_barrier = Arc::clone(&barrier);
             let writer = thread::spawn(move || {
                 writer_barrier.wait();
+
                 writer_controller.admit(prepared)
             });
             let closer_controller = Arc::clone(&controller);
             let closer_barrier = Arc::clone(&barrier);
             let closer = thread::spawn(move || {
                 closer_barrier.wait();
+
                 closer_controller.close_and_capture_cutoff()
             });
 
@@ -1092,12 +1103,14 @@ mod tests {
         let first_barrier = Arc::clone(&barrier);
         let first_writer = thread::spawn(move || {
             first_barrier.wait();
+
             first_controller.admit(first)
         });
         let second_controller = Arc::clone(&controller);
         let second_barrier = Arc::clone(&barrier);
         let second_writer = thread::spawn(move || {
             second_barrier.wait();
+
             second_controller.admit(second)
         });
 

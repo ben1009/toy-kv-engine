@@ -460,6 +460,7 @@ fn build_storage_options(
             value_cache_capacity_bytes: 0,
         });
     }
+
     opts
 }
 
@@ -492,6 +493,7 @@ fn wal_supported() -> bool {
             }
         };
         let _ = fs::remove_dir_all(&probe_dir);
+
         supported
     })
 }
@@ -518,6 +520,7 @@ pub fn open_stress_engine(
     }
 
     let wal_enabled = effective_options.enable_wal;
+
     KvEngine::open(db_path, effective_options)
         .map(|engine| (engine, wal_enabled))
         .map_err(|err| format!("KvEngine::open failed: {err}"))
@@ -710,6 +713,7 @@ const TXN_ERR_ALREADY_COMMITTED: &str = "transaction already committed";
 
 fn is_retryable_txn_error(e: &anyhow::Error) -> bool {
     let msg = e.to_string();
+
     msg.contains(TXN_ERR_SERIALIZABLE_CONFLICT) || msg.contains(TXN_ERR_ALREADY_COMMITTED)
 }
 
@@ -773,6 +777,7 @@ fn run_txn_batch(engine: &Arc<KvEngine>, batch: &[(&[u8], &[u8], bool)]) -> Resu
 
 pub fn cycle_report(seed: u64, cycle: u64) -> String {
     let (scenario, plan) = plan_cycle(seed, cycle);
+
     format!(
         "phase={:?} scenario=({}) op_count={}",
         plan.phase,
@@ -802,6 +807,7 @@ pub fn summarize_cycle_failure(
             message.push_str(&format!("{:?}; ", violation.kind));
         }
     }
+
     message
 }
 

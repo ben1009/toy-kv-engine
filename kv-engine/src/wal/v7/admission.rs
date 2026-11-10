@@ -369,6 +369,7 @@ impl WalV7ReservationOwner {
         if sealing {
             recovered_charge.logical_wal_bytes = 0;
         }
+
         Self::new_image(
             ledger,
             retained_resources,
@@ -408,6 +409,7 @@ impl WalV7ReservationOwner {
             let reservation = ledger.reserve(recovered_charge)?;
             reservations.insert(reservation.id, reservation);
         }
+
         Ok(Self {
             ledger,
             retained_resources,
@@ -431,6 +433,7 @@ impl WalV7ReservationOwner {
     /// buffers do not prevent that recovery.
     pub(crate) fn has_in_flight_source_spool_work(&self) -> bool {
         let state = self.state.lock();
+
         state.active_source_spool_preparations != 0 || state.active_batch_operations != 0
     }
 
@@ -461,6 +464,7 @@ impl WalV7ReservationOwner {
             (self.installed_dev, self.installed_ino) == (dev, ino),
             "v7 resource owner belongs to a different installed WAL image"
         );
+
         Ok(())
     }
 
@@ -503,6 +507,7 @@ impl WalV7ReservationOwner {
         state.reservations.insert(id, reservation);
         state.active_batch_operations = active_batch_operations;
         drop(state);
+
         Ok(WalV7OwnedBatchReservation {
             operation: Arc::new(WalV7BatchOperation {
                 owner: Arc::clone(self),
@@ -571,6 +576,7 @@ impl WalV7ReservationOwner {
         };
         state.active_source_spool_preparations = active_source_spool_preparations;
         drop(state);
+
         Ok(Some(WalV7OwnedPreparationReservation {
             owner: Arc::clone(self),
             reservation: Some(reservation),
@@ -585,6 +591,7 @@ impl WalV7ReservationOwner {
         let mut state = self.state.lock();
         state.retired = true;
         release_retired_reservations(&mut state);
+
         Ok(())
     }
 
@@ -608,6 +615,7 @@ impl WalV7ReservationOwner {
         if let Some(resources) = &self.retained_resources {
             resources.release_obligation_logical(segment_id);
         }
+
         Ok(())
     }
 
@@ -639,6 +647,7 @@ impl WalV7ReservationOwner {
         // A solo admitted batch retains source bytes when only its buffers
         // retire. Wake pressure waiters so they can now reclaim Active.
         self.ledger.notify_source_spool_work_finished();
+
         result.and(operation_result)
     }
 
@@ -652,6 +661,7 @@ impl WalV7ReservationOwner {
             .reservations
             .get_mut(&id)
             .ok_or(WalV7ReservationError::UnknownReservation)?;
+
         self.ledger
             .release_frontier_credit(reservation, source_credit)
     }
@@ -740,6 +750,7 @@ impl WalV7OwnedBatchReservation {
             .owner
             .release_frontier_credit(self.operation.id, self.frontier_source_credit)?;
         self.frontier_credit_held = false;
+
         Ok(())
     }
 
@@ -750,6 +761,7 @@ impl WalV7OwnedBatchReservation {
         if !self.operation.admitted.load(Ordering::Acquire) {
             return Err(WalV7ReservationError::ReservationMismatch);
         }
+
         match Arc::try_unwrap(self.operation) {
             Ok(operation) => operation.finish(),
             Err(operation) => {
@@ -766,6 +778,7 @@ impl WalV7BatchOperation {
             .owner
             .finish_batch_operation(self.id, self.admitted.load(Ordering::Acquire));
         self.finished = true;
+
         result
     }
 }
@@ -809,6 +822,7 @@ impl WalV7OwnedPreparationReservation {
         let Some(reservation) = self.reservation.as_mut() else {
             return Ok(());
         };
+
         self.owner.ledger.release_buffer_memory(reservation)
     }
 }
@@ -1011,6 +1025,7 @@ impl WalV7ResourceLedger {
         }
         state.charged = next;
         reservation.charge = retained;
+
         Ok(())
     }
 
@@ -1057,6 +1072,7 @@ impl WalV7ResourceLedger {
         }
         state.charged = next;
         reservation.charge = retained;
+
         Ok(())
     }
 
@@ -1097,6 +1113,7 @@ impl WalV7ResourceLedger {
         drop(state);
         self.inner.source_spool_changed.notify_all();
         self.inner.async_source_spool_changed.notify_waiters();
+
         Ok(())
     }
 
@@ -1110,6 +1127,7 @@ impl WalV7ResourceLedger {
         }
         release_reservation(&self.inner, reservation.id, reservation.charge)?;
         reservation.active = false;
+
         Ok(())
     }
 
@@ -1150,6 +1168,7 @@ impl WalV7ResourceLedger {
                 .source_spool_changed
                 .wait_for(&mut state, Duration::from_millis(50));
         }
+
         state.source_spool_progress_changed(generation, work_generation)
     }
 
@@ -1171,6 +1190,7 @@ impl WalV7ResourceLedger {
                 .source_spool_changed
                 .wait_for(&mut state, remaining);
         }
+
         state.source_spool_generation != generation
     }
 
@@ -1197,6 +1217,7 @@ impl WalV7ResourceLedger {
         tokio::pin!(notification);
         let closing_notification = closing.notified();
         tokio::pin!(closing_notification);
+
         loop {
             notification.as_mut().enable();
             closing_notification.as_mut().enable();
@@ -1262,6 +1283,7 @@ impl WalV7RetainedResources {
             .entry(segment_id)
             .or_default()
             .push(reservation);
+
         Ok(())
     }
 
@@ -1331,6 +1353,7 @@ impl WalV7RetainedResources {
             .or_default()
             .push(reservation);
         state.seal_sidecars_charged.insert(segment_id);
+
         Ok(())
     }
 
@@ -1369,6 +1392,7 @@ impl WalV7RetainedResources {
         };
         let persistent = self.ledger.reserve(charge)?;
         let staging = self.ledger.reserve(charge)?;
+
         Ok(WalV7SuccessorReservation {
             persistent,
             staging,
@@ -1395,6 +1419,7 @@ impl WalV7RetainedResources {
             return Err(WalV7ReservationError::ReservationMismatch);
         }
         state.pending_successors.insert(segment_id, reservation);
+
         Ok(())
     }
 
@@ -1442,6 +1467,7 @@ impl WalV7RetainedResources {
             .push(persistent);
         drop(state);
         drop(staging);
+
         Ok(())
     }
 
@@ -1454,6 +1480,7 @@ impl WalV7RetainedResources {
         }
         let reservation = self.ledger.reserve(charge)?;
         self.state.lock().startup_staging.push(reservation);
+
         Ok(())
     }
 
@@ -1475,6 +1502,7 @@ impl WalV7RetainedResources {
             .obligation_logical
             .insert(segment_id, reservation);
         debug_assert!(previous.is_none());
+
         Ok(())
     }
 
@@ -1491,6 +1519,7 @@ impl WalV7RetainedResources {
         }
         let reservation = self.ledger.reserve(charge)?;
         self.state.lock().unattributed.push(reservation);
+
         Ok(())
     }
 
@@ -1527,6 +1556,7 @@ impl Drop for WalV7Reservation {
         if !self.active {
             return;
         }
+
         if release_reservation(&self.ledger, self.id, self.charge).is_ok() {
             self.active = false;
         }
@@ -1564,6 +1594,7 @@ fn release_reservation(
         ledger.source_spool_changed.notify_all();
         ledger.async_source_spool_changed.notify_waiters();
     }
+
     Ok(())
 }
 
@@ -1576,6 +1607,7 @@ struct SourceSpoolWaiter<'a> {
 impl<'a> SourceSpoolWaiter<'a> {
     fn new(waiters: &'a AtomicU64) -> Self {
         waiters.fetch_add(1, Ordering::AcqRel);
+
         Self { waiters }
     }
 }
@@ -1875,6 +1907,7 @@ mod tests {
     #[test]
     fn batch_reservation_charges_fragment_rounding_and_one_frontier() {
         let ledger = WalV7ResourceLedger::new(batch_limits()).unwrap();
+
         for (batch_bytes, data_bytes, wal_bytes) in [
             (49, 4096, 8192),
             (4008, 4096, 8192),
@@ -1965,6 +1998,7 @@ mod tests {
             max_buffer_memory_bytes: 2 * (49 + 4096 + WAL_V7_FRAME_LEN as u64),
             ..batch_limits()
         };
+
         for (limits, expected_error) in [
             (
                 WalV7ResourceLimits {
@@ -2183,8 +2217,10 @@ mod tests {
             .map(|_| {
                 let ledger = Arc::clone(&ledger);
                 let start = Arc::clone(&start);
+
                 std::thread::spawn(move || {
                     start.wait();
+
                     ledger.reserve(charge(10, 10, 0, 10, 10))
                 })
             })

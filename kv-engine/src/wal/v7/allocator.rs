@@ -158,6 +158,7 @@ impl WalV7PhysicalAllocator {
         self.next_ticket = next_ticket;
         self.allocation_tail = end;
         self.ticket_data_ends.push_back(end);
+
         Ok(allocation)
     }
 
@@ -175,6 +176,7 @@ impl WalV7PhysicalAllocator {
             .checked_add(data_bytes)
             .and_then(|end| end.checked_add(FRAME_LEN_U64))
             .ok_or_else(|| anyhow::anyhow!("v7 fresh-segment DATA capacity overflows"))?;
+
         Ok(if fresh_reserved_end <= self.max_file_size {
             WalV7DataCapacityStatus::RotationRequired
         } else {
@@ -220,6 +222,7 @@ impl WalV7PhysicalAllocator {
         self.frontier_offsets.push(reservation.frame_offset);
         self.allocation_tail = frame_end;
         self.in_flight_frontier = Some(reservation.clone());
+
         Ok(reservation)
     }
 
@@ -258,6 +261,7 @@ impl WalV7PhysicalAllocator {
         self.tracked_ticket_start = reservation.ticket_end;
         self.last_frontier = next_frontier;
         self.in_flight_frontier = None;
+
         Ok(())
     }
 
@@ -266,6 +270,7 @@ impl WalV7PhysicalAllocator {
         self.validate_in_flight_frontier(&reservation)?;
         self.in_flight_frontier = None;
         self.poisoned = true;
+
         Ok(())
     }
 
@@ -280,6 +285,7 @@ impl WalV7PhysicalAllocator {
             .try_reserve_exact(allocations.len())
             .context("reserve v7 DATA group range metadata")?;
         self.visit_data_write_ranges(allocations, |range| ranges.push(range))?;
+
         Ok(ranges)
     }
 
@@ -357,6 +363,7 @@ impl WalV7PhysicalAllocator {
         }
 
         visit(current_range.expect("nonempty allocation group has a DATA range"));
+
         Ok(())
     }
 
@@ -385,6 +392,7 @@ impl WalV7PhysicalAllocator {
             .try_reserve_exact(offsets.len())
             .context("reserve v7 worker FRONTIER metadata")?;
         result.extend_from_slice(offsets);
+
         Ok(result)
     }
 
@@ -440,6 +448,7 @@ impl WalV7PhysicalAllocator {
             previous_frontier_end <= durable_end && durable_end <= self.allocation_tail,
             "v7 durable prefix end is outside the allocated physical prefix"
         );
+
         // DATA ranges are ordered and never cross a FRONTIER slot. If the
         // first excluded ticket ends within E(T), retaining the predecessor
         // also retains speculative DATA outside the captured ticket prefix.
@@ -477,6 +486,7 @@ impl WalV7PhysicalAllocator {
                 && reservation.frame_end == in_flight.frame_end,
             "v7 FRONTIER reservation is stale or belongs to another cycle"
         );
+
         Ok(())
     }
 
@@ -500,6 +510,7 @@ impl WalV7PhysicalAllocator {
                 .is_some_and(|count| count <= self.ticket_data_ends.len()),
             "v7 FRONTIER target exceeds tracked DATA cursor"
         );
+
         Ok(())
     }
 
@@ -520,6 +531,7 @@ impl WalV7PhysicalAllocator {
                 && allocation.frame_range.end <= self.allocation_tail,
             "invalid v7 DATA frame range"
         );
+
         Ok(())
     }
 
@@ -527,6 +539,7 @@ impl WalV7PhysicalAllocator {
         if self.poisoned {
             bail!("v7 WAL physical allocator is poisoned")
         }
+
         Ok(())
     }
 
@@ -565,6 +578,7 @@ impl WalV7PhysicalAllocator {
         let reserved_end = end
             .checked_add(reserved_marker_bytes)
             .ok_or_else(|| anyhow::anyhow!("v7 DATA and marker reservation end overflows"))?;
+
         Ok((next_ticket, end, reserved_end, byte_len))
     }
 }
@@ -607,6 +621,7 @@ fn validate_frontier_cursor(
             "invalid v7 nonzero runtime FRONTIER cursor"
         );
     }
+
     Ok(())
 }
 
@@ -643,6 +658,7 @@ fn validate_frontier_successor(
             && next.frontier.previous_frontier_digest == previous.frame_digest,
         "v7 FRONTIER does not extend the captured predecessor"
     );
+
     Ok(())
 }
 
@@ -697,6 +713,7 @@ mod tests {
             frame_offset: reservation.frame_offset(),
             frame_digest: [generation.wrapping_add(0x40).to_be_bytes()[7]; 32],
         };
+
         allocator.complete_frontier_sync(reservation, next)
     }
 

@@ -89,6 +89,7 @@ fn write_pitr_snapshot_fixture(
 #[test]
 fn pitr_snapshot_migration_uses_the_persisted_engine_version() {
     let state = untagged_pitr_snapshot(&legacy_pitr_sealing_state());
+
     for version in [7, MANIFEST_FORMAT_VERSION] {
         for engine_snapshot in [false, true] {
             let directory = tempdir().unwrap();
@@ -220,6 +221,7 @@ fn pitr_ambiguous_legacy_engine_snapshots_report_upgrade_guidance() {
         },
     ])
     .unwrap();
+
     for engine_snapshot in [false, true] {
         let directory = tempdir().unwrap();
         write_pitr_snapshot_fixture(
@@ -560,6 +562,7 @@ fn manifest_recovery_crash_retries_exact_snapshot_and_suffix() {
         Manifest::recover(path).unwrap();
         unreachable!("child must exit during manifest recovery");
     }
+
     for (target, pending) in [
         ("MANIFEST", false),
         ("ENGINE_MANIFEST", false),

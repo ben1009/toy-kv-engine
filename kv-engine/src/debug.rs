@@ -19,6 +19,7 @@ impl LsmStorageInner {
         for (level, files) in &snapshot.levels {
             out.push_str(&format!("L{level} ({}): {:?}\n", files.len(), files));
         }
+
         out
     }
 }

@@ -65,6 +65,9 @@ scc = "3.8.6"
 static_assertions = "1"
 tempfile = "3"
 
+[lints.clippy]
+undocumented_unsafe_blocks = "warn"
+
 [[bench]]
 name = "vlog_benchmarks"
 harness = false

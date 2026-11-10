@@ -75,6 +75,7 @@ fn main() -> Result<()> {
             run_case(&args, writers, pitr, pitr_first)?;
         }
     }
+
     Ok(())
 }
 
@@ -165,6 +166,7 @@ fn run_case_in_root(
                 value.fill(operation as u8);
                 engine.put(key.as_bytes(), &value)?;
             }
+
             Ok(())
         }));
     }

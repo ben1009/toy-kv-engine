@@ -206,6 +206,7 @@ impl IncrementalBloom {
             }
             h = h.wrapping_add(delta);
         }
+
         true
     }
 }

@@ -652,6 +652,7 @@ fn test_put_and_get_roundtrip() {
         let value = format!("val_{:04}", i);
         engine.put(key.as_bytes(), value.as_bytes()).unwrap();
     }
+
     for i in 0..50 {
         let key = format!("key_{:04}", i);
         let expected = format!("val_{:04}", i);
@@ -944,6 +945,7 @@ fn test_batch_get_with_flush() {
         let expected = format!("sst_{:04}", i);
         assert_eq!(res.as_ref().unwrap(), &Some(Bytes::from(expected)));
     }
+
     for (i, res) in results.iter().enumerate().skip(10) {
         let expected = format!("mem_{:04}", i);
         assert_eq!(res.as_ref().unwrap(), &Some(Bytes::from(expected)));

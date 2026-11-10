@@ -97,6 +97,7 @@ impl WalV7RuntimeMetadata {
             self.last_recorded_at.is_some() == (frontier.ticket_end > 0),
             "v7 runtime recorded-time cursor disagrees with its recovered ticket frontier"
         );
+
         Ok(())
     }
 }
@@ -997,6 +998,7 @@ pub(crate) fn recovery_temp_prefix(file_name: &OsStr) -> String {
         encoded_digest.push(char::from(HEX[usize::from(byte >> 4)]));
         encoded_digest.push(char::from(HEX[usize::from(byte & 0x0f)]));
     }
+
     format!(".toy-kv-v7-recovery-{encoded_digest}.tmp-")
 }
 
@@ -1025,6 +1027,7 @@ fn cleanup_stale_recovery_images(parent: &Path, parent_dir: &File, prefix: &str)
             Err(error) => return Err(error).context("remove stale v7 recovery image"),
         }
     }
+
     // A prior attempt may have unlinked every image before its directory sync
     // failed. An empty scan does not establish durable absence on retry.
     parent_dir
@@ -1142,6 +1145,7 @@ fn install_exact_v7_recovery_image(
                 && installed_metadata.dev() == source_metadata.dev(),
             "installed immutable v7 WAL has an unexpected file type, size, or device"
         );
+
         Ok(installed_metadata)
     })();
 
@@ -1184,6 +1188,7 @@ pub(crate) fn is_recovery_temp_name(name: &OsStr) -> bool {
     };
     let (pid, sequence_with_separator) = suffix.split_at(separator);
     let sequence = &sequence_with_separator[1..];
+
     !pid.is_empty()
         && pid.iter().all(u8::is_ascii_digit)
         && !sequence.is_empty()
@@ -1199,6 +1204,7 @@ fn validate_boundary_identity(boundary: ActiveBoundary, header: WalV7Header) -> 
             && boundary.incarnation == header.incarnation,
         "Active v7 recovery boundary identifies a different WAL"
     );
+
     Ok(())
 }
 
@@ -1225,6 +1231,7 @@ fn validate_selected_frontier(selection: &WalV7RecoverySelection) -> Result<()> 
             "selected Active v7 FRONTIER has invalid physical bounds"
         );
     }
+
     Ok(())
 }
 
@@ -1348,6 +1355,7 @@ impl PrefixRebuilder {
         seal_index
             .try_reserve(1)
             .context("reserve recovered v7 seal index")?;
+
         Ok(Self {
             header_digest,
             logical_hasher,
@@ -1371,6 +1379,7 @@ impl PrefixRebuilder {
             WalV7FrameKind::Frontier => self.accept_frontier(encoded, frame_offset),
             WalV7FrameKind::Data => self.accept_data_frame(&decoded.body, frame_offset),
         }?;
+
         Ok(())
     }
 
@@ -1408,6 +1417,7 @@ impl PrefixRebuilder {
             frontier,
             digest,
         });
+
         Ok(())
     }
 
@@ -1465,6 +1475,7 @@ impl PrefixRebuilder {
         if complete {
             self.finish_batch()?;
         }
+
         Ok(())
     }
 
@@ -1519,6 +1530,7 @@ impl PrefixRebuilder {
             .checked_add(1)
             .context("v7 recovered ticket counter overflows")?;
         self.batches.push(batch);
+
         Ok(())
     }
 
@@ -1535,6 +1547,7 @@ impl PrefixRebuilder {
         let last_frontier = self
             .last_frontier
             .context("Active v7 retained prefix has no generation-zero FRONTIER")?;
+
         Ok(RebuiltPrefix {
             last_frontier,
             next_ticket: self.next_ticket,
@@ -1583,6 +1596,7 @@ fn validate_selected_candidate_frame(
         frontier == selection.candidate.frontier && digest == selection.candidate.frame_digest,
         "selected Active v7 FRONTIER changed after verification"
     );
+
     Ok(())
 }
 
@@ -1629,6 +1643,7 @@ mod tests {
                 TEMP_DIRECTORY_SEQUENCE.fetch_add(1, Ordering::Relaxed)
             ));
             fs::create_dir(&path)?;
+
             Ok(Self(path))
         }
     }
@@ -1702,6 +1717,7 @@ mod tests {
         let mut hash = Sha256::new();
         hash.update(test_header().encode()?);
         hash.update(logical_batch);
+
         Ok((frames, hash.finalize().into()))
     }
 
@@ -1711,6 +1727,7 @@ mod tests {
         let header = WalV7Header::decode(&read_header(&mut file)?)?;
         let header_digest = header.digest()?;
         let discovery = discover_frontier_candidates(&mut file, file_len, &header_digest)?;
+
         select_recovery_candidate(
             &mut file,
             file_len,
@@ -1726,6 +1743,7 @@ mod tests {
         file.seek(SeekFrom::Start(0))?;
         let mut bytes = [0; WAL_V7_HEADER_LEN];
         file.read_exact(&mut bytes)?;
+
         Ok(bytes)
     }
 
@@ -1741,6 +1759,7 @@ mod tests {
                 value: b"value".to_vec(),
             }],
         };
+
         create_nonempty_image_for_batch(path, batch)
     }
 
@@ -1928,6 +1947,7 @@ mod tests {
         let second_install = install_active_recovery(&path, &selected_again)?;
         assert_eq!(fs::read(&path)?, normalized);
         assert_eq!(second_install.image_digest(), installed.image_digest());
+
         Ok(())
     }
 
@@ -1972,6 +1992,7 @@ mod tests {
             assert_eq!(fs::metadata(&path)?.ino(), original_inode);
             assert_eq!(fs::read_dir(&directory.0)?.count(), 1);
         }
+
         Ok(())
     }
 
@@ -2047,6 +2068,7 @@ mod tests {
                 value: marker_shaped_value.to_vec(),
             }]
         );
+
         Ok(())
     }
 
@@ -2258,6 +2280,7 @@ mod tests {
             terminal_frontier_digest: active.installed.frontier_digest,
             wal_digest: active.installed.image_digest(),
         };
+
         Ok((header, boundary))
     }
 
@@ -2291,6 +2314,7 @@ mod tests {
         );
         assert_eq!(fs::read(&path)?, original);
         recovered.installed.runtime_seed()?;
+
         Ok(())
     }
 
@@ -2320,6 +2344,7 @@ mod tests {
         assert_eq!(recovered.installed.next_ticket, 0);
         assert_eq!(recovered.installed.image_digest(), boundary.wal_digest);
         assert_eq!(fs::read(&path)?, original);
+
         Ok(())
     }
 
@@ -2344,6 +2369,7 @@ mod tests {
 
         assert_eq!(fs::read(&path)?, original);
         assert_ne!(recovered.installed.installed_ino, original_inode);
+
         Ok(())
     }
 
@@ -2375,6 +2401,7 @@ mod tests {
         assert_eq!(recovered.installed.image_digest(), boundary.wal_digest);
         assert_ne!(recovered.installed.installed_ino, original_inode);
         assert_eq!(fs::read(&seal_path)?, bytes);
+
         Ok(())
     }
 
@@ -2435,6 +2462,7 @@ mod tests {
             assert_eq!(fs::read(&seal_path)?, bytes, "case={case}");
             assert_eq!(fs::read_dir(&directory.0)?.count(), 2, "case={case}");
         }
+
         Ok(())
     }
 
@@ -2460,6 +2488,7 @@ mod tests {
         assert_eq!(fs::read(&path)?, original);
         assert_eq!(fs::metadata(&path)?.ino(), original_inode);
         assert_eq!(fs::read_dir(&directory.0)?.count(), 1);
+
         Ok(())
     }
 
@@ -2487,6 +2516,7 @@ mod tests {
         assert_eq!(fs::read(&path)?, corrupted);
         assert_eq!(fs::metadata(&path)?.ino(), original_inode);
         assert_eq!(fs::read_dir(&directory.0)?.count(), 1);
+
         Ok(())
     }
 
@@ -2545,6 +2575,7 @@ mod tests {
             seed.metadata.physical_hasher.finalize(),
             Sha256::digest(expected_physical)
         );
+
         Ok(())
     }
 
@@ -2582,6 +2613,7 @@ mod tests {
         installed.seal_index[0] = first_data_offset;
         assert!(installed.runtime_seed().is_ok());
         assert_eq!(fs::read(&path)?, normalized_image);
+
         Ok(())
     }
 
@@ -2634,6 +2666,7 @@ mod tests {
         // Assert
         assert!(!stale_image.exists());
         assert!(other_image.exists());
+
         Ok(())
     }
 
@@ -2659,6 +2692,7 @@ mod tests {
 
         let parent_dir = File::open(&directory.0)?;
         cleanup_stale_recovery_images(&directory.0, &parent_dir, &prefix)?;
+
         Ok(())
     }
 
@@ -2673,6 +2707,7 @@ mod tests {
         cleanup_failed_recovery_image(&temp_path, &parent_dir)?;
 
         assert!(!temp_path.exists());
+
         Ok(())
     }
 
@@ -2695,6 +2730,7 @@ mod tests {
         // Assert
         assert!(path.file_name().is_some_and(|name| name.to_str().is_none()));
         assert_eq!(fs::metadata(&path)?.len(), installed.image_len);
+
         Ok(())
     }
 
@@ -2782,6 +2818,7 @@ mod tests {
             );
             assert_eq!(undersized_ledger.snapshot(), WalV7ResourceCharge::default());
         }
+
         Ok(())
     }
 
@@ -2850,6 +2887,7 @@ mod tests {
                 .is_none()
         );
         assert_eq!(empty_ledger.snapshot(), WalV7ResourceCharge::default());
+
         Ok(())
     }
 
@@ -2866,6 +2904,7 @@ mod tests {
             .context("Immutable selection was normalized")?;
         assert!(error.to_string().contains("cannot be normalized"));
         assert_eq!(fs::read(&path)?, original);
+
         Ok(())
     }
 }

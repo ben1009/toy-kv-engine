@@ -33,7 +33,7 @@ use sha2::{Digest, Sha256};
 use crate::{
     pitr::{LIVE_WAL_V5_LIMITS, WalBatch, WalV5Limits},
     wal::{
-        DirectBuf, MAX_WAL_FILE_SIZE,
+        DirectBuf, DirectBufAllocation, MAX_WAL_FILE_SIZE,
         parallel_worker::{
             GroupWriteResult, IoWorker, IoWorkerClient, WorkerBuffer, WriteBuffer, WriteGroup,
         },
@@ -324,6 +324,7 @@ impl WalV8ParallelIo {
             self.drain_ready_locked(&mut submission)
                 .context("submit v8 DATA after registering a FRONTIER gap")?;
         }
+
         Ok(())
     }
 
@@ -365,6 +366,7 @@ impl WalV8ParallelIo {
         let first_ticket = submission.next_ticket;
         submission.packing = true;
         drop(submission);
+
         self.pack_admitted_group(first_ticket)
     }
 
@@ -381,6 +383,7 @@ impl WalV8ParallelIo {
         #[cfg(not(test))]
         let budget = DATA_GROUP_JOIN_BUDGET;
         let mut deadline = None;
+
         loop {
             // Never hold submission while entering the coordinator: FRONTIER
             // registration uses coordinator -> submission lock order.
@@ -431,6 +434,7 @@ impl WalV8ParallelIo {
 
     fn drain_ready_locked(&self, state: &mut WalV8SubmissionState) -> Result<()> {
         let admitted_end = self.coordinator.admitted_ticket_end();
+
         loop {
             let limit = state
                 .next_ticket
@@ -528,6 +532,7 @@ impl WalV8ParallelIo {
             state.next_file_offset = Some(cursor);
             return Ok(selected.len());
         }
+
         Ok(0)
     }
 }
@@ -559,6 +564,7 @@ fn reap_v8_group_result(
     }
     #[cfg(feature = "chaos-testing")]
     crate::chaos::failpoint::wal_crash_point("wal_v8.parallel.after_data_write");
+
     coordinator
         .mark_data_group_complete(result.tickets)
         .context("publish v8 DATA worker group completion")
@@ -571,6 +577,7 @@ impl Drop for WalV8ParallelIo {
         {
             log::error!("failed to close v8 WAL I/O worker: {error:#}");
         }
+
         if let Some(completion_thread) = self.completion_thread.get_mut().take()
             && completion_thread.join().is_err()
         {
@@ -623,7 +630,7 @@ pub(crate) struct WalV8FrameJob<'a> {
     coordinator: WalV8ParallelCoordinator,
     producer_guards: Arc<Mutex<BTreeMap<u64, EncodedWalV8Batch<WalV8ParallelAdmissionGuard>>>>,
     io: Arc<WalV8ParallelIo>,
-    data_buffer: Option<WalV8DataBuffer>,
+    data_buffer: Option<DirectBufAllocation>,
     #[cfg(feature = "bench")]
     profile: Option<Arc<crate::mem_table::WriteProfile>>,
 }
@@ -661,10 +668,12 @@ impl WalV8FrameJob<'_> {
             metrics
         };
 
-        let data_buffer = self
-            .data_buffer
-            .as_mut()
-            .context("v8 producer job lost its DATA buffer")?;
+        let mut data_buffer = WalV8DataBuffer(
+            self.data_buffer
+                .take()
+                .context("v8 producer job lost its DATA buffer")?
+                .initialize(),
+        );
         let data_len = encoded.encode_data_frames_into(data_buffer.as_mut_slice())?;
         ensure!(
             data_len == data_buffer.cap(),
@@ -682,10 +691,6 @@ impl WalV8FrameJob<'_> {
             self.coordinator
                 .mark_data_write_started(self.assignment.segment_ticket)?;
         }
-        let data_buffer = self
-            .data_buffer
-            .take()
-            .context("v8 producer job lost its DATA buffer before submission")?;
         let ticket = self.assignment.segment_ticket;
         let previous = self.producer_guards.lock().insert(ticket, encoded);
         if previous.is_some() {
@@ -702,6 +707,7 @@ impl WalV8FrameJob<'_> {
 
         #[cfg(feature = "bench")]
         return Ok(metrics);
+
         #[cfg(not(feature = "bench"))]
         {
             Ok(digest::WalV8DigestMetrics)
@@ -727,6 +733,7 @@ impl WalV8AdmissionPublisher for WalV8LeaderAdmissionPublisher<'_> {
         if let Some(reservation) = self.reservation.borrow_mut().as_mut() {
             reservation.mark_admitted();
         }
+
         Ok(admitted)
     }
 }
@@ -741,6 +748,7 @@ impl WalV8LeaderWriter {
         reservation_owner: Arc<WalV8ReservationOwner>,
     ) -> Result<Self> {
         reservation_owner.validate_image_and_workspace(installed, max_file_size)?;
+
         Self::new_inner(
             write_file,
             sync_file,
@@ -884,6 +892,7 @@ impl WalV8LeaderWriter {
             .write_file
             .try_clone()
             .context("clone v8 WAL handle for the I/O worker")?;
+
         self.into_parallel_with_worker_file(worker_file)
     }
 
@@ -910,6 +919,7 @@ impl WalV8LeaderWriter {
         if let Some(profile) = self.profile.load_full() {
             io.set_profile(profile);
         }
+
         Ok(WalV8ParallelWriter {
             write_file: self.write_file,
             sync_file: self.sync_file,
@@ -944,6 +954,7 @@ impl WalV8LeaderWriter {
         limits: WalV5Limits,
     ) -> Result<WalV8LeaderCommit> {
         let mut group = self.append_group(std::slice::from_ref(batch), limits)?;
+
         group
             .commits
             .pop()
@@ -974,6 +985,7 @@ impl WalV8LeaderWriter {
             prepared_batches.push(self.preflight_batch(batch, limits)?);
             metadata.push((batch.commit_ts, batch.recorded_at));
         }
+
         self.append_prepared_group(prepared_batches, &metadata)
     }
 
@@ -986,6 +998,7 @@ impl WalV8LeaderWriter {
     ) -> Result<WalV8PreparedBatch<'a>> {
         ensure!(!self.is_poisoned(), "v8 Leader WAL is poisoned");
         let limits = bounded_limits(limits);
+
         WalV8PreparedBatch::preflight(batch, limits, |bytes| {
             ensure!(
                 bytes <= self.max_file_size,
@@ -998,6 +1011,7 @@ impl WalV8LeaderWriter {
                 .transpose()?
                 .flatten();
             let coordinator = self.coordinator.reserve_preparation(bytes)?;
+
             Ok(WalV8PreflightReservation {
                 _coordinator: coordinator,
                 _source: source,
@@ -1021,6 +1035,7 @@ impl WalV8LeaderWriter {
         let digest_metrics = group.digest_metrics;
         #[cfg(not(feature = "bench"))]
         let digest_metrics = digest::WalV8DigestMetrics;
+
         Ok((commit, digest_metrics))
     }
 
@@ -1112,6 +1127,7 @@ impl WalV8LeaderWriter {
                         .context("v8 logical batch reservation exceeds u64")?;
                     let frame_bytes = u64::try_from(prepared.frame_buffer_bytes())
                         .context("v8 frame buffer reservation exceeds u64")?;
+
                     total
                         .checked_add(logical_bytes)
                         .and_then(|total| total.checked_add(frame_bytes))
@@ -1236,6 +1252,7 @@ impl WalV8LeaderWriter {
                     }
                     write_result.context("write v8 Parallel DATA frames")?;
                     coordinator.mark_data_complete(assignment.segment_ticket)?;
+
                     Ok(ProducerCompletion {
                         assignment,
                         digest_ready,
@@ -1260,6 +1277,7 @@ impl WalV8LeaderWriter {
                     }
                 }
             }
+
             if let Some(error) = first_error {
                 Err(error)
             } else {
@@ -1412,6 +1430,7 @@ impl WalV8LeaderWriter {
                 frontier_digest,
             });
         }
+
         Ok(WalV8LeaderCommitGroup {
             commits,
             frontier,
@@ -1462,6 +1481,7 @@ impl WalV8LeaderWriter {
         };
         empty.validate()?;
         active.validate()?;
+
         Ok((empty, active))
     }
 }
@@ -1487,6 +1507,7 @@ impl WalV8ParallelWriter {
                 "WAL sync diagnostics must be enabled before the first WAL ticket"
             );
             profile.set_wal_sync_diagnostics_enabled(enabled);
+
             Ok(())
         })
     }
@@ -1499,6 +1520,7 @@ impl WalV8ParallelWriter {
     ) -> Result<WalV8PreparedBatch<'a>> {
         ensure!(!self.is_poisoned(), "v8 Parallel WAL is poisoned");
         let limits = bounded_limits(limits);
+
         WalV8PreparedBatch::preflight(batch, limits, |bytes| {
             ensure!(
                 bytes <= self.max_file_size,
@@ -1511,6 +1533,7 @@ impl WalV8ParallelWriter {
                 .transpose()?
                 .flatten();
             let coordinator = self.coordinator.reserve_preparation(bytes)?;
+
             Ok(WalV8PreflightReservation {
                 _coordinator: coordinator,
                 _source: source,
@@ -1561,6 +1584,7 @@ impl WalV8ParallelWriter {
             frontier_offset: frontier.offset,
             frontier_digest: frontier.digest,
         };
+
         Ok((commit, metrics))
     }
 
@@ -1595,10 +1619,10 @@ impl WalV8ParallelWriter {
             .map(|owner| owner.reserve_batch(logical_bytes, frame_bytes))
             .transpose()?;
 
-        // Allocate the frame buffer before publishing the ticket. Once
-        // admission succeeds, every resource required to finish is already
-        // owned by this producer.
-        let data_buffer = WalV8DataBuffer(DirectBuf::new(prepared.frame_buffer_bytes()));
+        // Own the allocation before publishing the ticket. Initialization is
+        // payload-sized work, so defer it to finish after the MVCC sequencer
+        // has been released.
+        let data_buffer = DirectBufAllocation::new(prepared.frame_buffer_bytes());
         let publisher = WalV8LeaderAdmissionPublisher {
             coordinator: &self.coordinator,
             reservation: RefCell::new(&mut reservation),
@@ -1616,6 +1640,7 @@ impl WalV8ParallelWriter {
             }
         }
         after_admission();
+
         Ok(WalV8FrameJob {
             admitted: Some(admitted),
             assignment,
@@ -1639,6 +1664,7 @@ impl WalV8ParallelWriter {
         if result.is_ok() {
             driver.complete();
         }
+
         result
     }
 
@@ -1868,6 +1894,7 @@ impl WalV8ParallelWriter {
                 .finish_after_io()
                 .context("retire durable v8 batch resources")?;
         }
+
         Ok(())
     }
 
@@ -1888,6 +1915,7 @@ impl WalV8ParallelWriter {
                 .context("v8 Parallel producer guard disappeared")?;
             encoded.disarm_after_durable();
         }
+
         Ok(())
     }
 
@@ -1901,6 +1929,7 @@ impl WalV8ParallelWriter {
             self.coordinator.poison();
             return Err(error);
         }
+
         Ok(())
     }
 
@@ -1917,6 +1946,7 @@ impl WalV8ParallelWriter {
             self.coordinator.poison();
             return Err(error);
         }
+
         Ok(())
     }
 
@@ -1979,6 +2009,7 @@ impl WalV8ParallelWriter {
         };
         empty.validate()?;
         active.validate()?;
+
         Ok((empty, active))
     }
 }
@@ -2025,6 +2056,7 @@ fn validate_positional_write_handle(file: &File) -> io::Result<()> {
             "v8 WAL positional write handle uses O_APPEND",
         ));
     }
+
     Ok(())
 }
 
@@ -2038,6 +2070,7 @@ fn write_aligned_once(file: &File, bytes: &[u8], offset: u64) -> io::Result<()> 
             "v8 positional write is not frame aligned",
         ));
     }
+
     loop {
         match file.write_at(bytes, offset) {
             Ok(written) if written == bytes.len() => return Ok(()),
@@ -2061,6 +2094,7 @@ fn fdatasync_once(file: &File) -> io::Result<()> {
     crate::chaos::failpoint::fail_point!("wal.v8.leader.fdatasync", |_| Err(io::Error::other(
         "injected v8 WAL sync failure"
     )));
+
     loop {
         // SAFETY: fdatasync only borrows the live descriptor for the call.
         let result = unsafe { libc::fdatasync(file.as_raw_fd()) };
@@ -2090,6 +2124,7 @@ fn read_exact_at<const N: usize>(file: &File, offset: u64) -> io::Result<[u8; N]
             Err(error) => return Err(error),
         }
     }
+
     Ok(bytes)
 }
 
@@ -2124,6 +2159,7 @@ mod tests {
 
     fn header() -> WalV8Header {
         let archive_epoch_id = ArchiveEpochId([0x22; 16]);
+
         WalV8Header {
             timeline_id: TimelineId([0x11; 16]),
             archive_epoch_id,
@@ -2139,6 +2175,7 @@ mod tests {
 
     fn install_empty(path: &Path, header: WalV8Header) -> Result<WalV8InstalledRecovery> {
         let boundary = create_empty_active(path, header)?;
+
         super::super::install::recover_and_install_active(
             path,
             &[boundary],
@@ -2159,9 +2196,11 @@ mod tests {
             LIVE_WAL_V5_LIMITS,
             |batch| {
                 batches.push(batch.clone());
+
                 Ok(())
             },
         )?;
+
         Ok(batches)
     }
 
@@ -2381,6 +2420,7 @@ mod tests {
                 assert!(batches.is_empty());
             }
         }
+
         Ok(())
     }
 
@@ -2420,6 +2460,7 @@ mod tests {
             .expect_err("diagnostics re-enable after a new ticket must be rejected");
         assert!(error.to_string().contains("before the first WAL ticket"));
         assert!(!profile.wal_sync_diagnostics_enabled());
+
         Ok(())
     }
 
@@ -2460,6 +2501,7 @@ mod tests {
             max_file_size,
             Arc::clone(&owner),
         )?;
+
         Ok((writer, owner))
     }
 
@@ -2493,6 +2535,7 @@ mod tests {
             writer.image_len()?,
             FIXED_IMAGE_TEST_BYTES + 3 * FRAME_LEN_U64
         );
+
         Ok(())
     }
 
@@ -2522,6 +2565,7 @@ mod tests {
         assert_eq!(charge.source_spool_bytes, FIXED_IMAGE_TEST_BYTES);
         assert_eq!(charge.recovery_workspace_bytes, SEGMENT_LIMIT);
         assert_eq!(charge.buffer_memory_bytes, 0);
+
         Ok(())
     }
 
@@ -2560,6 +2604,7 @@ mod tests {
         );
         assert_eq!(charge.recovery_workspace_bytes, SEGMENT_LIMIT);
         assert_eq!(charge.buffer_memory_bytes, 0);
+
         Ok(())
     }
 
@@ -2611,6 +2656,7 @@ mod tests {
             writer.append_batch(&batch(30), LIVE_WAL_V5_LIMITS)?.ticket,
             2
         );
+
         Ok(())
     }
 
@@ -2651,6 +2697,7 @@ mod tests {
             boundary
         );
         assert_eq!(std::fs::read(&path)?, image);
+
         Ok(())
     }
 
@@ -2696,6 +2743,7 @@ mod tests {
         assert!(recovered.selection.batches.is_empty());
         assert_eq!(recovered.replay_tickets.len(), 1);
         assert_eq!(replayed_batches(&path, &recovered)?, [batch(10)]);
+
         Ok(())
     }
 
@@ -2729,6 +2777,7 @@ mod tests {
         assert_eq!(batches[0].commit_ts, 20);
         assert_eq!(batches[0].recorded_at, recorded_at);
         assert_eq!(batches[0].entries, input.entries);
+
         Ok(())
     }
 
@@ -2781,6 +2830,7 @@ mod tests {
             replayed_batches(&path, &recovered)?,
             batches.into_iter().chain([next_batch]).collect::<Vec<_>>()
         );
+
         Ok(())
     }
 
@@ -2803,6 +2853,7 @@ mod tests {
         assert!(error.downcast_ref::<WalV8LeaderCapacityError>().is_some());
         assert!(!writer.is_poisoned());
         assert_eq!(std::fs::metadata(&path)?.len(), installed.image_len);
+
         Ok(())
     }
 
@@ -2846,6 +2897,7 @@ mod tests {
         );
         assert_eq!(writer.coordinator.next_ticket(), 1);
         assert!(!writer.is_poisoned());
+
         Ok(())
     }
 
@@ -2908,6 +2960,7 @@ mod tests {
         assert_eq!(writer.coordinator.next_ticket(), 0);
         assert!(!writer.is_poisoned());
         assert_eq!(std::fs::metadata(&path)?.len(), installed.image_len);
+
         Ok(())
     }
 
@@ -2956,6 +3009,7 @@ mod tests {
         assert_eq!(retried.commits.len(), 1);
         assert_eq!(retried.commits[0].ticket, 0);
         assert!(!writer.is_poisoned());
+
         Ok(())
     }
 
@@ -2998,6 +3052,7 @@ mod tests {
         assert_eq!(recovered.active_boundary.ticket_end, 1);
         assert_eq!(replayed_batches(&path, &recovered)?, [batch(10)]);
         assert_ne!(std::fs::metadata(&path)?.ino(), original_inode);
+
         Ok(())
     }
 
@@ -3063,6 +3118,7 @@ mod tests {
                 .is_err()
         );
         drop(encoded);
+
         Ok(())
     }
 
@@ -3075,6 +3131,7 @@ mod tests {
             );
             thread::yield_now();
         }
+
         Ok(())
     }
 
@@ -3124,6 +3181,7 @@ mod tests {
             assert_eq!(writer.io.submission.lock().next_ticket, 0);
             third_job.finish()?;
             first_handle.join().expect("first DATA producer panicked")?;
+
             Ok(())
         })?;
         writer.wait_durable(2)?;
@@ -3142,6 +3200,7 @@ mod tests {
             MAX_WAL_FILE_SIZE,
         )?;
         assert_eq!(replayed_batches(&path, &recovered)?, [first, second, third]);
+
         Ok(())
     }
 
@@ -3176,6 +3235,7 @@ mod tests {
             first_handle
                 .join()
                 .expect("single-frame DATA producer panicked");
+
             Ok(())
         })?;
         assert_eq!(writer.io.submission.lock().next_ticket, 1);
@@ -3183,6 +3243,7 @@ mod tests {
         writer.wait_durable(0)?;
         second_job.finish()?;
         writer.wait_durable(1)?;
+
         Ok(())
     }
 
@@ -3212,6 +3273,7 @@ mod tests {
         second_job.finish()?;
         writer.wait_durable(1)?;
         assert_eq!(writer.coordinator.durable_ticket_end(), 2);
+
         Ok(())
     }
 
@@ -3252,12 +3314,14 @@ mod tests {
                 let result = rx.recv_timeout(Duration::from_secs(1))?;
                 assert_eq!(result.is_err(), poison);
                 first_handle.join().expect("stopped DATA packer panicked");
+
                 Ok(())
             })?;
             assert!(!writer.io.submission.lock().packing);
             assert_eq!(writer.coordinator.durable_ticket_end(), 0);
             assert_eq!(writer.io.submission.lock().next_ticket, u64::from(!poison));
         }
+
         Ok(())
     }
 
@@ -3325,6 +3389,7 @@ mod tests {
             let second_commit = second_handle
                 .join()
                 .map_err(|_| anyhow::anyhow!("second v8 producer panicked"))??;
+
             Ok((first_commit, second_commit))
         })?;
         assert_eq!(first_commit.0.ticket, 0);
@@ -3346,6 +3411,7 @@ mod tests {
         )?;
         assert_eq!(recovered.active_boundary.ticket_end, 2);
         assert_eq!(replayed_batches(&path, &recovered)?, [batch(10), batch(20)]);
+
         Ok(())
     }
 
@@ -3377,6 +3443,7 @@ mod tests {
         drop(frontier);
         reader.join().expect("published cursor reader panicked");
         assert_eq!(snapshot?, expected);
+
         Ok(())
     }
 
@@ -3435,6 +3502,7 @@ mod tests {
             replayed_batches(&path, &recovered)?,
             [first_batch, second_batch]
         );
+
         Ok(())
     }
 }

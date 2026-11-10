@@ -120,6 +120,7 @@ fn seed(value_separation: bool, value_size: usize, entry_count: usize) -> Scenar
         let key = format!("key-{index:06}");
         engine.put(key.as_bytes(), &value).unwrap();
     }
+
     Scenario {
         repository: dir.path().join("repository"),
         _dir: dir,
@@ -238,6 +239,7 @@ fn bench_backup(c: &mut Criterion) {
                                     scenario.engine.put(key.as_bytes(), &value).unwrap();
                                 }
                             }
+
                             scenario
                         },
                         |scenario| {

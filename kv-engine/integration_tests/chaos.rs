@@ -97,6 +97,7 @@ fn phase4_stress_crash_loop_smoke() {
                 false,
                 &format!("failed to read control log: {e}"),
             );
+
             panic!(
                 "failed to read control log: {e}; {}",
                 stress::cycle_report(seed, cycle)
@@ -121,6 +122,7 @@ fn phase4_stress_crash_loop_smoke() {
                         false,
                         &format!("failed to reopen engine: {e}"),
                     );
+
                     panic!(
                         "failed to reopen engine: {e}; {}",
                         stress::cycle_report(seed, cycle)
@@ -150,6 +152,7 @@ fn phase4_stress_crash_loop_smoke() {
                         wal_enabled,
                         &format!("reconciliation failed: {e}"),
                     );
+
                     panic!(
                         "reconciliation failed: {e}; {}",
                         stress::summarize_cycle_failure(seed, cycle, &log_path, &[])
@@ -211,6 +214,7 @@ fn phase4_stress_crash_loop_smoke() {
                 wal_enabled,
                 &format!("{phase_label} structural checks failed: {e}"),
             );
+
             panic!(
                 "{phase_label} structural checks failed: {e}; {}",
                 stress::cycle_report(seed, cycle)

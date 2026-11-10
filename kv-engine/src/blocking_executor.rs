@@ -64,6 +64,7 @@ impl BlockingExecutor {
 
         tokio::task::spawn_blocking(move || {
             let _guard = DecrementOnDrop(active);
+
             f()
         })
         .await
@@ -84,6 +85,7 @@ impl BlockingExecutor {
 
         tokio::task::spawn_blocking(move || {
             let _guard = DecrementOnDrop(active);
+
             f()
         })
         .await
@@ -104,6 +106,7 @@ impl BlockingExecutor {
 
         tokio::task::spawn_blocking(move || {
             let _guard = DecrementOnDrop(active);
+
             f()
         })
         .await
@@ -131,6 +134,7 @@ impl BlockingExecutor {
 
         tokio::task::spawn_blocking(move || {
             let _guard = DecrementOnDrop(active);
+
             f()
         })
         .await
@@ -172,6 +176,7 @@ impl BlockingExecutor {
         } else {
             self.max_blocking
         };
+
         loop {
             if cancelled.load(Ordering::Acquire) {
                 return false;

@@ -253,6 +253,7 @@ impl LsmIterator {
         if self.upper_unbounded {
             return true;
         }
+
         match self.upper.as_ref() {
             Bound::Unbounded => true,
             Bound::Included(key) => self.user_key.as_slice() <= key.as_slice(),
@@ -349,6 +350,7 @@ impl<I: StorageIterator> StorageIterator for FusedIterator<I> {
         if !self.is_valid() {
             panic!("invalid access to the underlying iterator");
         }
+
         self.iter.key()
     }
 
@@ -356,6 +358,7 @@ impl<I: StorageIterator> StorageIterator for FusedIterator<I> {
         if !self.is_valid() {
             panic!("invalid access to the underlying iterator");
         }
+
         self.iter.value()
     }
 
@@ -363,6 +366,7 @@ impl<I: StorageIterator> StorageIterator for FusedIterator<I> {
         if !self.is_valid() {
             panic!("invalid access to the underlying iterator");
         }
+
         self.iter.raw_value()
     }
 

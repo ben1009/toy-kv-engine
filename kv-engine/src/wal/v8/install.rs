@@ -231,6 +231,7 @@ pub(crate) fn recover_and_install_active(
         limits,
         normalized_len,
     })?;
+
     Ok(installed)
 }
 
@@ -302,6 +303,7 @@ pub(crate) fn recover_sealing_active(
         boundary.sealed_end,
         boundary.wal_digest,
     )?;
+
     Ok(WalV8SealingRecovery {
         seal,
         seal_bytes,
@@ -341,6 +343,7 @@ fn validate_existing_v8_sealing_sidecar(
         seal == *expected_seal && bytes == expected_bytes,
         "Sealing v8 sidecar differs from its immutable WAL authority"
     );
+
     Ok(())
 }
 
@@ -476,6 +479,7 @@ fn install_exact_v8_recovery_image(
                 && installed_metadata.dev() == source_metadata.dev(),
             "installed immutable v8 WAL has an unexpected file type, size, or device"
         );
+
         Ok(installed_metadata)
     })();
 
@@ -496,6 +500,7 @@ fn normalized_image_len(selection: &WalV8RecoverySelection) -> Result<u64> {
     if selection.active_boundary.ticket_end == 0 {
         return Ok(HEADER_LEN_U64 + FRAME_LEN_U64);
     }
+
     selection
         .active_boundary
         .durable_end
@@ -701,6 +706,7 @@ fn install_normalized_image(request: InstallRequest<'_>) -> Result<WalV8Installe
         );
 
         let last_recorded_at = replay_tickets.last().map(|ticket| ticket.recorded_at);
+
         Ok(WalV8InstalledRecovery {
             next_ticket: selection.active_boundary.ticket_end,
             last_recorded_at,
@@ -778,6 +784,7 @@ pub(crate) fn replay_installed_active_batches(
             && header_digest == installed.selection.physical_header_digest,
         "installed Active v8 WAL header digest changed before memtable replay"
     );
+
     replay_selected_batches(
         &mut file,
         &installed.selection,
@@ -825,6 +832,7 @@ fn validate_selected_candidate(
             && WalV8Frontier::decode_body(&decoded.body)? == selection.candidate.frontier,
         "selected Active v8 FRONTIER contents changed after selection"
     );
+
     Ok(())
 }
 
@@ -847,6 +855,7 @@ fn copy_retained_prefix(
             .context("write normalized Active v8 retained prefix")?;
         remaining -= u64::try_from(chunk_len)?;
     }
+
     Ok(())
 }
 
@@ -858,6 +867,7 @@ fn recovery_temp_prefix(file_name: &std::ffi::OsStr) -> String {
         output.push(char::from(HEX[usize::from(byte >> 4)]));
         output.push(char::from(HEX[usize::from(byte & 0x0f)]));
     }
+
     format!(".toy-kv-v8-recovery-{output}.tmp-")
 }
 
@@ -884,6 +894,7 @@ fn cleanup_stale_recovery_images(parent: &Path, parent_dir: &File, prefix: &str)
             Err(error) => return Err(error).context("remove stale v8 recovery image"),
         }
     }
+
     parent_dir
         .sync_all()
         .context("sync directory after checking stale v8 recovery images")
@@ -908,6 +919,7 @@ mod tests {
 
     fn test_header() -> WalV8Header {
         let archive_epoch_id = ArchiveEpochId([2; 16]);
+
         WalV8Header {
             timeline_id: TimelineId([1; 16]),
             archive_epoch_id,
@@ -941,6 +953,7 @@ mod tests {
             super::super::recovery::WalV8RecoveryDiagnostics::default()
         );
         assert_eq!(installed.image_len, HEADER_LEN_U64 + FRAME_LEN_U64);
+
         Ok(())
     }
 
@@ -972,6 +985,7 @@ mod tests {
         assert_eq!(rejected[0].frame_offset, HEADER_LEN_U64 + FRAME_LEN_U64);
         assert_eq!(rejected[0].frame_end, HEADER_LEN_U64 + 2 * FRAME_LEN_U64);
         assert!(rejected[0].reason.contains("frame offset mismatch"));
+
         Ok(())
     }
 }

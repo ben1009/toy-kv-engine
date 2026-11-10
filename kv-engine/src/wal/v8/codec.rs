@@ -41,6 +41,7 @@ pub(crate) fn data_fragment_count(batch_bytes: u64) -> Option<u32> {
 
     let fragment_capacity = WAL_V8_DATA_FRAGMENT_PAYLOAD_CAPACITY as u64;
     let remainder = u64::from(!batch_bytes.is_multiple_of(fragment_capacity));
+
     u32::try_from(batch_bytes / fragment_capacity + remainder).ok()
 }
 
@@ -73,6 +74,7 @@ impl WalV8Header {
 
         let mut header = [0; WAL_V8_HEADER_LEN];
         header[..WAL_V5_HEADER_LEN].copy_from_slice(&output);
+
         Ok(header)
     }
 
@@ -176,6 +178,7 @@ impl WalV8FrameKind {
                 "invalid v8 FRONTIER frame body length"
             ),
         }
+
         Ok(())
     }
 
@@ -210,6 +213,7 @@ impl WalV8FrameKind {
                 }
             }
         }
+
         Ok(())
     }
 }
@@ -240,6 +244,7 @@ impl WalV8DataFragmentHeader {
         body.extend_from_slice(&self.fragment_count.to_be_bytes());
         body.extend_from_slice(&self.batch_bytes.to_be_bytes());
         body.extend_from_slice(payload);
+
         Ok(body)
     }
 
@@ -257,6 +262,7 @@ impl WalV8DataFragmentHeader {
         };
         let payload = &input[WAL_V8_DATA_FRAGMENT_HEADER_LEN..];
         header.validate_payload_len(payload.len())?;
+
         Ok((header, payload))
     }
 
@@ -289,6 +295,7 @@ impl WalV8DataFragmentHeader {
             payload_len == expected_payload_len,
             "v8 DATA fragment payload length does not match its index"
         );
+
         Ok(())
     }
 }
@@ -334,6 +341,7 @@ impl WalV8LogicalBatchHeader {
         output[36..40].copy_from_slice(&entry_stream_crc.to_be_bytes());
         let header_crc = crc32fast::hash(&output[..40]);
         output[40..44].copy_from_slice(&header_crc.to_be_bytes());
+
         Ok(output)
     }
 
@@ -385,6 +393,7 @@ impl WalV8LogicalBatchHeader {
             input[44..48].iter().all(|byte| *byte == 0),
             "nonzero v8 logical batch reserved field"
         );
+
         Ok(header)
     }
 
@@ -410,6 +419,7 @@ impl WalV8LogicalBatchHeader {
             self.recorded_at_nanos < 1_000_000_000,
             "v8 recorded_at nanos out of range"
         );
+
         Ok(())
     }
 }
@@ -446,9 +456,11 @@ fn encode_frame(
         &mut output,
         |body_output| {
             body_output.copy_from_slice(body);
+
             Ok(())
         },
     )?;
+
     Ok(output)
 }
 
@@ -493,6 +505,7 @@ where
 
     let crc = frame_crc(output);
     output[60..64].copy_from_slice(&crc.to_be_bytes());
+
     Ok(())
 }
 
@@ -525,6 +538,7 @@ pub(crate) fn encode_data_fragment_frame_into(
     let body_len = WAL_V8_DATA_FRAGMENT_HEADER_LEN
         .checked_add(payload.len())
         .context("v8 DATA fragment body length overflows")?;
+
     encode_frame_into(
         WalV8FrameKind::Data,
         physical_header_digest,
@@ -538,6 +552,7 @@ pub(crate) fn encode_data_fragment_frame_into(
             body[12..16].copy_from_slice(&fragment.fragment_count.to_be_bytes());
             body[16..24].copy_from_slice(&fragment.batch_bytes.to_be_bytes());
             body[WAL_V8_DATA_FRAGMENT_HEADER_LEN..].copy_from_slice(payload);
+
             Ok(())
         },
     )
@@ -556,6 +571,7 @@ pub(crate) fn encode_generation_zero_frontier(
         previous_frontier_offset: 0,
         previous_frontier_digest: [0; 32],
     };
+
     encode_frame(
         WalV8FrameKind::Frontier,
         physical_header_digest,
@@ -584,6 +600,7 @@ pub(crate) fn encode_frontier_successor(
         &physical_header_digest,
         &initial_prefix_digest,
     )?;
+
     encode_frame(
         WalV8FrameKind::Frontier,
         physical_header_digest,
@@ -661,6 +678,7 @@ pub(crate) fn frame_record_digest(frame: &[u8]) -> Result<[u8; 32]> {
         frame.len() == WAL_V8_FRAME_LEN,
         "invalid v8 WAL frame length"
     );
+
     Ok(Sha256::digest(frame).into())
 }
 
@@ -685,6 +703,7 @@ impl WalV8Frontier {
         output[32..64].copy_from_slice(&self.prefix_digest);
         output[64..72].copy_from_slice(&self.previous_frontier_offset.to_be_bytes());
         output[72..104].copy_from_slice(&self.previous_frontier_digest);
+
         output
     }
 
@@ -693,6 +712,7 @@ impl WalV8Frontier {
             input.len() == WAL_V8_FRONTIER_BODY_LEN,
             "invalid v8 FRONTIER body length"
         );
+
         Ok(Self {
             generation: u64::from_be_bytes(input[0..8].try_into()?),
             ticket_end: u64::from_be_bytes(input[8..16].try_into()?),
@@ -723,6 +743,7 @@ impl WalV8Frontier {
                 && self.previous_frontier_digest == [0; 32],
             "invalid v8 generation-zero FRONTIER"
         );
+
         Ok(())
     }
 
@@ -765,6 +786,7 @@ impl WalV8Frontier {
                 && self.previous_frontier_digest == *previous_frame_digest,
             "v8 FRONTIER predecessor binding mismatch"
         );
+
         Ok(())
     }
 
@@ -781,6 +803,7 @@ impl WalV8Frontier {
                 && self.durable_end.is_multiple_of(WAL_V8_FRAME_LEN as u64),
             "invalid v8 FRONTIER physical bounds"
         );
+
         Ok(())
     }
 }
@@ -813,6 +836,7 @@ pub(crate) fn decode_frontier_successor(
         expected_physical_header_digest,
         initial_prefix_digest,
     )?;
+
     Ok((frontier, frame_record_digest(input)?))
 }
 
@@ -825,6 +849,7 @@ fn validate_frame_offset(frame_offset: u64) -> Result<()> {
     frame_offset
         .checked_add(WAL_V8_FRAME_LEN as u64)
         .ok_or_else(|| anyhow::anyhow!("v8 WAL frame end overflows"))?;
+
     Ok(())
 }
 
@@ -841,6 +866,7 @@ fn validate_batch_limits(limits: WalV5Limits) -> Result<()> {
         limits.max_batch_data_bytes <= u32::MAX as usize,
         "v8 batch byte limit exceeds wire format"
     );
+
     Ok(())
 }
 
@@ -848,6 +874,7 @@ fn frame_crc(frame: &[u8]) -> u32 {
     let mut crc = crc32fast::Hasher::new();
     crc.update(&frame[..60]);
     crc.update(&frame[64..]);
+
     crc.finalize()
 }
 
@@ -907,6 +934,7 @@ mod tests {
             0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2d,
             0x2e, 0x2f,
         ]);
+
         WalV8Header {
             timeline_id: TimelineId([
                 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d,
@@ -925,6 +953,7 @@ mod tests {
     fn decode_hex(value: &str) -> Vec<u8> {
         let (pairs, remainder) = value.as_bytes().as_chunks::<2>();
         assert!(remainder.is_empty());
+
         pairs
             .iter()
             .map(|pair| {
@@ -955,6 +984,7 @@ mod tests {
         frame[56..60].copy_from_slice(&u32::try_from(body.len()).unwrap().to_be_bytes());
         frame[60..64].copy_from_slice(&crc);
         frame[64..64 + body.len()].copy_from_slice(body);
+
         frame
     }
 
@@ -1017,6 +1047,7 @@ mod tests {
             decode_frame_structural(&frame, 4096, &physical_digest, &p0)?.body,
             body
         );
+
         Ok(())
     }
 
@@ -1096,6 +1127,7 @@ mod tests {
             assert_eq!(decoded.fragment_index, last_index);
             assert_eq!(payload.len(), last_payload_len);
         }
+
         Ok(())
     }
 
@@ -1186,6 +1218,7 @@ mod tests {
             )
             .is_err()
         );
+
         Ok(())
     }
 
@@ -1202,6 +1235,7 @@ mod tests {
         let mut header = golden_header().encode()?;
         header[144] ^= 1;
         assert!(WalV8Header::decode(&header).is_err());
+
         Ok(())
     }
 
@@ -1235,6 +1269,7 @@ mod tests {
         assert!(decode_frame_structural(&f0_corrupt, 4096, &physical_digest, &p0).is_err());
         assert!(decode_frame_structural(&f0_bytes, 8192, &physical_digest, &p0).is_err());
         assert!(decode_frame_structural(&f0_bytes, 4096, &[0; 32], &p0).is_err());
+
         Ok(())
     }
 }

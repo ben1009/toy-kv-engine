@@ -153,6 +153,7 @@ pub fn encoded_user_key_prefix(encoded: &[u8]) -> Option<&[u8]> {
     if encoded.len() < 17 {
         return None;
     }
+
     Some(&encoded[..encoded.len() - 8])
 }
 
@@ -201,6 +202,7 @@ pub fn decode_user_key_into(encoded_prefix: &[u8], dst: &mut Vec<u8>) -> bool {
         dst.extend_from_slice(group);
         i += ENC_GROUP_SIZE + 1;
     }
+
     i == encoded_prefix.len()
 }
 
@@ -525,6 +527,7 @@ mod tests {
         let enc = encode_internal_key(b"abc", 10);
         let cow = decode_user_key_cow(&enc).unwrap();
         assert_eq!(&*cow, b"abc");
+
         // Always Owned — memcomparable always needs decode
         match cow {
             std::borrow::Cow::Owned(_) => {}

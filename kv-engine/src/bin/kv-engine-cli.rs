@@ -311,6 +311,7 @@ impl Command {
                 |(_, opt_args)| {
                     let (begin, end) = opt_args
                         .map_or((None, None), |(_, begin, _, end)| (Some(begin), Some(end)));
+
                     Command::Scan { begin, end }
                 },
             )(i)

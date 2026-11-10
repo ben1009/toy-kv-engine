@@ -289,6 +289,7 @@ impl LsmMvccInner {
 
     pub(crate) fn closed_admission_generation(&self) -> Option<u64> {
         let publication = self.publication.lock();
+
         (!publication.admission_open).then_some(publication.fence_generation)
     }
 
@@ -304,6 +305,7 @@ impl LsmMvccInner {
         self.commit_gate.store(false, Ordering::SeqCst);
         self.publication_condvar.notify_all();
         self.async_publication_changed.notify_waiters();
+
         true
     }
 
@@ -382,6 +384,7 @@ impl LsmMvccInner {
             self.publication_condvar.notify_all();
             self.async_publication_changed.notify_waiters();
         }
+
         true
     }
 
@@ -417,6 +420,7 @@ impl LsmMvccInner {
             self.retire_commit_ts(next);
             return Err(self.commit_gate_error());
         }
+
         Ok(next)
     }
 
@@ -531,6 +535,7 @@ impl LsmMvccInner {
         if publication.next_to_publish != previous_frontier {
             self.async_publication_changed.notify_waiters();
         }
+
         if publication.waiters > 0 && publication.next_to_publish != previous_frontier {
             self.publication_condvar.notify_all();
             self.async_publication_changed.notify_waiters();
@@ -667,6 +672,7 @@ impl LsmMvccInner {
         }
         let notification = self.async_publication_changed.notified();
         tokio::pin!(notification);
+
         loop {
             notification.as_mut().enable();
             {
@@ -1359,6 +1365,7 @@ impl LsmMvccInner {
     ) -> anyhow::Result<usize> {
         u32::try_from(entries.len())
             .map_err(|_| anyhow::anyhow!("batch entry count exceeds u32::MAX"))?;
+
         entries
             .iter()
             .try_fold(0usize, |total, (key, value, kind)| {
@@ -1771,6 +1778,7 @@ impl LsmMvccInner {
             self.publication_condvar.notify_all();
             self.async_publication_changed.notify_waiters();
         }
+
         true
     }
 
@@ -1981,6 +1989,7 @@ mod tests {
             let barrier = Arc::clone(&barrier);
             workers.push(std::thread::spawn(move || {
                 barrier.wait();
+
                 mvcc.reserve_commit_ts().unwrap()
             }));
         }
@@ -2061,6 +2070,7 @@ mod tests {
 
     fn wait_for_ready(mvcc: &LsmMvccInner, count: usize) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+
         while mvcc.publication.lock().ready.len() != count {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -2079,6 +2089,7 @@ mod tests {
         let followers: Vec<_> = (3..=4)
             .map(|timestamp| {
                 let mvcc = Arc::clone(&mvcc);
+
                 std::thread::spawn(move || mvcc.publish_commit_ts(timestamp).unwrap())
             })
             .collect();
@@ -2131,6 +2142,7 @@ mod tests {
         let followers: Vec<_> = (2..=64)
             .map(|timestamp| {
                 let mvcc = Arc::clone(&mvcc);
+
                 std::thread::spawn(move || mvcc.publish_commit_ts(timestamp).unwrap())
             })
             .collect();
@@ -2596,6 +2608,7 @@ mod native_async_tests {
             tokio::pin!(publish);
             poll_fn(|cx| {
                 assert!(publish.as_mut().poll(cx).is_pending());
+
                 Poll::Ready(())
             })
             .await;
@@ -2620,6 +2633,7 @@ mod native_async_tests {
         tokio::pin!(publish);
         poll_fn(|cx| {
             assert!(publish.as_mut().poll(cx).is_pending());
+
             Poll::Ready(())
         })
         .await;
@@ -2647,6 +2661,7 @@ mod async_cancellation_tests {
         let mut later = Box::pin(mvcc.publish_commit_ts_async(2));
         poll_fn(|cx| {
             assert!(later.as_mut().poll(cx).is_pending());
+
             Poll::Ready(())
         })
         .await;

@@ -128,6 +128,7 @@ impl Snapshot {
                 .run_result(move || {
                     #[cfg(feature = "chaos-testing")]
                     crate::chaos::failpoint::fail_point!("snapshot.get_async.after_dispatch");
+
                     snap.storage.get_with_ts(&key, snap.read_ts)
                 })
                 .await

@@ -121,6 +121,7 @@ fn drop_sst_page_cache(dir: &std::path::Path) {
             && let Ok(file) = std::fs::File::open(&path)
         {
             let rc =
+                // SAFETY: file owns a live descriptor and posix_fadvise receives only integer offsets.
                 unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
             assert_eq!(rc, 0, "posix_fadvise failed for {}", path.display());
         }

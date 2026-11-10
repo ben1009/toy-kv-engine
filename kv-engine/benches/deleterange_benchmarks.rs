@@ -88,6 +88,7 @@ fn count_scan(iter: impl StorageIterator) -> usize {
         count += 1;
         iter.next().unwrap();
     }
+
     count
 }
 
@@ -452,6 +453,7 @@ fn bench_flush_compaction(c: &mut Criterion) {
                     let key = format!("key{:06}", i);
                     lsm.put(key.as_bytes(), &value).unwrap();
                 }
+
                 (dir, lsm)
             },
             |(dir, lsm)| {
@@ -470,6 +472,7 @@ fn bench_flush_compaction(c: &mut Criterion) {
             || {
                 let dir = tempfile::tempdir().unwrap();
                 let lsm = KvEngine::open(dir.path(), make_options()).unwrap();
+
                 (dir, lsm)
             },
             |(dir, lsm)| {
@@ -495,6 +498,7 @@ fn bench_flush_compaction(c: &mut Criterion) {
                 }
                 lsm.delete_range(b"key001000", b"key002000").unwrap();
                 flush_all(&lsm);
+
                 (dir, lsm)
             },
             |(dir, lsm)| {
@@ -523,6 +527,7 @@ fn bench_flush_compaction(c: &mut Criterion) {
                 // Now add a range-only tombstone and flush
                 lsm.delete_range(b"key000500", b"key000800").unwrap();
                 flush_all(&lsm);
+
                 (dir, lsm)
             },
             |(dir, lsm)| {
@@ -564,6 +569,7 @@ fn bench_recovery(c: &mut Criterion) {
                         std::fs::copy(entry.path(), temp_dir.path().join(entry.file_name()))
                             .unwrap();
                     }
+
                     temp_dir
                 },
                 |temp_dir| {
@@ -596,6 +602,7 @@ fn bench_recovery(c: &mut Criterion) {
                     let entry = entry.unwrap();
                     std::fs::copy(entry.path(), temp_dir.path().join(entry.file_name())).unwrap();
                 }
+
                 temp_dir
             },
             |temp_dir| {

@@ -289,6 +289,7 @@ impl WalV7LeaderWriter {
         drop(buffers);
         drop(logical_batch);
         let retain_result = reservation.finish_after_io();
+
         match (result, retain_result) {
             (Ok(commit), Ok(())) => {
                 self.poisoned = false;
@@ -632,6 +633,7 @@ fn read_header_digest(file: &File) -> Result<[u8; 32]> {
         header.encode()?.as_slice() == header_bytes,
         "v7 WAL immutable header is not canonical"
     );
+
     Ok(Sha256::digest(header_bytes).into())
 }
 
@@ -684,6 +686,7 @@ fn fdatasync_once(file: &File) -> io::Result<()> {
     crate::chaos::failpoint::fail_point!("wal.v7.leader.fdatasync", |_| Err(io::Error::other(
         "injected v7 WAL sync failure"
     )));
+
     loop {
         // SAFETY: the file descriptor is live and owned by `file`.
         let result = unsafe { libc::fdatasync(file.as_raw_fd()) };
@@ -755,6 +758,7 @@ mod tests {
         let mut image = header.encode()?.to_vec();
         image.extend_from_slice(&encode_generation_zero_frontier(header.digest()?)?);
         fs::write(path, image)?;
+
         recover(
             path,
             ActiveBoundary {
@@ -791,6 +795,7 @@ mod tests {
 
     fn resource_owner(installed: &WalV7InstalledRecovery) -> Result<Arc<WalV7ReservationOwner>> {
         let ledger = WalV7ResourceLedger::new(resource_limits())?;
+
         Ok(Arc::new(WalV7ReservationOwner::new(ledger, installed)?))
     }
 
@@ -863,6 +868,7 @@ mod tests {
         assert_eq!(installed.batches, [first, second]);
         assert_eq!(installed.next_ticket, 2);
         assert_eq!(installed.append_offset, committed_end);
+
         Ok(())
     }
 
@@ -894,6 +900,7 @@ mod tests {
         wal.sync()?;
         wal.close()?;
         assert_eq!(fs::read(&path)?, original_image);
+
         Ok(())
     }
 
@@ -928,6 +935,7 @@ mod tests {
                 .is_err()
         );
         assert_eq!(fs::read(&path)?, uncertain_image);
+
         Ok(())
     }
 
@@ -972,6 +980,7 @@ mod tests {
             );
             assert_eq!(fs::read(&path)?, uncertain_image);
         }
+
         Ok(())
     }
 
@@ -1053,6 +1062,7 @@ mod tests {
                 );
             }
         }
+
         Ok(())
     }
 
@@ -1127,6 +1137,7 @@ mod tests {
         assert!(observations[0].succeeded);
 
         wal.close()?;
+
         Ok(())
     }
 
@@ -1334,6 +1345,7 @@ mod tests {
                 assert_eq!(owner.snapshot().buffer_memory_bytes, 0);
             }
         }
+
         Ok(())
     }
 
@@ -1406,6 +1418,7 @@ mod tests {
             replacement,
         )?;
         assert_eq!(writer.runtime_seed()?.next_ticket, 1);
+
         Ok(())
     }
 
@@ -1455,6 +1468,7 @@ mod tests {
         assert_eq!(ledger.snapshot(), expected);
         drop(owner);
         assert_eq!(ledger.snapshot(), WalV7ResourceCharge::default());
+
         Ok(())
     }
 
@@ -1622,6 +1636,7 @@ mod tests {
             previous.frontier.prefix_digest
         );
         assert_eq!(recovered.batches, [baseline]);
+
         Ok(())
     }
 
@@ -1696,6 +1711,7 @@ mod tests {
             previous.frontier.prefix_digest
         );
         assert_eq!(recovered.batches, [baseline]);
+
         Ok(())
     }
 

@@ -144,6 +144,7 @@ fn setup_instance(vlog_enabled: bool, min_value_size: usize, compaction: bool) -
     } else {
         make_options(vlog_enabled, min_value_size)
     };
+
     TempEngine::new(options)
 }
 
@@ -283,6 +284,7 @@ fn bench_read_point_get(c: &mut Criterion) {
 
         group.bench_function(label, |b| {
             let mut i = 0usize;
+
             b.iter(|| {
                 let result = lsm.get(&keys[i % keys.len()]).unwrap();
                 black_box(result);
@@ -306,6 +308,7 @@ fn bench_read_point_get(c: &mut Criterion) {
 
         group.bench_function("vlog_cached", |b| {
             let mut i = 0usize;
+
             b.iter(|| {
                 let result = lsm.get(&keys[i % keys.len()]).unwrap();
                 black_box(result);
@@ -350,6 +353,7 @@ fn bench_read_scan(c: &mut Criterion) {
         group.bench_function(label, |b| {
             b.iter(|| {
                 let mut scan = lsm.scan(Bound::Unbounded, Bound::Unbounded).unwrap();
+
                 while scan.is_valid() {
                     black_box(scan.value());
                     scan.next().unwrap();
@@ -426,6 +430,7 @@ fn bench_prefix_scan(c: &mut Criterion) {
                     }
                     total += start.elapsed();
                 }
+
                 total
             })
         });
@@ -548,6 +553,7 @@ fn bench_cold_point_get(c: &mut Criterion) {
 
         group.bench_function(label, |b| {
             let mut i = 0usize;
+
             b.iter(|| {
                 let result = lsm.get(&sst_keys[i % sst_keys.len()]).unwrap();
                 black_box(result);
@@ -604,6 +610,7 @@ fn bench_flush_throughput(c: &mut Criterion) {
                         enable_cache_backfill: true,
                         prefix_bloom: PrefixBloomOptions::default(),
                     };
+
                     TempEngine::new(options)
                 },
                 |lsm| {
@@ -684,6 +691,7 @@ fn bench_cold_scan(c: &mut Criterion) {
         group.bench_function(label, |b| {
             b.iter(|| {
                 let mut scan = lsm.scan(Bound::Unbounded, Bound::Unbounded).unwrap();
+
                 while scan.is_valid() {
                     black_box(scan.value());
                     scan.next().unwrap();
@@ -714,11 +722,13 @@ fn drop_os_page_cache(dir: &Path) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
+
     for entry in entries.filter_map(|e| e.ok()) {
         let path = entry.path();
         if path.extension().is_some_and(|ext| ext == "sst")
             && let Ok(file) = std::fs::File::open(&path)
         {
+            // SAFETY: file owns a live descriptor and posix_fadvise receives only integer offsets.
             let rc =
                 unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
             assert_eq!(rc, 0, "posix_fadvise failed for {}", path.display());

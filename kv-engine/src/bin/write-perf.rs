@@ -578,6 +578,7 @@ impl HarnessConfig {
                  (expected force, admit, or bypass)"
             ),
         };
+
         #[allow(clippy::needless_update)]
         ParallelScanOptions {
             max_parallelism: self.parallel_scan_max_parallelism,
@@ -1099,6 +1100,7 @@ fn wal_v8_digest_record(engine: &KvEngine, wal_run_info: WalRunInfo) -> Option<W
     }
 
     let profile = engine.write_profile();
+
     Some(WalV8DigestRecord {
         payload_hash_bytes: profile.wal_v8_payload_hash_bytes,
         payload_hash_cpu_ns: profile.wal_v8_payload_hash_cpu_ns,
@@ -1218,6 +1220,7 @@ fn process_cpu_times() -> Option<ProcessCpuTimes> {
             system_ms: to_ms(usage.ru_stime),
         })
     }
+
     #[cfg(not(unix))]
     None
 }
@@ -1622,6 +1625,7 @@ fn validate_json_artifact(path: &Path) -> Result<()> {
 
 fn validate_json_record(record: &serde_json::Value) -> Result<()> {
     let schema = json_str(record, "schema")?;
+
     match schema {
         JSON_SCHEMA_V1 => Ok(()),
         JSON_SCHEMA_V2 => validate_steady_state_json_record(record),
@@ -1636,6 +1640,7 @@ fn validate_steady_state_json_record(record: &serde_json::Value) -> Result<()> {
     );
 
     let phase = json_str(record, "phase")?;
+
     match phase {
         "prepare" => {
             anyhow::ensure!(
@@ -1720,6 +1725,7 @@ fn validate_steady_state_measurement_json(record: &serde_json::Value) -> Result<
             "idle result.ops must match validation.completed_operations"
         );
     }
+
     Ok(())
 }
 
@@ -1959,6 +1965,7 @@ fn validate_steady_state_task_shape(task: &serde_json::Value, workload: &str) ->
         }
         other => bail!("unknown steady-state workload `{other}`"),
     }
+
     Ok(())
 }
 
@@ -2000,6 +2007,7 @@ fn validate_task_fixed_shape(
         (None, Some(_)) => bail!("missing `zipfian_exponent`"),
         (None, None) => {}
     }
+
     Ok(())
 }
 
@@ -2177,6 +2185,7 @@ fn validate_rate_window_total_json(
     complete_windows: u64,
 ) -> Result<u64> {
     validate_rate_window_json(rate_window, field_name, complete_windows)?;
+
     json_u64(rate_window, "total")
 }
 
@@ -2189,6 +2198,7 @@ fn require_throughput_rate_window_total(
     let value = throughput
         .get(field)
         .with_context(|| format!("{workload} throughput.{field} must be present"))?;
+
     validate_rate_window_total_json(value, &format!("throughput.{field}"), complete_windows)
 }
 
@@ -2284,6 +2294,7 @@ fn max_latency_samples(selected_operations: u64, clients: u64, sample_every: u64
     let active_clients = clients.min(selected_operations);
 
     let remaining_operations = selected_operations - active_clients;
+
     active_clients
         .checked_add(remaining_operations / sample_every)
         .context("maximum latency sample count overflowed")
@@ -2445,6 +2456,7 @@ fn ensure_optional_counter_monotonic(
     if let (Some(before), Some(after)) = (before, after) {
         ensure_counter_monotonic(field, before, after)?;
     }
+
     Ok(())
 }
 
@@ -2621,6 +2633,7 @@ fn validate_scan_error_counters(validation: &serde_json::Value, workload: &str) 
             "{workload} validation.{field} must be zero"
         );
     }
+
     Ok(())
 }
 
@@ -2862,6 +2875,7 @@ fn json_optional_str<'a>(record: &'a serde_json::Value, field: &str) -> Result<O
     if value.is_null() {
         return Ok(None);
     }
+
     value
         .as_str()
         .map(Some)
@@ -3525,6 +3539,7 @@ fn run_wal_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
                     latency_samples.push(start.elapsed().as_nanos() as u64);
                 }
             }
+
             Ok(latency_samples)
         }));
     }
@@ -3702,6 +3717,7 @@ fn run_wal_batch_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>
                 next += current_batch;
                 batch_index += 1;
             }
+
             Ok(WalWriterResult {
                 latency_samples,
                 #[cfg(feature = "bench")]
@@ -3800,6 +3816,7 @@ fn run_wal_batch_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>
     measurement.record.latency = cfg.latency_sample_every.map(|sample_every| {
         let completed_commits =
             effective_wal_batch_commit_count(num_keys, writer_threads, batch_size);
+
         latency_record(sample_every, completed_commits, &latency_samples)
     });
 
@@ -3831,6 +3848,7 @@ fn run_wal_batch_delete_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasu
             let thread_ops = per_thread + usize::from(t < remainder);
             let start_idx = t * per_thread + remainder.min(t);
             let mut next = 0usize;
+
             while next < thread_ops {
                 let current_batch = (thread_ops - next).min(batch_size);
                 let mut keys = Vec::with_capacity(current_batch);
@@ -3943,6 +3961,7 @@ fn run_memtable_publish_workload(
                     .expect("memtable publish failed");
                 next += current_batch;
             }
+
             Ok(())
         }));
     }
@@ -3990,6 +4009,7 @@ fn effective_wal_batch_size(num_keys: usize, writer_threads: usize, requested: u
     let remainder = num_keys % writer_threads;
 
     let max_thread_ops = per_thread + usize::from(remainder > 0);
+
     requested.min(max_thread_ops.max(1))
 }
 
@@ -4000,6 +4020,7 @@ fn effective_wal_batch_commit_count(
 ) -> u64 {
     let per_thread = num_keys / writer_threads;
     let remainder = num_keys % writer_threads;
+
     (0..writer_threads)
         .map(|thread| (per_thread + usize::from(thread < remainder)).div_ceil(batch_size) as u64)
         .sum()
@@ -4030,6 +4051,7 @@ fn build_crud_bench_toykv_options(cfg: &HarnessConfig) -> LsmStorageOptions {
     if let Some(vlog) = options.value_separation.as_mut() {
         vlog.min_value_size = 4 * 1024;
     }
+
     options
 }
 
@@ -4177,6 +4199,7 @@ fn crud_bench_like_payload(value_size: usize) -> Vec<u8> {
     value.push(6);
 
     value.extend(std::iter::repeat_n(b'x', value_size.saturating_sub(1)));
+
     value
 }
 
@@ -4192,6 +4215,7 @@ fn splitmix64(mut x: u64) -> u64 {
     z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
 
     z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+
     z ^ (z >> 31)
 }
 
@@ -4203,6 +4227,7 @@ fn steady_state_loaded_key(id: u64) -> [u8; 20] {
     let mut key = [b'0'; 20];
 
     key[..8].copy_from_slice(&id.to_be_bytes());
+
     key
 }
 
@@ -4210,6 +4235,7 @@ fn steady_state_missing_key(id: u64) -> [u8; 20] {
     let mut key = steady_state_loaded_key(id);
 
     key[19] = b'1';
+
     key
 }
 
@@ -4300,6 +4326,7 @@ impl SteadyStateOperationMix {
         ));
 
         schedule.shuffle(&mut rng);
+
         schedule
     }
 
@@ -4357,6 +4384,7 @@ impl ZipfianSampler {
         let rank = match self.cdf.binary_search_by(|probe| probe.total_cmp(&needle)) {
             Ok(idx) | Err(idx) => idx,
         } as u64;
+
         splitmix64(rank) % self.cdf.len() as u64
     }
 }
@@ -4401,6 +4429,7 @@ impl SteadyStateKeySelector {
 
     fn key(&self, rng: &mut ChaCha12Rng) -> [u8; 20] {
         let id = self.sample(rng);
+
         match self {
             Self::UniformMissingInRange { .. } => steady_state_missing_key(id),
             Self::Uniform { .. } | Self::ScrambledZipfian { .. } => steady_state_loaded_key(id),
@@ -4468,6 +4497,7 @@ impl SteadyStateWindowStats {
             self.rate_windows
                 .resize(other.rate_windows.len(), SteadyStateRateWindow::default());
         }
+
         for (idx, other_window) in other.rate_windows.into_iter().enumerate() {
             self.rate_windows[idx].merge(other_window);
         }
@@ -4516,6 +4546,7 @@ fn wait_for_steady_state_window_start(
     window_start: &Mutex<Option<Instant>>,
 ) -> Instant {
     start_barrier.wait();
+
     (*window_start.lock()).expect("steady-state window start set before worker release")
 }
 
@@ -4614,6 +4645,7 @@ fn run_steady_state_read_window(
             .map_err(|_| anyhow!("steady-state read worker thread panicked"))??;
         stats.merge(worker);
     }
+
     Ok(stats)
 }
 
@@ -4729,6 +4761,7 @@ fn run_steady_state_scan_window(
             .map_err(|_| anyhow!("steady-state scan worker thread panicked"))??;
         stats.merge(worker);
     }
+
     Ok(stats)
 }
 
@@ -4827,6 +4860,7 @@ fn run_steady_state_ingest_window(
             .map_err(|_| anyhow!("steady-state ingest worker thread panicked"))??;
         stats.merge(worker);
     }
+
     Ok(stats)
 }
 
@@ -4983,6 +5017,7 @@ fn run_steady_state_mixed_window(
             .map_err(|_| anyhow!("steady-state worker thread panicked"))??;
         stats.merge(worker);
     }
+
     Ok(stats)
 }
 
@@ -5155,6 +5190,7 @@ fn run_steady_state_transaction_window(
             .map_err(|_| anyhow!("steady-state transaction worker thread panicked"))??;
         stats.merge(worker);
     }
+
     Ok(stats)
 }
 
@@ -5181,6 +5217,7 @@ fn latency_record(
     sorted.sort_unstable();
 
     let sum: u128 = sorted.iter().map(|sample| *sample as u128).sum();
+
     LatencyRecord {
         sample_every,
         samples: sorted.len() as u64,
@@ -5234,6 +5271,7 @@ fn rate_window_record(values: impl Iterator<Item = u64>) -> Option<RateWindowRec
     sorted.sort_unstable();
 
     let len = sorted.len();
+
     Some(RateWindowRecord {
         total,
         avg_per_sec: total as f64 / len as f64,
@@ -5250,6 +5288,7 @@ fn percentile_rate(sorted_values: &[u64], percentile: f64) -> f64 {
     debug_assert!(!sorted_values.is_empty());
 
     let idx = ((sorted_values.len() - 1) as f64 * percentile).round() as usize;
+
     sorted_values[idx] as f64
 }
 
@@ -5257,6 +5296,7 @@ fn percentile_latency_ms(sorted_samples_ns: &[u64], percentile: f64) -> f64 {
     debug_assert!(!sorted_samples_ns.is_empty());
 
     let idx = ((sorted_samples_ns.len() - 1) as f64 * percentile).round() as usize;
+
     sorted_samples_ns[idx] as f64 / 1_000_000.0
 }
 
@@ -5473,6 +5513,7 @@ fn run_concurrent_batch_write_phase(
             let thread_ops = per_thread + usize::from(t < remainder);
             let base_idx = t * per_thread + remainder.min(t);
             let mut next = 0usize;
+
             while next < thread_ops {
                 let current_batch = (thread_ops - next).min(batch_size);
                 let mut keys = Vec::with_capacity(current_batch);
@@ -6621,6 +6662,7 @@ fn write_golden_manifest(path: &Path, manifest: GoldenManifestRecord) -> Result<
     let manifest_path = golden_manifest_path(path);
 
     let contents = serde_json::to_vec_pretty(&manifest)?;
+
     fs::write(&manifest_path, contents)
         .with_context(|| format!("failed to write {}", manifest_path.display()))
 }
@@ -6789,6 +6831,7 @@ fn golden_manifest_engine_options_hash_matches(
     if manifest.engine_options_hash == engine_options_hash(expected_options)? {
         return Ok(true);
     }
+
     Ok(!expected_options.serializable
         && !manifest.engine_options.serializable
         && manifest.engine_options_hash == legacy_engine_options_hash(expected_options)?)
@@ -6805,6 +6848,7 @@ fn golden_baseline_record(path: &Path, engine: &KvEngine) -> Result<GoldenBaseli
 
 fn count_files_with_extension(path: &Path, extension: &str) -> Result<usize> {
     let mut count = 0usize;
+
     match fs::read_dir(path) {
         Ok(entries) => {
             for entry in entries {
@@ -6855,6 +6899,7 @@ fn stable_digest(bytes: &[u8]) -> String {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
+
     format!("fnv1a64:{hash:016x}")
 }
 
@@ -6912,6 +6957,7 @@ fn source_commit() -> String {
     if let Some(commit) = option_env!("GITHUB_SHA").filter(|commit| !commit.trim().is_empty()) {
         return commit.to_string();
     }
+
     runtime_git_source_commit().unwrap_or_else(|| "unknown".to_string())
 }
 
@@ -6927,6 +6973,7 @@ fn runtime_git_source_commit() -> Option<String> {
     let commit = String::from_utf8(output.stdout).ok()?;
 
     let commit = commit.trim();
+
     (!commit.is_empty()).then(|| commit.to_string())
 }
 
@@ -7865,6 +7912,7 @@ fn make_measurement(
     };
 
     let summary = summary_for(&record);
+
     BenchMeasurement { record, summary }
 }
 
@@ -7989,6 +8037,7 @@ fn summary_for(record: &MeasurementRecord) -> String {
             max_block_loads, max_sst_switches
         );
     }
+
     summary
 }
 
@@ -8191,6 +8240,7 @@ impl<'a> CleanupPathOnDrop<'a> {
     fn finalize(mut self) -> Result<()> {
         let result = finalize_path(self.cfg, self.path);
         self.armed = result.is_err();
+
         result
     }
 }
@@ -8226,6 +8276,7 @@ fn checkpoint_clone_source_path(target_path: &Path) -> PathBuf {
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| "workload".to_string());
+
     target_path.with_file_name(format!(
         "{name}.golden-source-{}-{}.tmp",
         std::process::id(),
@@ -8238,6 +8289,7 @@ fn checkpoint_target_lock_path(target_path: &Path) -> PathBuf {
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| "checkpoint".to_string());
+
     target_path.with_file_name(format!("{name}.checkpoint.lock"))
 }
 
@@ -8246,6 +8298,7 @@ fn incremental_backup_init_lock_path(repository: &Path) -> PathBuf {
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| "pitr-repository".to_string());
+
     repository.with_file_name(format!(".{name}.incremental-backup.init.lock"))
 }
 
@@ -8499,6 +8552,7 @@ mod tests {
         let mut attempts = 0;
         let mut operation = || {
             attempts += 1;
+
             if attempts == 1 {
                 Err(anyhow!(PITR_ADMISSION_BARRIER_ERROR).context("write batch rejected"))
             } else {
@@ -8515,6 +8569,7 @@ mod tests {
         let mut attempts = 0;
         let mut operation = || {
             attempts += 1;
+
             Err::<(), _>(anyhow!(PITR_ADMISSION_BARRIER_ERROR))
         };
         assert!(
@@ -8526,6 +8581,7 @@ mod tests {
         let mut attempts = 0;
         let mut operation = || {
             attempts += 1;
+
             Err::<(), _>(anyhow!("unrelated write failure"))
         };
         assert!(
@@ -9154,6 +9210,7 @@ mod tests {
         };
 
         manifest.manifest_digest = golden_manifest_digest(&manifest).expect("digest manifest");
+
         manifest
     }
 
@@ -9846,6 +9903,7 @@ mod tests {
             STEADY_STATE_KEY_STREAM_LABEL,
             0,
         ));
+
         for _ in 0..1000 {
             assert!(sampler.sample(&mut rng) < 17);
         }

@@ -793,6 +793,7 @@ fn collect_scan_keys(iter: crate::lsm_iterator::ScanIterator) -> Vec<Vec<u8>> {
         results.push(iter.key().to_vec());
         iter.next().unwrap();
     }
+
     results
 }
 
@@ -804,6 +805,7 @@ fn collect_scan_kv(iter: crate::lsm_iterator::ScanIterator) -> Vec<(Vec<u8>, Vec
         results.push((iter.key().to_vec(), iter.value().to_vec()));
         iter.next().unwrap();
     }
+
     results
 }
 

@@ -220,6 +220,7 @@ impl MockStorage {
                 files.iter().map(|x| self.file_list[x]).collect::<Vec<_>>()
             );
         }
+
         if with_key {
             self.check_keys();
         }
@@ -236,6 +237,7 @@ impl MockStorage {
         for (level, files) in &self.snapshot.levels {
             println!("L{level} ({}): {:?}", files.len(), files);
         }
+
         if with_key {
             self.check_keys();
         }
@@ -282,6 +284,7 @@ fn generate_random_split(
             KeyBytes::for_testing_from_bytes_no_ts(end_bytes.freeze()),
         ));
     }
+
     result
 }
 

@@ -309,6 +309,7 @@ impl PitrState {
             self.legacy_v7_boundary_recovery || self.has_legacy_v7_successor_without_boundary();
         self.validate_with_legacy_boundary(missing_legacy_boundary)?;
         self.legacy_v7_boundary_recovery = missing_legacy_boundary;
+
         Ok(missing_legacy_boundary)
     }
 
@@ -732,6 +733,7 @@ impl PitrState {
                 "commit anchor exceeds recorded-time high-water"
             );
         }
+
         Ok(())
     }
 }
@@ -1455,6 +1457,7 @@ fn replay_pitr_records_inner(
             "legacy v7 Active boundary requires engine WAL-header recovery"
         );
     }
+
     Ok(state)
 }
 
@@ -1637,6 +1640,7 @@ fn require_active_boundary_formats(value: &serde_json::Value) -> Result<()> {
         }
         _ => {}
     }
+
     Ok(())
 }
 
@@ -1661,6 +1665,7 @@ pub(crate) fn migrate_legacy_snapshot_obligations(state: &mut PitrState) -> Resu
             }
         }
     }
+
     state.validate()
 }
 
@@ -1674,6 +1679,7 @@ fn pitr_snapshot_digest(format_version: u32, payload_len: u32, payload: &[u8]) -
     }
     digest.update(payload_len.to_be_bytes());
     digest.update(payload);
+
     digest.finalize().into()
 }
 
@@ -1687,6 +1693,7 @@ fn pitr_record_digest(format_version: u32, payload_len: u32, payload: &[u8]) -> 
     }
     digest.update(payload_len.to_be_bytes());
     digest.update(payload);
+
     digest.finalize().into()
 }
 
@@ -1704,6 +1711,7 @@ pub(crate) fn encode_pitr_record_stream(records: &[PitrManifestRecord]) -> Resul
             "PITR manifest record stream exceeds the configured size limit"
         );
     }
+
     Ok(encoded)
 }
 
@@ -1732,6 +1740,7 @@ pub(crate) fn decode_pitr_record_stream(bytes: &[u8]) -> Result<Vec<PitrManifest
         records.push(decode_pitr_record(&bytes[offset..offset + frame_len])?);
         offset += frame_len;
     }
+
     Ok(records)
 }
 
@@ -1825,6 +1834,7 @@ fn validate_active_boundary_advance(previous: ActiveBoundary, next: ActiveBounda
             "Active WAL boundary ticket advance lacks a larger durable prefix"
         );
     }
+
     Ok(())
 }
 
@@ -1910,6 +1920,7 @@ fn apply_high_water(
             "empty segment cannot advance recorded-time high-water"
         );
     }
+
     Ok(())
 }
 
@@ -1926,6 +1937,7 @@ mod tests {
         encoded.extend_from_slice(&payload_len.to_be_bytes());
         encoded.extend_from_slice(&digest);
         encoded.extend_from_slice(payload);
+
         encoded
     }
 
@@ -1938,6 +1950,7 @@ mod tests {
         encoded.extend_from_slice(&payload_len.to_be_bytes());
         encoded.extend_from_slice(&digest);
         encoded.extend_from_slice(payload);
+
         encoded
     }
 
@@ -3091,6 +3104,7 @@ mod tests {
         }
 
         let record_payload = serde_json::to_vec(&legacy_seal).unwrap();
+
         for format_version in [
             PREVIOUS_PITR_MANIFEST_FORMAT_VERSION,
             PRE_V10_PITR_MANIFEST_FORMAT_VERSION,
@@ -3304,6 +3318,7 @@ mod tests {
                 immutable_boundary: Some(immutable_boundary(active, 8192)),
             },
         ]);
+
         for last_commit_anchor in [None, Some(commit)] {
             let error = replay_pitr_records(records.iter().cloned().chain([
                 PitrManifestRecord::SegmentSealed {
@@ -3346,6 +3361,7 @@ mod tests {
             },
             entry_digest: [9; 32],
         };
+
         replay_pitr_records([
             PitrManifestRecord::Snapshot(Box::new(previous)),
             PitrManifestRecord::ActiveBoundaryAdvanced { boundary: initial },

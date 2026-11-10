@@ -281,6 +281,7 @@ pub(crate) fn required_source_objects(
             wal_digest_policy,
         });
     }
+
     Ok(objects)
 }
 
@@ -315,6 +316,7 @@ pub(crate) fn load_verified_source_objects(
         verify_source_object(object, &bytes)?;
         loaded.push((object.clone(), bytes));
     }
+
     Ok(loaded)
 }
 
@@ -380,6 +382,7 @@ pub(crate) fn decode_restore_segment_batches(
         _ => decode_restore_wal_batches_for_segment(wal, expected, limits)?,
     };
     validate_segment_batch_range(expected, &batches)?;
+
     Ok(batches)
 }
 
@@ -404,6 +407,7 @@ pub(crate) fn load_verified_archive_objects(
             .iter()
             .find(|object| object.name == name)
             .and_then(|object| object.bytes);
+
         stager.read(name, expected)
     })
 }
@@ -633,6 +637,7 @@ impl ExactRestoreExecutor {
                 );
             }
         }
+
         Ok(())
     }
 
@@ -670,6 +675,7 @@ impl ExactRestoreExecutor {
                 return Ok(identity);
             }
         }
+
         anyhow::bail!("PITR restore timeline generation exhausted redraw attempts")
     }
 
@@ -762,6 +768,7 @@ impl ExactRestoreExecutor {
                 self.last_commit_ts = Some(batch.commit_ts);
                 self.applied_batches = next_count;
             }
+
             Ok(())
         })();
 
@@ -770,6 +777,7 @@ impl ExactRestoreExecutor {
             self.last_commit_ts = last_commit_ts;
             self.applied_batches = applied_batches;
         }
+
         result
     }
 
@@ -900,12 +908,14 @@ impl ExactRestoreExecutor {
             self.persist_frontier()?;
             self.remove_recovery_wal()?;
             self.publish()?;
+
             self.recovery_info()
         })();
 
         if result.is_err() {
             let _ = self.abort();
         }
+
         result
     }
 
@@ -1844,6 +1854,7 @@ mod tests {
                     ArchiveObjectKind::Wal => wal.clone(),
                     ArchiveObjectKind::Seal => seal.clone(),
                 };
+
                 (object, bytes)
             })
             .collect::<Vec<_>>();

@@ -110,6 +110,7 @@ impl WalV7PreparingBatch {
                 value.checked_add(1)
             })
             .map_err(|_| anyhow!("v7 producer preparation count overflow"))?;
+
         Ok(Self {
             count: Arc::clone(count),
         })
@@ -156,6 +157,7 @@ impl ParallelWalRuntimeStart {
             prewarm_buffers: true,
         };
         start.validate()?;
+
         Ok(start)
     }
 
@@ -190,6 +192,7 @@ impl ParallelWalRuntimeStart {
             prewarm_buffers: false,
         };
         start.validate()?;
+
         Ok(start)
     }
 
@@ -224,6 +227,7 @@ impl ParallelWalRuntimeStart {
             (None, None, None, None) => {}
             _ => bail!("parallel WAL startup has incomplete v7 recovery metadata"),
         }
+
         Ok(())
     }
 
@@ -299,6 +303,7 @@ fn validate_v7_header_digest(file: &File, expected_digest: [u8; 32]) -> Result<(
         actual_digest == expected_digest,
         "v7 WAL immutable header digest does not match the recovered runtime seed"
     );
+
     Ok(())
 }
 
@@ -344,6 +349,7 @@ impl BufferBudget {
                 .checked_add(1)
                 .ok_or_else(|| anyhow!("oversized WAL buffer waiter count overflow"))?;
         }
+
         loop {
             if state.closed {
                 if oversized {
@@ -396,6 +402,7 @@ impl BufferBudget {
         }
         let notification = self.async_available.notified();
         tokio::pin!(notification);
+
         loop {
             notification.as_mut().enable();
             {
@@ -555,6 +562,7 @@ impl WorkerBuffer for ParallelBuffer {
 
     fn retire(mut self, pool: &ArrayQueue<Self>) {
         self.release_budget();
+
         if self.poolable && self.cap() == BUFFER_POOL_BUF_SIZE {
             let _ = pool.push(self);
         } else if self.cap() == WAL_V7_FRAME_LEN
@@ -644,6 +652,7 @@ impl WalV7FrameJob {
             publish_v7_ready_batch(&mut admission, batch);
             drop(admission);
             self.inner.v7_frames_ready.notify_all();
+
             Ok(())
         })();
         if let Err(error) = &result {
@@ -673,6 +682,7 @@ fn publish_v7_ready_batch(admission: &mut AdmissionState, batch: AdmittedBatch) 
         ticket >= admission.v7_ready_ticket && ticket < admission.next_ticket,
         "v7 producer completion is outside assigned tickets"
     );
+
     if ticket == admission.v7_ready_ticket {
         admission.queue.push_back(batch);
         admission.v7_ready_ticket += 1;
@@ -761,6 +771,7 @@ impl ParallelWalV7Metadata {
             self.last_recorded_at.is_some() == (frontier.ticket_end > 0),
             "v7 runtime recorded-time cursor disagrees with its recovered ticket frontier"
         );
+
         Ok(())
     }
 }
@@ -1021,6 +1032,7 @@ impl AsyncV7ExtentControl {
 
     fn request(&self, end: u64) {
         self.target.fetch_max(end, Ordering::AcqRel);
+
         if let Some(requests) = self.requests.lock().as_ref() {
             // A full wake channel already guarantees another target check.
             let _ = requests.try_send(());
@@ -1034,6 +1046,7 @@ impl AsyncV7ExtentControl {
     #[cfg(test)]
     fn pause_before_chunk(&self) {
         let hook = self.before_chunk.lock().take();
+
         if let Some((entered, resume)) = hook {
             let _ = entered.send(());
             while !self.stopping.load(Ordering::Acquire) {
@@ -1103,9 +1116,11 @@ impl AsyncV7ExtentInitializer {
                     worker_control.fail("v7 extent initializer panicked".to_owned());
                     bail!("v7 extent initializer panicked");
                 }
+
                 Ok(())
             })
             .context("failed to spawn v7 extent initializer")?;
+
         Ok(Self {
             control,
             join: Some(join),
@@ -1119,6 +1134,7 @@ impl AsyncV7ExtentInitializer {
             join.join()
                 .map_err(|_| anyhow!("v7 extent initializer panicked"))??;
         }
+
         Ok(())
     }
 }
@@ -1315,6 +1331,7 @@ impl ParallelWalRuntime {
                             &mut v7_hash_inputs,
                         )?;
                     }
+
                     Ok(())
                 })) {
                     Ok(result) => result,
@@ -1513,6 +1530,7 @@ impl ParallelWalRuntime {
         let commit_ts = batch.commit_ts;
         let recorded_at = batch.recorded_at;
         let prepared = self.prepare_v7_batch(batch, limits)?;
+
         self.put_v7_prepared_batch(prepared, commit_ts, recorded_at)
     }
 
@@ -1650,6 +1668,7 @@ impl ParallelWalRuntime {
         // regardless of whether its producer has finished framing.
         self.inner.v7_frames_ready.notify_all();
         let _ = self.inner.packer_wake.try_send(true);
+
         Ok((ticket, first_data_offset, frame_job))
     }
 
@@ -1788,6 +1807,7 @@ impl ParallelWalRuntime {
         self.inner
             .file_size_limit
             .store(limit, std::sync::atomic::Ordering::Release);
+
         Ok(())
     }
 
@@ -1808,6 +1828,7 @@ impl ParallelWalRuntime {
         if self.inner.durability.state.lock().poison_ticket.is_some() {
             return true;
         }
+
         self.inner.admission.lock().poison.is_some()
     }
 
@@ -1828,6 +1849,7 @@ impl ParallelWalRuntime {
             admission.next_ticket != admission.initial_ticket,
         )?;
         profile.set_wal_sync_diagnostics_enabled(enabled);
+
         Ok(())
     }
 
@@ -1839,6 +1861,7 @@ impl ParallelWalRuntime {
         if cutoff == 0 {
             return Ok(());
         }
+
         self.wait_durable(cutoff - 1)
     }
 
@@ -1847,6 +1870,7 @@ impl ParallelWalRuntime {
         ensure!(ticket < assigned, "unassigned parallel WAL ticket {ticket}");
         let notification = self.inner.durability.async_changed.notified();
         tokio::pin!(notification);
+
         loop {
             // Register before reading the predicate; completion may race with
             // this check and the subsequent await without losing the wakeup.
@@ -1876,6 +1900,7 @@ impl ParallelWalRuntime {
             ticket < assigned,
             "submit_and_commit called with unassigned parallel WAL ticket {ticket} (next_ticket={assigned})"
         );
+
         loop {
             if state.durable_frontier > ticket {
                 return Ok(());
@@ -2027,6 +2052,7 @@ impl ParallelWalRuntime {
 
         threads.closed = true;
         threads.close_error.clone_from(&close_error);
+
         match close_error {
             Some(error) => Err(anyhow!(error)),
             None => Ok(()),
@@ -2044,12 +2070,14 @@ impl ParallelWalRuntime {
             threads.close_error.get_or_insert_with(|| message.clone());
             bail!(message);
         }
+
         Ok(())
     }
 
     #[cfg(feature = "chaos-testing")]
     fn close_failure_is_injected() -> bool {
         crate::chaos::failpoint::fail_point!("parallel_wal.close_failure", |_| true);
+
         false
     }
 
@@ -2071,6 +2099,7 @@ fn validate_v7_data_capacity(admission: &AdmissionState, fragment_count: u32) ->
         .v7_allocator
         .as_ref()
         .context("v7 Parallel runtime has no physical allocator")?;
+
     match allocator.data_capacity_status(fragment_count)? {
         WalV7DataCapacityStatus::Fits => Ok(()),
         WalV7DataCapacityStatus::RotationRequired => Err(anyhow::Error::new(
@@ -2092,6 +2121,7 @@ fn pack_admitted_groups(
         v7_hash_inputs.is_empty(),
         "v7 packer still owns unhashed inputs"
     );
+
     loop {
         let packed_result = {
             let mut admission = inner.admission.lock();
@@ -2235,6 +2265,7 @@ fn pack_admitted_groups(
                     materialize_v7_batches(v7_batches, prefix, &mut packed.writes)?;
                     publish_v7_prefix(inner, expected_ticket, prefix)?;
                 }
+
                 Ok(())
             })();
             if let Err(error) = materialized {
@@ -2347,6 +2378,7 @@ fn pack_admitted_groups(
                     prefix.logical_hasher.update(input.logical_batch.as_bytes());
                     prefix.last_commit_ts = input.commit_ts;
                 }
+
                 publish_v7_prefix(inner, expected_ticket, prefix)
             })();
             if let Err(error) = hashed {
@@ -2495,6 +2527,7 @@ fn take_admitted_group(
     } else {
         Vec::new()
     };
+
     Ok(Some(PackedGroup {
         first_ticket,
         next_ticket: expected_ticket,
@@ -2623,6 +2656,7 @@ fn materialize_v7_batches(
             batch.aligned_len,
         ));
     }
+
     Ok(())
 }
 
@@ -2655,6 +2689,7 @@ fn report_packer_failure(inner: &RuntimeInner, ticket: u64, error: &anyhow::Erro
     inner.v7_frames_ready.notify_all();
     let _ = inner.packer_wake.try_send(true);
     inner.buffer_budget.close();
+
     if let Some(failures) = inner.packer_failures.lock().as_ref() {
         let _ = failures.send(GroupWriteResult {
             group_id: u64::MAX,
@@ -2782,6 +2817,7 @@ fn coalesce_admitted_prefix(
 
     let deadline = Instant::now() + wait;
     let mut cutoff = inner.admission.lock().next_ticket;
+
     loop {
         let state = inner.durability.state.lock();
         if state.poison_ticket.is_some() {
@@ -3152,6 +3188,7 @@ fn append_v7_frontier(
             format!("v7 Parallel FRONTIER write failed: {error:#}"),
         );
     }
+
     result
 }
 
@@ -3232,6 +3269,7 @@ fn complete_v7_frontier_cycle(inner: &RuntimeInner, cycle: WalV7FrontierCycle) -
             .finish_after_io()
             .context("retire v7 Parallel transient buffer reservation")?;
     }
+
     Ok(())
 }
 
@@ -3245,6 +3283,7 @@ fn validate_sync_diagnostics_transition(
         !enabled || currently_enabled || !has_admitted_ticket,
         "WAL sync diagnostics must be enabled before the first WAL ticket"
     );
+
     Ok(())
 }
 
@@ -3402,6 +3441,7 @@ fn fdatasync_file(sync_file: &File) -> io::Result<()> {
         io::Error::other("injected parallel WAL fdatasync failure")
     ));
 
+    // SAFETY: sync_file owns a live descriptor and fdatasync retains no pointers after returning.
     let result = unsafe { libc::fdatasync(sync_file.as_raw_fd()) };
     if result == 0 {
         return Ok(());
@@ -3416,6 +3456,7 @@ fn wal_sync_timestamp() -> Option<std::time::Instant> {
     {
         Some(Instant::now())
     }
+
     #[cfg(not(feature = "bench"))]
     {
         None
@@ -3464,6 +3505,7 @@ fn check_v7_preparation_failure(inner: &RuntimeInner) -> Result<()> {
     {
         bail!("v7 extent preparation previously failed: {error}");
     }
+
     Ok(())
 }
 
@@ -3496,6 +3538,7 @@ fn initialize_v7_extent_prefix(
             *prepared_end += len as u64;
         }
     }
+
     Ok(())
 }
 
@@ -3564,6 +3607,7 @@ fn preallocate_runtime_for_write(
     if concurrent_preparation {
         control.request(end);
     }
+
     Ok(())
 }
 
@@ -3597,6 +3641,7 @@ fn prepare_v7_background_chunk(inner: &RuntimeInner, target: u64) -> Result<()> 
     }
     let ready = if next == aligned_target { target } else { next };
     inner.prepared_file_end.store(ready, Ordering::Release);
+
     Ok(())
 }
 
@@ -3610,6 +3655,8 @@ fn preallocate(file: &File, end: u64) -> Result<()> {
         return Ok(());
     }
 
+    // SAFETY: file owns a live descriptor and the preallocation range was checked and converted
+    // above.
     let result = unsafe {
         libc::fallocate(
             file.as_raw_fd(),
@@ -3631,11 +3678,13 @@ fn preallocate(file: &File, end: u64) -> Result<()> {
             .context("ftruncate fallback failed during WAL preallocation")?;
         return Ok(());
     }
+
     Err(error).context("fallocate failed during WAL preallocation")
 }
 
 fn round_up(value: u64, alignment: u64) -> Option<u64> {
     let remainder = value % alignment;
+
     if remainder == 0 {
         Some(value)
     } else {
@@ -3772,6 +3821,7 @@ mod tests {
         assert!(observations[0].succeeded);
 
         wal.close()?;
+
         Ok(())
     }
 
@@ -3779,6 +3829,7 @@ mod tests {
         let base =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/wal-opt/async-extent-tests");
         std::fs::create_dir_all(&base)?;
+
         Ok(tempfile::tempdir_in(base)?)
     }
 
@@ -3792,11 +3843,13 @@ mod tests {
         let (entered, waiting) = crossbeam_channel::bounded(1);
         let (resume, released) = crossbeam_channel::bounded(1);
         *control.before_chunk.lock() = Some((entered, released));
+
         Some((waiting, resume))
     }
 
     fn wait_for_extent_state(mut ready: impl FnMut() -> bool) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+
         while !ready() {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -3814,6 +3867,7 @@ mod tests {
                 value: vec![0x6b; 32 * 1024],
             });
         }
+
         batch
     }
 
@@ -3913,6 +3967,7 @@ mod tests {
             )?;
             assert_eq!(recovered.installed.batches, batches);
         }
+
         Ok(())
     }
 
@@ -3980,6 +4035,7 @@ mod tests {
             },
         )?;
         assert_eq!(recovered.installed.batches, batches);
+
         Ok(())
     }
 
@@ -4040,6 +4096,7 @@ mod tests {
             },
         )?;
         assert_eq!(recovered.installed.batches, batches);
+
         Ok(())
     }
 
@@ -4102,6 +4159,7 @@ mod tests {
             },
         )?;
         assert_eq!(recovered.installed.batches, vec![first, large]);
+
         Ok(())
     }
 
@@ -4165,6 +4223,7 @@ mod tests {
             )?;
             assert_eq!(recovered.installed.batches, batches);
         }
+
         Ok(())
     }
 
@@ -4235,6 +4294,7 @@ mod tests {
             },
         )?;
         assert_eq!(recovered.installed.batches, vec![first]);
+
         Ok(())
     }
 
@@ -4262,6 +4322,7 @@ mod tests {
                 count += 1;
             }
         }
+
         Ok(count)
     }
 
@@ -4534,6 +4595,7 @@ mod tests {
             },
         )?;
         assert_eq!(recovered.installed.batches, batches);
+
         Ok(())
     }
 
@@ -4587,6 +4649,7 @@ mod tests {
                 }
                 std::thread::yield_now();
             }
+
             Ok(())
         };
         wait_for_cutoff(second + 1)?;
@@ -4615,6 +4678,7 @@ mod tests {
             },
         )?;
         assert_eq!(recovered.installed.batches, batches);
+
         Ok(())
     }
 
@@ -4674,6 +4738,7 @@ mod tests {
             assert_eq!(snapshot.wal_commit_buffers, 2);
         }
         wal.close()?;
+
         Ok(())
     }
 
@@ -4709,6 +4774,7 @@ mod tests {
             "a lone producer waited for the configured ten-second join"
         );
         wal.close()?;
+
         Ok(())
     }
 
@@ -4766,6 +4832,7 @@ mod tests {
                 .context("full window blocked its ready prefix")?
                 .map_err(anyhow::Error::msg)?;
             waiter.join().expect("first ticket waiter panicked");
+
             Ok(())
         })?;
         for job in jobs.into_iter().flatten() {
@@ -4784,6 +4851,7 @@ mod tests {
             },
         )?;
         assert_eq!(recovered.installed.batches, batches);
+
         Ok(())
     }
 
@@ -4829,6 +4897,7 @@ mod tests {
             "close did not wake the open group"
         );
         drop(prepared);
+
         Ok(())
     }
 
@@ -4869,6 +4938,7 @@ mod tests {
         wal.submit_and_commit(first)?;
         assert!(wal.submit_and_commit(second).is_err());
         assert!(wal.close().is_err());
+
         Ok(())
     }
 
@@ -4918,6 +4988,7 @@ mod tests {
             waiter.join().expect("first ticket waiter panicked");
             second_job.take().expect("second producer job").finish()?;
             wal.submit_and_commit(second)?;
+
             Ok(())
         })?;
         wal.close()?;
@@ -5101,6 +5172,7 @@ mod tests {
     #[cfg(feature = "chaos-testing")]
     fn wait_for_v7_written(runtime: &super::ParallelWalRuntime, ticket_end: u64) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+
         while runtime.inner.durability.state.lock().written_frontier < ticket_end {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -5182,6 +5254,7 @@ mod tests {
             assert_eq!(runtime.inner.durability.state.lock().durable_frontier, 0);
             gate.release();
             closing.join().expect("close thread panicked")?;
+
             Ok(())
         })?;
         assert_eq!(owner.snapshot().buffer_memory_bytes, 0);
@@ -5326,6 +5399,7 @@ mod tests {
             },
         )?;
         assert_eq!(recovered.installed.batches, vec![first, second]);
+
         Ok(())
     }
 
@@ -5395,6 +5469,7 @@ mod tests {
             },
         )?;
         assert_eq!(recovered.installed.batches, vec![first]);
+
         Ok(())
     }
 
@@ -5687,6 +5762,7 @@ mod tests {
             .pop_front()
             .expect("test DATA has an admission entry");
         assert_eq!(entry.ticket, batch.ticket);
+
         batch
     }
 
@@ -5707,6 +5783,7 @@ mod tests {
             .as_mut()
             .unwrap()
             .logical_hasher = prefix.logical_hasher.clone();
+
         Ok((batch, prefix.clone()))
     }
 
@@ -5755,6 +5832,7 @@ mod tests {
             )?;
         }
         super::WorkerBuffer::retire(buffer, &inner.buffer_pool);
+
         Ok(super::GroupWriteResult {
             group_id: ticket,
             tickets: ticket..ticket + 1,
@@ -6423,6 +6501,7 @@ mod tests {
 
         owner.retire_after_durable_cleanup()?;
         assert_eq!(owner.snapshot(), WalV7ResourceCharge::default());
+
         Ok(())
     }
 
@@ -7999,6 +8078,7 @@ mod native_async_tests {
         poll_fn(|cx| {
             assert!(first.as_mut().poll(cx).is_pending());
             assert!(second.as_mut().poll(cx).is_pending());
+
             Poll::Ready(())
         })
         .await;
@@ -8010,6 +8090,7 @@ mod native_async_tests {
                 "written is not durable"
             );
             assert!(second.as_mut().poll(cx).is_pending());
+
             Poll::Ready(())
         })
         .await;
@@ -8024,6 +8105,7 @@ mod native_async_tests {
                 first.as_mut().poll(cx).is_pending(),
                 "earlier written prefix can still sync"
             );
+
             Poll::Ready(())
         })
         .await;
@@ -8052,6 +8134,7 @@ mod async_budget_tests {
         poll_fn(|cx| {
             assert!(oversized.as_mut().poll(cx).is_pending());
             assert!(ordinary.as_mut().poll(cx).is_pending());
+
             Poll::Ready(())
         })
         .await;
@@ -8071,6 +8154,7 @@ mod async_budget_tests {
         poll_fn(|cx| {
             assert!(ordinary.as_mut().poll(cx).is_pending());
             assert!(oversized.as_mut().poll(cx).is_pending());
+
             Poll::Ready(())
         })
         .await;

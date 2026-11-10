@@ -33,6 +33,7 @@ fn set_parallel_wal_file_size_limit(engine: &KvEngine, limit: u64) -> usize {
         .memtable
         .set_parallel_wal_file_size_limit_for_test(limit)
         .expect("set active parallel WAL size limit");
+
     state.memtable.id()
 }
 
@@ -138,6 +139,7 @@ fn create_parallel_wal_or_skip(path: &std::path::Path) -> Option<Wal> {
 #[cfg(feature = "chaos-testing")]
 fn wait_for_parallel_wal_counter(counter: impl Fn() -> usize, expected: usize, description: &str) {
     let started = Instant::now();
+
     while counter() < expected {
         assert!(
             started.elapsed() < Duration::from_secs(10),
@@ -346,8 +348,10 @@ fn test_parallel_v4_wal_concurrent_admission_drains_on_close() {
         .map(|writer| {
             let wal = Arc::clone(&wal);
             let barrier = Arc::clone(&barrier);
+
             thread::spawn(move || {
                 barrier.wait();
+
                 for write in 0..WRITES_PER_WRITER {
                     let commit_ts = (writer * WRITES_PER_WRITER + write + 1) as u64;
                     let key = format!("{writer}/{write}");
@@ -491,6 +495,7 @@ fn failpoint_leader_wal_stale_submitters_preserve_io_error() {
         .map(|_| {
             let caller_wal = Arc::clone(&wal);
             let finished_tx = finished_tx.clone();
+
             thread::Builder::new()
                 .name("stale-poison-wal-caller".to_owned())
                 .spawn(move || {
@@ -1578,6 +1583,7 @@ fn test_wal_v5_admission_reserves_before_ticket_without_concurrent_overshoot() {
         let barrier = Arc::clone(&barrier);
         workers.push(thread::spawn(move || {
             barrier.wait();
+
             wal.put_v5_batch(
                 &crate::pitr::WalBatch {
                     commit_ts,
@@ -3479,6 +3485,7 @@ fn test_storage_open_and_close() {
         let _storage =
             LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap();
     }
+
     // Reopen should work.
     {
         let _storage =
@@ -3791,6 +3798,7 @@ fn test_wal_v5_seal_matches_the_segment_when_writers_race_the_leader() {
         let next_commit_ts = Arc::clone(&next_commit_ts);
         workers.push(thread::spawn(move || {
             barrier.wait();
+
             for _index in 0..PER_WRITER {
                 let ticket = {
                     let mut next = next_commit_ts.lock().unwrap();

@@ -147,6 +147,7 @@ impl WalV8ReservationOwner {
             self.recovery_workspace_bytes >= round_up(max_file_size, self.source_allocation_unit)?,
             "v8 recovery workspace cannot hold the configured maximum image"
         );
+
         Ok(())
     }
 
@@ -178,6 +179,7 @@ impl WalV8ReservationOwner {
         charge.source_spool_bytes = round_up(frame_buffer_bytes, self.source_allocation_unit)?
             .checked_add(marker_source_bytes)
             .context("v8 source spool reservation overflows")?;
+
         self.image_owner
             .reserve_batch_charge(charge, marker_source_bytes)
             .map_err(Into::into)
@@ -190,6 +192,7 @@ fn round_up(bytes: u64, unit: u64) -> Result<u64> {
         .checked_add(unit - 1)
         .context("v8 source allocation rounding overflows")?
         / unit;
+
     blocks
         .checked_mul(unit)
         .context("v8 source allocation reservation overflows")

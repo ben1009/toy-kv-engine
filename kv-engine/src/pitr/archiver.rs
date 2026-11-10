@@ -259,6 +259,7 @@ impl PitrArchiver {
                 }),
             };
         }
+
         Ok(match publication {
             ArchivePublicationOutcome::Committed { sequence } => {
                 ArchiveTransactionOutcome::Committed { sequence }
@@ -356,6 +357,7 @@ impl PitrArchiver {
                 crate::pitr::catalog::PitrCatalogRecord::CoverageBreak(_) => {}
             }
         }
+
         Ok(ids)
     }
 
@@ -411,12 +413,14 @@ impl PitrArchiver {
                 // the catalog directory durability boundary.
                 unsafe { libc::_exit(137) }
             }
+
             Ok(())
         })();
 
         if result.is_err() {
             let _ = std::fs::remove_file(&temp_path);
         }
+
         result
     }
 
@@ -530,6 +534,7 @@ fn check_archive_cancellation(cancellation: Option<&std::sync::atomic::AtomicBoo
     if cancellation.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire)) {
         anyhow::bail!("PITR archive cancelled between I/O chunks");
     }
+
     Ok(())
 }
 
@@ -554,6 +559,7 @@ fn wait_for_archive_tokens(
         std::thread::sleep(slice);
         wait -= slice;
     }
+
     Ok(())
 }
 
@@ -981,6 +987,7 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(30));
                 cancelled.store(true, std::sync::atomic::Ordering::Release);
             });
+
             wait_for_archive_tokens(Duration::from_secs(10), Some(&cancelled)).unwrap_err()
         });
         assert!(error.to_string().contains("cancelled"));
