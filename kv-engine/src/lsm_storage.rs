@@ -38343,6 +38343,13 @@ mod tests {
             },
         )
         .unwrap();
+        // Seed the database before PITR starts: its worker can stop commit
+        // admission briefly while installing a barrier.
+        for index in 0..64_u32 {
+            engine
+                .put(format!("key-{index:03}").as_bytes(), b"value")
+                .unwrap();
+        }
         engine
             .enable_pitr(crate::pitr::api::PitrOptions {
                 repository: repository.clone(),
@@ -38355,11 +38362,6 @@ mod tests {
                 runtime: crate::pitr::api::PitrRuntimeOptions::default(),
             })
             .unwrap();
-        for index in 0..64_u32 {
-            engine
-                .put(format!("key-{index:03}").as_bytes(), b"value")
-                .unwrap();
-        }
 
         let runtime = std::sync::Arc::new(
             tokio::runtime::Builder::new_current_thread()
