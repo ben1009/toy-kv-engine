@@ -38,7 +38,8 @@ for writer in "${WRITERS[@]}"; do
     fi
     SEEN_WRITERS[$writer]=1
 done
-if [[ "$SUITE" != "batch64" && "$SUITE" != "rfc026-full" ]]; then
+if [[ "$SUITE" != "batch64" && "$SUITE" != "rfc026-full" \
+    && "$SUITE" != "v8-small-ticket-profile" ]]; then
     echo "unsupported benchmark suite: $SUITE" >&2
     exit 64
 fi
@@ -61,9 +62,14 @@ exec > >(tee -a "$BOOT_LOG") 2>&1
 echo "[$(date --iso-8601=seconds)] starting GCP WAL benchmark setup"
 
 apt-get update
-DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-    build-essential ca-certificates clang cmake curl git libclang-dev libssl-dev mdadm pkg-config \
+INSTALL_PACKAGES=(
+    build-essential ca-certificates clang cmake curl git libclang-dev libssl-dev mdadm pkg-config
     python3 sudo time util-linux xz-utils
+)
+if [[ "$SUITE" == "v8-small-ticket-profile" ]]; then
+    INSTALL_PACKAGES+=(linux-tools-common linux-tools-gcp)
+fi
+DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${INSTALL_PACKAGES[@]}"
 
 id bench >/dev/null 2>&1 || useradd --create-home --shell /bin/bash bench
 usermod -aG sudo bench
@@ -155,6 +161,9 @@ chown bench:bench "$BOOT_LOG"
 set +e
 runuser -u bench -- env \
     BENCH_COMMIT="$COMMIT" \
+    BENCH_PROJECT="$PROJECT" \
+    BENCH_ZONE="$ZONE" \
+    BENCH_INSTANCE="$INSTANCE" \
     BENCH_NUM="$NUM" \
     BENCH_REPO_URL="https://github.com/ben1009/toy-kv-engine.git" \
     BENCH_RESULTS="$RESULTS" \
@@ -163,6 +172,7 @@ runuser -u bench -- env \
     BENCH_MACHINE_TYPE="$MACHINE_TYPE" \
     BENCH_SSD_COUNT="$SSD_COUNT" \
     BENCH_SSD_TOTAL_GIB="$SSD_TOTAL_GIB" \
+    BENCH_DEVICE="$WAL_DEVICE" \
     BENCH_WRITERS="$WRITERS_CSV" \
     BENCH_SUITE="$SUITE" \
     BENCH_BOOT_LOG="$BOOT_LOG" \
@@ -206,7 +216,18 @@ rustup toolchain install "$TOOLCHAIN" --profile minimal
 
 cd "$REPO"
 export PYTHONPATH="$REPO/scripts${PYTHONPATH:+:$PYTHONPATH}"
-cargo "+$TOOLCHAIN" build --locked --release --package kv-engine --features bench --bin write-perf
+BENCH_FEATURES=bench
+if [[ "$BENCH_SUITE" == "v8-small-ticket-profile" ]]; then
+    BENCH_FEATURES=bench,hotpath-profile
+fi
+if [[ "$BENCH_SUITE" == "v8-small-ticket-profile" ]]; then
+    if ! command -v perf >/dev/null 2>&1; then
+        echo "perf is not installed; profiling suite requires perf" >&2
+        exit 1
+    fi
+    perf version >"$BENCH_RESULTS/perf-version.txt" 2>&1
+fi
+cargo "+$TOOLCHAIN" build --locked --release --package kv-engine --features "$BENCH_FEATURES" --bin write-perf
 BINARY="$REPO/target/release/write-perf"
 BINARY_SHA256="$(sha256sum "$BINARY" | cut -d' ' -f1)"
 printf '%s\n' "$ACTUAL_COMMIT" >"$BENCH_RESULTS/commit.txt"
@@ -214,7 +235,21 @@ printf '%s\n' "$TOOLCHAIN" >"$BENCH_RESULTS/rust-toolchain.txt"
 printf '%s\n' "$BINARY_SHA256" >"$BENCH_RESULTS/write-perf.sha256"
 cp "$REPO/rust-toolchain" "$BENCH_RESULTS/rust-toolchain.toml"
 
-if [[ "$BENCH_SUITE" == "rfc026-full" ]]; then
+if [[ "$BENCH_SUITE" == "v8-small-ticket-profile" ]]; then
+    if [[ ! -r /tmp/gcp-wal-profile-runner.py ]]; then
+        echo "profile runner was not uploaded" >&2
+        exit 1
+    fi
+    cp /tmp/gcp-wal-profile-runner.py "$REPO/scripts/gcp_wal_profile_runner.py"
+    echo "WAL_BENCHMARK_STARTED $(date --iso-8601=seconds)" | tee -a "$BENCH_BOOT_LOG"
+    PYTHONPATH="$REPO/scripts${PYTHONPATH:+:$PYTHONPATH}" \
+        python3 "$REPO/scripts/gcp_wal_profile_runner.py" \
+        --binary "$BINARY" \
+        --results-dir "$BENCH_RESULTS" \
+        --db-root "$BENCH_WORK/databases" \
+        --writers "$BENCH_WRITERS" \
+        --safe-deadline-epoch "$BENCH_SAFE_DEADLINE_EPOCH"
+elif [[ "$BENCH_SUITE" == "rfc026-full" ]]; then
     python3 - "$BENCH_RESULTS/benchmark-plan.json" "$ACTUAL_COMMIT" "$BINARY_SHA256" \
         "$BENCH_WRITERS" "$BENCH_MACHINE_TYPE" "$BENCH_SSD_COUNT" "$BENCH_SSD_TOTAL_GIB" <<'PY'
 import json

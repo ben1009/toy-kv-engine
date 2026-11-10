@@ -78,11 +78,11 @@ creation can still fail if the zone is depleted or Free Trial access is
 restricted. The runner does not retry by changing zones or billing state.
 
 Provisioning requires an explicit IPv4 CIDR no broader than `/24` for SSH (a
-single public IP as `/32` is preferred). Before creating resources, the runner
-audits project VPC firewall rules and global and regional effective firewall
-policies on the selected network. It refuses to proceed if an applicable SSH
-allow rule permits a broader source, and repeats the audit immediately before
-opening each SSH/SCP connection. This requires `compute.firewalls.list`,
+single public IP as `/32` is preferred). The runner audits project firewall
+rules and global and regional effective firewall policies before creating the
+VM or firewall rule. It refuses to proceed if an applicable SSH allow rule
+permits a broader source, and repeats the audit immediately before opening each
+SSH/SCP connection. This requires `compute.firewalls.list`,
 `compute.networks.getEffectiveFirewalls`, and
 `compute.networks.getRegionEffectiveFirewalls`; default networks with a
 target-all `0.0.0.0/0` SSH rule must be narrowed or replaced with an isolated
@@ -156,7 +156,8 @@ guest attributes. Applicable IAM permission names include
 `compute.subnetworks.use`, `compute.reservations.list`,
 `compute.firewalls.list`, `compute.networks.getEffectiveFirewalls`,
 `compute.networks.getRegionEffectiveFirewalls`, `compute.firewalls.create`, and
-`compute.firewalls.delete`. Project policies can require additional
+`compute.firewalls.delete`, `compute.globalOperations.get`,
+`compute.regionOperations.get`, and `compute.zoneOperations.get`. Project policies can require additional
 permissions. Use a least-privilege custom role or
 existing roles that grant these operations; the runner itself never grants
 roles or enables APIs.
@@ -209,6 +210,40 @@ The 16-vCPU shape uses two bundled Local SSDs in a guest RAID0. Preflight checks
 that the project has quota for all 16 C4 vCPUs and 750 GB of C4 Local SSD before
 creating a VM. This does not reserve zone capacity or guarantee that a host is
 currently available.
+
+For diagnostic CPU attribution of the small-ticket gap, use the profiling suite
+instead of the scored matrix:
+
+```bash
+python3 scripts/gcp-free-trial-wal-bench.py \
+  --project YOUR_PROJECT_ID \
+  --zone us-central1-a \
+  --machine-type c4-standard-16-lssd \
+  --v8-small-ticket-profile \
+  --commit 0123456789abcdef0123456789abcdef01234567 \
+  --ssh-source-range 203.0.113.10/32 \
+  --estimated-hourly-cost-usd YOUR_CURRENT_ESTIMATE \
+  --max-estimated-spend-usd YOUR_SPEND_CEILING \
+  --max-runtime-minutes 60 \
+  --keep-vm-after-run \
+  --confirm-free-trial
+```
+
+The default profiling plan has 28 instrumented runs: V7/V8 Parallel for point,
+batch8, batch16, and batch64 at 1/8/16 writers, plus V8 Leader for each
+single-writer workload. Point runs attempt `perf record` at 199 Hz with DWARF
+stacks; every run enables the write-perf Hotpath report with 10% timing
+sampling. The VM installs the matching GCP kernel tools, saves per-run stderr,
+JSON, pipeline counters, and perf reports/data, then follows the same automatic
+teardown path. Profiling overhead changes throughput and latency, so these
+captures are for attribution only and must not be compared with uninstrumented
+matrix scores. If `perf` cannot record, the runner retries that cell without
+perf and marks the capture unavailable while retaining the engine profile.
+By default, a completed run deletes its VM and temporary SSH firewall rule.
+`--keep-vm-after-run` instead retains both after a successful, collected run
+until the server-side VM deadline; the private reconnect key is saved in the
+results directory with mode `0600`. The retained VM is still automatically
+deleted at that deadline.
 
 Replace the example commit, CIDR, and cost values. Use a full 40-character
 commit SHA. The two cost arguments are mandatory for a full run: look up

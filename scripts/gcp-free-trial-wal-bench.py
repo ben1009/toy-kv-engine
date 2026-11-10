@@ -36,8 +36,6 @@ from gcp_wal_matrix import (
     build_benchmark_plan,
     validate_writer_counts,
 )
-
-
 MACHINE_TYPE = "c4-standard-8-lssd"
 MACHINE_SPECS = {
     "c4-standard-8-lssd": {"vcpus": 8, "ssd_count": 1, "ssd_gb": 375, "ssd_gib": 375},
@@ -46,6 +44,7 @@ MACHINE_SPECS = {
 VM_INSTANCE_QUOTA = "INSTANCES"
 RUNNERS = Path(__file__).with_name("gcp-free-trial-wal-bench-remote.sh")
 MATRIX_MODULE = Path(__file__).with_name("gcp_wal_matrix.py")
+PROFILE_RUNNER = Path(__file__).with_name("gcp_wal_profile_runner.py")
 REPO_URL = "https://github.com/ben1009/toy-kv-engine.git"
 MAX_RUNTIME_MINUTES = 180
 MIN_RUNTIME_MINUTES = 60
@@ -921,13 +920,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--project", required=True, help="Explicit GCP project ID; no gcloud default is used")
     parser.add_argument("--zone", required=True, help="Zone to verify and use, for example us-central1-a")
     parser.add_argument("--commit", required=True, help="Full 40-character toy-kv-engine commit SHA to benchmark")
-    parser.add_argument("--machine-type", choices=tuple(MACHINE_SPECS), default=MACHINE_TYPE,
-                        help="C4 Local SSD shape (default: c4-standard-8-lssd)")
+    parser.add_argument("--machine-type", choices=tuple(MACHINE_SPECS),
+                        help="C4 Local SSD shape (defaults to 8-vCPU for benchmark suites)")
     parser.add_argument("--writers", type=int, nargs="+", choices=(1, 2, 4, 8, 16),
-                        help="Writer counts to run (defaults: 1 4 8 for batch64; 1 2 4 8 16 for full matrix)")
-    parser.add_argument("--full-rfc026-matrix", action="store_true",
-                        help="Run point/batch8/batch16/batch64 across V4/V7/V8 parallel and V8 Leader")
-    parser.add_argument("--network", default="default", help="Existing VPC network (default: default)")
+                        help="Writer counts to run (defaults depend on the selected suite)")
+    suite_group = parser.add_mutually_exclusive_group()
+    suite_group.add_argument("--full-rfc026-matrix", action="store_true",
+                             help="Run point/batch8/batch16/batch64 across V4/V7/V8 parallel and V8 Leader")
+    suite_group.add_argument("--v8-small-ticket-profile", action="store_true",
+                             help="Collect Hotpath/perf diagnostics for V7/V8 point and batch workloads")
+    parser.add_argument("--network", help="Existing VPC to use (default: default)")
     parser.add_argument("--subnet", help="Subnetwork name for custom-mode VPCs (must be in the requested region)")
     parser.add_argument("--ssh-source-range", help="Restricted IPv4 CIDR allowed to SSH to this ephemeral VM")
     parser.add_argument("--results-dir", type=Path, help="Local directory for preflight and collected artifacts")
@@ -939,11 +941,21 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--max-estimated-spend-usd", type=float,
                         help="Refuse the run if hourly estimate × maximum VM runtime exceeds this amount")
     parser.add_argument("--preflight-only", action="store_true", help="Run read-only checks; never create cloud resources")
+    parser.add_argument(
+        "--keep-vm-after-run", action="store_true",
+        help="Retain a successful benchmark VM and its restricted SSH rule until its server-side delete deadline",
+    )
     parser.add_argument("--confirm-free-trial", action="store_true",
                         help="Attest that Billing Overview says Free Trial and you will not upgrade to Paid")
     args = parser.parse_args(argv)
+    if args.machine_type is None:
+        args.machine_type = MACHINE_TYPE
+    args.network = args.network or "default"
     if args.writers is None:
-        args.writers = FULL_DEFAULT_WRITERS if args.full_rfc026_matrix else LEGACY_DEFAULT_WRITERS
+        if args.v8_small_ticket_profile:
+            args.writers = (1, 8, 16)
+        else:
+            args.writers = FULL_DEFAULT_WRITERS if args.full_rfc026_matrix else LEGACY_DEFAULT_WRITERS
     try:
         args.writers = validate_writer_counts(args.writers)
     except ValueError as error:
@@ -952,8 +964,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error("--commit must be a full 40-character SHA")
     if args.num < 64:
         parser.error("--num must be at least 64")
-    if args.full_rfc026_matrix and args.num != 750_000:
-        parser.error("--full-rfc026-matrix uses its fixed per-workload operation counts; omit --num overrides")
+    if (args.full_rfc026_matrix or args.v8_small_ticket_profile) and args.num != 750_000:
+        parser.error("the selected multi-workload suite uses fixed operation counts; omit --num overrides")
     if not MIN_RUNTIME_MINUTES <= args.max_runtime_minutes <= MAX_RUNTIME_MINUTES:
         parser.error(f"--max-runtime-minutes must be between {MIN_RUNTIME_MINUTES} and {MAX_RUNTIME_MINUTES}")
     if (args.estimated_hourly_cost_usd is None) != (args.max_estimated_spend_usd is None):
@@ -994,6 +1006,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 def write_json(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def should_retain_vm(args: argparse.Namespace, return_code: int, lifecycle: dict[str, Any]) -> bool:
+    return bool(
+        getattr(args, "keep_vm_after_run", False)
+        and return_code == 0
+        and lifecycle.get("created")
+        and lifecycle.get("benchmark_started")
+        and lifecycle.get("collected")
+    )
 
 
 def create_private_results_directory(path: Path) -> None:
@@ -1235,6 +1257,7 @@ def append_local_log(path: Path, text: str) -> None:
 def provision_and_run(
     args: argparse.Namespace, gcloud: Gcloud, results_dir: Path, preflight_result: dict[str, Any]
 ) -> int:
+    profile_suite = getattr(args, "v8_small_ticket_profile", False)
     missing_tools = [tool for tool in ("ssh", "scp", "ssh-keygen") if not shutil.which(tool)]
     if missing_tools:
         raise BenchError("Required local tools are missing: " + ", ".join(missing_tools))
@@ -1252,9 +1275,11 @@ def provision_and_run(
     firewall = f"walbench-ssh-{suffix}"
     key_log = results_dir / "ssh.log"
     ssh_log = results_dir / "remote-session.log"
-    lifecycle = {"instance": instance, "firewall": firewall, "created": False, "firewall_created": False,
-                 "benchmark_started": False, "remote_execution_uncertain": False,
-                 "collected": False, "cleanup": []}
+    lifecycle = {"project": args.project, "zone": args.zone,
+                 "instance": instance, "firewall": firewall, "created": False, "firewall_created": False,
+                 "network": args.network, "subnet": args.subnet,
+                 "benchmark_started": False,
+                 "remote_execution_uncertain": False, "collected": False, "retained": False, "cleanup": []}
     results_dir.mkdir(parents=True, exist_ok=True)
     lifecycle_path = results_dir / "lifecycle.json"
 
@@ -1274,8 +1299,8 @@ def provision_and_run(
     # Save resource names before cloud create requests can be interrupted.
     persist_lifecycle()
 
-    # VPC firewall rules are additive. A temporary /32 rule cannot restrict a
-    # pre-existing target-all allow rule, so reject a broader SSH path first.
+    # VPC firewall rules are additive, so check the existing network before
+    # creating the benchmark VM or its temporary SSH rule.
     network_region = zone_region(args.zone)
     audit_ssh_firewall_rules(gcloud, args.project, args.network, network_region, tag, args.ssh_source_range)
 
@@ -1335,6 +1360,9 @@ def provision_and_run(
                 "termination_timestamp": instance_info.get("terminationTimestamp"),
                 "auto_delete_deadline_minutes": args.max_runtime_minutes,
             })
+            lifecycle["external_ip"] = ip
+            lifecycle["termination_timestamp"] = instance_info.get("terminationTimestamp")
+            persist_lifecycle()
 
             termination_time = instance_info.get("terminationTimestamp")
             if termination_time:
@@ -1385,7 +1413,6 @@ def provision_and_run(
             append_local_log(key_log, scp_result.stdout + scp_result.stderr)
             if scp_result.returncode:
                 raise BenchError(f"Could not copy remote runner: {scp_result.stderr.strip()}")
-
             if not MATRIX_MODULE.is_file():
                 raise BenchError(f"Benchmark matrix module is not present in this checkout: {MATRIX_MODULE}")
             audit_ssh_firewall_rules(
@@ -1397,12 +1424,23 @@ def provision_and_run(
             append_local_log(key_log, matrix_copy.stdout + matrix_copy.stderr)
             if matrix_copy.returncode:
                 raise BenchError(f"Could not copy benchmark matrix module: {matrix_copy.stderr.strip()}")
+            if profile_suite:
+                if not PROFILE_RUNNER.is_file():
+                    raise BenchError(f"Profiling helper is not present in this checkout: {PROFILE_RUNNER}")
+                profile_copy = scp_to_vm(
+                    ip, PROFILE_RUNNER, "/tmp/gcp-wal-profile-runner.py", key, known_hosts, timeout=120
+                )
+                append_local_log(key_log, profile_copy.stdout + profile_copy.stderr)
+                if profile_copy.returncode:
+                    raise BenchError(f"Could not copy profile runner: {profile_copy.stderr.strip()}")
 
             safe_deadline_epoch = int(deadline_epoch - 600)
             remote_command = "sudo -n bash /tmp/run-wal-bench.sh " + shlex.join([
                 args.commit.lower(), str(args.num), args.project, args.zone, instance, str(safe_deadline_epoch),
                 args.machine_type, ",".join(str(writer) for writer in args.writers),
-                "rfc026-full" if args.full_rfc026_matrix else "batch64",
+                "v8-small-ticket-profile" if profile_suite else (
+                    "rfc026-full" if args.full_rfc026_matrix else "batch64"
+                ),
             ])
             remaining = max(30, int(deadline - time.monotonic()))
             try:
@@ -1454,22 +1492,58 @@ def provision_and_run(
                             elif not collection.get("bootstrap_log"):
                                 lifecycle["cleanup"].append("bootstrap log could not be collected; benchmark results are local")
                                 persist_lifecycle()
+                        if should_retain_vm(args, return_code, lifecycle):
+                            retained_key = results_dir / "retained-ssh-key"
+                            retained_known_hosts = results_dir / "retained-known-hosts"
+                            shutil.copyfile(key, retained_key)
+                            os.chmod(retained_key, 0o600)
+                            shutil.copyfile(known_hosts, retained_known_hosts)
+                            os.chmod(retained_known_hosts, 0o600)
+                            connect_command = shlex.join([
+                                "ssh", "-i", str(retained_key), "-o", "IdentitiesOnly=yes",
+                                "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes",
+                                "-o", "ConnectTimeout=8", "-o", "ServerAliveInterval=30",
+                                "-o", "ServerAliveCountMax=3",
+                                "-o", f"UserKnownHostsFile={retained_known_hosts}",
+                                "-o", "GlobalKnownHostsFile=/dev/null", f"bench@{ip}",
+                            ])
+                            (results_dir / "reconnect.txt").write_text(
+                                f"VM retained until its GCP auto-delete deadline.\n"
+                                f"Auto-delete deadline: {lifecycle.get('termination_timestamp', 'see instance.json')}\n"
+                                f"VPC: {lifecycle.get('network')}\n"
+                                f"Subnet: {lifecycle.get('subnet')}\n"
+                                f"SSH firewall rule: {firewall}\n"
+                                f"{connect_command}\n",
+                                encoding="utf-8",
+                            )
+                            lifecycle["retained"] = True
+                            lifecycle["cleanup"].append(
+                                "VM and restricted SSH firewall retained; only the VM has a server-side delete deadline"
+                            )
+                            try:
+                                persist_lifecycle()
+                            except BaseException:
+                                lifecycle["retained"] = False
+                                raise
                     except BaseException as error:
                         return_code = 1
-                        lifecycle["cleanup"].append(f"artifact collection failed: {error}")
+                        lifecycle["cleanup"].append(f"local artifact/retention step failed: {error}")
                         persist_lifecycle()
             finally:
                 # Local log/collection I/O can fail (for example, a full disk).
                 # It must never prevent teardown of the cloud resources.
-                cleanup_messages, cleanup_verification, cleanup_failed = cleanup_gcp_resources(
-                    gcloud,
-                    project=args.project,
-                    zone=args.zone,
-                    instance=instance,
-                    firewall=firewall,
-                    vm_created=lifecycle["created"],
-                    firewall_created=lifecycle["firewall_created"],
-                )
+                if lifecycle["retained"]:
+                    cleanup_messages, cleanup_verification, cleanup_failed = [], {}, False
+                else:
+                    cleanup_messages, cleanup_verification, cleanup_failed = cleanup_gcp_resources(
+                        gcloud,
+                        project=args.project,
+                        zone=args.zone,
+                        instance=instance,
+                        firewall=firewall,
+                        vm_created=lifecycle["created"],
+                        firewall_created=lifecycle["firewall_created"],
+                    )
                 lifecycle["cleanup"].extend(cleanup_messages)
                 if cleanup_verification:
                     lifecycle["cleanup_verification"] = cleanup_verification
@@ -1499,18 +1573,34 @@ def main(argv: list[str] | None = None) -> int:
     gcloud = Gcloud(args.project, results_dir / "gcloud-commands.jsonl")
 
     try:
-        report = preflight(gcloud, args.project, args.zone, args.network, args.subnet, args.machine_type)
+        report = preflight(
+            gcloud, args.project, args.zone, args.network, args.subnet, args.machine_type,
+        )
         report["benchmark_commit"] = args.commit.lower()
         report["writer_counts"] = list(args.writers)
-        report["benchmark_suite"] = "rfc026-full" if args.full_rfc026_matrix else "batch64"
-        report["benchmark_plan"] = build_benchmark_plan(
-            full_matrix=args.full_rfc026_matrix,
-            writers=args.writers,
-            machine_type=args.machine_type,
-            machine_spec=MACHINE_SPECS[args.machine_type],
-            num=args.num,
-            commit=args.commit.lower(),
-        )
+        if args.v8_small_ticket_profile:
+            report["benchmark_suite"] = "v8-small-ticket-profile"
+            try:
+                from gcp_wal_profile_runner import build_profile_plan
+            except ModuleNotFoundError as error:
+                raise BenchError(
+                    "The optional V8 profile helper is not present in this checkout; "
+                    "use a checkout containing scripts/gcp_wal_profile_runner.py or select another suite."
+                ) from error
+            report["benchmark_plan"] = build_profile_plan(
+                args.writers, machine_type=args.machine_type, machine_spec=MACHINE_SPECS[args.machine_type],
+                commit=args.commit.lower(),
+            )
+        else:
+            report["benchmark_suite"] = "rfc026-full" if args.full_rfc026_matrix else "batch64"
+            report["benchmark_plan"] = build_benchmark_plan(
+                full_matrix=args.full_rfc026_matrix,
+                writers=args.writers,
+                machine_type=args.machine_type,
+                machine_spec=MACHINE_SPECS[args.machine_type],
+                num=args.num,
+                commit=args.commit.lower(),
+            )
         report["machine_type"] = args.machine_type
         report["free_trial_attestation"] = bool(args.confirm_free_trial)
         if args.estimated_hourly_cost_usd is not None:
@@ -1539,10 +1629,10 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     if args.preflight_only:
-        print(f"Read-only preflight passed. No VM or network rule was created. Results: {results_dir}")
+        print(f"Read-only preflight passed. No cloud resources were created. Results: {results_dir}")
         return 0
 
-    print("Preflight passed. Creating a disposable C4 VM; the runner will not alter billing or quota settings.")
+    print("Preflight passed. Starting the benchmark VM; billing, APIs, and quota settings will not be changed.")
     try:
         run_status = provision_and_run(args, gcloud, results_dir, report)
     except BaseException as error:
@@ -1553,7 +1643,7 @@ def main(argv: list[str] | None = None) -> int:
             "resource_state": "provisioning may have started; inspect lifecycle.json and gcloud-commands.jsonl",
             "note": "The server-side VM deletion deadline remains the fallback if local cleanup did not complete.",
         })
-        print(f"Benchmark run failed; provisioning may have started: {error}", file=sys.stderr)
+        print(f"GCP setup/run failed; provisioning may have started: {error}", file=sys.stderr)
         print(f"Run diagnostics: {results_dir}", file=sys.stderr)
         return 2
     print(f"Benchmark artifacts: {results_dir}")
