@@ -158,6 +158,24 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
             BENCH.argparse.Namespace(keep_vm_after_run=False), 0, complete,
         ))
 
+    def test_retained_vm_reconnect_instructions_include_quoted_firewall_cleanup(self) -> None:
+        project = "project name"
+        firewall = "temporary ssh rule; echo unsafe"
+        instructions = BENCH.retained_vm_reconnect_instructions(
+            termination_timestamp="2026-11-10T08:00:00Z",
+            network="default",
+            subnet="default",
+            firewall=firewall,
+            project=project,
+            connect_command="ssh -i retained-key bench@192.0.2.1",
+        )
+
+        cleanup_prefix = "Delete the temporary SSH firewall rule after the VM is gone: "
+        cleanup_line = next(line for line in instructions.splitlines() if line.startswith(cleanup_prefix))
+        self.assertEqual(BENCH.shlex.split(cleanup_line.removeprefix(cleanup_prefix)), [
+            "gcloud", "compute", "firewall-rules", "delete", firewall, f"--project={project}", "--quiet",
+        ])
+
     def test_benchmark_plan_matches_suite_and_machine_shape(self) -> None:
         full = build_benchmark_plan(
             full_matrix=True, writers=FULL_DEFAULT_WRITERS, machine_type="c4-standard-16-lssd",

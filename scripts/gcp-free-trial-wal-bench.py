@@ -1018,6 +1018,31 @@ def should_retain_vm(args: argparse.Namespace, return_code: int, lifecycle: dict
     )
 
 
+def retained_vm_reconnect_instructions(
+    *,
+    termination_timestamp: Any,
+    network: Any,
+    subnet: Any,
+    firewall: str,
+    project: str,
+    connect_command: str,
+) -> str:
+    cleanup_command = (
+        "gcloud compute firewall-rules delete "
+        f"{shlex.quote(firewall)} --project={shlex.quote(project)} --quiet"
+    )
+
+    return (
+        "VM retained until its GCP auto-delete deadline.\n"
+        f"Auto-delete deadline: {termination_timestamp}\n"
+        f"VPC: {network}\n"
+        f"Subnet: {subnet}\n"
+        f"SSH firewall rule: {firewall}\n"
+        f"Delete the temporary SSH firewall rule after the VM is gone: {cleanup_command}\n"
+        f"{connect_command}\n"
+    )
+
+
 def create_private_results_directory(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=False, mode=0o700)
     # mkdir's mode is affected by umask; explicitly ensure artifacts stay private
@@ -1508,12 +1533,16 @@ def provision_and_run(
                                 "-o", "GlobalKnownHostsFile=/dev/null", f"bench@{ip}",
                             ])
                             (results_dir / "reconnect.txt").write_text(
-                                f"VM retained until its GCP auto-delete deadline.\n"
-                                f"Auto-delete deadline: {lifecycle.get('termination_timestamp', 'see instance.json')}\n"
-                                f"VPC: {lifecycle.get('network')}\n"
-                                f"Subnet: {lifecycle.get('subnet')}\n"
-                                f"SSH firewall rule: {firewall}\n"
-                                f"{connect_command}\n",
+                                retained_vm_reconnect_instructions(
+                                    termination_timestamp=lifecycle.get(
+                                        "termination_timestamp", "see instance.json"
+                                    ),
+                                    network=lifecycle.get("network"),
+                                    subnet=lifecycle.get("subnet"),
+                                    firewall=firewall,
+                                    project=args.project,
+                                    connect_command=connect_command,
+                                ),
                                 encoding="utf-8",
                             )
                             lifecycle["retained"] = True
