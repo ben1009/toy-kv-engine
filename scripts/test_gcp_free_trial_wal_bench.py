@@ -282,6 +282,40 @@ print(json.dumps(record))
         self.assertIn('python3 "$REPO/scripts/gcp_wal_profile_runner.py"', source)
         self.assertIn('"v8-small-ticket-profile"', source)
 
+    def test_remote_profile_probe_allows_missing_or_broken_perf(self) -> None:
+        source = Path(__file__).with_name("gcp-free-trial-wal-bench-remote.sh").read_text(encoding="utf-8")
+        start = source.index(
+            'if [[ "$BENCH_SUITE" == "v8-small-ticket-profile" ]]; then\n',
+            source.index('BENCH_FEATURES=bench,hotpath-profile'),
+        )
+        finish = source.index('\ncargo "+$TOOLCHAIN" build', start)
+        probe = source[start:finish]
+
+        for perf_status in (None, 1, 0):
+            with self.subTest(perf_status=perf_status), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                bin_dir = root / "bin"
+                bin_dir.mkdir()
+                if perf_status is not None:
+                    perf = bin_dir / "perf"
+                    perf.write_text(
+                        f"#!/bin/sh\nprintf 'perf probe output\\n'\nexit {perf_status}\n",
+                        encoding="utf-8",
+                    )
+                    perf.chmod(0o755)
+                result = subprocess.run(
+                    ["/bin/bash", "-euc", probe],
+                    env={
+                        "PATH": str(bin_dir), "BENCH_RESULTS": str(root),
+                        "BENCH_SUITE": "v8-small-ticket-profile",
+                    },
+                    text=True, capture_output=True, check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertTrue((root / "perf-version.txt").read_text(encoding="utf-8").strip())
+                if perf_status != 0:
+                    self.assertIn("continuing", result.stderr)
+
     def test_small_ticket_profile_preserves_failure_status_with_usable_json(self) -> None:
         row = build_profile_schedule((1,))[0]
         record = {

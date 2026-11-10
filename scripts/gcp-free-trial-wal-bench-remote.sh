@@ -221,11 +221,9 @@ if [[ "$BENCH_SUITE" == "v8-small-ticket-profile" ]]; then
     BENCH_FEATURES=bench,hotpath-profile
 fi
 if [[ "$BENCH_SUITE" == "v8-small-ticket-profile" ]]; then
-    if ! command -v perf >/dev/null 2>&1; then
-        echo "perf is not installed; profiling suite requires perf" >&2
-        exit 1
+    if ! perf version >"$BENCH_RESULTS/perf-version.txt" 2>&1; then
+        echo "perf is unavailable; continuing with Hotpath diagnostics and capture fallback" >&2
     fi
-    perf version >"$BENCH_RESULTS/perf-version.txt" 2>&1
 fi
 cargo "+$TOOLCHAIN" build --locked --release --package kv-engine --features "$BENCH_FEATURES" --bin write-perf
 BINARY="$REPO/target/release/write-perf"

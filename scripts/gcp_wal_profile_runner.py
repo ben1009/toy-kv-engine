@@ -62,7 +62,7 @@ def build_profile_plan(
         "perf_captures_planned": sum(bool(row["perf_capture"]) for row in schedule),
         "hotpath_sampling_rate": 0.1,
         "perf_frequency_hz": 199,
-        "perf_stack_mode": "DWARF, max 4096 frames",
+        "perf_stack_mode": "DWARF, 4096-byte stack dump",
         "machine_type": machine_type,
         "vcpus": machine_spec["vcpus"],
         "local_ssd_count": machine_spec["ssd_count"],

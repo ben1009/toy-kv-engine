@@ -233,12 +233,14 @@ The default profiling plan has 28 instrumented runs: V7/V8 Parallel for point,
 batch8, batch16, and batch64 at 1/8/16 writers, plus V8 Leader for each
 single-writer workload. Point runs attempt `perf record` at 199 Hz with DWARF
 stacks; every run enables the write-perf Hotpath report with 10% timing
-sampling. The VM installs the matching GCP kernel tools, saves per-run stderr,
+sampling. The VM installs GCP profiling tools, saves per-run stderr,
 JSON, pipeline counters, and perf reports/data, then follows the same automatic
 teardown path. Profiling overhead changes throughput and latency, so these
 captures are for attribution only and must not be compared with uninstrumented
-matrix scores. If `perf` cannot record, the runner retries that cell without
-perf and marks the capture unavailable while retaining the engine profile.
+matrix scores. If `perf` is missing, the runner collects the engine profile
+alone. A failed recording with no benchmark JSON may retry without perf within
+the original cell budget. Version probe failures are saved in `perf-version.txt`
+and do not abort the suite.
 By default, a completed run deletes its VM and temporary SSH firewall rule.
 `--keep-vm-after-run` instead retains both after a successful, collected run
 until the server-side VM deadline; the private reconnect key is saved in the
