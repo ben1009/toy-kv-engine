@@ -1378,6 +1378,7 @@ mod bench_cpu_affinity {
         mode: String,
         format_version: u16,
         writer_count: usize,
+        warmup_puts: usize,
         report_path: PathBuf,
         topology: Vec<Vec<usize>>,
         writer_cpus: Vec<usize>,
@@ -1397,6 +1398,7 @@ mod bench_cpu_affinity {
             pitr: bool,
             format_version: u16,
             writer_count: usize,
+            warmup_puts: usize,
         ) -> Result<Option<Self>> {
             let Ok(mode) = std::env::var(MODE_ENV) else {
                 return Ok(None);
@@ -1504,7 +1506,7 @@ mod bench_cpu_affinity {
                 Vec::new()
             };
 
-            warmup_io_wq(engine, value, writer_count, pitr)?;
+            warmup_io_wq(engine, value, writer_count, warmup_puts, pitr)?;
             engine.reset_write_profile();
 
             let before = thread_snapshot()?;
@@ -1519,6 +1521,7 @@ mod bench_cpu_affinity {
                 mode,
                 format_version,
                 writer_count,
+                warmup_puts,
                 report_path,
                 topology,
                 writer_cpus,
@@ -1603,6 +1606,7 @@ mod bench_cpu_affinity {
                 "mode": self.mode,
                 "format_version": self.format_version,
                 "writer_count": self.writer_count,
+                "warmup_puts": self.warmup_puts,
                 "cpu_topology_siblings": self.topology,
                 "writer_cpus": self.writer_cpus,
                 "wal_helper_cpus": self.helper_cpus,
@@ -1640,16 +1644,15 @@ mod bench_cpu_affinity {
         engine: &Arc<KvEngine>,
         value: &[u8],
         writer_count: usize,
+        warmup_puts: usize,
         pitr: bool,
     ) -> Result<()> {
-        const WARMUP_PUTS: usize = 4096;
-
         ensure!(
             writer_count > 0,
             "io-wq warmup requires at least one writer"
         );
-        let per_thread = WARMUP_PUTS / writer_count;
-        let remainder = WARMUP_PUTS % writer_count;
+        let per_thread = warmup_puts / writer_count;
+        let remainder = warmup_puts % writer_count;
         let mut handles = Vec::with_capacity(writer_count);
         for writer_index in 0..writer_count {
             let engine = Arc::clone(engine);
@@ -4154,6 +4157,7 @@ fn run_wal_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
         retry_pitr_barrier,
         wal_run_info.format_version,
         writer_threads,
+        num_keys,
     )?;
     #[cfg(all(feature = "bench", target_os = "linux"))]
     let affinity_enabled = affinity_capture.is_some();
