@@ -1604,25 +1604,14 @@ impl<B: WorkerBuffer> Clone for IoWorkerClient<B> {
 }
 
 #[cfg(all(feature = "bench", target_os = "linux"))]
-fn configure_bench_io_worker_affinity() -> Result<Option<(Option<String>, libc::cpu_set_t)>> {
+fn configure_bench_io_worker_affinity() -> Result<Option<(String, libc::cpu_set_t)>> {
     const IOWQ_AFFINITY_ENV: &str = "TOYKV_BENCH_IOWQ_AFFINITY";
-    const WAL_IO_WORKER_CPU_ENV: &str = "TOYKV_BENCH_WAL_IO_WORKER_CPU";
 
-    let iowq_affinity = std::env::var(IOWQ_AFFINITY_ENV).ok();
-    let wal_io_worker_cpu = std::env::var(WAL_IO_WORKER_CPU_ENV)
-        .ok()
-        .filter(|value| !value.is_empty());
-    if iowq_affinity.is_none() && wal_io_worker_cpu.is_none() {
+    let Ok(iowq_affinity) = std::env::var(IOWQ_AFFINITY_ENV) else {
         return Ok(None);
-    }
+    };
 
     let inherited_mask = current_cpu_affinity()?;
-    if let Some(value) = wal_io_worker_cpu {
-        let cpu = value
-            .parse::<usize>()
-            .with_context(|| format!("invalid CPU in {WAL_IO_WORKER_CPU_ENV}={value:?}"))?;
-        pin_current_thread_to_cpu(cpu, &inherited_mask)?;
-    }
 
     Ok(Some((iowq_affinity, inherited_mask)))
 }
@@ -1707,35 +1696,6 @@ fn current_cpu_affinity() -> Result<libc::cpu_set_t> {
     Ok(current_mask)
 }
 
-#[cfg(all(feature = "bench", target_os = "linux"))]
-fn pin_current_thread_to_cpu(cpu: usize, inherited_mask: &libc::cpu_set_t) -> Result<()> {
-    ensure!(
-        cpu < libc::CPU_SETSIZE as usize,
-        "CPU {cpu} exceeds cpu_set_t"
-    );
-    // SAFETY: cpu was checked against CPU_SETSIZE and inherited_mask is initialized.
-    let cpu_is_allowed = unsafe { libc::CPU_ISSET(cpu, inherited_mask) };
-    ensure!(
-        cpu_is_allowed,
-        "CPU {cpu} is outside the WAL worker's inherited affinity mask"
-    );
-    // SAFETY: cpu_set_t is an integer bitset, so zero is a valid empty mask.
-    let mut requested_mask = unsafe { std::mem::zeroed::<libc::cpu_set_t>() };
-    // SAFETY: cpu was checked against CPU_SETSIZE and requested_mask is writable.
-    unsafe { libc::CPU_SET(cpu, &mut requested_mask) };
-    // SAFETY: the mask is initialized and pid 0 refers to the current thread.
-    let result = unsafe {
-        libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &requested_mask)
-    };
-    ensure!(
-        result == 0,
-        "pin WAL I/O worker to CPU {cpu}: {}",
-        io::Error::last_os_error()
-    );
-
-    Ok(())
-}
-
 impl<B: WorkerBuffer> IoWorker<B> {
     pub(crate) fn spawn(
         wal_file: Arc<File>,
@@ -1797,7 +1757,7 @@ impl<B: WorkerBuffer> IoWorker<B> {
                     }
                 };
                 #[cfg(all(feature = "bench", target_os = "linux"))]
-                if let Some((Some(iowq_affinity), inherited_mask)) = bench_io_affinity.as_ref()
+                if let Some((iowq_affinity, inherited_mask)) = bench_io_affinity.as_ref()
                     && let Err(error) =
                         register_bench_iowq_affinity(&ring, iowq_affinity, inherited_mask)
                 {

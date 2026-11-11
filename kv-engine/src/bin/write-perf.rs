@@ -1342,7 +1342,8 @@ fn process_cpu_delta(
 mod bench_cpu_affinity {
     use std::{fs, io, path::PathBuf};
 
-    use anyhow::{Context, Result, ensure};
+    use super::{Arc, KvEngine};
+    use anyhow::{Context, Result, anyhow, ensure};
     use serde::Serialize;
 
     const MODE_ENV: &str = "TOYKV_BENCH_AFFINITY_MODE";
@@ -1381,7 +1382,7 @@ mod bench_cpu_affinity {
         topology: Vec<Vec<usize>>,
         writer_cpus: Vec<usize>,
         helper_cpus: Vec<usize>,
-        io_worker_cpu_before_ring: Option<usize>,
+        io_worker_cpu_after_warmup: Option<usize>,
         iowq_affinity: String,
         expected_iowq_cpus: Vec<usize>,
         before: Vec<ThreadPlacement>,
@@ -1390,7 +1391,13 @@ mod bench_cpu_affinity {
     }
 
     impl Capture {
-        pub fn new(format_version: u16, writer_count: usize) -> Result<Option<Self>> {
+        pub fn new(
+            engine: &Arc<KvEngine>,
+            value: &[u8],
+            pitr: bool,
+            format_version: u16,
+            writer_count: usize,
+        ) -> Result<Option<Self>> {
             let Ok(mode) = std::env::var(MODE_ENV) else {
                 return Ok(None);
             };
@@ -1467,7 +1474,7 @@ mod bench_cpu_affinity {
                     .map(|siblings| siblings[1])
                     .collect()
             };
-            let io_worker_cpu_before_ring = std::env::var(WAL_IO_WORKER_CPU_ENV)
+            let io_worker_cpu_after_warmup = std::env::var(WAL_IO_WORKER_CPU_ENV)
                 .ok()
                 .filter(|value| !value.is_empty())
                 .map(|value| {
@@ -1478,12 +1485,12 @@ mod bench_cpu_affinity {
                 .transpose()?;
             if mode == "none" {
                 ensure!(
-                    io_worker_cpu_before_ring.is_none(),
+                    io_worker_cpu_after_warmup.is_none(),
                     "{WAL_IO_WORKER_CPU_ENV} must be empty when {MODE_ENV}=none"
                 );
             } else {
                 ensure!(
-                    helper_cpus.first() == io_worker_cpu_before_ring.as_ref(),
+                    helper_cpus.first() == io_worker_cpu_after_warmup.as_ref(),
                     "{WAL_IO_WORKER_CPU_ENV} must match the WAL I/O worker's requested CPU"
                 );
             }
@@ -1496,6 +1503,9 @@ mod bench_cpu_affinity {
             } else {
                 Vec::new()
             };
+
+            warmup_io_wq(engine, value, writer_count, pitr)?;
+            engine.reset_write_profile();
 
             let before = thread_snapshot()?;
             let wal_helpers = if mode == "none" {
@@ -1513,7 +1523,7 @@ mod bench_cpu_affinity {
                 topology,
                 writer_cpus,
                 helper_cpus,
-                io_worker_cpu_before_ring,
+                io_worker_cpu_after_warmup,
                 iowq_affinity,
                 expected_iowq_cpus,
                 before,
@@ -1596,7 +1606,7 @@ mod bench_cpu_affinity {
                 "cpu_topology_siblings": self.topology,
                 "writer_cpus": self.writer_cpus,
                 "wal_helper_cpus": self.helper_cpus,
-                "wal_io_worker_cpu_before_ring_creation": self.io_worker_cpu_before_ring,
+                "wal_io_worker_cpu_after_io_wq_warmup": self.io_worker_cpu_after_warmup,
                 "wal_helpers": self.wal_helpers,
                 "io_wq_affinity": self.iowq_affinity,
                 "expected_io_wq_cpus": self.expected_iowq_cpus,
@@ -1626,6 +1636,55 @@ mod bench_cpu_affinity {
         })
     }
 
+    fn warmup_io_wq(
+        engine: &Arc<KvEngine>,
+        value: &[u8],
+        writer_count: usize,
+        pitr: bool,
+    ) -> Result<()> {
+        const WARMUP_PUTS: usize = 4096;
+
+        ensure!(
+            writer_count > 0,
+            "io-wq warmup requires at least one writer"
+        );
+        let per_thread = WARMUP_PUTS / writer_count;
+        let remainder = WARMUP_PUTS % writer_count;
+        let mut handles = Vec::with_capacity(writer_count);
+        for writer_index in 0..writer_count {
+            let engine = Arc::clone(engine);
+            let value = value.to_vec();
+            let thread_ops = per_thread + usize::from(writer_index < remainder);
+            let start_index = writer_index * per_thread + remainder.min(writer_index);
+            handles.push(std::thread::spawn(move || -> Result<()> {
+                for index in start_index..start_index + thread_ops {
+                    let key = format!("affinity-warmup-{index:08}");
+                    super::with_pitr_admission_retry(pitr, || engine.put(key.as_bytes(), &value))?;
+                }
+
+                Ok(())
+            }));
+        }
+
+        let mut first_error = None;
+        for handle in handles {
+            match handle.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    first_error.get_or_insert(error);
+                }
+                Err(_) => {
+                    first_error.get_or_insert_with(|| anyhow!("io-wq warmup thread panicked"));
+                }
+            }
+        }
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+
+        Ok(())
+    }
+
     fn pin_wal_helpers(
         threads: &[ThreadPlacement],
         cpus: &[usize],
@@ -1646,17 +1705,7 @@ mod bench_cpu_affinity {
                 thread.allowed_cpus.contains(&cpu),
                 "WAL role {role} cannot be pinned to unavailable CPU {cpu}"
             );
-            if role == "io-worker" {
-                // Its affinity is set before ring creation so io-wq inherits the
-                // independently registered mask. Do not narrow it again here.
-                let actual = read_thread(thread.tid)?;
-                ensure!(
-                    actual.allowed_cpus == [cpu],
-                    "WAL I/O worker startup affinity does not match requested CPU {cpu}"
-                );
-            } else {
-                set_affinity(thread.tid, cpu)?;
-            }
+            set_affinity(thread.tid, cpu)?;
             helpers.push(WalHelperPlacement {
                 tid: thread.tid,
                 name: thread.name.clone(),
@@ -4094,19 +4143,24 @@ fn run_wal_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
             (cfg.profile || cfg.wal_sync_diagnostics) && wal_run_info.runtime_counters_available(),
         )?;
     }
-    #[cfg(feature = "bench")]
-    let wal_io_start = engine
-        .benchmark_wal_io_diagnostics()
-        .map(WalIoDiagnosticsRecord::from);
     let value = vec![b'x'; cfg.value_size];
     let num_keys = cfg.num;
     let writer_threads = cfg.threads;
     let retry_pitr_barrier = cfg.pitr;
     #[cfg(all(feature = "bench", target_os = "linux"))]
-    let affinity_capture =
-        bench_cpu_affinity::Capture::new(wal_run_info.format_version, writer_threads)?;
+    let affinity_capture = bench_cpu_affinity::Capture::new(
+        &engine,
+        &value,
+        retry_pitr_barrier,
+        wal_run_info.format_version,
+        writer_threads,
+    )?;
     #[cfg(all(feature = "bench", target_os = "linux"))]
     let affinity_enabled = affinity_capture.is_some();
+    #[cfg(feature = "bench")]
+    let wal_io_start = engine
+        .benchmark_wal_io_diagnostics()
+        .map(WalIoDiagnosticsRecord::from);
     #[cfg(all(feature = "bench", target_os = "linux"))]
     let affinity_writer_placements = Arc::new(Mutex::new(Vec::new()));
     #[cfg(all(feature = "bench", target_os = "linux"))]
