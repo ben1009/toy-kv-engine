@@ -82,6 +82,7 @@ the retained and rejected experiments.
 - [GCP Free Trial WAL benchmark runner](benchmarks/gcp-free-trial-wal-bench.md)
 - [RFC 026 GCP V8 point sync diagnostic, 2026-11-10](benchmarks/rfc-026-v8-point-sync-gcp-20261110.md)
 - [RFC 026 V8 FRONTIER I/O A/B on GCP, 2026-11-11](benchmarks/rfc-026-v8-frontier-io-ab-gcp-20261111.md)
+- [RFC 026 V8 coalescing budget A/B on GCP, 2026-11-11](benchmarks/rfc-026-v8-coalescing-budget-gcp-20261111.md)
 - [Held-out WAL latency calibration method](benchmarks/wal-state-calibration-method.md)
 - [RFC 026 held-out calibration: no qualified V7/V8 ratio, 2026-11-03](benchmarks/rfc-026-v8-calibrated-states-20261103.md)
 - [WAL extent attribution and calibration observations](benchmarks/wal-extent-attribution-method.md)
