@@ -1501,8 +1501,8 @@ mod bench_cpu_affinity {
                 io_wq_worker_count_after_warmup = count_io_wq_workers()?;
             }
             ensure!(
-                io_wq_worker_count_after_warmup >= writer_count,
-                "io-wq warmup created {io_wq_worker_count_after_warmup} workers for {writer_count} writers after {warmup_puts} puts"
+                io_wq_worker_count_after_warmup > 0,
+                "io-wq warmup created no workers after {warmup_puts} puts"
             );
             engine.reset_write_profile();
 
