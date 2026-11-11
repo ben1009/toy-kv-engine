@@ -1352,8 +1352,6 @@ mod bench_cpu_affinity {
     const IOWQ_AFFINITY_ENV: &str = "TOYKV_BENCH_IOWQ_AFFINITY";
     const WAL_IO_WORKER_CPU_ENV: &str = "TOYKV_BENCH_WAL_IO_WORKER_CPU";
     const IO_WQ_INITIAL_WARMUP_PUTS: usize = 32_768;
-    const IO_WQ_WARMUP_BATCH_PUTS: usize = 4_096;
-    const IO_WQ_MAX_WARMUP_PUTS: usize = 65_536;
 
     #[derive(Clone, Debug, Serialize)]
     pub struct ThreadPlacement {
@@ -1490,16 +1488,9 @@ mod bench_cpu_affinity {
                 Vec::new()
             };
 
-            let warmup_limit = workload_puts.min(IO_WQ_MAX_WARMUP_PUTS);
-            let mut warmup_puts = workload_puts.min(IO_WQ_INITIAL_WARMUP_PUTS);
+            let warmup_puts = workload_puts.min(IO_WQ_INITIAL_WARMUP_PUTS);
             warmup_io_wq(engine, value, writer_count, 0, warmup_puts, pitr)?;
-            let mut io_wq_worker_count_after_warmup = count_io_wq_workers()?;
-            while io_wq_worker_count_after_warmup < writer_count && warmup_puts < warmup_limit {
-                let batch_puts = IO_WQ_WARMUP_BATCH_PUTS.min(warmup_limit - warmup_puts);
-                warmup_io_wq(engine, value, writer_count, warmup_puts, batch_puts, pitr)?;
-                warmup_puts += batch_puts;
-                io_wq_worker_count_after_warmup = count_io_wq_workers()?;
-            }
+            let io_wq_worker_count_after_warmup = count_io_wq_workers()?;
             ensure!(
                 io_wq_worker_count_after_warmup > 0,
                 "io-wq warmup created no workers after {warmup_puts} puts"
