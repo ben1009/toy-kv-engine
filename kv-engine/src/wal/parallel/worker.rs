@@ -1639,26 +1639,43 @@ fn register_bench_iowq_affinity(
     let mut requested_mask = *inherited_mask;
     match value {
         "all" => {}
-        value if value.starts_with("cpu:") => {
-            let cpu = value
+        value if value.starts_with("cpu:") || value.starts_with("cpus:") => {
+            let cpu_list = value
                 .strip_prefix("cpu:")
-                .context("missing CPU prefix in io_uring affinity mode")?
-                .parse::<usize>()
-                .with_context(|| format!("invalid CPU in {AFFINITY_ENV}={value:?}"))?;
+                .or_else(|| value.strip_prefix("cpus:"))
+                .context("missing CPU prefix in io_uring affinity mode")?;
+            let mut cpus = cpu_list
+                .split(',')
+                .map(|cpu| {
+                    cpu.parse::<usize>()
+                        .with_context(|| format!("invalid CPU in {AFFINITY_ENV}={value:?}"))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            cpus.sort_unstable();
             ensure!(
-                cpu < libc::CPU_SETSIZE as usize,
-                "CPU {cpu} exceeds cpu_set_t"
+                !cpus.is_empty(),
+                "{AFFINITY_ENV} CPU list must not be empty"
             );
             ensure!(
-                allowed_cpus.contains(&cpu),
-                "CPU {cpu} is outside the WAL worker's inherited affinity mask"
+                cpus.windows(2).all(|pair| pair[0] != pair[1]),
+                "{AFFINITY_ENV} CPU list must not contain duplicates"
+            );
+            ensure!(
+                cpus.iter().all(|cpu| *cpu < libc::CPU_SETSIZE as usize),
+                "{AFFINITY_ENV} contains a CPU ID outside cpu_set_t"
+            );
+            ensure!(
+                cpus.iter().all(|cpu| allowed_cpus.contains(cpu)),
+                "{AFFINITY_ENV} contains CPUs outside the WAL worker's inherited affinity mask"
             );
             // SAFETY: cpu_set_t is an integer bitset, so zero is a valid empty mask.
             requested_mask = unsafe { std::mem::zeroed::<libc::cpu_set_t>() };
-            // SAFETY: cpu was checked against CPU_SETSIZE and requested_mask is writable.
-            unsafe { libc::CPU_SET(cpu, &mut requested_mask) };
+            for cpu in cpus {
+                // SAFETY: every CPU was checked against CPU_SETSIZE and requested_mask is writable.
+                unsafe { libc::CPU_SET(cpu, &mut requested_mask) };
+            }
         }
-        _ => bail!("{AFFINITY_ENV} must be 'all' or 'cpu:<id>'"),
+        _ => bail!("{AFFINITY_ENV} must be 'all', 'cpu:<id>', or 'cpus:<id>,<id>'"),
     }
 
     ring.submitter()

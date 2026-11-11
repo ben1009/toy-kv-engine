@@ -1439,27 +1439,7 @@ mod bench_cpu_affinity {
             let iowq_affinity = std::env::var(IOWQ_AFFINITY_ENV).with_context(|| {
                 format!("{IOWQ_AFFINITY_ENV} is required for CPU affinity capture")
             })?;
-            let expected_iowq_cpus = match iowq_affinity.as_str() {
-                "all" => allowed_cpus.clone(),
-                value => {
-                    let cpu = value
-                        .strip_prefix("cpu:")
-                        .with_context(|| {
-                            format!("{IOWQ_AFFINITY_ENV} must be 'all' or 'cpu:<id>'")
-                        })?
-                        .parse::<usize>()
-                        .with_context(|| format!("invalid CPU in {IOWQ_AFFINITY_ENV}={value:?}"))?;
-                    ensure!(
-                        cpu < libc::CPU_SETSIZE as usize,
-                        "io-wq CPU {cpu} exceeds cpu_set_t"
-                    );
-                    ensure!(
-                        allowed_cpus.contains(&cpu),
-                        "io-wq CPU {cpu} is outside the process affinity mask"
-                    );
-                    vec![cpu]
-                }
-            };
+            let expected_iowq_cpus = parse_iowq_cpus(&iowq_affinity, &allowed_cpus)?;
             for siblings in &topology {
                 let actual = parse_linux_cpu_list(&fs::read_to_string(format!(
                     "/sys/devices/system/cpu/cpu{}/topology/thread_siblings_list",
@@ -1820,6 +1800,46 @@ mod bench_cpu_affinity {
             "{TOPOLOGY_ENV} must not repeat a logical CPU"
         );
         Ok(topology)
+    }
+
+    fn parse_iowq_cpus(value: &str, allowed_cpus: &[usize]) -> Result<Vec<usize>> {
+        if value == "all" {
+            return Ok(allowed_cpus.to_vec());
+        }
+
+        let cpu_list = value
+            .strip_prefix("cpu:")
+            .or_else(|| value.strip_prefix("cpus:"))
+            .with_context(|| {
+                format!("{IOWQ_AFFINITY_ENV} must be 'all', 'cpu:<id>', or 'cpus:<id>,<id>'")
+            })?;
+        let mut cpus = cpu_list
+            .split(',')
+            .map(|cpu| {
+                let cpu = cpu
+                    .parse::<usize>()
+                    .with_context(|| format!("invalid CPU in {IOWQ_AFFINITY_ENV}={value:?}"))?;
+                ensure!(
+                    cpu < libc::CPU_SETSIZE as usize,
+                    "io-wq CPU {cpu} exceeds cpu_set_t"
+                );
+                ensure!(
+                    allowed_cpus.contains(&cpu),
+                    "io-wq CPU {cpu} is outside the process affinity mask"
+                );
+                Ok(cpu)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        cpus.sort_unstable();
+        ensure!(
+            !cpus.is_empty(),
+            "io-wq affinity CPU list must not be empty"
+        );
+        ensure!(
+            cpus.windows(2).all(|pair| pair[0] != pair[1]),
+            "io-wq affinity CPU list must not contain duplicates"
+        );
+        Ok(cpus)
     }
 
     fn set_affinity(tid: libc::pid_t, cpu: usize) -> Result<()> {
