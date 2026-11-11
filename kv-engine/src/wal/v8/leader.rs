@@ -192,6 +192,8 @@ pub(crate) struct WalV8ParallelWriter {
     initial_ticket: u64,
     #[cfg(feature = "bench")]
     io_diagnostics: WalIoDiagnostics,
+    /// Benchmark-only budget for eligible coalescing calls, independent of
+    /// detailed sync-observation capture.
     #[cfg(feature = "bench")]
     coalesce_budget_override_us: Option<u64>,
     #[cfg(feature = "bench")]
@@ -1864,11 +1866,6 @@ impl WalV8ParallelWriter {
             let diagnostics_enabled = profile
                 .as_ref()
                 .is_some_and(|profile| profile.wal_sync_diagnostics_enabled());
-            #[cfg(feature = "bench")]
-            ensure!(
-                self.coalesce_budget_override_us.is_none() || diagnostics_enabled,
-                "fixed V8 coalescing budgets require --wal-sync-diagnostics"
-            );
             #[cfg(feature = "bench")]
             let mut coalescing_observation = None;
             let mut snapshot = self.coordinator.frontier_ready_snapshot();
