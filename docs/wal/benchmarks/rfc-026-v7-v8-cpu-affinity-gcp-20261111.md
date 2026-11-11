@@ -2,17 +2,17 @@
 
 ## Summary
 
-Pinning the persistent WAL helper threads produced a large V8 throughput gain at
-16 writers, while the same change had little effect on V7. Pinning writers as
-well reduced CPU migrations further, but did not outperform helper-only pinning
-at 16 writers. This is evidence that CPU placement matters to this V8 workload,
-but it does not isolate userspace locality: pinning the WAL I/O worker also
-restricted every observed io_uring worker to CPU 8.
+The initial affinity experiment showed a V8 gain when pinning persistent WAL
+helpers, but it also changed io_uring worker placement. A V8-only 2×2 follow-up
+separated those controls: pinning io-wq workers to CPU 8 alone raised median
+throughput by 30.0%, while pinning WAL helpers alone changed it by 0.2%.
+Pinning both raised throughput by 19.4%, below io-wq-only pinning by 8.2%.
 
-The experiment does not justify adding a dedicated durability-driver thread.
-The V8 driver still ran inline on writer threads, and the writer-pinned arm did
-not beat the WAL-helper-pinned arm at 16 writers. First separate the io_uring
-worker affinity effect from userspace WAL-thread affinity.
+The results make io-wq placement the strongest lead in this 16-writer Point
+configuration. The io-wq-only arm reduced migrations and Sync count without
+reducing mean `fdatasync` latency, so the gain is not explained by faster Sync
+syscalls. This single-CPU placement result does not establish a general
+placement policy or justify a dedicated durability-driver thread.
 
 ## Method
 
@@ -81,7 +81,7 @@ fell from 7,882 in A to 6,908 in B and 6,965 in C. Eventfd writes fell from
 nearly constant while eventfd writes fell. These counters suggest that
 placement changed coordination and group formation as well as CPU migration.
 
-## Interpretation and limits
+## Interpretation and limits of the initial experiment
 
 The affinity arms changed io_uring worker placement too. In A, every observed
 `iou-wrk-*` thread was allowed CPUs 0–15. In B and C, every observed io_uring
@@ -103,5 +103,63 @@ there is not yet evidence that pinning the inline durability driver through its
 writer thread adds throughput beyond pinning the persistent WAL helpers. A
 fixed-driver-thread experiment should wait until these effects are separated.
 
+## Follow-up: separate WAL-helper and io-wq affinity
+
+This V8-only 2×2 experiment separates persistent helper placement from the
+io-wq CPU mask. It used the same `c4-standard-16-lssd` host, Local SSD RAID0,
+ext4, 16 writers, 100,000 Point puts per run, 1 KiB values, Direct DATA and
+FRONTIER, buffered Sync, fixed 400 μs coalescing, and no compaction. The
+benchmark ran with broad profiling and per-Sync diagnostics disabled; sampled
+latency was collected every 100 operations, and `perf stat` recorded CPU
+migrations and context switches. Five counterbalanced runs were completed per
+arm using source commit `0ec10d6f`.
+
+The harness used 32 synchronized warmup callers for 32,768 warmup puts. Each
+run had at least 27 live io-wq workers before affinity changes; the final
+affinity snapshot verified every surviving io-wq worker against the requested
+mask. All 20 measured JSON records confirmed stable WAL handles on the Local
+SSD inode, with DATA and FRONTIER `O_DIRECT` and Sync buffered.
+
+| Arm | Persistent WAL helpers | io-wq allowed CPUs | Median puts/s (range) | p50 ms | sampled p99 ms |
+| :--- | :--- | :--- | ---: | ---: | ---: |
+| A | unpinned | 0–15 | 20.69k (20.47–20.83k) | 0.758 | 1.079 |
+| B | I/O worker 8, completion reaper 9 | 0–15 | 20.72k (20.71–20.77k) | 0.757 | 1.245 |
+| C | unpinned | CPU 8 | 26.89k (26.49–27.04k) | 0.579 | 0.838 |
+| D | I/O worker 8, completion reaper 9 | CPU 8 | 24.70k (24.64–24.94k) | 0.619 | 1.153 |
+
+Supporting counters are medians per run:
+
+| Arm | Syncs | mean `fdatasync` μs | process CPU s | CPU migrations | context switches | eventfd writes |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: |
+| A | 7,831 | 106.1 | 11.70 | 216,526 | 1,105,973 | 38,470 |
+| B | 7,840 | 106.4 | 11.46 | 195,573 | 1,115,820 | 42,000 |
+| C | 6,328 | 106.6 | 8.84 | 104,855 | 1,006,208 | 35,127 |
+| D | 6,908 | 114.4 | 8.29 | 87,988 | 1,127,258 | 32,429 |
+
+`p50` and sampled `p99` are medians of each arm's five per-run latency
+percentiles. Process CPU is the median timed process CPU per run.
+
+Against A, B changed throughput by +0.2% despite 9.7% fewer migrations.
+Compared with A, C raised throughput by 30.0%, reduced migrations by 51.6%,
+and reduced process CPU by 24.5%. Its Sync count fell by 19.2%, while mean
+`fdatasync` duration stayed effectively unchanged (106.1 to 106.6 μs). C's
+results are consistent with improved io-wq locality and changed group
+formation; the experiment cannot separate those effects. Context switches
+fell by 9.0% in C, far less than migrations, and were slightly higher in B and
+D than A.
+
+D was 8.2% slower than C even though it further reduced migrations. The
+I/O worker shares CPU 8 with all io-wq workers in D, so CPU contention is one
+possible explanation, but this test does not establish that cause. The sampled
+p99 medians improved in C and worsened in D; they remain secondary to the
+throughput result because each arm has five runs and p99 is sampled.
+
+The next useful experiment is to repeat the io-wq-only arm on another CPU
+selected from the C4 topology and include a matched V7 control. Keep the WAL
+helpers unpinned while varying only the io-wq mask. Do not change production
+defaults or introduce a dedicated driver based on this single CPU placement.
+
 Raw JSON, affinity snapshots, and perf outputs are retained locally and were
-not added to GitHub.
+not added to GitHub. The Terraform-managed VM, firewall, subnet and network were
+destroyed after collection; Terraform state and GCP resource-list checks were
+empty afterward.
