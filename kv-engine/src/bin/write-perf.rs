@@ -1338,6 +1338,416 @@ fn process_cpu_delta(
     }
 }
 
+#[cfg(all(feature = "bench", target_os = "linux"))]
+mod bench_cpu_affinity {
+    use std::{fs, io, path::PathBuf};
+
+    use anyhow::{Context, Result, ensure};
+    use serde::Serialize;
+
+    const MODE_ENV: &str = "TOYKV_BENCH_AFFINITY_MODE";
+    const REPORT_ENV: &str = "TOYKV_BENCH_AFFINITY_REPORT";
+    const TOPOLOGY_ENV: &str = "TOYKV_BENCH_AFFINITY_TOPOLOGY";
+
+    #[derive(Clone, Debug, Serialize)]
+    pub struct ThreadPlacement {
+        tid: libc::pid_t,
+        name: String,
+        allowed_cpus: Vec<usize>,
+    }
+
+    #[derive(Clone, Debug, Serialize)]
+    struct WalHelperPlacement {
+        tid: libc::pid_t,
+        name: String,
+        cpu: usize,
+    }
+
+    #[derive(Serialize)]
+    pub struct WriterPlacement {
+        writer_index: usize,
+        tid: libc::pid_t,
+        pinned_cpu: Option<usize>,
+        allowed_cpus: Vec<usize>,
+    }
+
+    pub struct Capture {
+        mode: String,
+        format_version: u16,
+        writer_count: usize,
+        report_path: PathBuf,
+        topology: Vec<Vec<usize>>,
+        writer_cpus: Vec<usize>,
+        helper_cpus: Vec<usize>,
+        before: Vec<ThreadPlacement>,
+        after_pinning: Vec<ThreadPlacement>,
+        wal_helpers: Vec<WalHelperPlacement>,
+    }
+
+    impl Capture {
+        pub fn new(format_version: u16, writer_count: usize) -> Result<Option<Self>> {
+            let Ok(mode) = std::env::var(MODE_ENV) else {
+                return Ok(None);
+            };
+            ensure!(
+                matches!(mode.as_str(), "none" | "wal" | "wal_writers"),
+                "{MODE_ENV} must be none, wal, or wal_writers"
+            );
+            ensure!(
+                matches!(format_version, 7 | 8),
+                "CPU affinity experiment supports only V7/V8 PITR WAL"
+            );
+            let report_path = std::env::var_os(REPORT_ENV)
+                .map(PathBuf::from)
+                .with_context(|| format!("{REPORT_ENV} is required for CPU affinity capture"))?;
+            let topology = parse_topology()?;
+            ensure!(
+                topology.len() == 8 && topology.iter().all(|siblings| siblings.len() == 2),
+                "the C4 affinity experiment expects 8 cores with 2 SMT siblings each"
+            );
+            ensure!(
+                (writer_count == 8 || writer_count == 16)
+                    && topology.iter().map(Vec::len).sum::<usize>() == 16,
+                "the C4 affinity experiment supports 8 or 16 writers on 16 logical CPUs"
+            );
+            let allowed_cpus = read_thread(current_tid())?.allowed_cpus;
+            ensure!(
+                topology
+                    .iter()
+                    .flatten()
+                    .all(|cpu| allowed_cpus.contains(cpu)),
+                "the supplied topology includes CPUs outside the process affinity mask"
+            );
+            for siblings in &topology {
+                let actual = parse_linux_cpu_list(&fs::read_to_string(format!(
+                    "/sys/devices/system/cpu/cpu{}/topology/thread_siblings_list",
+                    siblings[0]
+                ))?)?;
+                ensure!(
+                    actual == *siblings,
+                    "{TOPOLOGY_ENV} does not match Linux sibling topology for CPU {}",
+                    siblings[0]
+                );
+            }
+            let helper_cpus = if mode == "none" {
+                Vec::new()
+            } else {
+                topology
+                    .iter()
+                    .take(5)
+                    .map(|siblings| siblings[1])
+                    .collect()
+            };
+            let writer_cpus = if mode == "wal_writers" {
+                if writer_count == 8 {
+                    topology.iter().map(|siblings| siblings[0]).collect()
+                } else {
+                    topology.iter().flatten().copied().collect()
+                }
+            } else {
+                Vec::new()
+            };
+
+            let before = thread_snapshot()?;
+            let wal_helpers = if mode == "none" {
+                Vec::new()
+            } else {
+                pin_wal_helpers(&before, &helper_cpus, format_version)?
+            };
+            let after_pinning = thread_snapshot()?;
+
+            Ok(Some(Self {
+                mode,
+                format_version,
+                writer_count,
+                report_path,
+                topology,
+                writer_cpus,
+                helper_cpus,
+                before,
+                after_pinning,
+                wal_helpers,
+            }))
+        }
+
+        pub fn writer_cpu(&self, writer_index: usize) -> Option<usize> {
+            self.writer_cpus.get(writer_index).copied()
+        }
+
+        pub fn finish(self, writers: Vec<WriterPlacement>) -> Result<()> {
+            ensure!(
+                writers.len() == self.writer_count,
+                "captured {} writer masks, expected {}",
+                writers.len(),
+                self.writer_count
+            );
+            let after = thread_snapshot()?;
+            let after_wal_helpers = after
+                .iter()
+                .filter(|thread| thread.name.starts_with("wal-"))
+                .collect::<Vec<_>>();
+            if self.mode != "none" {
+                ensure!(
+                    after_wal_helpers.len() == self.wal_helpers.len(),
+                    "persistent WAL helper thread set changed during the measured workload"
+                );
+            }
+            for helper in &self.wal_helpers {
+                ensure!(
+                    after.iter().any(|thread| {
+                        thread.tid == helper.tid && thread.allowed_cpus == [helper.cpu]
+                    }),
+                    "WAL helper {} (TID {}) no longer has its requested CPU mask",
+                    helper.name,
+                    helper.tid
+                );
+            }
+            let process_cpus = self
+                .before
+                .iter()
+                .find(|thread| thread.tid == std::process::id() as libc::pid_t)
+                .map(|thread| thread.allowed_cpus.clone())
+                .context("process thread was not captured before the workload")?;
+            let io_uring_workers_after = after
+                .iter()
+                .filter(|thread| thread.name.starts_with("iou-wrk-"))
+                .collect::<Vec<_>>();
+            let io_uring_workers_match_process_mask = io_uring_workers_after
+                .iter()
+                .all(|thread| thread.allowed_cpus == process_cpus);
+            let io_uring_worker_count_after = io_uring_workers_after.len();
+            if self.mode == "wal_writers" {
+                ensure!(
+                    writers.iter().enumerate().all(|(index, writer)| {
+                        writer.pinned_cpu.is_some_and(|cpu| {
+                            self.writer_cpus.get(index) == Some(&cpu)
+                                && writer.allowed_cpus == [cpu]
+                        })
+                    }),
+                    "writer CPU masks do not match the requested placement"
+                );
+            }
+            let report = serde_json::json!({
+                "mode": self.mode,
+                "format_version": self.format_version,
+                "writer_count": self.writer_count,
+                "cpu_topology_siblings": self.topology,
+                "writer_cpus": self.writer_cpus,
+                "wal_helper_cpus": self.helper_cpus,
+                "wal_helpers": self.wal_helpers,
+                "io_uring_workers_match_process_mask": io_uring_workers_match_process_mask,
+                "threads_before": self.before,
+                "threads_after_pinning": self.after_pinning,
+                "io_uring_workers_after": io_uring_workers_after,
+                "writers": writers,
+                "threads_after_workload": after,
+                "io_uring_worker_count_after": io_uring_worker_count_after,
+            });
+            fs::write(&self.report_path, serde_json::to_vec_pretty(&report)?)?;
+            Ok(())
+        }
+    }
+
+    pub fn place_writer(writer_index: usize, cpu: Option<usize>) -> Result<WriterPlacement> {
+        if let Some(cpu) = cpu {
+            set_affinity(0, cpu)?;
+        }
+        let tid = current_tid();
+        let thread = read_thread(tid)?;
+        Ok(WriterPlacement {
+            writer_index,
+            tid,
+            pinned_cpu: cpu,
+            allowed_cpus: thread.allowed_cpus,
+        })
+    }
+
+    fn pin_wal_helpers(
+        threads: &[ThreadPlacement],
+        cpus: &[usize],
+        format_version: u16,
+    ) -> Result<Vec<WalHelperPlacement>> {
+        let mut helpers = Vec::new();
+        for thread in threads
+            .iter()
+            .filter(|thread| thread.name.starts_with("wal-"))
+        {
+            let Some((role, cpu_index)) = wal_role(&thread.name) else {
+                anyhow::bail!("unrecognized persistent WAL thread name {:?}", thread.name);
+            };
+            let cpu = *cpus
+                .get(cpu_index)
+                .with_context(|| format!("missing CPU assignment for WAL role {role}"))?;
+            ensure!(
+                thread.allowed_cpus.contains(&cpu),
+                "WAL role {role} cannot be pinned to unavailable CPU {cpu}"
+            );
+            set_affinity(thread.tid, cpu)?;
+            helpers.push(WalHelperPlacement {
+                tid: thread.tid,
+                name: thread.name.clone(),
+                cpu,
+            });
+        }
+
+        let has_role = |prefix: &str| helpers.iter().any(|helper| helper.name.starts_with(prefix));
+        ensure!(has_role("wal-io-worker"), "WAL I/O worker was not found");
+        if format_version == 7 {
+            ensure!(
+                has_role("wal-sync-coord") && has_role("wal-ordered-pa"),
+                "V7 sync coordinator or ordered packer was not found"
+            );
+        } else {
+            ensure!(
+                has_role("wal-v8-completi"),
+                "V8 completion reaper was not found"
+            );
+        }
+        Ok(helpers)
+    }
+
+    fn wal_role(name: &str) -> Option<(&'static str, usize)> {
+        if name.starts_with("wal-io-worker") {
+            Some(("io-worker", 0))
+        } else if name.starts_with("wal-sync-coord") {
+            Some(("sync-coordinator", 1))
+        } else if name.starts_with("wal-v8-completi") {
+            Some(("v8-completion-reaper", 1))
+        } else if name.starts_with("wal-ordered-pa") {
+            Some(("ordered-packer", 2))
+        } else if name.starts_with("wal-v7-extent-i") {
+            Some(("v7-extent-initializer", 3))
+        } else if name.starts_with("wal-extent-init") {
+            Some(("extent-initializer", 4))
+        } else {
+            None
+        }
+    }
+
+    fn parse_topology() -> Result<Vec<Vec<usize>>> {
+        let value = std::env::var(TOPOLOGY_ENV)
+            .with_context(|| format!("{TOPOLOGY_ENV} is required for CPU affinity capture"))?;
+        let topology = value
+            .split(';')
+            .map(|core| {
+                let mut siblings = core
+                    .split(',')
+                    .map(|cpu| {
+                        cpu.parse::<usize>()
+                            .with_context(|| format!("invalid CPU in {TOPOLOGY_ENV}"))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                siblings.sort_unstable();
+                ensure!(
+                    siblings.len() == 2 && siblings[0] != siblings[1],
+                    "each {TOPOLOGY_ENV} core group must contain two unique siblings"
+                );
+                ensure!(
+                    siblings.iter().all(|cpu| *cpu < libc::CPU_SETSIZE as usize),
+                    "{TOPOLOGY_ENV} contains a CPU ID outside cpu_set_t"
+                );
+                Ok(siblings)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let all_cpus = topology
+            .iter()
+            .flatten()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+        ensure!(
+            all_cpus.len() == topology.len() * 2,
+            "{TOPOLOGY_ENV} must not repeat a logical CPU"
+        );
+        Ok(topology)
+    }
+
+    fn set_affinity(tid: libc::pid_t, cpu: usize) -> Result<()> {
+        ensure!(
+            cpu < libc::CPU_SETSIZE as usize,
+            "CPU {cpu} exceeds cpu_set_t"
+        );
+        // SAFETY: cpu_set_t is an integer bitset; zero initializes an empty mask.
+        let mut mask = unsafe { std::mem::zeroed::<libc::cpu_set_t>() };
+        // SAFETY: `cpu` was checked against CPU_SETSIZE and `mask` is writable.
+        unsafe { libc::CPU_SET(cpu, &mut mask) };
+        // SAFETY: the mask is initialized and `tid` is either zero (current thread)
+        // or a TID read from /proc/self/task; the full mask size is supplied.
+        let result =
+            unsafe { libc::sched_setaffinity(tid, std::mem::size_of::<libc::cpu_set_t>(), &mask) };
+        ensure!(
+            result == 0,
+            "set CPU affinity for TID {tid} to CPU {cpu}: {}",
+            io::Error::last_os_error()
+        );
+        Ok(())
+    }
+
+    fn current_tid() -> libc::pid_t {
+        // SAFETY: gettid has no pointers or preconditions and returns this thread's ID.
+        unsafe { libc::gettid() }
+    }
+
+    fn thread_snapshot() -> Result<Vec<ThreadPlacement>> {
+        let mut threads = Vec::new();
+        for entry in fs::read_dir("/proc/self/task")? {
+            let entry = entry?;
+            let tid = entry
+                .file_name()
+                .to_str()
+                .context("non-UTF8 TID in /proc/self/task")?
+                .parse::<libc::pid_t>()
+                .context("invalid TID in /proc/self/task")?;
+            match read_thread(tid) {
+                Ok(thread) => threads.push(thread),
+                Err(error)
+                    if error
+                        .downcast_ref::<io::Error>()
+                        .is_some_and(|error| error.kind() == io::ErrorKind::NotFound) =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        threads.sort_by_key(|thread| thread.tid);
+        Ok(threads)
+    }
+
+    fn read_thread(tid: libc::pid_t) -> Result<ThreadPlacement> {
+        let status = fs::read_to_string(format!("/proc/self/task/{tid}/status"))?;
+        let field = |name: &str| -> Result<&str> {
+            status
+                .lines()
+                .find_map(|line| line.strip_prefix(name))
+                .map(str::trim)
+                .with_context(|| format!("missing {name} for TID {tid}"))
+        };
+        let name = field("Name:")?.to_owned();
+        let allowed_cpus = parse_linux_cpu_list(field("Cpus_allowed_list:")?)?;
+        Ok(ThreadPlacement {
+            tid,
+            name,
+            allowed_cpus,
+        })
+    }
+
+    fn parse_linux_cpu_list(value: &str) -> Result<Vec<usize>> {
+        let mut cpus = Vec::new();
+        for part in value.trim().split(',') {
+            let (start, end) = match part.split_once('-') {
+                Some((start, end)) => (start.parse::<usize>()?, end.parse::<usize>()?),
+                None => {
+                    let cpu = part.parse::<usize>()?;
+                    (cpu, cpu)
+                }
+            };
+            ensure!(start <= end, "invalid CPU range {part:?}");
+            cpus.extend(start..=end);
+        }
+        Ok(cpus)
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 struct MeasurementCounters {
     block_cache_entry_count: u64,
@@ -3618,17 +4028,64 @@ fn run_wal_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
     let num_keys = cfg.num;
     let writer_threads = cfg.threads;
     let retry_pitr_barrier = cfg.pitr;
+    #[cfg(all(feature = "bench", target_os = "linux"))]
+    let affinity_capture =
+        bench_cpu_affinity::Capture::new(wal_run_info.format_version, writer_threads)?;
+    #[cfg(all(feature = "bench", target_os = "linux"))]
+    let affinity_enabled = affinity_capture.is_some();
+    #[cfg(all(feature = "bench", target_os = "linux"))]
+    let affinity_writer_placements = Arc::new(Mutex::new(Vec::new()));
+    #[cfg(all(feature = "bench", target_os = "linux"))]
+    let affinity_ready = affinity_enabled.then(|| Arc::new(Barrier::new(writer_threads + 1)));
+    #[cfg(all(feature = "bench", target_os = "linux"))]
+    let affinity_start = affinity_enabled.then(|| Arc::new(Barrier::new(writer_threads + 1)));
     let baseline = collect_counters(&engine)?;
+    #[cfg(all(feature = "bench", target_os = "linux"))]
+    let mut cpu_start = process_cpu_times();
+    #[cfg(not(all(feature = "bench", target_os = "linux")))]
     let cpu_start = process_cpu_times();
     let per_thread = num_keys / writer_threads;
     let remainder = num_keys % writer_threads;
+    #[cfg(all(feature = "bench", target_os = "linux"))]
+    let mut start = Instant::now();
+    #[cfg(not(all(feature = "bench", target_os = "linux")))]
     let start = Instant::now();
     let mut handles = vec![];
     for t in 0..writer_threads {
         let eng = engine.clone();
         let val = value.clone();
         let sample_every = cfg.latency_sample_every;
+        #[cfg(all(feature = "bench", target_os = "linux"))]
+        let affinity_writer_cpu = affinity_capture
+            .as_ref()
+            .and_then(|capture| capture.writer_cpu(t));
+        #[cfg(all(feature = "bench", target_os = "linux"))]
+        let affinity_writer_placements = Arc::clone(&affinity_writer_placements);
+        #[cfg(all(feature = "bench", target_os = "linux"))]
+        let writer_ready = affinity_ready.as_ref().map(Arc::clone);
+        #[cfg(all(feature = "bench", target_os = "linux"))]
+        let writer_start = affinity_start.as_ref().map(Arc::clone);
         handles.push(std::thread::spawn(move || -> Result<Vec<u64>> {
+            #[cfg(all(feature = "bench", target_os = "linux"))]
+            if affinity_enabled {
+                match bench_cpu_affinity::place_writer(t, affinity_writer_cpu) {
+                    Ok(placement) => affinity_writer_placements.lock().push(placement),
+                    Err(error) => {
+                        if let (Some(ready), Some(start_gate)) =
+                            (writer_ready.as_ref(), writer_start.as_ref())
+                        {
+                            ready.wait();
+                            start_gate.wait();
+                        }
+                        return Err(error);
+                    }
+                }
+            }
+            #[cfg(all(feature = "bench", target_os = "linux"))]
+            if let (Some(ready), Some(start_gate)) = (writer_ready, writer_start) {
+                ready.wait();
+                start_gate.wait();
+            }
             let thread_ops = per_thread + usize::from(t < remainder);
             let start_idx = t * per_thread + remainder.min(t);
             let mut latency_samples = Vec::new();
@@ -3646,6 +4103,13 @@ fn run_wal_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
 
             Ok(latency_samples)
         }));
+    }
+    #[cfg(all(feature = "bench", target_os = "linux"))]
+    if let (Some(ready), Some(start_gate)) = (affinity_ready.as_ref(), affinity_start.as_ref()) {
+        ready.wait();
+        cpu_start = process_cpu_times();
+        start = Instant::now();
+        start_gate.wait();
     }
     let mut latency_samples = Vec::new();
     let mut writer_error = None;
@@ -3667,6 +4131,10 @@ fn run_wal_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
     let elapsed = start.elapsed();
     let (process_cpu_user_ms, process_cpu_system_ms) =
         process_cpu_delta(cpu_start, process_cpu_times());
+    #[cfg(all(feature = "bench", target_os = "linux"))]
+    if let Some(capture) = affinity_capture {
+        capture.finish(std::mem::take(&mut *affinity_writer_placements.lock()))?;
+    }
     #[cfg(feature = "bench")]
     let wal_pipeline = wal_pipeline_record(
         &engine,
