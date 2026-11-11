@@ -1348,6 +1348,7 @@ mod bench_cpu_affinity {
     const MODE_ENV: &str = "TOYKV_BENCH_AFFINITY_MODE";
     const REPORT_ENV: &str = "TOYKV_BENCH_AFFINITY_REPORT";
     const TOPOLOGY_ENV: &str = "TOYKV_BENCH_AFFINITY_TOPOLOGY";
+    const IOWQ_AFFINITY_ENV: &str = "TOYKV_BENCH_IOWQ_AFFINITY";
 
     #[derive(Clone, Debug, Serialize)]
     pub struct ThreadPlacement {
@@ -1379,6 +1380,8 @@ mod bench_cpu_affinity {
         topology: Vec<Vec<usize>>,
         writer_cpus: Vec<usize>,
         helper_cpus: Vec<usize>,
+        iowq_affinity: String,
+        expected_iowq_cpus: Vec<usize>,
         before: Vec<ThreadPlacement>,
         after_pinning: Vec<ThreadPlacement>,
         wal_helpers: Vec<WalHelperPlacement>,
@@ -1418,6 +1421,30 @@ mod bench_cpu_affinity {
                     .all(|cpu| allowed_cpus.contains(cpu)),
                 "the supplied topology includes CPUs outside the process affinity mask"
             );
+            let iowq_affinity = std::env::var(IOWQ_AFFINITY_ENV).with_context(|| {
+                format!("{IOWQ_AFFINITY_ENV} is required for CPU affinity capture")
+            })?;
+            let expected_iowq_cpus = match iowq_affinity.as_str() {
+                "all" => allowed_cpus.clone(),
+                value => {
+                    let cpu = value
+                        .strip_prefix("cpu:")
+                        .with_context(|| {
+                            format!("{IOWQ_AFFINITY_ENV} must be 'all' or 'cpu:<id>'")
+                        })?
+                        .parse::<usize>()
+                        .with_context(|| format!("invalid CPU in {IOWQ_AFFINITY_ENV}={value:?}"))?;
+                    ensure!(
+                        cpu < libc::CPU_SETSIZE as usize,
+                        "io-wq CPU {cpu} exceeds cpu_set_t"
+                    );
+                    ensure!(
+                        allowed_cpus.contains(&cpu),
+                        "io-wq CPU {cpu} is outside the process affinity mask"
+                    );
+                    vec![cpu]
+                }
+            };
             for siblings in &topology {
                 let actual = parse_linux_cpu_list(&fs::read_to_string(format!(
                     "/sys/devices/system/cpu/cpu{}/topology/thread_siblings_list",
@@ -1464,6 +1491,8 @@ mod bench_cpu_affinity {
                 topology,
                 writer_cpus,
                 helper_cpus,
+                iowq_affinity,
+                expected_iowq_cpus,
                 before,
                 after_pinning,
                 wal_helpers,
@@ -1510,20 +1539,22 @@ mod bench_cpu_affinity {
                     helper.tid
                 );
             }
-            let process_cpus = self
-                .before
-                .iter()
-                .find(|thread| thread.tid == std::process::id() as libc::pid_t)
-                .map(|thread| thread.allowed_cpus.clone())
-                .context("process thread was not captured before the workload")?;
             let io_uring_workers_after = after
                 .iter()
                 .filter(|thread| thread.name.starts_with("iou-wrk-"))
                 .collect::<Vec<_>>();
-            let io_uring_workers_match_process_mask = io_uring_workers_after
-                .iter()
-                .all(|thread| thread.allowed_cpus == process_cpus);
             let io_uring_worker_count_after = io_uring_workers_after.len();
+            ensure!(
+                io_uring_worker_count_after > 0,
+                "no live io_uring workers were available to verify affinity"
+            );
+            ensure!(
+                io_uring_workers_after
+                    .iter()
+                    .all(|thread| thread.allowed_cpus == self.expected_iowq_cpus),
+                "io_uring worker masks do not match requested {IOWQ_AFFINITY_ENV}={:?}",
+                self.iowq_affinity
+            );
             if self.mode == "wal_writers" {
                 ensure!(
                     writers.iter().all(|writer| {
@@ -1543,7 +1574,8 @@ mod bench_cpu_affinity {
                 "writer_cpus": self.writer_cpus,
                 "wal_helper_cpus": self.helper_cpus,
                 "wal_helpers": self.wal_helpers,
-                "io_uring_workers_match_process_mask": io_uring_workers_match_process_mask,
+                "io_wq_affinity": self.iowq_affinity,
+                "expected_io_wq_cpus": self.expected_iowq_cpus,
                 "threads_before": self.before,
                 "threads_after_pinning": self.after_pinning,
                 "io_uring_workers_after": io_uring_workers_after,
