@@ -1351,6 +1351,7 @@ mod bench_cpu_affinity {
     const TOPOLOGY_ENV: &str = "TOYKV_BENCH_AFFINITY_TOPOLOGY";
     const IOWQ_AFFINITY_ENV: &str = "TOYKV_BENCH_IOWQ_AFFINITY";
     const WAL_IO_WORKER_CPU_ENV: &str = "TOYKV_BENCH_WAL_IO_WORKER_CPU";
+    const IO_WQ_WARMUP_MAX_PUTS: usize = 32_768;
 
     #[derive(Clone, Debug, Serialize)]
     pub struct ThreadPlacement {
@@ -1398,7 +1399,7 @@ mod bench_cpu_affinity {
             pitr: bool,
             format_version: u16,
             writer_count: usize,
-            warmup_puts: usize,
+            workload_puts: usize,
         ) -> Result<Option<Self>> {
             let Ok(mode) = std::env::var(MODE_ENV) else {
                 return Ok(None);
@@ -1506,6 +1507,7 @@ mod bench_cpu_affinity {
                 Vec::new()
             };
 
+            let warmup_puts = workload_puts.min(IO_WQ_WARMUP_MAX_PUTS);
             warmup_io_wq(engine, value, writer_count, warmup_puts, pitr)?;
             engine.reset_write_profile();
 
