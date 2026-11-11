@@ -17,6 +17,8 @@ use wrapper::kv_engine_wrapper;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use clap::{Parser, ValueEnum};
+#[cfg(feature = "bench")]
+use kv_engine_wrapper::wal::{WalIoDiagnostics, WalIoHandleMetadata};
 use kv_engine_wrapper::{
     BackupOptions, CreateBackupOutcome, EnablePitrOutcome, MAX_STATUS_PAGE_SIZE,
     PersistedPitrConfig, PitrOptions, PitrResumeOutcome, PitrRuntimeOptions, PitrStatus,
@@ -1079,6 +1081,44 @@ struct WalPipelineRecord {
     wal_allocated_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     sync_observations: Option<Vec<WalSyncObservationRecord>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wal_io: Option<WalIoDiagnosticsRecord>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+struct WalIoHandleRecord {
+    o_direct: Option<bool>,
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(feature = "bench")]
+impl From<WalIoHandleMetadata> for WalIoHandleRecord {
+    fn from(metadata: WalIoHandleMetadata) -> Self {
+        Self {
+            o_direct: metadata.o_direct,
+            device: metadata.device,
+            inode: metadata.inode,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+struct WalIoDiagnosticsRecord {
+    data: WalIoHandleRecord,
+    frontier: WalIoHandleRecord,
+    sync: WalIoHandleRecord,
+}
+
+#[cfg(feature = "bench")]
+impl From<WalIoDiagnostics> for WalIoDiagnosticsRecord {
+    fn from(diagnostics: WalIoDiagnostics) -> Self {
+        Self {
+            data: diagnostics.data.into(),
+            frontier: diagnostics.frontier.into(),
+            sync: diagnostics.sync.into(),
+        }
+    }
 }
 
 /// V8 CPU times are raw sums from sampled tickets, not extrapolated totals.
@@ -1161,6 +1201,9 @@ fn wal_pipeline_record(
 
     let profile = engine.write_profile();
     let (wal_file_length_bytes, wal_allocated_bytes) = engine.benchmark_wal_file_usage()?;
+    let wal_io = engine
+        .benchmark_wal_io_diagnostics()
+        .map(WalIoDiagnosticsRecord::from);
     let sync_observations = detailed.then(|| {
         engine
             .write_profile_sync_observations()
@@ -1194,6 +1237,7 @@ fn wal_pipeline_record(
         wal_file_length_bytes,
         wal_allocated_bytes,
         sync_observations,
+        wal_io,
     }))
 }
 
@@ -10103,6 +10147,23 @@ mod tests {
                     v8_data_write_call_ns: 0,
                     sync_coalesce_wait_calls: 3,
                     sync_coalesce_wait_ns: 9000,
+                    wal_io: cfg!(feature = "bench").then_some(WalIoDiagnosticsRecord {
+                        data: WalIoHandleRecord {
+                            o_direct: Some(true),
+                            device: 7,
+                            inode: 11,
+                        },
+                        frontier: WalIoHandleRecord {
+                            o_direct: Some(false),
+                            device: 7,
+                            inode: 11,
+                        },
+                        sync: WalIoHandleRecord {
+                            o_direct: Some(false),
+                            device: 7,
+                            inode: 11,
+                        },
+                    }),
                     ..WalPipelineRecord::default()
                 }),
                 ..MeasurementResult::default()
@@ -10130,6 +10191,22 @@ mod tests {
             assert_eq!(
                 json["result"]["wal_pipeline"]["sync_coalesce_wait_ns"],
                 9000
+            );
+            assert_eq!(
+                json["result"]["wal_pipeline"]["wal_io"]["data"]["o_direct"],
+                true
+            );
+            assert_eq!(
+                json["result"]["wal_pipeline"]["wal_io"]["frontier"]["o_direct"],
+                false
+            );
+            assert_eq!(
+                json["result"]["wal_pipeline"]["wal_io"]["data"]["inode"],
+                11
+            );
+            assert_eq!(
+                json["result"]["wal_pipeline"]["wal_io"]["frontier"]["inode"],
+                11
             );
         } else {
             assert!(json["result"].get("wal_pipeline").is_none());

@@ -41,6 +41,9 @@ use crate::{
     },
 };
 
+#[cfg(feature = "bench")]
+use crate::wal::{WalIoDiagnostics, WalIoHandleMetadata};
+
 use super::{
     WAL_V8_HEADER_LEN,
     codec::{
@@ -135,6 +138,8 @@ pub(crate) struct WalV8LeaderWriter {
     installed_dev: u64,
     installed_ino: u64,
     #[cfg(feature = "bench")]
+    io_diagnostics: WalIoDiagnostics,
+    #[cfg(feature = "bench")]
     profile: arc_swap::ArcSwapOption<crate::mem_table::WriteProfile>,
 }
 
@@ -158,6 +163,8 @@ pub(crate) struct WalV8ParallelWriter {
     installed_ino: u64,
     #[cfg(feature = "bench")]
     initial_ticket: u64,
+    #[cfg(feature = "bench")]
+    io_diagnostics: WalIoDiagnostics,
     #[cfg(feature = "bench")]
     profile: arc_swap::ArcSwapOption<crate::mem_table::WriteProfile>,
 }
@@ -861,6 +868,13 @@ impl WalV8LeaderWriter {
             "v8 admission coordinator differs from the installed recovery boundary"
         );
 
+        #[cfg(feature = "bench")]
+        let io_diagnostics = WalIoDiagnostics {
+            data: WalIoHandleMetadata::from_file(&write_file)?,
+            frontier: WalIoHandleMetadata::from_file(&write_file)?,
+            sync: WalIoHandleMetadata::from_file(&sync_file)?,
+        };
+
         Ok(Self {
             write_file,
             sync_file,
@@ -876,6 +890,8 @@ impl WalV8LeaderWriter {
             installed_dev: installed.installed_dev,
             installed_ino: installed.installed_ino,
             #[cfg(feature = "bench")]
+            io_diagnostics,
+            #[cfg(feature = "bench")]
             profile: arc_swap::ArcSwapOption::empty(),
         })
     }
@@ -883,6 +899,11 @@ impl WalV8LeaderWriter {
     #[cfg(feature = "bench")]
     pub(crate) fn set_write_profile(&self, profile: Arc<crate::mem_table::WriteProfile>) {
         self.profile.store(Some(profile));
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn io_diagnostics(&self) -> WalIoDiagnostics {
+        self.io_diagnostics
     }
 
     /// Transfer the validated image and coordinator to the concurrent
@@ -913,6 +934,12 @@ impl WalV8LeaderWriter {
                 && worker_metadata.len() >= self.coordinator.last_frontier_end(),
             "v8 WAL I/O worker handle does not refer to the installed Active inode"
         );
+        #[cfg(feature = "bench")]
+        let mut io_diagnostics = self.io_diagnostics;
+        #[cfg(feature = "bench")]
+        {
+            io_diagnostics.data = WalIoHandleMetadata::from_file(&worker_file)?;
+        }
         let initial_ticket = self.coordinator.next_ticket();
         let io = WalV8ParallelIo::spawn(worker_file, self.coordinator.clone(), initial_ticket)?;
         #[cfg(feature = "bench")]
@@ -942,6 +969,8 @@ impl WalV8LeaderWriter {
             installed_ino: self.installed_ino,
             #[cfg(feature = "bench")]
             initial_ticket,
+            #[cfg(feature = "bench")]
+            io_diagnostics,
             #[cfg(feature = "bench")]
             profile: self.profile,
         })
@@ -1487,6 +1516,11 @@ impl WalV8LeaderWriter {
 }
 
 impl WalV8ParallelWriter {
+    #[cfg(feature = "bench")]
+    pub(crate) fn io_diagnostics(&self) -> WalIoDiagnostics {
+        self.io_diagnostics
+    }
+
     #[cfg(feature = "bench")]
     pub(crate) fn set_write_profile(&self, profile: Arc<crate::mem_table::WriteProfile>) {
         self.io.set_profile(Arc::clone(&profile));

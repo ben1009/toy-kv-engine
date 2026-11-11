@@ -354,6 +354,44 @@ On flush and compaction, newly produced SST blocks are inserted into the block c
 3. Run `cargo make check` locally to verify fmt, clippy, tests, and typos.
 4. Open a PR. CI runs `check.yml`, `test.yml`, and `safety.yml`.
 
+## GCP Benchmark Workflow
+
+For GCP WAL benchmarks, read `docs/wal/benchmarks/gcp-free-trial-wal-bench.md` and
+`infra/gcp/test-environment/README.md` first. Reuse the project, zone, SSH source
+CIDR, and spend limits already supplied in the active session instead of asking
+for them again. Pass the project explicitly to every cloud command. Do not put
+project identifiers, public IPs, credentials, access tokens, or private keys in
+tracked files.
+
+Before provisioning:
+
+1. Confirm the active `gcloud` identity and that Billing Overview still shows
+   Free Trial. Set `--confirm-free-trial` only after that attestation. Never
+   enable Paid billing, APIs, or quotas.
+2. Run the benchmark runner with `--preflight-only` using the same machine,
+   runtime, network, and cost arguments planned for the run. The current user
+   authorization is a maximum 60-minute VM lifetime and a $2 estimated-spend
+   ceiling; do not raise either without explicit authorization. The estimate is
+   an admission guard, not a hard GCP billing cap.
+3. Audit effective ingress rules before creating a VM. If the default VPC has
+   broad SSH or other conflicting ingress rules, stop using it. Do not weaken or
+   delete shared firewall rules. Use a temporary isolated VPC and regional
+   subnet managed by Terraform, with an internet-egress route for bootstrap and
+   downloads and SSH restricted to the supplied CIDR (prefer `/32`). Use the
+   repository's Terraform configuration as the resource/authentication pattern;
+   keep temporary state outside the repository and destroy it after the run.
+
+Run the smallest experiment that answers the current diagnostic question. Keep
+experimental source patches and runner changes isolated from PR branches; record
+the source commit and patch checksum with the results. Profiling or Hotpath runs
+are diagnostic and must not be reported as unprofiled throughput scores.
+
+After collection, verify the VM, boot disk, temporary SSH rule, route, subnet,
+and isolated VPC are deleted. Copy the result artifacts locally before teardown
+and report the result directory, observed I/O metadata, cleanup verification,
+and any failed or incomplete steps. PR #549 is explicitly not authorized to
+merge unless the user changes that instruction.
+
 ## Useful Binaries
 
 - `kv-engine-cli` — interactive REPL for manual testing:

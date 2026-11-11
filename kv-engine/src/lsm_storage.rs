@@ -10087,6 +10087,19 @@ impl KvEngine {
             .set_wal_sync_diagnostics_enabled(enabled)
     }
 
+    /// I/O flags and inode identity for the active V8 WAL handles.
+    #[cfg(feature = "bench")]
+    #[doc(hidden)]
+    pub fn benchmark_wal_io_diagnostics(&self) -> Option<crate::wal::WalIoDiagnostics> {
+        let _active_memtable = self.inner.active_memtable_lock.read();
+
+        self.inner
+            .state
+            .load()
+            .memtable
+            .benchmark_wal_io_diagnostics()
+    }
+
     /// Per-call durability progress captured during the last profiled workload.
     #[cfg(feature = "bench")]
     pub fn write_profile_sync_observations(&self) -> Vec<crate::mem_table::WalSyncObservation> {

@@ -257,6 +257,7 @@ record = {
     'latency': {'p99_ms': 1.25},
 }
 print(json.dumps(record))
+print('[hotpath] diagnostic report follows')
 """, encoding="utf-8")
             fake_binary.chmod(0o755)
             results = root / "results"

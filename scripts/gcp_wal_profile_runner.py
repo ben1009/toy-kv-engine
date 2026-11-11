@@ -132,6 +132,22 @@ def _build_command(binary: Path, row: dict[str, Any], db_root: Path) -> tuple[li
     return command, expected_batch, wal_mode
 
 
+def _load_benchmark_record(result_path: Path) -> dict[str, Any]:
+    records: list[dict[str, Any]] = []
+    with result_path.open(encoding="utf-8") as stream:
+        for line in stream:
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(value, dict) and all(key in value for key in ("result", "params", "latency")):
+                records.append(value)
+
+    if len(records) != 1:
+        raise ValueError(f"expected one benchmark JSON record, found {len(records)}")
+    return records[0]
+
+
 def _run_one(
     row: dict[str, Any], *, binary: Path, result_root: Path, db_root: Path,
     timeout_seconds: int,
@@ -249,10 +265,7 @@ def _run_one(
     # successful: perf also propagates benchmark and timeout exit statuses.
     if exit_code == 0 or (result_path.is_file() and result_path.stat().st_size):
         try:
-            parsed_record = json.loads(result_path.read_text(encoding="utf-8"))
-            if not isinstance(parsed_record, dict):
-                raise ValueError("benchmark JSON must be an object")
-            record = parsed_record
+            record = _load_benchmark_record(result_path)
         except (OSError, ValueError) as error:
             if exit_code == 0:
                 exit_code = 65

@@ -8,6 +8,9 @@ use std::{
 };
 
 #[cfg(feature = "bench")]
+use std::os::unix::fs::MetadataExt;
+
+#[cfg(feature = "bench")]
 use std::time::Instant;
 
 use anyhow::{Context, Result, ensure};
@@ -26,6 +29,56 @@ use v7::{allocator::WalV7FrontierCursor, codec::WAL_V7_FRAME_LEN, leader::WalV7L
 
 #[cfg(test)]
 mod parallel;
+
+#[cfg(all(test, feature = "bench"))]
+mod io_metadata_tests {
+    use std::{
+        fs::OpenOptions,
+        os::unix::fs::{MetadataExt, OpenOptionsExt},
+    };
+
+    use super::WalIoHandleMetadata;
+
+    #[test]
+    fn captures_direct_flag_and_inode_from_file_handles() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("wal");
+        let buffered_file = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&path)?;
+        let buffered = WalIoHandleMetadata::from_file(&buffered_file)?;
+
+        assert_eq!(buffered.o_direct, Some(false));
+        assert_eq!(buffered.device, buffered_file.metadata()?.dev());
+        assert_eq!(buffered.inode, buffered_file.metadata()?.ino());
+
+        #[cfg(target_os = "linux")]
+        match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_DIRECT)
+            .open(&path)
+        {
+            Ok(direct_file) => {
+                let direct = WalIoHandleMetadata::from_file(&direct_file)?;
+
+                assert_eq!(direct.o_direct, Some(true));
+                assert_eq!(direct.device, buffered.device);
+                assert_eq!(direct.inode, buffered.inode);
+            }
+            Err(error)
+                if matches!(
+                    error.raw_os_error(),
+                    Some(libc::EINVAL | libc::EOPNOTSUPP | libc::ENOSYS)
+                ) => {}
+            Err(error) => return Err(error.into()),
+        }
+
+        Ok(())
+    }
+}
 
 pub(crate) mod format;
 pub(crate) mod v7;
@@ -54,6 +107,54 @@ pub struct RecoveredWalBatch {
     pub max_ts: u64,
     /// Maximum recorded-at timestamp found across recovered batches.
     pub(crate) max_recorded_at: Option<crate::pitr::RecordedAt>,
+}
+
+/// I/O mode and inode identity for one V8 WAL handle in benchmark output.
+#[cfg(feature = "bench")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[doc(hidden)]
+pub struct WalIoHandleMetadata {
+    pub o_direct: Option<bool>,
+    pub device: u64,
+    pub inode: u64,
+}
+
+#[cfg(feature = "bench")]
+impl WalIoHandleMetadata {
+    pub(crate) fn from_file(file: &File) -> Result<Self> {
+        #[cfg(target_os = "linux")]
+        let o_direct = {
+            // SAFETY: `file` keeps its descriptor open for this `fcntl` call.
+            let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+            ensure!(
+                flags >= 0,
+                "failed to query WAL handle flags with F_GETFL: {}",
+                std::io::Error::last_os_error()
+            );
+            Some(flags & libc::O_DIRECT != 0)
+        };
+
+        #[cfg(not(target_os = "linux"))]
+        let o_direct = None;
+
+        let metadata = file.metadata().context("inspect WAL handle metadata")?;
+
+        Ok(Self {
+            o_direct,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+}
+
+/// V8 WAL handle metadata captured for benchmark diagnostics.
+#[cfg(feature = "bench")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[doc(hidden)]
+pub struct WalIoDiagnostics {
+    pub data: WalIoHandleMetadata,
+    pub frontier: WalIoHandleMetadata,
+    pub sync: WalIoHandleMetadata,
 }
 
 /// Size of a batch header (v2/v3): commit_ts (8) + entry_count (4) + data_crc32 (4) = 16 bytes.
@@ -1833,6 +1934,18 @@ impl Wal {
         if let Some(writer) = &self.v8_parallel {
             writer.set_write_profile(Arc::clone(&profile));
         }
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn benchmark_io_diagnostics(&self) -> Option<WalIoDiagnostics> {
+        self.v8_leader
+            .as_ref()
+            .map(|writer| writer.lock().io_diagnostics())
+            .or_else(|| {
+                self.v8_parallel
+                    .as_ref()
+                    .map(v8::leader::WalV8ParallelWriter::io_diagnostics)
+            })
     }
 
     #[cfg(feature = "bench")]

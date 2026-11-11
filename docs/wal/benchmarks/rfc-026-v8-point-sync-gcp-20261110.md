@@ -72,6 +72,23 @@ Leader was 22.6% faster. Both modes had 100,000 syncs and similar per-call sync 
 
 With `--profile` enabled only for this diagnostic cohort (not for throughput scoring), V7's per-sync observation median was about 1 μs, P95 107–109 μs, and P99 124–139 μs. V8's median was 165 μs, P95 186–187 μs, and P99 about 200 μs. V8 observations usually saw the next ticket's frames ready and digest folded, while its data was not yet complete; mean groups covered per sync was about 13.8. This suggests data-write completion and sync sequencing deserve investigation, but does not prove which dirty pages or file state caused the kernel latency.
 
+## Follow-up DATA-mode probe — 2026-11-11
+
+A separate profiled V8 Parallel Point run added benchmark-only reporting of the active DATA, FRONTIER, and sync handles. The diagnostic binary used base commit `9201660f59f8aa402f94d190c0843613671a34b1` plus a temporary bench-only Rust patch with SHA-256 `77580ad3baeff38c0649d27b644dec28cd4a211f9eebe3f041c378d1d81b640e`.
+
+| Observation | Result |
+| --- | ---: |
+| DATA worker `O_DIRECT` | true |
+| FRONTIER handle `O_DIRECT` | false |
+| Sync handle `O_DIRECT` | false |
+| Device / inode (all three handles) | 2431 / 26613180 |
+| Throughput | 19,826 puts/s |
+| p99 latency | 1.773 ms |
+| Sync count | 7,166 |
+| Mean `fdatasync` time | 178.9 μs |
+
+This run confirms that the DATA worker used `O_DIRECT` while FRONTIER remained buffered on the same inode. It removes the DATA-mode uncertainty for this run, but a single profiled observation cannot establish that buffered FRONTIER caused the latency or be compared directly with the unprofiled scores above. The measured sync latency is consistent with the earlier V8 observations; a counterbalanced A/B that changes only FRONTIER I/O is still needed to test causality.
+
 ## Next optimization point
 
 First instrument or require the DATA worker's actual I/O mode, then run a controlled V8 Parallel A/B with the same confirmed DATA mode in both arms. Change only how FRONTIER is written: current buffered FRONTIER versus an aligned `O_DIRECT` FRONTIER write. Keep DATA, digest, ticket, group commit, the sync handle, and one-`fdatasync` durability semantics unchanged. Do not only replace `sync_file`; the variable to test is the FRONTIER write itself. Measure per-run throughput, syscall latency distribution, sync count, p50, and p99 on the same host in counterbalanced order.

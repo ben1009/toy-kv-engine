@@ -2760,6 +2760,11 @@ impl MemTable {
         self.wal.as_ref().map(Wal::io_mode)
     }
 
+    #[cfg(feature = "bench")]
+    pub(crate) fn benchmark_wal_io_diagnostics(&self) -> Option<crate::wal::WalIoDiagnostics> {
+        self.wal.as_ref().and_then(Wal::benchmark_io_diagnostics)
+    }
+
     pub(crate) fn uses_pitr_batch_wal(&self) -> bool {
         self.wal_v7_source || self.wal_v8_source || self.wal.as_ref().is_some_and(Wal::is_pitr)
     }
@@ -4235,6 +4240,32 @@ mod tests {
         let installed = recover_v8(&path, header, &[anchor])?;
         let file = fs::OpenOptions::new().read(true).write(true).open(&path)?;
 
+        #[cfg(feature = "bench")]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+
+            let buffered_metadata = crate::wal::WalIoHandleMetadata::from_file(&file)?;
+            assert_eq!(buffered_metadata.o_direct, Some(false));
+
+            match fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(libc::O_DIRECT)
+                .open(&path)
+            {
+                Ok(direct_file) => {
+                    let direct_metadata = crate::wal::WalIoHandleMetadata::from_file(&direct_file)?;
+                    assert_eq!(direct_metadata.o_direct, Some(true));
+                }
+                Err(error)
+                    if matches!(
+                        error.raw_os_error(),
+                        Some(libc::EINVAL | libc::EOPNOTSUPP | libc::ENOSYS)
+                    ) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+
         for errno in [libc::EINVAL, libc::EOPNOTSUPP, libc::ENOSYS] {
             let worker = super::open_v8_worker_file(&path, &file, &installed, |_| {
                 Err(std::io::Error::from_raw_os_error(errno))
@@ -4275,6 +4306,16 @@ mod tests {
             TEST_V8_MAX_IMAGE_LEN,
         )?;
         let writer = leader.into_parallel_with_worker_file(worker)?;
+        #[cfg(feature = "bench")]
+        {
+            let diagnostics = writer.io_diagnostics();
+            assert_eq!(diagnostics.data.o_direct, Some(false));
+            assert_eq!(diagnostics.frontier.o_direct, Some(false));
+            assert_eq!(diagnostics.sync.o_direct, Some(false));
+            assert_eq!(diagnostics.data.device, diagnostics.frontier.device);
+            assert_eq!(diagnostics.data.inode, diagnostics.frontier.inode);
+            assert_eq!(diagnostics.data.inode, installed.installed_ino);
+        }
         let batch = WalBatch {
             commit_ts: 1,
             recorded_at: RecordedAt { secs: 1, nanos: 0 },
