@@ -82,6 +82,7 @@ the retained and rejected experiments.
 - [GCP Free Trial WAL benchmark runner](benchmarks/gcp-free-trial-wal-bench.md)
 - [RFC 026 GCP V8 point sync diagnostic, 2026-11-10](benchmarks/rfc-026-v8-point-sync-gcp-20261110.md)
 - [RFC 026 V8 FRONTIER I/O A/B on GCP, 2026-11-11](benchmarks/rfc-026-v8-frontier-io-ab-gcp-20261111.md)
+- [RFC 026 V7/V8 CPU affinity on GCP, 2026-11-11](benchmarks/rfc-026-v7-v8-cpu-affinity-gcp-20261111.md)
 - [RFC 026 V8 coalescing budget A/B on GCP, 2026-11-11](benchmarks/rfc-026-v8-coalescing-budget-gcp-20261111.md)
 - [RFC 026 V8 low-overhead coalescing confirmation on GCP, 2026-11-11](benchmarks/rfc-026-v8-low-overhead-budget-gcp-20261111.md)
 - [RFC 026 V7 vs V8 Direct/400 μs on GCP, 2026-11-11](benchmarks/rfc-026-v7-v8-direct400-gcp-20261111.md)
