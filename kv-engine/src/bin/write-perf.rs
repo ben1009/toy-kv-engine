@@ -1573,15 +1573,27 @@ mod bench_cpu_affinity {
                     helper.tid
                 );
             }
+            let io_uring_workers_after_pinning = self
+                .after_pinning
+                .iter()
+                .filter(|thread| thread.name.starts_with("iou-wrk-"))
+                .collect::<Vec<_>>();
+            ensure!(
+                !io_uring_workers_after_pinning.is_empty(),
+                "no live io_uring workers were available to verify affinity after warmup"
+            );
+            ensure!(
+                io_uring_workers_after_pinning
+                    .iter()
+                    .all(|thread| thread.allowed_cpus == self.expected_iowq_cpus),
+                "post-warmup io_uring worker masks do not match requested {IOWQ_AFFINITY_ENV}={:?}: {io_uring_workers_after_pinning:?}",
+                self.iowq_affinity,
+            );
             let io_uring_workers_after = after
                 .iter()
                 .filter(|thread| thread.name.starts_with("iou-wrk-"))
                 .collect::<Vec<_>>();
             let io_uring_worker_count_after = io_uring_workers_after.len();
-            ensure!(
-                io_uring_worker_count_after > 0,
-                "no live io_uring workers were available to verify affinity"
-            );
             ensure!(
                 io_uring_workers_after
                     .iter()
@@ -1615,6 +1627,7 @@ mod bench_cpu_affinity {
                 "expected_io_wq_cpus": self.expected_iowq_cpus,
                 "threads_before": self.before,
                 "threads_after_pinning": self.after_pinning,
+                "io_uring_workers_after_pinning": io_uring_workers_after_pinning,
                 "io_uring_workers_after": io_uring_workers_after,
                 "writers": writers,
                 "threads_after_workload": after,
