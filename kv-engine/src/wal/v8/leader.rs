@@ -22,6 +22,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(feature = "bench")]
+use std::ffi::OsStr;
+
 #[cfg(test)]
 use std::os::unix::fs::OpenOptionsExt;
 
@@ -147,7 +150,7 @@ pub(crate) struct WalV8LeaderWriter {
 /// can overlap across callers; this mutex protects only the one-at-a-time
 /// FRONTIER write and sync cycle.
 pub(crate) struct WalV8ParallelWriter {
-    write_file: File,
+    frontier_file: File,
     sync_file: File,
     header: WalV8Header,
     physical_header_digest: [u8; 32],
@@ -167,6 +170,30 @@ pub(crate) struct WalV8ParallelWriter {
     io_diagnostics: WalIoDiagnostics,
     #[cfg(feature = "bench")]
     profile: arc_swap::ArcSwapOption<crate::mem_table::WriteProfile>,
+}
+
+#[cfg(feature = "bench")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WalV8FrontierWriteMode {
+    Buffered,
+    Direct,
+}
+
+#[cfg(feature = "bench")]
+impl WalV8FrontierWriteMode {
+    fn from_environment() -> Result<Self> {
+        Self::from_value(std::env::var_os("TOYKV_WAL_V8_FRONTIER_MODE").as_deref())
+    }
+
+    fn from_value(value: Option<&OsStr>) -> Result<Self> {
+        match value.and_then(OsStr::to_str) {
+            None | Some("buffered") => Ok(Self::Buffered),
+            Some("direct") => Ok(Self::Direct),
+            Some(value) => anyhow::bail!(
+                "invalid TOYKV_WAL_V8_FRONTIER_MODE {value:?}; expected `buffered` or `direct`"
+            ),
+        }
+    }
 }
 
 struct WalV8ParallelFrontier {
@@ -940,6 +967,30 @@ impl WalV8LeaderWriter {
         {
             io_diagnostics.data = WalIoHandleMetadata::from_file(&worker_file)?;
         }
+        #[cfg(feature = "bench")]
+        let frontier_file = match WalV8FrontierWriteMode::from_environment()? {
+            WalV8FrontierWriteMode::Buffered => self.write_file,
+            WalV8FrontierWriteMode::Direct => {
+                ensure!(
+                    io_diagnostics.data.o_direct == Some(true),
+                    "direct FRONTIER experiment requires an O_DIRECT DATA worker"
+                );
+                worker_file
+                    .try_clone()
+                    .context("clone direct V8 WAL DATA handle for FRONTIER writes")?
+            }
+        };
+        #[cfg(feature = "bench")]
+        {
+            io_diagnostics.frontier = WalIoHandleMetadata::from_file(&frontier_file)?;
+            ensure!(
+                io_diagnostics.frontier.device == io_diagnostics.data.device
+                    && io_diagnostics.frontier.inode == io_diagnostics.data.inode,
+                "V8 WAL FRONTIER handle does not refer to the DATA inode"
+            );
+        }
+        #[cfg(not(feature = "bench"))]
+        let frontier_file = self.write_file;
         let initial_ticket = self.coordinator.next_ticket();
         let io = WalV8ParallelIo::spawn(worker_file, self.coordinator.clone(), initial_ticket)?;
         #[cfg(feature = "bench")]
@@ -948,7 +999,7 @@ impl WalV8LeaderWriter {
         }
 
         Ok(WalV8ParallelWriter {
-            write_file: self.write_file,
+            frontier_file,
             sync_file: self.sync_file,
             header: self.header,
             physical_header_digest: self.physical_header_digest,
@@ -1826,7 +1877,7 @@ impl WalV8ParallelWriter {
             #[cfg(feature = "bench")]
             let frontier_write_started = profile.as_ref().map(|_| Instant::now());
             write_aligned_once(
-                &self.write_file,
+                &self.frontier_file,
                 frontier_buffer.initialized_slice(0, WAL_V8_FRAME_LEN),
                 reservation.frame_offset,
             )
@@ -2190,6 +2241,24 @@ mod tests {
     use crate::wal::v7::admission::{
         WalV7ResourceCharge, WalV7ResourceLedger, WalV7ResourceLimits, WalV7RetainedResources,
     };
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn frontier_write_mode_parses_only_supported_values() {
+        assert_eq!(
+            WalV8FrontierWriteMode::from_value(None).unwrap(),
+            WalV8FrontierWriteMode::Buffered
+        );
+        assert_eq!(
+            WalV8FrontierWriteMode::from_value(Some(OsStr::new("buffered"))).unwrap(),
+            WalV8FrontierWriteMode::Buffered
+        );
+        assert_eq!(
+            WalV8FrontierWriteMode::from_value(Some(OsStr::new("direct"))).unwrap(),
+            WalV8FrontierWriteMode::Direct
+        );
+        assert!(WalV8FrontierWriteMode::from_value(Some(OsStr::new("invalid"))).is_err());
+    }
 
     fn header() -> WalV8Header {
         let archive_epoch_id = ArchiveEpochId([0x22; 16]);
@@ -3132,7 +3201,7 @@ mod tests {
             .coordinator
             .mark_frames_ready(assignment.segment_ticket)?;
         write_aligned_once(
-            &writer.write_file,
+            &writer.frontier_file,
             data_buffer.initialized_slice(0, data_len),
             assignment.first_data_offset,
         )?;

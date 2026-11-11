@@ -1082,7 +1082,11 @@ struct WalPipelineRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     sync_observations: Option<Vec<WalSyncObservationRecord>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    wal_io: Option<WalIoDiagnosticsRecord>,
+    wal_io_start: Option<WalIoDiagnosticsRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wal_io_end: Option<WalIoDiagnosticsRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wal_io_stable: Option<bool>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
@@ -1194,6 +1198,7 @@ fn wal_pipeline_record(
     engine: &KvEngine,
     detailed: bool,
     wal_run_info: WalRunInfo,
+    wal_io_start: Option<WalIoDiagnosticsRecord>,
 ) -> Result<Option<WalPipelineRecord>> {
     if !wal_run_info.runtime_counters_available() {
         return Ok(None);
@@ -1201,9 +1206,13 @@ fn wal_pipeline_record(
 
     let profile = engine.write_profile();
     let (wal_file_length_bytes, wal_allocated_bytes) = engine.benchmark_wal_file_usage()?;
-    let wal_io = engine
+    let wal_io_end = engine
         .benchmark_wal_io_diagnostics()
         .map(WalIoDiagnosticsRecord::from);
+    let wal_io_stable = wal_io_start
+        .as_ref()
+        .zip(wal_io_end.as_ref())
+        .map(|(start, end)| start == end);
     let sync_observations = detailed.then(|| {
         engine
             .write_profile_sync_observations()
@@ -1237,7 +1246,9 @@ fn wal_pipeline_record(
         wal_file_length_bytes,
         wal_allocated_bytes,
         sync_observations,
-        wal_io,
+        wal_io_start,
+        wal_io_end,
+        wal_io_stable,
     }))
 }
 
@@ -3554,6 +3565,10 @@ fn run_wal_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
             cfg.profile && wal_run_info.runtime_counters_available(),
         )?;
     }
+    #[cfg(feature = "bench")]
+    let wal_io_start = engine
+        .benchmark_wal_io_diagnostics()
+        .map(WalIoDiagnosticsRecord::from);
     let value = vec![b'x'; cfg.value_size];
     let num_keys = cfg.num;
     let writer_threads = cfg.threads;
@@ -3608,7 +3623,7 @@ fn run_wal_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
     let (process_cpu_user_ms, process_cpu_system_ms) =
         process_cpu_delta(cpu_start, process_cpu_times());
     #[cfg(feature = "bench")]
-    let wal_pipeline = wal_pipeline_record(&engine, cfg.profile, wal_run_info)?;
+    let wal_pipeline = wal_pipeline_record(&engine, cfg.profile, wal_run_info, wal_io_start)?;
     #[cfg(not(feature = "bench"))]
     let wal_pipeline = None;
     #[cfg(feature = "bench")]
@@ -3698,6 +3713,10 @@ fn run_wal_batch_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>
             cfg.profile && wal_run_info.runtime_counters_available(),
         )?;
     }
+    #[cfg(feature = "bench")]
+    let wal_io_start = engine
+        .benchmark_wal_io_diagnostics()
+        .map(WalIoDiagnosticsRecord::from);
     let value = vec![b'x'; cfg.value_size];
     let num_keys = cfg.num;
     let writer_threads = cfg.threads;
@@ -3801,7 +3820,7 @@ fn run_wal_batch_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>
         .map(|capture| capture.finish(timeline_spans))
         .transpose()?;
     #[cfg(feature = "bench")]
-    let wal_pipeline = wal_pipeline_record(&engine, cfg.profile, wal_run_info)?;
+    let wal_pipeline = wal_pipeline_record(&engine, cfg.profile, wal_run_info, wal_io_start)?;
     #[cfg(not(feature = "bench"))]
     let wal_pipeline = None;
     #[cfg(feature = "bench")]
@@ -10147,7 +10166,7 @@ mod tests {
                     v8_data_write_call_ns: 0,
                     sync_coalesce_wait_calls: 3,
                     sync_coalesce_wait_ns: 9000,
-                    wal_io: cfg!(feature = "bench").then_some(WalIoDiagnosticsRecord {
+                    wal_io_start: cfg!(feature = "bench").then_some(WalIoDiagnosticsRecord {
                         data: WalIoHandleRecord {
                             o_direct: Some(true),
                             device: 7,
@@ -10164,6 +10183,24 @@ mod tests {
                             inode: 11,
                         },
                     }),
+                    wal_io_end: cfg!(feature = "bench").then_some(WalIoDiagnosticsRecord {
+                        data: WalIoHandleRecord {
+                            o_direct: Some(true),
+                            device: 7,
+                            inode: 11,
+                        },
+                        frontier: WalIoHandleRecord {
+                            o_direct: Some(false),
+                            device: 7,
+                            inode: 11,
+                        },
+                        sync: WalIoHandleRecord {
+                            o_direct: Some(false),
+                            device: 7,
+                            inode: 11,
+                        },
+                    }),
+                    wal_io_stable: cfg!(feature = "bench").then_some(true),
                     ..WalPipelineRecord::default()
                 }),
                 ..MeasurementResult::default()
@@ -10193,19 +10230,20 @@ mod tests {
                 9000
             );
             assert_eq!(
-                json["result"]["wal_pipeline"]["wal_io"]["data"]["o_direct"],
+                json["result"]["wal_pipeline"]["wal_io_start"]["data"]["o_direct"],
                 true
             );
             assert_eq!(
-                json["result"]["wal_pipeline"]["wal_io"]["frontier"]["o_direct"],
+                json["result"]["wal_pipeline"]["wal_io_start"]["frontier"]["o_direct"],
                 false
             );
+            assert_eq!(json["result"]["wal_pipeline"]["wal_io_stable"], true);
             assert_eq!(
-                json["result"]["wal_pipeline"]["wal_io"]["data"]["inode"],
+                json["result"]["wal_pipeline"]["wal_io_start"]["data"]["inode"],
                 11
             );
             assert_eq!(
-                json["result"]["wal_pipeline"]["wal_io"]["frontier"]["inode"],
+                json["result"]["wal_pipeline"]["wal_io_end"]["frontier"]["inode"],
                 11
             );
         } else {
