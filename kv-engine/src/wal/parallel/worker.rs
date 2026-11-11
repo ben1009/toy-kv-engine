@@ -880,6 +880,7 @@ struct WorkerCore<B: WorkerBuffer> {
     groups: HashMap<GroupId, GroupState>,
     group_order: VecDeque<GroupId>,
     writes: HashMap<RequestId, OwnedWrite<B>>,
+    allow_out_of_order_groups: bool,
     next_ticket: Option<u64>,
     next_file_offset: Option<u64>,
     next_group_id: u64,
@@ -893,10 +894,15 @@ struct WorkerCore<B: WorkerBuffer> {
 
 impl<B: WorkerBuffer> WorkerCore<B> {
     fn new() -> Self {
+        Self::with_ordering(false)
+    }
+
+    fn with_ordering(allow_out_of_order_groups: bool) -> Self {
         Self {
             groups: HashMap::new(),
             group_order: VecDeque::new(),
             writes: HashMap::new(),
+            allow_out_of_order_groups,
             next_ticket: None,
             next_file_offset: None,
             next_group_id: 0,
@@ -916,21 +922,39 @@ impl<B: WorkerBuffer> WorkerCore<B> {
         {
             return Err(WorkerError::Poisoned);
         }
-        if let Some(next_ticket) = self.next_ticket
-            && group.tickets.start != next_ticket
-        {
-            return Err(WorkerError::TicketHole);
-        }
         if self.groups.len() >= MAX_INFLIGHT_GROUPS {
             return Err(WorkerError::TooManyGroups);
         }
 
         let file_start = group.allocation_range.start;
-        if self
-            .next_file_offset
-            .is_some_and(|next_file_offset| file_start != next_file_offset)
-        {
-            return Err(WorkerError::InvalidWriteRange);
+        if self.allow_out_of_order_groups {
+            // V8's benchmark-only mode submits uniquely admitted ticket ranges
+            // at their preassigned offsets. Gaps are allowed, but live groups
+            // must never overlap in either logical or physical space.
+            if self.groups.values().any(|existing| {
+                group.tickets.start < existing.tickets.end
+                    && existing.tickets.start < group.tickets.end
+            }) {
+                return Err(WorkerError::DuplicateGroup);
+            }
+            if self.groups.values().any(|existing| {
+                file_start < existing.file_range.end
+                    && existing.file_range.start < group.allocation_range.end
+            }) {
+                return Err(WorkerError::InvalidWriteRange);
+            }
+        } else {
+            if let Some(next_ticket) = self.next_ticket
+                && group.tickets.start != next_ticket
+            {
+                return Err(WorkerError::TicketHole);
+            }
+            if self
+                .next_file_offset
+                .is_some_and(|next_file_offset| file_start != next_file_offset)
+            {
+                return Err(WorkerError::InvalidWriteRange);
+            }
         }
         let file_end = group.allocation_range.end;
 
@@ -972,8 +996,20 @@ impl<B: WorkerBuffer> WorkerCore<B> {
         self.next_group_id = next_group_id;
         self.next_request_id = next_request_id;
         self.next_buffer_id = next_buffer_id;
-        self.next_ticket = Some(group.tickets.end);
-        self.next_file_offset = Some(file_end);
+        self.next_ticket = Some(self.next_ticket.map_or(group.tickets.end, |next_ticket| {
+            if self.allow_out_of_order_groups {
+                next_ticket.max(group.tickets.end)
+            } else {
+                group.tickets.end
+            }
+        }));
+        self.next_file_offset = Some(self.next_file_offset.map_or(file_end, |next_file_offset| {
+            if self.allow_out_of_order_groups {
+                next_file_offset.max(file_end)
+            } else {
+                file_end
+            }
+        }));
         self.group_order.push_back(group_id);
         let request_ids = request_ids_start..next_request_id;
         self.groups.insert(
@@ -1403,11 +1439,28 @@ impl<B: WorkerBuffer> WorkerCore<B> {
         debug_assert!(self.staged_sqes + self.outstanding_sqes <= MAX_OUTSTANDING_SQES);
         debug_assert!(self.stage_cursor < self.group_order.len().max(1));
 
-        for pair in self.group_order.iter().collect::<Vec<_>>().windows(2) {
-            let first = self.groups.get(pair[0]).expect("ordered group exists");
-            let second = self.groups.get(pair[1]).expect("ordered group exists");
-            debug_assert!(first.tickets.end <= second.tickets.start);
-            debug_assert!(first.file_range.end <= second.file_range.start);
+        if self.allow_out_of_order_groups {
+            for (index, first_id) in self.group_order.iter().enumerate() {
+                let first = self.groups.get(first_id).expect("ordered group exists");
+                for second_id in self.group_order.iter().skip(index + 1) {
+                    let second = self.groups.get(second_id).expect("ordered group exists");
+                    debug_assert!(
+                        first.tickets.end <= second.tickets.start
+                            || second.tickets.end <= first.tickets.start
+                    );
+                    debug_assert!(
+                        first.file_range.end <= second.file_range.start
+                            || second.file_range.end <= first.file_range.start
+                    );
+                }
+            }
+        } else {
+            for pair in self.group_order.iter().collect::<Vec<_>>().windows(2) {
+                let first = self.groups.get(pair[0]).expect("ordered group exists");
+                let second = self.groups.get(pair[1]).expect("ordered group exists");
+                debug_assert!(first.tickets.end <= second.tickets.start);
+                debug_assert!(first.file_range.end <= second.file_range.start);
+            }
         }
     }
 }
@@ -1719,6 +1772,23 @@ impl<B: WorkerBuffer> IoWorker<B> {
         buffer_pool: Arc<ArrayQueue<B>>,
         async_write_min_bytes: Option<usize>,
     ) -> Result<Self> {
+        Self::spawn_with_group_ordering(wal_file, buffer_pool, async_write_min_bytes, false)
+    }
+
+    pub(crate) fn spawn_out_of_order(
+        wal_file: Arc<File>,
+        buffer_pool: Arc<ArrayQueue<B>>,
+        async_write_min_bytes: Option<usize>,
+    ) -> Result<Self> {
+        Self::spawn_with_group_ordering(wal_file, buffer_pool, async_write_min_bytes, true)
+    }
+
+    fn spawn_with_group_ordering(
+        wal_file: Arc<File>,
+        buffer_pool: Arc<ArrayQueue<B>>,
+        async_write_min_bytes: Option<usize>,
+        allow_out_of_order_groups: bool,
+    ) -> Result<Self> {
         let (command_tx, command_rx) = unbounded();
         let (completion_tx, completion_rx) = unbounded::<GroupWriteResult>();
         let failure_events = completion_tx.clone();
@@ -1803,6 +1873,7 @@ impl<B: WorkerBuffer> IoWorker<B> {
                     &worker_wake,
                     worker_sync_progress,
                     async_write_min_bytes,
+                    allow_out_of_order_groups,
                 )
             })
             .context("failed to spawn WAL I/O worker")?;
@@ -1989,8 +2060,9 @@ fn run_worker<B: WorkerBuffer>(
     wake: &WorkerWake,
     sync_progress: Arc<WalSyncProgress>,
     async_write_min_bytes: Option<usize>,
+    allow_out_of_order_groups: bool,
 ) -> Result<()> {
-    let mut core = WorkerCore::<B>::new();
+    let mut core = WorkerCore::<B>::with_ordering(allow_out_of_order_groups);
     let mut group_permits = HashMap::<GroupId, GroupPermit>::new();
     let mut ring_staged = VecDeque::<RequestId>::new();
     let mut shutdown_reply = None;
@@ -2748,6 +2820,57 @@ mod tests {
         }
         assert!(core.is_idle());
         assert_eq!(drops.load(Ordering::Acquire), 4);
+    }
+
+    #[test]
+    fn worker_can_stage_v8_groups_in_ticket_order_independent_arrival_order() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut core = WorkerCore::with_ordering(true);
+        core.enqueue(make_group(1..2, 8192, 1, 4096, &drops))
+            .expect("enqueue ready successor ticket first");
+        core.enqueue(make_group(0..1, 4096, 1, 4096, &drops))
+            .expect("enqueue delayed head ticket second");
+
+        let requests = submitted_ids(&mut core, 256);
+        assert_eq!(requests.len(), 2);
+        assert_eq!(core.inflight_group_count(), 2);
+
+        let mut results = Vec::new();
+        for request_id in requests.into_iter().rev() {
+            for event in core
+                .complete_write(request_id, 4096)
+                .expect("complete full-length out-of-order write")
+            {
+                match event {
+                    WorkerEvent::BufferRetired(buffer) => drop(buffer),
+                    WorkerEvent::GroupFinished(result) => results.push(result),
+                }
+            }
+        }
+        results.sort_by_key(|result| result.tickets.start);
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].tickets, 0..1);
+        assert_eq!(results[1].tickets, 1..2);
+        assert!(core.is_idle());
+        assert_eq!(drops.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn worker_rejects_overlapping_v8_groups_when_ordering_is_relaxed() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut core = WorkerCore::with_ordering(true);
+        core.enqueue(make_group(1..2, 8192, 1, 4096, &drops))
+            .expect("enqueue first group");
+        assert!(matches!(
+            core.enqueue(make_group(1..2, 12_288, 1, 4096, &drops)),
+            Err(WorkerError::DuplicateGroup)
+        ));
+        assert!(matches!(
+            core.enqueue(make_group(0..1, 8192, 1, 4096, &drops)),
+            Err(WorkerError::InvalidWriteRange)
+        ));
+        assert_eq!(core.group_count(), 1);
     }
 
     #[test]

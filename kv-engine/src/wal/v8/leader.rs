@@ -294,14 +294,38 @@ struct WalV8SubmissionState {
     next_file_offset: Option<u64>,
     pending: BTreeMap<u64, PendingV8DataWrite>,
     frontier_offsets: BTreeSet<u64>,
+    submit_any_ready_ticket: bool,
     packing: bool,
     #[cfg(test)]
     group_wait_cutoff: Option<u64>,
 }
 
-/// Ordered DATA submission over the repository's bounded io_uring worker.
-/// Producer jobs may finish out of order; only contiguous ticket ranges are
-/// submitted, and embedded FRONTIER frames account for physical gaps.
+fn benchmark_submits_any_ready_ticket() -> Result<bool> {
+    #[cfg(feature = "bench")]
+    {
+        const SUBMIT_ORDER_ENV: &str = "TOYKV_BENCH_V8_DATA_SUBMIT_ORDER";
+        let Some(value) = std::env::var_os(SUBMIT_ORDER_ENV) else {
+            return Ok(false);
+        };
+        let value = value
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("{SUBMIT_ORDER_ENV} is not valid UTF-8"))?;
+        return match value.as_str() {
+            "ordered" => Ok(false),
+            "ready" => Ok(true),
+            _ => anyhow::bail!("{SUBMIT_ORDER_ENV} must be 'ordered' or 'ready'"),
+        };
+    }
+
+    #[cfg(not(feature = "bench"))]
+    {
+        Ok(false)
+    }
+}
+
+/// DATA submission over the repository's bounded io_uring worker. Production
+/// submits only contiguous ticket ranges. A benchmark-only mode can submit
+/// each ready ticket independently at its preassigned file offset.
 struct WalV8ParallelIo {
     client: IoWorkerClient<WalV8DataBuffer>,
     worker: Mutex<Option<IoWorker<WalV8DataBuffer>>>,
@@ -320,11 +344,14 @@ impl WalV8ParallelIo {
         coordinator: WalV8ParallelCoordinator,
         first_ticket: u64,
     ) -> Result<Arc<Self>> {
-        let mut worker = IoWorker::spawn(
-            Arc::new(worker_file),
-            Arc::new(ArrayQueue::<WalV8DataBuffer>::new(1)),
-            None,
-        )?;
+        let submit_any_ready_ticket = benchmark_submits_any_ready_ticket()?;
+        let worker_file = Arc::new(worker_file);
+        let buffer_pool = Arc::new(ArrayQueue::<WalV8DataBuffer>::new(1));
+        let mut worker = if submit_any_ready_ticket {
+            IoWorker::spawn_out_of_order(worker_file, buffer_pool, None)?
+        } else {
+            IoWorker::spawn(worker_file, buffer_pool, None)?
+        };
         let client = worker.client();
         let progress = worker.sync_progress();
         progress.initialize_frontiers(first_ticket);
@@ -357,6 +384,7 @@ impl WalV8ParallelIo {
                 next_file_offset: None,
                 pending: BTreeMap::new(),
                 frontier_offsets: BTreeSet::new(),
+                submit_any_ready_ticket,
                 packing: false,
                 #[cfg(test)]
                 group_wait_cutoff: None,
@@ -389,10 +417,12 @@ impl WalV8ParallelIo {
                 .is_none_or(|next_offset| offset >= next_offset),
             "v8 FRONTIER worker offset precedes submitted DATA"
         );
-        ensure!(
-            submission.frontier_offsets.insert(offset),
-            "v8 FRONTIER worker offset was registered twice"
-        );
+        if !submission.submit_any_ready_ticket {
+            ensure!(
+                submission.frontier_offsets.insert(offset),
+                "v8 FRONTIER worker offset was registered twice"
+            );
+        }
         // A producer may already have queued the next DATA ticket while it
         // was waiting for this physical gap to be assigned. Revisit the
         // queue now that the gap is known; otherwise its DATA can remain
@@ -401,7 +431,10 @@ impl WalV8ParallelIo {
         // This callback holds the coordinator's admission lock. An elected
         // packer will observe the gap after waking; otherwise drain ready
         // work directly without acquiring the coordinator in reverse order.
-        if !submission.packing {
+        if submission.submit_any_ready_ticket {
+            self.drain_ready_tickets_locked(&mut submission)
+                .context("submit v8 DATA after registering a FRONTIER gap")?;
+        } else if !submission.packing {
             self.drain_ready_locked(&mut submission)
                 .context("submit v8 DATA after registering a FRONTIER gap")?;
         }
@@ -429,6 +462,9 @@ impl WalV8ParallelIo {
             "v8 DATA ticket was queued twice"
         );
         self.frames_ready.notify_all();
+        if submission.submit_any_ready_ticket {
+            return self.drain_ready_tickets_locked(&mut submission);
+        }
         if submission.packing || !submission.pending.contains_key(&submission.next_ticket) {
             return Ok(());
         }
@@ -449,6 +485,46 @@ impl WalV8ParallelIo {
         drop(submission);
 
         self.pack_admitted_group(first_ticket)
+    }
+
+    /// Submit every currently ready ticket separately, preserving each
+    /// admission-assigned offset while allowing later tickets to pass a
+    /// producer whose DATA buffer is not ready yet.
+    fn drain_ready_tickets_locked(&self, state: &mut WalV8SubmissionState) -> Result<()> {
+        let admitted_end = self.coordinator.admitted_ticket_end();
+        while let Some((&ticket, _)) = state.pending.first_key_value() {
+            ensure!(
+                ticket < admitted_end,
+                "v8 pending DATA ticket has not been admitted"
+            );
+            let pending = state
+                .pending
+                .remove(&ticket)
+                .context("v8 ready DATA ticket disappeared")?;
+            let write_len = pending.buffer.len();
+            let allocation_end = pending
+                .file_offset
+                .checked_add(u64::try_from(write_len)?)
+                .context("v8 out-of-order DATA allocation end overflows")?;
+            let ticket_end = ticket
+                .checked_add(1)
+                .context("v8 out-of-order DATA ticket overflows")?;
+            let write = WriteBuffer::new(pending.buffer, pending.file_offset, write_len);
+            let group = WriteGroup::new(ticket..ticket_end, vec![write])
+                .map_err(|error| anyhow::anyhow!("build v8 out-of-order DATA group: {error:?}"))?;
+            self.client
+                .submit_group(group)
+                .context("submit out-of-order v8 DATA ticket")?;
+            state.next_file_offset = Some(
+                state
+                    .next_file_offset
+                    .map_or(allocation_end, |next_offset| {
+                        next_offset.max(allocation_end)
+                    }),
+            );
+        }
+
+        Ok(())
     }
 
     fn pack_admitted_group(&self, first_ticket: u64) -> Result<()> {

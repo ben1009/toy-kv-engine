@@ -1087,6 +1087,8 @@ struct WalPipelineRecord {
     commit_solo_groups: u64,
     commit_buffers: u64,
     commit_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    v8_data_submit_order: Option<&'static str>,
     cqe_count: u64,
     inflight_groups_max: u64,
     outstanding_write_sqes_max: u64,
@@ -1271,6 +1273,14 @@ fn wal_pipeline_record(
         commit_solo_groups: profile.wal_commit_solo_groups,
         commit_buffers: profile.wal_commit_buffers,
         commit_bytes: profile.wal_commit_bytes,
+        v8_data_submit_order: (wal_run_info.format_version == 8
+            && wal_run_info.io_mode == "parallel")
+            .then(
+                || match std::env::var("TOYKV_BENCH_V8_DATA_SUBMIT_ORDER").as_deref() {
+                    Ok("ready") => "any_ready_ticket",
+                    _ => "ticket_prefix",
+                },
+            ),
         cqe_count: profile.wal_cqe_count,
         inflight_groups_max: profile.wal_inflight_groups_max,
         outstanding_write_sqes_max: profile.wal_outstanding_write_sqes_max,

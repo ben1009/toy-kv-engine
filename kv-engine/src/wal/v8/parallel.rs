@@ -2306,6 +2306,37 @@ mod tests {
     }
 
     #[test]
+    fn out_of_order_data_completion_keeps_durable_frontier_contiguous() -> Result<()> {
+        let coordinator = coordinator(8)?;
+        let first = batch(10);
+        let second = batch(20);
+        let mut first_encoded = admit(&first, &coordinator)?.encode()?;
+        let mut second_encoded = admit(&second, &coordinator)?.encode()?;
+        mark_producer_ready(&mut first_encoded, &coordinator, false)?;
+        mark_producer_ready(&mut second_encoded, &coordinator, false)?;
+
+        coordinator.mark_data_group_complete(1..2)?;
+        assert!(coordinator.frontier_ready_prefix().is_empty());
+        assert_eq!(coordinator.durable_ticket_end(), 0);
+
+        coordinator.mark_data_group_complete(0..1)?;
+        assert_eq!(
+            coordinator
+                .frontier_ready_prefix()
+                .iter()
+                .map(|ticket| ticket.assignment.segment_ticket)
+                .collect::<Vec<_>>(),
+            [0, 1]
+        );
+        let frontier = coordinator.reserve_frontier(2)?;
+        coordinator.publish_durable_frontier(frontier)?;
+        first_encoded.disarm_after_durable();
+        second_encoded.disarm_after_durable();
+
+        Ok(())
+    }
+
+    #[test]
     fn frontier_reservation_does_not_replace_durable_publication_notification() -> Result<()> {
         let coordinator = coordinator(8)?;
         let first = batch(10);
