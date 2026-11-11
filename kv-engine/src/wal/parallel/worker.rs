@@ -1604,35 +1604,48 @@ impl<B: WorkerBuffer> Clone for IoWorkerClient<B> {
 }
 
 #[cfg(all(feature = "bench", target_os = "linux"))]
-fn register_bench_iowq_affinity(ring: &io_uring::IoUring) -> Result<()> {
+fn configure_bench_io_worker_affinity() -> Result<Option<(Option<String>, libc::cpu_set_t)>> {
+    const IOWQ_AFFINITY_ENV: &str = "TOYKV_BENCH_IOWQ_AFFINITY";
+    const WAL_IO_WORKER_CPU_ENV: &str = "TOYKV_BENCH_WAL_IO_WORKER_CPU";
+
+    let iowq_affinity = std::env::var(IOWQ_AFFINITY_ENV).ok();
+    let wal_io_worker_cpu = std::env::var(WAL_IO_WORKER_CPU_ENV)
+        .ok()
+        .filter(|value| !value.is_empty());
+    if iowq_affinity.is_none() && wal_io_worker_cpu.is_none() {
+        return Ok(None);
+    }
+
+    let inherited_mask = current_cpu_affinity()?;
+    if let Some(value) = wal_io_worker_cpu {
+        let cpu = value
+            .parse::<usize>()
+            .with_context(|| format!("invalid CPU in {WAL_IO_WORKER_CPU_ENV}={value:?}"))?;
+        pin_current_thread_to_cpu(cpu, &inherited_mask)?;
+    }
+
+    Ok(Some((iowq_affinity, inherited_mask)))
+}
+
+#[cfg(all(feature = "bench", target_os = "linux"))]
+fn register_bench_iowq_affinity(
+    ring: &io_uring::IoUring,
+    value: &str,
+    inherited_mask: &libc::cpu_set_t,
+) -> Result<()> {
     const AFFINITY_ENV: &str = "TOYKV_BENCH_IOWQ_AFFINITY";
 
-    let Ok(value) = std::env::var(AFFINITY_ENV) else {
-        return Ok(());
-    };
-
-    // SAFETY: `cpu_set_t` is an integer bitset, so zero is a valid empty mask.
-    let mut current_mask = unsafe { std::mem::zeroed::<libc::cpu_set_t>() };
-    // SAFETY: the initialized mask is writable and pid 0 asks for this thread's affinity.
-    let result = unsafe {
-        libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut current_mask)
-    };
-    ensure!(
-        result == 0,
-        "read WAL worker CPU affinity: {}",
-        io::Error::last_os_error()
-    );
     let allowed_cpus = (0..libc::CPU_SETSIZE as usize)
-        // SAFETY: each CPU index is bounded by CPU_SETSIZE and current_mask is initialized.
-        .filter(|cpu| unsafe { libc::CPU_ISSET(*cpu, &current_mask) })
+        // SAFETY: each CPU index is bounded by CPU_SETSIZE and inherited_mask is initialized.
+        .filter(|cpu| unsafe { libc::CPU_ISSET(*cpu, inherited_mask) })
         .collect::<Vec<_>>();
     ensure!(
         !allowed_cpus.is_empty(),
-        "WAL worker has an empty CPU affinity mask"
+        "WAL worker has an empty inherited CPU affinity mask"
     );
 
-    let mut requested_mask = current_mask;
-    match value.as_str() {
+    let mut requested_mask = *inherited_mask;
+    match value {
         "all" => {}
         value if value.starts_with("cpu:") => {
             let cpu = value
@@ -1659,6 +1672,57 @@ fn register_bench_iowq_affinity(ring: &io_uring::IoUring) -> Result<()> {
     ring.submitter()
         .register_iowq_aff(&requested_mask)
         .with_context(|| format!("register io_uring worker affinity {value:?}"))?;
+    Ok(())
+}
+
+#[cfg(all(feature = "bench", target_os = "linux"))]
+fn current_cpu_affinity() -> Result<libc::cpu_set_t> {
+    // SAFETY: `cpu_set_t` is an integer bitset, so zero is a valid empty mask.
+    let mut current_mask = unsafe { std::mem::zeroed::<libc::cpu_set_t>() };
+    // SAFETY: the initialized mask is writable and pid 0 asks for this thread's affinity.
+    let result = unsafe {
+        libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut current_mask)
+    };
+    ensure!(
+        result == 0,
+        "read WAL worker CPU affinity: {}",
+        io::Error::last_os_error()
+    );
+    let has_allowed_cpu = (0..libc::CPU_SETSIZE as usize).any(|cpu| {
+        // SAFETY: cpu is bounded by CPU_SETSIZE and current_mask is initialized.
+        unsafe { libc::CPU_ISSET(cpu, &current_mask) }
+    });
+    ensure!(has_allowed_cpu, "WAL worker has an empty CPU affinity mask");
+
+    Ok(current_mask)
+}
+
+#[cfg(all(feature = "bench", target_os = "linux"))]
+fn pin_current_thread_to_cpu(cpu: usize, inherited_mask: &libc::cpu_set_t) -> Result<()> {
+    ensure!(
+        cpu < libc::CPU_SETSIZE as usize,
+        "CPU {cpu} exceeds cpu_set_t"
+    );
+    // SAFETY: cpu was checked against CPU_SETSIZE and inherited_mask is initialized.
+    let cpu_is_allowed = unsafe { libc::CPU_ISSET(cpu, inherited_mask) };
+    ensure!(
+        cpu_is_allowed,
+        "CPU {cpu} is outside the WAL worker's inherited affinity mask"
+    );
+    // SAFETY: cpu_set_t is an integer bitset, so zero is a valid empty mask.
+    let mut requested_mask = unsafe { std::mem::zeroed::<libc::cpu_set_t>() };
+    // SAFETY: cpu was checked against CPU_SETSIZE and requested_mask is writable.
+    unsafe { libc::CPU_SET(cpu, &mut requested_mask) };
+    // SAFETY: the mask is initialized and pid 0 refers to the current thread.
+    let result = unsafe {
+        libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &requested_mask)
+    };
+    ensure!(
+        result == 0,
+        "pin WAL I/O worker to CPU {cpu}: {}",
+        io::Error::last_os_error()
+    );
+
     Ok(())
 }
 
@@ -1689,6 +1753,17 @@ impl<B: WorkerBuffer> IoWorker<B> {
         let join = thread::Builder::new()
             .name("wal-io-worker".to_owned())
             .spawn(move || {
+                #[cfg(all(feature = "bench", target_os = "linux"))]
+                let bench_io_affinity = match configure_bench_io_worker_affinity() {
+                    Ok(affinity) => affinity,
+                    Err(error) => {
+                        let _ = startup_tx.send(Err(
+                            error.context("failed to configure WAL I/O worker affinity")
+                        ));
+                        return Err(anyhow!("WAL I/O worker affinity configuration failed"));
+                    }
+                };
+
                 // This thread creates, submits to, and reaps the ring. Let
                 // completion task work run at kernel transitions instead of
                 // interrupting userspace, and advertise the single issuer.
@@ -1712,7 +1787,10 @@ impl<B: WorkerBuffer> IoWorker<B> {
                     }
                 };
                 #[cfg(all(feature = "bench", target_os = "linux"))]
-                if let Err(error) = register_bench_iowq_affinity(&ring) {
+                if let Some((Some(iowq_affinity), inherited_mask)) = bench_io_affinity.as_ref()
+                    && let Err(error) =
+                        register_bench_iowq_affinity(&ring, iowq_affinity, inherited_mask)
+                {
                     let _ = startup_tx
                         .send(Err(error.context("failed to set io_uring worker affinity")));
                     return Err(anyhow!(

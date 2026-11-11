@@ -1349,6 +1349,7 @@ mod bench_cpu_affinity {
     const REPORT_ENV: &str = "TOYKV_BENCH_AFFINITY_REPORT";
     const TOPOLOGY_ENV: &str = "TOYKV_BENCH_AFFINITY_TOPOLOGY";
     const IOWQ_AFFINITY_ENV: &str = "TOYKV_BENCH_IOWQ_AFFINITY";
+    const WAL_IO_WORKER_CPU_ENV: &str = "TOYKV_BENCH_WAL_IO_WORKER_CPU";
 
     #[derive(Clone, Debug, Serialize)]
     pub struct ThreadPlacement {
@@ -1380,6 +1381,7 @@ mod bench_cpu_affinity {
         topology: Vec<Vec<usize>>,
         writer_cpus: Vec<usize>,
         helper_cpus: Vec<usize>,
+        io_worker_cpu_before_ring: Option<usize>,
         iowq_affinity: String,
         expected_iowq_cpus: Vec<usize>,
         before: Vec<ThreadPlacement>,
@@ -1465,6 +1467,26 @@ mod bench_cpu_affinity {
                     .map(|siblings| siblings[1])
                     .collect()
             };
+            let io_worker_cpu_before_ring = std::env::var(WAL_IO_WORKER_CPU_ENV)
+                .ok()
+                .filter(|value| !value.is_empty())
+                .map(|value| {
+                    value.parse::<usize>().with_context(|| {
+                        format!("invalid CPU in {WAL_IO_WORKER_CPU_ENV}={value:?}")
+                    })
+                })
+                .transpose()?;
+            if mode == "none" {
+                ensure!(
+                    io_worker_cpu_before_ring.is_none(),
+                    "{WAL_IO_WORKER_CPU_ENV} must be empty when {MODE_ENV}=none"
+                );
+            } else {
+                ensure!(
+                    helper_cpus.first() == io_worker_cpu_before_ring.as_ref(),
+                    "{WAL_IO_WORKER_CPU_ENV} must match the WAL I/O worker's requested CPU"
+                );
+            }
             let writer_cpus = if mode == "wal_writers" {
                 if writer_count == 8 {
                     topology.iter().map(|siblings| siblings[0]).collect()
@@ -1491,6 +1513,7 @@ mod bench_cpu_affinity {
                 topology,
                 writer_cpus,
                 helper_cpus,
+                io_worker_cpu_before_ring,
                 iowq_affinity,
                 expected_iowq_cpus,
                 before,
@@ -1573,6 +1596,7 @@ mod bench_cpu_affinity {
                 "cpu_topology_siblings": self.topology,
                 "writer_cpus": self.writer_cpus,
                 "wal_helper_cpus": self.helper_cpus,
+                "wal_io_worker_cpu_before_ring_creation": self.io_worker_cpu_before_ring,
                 "wal_helpers": self.wal_helpers,
                 "io_wq_affinity": self.iowq_affinity,
                 "expected_io_wq_cpus": self.expected_iowq_cpus,
