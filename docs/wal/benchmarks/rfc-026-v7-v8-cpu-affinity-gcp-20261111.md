@@ -95,13 +95,13 @@ the same logical CPUs 8–11 (V7) or 8–9 (V8) with writers. This makes C a
 placement stress case rather than a dedicated-core comparison, and may explain
 why it failed to beat B at 16 writers.
 
-The results support a controlled follow-up that pins WAL helpers while
-explicitly controlling io_uring worker masks. They do not yet show whether the
-benefit comes from helper locality, io_uring placement, changed group
-formation, or their interaction. Since C did not outperform B at 16 writers,
-there is not yet evidence that pinning the inline durability driver through its
-writer thread adds throughput beyond pinning the persistent WAL helpers. A
-fixed-driver-thread experiment should wait until these effects are separated.
+The initial matrix supported a follow-up that varied io-wq masks independently
+of WAL-helper placement. The 2×2 results below show that io-wq-only pinning was
+the strongest arm in this configuration, but do not establish whether the gain
+came from locality, changed group formation, or a CPU 8-specific effect. The
+combined arm did not beat io-wq-only placement, so a fixed-driver-thread test
+should wait until the io-wq result is repeated on another CPU and compared with
+a matched V7 control.
 
 ## Follow-up: separate WAL-helper and io-wq affinity
 
