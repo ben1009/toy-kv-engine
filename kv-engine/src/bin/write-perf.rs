@@ -1646,7 +1646,17 @@ mod bench_cpu_affinity {
                 thread.allowed_cpus.contains(&cpu),
                 "WAL role {role} cannot be pinned to unavailable CPU {cpu}"
             );
-            set_affinity(thread.tid, cpu)?;
+            if role == "io-worker" {
+                // Its affinity is set before ring creation so io-wq inherits the
+                // independently registered mask. Do not narrow it again here.
+                let actual = read_thread(thread.tid)?;
+                ensure!(
+                    actual.allowed_cpus == [cpu],
+                    "WAL I/O worker startup affinity does not match requested CPU {cpu}"
+                );
+            } else {
+                set_affinity(thread.tid, cpu)?;
+            }
             helpers.push(WalHelperPlacement {
                 tid: thread.tid,
                 name: thread.name.clone(),
