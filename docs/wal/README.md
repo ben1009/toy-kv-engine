@@ -84,6 +84,7 @@ the retained and rejected experiments.
 - [RFC 026 V8 FRONTIER I/O A/B on GCP, 2026-11-11](benchmarks/rfc-026-v8-frontier-io-ab-gcp-20261111.md)
 - [RFC 026 V8 coalescing budget A/B on GCP, 2026-11-11](benchmarks/rfc-026-v8-coalescing-budget-gcp-20261111.md)
 - [RFC 026 V8 low-overhead coalescing confirmation on GCP, 2026-11-11](benchmarks/rfc-026-v8-low-overhead-budget-gcp-20261111.md)
+- [RFC 026 V7 vs V8 Direct/400 μs on GCP, 2026-11-11](benchmarks/rfc-026-v7-v8-direct400-gcp-20261111.md)
 - [Held-out WAL latency calibration method](benchmarks/wal-state-calibration-method.md)
 - [RFC 026 held-out calibration: no qualified V7/V8 ratio, 2026-11-03](benchmarks/rfc-026-v8-calibrated-states-20261103.md)
 - [WAL extent attribution and calibration observations](benchmarks/wal-extent-attribution-method.md)
