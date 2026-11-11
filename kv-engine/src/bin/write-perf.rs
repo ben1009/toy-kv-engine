@@ -1474,12 +1474,20 @@ mod bench_cpu_affinity {
             self.writer_cpus.get(writer_index).copied()
         }
 
-        pub fn finish(self, writers: Vec<WriterPlacement>) -> Result<()> {
+        pub fn finish(self, mut writers: Vec<WriterPlacement>) -> Result<()> {
             ensure!(
                 writers.len() == self.writer_count,
                 "captured {} writer masks, expected {}",
                 writers.len(),
                 self.writer_count
+            );
+            writers.sort_by_key(|writer| writer.writer_index);
+            ensure!(
+                writers
+                    .iter()
+                    .enumerate()
+                    .all(|(index, writer)| writer.writer_index == index),
+                "writer placement indices are not a complete sequence"
             );
             let after = thread_snapshot()?;
             let after_wal_helpers = after
@@ -1518,9 +1526,9 @@ mod bench_cpu_affinity {
             let io_uring_worker_count_after = io_uring_workers_after.len();
             if self.mode == "wal_writers" {
                 ensure!(
-                    writers.iter().enumerate().all(|(index, writer)| {
+                    writers.iter().all(|writer| {
                         writer.pinned_cpu.is_some_and(|cpu| {
-                            self.writer_cpus.get(index) == Some(&cpu)
+                            self.writer_cpus.get(writer.writer_index) == Some(&cpu)
                                 && writer.allowed_cpus == [cpu]
                         })
                     }),
