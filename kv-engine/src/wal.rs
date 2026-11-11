@@ -1958,6 +1958,10 @@ impl Wal {
             runtime.set_wal_sync_diagnostics_enabled(profile, enabled)
         } else if let Some(writer) = &self.v8_parallel {
             writer.set_wal_sync_diagnostics_enabled(profile, enabled)
+        } else if let Some(writer) = &self.v8_leader {
+            writer
+                .lock()
+                .set_wal_sync_diagnostics_enabled(profile, enabled)
         } else {
             profile.set_wal_sync_diagnostics_enabled(enabled);
             Ok(())

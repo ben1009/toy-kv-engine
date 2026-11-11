@@ -150,6 +150,7 @@ def _load_benchmark_record(result_path: Path) -> dict[str, Any]:
 
 def _validate_wal_io_metadata(
     pipeline: dict[str, Any], expected_version: int, expected_frontier_mode: str = "buffered",
+    expected_data_o_direct: bool = True,
 ) -> dict[str, Any]:
     if expected_version != 8:
         return {}
@@ -179,6 +180,10 @@ def _validate_wal_io_metadata(
 
     if len(identities) != 1:
         raise ValueError("V8 DATA, FRONTIER, and sync handles do not identify one WAL inode")
+    if start["data"]["o_direct"] is not expected_data_o_direct:
+        raise ValueError(f"expected V8 DATA O_DIRECT={expected_data_o_direct}")
+    if start["sync"]["o_direct"] is not False:
+        raise ValueError("expected V8 sync O_DIRECT=False")
     expected_frontier_direct = expected_frontier_mode == "direct"
     if start["frontier"]["o_direct"] is not expected_frontier_direct:
         raise ValueError(
@@ -194,6 +199,10 @@ def _validate_wal_io_metadata(
         "wal_io_device": device,
         "wal_io_inode": inode,
     }
+
+
+def _expected_frontier_mode_for_arm(arm: str, configured_mode: str) -> str:
+    return configured_mode if arm == "v8_parallel" else "buffered"
 
 
 def _run_one(
@@ -342,14 +351,21 @@ def _run_one(
                 raise ValueError("benchmark wal_pipeline must be an object or null")
             cpu_seconds = (float(result["process_cpu_user_ms"]) + float(result["process_cpu_system_ms"])) / 1000
             expected_version = 7 if row["arm"] == "v7_parallel" else 8
-            expected_frontier_mode = os.environ.get("TOYKV_WAL_V8_FRONTIER_MODE", "buffered")
+            expected_frontier_mode = _expected_frontier_mode_for_arm(
+                row["arm"], os.environ.get("TOYKV_WAL_V8_FRONTIER_MODE", "buffered")
+            )
             parsed_metrics = {
                 "ops": ops,
                 "puts_per_second": float(result["ops_per_sec"]),
                 "p99_ms": float(latency["p99_ms"]),
                 "cpu_seconds": cpu_seconds,
                 "sync_count": pipeline.get("sync_count", ""),
-                **_validate_wal_io_metadata(pipeline, expected_version, expected_frontier_mode),
+                **_validate_wal_io_metadata(
+                    pipeline,
+                    expected_version,
+                    expected_frontier_mode,
+                    expected_data_o_direct=row["arm"] == "v8_parallel",
+                ),
             }
             if any(not math.isfinite(parsed_metrics[key]) or parsed_metrics[key] < 0
                    for key in ("puts_per_second", "p99_ms", "cpu_seconds")):

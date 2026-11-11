@@ -47,6 +47,9 @@ use crate::{
 #[cfg(feature = "bench")]
 use crate::wal::{WalIoDiagnostics, WalIoHandleMetadata};
 
+#[cfg(feature = "bench")]
+use super::parallel::WalV8TicketProgress;
+
 use super::{
     WAL_V8_HEADER_LEN,
     codec::{
@@ -73,6 +76,25 @@ const MAX_GROUP_TICKETS: usize = 8;
 // under contention; explicit Leader groups retain their separate smaller cap.
 const MAX_PARALLEL_INFLIGHT_TICKETS: usize = 32;
 const DATA_GROUP_JOIN_BUDGET: Duration = Duration::from_micros(10);
+
+#[cfg(feature = "bench")]
+fn data_completion_to_frontier_start_ns(
+    tickets: &[WalV8TicketProgress],
+    frontier_write_started: Option<Instant>,
+) -> Option<u64> {
+    let frontier_write_started = frontier_write_started?;
+    let mut latest_completion = None;
+    for ticket in tickets {
+        let completed_at = ticket.data_completed_at?;
+        latest_completion = Some(
+            latest_completion.map_or(completed_at, |latest: Instant| latest.max(completed_at)),
+        );
+    }
+
+    let wait = frontier_write_started.checked_duration_since(latest_completion?)?;
+
+    Some(wait.as_nanos().min(u64::MAX as u128) as u64)
+}
 
 pub(crate) type WalV8PreparedBatch<'a> = PreparedWalV8Batch<'a, WalV8PreflightReservation>;
 
@@ -142,6 +164,8 @@ pub(crate) struct WalV8LeaderWriter {
     installed_ino: u64,
     #[cfg(feature = "bench")]
     io_diagnostics: WalIoDiagnostics,
+    #[cfg(feature = "bench")]
+    initial_ticket: u64,
     #[cfg(feature = "bench")]
     profile: arc_swap::ArcSwapOption<crate::mem_table::WriteProfile>,
 }
@@ -919,13 +943,40 @@ impl WalV8LeaderWriter {
             #[cfg(feature = "bench")]
             io_diagnostics,
             #[cfg(feature = "bench")]
+            initial_ticket: installed.next_ticket,
+            #[cfg(feature = "bench")]
             profile: arc_swap::ArcSwapOption::empty(),
         })
     }
 
     #[cfg(feature = "bench")]
     pub(crate) fn set_write_profile(&self, profile: Arc<crate::mem_table::WriteProfile>) {
+        if self.coordinator.next_ticket() == self.initial_ticket {
+            self.coordinator
+                .set_data_completion_timestamps_enabled(profile.wal_sync_diagnostics_enabled());
+        }
         self.profile.store(Some(profile));
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn set_wal_sync_diagnostics_enabled(
+        &self,
+        profile: &crate::mem_table::WriteProfile,
+        enabled: bool,
+    ) -> Result<()> {
+        self.coordinator.with_next_ticket(|next_ticket| {
+            ensure!(
+                !enabled
+                    || profile.wal_sync_diagnostics_enabled()
+                    || next_ticket == self.initial_ticket,
+                "WAL sync diagnostics must be enabled before the first WAL ticket"
+            );
+            profile.set_wal_sync_diagnostics_enabled(enabled);
+            self.coordinator
+                .set_data_completion_timestamps_enabled(enabled);
+
+            Ok(())
+        })
     }
 
     #[cfg(feature = "bench")]
@@ -1431,18 +1482,20 @@ impl WalV8LeaderWriter {
         )
         .context("write v8 Leader FRONTIER")?;
         #[cfg(feature = "bench")]
-        if let (Some(profile), Some(started)) = (&profile, frontier_write_started) {
-            let data_bytes = producer_completions
-                .iter()
-                .fold(0_u64, |total, completion| {
-                    total.saturating_add(completion.encoded.frame_buffer_bytes() as u64)
-                });
-            profile.record_wal_commit_group(producer_completions.len() as u64, data_bytes);
-            profile.record_wal_frontier_write(
-                WAL_V8_FRAME_LEN as u64,
-                started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
-            );
-        }
+        let frontier_write_ns =
+            if let (Some(profile), Some(started)) = (&profile, frontier_write_started) {
+                let data_bytes = producer_completions
+                    .iter()
+                    .fold(0_u64, |total, completion| {
+                        total.saturating_add(completion.encoded.frame_buffer_bytes() as u64)
+                    });
+                let frontier_write_ns = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+                profile.record_wal_commit_group(producer_completions.len() as u64, data_bytes);
+                profile.record_wal_frontier_write(WAL_V8_FRAME_LEN as u64, frontier_write_ns);
+                Some(frontier_write_ns)
+            } else {
+                None
+            };
         #[cfg(feature = "bench")]
         let sync_started = profile.as_ref().map(|_| Instant::now());
         let sync_result = fdatasync_once(&self.sync_file);
@@ -1458,6 +1511,12 @@ impl WalV8LeaderWriter {
                     written_frontier_end: ticket_end,
                     groups_completed: producer_completions.len() as u64,
                     groups_covered: producer_completions.len() as u64,
+                    tickets_covered: Some(producer_completions.len() as u64),
+                    frontier_write_ns: frontier_write_ns.unwrap_or(0),
+                    data_completion_to_frontier_start_ns: data_completion_to_frontier_start_ns(
+                        &ready_prefix[..producer_completions.len()],
+                        frontier_write_started,
+                    ),
                     duration_ns,
                     succeeded: sync_result.is_ok(),
                     ..crate::mem_table::WalSyncObservation::default()
@@ -1575,6 +1634,10 @@ impl WalV8ParallelWriter {
     #[cfg(feature = "bench")]
     pub(crate) fn set_write_profile(&self, profile: Arc<crate::mem_table::WriteProfile>) {
         self.io.set_profile(Arc::clone(&profile));
+        if self.coordinator.next_ticket() == self.initial_ticket {
+            self.coordinator
+                .set_data_completion_timestamps_enabled(profile.wal_sync_diagnostics_enabled());
+        }
         self.profile.store(Some(profile));
     }
 
@@ -1592,6 +1655,8 @@ impl WalV8ParallelWriter {
                 "WAL sync diagnostics must be enabled before the first WAL ticket"
             );
             profile.set_wal_sync_diagnostics_enabled(enabled);
+            self.coordinator
+                .set_data_completion_timestamps_enabled(enabled);
 
             Ok(())
         })
@@ -1885,17 +1950,20 @@ impl WalV8ParallelWriter {
             #[cfg(feature = "chaos-testing")]
             crate::chaos::failpoint::wal_crash_point("wal_v8.parallel.after_frontier_write");
             #[cfg(feature = "bench")]
-            if let (Some(profile), Some(started)) = (&profile, frontier_write_started) {
+            let frontier_write_ns = if let (Some(profile), Some(started)) =
+                (&profile, frontier_write_started)
+            {
                 let data_bytes = ready.iter().fold(0_u64, |total, progress| {
                     total.saturating_add(progress.frame_buffer_bytes as u64)
                 });
                 let groups = ready.len() as u64;
+                let frontier_write_ns = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
                 profile.record_wal_commit_group(groups, data_bytes);
-                profile.record_wal_frontier_write(
-                    WAL_V8_FRAME_LEN as u64,
-                    started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
-                );
-            }
+                profile.record_wal_frontier_write(WAL_V8_FRAME_LEN as u64, frontier_write_ns);
+                Some(frontier_write_ns)
+            } else {
+                None
+            };
             let sync_started = Instant::now();
             let sync_result = fdatasync_once(&self.sync_file);
             previous.last_sync_latency = Some(sync_started.elapsed());
@@ -1926,6 +1994,12 @@ impl WalV8ParallelWriter {
                             .and_then(|ticket| ticket.data_write_elapsed_ns),
                         groups_completed: groups,
                         groups_covered: groups,
+                        tickets_covered: Some(frontier_ticket_end - first_ticket),
+                        frontier_write_ns: frontier_write_ns.unwrap_or(0),
+                        data_completion_to_frontier_start_ns: data_completion_to_frontier_start_ns(
+                            &ready,
+                            frontier_write_started,
+                        ),
                         duration_ns,
                         succeeded: sync_result.is_ok(),
                         ..crate::mem_table::WalSyncObservation::default()
@@ -2409,6 +2483,8 @@ mod tests {
     fn failpoint_parallel_writer_crashes_at_durability_boundaries() -> Result<()> {
         const CHILD_WAL_ENV: &str = "TOY_KV_V8_PARALLEL_CRASH_CHILD_WAL";
         const CHILD_ACK_ENV: &str = "TOY_KV_V8_PARALLEL_CRASH_CHILD_ACK";
+        const CHILD_FRONTIER_MODE_ENV: &str = "TOY_KV_V8_PARALLEL_CRASH_FRONTIER_MODE";
+        const FRONTIER_MODE_ENV: &str = "TOYKV_WAL_V8_FRONTIER_MODE";
         const TEST_NAME: &str =
             "wal::v8::leader::tests::failpoint_parallel_writer_crashes_at_durability_boundaries";
         const CRASH_POINTS: [(&str, u64, u64); 4] = [
@@ -2433,6 +2509,18 @@ mod tests {
                 LIVE_WAL_V5_LIMITS,
                 MAX_WAL_FILE_SIZE,
             )?;
+            #[cfg(feature = "bench")]
+            let writer = if std::env::var(CHILD_FRONTIER_MODE_ENV).as_deref() == Ok("direct") {
+                let worker_file = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .custom_flags(libc::O_DIRECT)
+                    .open(wal_path)?;
+                open_writer(wal_path, &installed)?.into_parallel_with_worker_file(worker_file)?
+            } else {
+                open_writer(wal_path, &installed)?.into_parallel()?
+            };
+            #[cfg(not(feature = "bench"))]
             let writer = open_writer(wal_path, &installed)?.into_parallel()?;
             let value = batch(10);
             writer.append_prepared_batch(
@@ -2444,83 +2532,98 @@ mod tests {
             anyhow::bail!("configured V8 writer crash point did not stop the child")
         }
 
-        for (crash_point, expected_min_ticket_end, expected_max_ticket_end) in CRASH_POINTS {
-            let directory = tempfile::tempdir()?;
-            let wal_path = directory.path().join("active-v8.wal");
-            let ack_path = directory.path().join("acknowledged");
-            let marker_path = directory.path().join("crash.marker");
-            let anchor = create_empty_active(&wal_path, header())?;
+        let parent = Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/wal-v8-tests");
+        std::fs::create_dir_all(&parent)?;
+        #[cfg(feature = "bench")]
+        let frontier_modes = ["buffered", "direct"];
+        #[cfg(not(feature = "bench"))]
+        let frontier_modes = ["buffered"];
 
-            let mut child = Command::new(std::env::current_exe()?);
-            child
-                .arg("--exact")
-                .arg(TEST_NAME)
-                .arg("--nocapture")
-                .env(CHILD_WAL_ENV, &wal_path)
-                .env(CHILD_ACK_ENV, &ack_path)
-                .env(
-                    crate::chaos::failpoint::PARALLEL_WAL_CRASH_POINT_ENV,
-                    crash_point,
-                )
-                .env(
-                    crate::chaos::failpoint::PARALLEL_WAL_CRASH_OCCURRENCE_ENV,
-                    "1",
-                )
-                .env(
-                    crate::chaos::failpoint::PARALLEL_WAL_CRASH_MARKER_ENV,
-                    &marker_path,
-                )
-                .stdout(Stdio::null())
-                .stderr(Stdio::null());
-            let mut child = child.spawn()?;
-            let deadline = Instant::now() + Duration::from_secs(30);
-            loop {
-                if marker_path.is_file() {
-                    break;
-                }
-                if let Some(status) = child.try_wait()? {
-                    anyhow::bail!("V8 writer child exited before reaching {crash_point}: {status}");
-                }
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    anyhow::bail!("V8 writer child did not reach {crash_point}");
-                }
-                thread::sleep(Duration::from_millis(10));
-            }
+        for frontier_mode in frontier_modes {
+            for (crash_point, expected_min_ticket_end, expected_max_ticket_end) in CRASH_POINTS {
+                let directory = tempfile::tempdir_in(&parent)?;
+                let wal_path = directory.path().join("active-v8.wal");
+                let ack_path = directory.path().join("acknowledged");
+                let marker_path = directory.path().join("crash.marker");
+                let anchor = create_empty_active(&wal_path, header())?;
 
-            child.kill()?;
-            let status = child.wait()?;
-            ensure!(
-                status.signal() == Some(libc::SIGKILL),
-                "V8 writer child was not killed at {crash_point}: {status}"
-            );
-            assert_eq!(std::fs::read_to_string(&marker_path)?.trim(), crash_point);
-            assert!(!ack_path.exists(), "crashed V8 write was acknowledged");
+                let mut child = Command::new(std::env::current_exe()?);
+                child
+                    .arg("--exact")
+                    .arg(TEST_NAME)
+                    .arg("--nocapture")
+                    .env(CHILD_WAL_ENV, &wal_path)
+                    .env(CHILD_ACK_ENV, &ack_path)
+                    .env(CHILD_FRONTIER_MODE_ENV, frontier_mode)
+                    .env(FRONTIER_MODE_ENV, frontier_mode)
+                    .env(
+                        crate::chaos::failpoint::PARALLEL_WAL_CRASH_POINT_ENV,
+                        crash_point,
+                    )
+                    .env(
+                        crate::chaos::failpoint::PARALLEL_WAL_CRASH_OCCURRENCE_ENV,
+                        "1",
+                    )
+                    .env(
+                        crate::chaos::failpoint::PARALLEL_WAL_CRASH_MARKER_ENV,
+                        &marker_path,
+                    )
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::inherit());
+                let mut child = child.spawn()?;
+                let deadline = Instant::now() + Duration::from_secs(30);
+                loop {
+                    if marker_path.is_file() {
+                        break;
+                    }
+                    if let Some(status) = child.try_wait()? {
+                        anyhow::bail!(
+                            "V8 writer child exited before reaching {crash_point} in {frontier_mode} mode: {status}"
+                        );
+                    }
+                    if Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        anyhow::bail!(
+                            "V8 writer child did not reach {crash_point} in {frontier_mode} mode"
+                        );
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
 
-            let recovered = super::super::install::recover_and_install_active(
-                &wal_path,
-                &[anchor],
-                header().predecessor,
-                LIVE_WAL_V5_LIMITS,
-                MAX_WAL_FILE_SIZE,
-            )?;
-            assert!(
-                (expected_min_ticket_end..=expected_max_ticket_end)
-                    .contains(&recovered.active_boundary.ticket_end),
-                "recovered ticket end {} is outside the permitted range for {crash_point}",
-                recovered.active_boundary.ticket_end,
-            );
-            let batches = replayed_batches(&wal_path, &recovered)?;
-            assert_eq!(
-                batches.len() as u64,
-                recovered.active_boundary.ticket_end,
-                "replay count differs from recovered boundary at {crash_point}"
-            );
-            if recovered.active_boundary.ticket_end == 1 {
-                assert_eq!(batches, [batch(10)]);
-            } else {
-                assert!(batches.is_empty());
+                child.kill()?;
+                let status = child.wait()?;
+                ensure!(
+                    status.signal() == Some(libc::SIGKILL),
+                    "V8 writer child was not killed at {crash_point} in {frontier_mode} mode: {status}"
+                );
+                assert_eq!(std::fs::read_to_string(&marker_path)?.trim(), crash_point);
+                assert!(!ack_path.exists(), "crashed V8 write was acknowledged");
+
+                let recovered = super::super::install::recover_and_install_active(
+                    &wal_path,
+                    &[anchor],
+                    header().predecessor,
+                    LIVE_WAL_V5_LIMITS,
+                    MAX_WAL_FILE_SIZE,
+                )?;
+                assert!(
+                    (expected_min_ticket_end..=expected_max_ticket_end)
+                        .contains(&recovered.active_boundary.ticket_end),
+                    "recovered ticket end {} is outside the permitted range for {crash_point}",
+                    recovered.active_boundary.ticket_end,
+                );
+                let batches = replayed_batches(&wal_path, &recovered)?;
+                assert_eq!(
+                    batches.len() as u64,
+                    recovered.active_boundary.ticket_end,
+                    "replay count differs from recovered boundary at {crash_point} in {frontier_mode} mode"
+                );
+                if recovered.active_boundary.ticket_end == 1 {
+                    assert_eq!(batches, [batch(10)]);
+                } else {
+                    assert!(batches.is_empty());
+                }
             }
         }
 
@@ -2557,6 +2660,48 @@ mod tests {
             20,
             next.recorded_at,
         )?;
+        let observations = profile.wal_sync_observations();
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].tickets_covered, Some(1));
+        assert!(observations[0].frontier_write_ns > 0);
+        assert!(observations[0].duration_ns > 0);
+        assert!(
+            observations[0]
+                .data_completion_to_frontier_start_ns
+                .is_some()
+        );
+        writer.set_wal_sync_diagnostics_enabled(&profile, false)?;
+        let error = writer
+            .set_wal_sync_diagnostics_enabled(&profile, true)
+            .expect_err("diagnostics re-enable after a new ticket must be rejected");
+        assert!(error.to_string().contains("before the first WAL ticket"));
+        assert!(!profile.wal_sync_diagnostics_enabled());
+
+        Ok(())
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn leader_sync_diagnostics_capture_frontier_io_and_completion_wait() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("diagnostics-leader-v8.wal");
+        let mut writer = open_writer(&path, &install_empty(&path, header())?)?;
+        let profile = Arc::new(crate::mem_table::WriteProfile::default());
+        writer.set_write_profile(Arc::clone(&profile));
+        writer.set_wal_sync_diagnostics_enabled(&profile, true)?;
+
+        writer.append_batch(&batch(10), LIVE_WAL_V5_LIMITS)?;
+
+        let observations = profile.wal_sync_observations();
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].tickets_covered, Some(1));
+        assert!(observations[0].frontier_write_ns > 0);
+        assert!(observations[0].duration_ns > 0);
+        assert!(
+            observations[0]
+                .data_completion_to_frontier_start_ns
+                .is_some()
+        );
         writer.set_wal_sync_diagnostics_enabled(&profile, false)?;
         let error = writer
             .set_wal_sync_diagnostics_enabled(&profile, true)

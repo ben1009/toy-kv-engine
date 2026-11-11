@@ -73,6 +73,10 @@ struct CoordinatorInner {
     /// DATA submitter can identify a lone admitted head without taking the
     /// coordinator lock under its submission lock.
     admitted_ticket_end: AtomicU64,
+    /// Avoid timestamping every DATA completion unless detailed sync
+    /// diagnostics are enabled for this WAL.
+    #[cfg(feature = "bench")]
+    data_completion_timestamps_enabled: std::sync::atomic::AtomicBool,
     segment_incarnation: [u8; 16],
     physical_header_digest: [u8; 32],
     initial_prefix_digest: WalV8Digest,
@@ -122,6 +126,8 @@ struct TicketState {
     data_complete: bool,
     #[cfg(feature = "bench")]
     data_write_started_at: Option<Instant>,
+    #[cfg(feature = "bench")]
+    data_completed_at: Option<Instant>,
 }
 
 /// Immutable view of one ticket in the admission window.
@@ -138,6 +144,8 @@ pub(crate) struct WalV8TicketProgress {
     pub(crate) data_complete: bool,
     #[cfg(feature = "bench")]
     pub(crate) data_write_elapsed_ns: Option<u64>,
+    #[cfg(feature = "bench")]
+    pub(crate) data_completed_at: Option<Instant>,
 }
 
 /// Atomic view of the durability decision point. `next_not_ready` is the
@@ -265,6 +273,8 @@ impl WalV8ParallelCoordinator {
                 durability_changed: Condvar::new(),
                 durable_published: Condvar::new(),
                 admitted_ticket_end: AtomicU64::new(config.next_ticket),
+                #[cfg(feature = "bench")]
+                data_completion_timestamps_enabled: std::sync::atomic::AtomicBool::new(false),
                 segment_incarnation: header.incarnation,
                 physical_header_digest,
                 initial_prefix_digest,
@@ -309,6 +319,13 @@ impl WalV8ParallelCoordinator {
 
     pub(crate) fn admitted_ticket_end(&self) -> u64 {
         self.inner.admitted_ticket_end.load(Ordering::Acquire)
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn set_data_completion_timestamps_enabled(&self, enabled: bool) {
+        self.inner
+            .data_completion_timestamps_enabled
+            .store(enabled, Ordering::Release);
     }
 
     /// Return the contiguous head prefix whose DATA frames are ready to submit.
@@ -557,6 +574,14 @@ impl WalV8ParallelCoordinator {
             return Ok(());
         }
         state.tickets[index].data_complete = true;
+        #[cfg(feature = "bench")]
+        if self
+            .inner
+            .data_completion_timestamps_enabled
+            .load(Ordering::Acquire)
+        {
+            state.tickets[index].data_completed_at = Some(Instant::now());
+        }
         signal_change(&self.inner, &mut state);
         signal_durability_progress(&self.inner, &mut state);
 
@@ -627,6 +652,12 @@ impl WalV8ParallelCoordinator {
             poison_locked(&self.inner, &mut state);
             anyhow::bail!("v8 DATA-completion group partially duplicates prior completion")
         }
+        #[cfg(feature = "bench")]
+        let data_completed_at = self
+            .inner
+            .data_completion_timestamps_enabled
+            .load(Ordering::Acquire)
+            .then(Instant::now);
         for entry in state
             .tickets
             .iter_mut()
@@ -634,6 +665,10 @@ impl WalV8ParallelCoordinator {
             .take(ticket_count)
         {
             entry.data_complete = true;
+            #[cfg(feature = "bench")]
+            {
+                entry.data_completed_at = data_completed_at;
+            }
         }
         signal_change(&self.inner, &mut state);
         signal_durability_progress(&self.inner, &mut state);
@@ -1149,6 +1184,8 @@ impl WalV8AdmissionPublisher for WalV8ParallelCoordinator {
             data_complete: false,
             #[cfg(feature = "bench")]
             data_write_started_at: None,
+            #[cfg(feature = "bench")]
+            data_completed_at: None,
         });
         state.next_ticket = next_ticket;
         state.next_data_offset = data_end;
@@ -1251,6 +1288,8 @@ impl TicketState {
             data_write_elapsed_ns: self
                 .data_write_started_at
                 .map(|started| started.elapsed().as_nanos().min(u64::MAX as u128) as u64),
+            #[cfg(feature = "bench")]
+            data_completed_at: self.data_completed_at,
         }
     }
 

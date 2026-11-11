@@ -26,6 +26,7 @@ from gcp_wal_matrix import (
     validate_rfc026_rows,
 )
 from gcp_wal_profile_runner import (
+    _expected_frontier_mode_for_arm,
     _load_benchmark_record,
     _run_one as run_profile_one,
     _validate_wal_io_metadata,
@@ -172,6 +173,44 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
         }
         self.assertTrue(_validate_wal_io_metadata(direct_pipeline, 8, "direct")["wal_frontier_o_direct"])
         self.assertEqual(_validate_wal_io_metadata({}, 7), {})
+        self.assertEqual(_expected_frontier_mode_for_arm("v8_parallel", "direct"), "direct")
+        self.assertEqual(_expected_frontier_mode_for_arm("v8_leader", "direct"), "buffered")
+        leader_handles = {
+            **handles,
+            "data": {**handles["data"], "o_direct": False},
+        }
+        leader_pipeline = {
+            "wal_io_start": leader_handles,
+            "wal_io_end": leader_handles,
+            "wal_io_stable": True,
+        }
+        self.assertFalse(
+            _validate_wal_io_metadata(
+                leader_pipeline,
+                8,
+                expected_data_o_direct=False,
+            )["wal_data_o_direct"]
+        )
+
+        buffered_data = {
+            **handles,
+            "data": {**handles["data"], "o_direct": False},
+        }
+        direct_sync = {
+            **handles,
+            "sync": {**handles["sync"], "o_direct": True},
+        }
+        for invalid_handles, message in (
+            (buffered_data, "expected V8 DATA O_DIRECT=True"),
+            (direct_sync, "expected V8 sync O_DIRECT=False"),
+        ):
+            invalid = {
+                "wal_io_start": invalid_handles,
+                "wal_io_end": invalid_handles,
+                "wal_io_stable": True,
+            }
+            with self.subTest(message=message), self.assertRaisesRegex(ValueError, message):
+                _validate_wal_io_metadata(invalid, 8)
 
         changed_inode = {**handles, "frontier": {**handles["frontier"], "inode": 12}}
         invalid_pipelines = (
@@ -297,8 +336,9 @@ def value(name, default=None):
     except ValueError: return default
 
 version = value('--pitr-format', 'v4')
+wal_mode = value('--wal-io-mode', 'parallel')
 handles = {
-    name: {'o_direct': name == 'data', 'device': 7, 'inode': 11}
+    name: {'o_direct': name == 'data' and wal_mode == 'parallel', 'device': 7, 'inode': 11}
     for name in ('data', 'frontier', 'sync')
 }
 pipeline = {'sync_count': 12}

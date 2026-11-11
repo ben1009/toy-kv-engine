@@ -279,6 +279,10 @@ struct Args {
     /// Select the WAL scheduler for WAL comparisons (parallel by default; v6 PITR uses Leader).
     #[arg(long, value_enum)]
     wal_io_mode: Option<WalIoModeArg>,
+    /// Capture per-sync V8 durability timing without enabling broad profiling.
+    /// Requires a bench build and PITR V8 (the default when `--pitr` is used).
+    #[arg(long, requires = "pitr")]
+    wal_sync_diagnostics: bool,
     #[arg(long)]
     vlog: bool,
     #[arg(long)]
@@ -359,6 +363,7 @@ struct HarnessConfig {
     wal_override: Option<bool>,
     wal_io_mode: WalIoModeArg,
     wal_io_mode_explicit: bool,
+    wal_sync_diagnostics: bool,
     vlog_override: bool,
     profile: bool,
     pitr: bool,
@@ -473,6 +478,7 @@ impl HarnessConfig {
             wal_override,
             wal_io_mode,
             wal_io_mode_explicit,
+            wal_sync_diagnostics: args.wal_sync_diagnostics,
             vlog_override: args.vlog,
             profile: args.profile,
             pitr: args.pitr,
@@ -1048,6 +1054,13 @@ struct WalSyncObservationRecord {
     write_cqes_completed: u64,
     groups_completed: u64,
     groups_covered: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tickets_covered: Option<u64>,
+    frontier_write_ns: u64,
+    fdatasync_ns: u64,
+    durability_io_ns: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data_completion_to_frontier_start_ns: Option<u64>,
     duration_ns: u64,
     succeeded: bool,
 }
@@ -1187,6 +1200,13 @@ impl From<kv_engine_wrapper::mem_table::WalSyncObservation> for WalSyncObservati
             write_cqes_completed: observation.write_cqes_completed,
             groups_completed: observation.groups_completed,
             groups_covered: observation.groups_covered,
+            tickets_covered: observation.tickets_covered,
+            frontier_write_ns: observation.frontier_write_ns,
+            fdatasync_ns: observation.duration_ns,
+            durability_io_ns: observation
+                .frontier_write_ns
+                .saturating_add(observation.duration_ns),
+            data_completion_to_frontier_start_ns: observation.data_completion_to_frontier_start_ns,
             duration_ns: observation.duration_ns,
             succeeded: observation.succeeded,
         }
@@ -3562,7 +3582,7 @@ fn run_wal_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
     {
         engine.reset_write_profile();
         engine.set_wal_sync_diagnostics_enabled(
-            cfg.profile && wal_run_info.runtime_counters_available(),
+            (cfg.profile || cfg.wal_sync_diagnostics) && wal_run_info.runtime_counters_available(),
         )?;
     }
     #[cfg(feature = "bench")]
@@ -3623,7 +3643,12 @@ fn run_wal_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
     let (process_cpu_user_ms, process_cpu_system_ms) =
         process_cpu_delta(cpu_start, process_cpu_times());
     #[cfg(feature = "bench")]
-    let wal_pipeline = wal_pipeline_record(&engine, cfg.profile, wal_run_info, wal_io_start)?;
+    let wal_pipeline = wal_pipeline_record(
+        &engine,
+        cfg.profile || cfg.wal_sync_diagnostics,
+        wal_run_info,
+        wal_io_start,
+    )?;
     #[cfg(not(feature = "bench"))]
     let wal_pipeline = None;
     #[cfg(feature = "bench")]
@@ -3710,7 +3735,7 @@ fn run_wal_batch_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>
     {
         engine.reset_write_profile();
         engine.set_wal_sync_diagnostics_enabled(
-            cfg.profile && wal_run_info.runtime_counters_available(),
+            (cfg.profile || cfg.wal_sync_diagnostics) && wal_run_info.runtime_counters_available(),
         )?;
     }
     #[cfg(feature = "bench")]
@@ -3820,7 +3845,12 @@ fn run_wal_batch_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>
         .map(|capture| capture.finish(timeline_spans))
         .transpose()?;
     #[cfg(feature = "bench")]
-    let wal_pipeline = wal_pipeline_record(&engine, cfg.profile, wal_run_info, wal_io_start)?;
+    let wal_pipeline = wal_pipeline_record(
+        &engine,
+        cfg.profile || cfg.wal_sync_diagnostics,
+        wal_run_info,
+        wal_io_start,
+    )?;
     #[cfg(not(feature = "bench"))]
     let wal_pipeline = None;
     #[cfg(feature = "bench")]
@@ -8565,6 +8595,16 @@ fn validate_config(cfg: &HarnessConfig) -> Result<()> {
             );
         }
     }
+    if cfg.wal_sync_diagnostics {
+        anyhow::ensure!(
+            cfg!(feature = "bench"),
+            "--wal-sync-diagnostics requires a bench build"
+        );
+        anyhow::ensure!(
+            cfg.pitr_format.unwrap_or(PitrFormatArg::V8) == PitrFormatArg::V8,
+            "--wal-sync-diagnostics requires PITR V8"
+        );
+    }
     if cfg.prepare_golden || cfg.golden_path.is_some() || cfg.clone_golden {
         anyhow::ensure!(
             cfg.suite == Suite::SteadyState,
@@ -8927,6 +8967,43 @@ mod tests {
         );
 
         assert!(Args::try_parse_from(["write-perf", "--pitr-format", "v6"]).is_err());
+    }
+
+    #[test]
+    fn wal_sync_diagnostics_require_bench_build_and_v8_pitr() {
+        let v8 = HarnessConfig::from_args(
+            Args::try_parse_from(["write-perf", "--pitr", "--wal-sync-diagnostics"])
+                .expect("parse V8 diagnostics option"),
+        );
+        let result = validate_config(&v8);
+        if cfg!(feature = "bench") {
+            result.expect("bench build can capture V8 sync diagnostics");
+        } else {
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("requires a bench build")
+            );
+        }
+
+        let v7 = HarnessConfig::from_args(
+            Args::try_parse_from([
+                "write-perf",
+                "--pitr",
+                "--pitr-format",
+                "v7",
+                "--wal-sync-diagnostics",
+            ])
+            .expect("parse incompatible V7 diagnostics option"),
+        );
+        assert!(
+            validate_config(&v7)
+                .unwrap_err()
+                .to_string()
+                .contains("requires PITR V8")
+        );
+        assert!(Args::try_parse_from(["write-perf", "--wal-sync-diagnostics"]).is_err());
     }
 
     #[derive(Debug, Deserialize)]
@@ -10125,6 +10202,7 @@ mod tests {
             wal_override: None,
             wal_io_mode: WalIoModeArg::Leader,
             wal_io_mode_explicit: false,
+            wal_sync_diagnostics: false,
             vlog_override: false,
             profile: true,
             clients: 1,
@@ -12657,6 +12735,7 @@ mod tests {
             wal_override: None,
             wal_io_mode: WalIoModeArg::Leader,
             wal_io_mode_explicit: false,
+            wal_sync_diagnostics: false,
             vlog_override: false,
             profile: false,
             clients: 1,
@@ -12798,6 +12877,9 @@ mod tests {
                 write_cqes_completed: 4,
                 groups_completed: 2,
                 groups_covered: 3,
+                tickets_covered: Some(4),
+                frontier_write_ns: 100_000,
+                data_completion_to_frontier_start_ns: Some(20_000),
                 duration_ns: 250_000,
                 succeeded: true,
             });
@@ -12817,6 +12899,11 @@ mod tests {
         assert_eq!(json["write_cqes_completed"], 4);
         assert_eq!(json["groups_completed"], 2);
         assert_eq!(json["groups_covered"], 3);
+        assert_eq!(json["tickets_covered"], 4);
+        assert_eq!(json["frontier_write_ns"], 100_000);
+        assert_eq!(json["fdatasync_ns"], 250_000);
+        assert_eq!(json["durability_io_ns"], 350_000);
+        assert_eq!(json["data_completion_to_frontier_start_ns"], 20_000);
         assert_eq!(json["duration_ns"], 250_000);
         assert_eq!(json["succeeded"], true);
     }

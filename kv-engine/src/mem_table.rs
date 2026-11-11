@@ -282,6 +282,13 @@ pub struct WalSyncObservation {
     pub write_cqes_completed: u64,
     pub groups_completed: u64,
     pub groups_covered: u64,
+    /// Ticket count represented by this V8 durability frontier.
+    pub tickets_covered: Option<u64>,
+    /// Time spent writing the V8 FRONTIER frame before fdatasync.
+    pub frontier_write_ns: u64,
+    /// Time from the latest covered DATA completion to FRONTIER write start.
+    pub data_completion_to_frontier_start_ns: Option<u64>,
+    /// fdatasync duration (retained under its historical name for compatibility).
     pub duration_ns: u64,
     pub succeeded: bool,
 }

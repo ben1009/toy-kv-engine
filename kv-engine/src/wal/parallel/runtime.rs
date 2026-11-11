@@ -3371,6 +3371,9 @@ fn synchronize_written_prefix(sync_file: &File, inner: &RuntimeInner) -> Result<
                 write_cqes_completed: _sync_end.write_cqes_completed,
                 groups_completed: _sync_end.groups_completed,
                 groups_covered: _sync_end.groups_covered,
+                tickets_covered: None,
+                frontier_write_ns: 0,
+                data_completion_to_frontier_start_ns: None,
                 duration_ns,
                 succeeded: sync_error.is_none(),
             });

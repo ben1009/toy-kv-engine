@@ -10071,12 +10071,12 @@ impl KvEngine {
     ///
     /// Diagnostics must be enabled before its first ticket is admitted. They
     /// can be disabled later, but cannot be re-enabled on that WAL because the
-    /// worker cannot reconstruct observations for the disabled interval.
+    /// writer cannot reconstruct completion timestamps for the disabled interval.
     ///
     /// # Errors
     ///
-    /// Returns an error if diagnostics are enabled after the active parallel
-    /// WAL has admitted a ticket.
+    /// Returns an error if diagnostics are enabled after the active V8 WAL has
+    /// admitted a ticket.
     pub fn set_wal_sync_diagnostics_enabled(&self, enabled: bool) -> Result<()> {
         let _active_memtable = self.inner.active_memtable_lock.read();
 
