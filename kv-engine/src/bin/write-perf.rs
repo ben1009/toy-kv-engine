@@ -1351,7 +1351,9 @@ mod bench_cpu_affinity {
     const TOPOLOGY_ENV: &str = "TOYKV_BENCH_AFFINITY_TOPOLOGY";
     const IOWQ_AFFINITY_ENV: &str = "TOYKV_BENCH_IOWQ_AFFINITY";
     const WAL_IO_WORKER_CPU_ENV: &str = "TOYKV_BENCH_WAL_IO_WORKER_CPU";
-    const IO_WQ_WARMUP_MAX_PUTS: usize = 32_768;
+    const IO_WQ_INITIAL_WARMUP_PUTS: usize = 32_768;
+    const IO_WQ_WARMUP_BATCH_PUTS: usize = 4_096;
+    const IO_WQ_MAX_WARMUP_PUTS: usize = 65_536;
 
     #[derive(Clone, Debug, Serialize)]
     pub struct ThreadPlacement {
@@ -1380,6 +1382,7 @@ mod bench_cpu_affinity {
         format_version: u16,
         writer_count: usize,
         warmup_puts: usize,
+        io_wq_worker_count_after_warmup: usize,
         report_path: PathBuf,
         topology: Vec<Vec<usize>>,
         writer_cpus: Vec<usize>,
@@ -1507,8 +1510,20 @@ mod bench_cpu_affinity {
                 Vec::new()
             };
 
-            let warmup_puts = workload_puts.min(IO_WQ_WARMUP_MAX_PUTS);
-            warmup_io_wq(engine, value, writer_count, warmup_puts, pitr)?;
+            let warmup_limit = workload_puts.min(IO_WQ_MAX_WARMUP_PUTS);
+            let mut warmup_puts = workload_puts.min(IO_WQ_INITIAL_WARMUP_PUTS);
+            warmup_io_wq(engine, value, writer_count, 0, warmup_puts, pitr)?;
+            let mut io_wq_worker_count_after_warmup = count_io_wq_workers()?;
+            while io_wq_worker_count_after_warmup < writer_count && warmup_puts < warmup_limit {
+                let batch_puts = IO_WQ_WARMUP_BATCH_PUTS.min(warmup_limit - warmup_puts);
+                warmup_io_wq(engine, value, writer_count, warmup_puts, batch_puts, pitr)?;
+                warmup_puts += batch_puts;
+                io_wq_worker_count_after_warmup = count_io_wq_workers()?;
+            }
+            ensure!(
+                io_wq_worker_count_after_warmup >= writer_count,
+                "io-wq warmup created {io_wq_worker_count_after_warmup} workers for {writer_count} writers after {warmup_puts} puts"
+            );
             engine.reset_write_profile();
 
             let before = thread_snapshot()?;
@@ -1524,6 +1539,7 @@ mod bench_cpu_affinity {
                 format_version,
                 writer_count,
                 warmup_puts,
+                io_wq_worker_count_after_warmup,
                 report_path,
                 topology,
                 writer_cpus,
@@ -1609,6 +1625,7 @@ mod bench_cpu_affinity {
                 "format_version": self.format_version,
                 "writer_count": self.writer_count,
                 "warmup_puts": self.warmup_puts,
+                "io_wq_worker_count_after_warmup": self.io_wq_worker_count_after_warmup,
                 "cpu_topology_siblings": self.topology,
                 "writer_cpus": self.writer_cpus,
                 "wal_helper_cpus": self.helper_cpus,
@@ -1646,6 +1663,7 @@ mod bench_cpu_affinity {
         engine: &Arc<KvEngine>,
         value: &[u8],
         writer_count: usize,
+        base_index: usize,
         warmup_puts: usize,
         pitr: bool,
     ) -> Result<()> {
@@ -1660,7 +1678,7 @@ mod bench_cpu_affinity {
             let engine = Arc::clone(engine);
             let value = value.to_vec();
             let thread_ops = per_thread + usize::from(writer_index < remainder);
-            let start_index = writer_index * per_thread + remainder.min(writer_index);
+            let start_index = base_index + writer_index * per_thread + remainder.min(writer_index);
             handles.push(std::thread::spawn(move || -> Result<()> {
                 for index in start_index..start_index + thread_ops {
                     let key = format!("affinity-warmup-{index:08}");
@@ -1688,6 +1706,13 @@ mod bench_cpu_affinity {
         }
 
         Ok(())
+    }
+
+    fn count_io_wq_workers() -> Result<usize> {
+        Ok(thread_snapshot()?
+            .iter()
+            .filter(|thread| thread.name.starts_with("iou-wrk-"))
+            .count())
     }
 
     fn pin_wal_helpers(
