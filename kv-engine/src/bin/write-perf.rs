@@ -1671,15 +1671,22 @@ mod bench_cpu_affinity {
             writer_count > 0,
             "io-wq warmup requires at least one writer"
         );
-        let per_thread = warmup_puts / writer_count;
-        let remainder = warmup_puts % writer_count;
-        let mut handles = Vec::with_capacity(writer_count);
-        for writer_index in 0..writer_count {
+        if warmup_puts == 0 {
+            return Ok(());
+        }
+        let warmup_thread_count = writer_count.saturating_mul(2).min(warmup_puts);
+        let per_thread = warmup_puts / warmup_thread_count;
+        let remainder = warmup_puts % warmup_thread_count;
+        let start_barrier = Arc::new(std::sync::Barrier::new(warmup_thread_count + 1));
+        let mut handles = Vec::with_capacity(warmup_thread_count);
+        for writer_index in 0..warmup_thread_count {
             let engine = Arc::clone(engine);
             let value = value.to_vec();
             let thread_ops = per_thread + usize::from(writer_index < remainder);
             let start_index = base_index + writer_index * per_thread + remainder.min(writer_index);
+            let start_barrier = Arc::clone(&start_barrier);
             handles.push(std::thread::spawn(move || -> Result<()> {
+                start_barrier.wait();
                 for index in start_index..start_index + thread_ops {
                     let key = format!("affinity-warmup-{index:08}");
                     super::with_pitr_admission_retry(pitr, || engine.put(key.as_bytes(), &value))?;
@@ -1688,6 +1695,7 @@ mod bench_cpu_affinity {
                 Ok(())
             }));
         }
+        start_barrier.wait();
 
         let mut first_error = None;
         for handle in handles {
