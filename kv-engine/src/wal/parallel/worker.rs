@@ -1643,6 +1643,9 @@ fn register_bench_iowq_affinity(
         !allowed_cpus.is_empty(),
         "WAL worker has an empty inherited CPU affinity mask"
     );
+    if std::env::var_os("TOYKV_BENCH_IOWQ_DEBUG").is_some() {
+        eprintln!("benchmark WAL I/O worker inherited CPUs: {allowed_cpus:?}");
+    }
 
     let mut requested_mask = *inherited_mask;
     match value {
@@ -1672,6 +1675,13 @@ fn register_bench_iowq_affinity(
     ring.submitter()
         .register_iowq_aff(&requested_mask)
         .with_context(|| format!("register io_uring worker affinity {value:?}"))?;
+    if std::env::var_os("TOYKV_BENCH_IOWQ_DEBUG").is_some() {
+        let registered_cpus = (0..libc::CPU_SETSIZE as usize)
+            // SAFETY: each CPU index is bounded by CPU_SETSIZE and requested_mask is initialized.
+            .filter(|cpu| unsafe { libc::CPU_ISSET(*cpu, &requested_mask) })
+            .collect::<Vec<_>>();
+        eprintln!("benchmark io-wq registered CPUs: {registered_cpus:?}");
+    }
     Ok(())
 }
 
