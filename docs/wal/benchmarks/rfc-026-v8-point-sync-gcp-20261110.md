@@ -27,7 +27,7 @@ Individual unprofiled runs are listed below. Latency percentiles use one-in-100 
 
 | Run | Format | Throughput (k puts/s) | p50 (ms) | p99 (ms) | Syncs | Runtime `fdatasync` mean (μs) | Process CPU (s) |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| 01 | V7 | 42.37 | 0.335 | 1.082 | 8,168 | 19.8 | 5.83 |
+| 01 | V7 | 42.37 | 0.335 | 1.082 | 8,168 | 19.9 | 5.83 |
 | 02 | V8 | 20.59 | 0.774 | 1.330 | 7,304 | 166.6 | 11.31 |
 | 03 | V8 | 20.60 | 0.766 | 1.441 | 7,298 | 166.1 | 11.29 |
 | 04 | V7 | 49.28 | 0.300 | 0.746 | 8,193 | 14.8 | 5.85 |
