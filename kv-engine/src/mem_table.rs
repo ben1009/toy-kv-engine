@@ -288,6 +288,18 @@ pub struct WalSyncObservation {
     pub frontier_write_ns: u64,
     /// Time from the latest covered DATA completion to FRONTIER write start.
     pub data_completion_to_frontier_start_ns: Option<u64>,
+    /// V8 FRONTIER coalescing budget selected when this advance was eligible.
+    pub coalescing_budget_us: Option<u64>,
+    /// Whether coalescing entered its condition wait for this advance.
+    pub coalescing_waited: Option<bool>,
+    /// Elapsed time in the coalescing call, including condition-variable overhead.
+    pub coalescing_wait_ns: Option<u64>,
+    /// Ready and admitted ticket counts on each side of the coalescing call.
+    pub ready_tickets_before_coalescing: Option<u64>,
+    pub ready_tickets_after_coalescing: Option<u64>,
+    pub ready_tickets_gained_during_coalescing: Option<u64>,
+    pub admitted_tickets_before_coalescing: Option<u64>,
+    pub admitted_tickets_after_coalescing: Option<u64>,
     /// fdatasync duration (retained under its historical name for compatibility).
     pub duration_ns: u64,
     pub succeeded: bool,

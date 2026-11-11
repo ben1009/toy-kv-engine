@@ -1061,6 +1061,22 @@ struct WalSyncObservationRecord {
     durability_io_ns: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     data_completion_to_frontier_start_ns: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    coalescing_budget_us: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    coalescing_waited: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    coalescing_wait_ns: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ready_tickets_before_coalescing: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ready_tickets_after_coalescing: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ready_tickets_gained_during_coalescing: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    admitted_tickets_before_coalescing: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    admitted_tickets_after_coalescing: Option<u64>,
     duration_ns: u64,
     succeeded: bool,
 }
@@ -1207,6 +1223,15 @@ impl From<kv_engine_wrapper::mem_table::WalSyncObservation> for WalSyncObservati
                 .frontier_write_ns
                 .saturating_add(observation.duration_ns),
             data_completion_to_frontier_start_ns: observation.data_completion_to_frontier_start_ns,
+            coalescing_budget_us: observation.coalescing_budget_us,
+            coalescing_waited: observation.coalescing_waited,
+            coalescing_wait_ns: observation.coalescing_wait_ns,
+            ready_tickets_before_coalescing: observation.ready_tickets_before_coalescing,
+            ready_tickets_after_coalescing: observation.ready_tickets_after_coalescing,
+            ready_tickets_gained_during_coalescing: observation
+                .ready_tickets_gained_during_coalescing,
+            admitted_tickets_before_coalescing: observation.admitted_tickets_before_coalescing,
+            admitted_tickets_after_coalescing: observation.admitted_tickets_after_coalescing,
             duration_ns: observation.duration_ns,
             succeeded: observation.succeeded,
         }
@@ -12882,6 +12907,7 @@ mod tests {
                 data_completion_to_frontier_start_ns: Some(20_000),
                 duration_ns: 250_000,
                 succeeded: true,
+                ..kv_engine_wrapper::mem_table::WalSyncObservation::default()
             });
 
         let json = serde_json::to_value(observation).expect("serialize sync observation");

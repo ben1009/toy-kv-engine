@@ -3376,6 +3376,7 @@ fn synchronize_written_prefix(sync_file: &File, inner: &RuntimeInner) -> Result<
                 data_completion_to_frontier_start_ns: None,
                 duration_ns,
                 succeeded: sync_error.is_none(),
+                ..crate::mem_table::WalSyncObservation::default()
             });
         }
     }

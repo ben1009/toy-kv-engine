@@ -193,6 +193,8 @@ pub(crate) struct WalV8ParallelWriter {
     #[cfg(feature = "bench")]
     io_diagnostics: WalIoDiagnostics,
     #[cfg(feature = "bench")]
+    coalesce_budget_override_us: Option<u64>,
+    #[cfg(feature = "bench")]
     profile: arc_swap::ArcSwapOption<crate::mem_table::WriteProfile>,
 }
 
@@ -218,6 +220,25 @@ impl WalV8FrontierWriteMode {
             ),
         }
     }
+}
+
+#[cfg(feature = "bench")]
+fn coalesce_budget_override_from_environment() -> Result<Option<u64>> {
+    let Some(value) = std::env::var_os("TOYKV_WAL_V8_COALESCE_BUDGET_US") else {
+        return Ok(None);
+    };
+    let value = value
+        .to_str()
+        .context("TOYKV_WAL_V8_COALESCE_BUDGET_US is not valid UTF-8")?;
+    let budget_us = value.parse::<u64>().with_context(|| {
+        format!("invalid TOYKV_WAL_V8_COALESCE_BUDGET_US {value:?}; expected `100` or `400`")
+    })?;
+    ensure!(
+        matches!(budget_us, 100 | 400),
+        "invalid TOYKV_WAL_V8_COALESCE_BUDGET_US {value:?}; expected `100` or `400`"
+    );
+
+    Ok(Some(budget_us))
 }
 
 struct WalV8ParallelFrontier {
@@ -1015,6 +1036,8 @@ impl WalV8LeaderWriter {
         #[cfg(feature = "bench")]
         let mut io_diagnostics = self.io_diagnostics;
         #[cfg(feature = "bench")]
+        let coalesce_budget_override_us = coalesce_budget_override_from_environment()?;
+        #[cfg(feature = "bench")]
         {
             io_diagnostics.data = WalIoHandleMetadata::from_file(&worker_file)?;
         }
@@ -1073,6 +1096,8 @@ impl WalV8LeaderWriter {
             initial_ticket,
             #[cfg(feature = "bench")]
             io_diagnostics,
+            #[cfg(feature = "bench")]
+            coalesce_budget_override_us,
             #[cfg(feature = "bench")]
             profile: self.profile,
         })
@@ -1835,33 +1860,70 @@ impl WalV8ParallelWriter {
 
             #[cfg(feature = "bench")]
             let profile = self.profile.load_full();
+            #[cfg(feature = "bench")]
+            let diagnostics_enabled = profile
+                .as_ref()
+                .is_some_and(|profile| profile.wal_sync_diagnostics_enabled());
+            #[cfg(feature = "bench")]
+            ensure!(
+                self.coalesce_budget_override_us.is_none() || diagnostics_enabled,
+                "fixed V8 coalescing budgets require --wal-sync-diagnostics"
+            );
+            #[cfg(feature = "bench")]
+            let mut coalescing_observation = None;
             let mut snapshot = self.coordinator.frontier_ready_snapshot();
             if !snapshot.ready_prefix.is_empty()
                 && snapshot.ready_prefix.len() < snapshot.admitted_ticket_count
                 && let Some(latency) = previous.last_sync_latency
             {
-                let budget = if latency >= Duration::from_micros(100) {
-                    Duration::from_micros(400)
-                } else {
-                    Duration::from_micros(100)
-                };
                 #[cfg(feature = "bench")]
-                let started = Instant::now();
+                let budget_us = self.coalesce_budget_override_us.unwrap_or_else(|| {
+                    if latency >= Duration::from_micros(100) {
+                        400
+                    } else {
+                        100
+                    }
+                });
+                #[cfg(not(feature = "bench"))]
+                let budget_us = if latency >= Duration::from_micros(100) {
+                    400
+                } else {
+                    100
+                };
+                let budget = Duration::from_micros(budget_us);
+                #[cfg(feature = "bench")]
+                let ready_tickets_before_coalescing = snapshot.ready_prefix.len() as u64;
+                #[cfg(feature = "bench")]
+                let admitted_tickets_before_coalescing = snapshot.admitted_ticket_count as u64;
+                #[cfg(feature = "bench")]
+                let started = profile.as_ref().map(|_| Instant::now());
                 let waited = self.coordinator.coalesce_frontier_ready(budget);
                 #[cfg(feature = "bench")]
+                let coalescing_wait_ns = started
+                    .map(|started| started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+                #[cfg(feature = "bench")]
                 if waited && let Some(profile) = &profile {
-                    profile.record_wal_sync_coalesce_wait(
-                        started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
-                    );
+                    profile.record_wal_sync_coalesce_wait(coalescing_wait_ns.unwrap_or_default());
                 }
                 #[cfg(not(feature = "bench"))]
                 let _ = waited;
                 snapshot = self.coordinator.frontier_ready_snapshot();
+                #[cfg(feature = "bench")]
+                if diagnostics_enabled {
+                    let ready_tickets_after_coalescing = snapshot.ready_prefix.len() as u64;
+                    coalescing_observation = Some((
+                        budget_us,
+                        waited,
+                        coalescing_wait_ns.unwrap_or_default(),
+                        ready_tickets_before_coalescing,
+                        ready_tickets_after_coalescing,
+                        ready_tickets_after_coalescing
+                            .saturating_sub(ready_tickets_before_coalescing),
+                        admitted_tickets_before_coalescing,
+                        snapshot.admitted_ticket_count as u64,
+                    ));
+                }
             }
-            #[cfg(feature = "bench")]
-            let diagnostics_enabled = profile
-                .as_ref()
-                .is_some_and(|profile| profile.wal_sync_diagnostics_enabled());
             #[cfg(feature = "bench")]
             let frontier_observation = diagnostics_enabled.then_some((
                 snapshot.admitted_ticket_count as u64,
@@ -2000,6 +2062,18 @@ impl WalV8ParallelWriter {
                             &ready,
                             frontier_write_started,
                         ),
+                        coalescing_budget_us: coalescing_observation.map(|value| value.0),
+                        coalescing_waited: coalescing_observation.map(|value| value.1),
+                        coalescing_wait_ns: coalescing_observation.map(|value| value.2),
+                        ready_tickets_before_coalescing: coalescing_observation
+                            .map(|value| value.3),
+                        ready_tickets_after_coalescing: coalescing_observation.map(|value| value.4),
+                        ready_tickets_gained_during_coalescing: coalescing_observation
+                            .map(|value| value.5),
+                        admitted_tickets_before_coalescing: coalescing_observation
+                            .map(|value| value.6),
+                        admitted_tickets_after_coalescing: coalescing_observation
+                            .map(|value| value.7),
                         duration_ns,
                         succeeded: sync_result.is_ok(),
                         ..crate::mem_table::WalSyncObservation::default()
