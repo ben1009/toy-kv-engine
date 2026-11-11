@@ -7,7 +7,9 @@ Changing only the V8 Parallel FRONTIER write handle from buffered I/O to
 improve throughput: the direct arm issued more durability advances, offsetting
 the lower latency per sync. This identifies buffered FRONTIER I/O as a strong
 contributor to the slow syscall distribution, but not as a standalone
-throughput fix.
+throughput fix. Follow-up stage timings also found that O_DIRECT FRONTIER
+writes increased accumulated FRONTIER-write-plus-sync time by 19.4% per run;
+the lower syscall latency does not make this a throughput optimization.
 
 The experiment uses a benchmark-only mode switch. It does not change the
 default WAL behavior. Run crash-recovery qualification before considering a
@@ -69,15 +71,54 @@ syncs in the unprofiled runs. Throughput stayed essentially flat across the
 ABBA blocks, so the saved time per sync was consumed by more frequent
 durability advances. The reason for the increased sync count remains open.
 
+## Combined FRONTIER write and `fdatasync` timing follow-up
+
+The earlier A/B timed `fdatasync` but not the FRONTIER write itself. This
+follow-up used the per-advance observations added in commit
+`98bd2bb3853f32239f04588dc4641cef3eb83dc8`, without broad profiling. Two
+unprofiled ABBA blocks ran in the order buffered, direct, direct, buffered;
+each run contained 100,000 Point puts with 16 writers and 1 KiB values.
+
+| Metric | Buffered FRONTIER | Direct FRONTIER | Change |
+| --- | ---: | ---: | ---: |
+| Throughput, median of four runs | 20.05k puts/s | 19.65k puts/s | -2.0% |
+| Sampled operation p50, median | 0.782 ms | 0.779 ms | — |
+| Sync advances per run, median | 7,478 | 9,251 | +23.7% |
+| Mean tickets per advance | 13.39 | 10.78 | -19.5% |
+| FRONTIER write p50 / p95 per advance | 4.4 / 32.4 μs | 40.9 / 262.0 μs | |
+| `fdatasync` p50 / p95 per advance | 167.8 / 193.1 μs | 104.7 / 127.0 μs | |
+| FRONTIER write + `fdatasync` p50 / p95 per advance | 173.5 / 212.3 μs | 148.6 / 374.4 μs | |
+| Sum of per-advance write + sync timings, median per run | 1.360 s | 1.624 s | +19.4% |
+
+Direct FRONTIER reduced median `fdatasync` time by 37.6%, but the O_DIRECT
+FRONTIER write itself took longer: its median rose from 4.4 μs to 40.9 μs and
+its p95 from 32.4 μs to 262.0 μs. The combined per-advance median improved,
+while its p95 worsened. More frequent, smaller advances raised the sum of
+FRONTIER-write-plus-sync timings by 19.4% per run, and throughput fell by 2.0%.
+Thus, the faster syscall does not translate into a faster durability path or
+better throughput in this workload.
+
+Sampled operation p99 medians were 4.40 ms buffered and 3.13 ms direct, but
+the run ranges overlapped (3.77–4.50 ms and 2.15–4.26 ms respectively); this
+small sample does not establish a stable tail-latency improvement.
+
+All eight runs reported DATA `O_DIRECT=true`, FRONTIER mode matching the
+selected arm, and a buffered sync descriptor. The three handles referred to
+the same device and inode; start/end metadata remained stable, and every
+recorded sync observation succeeded. Sync counts matched observation counts.
+This was a performance experiment only; it did not run crash-recovery
+qualification.
+
 ## Follow-up
 
-Investigate why direct FRONTIER completion increases durability-advance
-frequency and whether coalescing can preserve the lower syscall latency without
-increasing sync count. Keep the experiment mode behind the `bench` feature
-until crash-recovery tests cover direct FRONTIER writes and the existing
-DATA-completion → FRONTIER → sync → durable-publication order.
+Investigate the higher direct-write cost and smaller groups, then test whether
+controlled coalescing reduces the accumulated durability cost. Keep the
+experiment mode behind the `bench` feature until crash-recovery tests cover
+direct FRONTIER writes and the existing DATA-completion → FRONTIER → sync →
+durable-publication order.
 
 The GCP VM, boot disk, firewall, subnet, and isolated network were destroyed
 after artifact collection. Raw JSON and bpftrace outputs remain in the local
-`/tmp/gcp-v8-frontier-ab-20261111` experiment directory; they are not committed
-to the repository.
+`/tmp/gcp-v8-frontier-ab-20261111` experiment directory. The per-advance JSON
+for this follow-up is in local `/tmp/gcp-v8-durability-diagnostics-20261111`;
+neither set of raw artifacts is committed to the repository.
