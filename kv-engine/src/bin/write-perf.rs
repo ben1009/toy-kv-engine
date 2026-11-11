@@ -1575,8 +1575,8 @@ mod bench_cpu_affinity {
                 io_uring_workers_after
                     .iter()
                     .all(|thread| thread.allowed_cpus == self.expected_iowq_cpus),
-                "io_uring worker masks do not match requested {IOWQ_AFFINITY_ENV}={:?}",
-                self.iowq_affinity
+                "io_uring worker masks do not match requested {IOWQ_AFFINITY_ENV}={:?}: {io_uring_workers_after:?}",
+                self.iowq_affinity,
             );
             if self.mode == "wal_writers" {
                 ensure!(
