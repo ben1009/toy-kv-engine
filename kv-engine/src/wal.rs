@@ -1968,6 +1968,21 @@ impl Wal {
         }
     }
 
+    #[cfg(feature = "bench")]
+    pub(crate) fn set_wal_hol_diagnostics_enabled(
+        &self,
+        profile: &crate::mem_table::WriteProfile,
+        enabled: bool,
+    ) -> Result<()> {
+        if let Some(writer) = &self.v8_parallel {
+            writer.set_wal_hol_diagnostics_enabled(profile, enabled)
+        } else {
+            profile.set_wal_hol_diagnostics_enabled(enabled);
+
+            Ok(())
+        }
+    }
+
     pub(crate) fn pitr_rotation_needed(&self) -> bool {
         self.pitr_rotation_needed.load(Ordering::Acquire)
     }

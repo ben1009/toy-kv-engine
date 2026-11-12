@@ -10087,6 +10087,18 @@ impl KvEngine {
             .set_wal_sync_diagnostics_enabled(enabled)
     }
 
+    #[cfg(feature = "bench")]
+    /// Enable benchmark-only V8 ordering head-of-line diagnostics.
+    pub fn set_wal_hol_diagnostics_enabled(&self, enabled: bool) -> Result<()> {
+        let _active_memtable = self.inner.active_memtable_lock.read();
+
+        self.inner
+            .state
+            .load()
+            .memtable
+            .set_wal_hol_diagnostics_enabled(enabled)
+    }
+
     /// I/O flags and inode identity for the active V8 WAL handles.
     #[cfg(feature = "bench")]
     #[doc(hidden)]

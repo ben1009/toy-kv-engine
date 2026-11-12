@@ -77,6 +77,11 @@ struct CoordinatorInner {
     /// diagnostics are enabled for this WAL.
     #[cfg(feature = "bench")]
     data_completion_timestamps_enabled: std::sync::atomic::AtomicBool,
+    /// Fast opt-in gate for ordering HOL instrumentation.
+    #[cfg(feature = "bench")]
+    hol_diagnostics_enabled: std::sync::atomic::AtomicBool,
+    #[cfg(feature = "bench")]
+    profile: arc_swap::ArcSwapOption<crate::mem_table::WriteProfile>,
     segment_incarnation: [u8; 16],
     physical_header_digest: [u8; 32],
     initial_prefix_digest: WalV8Digest,
@@ -128,6 +133,10 @@ struct TicketState {
     data_write_started_at: Option<Instant>,
     #[cfg(feature = "bench")]
     data_completed_at: Option<Instant>,
+    #[cfg(feature = "bench")]
+    digest_hol_started_at: Option<Instant>,
+    #[cfg(feature = "bench")]
+    data_completion_hol_started_at: Option<Instant>,
 }
 
 /// Immutable view of one ticket in the admission window.
@@ -275,6 +284,10 @@ impl WalV8ParallelCoordinator {
                 admitted_ticket_end: AtomicU64::new(config.next_ticket),
                 #[cfg(feature = "bench")]
                 data_completion_timestamps_enabled: std::sync::atomic::AtomicBool::new(false),
+                #[cfg(feature = "bench")]
+                hol_diagnostics_enabled: std::sync::atomic::AtomicBool::new(false),
+                #[cfg(feature = "bench")]
+                profile: arc_swap::ArcSwapOption::empty(),
                 segment_incarnation: header.incarnation,
                 physical_header_digest,
                 initial_prefix_digest,
@@ -325,6 +338,22 @@ impl WalV8ParallelCoordinator {
     pub(crate) fn set_data_completion_timestamps_enabled(&self, enabled: bool) {
         self.inner
             .data_completion_timestamps_enabled
+            .store(enabled, Ordering::Release);
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn set_hol_diagnostics_profile(&self, profile: Arc<crate::mem_table::WriteProfile>) {
+        let enabled = profile.wal_hol_diagnostics_enabled();
+        self.inner.profile.store(Some(profile));
+        self.inner
+            .hol_diagnostics_enabled
+            .store(enabled, Ordering::Release);
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn set_hol_diagnostics_enabled(&self, enabled: bool) {
+        self.inner
+            .hol_diagnostics_enabled
             .store(enabled, Ordering::Release);
     }
 
@@ -452,6 +481,8 @@ impl WalV8ParallelCoordinator {
             return Ok(());
         }
         state.tickets[index].frames_ready = true;
+        #[cfg(feature = "bench")]
+        refresh_data_completion_order_hol(&self.inner, &mut state);
         signal_change(&self.inner, &mut state);
 
         Ok(())
@@ -523,15 +554,39 @@ impl WalV8ParallelCoordinator {
                 poison_locked(&self.inner, &mut state);
                 anyhow::bail!("conflicting v8 digest-ready event")
             }
-            None => state.tickets[index].digest_ready = Some(digest),
+            None => {
+                state.tickets[index].digest_ready = Some(digest);
+                #[cfg(feature = "bench")]
+                if self.inner.hol_diagnostics_enabled.load(Ordering::Acquire)
+                    && digest.segment_ticket > state.folded_ticket_end
+                {
+                    state.tickets[index].digest_hol_started_at = Some(Instant::now());
+                }
+            }
         }
         #[cfg(feature = "bench")]
         let cpu_before = state.ordered_link_hash_cpu_ns;
         let folded_before = state.folded_ticket_end;
-        if let Err(error) = fold_ready_digests(&mut state) {
+        let hol_profile: Option<Arc<crate::mem_table::WriteProfile>> = {
+            #[cfg(feature = "bench")]
+            {
+                self.inner
+                    .hol_diagnostics_enabled
+                    .load(Ordering::Acquire)
+                    .then(|| self.inner.profile.load_full())
+                    .flatten()
+            }
+            #[cfg(not(feature = "bench"))]
+            {
+                None
+            }
+        };
+        if let Err(error) = fold_ready_digests(&mut state, hol_profile.as_deref()) {
             poison_locked(&self.inner, &mut state);
             return Err(error);
         }
+        #[cfg(feature = "bench")]
+        refresh_data_completion_order_hol(&self.inner, &mut state);
         #[cfg(feature = "bench")]
         let ordered_link_hash_cpu_ns = state.ordered_link_hash_cpu_ns.saturating_sub(cpu_before);
         #[cfg(not(feature = "bench"))]
@@ -582,6 +637,8 @@ impl WalV8ParallelCoordinator {
         {
             state.tickets[index].data_completed_at = Some(Instant::now());
         }
+        #[cfg(feature = "bench")]
+        refresh_data_completion_order_hol(&self.inner, &mut state);
         signal_change(&self.inner, &mut state);
         signal_durability_progress(&self.inner, &mut state);
 
@@ -670,6 +727,8 @@ impl WalV8ParallelCoordinator {
                 entry.data_completed_at = data_completed_at;
             }
         }
+        #[cfg(feature = "bench")]
+        refresh_data_completion_order_hol(&self.inner, &mut state);
         signal_change(&self.inner, &mut state);
         signal_durability_progress(&self.inner, &mut state);
 
@@ -1186,6 +1245,10 @@ impl WalV8AdmissionPublisher for WalV8ParallelCoordinator {
             data_write_started_at: None,
             #[cfg(feature = "bench")]
             data_completed_at: None,
+            #[cfg(feature = "bench")]
+            digest_hol_started_at: None,
+            #[cfg(feature = "bench")]
+            data_completion_hol_started_at: None,
         });
         state.next_ticket = next_ticket;
         state.next_data_offset = data_end;
@@ -1303,7 +1366,13 @@ impl TicketState {
 
 /// Fold producer digests in strict ticket order, even when later producers
 /// finish hashing first. The fold is bounded by the admitted ticket window.
-fn fold_ready_digests(state: &mut CoordinatorState) -> Result<()> {
+fn fold_ready_digests(
+    state: &mut CoordinatorState,
+    hol_profile: Option<&crate::mem_table::WriteProfile>,
+) -> Result<()> {
+    #[cfg(not(feature = "bench"))]
+    let _ = hol_profile;
+
     loop {
         let index = usize::try_from(
             state
@@ -1325,6 +1394,8 @@ fn fold_ready_digests(state: &mut CoordinatorState) -> Result<()> {
         let logical_batch_bytes = u64::try_from(ticket.plan.logical_batch_bytes)
             .context("v8 folded logical batch length exceeds u64")?;
         #[cfg(feature = "bench")]
+        let digest_hol_started_at = ticket.digest_hol_started_at;
+        #[cfg(feature = "bench")]
         let hash_started = super::digest::should_sample_hash_cpu(state.folded_ticket_end)
             .then(super::digest::thread_cpu_time_ns);
         let prefix_digest = super::digest::advance_prefix(
@@ -1344,11 +1415,51 @@ fn fold_ready_digests(state: &mut CoordinatorState) -> Result<()> {
             .checked_add(1)
             .context("v8 folded ticket cursor overflows")?;
         state.tickets[index].prefix_digest_after = Some(prefix_digest);
+        #[cfg(feature = "bench")]
+        {
+            state.tickets[index].digest_hol_started_at = None;
+            if let (Some(profile), Some(started_at)) = (hol_profile, digest_hol_started_at) {
+                profile.record_wal_v8_digest_order_hol(elapsed_ns(started_at, Instant::now()));
+            }
+        }
         state.folded_ticket_end = next_ticket;
         state.folded_prefix_digest = prefix_digest;
     }
 
     Ok(())
+}
+
+#[cfg(feature = "bench")]
+fn refresh_data_completion_order_hol(inner: &CoordinatorInner, state: &mut CoordinatorState) {
+    if !inner.hol_diagnostics_enabled.load(Ordering::Acquire) {
+        return;
+    }
+    let Some(profile) = inner.profile.load_full() else {
+        return;
+    };
+
+    let now = Instant::now();
+    let mut prefix_open = true;
+    for ticket in &mut state.tickets {
+        let ready = ticket.data_complete;
+        if prefix_open && ready {
+            if let Some(started_at) = ticket.data_completion_hol_started_at.take() {
+                profile.record_wal_v8_data_completion_hol(elapsed_ns(started_at, now));
+            }
+        } else if ready {
+            ticket.data_completion_hol_started_at.get_or_insert(now);
+        } else {
+            prefix_open = false;
+        }
+    }
+}
+
+#[cfg(feature = "bench")]
+fn elapsed_ns(started_at: Instant, ended_at: Instant) -> u64 {
+    ended_at
+        .saturating_duration_since(started_at)
+        .as_nanos()
+        .min(u64::MAX as u128) as u64
 }
 
 fn validate_plan(plan: WalV8AdmissionPlan) -> Result<()> {

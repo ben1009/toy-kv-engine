@@ -298,6 +298,17 @@ struct WalV8SubmissionState {
     packing: bool,
     #[cfg(test)]
     group_wait_cutoff: Option<u64>,
+    #[cfg(feature = "bench")]
+    data_submit_hol: Option<WalV8DataSubmitHol>,
+}
+
+#[cfg(feature = "bench")]
+struct WalV8DataSubmitHol {
+    started_at: Instant,
+    last_updated_at: Instant,
+    blocked_successors: u64,
+    successor_ticket_wait_ns: u64,
+    max_successors: u64,
 }
 
 fn benchmark_submits_any_ready_ticket() -> Result<bool> {
@@ -335,6 +346,10 @@ struct WalV8ParallelIo {
     group_join_micros: std::sync::atomic::AtomicU64,
     coordinator: WalV8ParallelCoordinator,
     progress: Arc<crate::wal::parallel_worker::WalSyncProgress>,
+    #[cfg(feature = "bench")]
+    profile: arc_swap::ArcSwapOption<crate::mem_table::WriteProfile>,
+    #[cfg(feature = "bench")]
+    hol_diagnostics_enabled: std::sync::atomic::AtomicBool,
     completion_thread: Mutex<Option<thread::JoinHandle<()>>>,
 }
 
@@ -388,6 +403,8 @@ impl WalV8ParallelIo {
                 packing: false,
                 #[cfg(test)]
                 group_wait_cutoff: None,
+                #[cfg(feature = "bench")]
+                data_submit_hol: None,
             }),
             frames_ready: Condvar::new(),
             #[cfg(test)]
@@ -396,13 +413,27 @@ impl WalV8ParallelIo {
             ),
             coordinator,
             progress,
+            #[cfg(feature = "bench")]
+            profile: arc_swap::ArcSwapOption::empty(),
+            #[cfg(feature = "bench")]
+            hol_diagnostics_enabled: std::sync::atomic::AtomicBool::new(false),
             completion_thread: Mutex::new(Some(completion_thread)),
         }))
     }
 
     #[cfg(feature = "bench")]
     fn set_profile(&self, profile: Arc<crate::mem_table::WriteProfile>) {
-        self.progress.set_profile(profile);
+        let enabled = profile.wal_hol_diagnostics_enabled();
+        self.progress.set_profile(Arc::clone(&profile));
+        self.profile.store(Some(profile));
+        self.hol_diagnostics_enabled
+            .store(enabled, std::sync::atomic::Ordering::Release);
+    }
+
+    #[cfg(feature = "bench")]
+    fn set_hol_diagnostics_enabled(&self, enabled: bool) {
+        self.hol_diagnostics_enabled
+            .store(enabled, std::sync::atomic::Ordering::Release);
     }
 
     fn register_frontier_offset(&self, offset: u64) -> Result<()> {
@@ -462,6 +493,10 @@ impl WalV8ParallelIo {
             "v8 DATA ticket was queued twice"
         );
         self.frames_ready.notify_all();
+        #[cfg(feature = "bench")]
+        if !submission.submit_any_ready_ticket {
+            self.update_data_submit_hol(&mut submission);
+        }
         if submission.submit_any_ready_ticket {
             return self.drain_ready_tickets_locked(&mut submission);
         }
@@ -485,6 +520,65 @@ impl WalV8ParallelIo {
         drop(submission);
 
         self.pack_admitted_group(first_ticket)
+    }
+
+    #[cfg(feature = "bench")]
+    fn update_data_submit_hol(&self, state: &mut WalV8SubmissionState) {
+        if !self
+            .hol_diagnostics_enabled
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return;
+        }
+        let Some(profile) = self.profile.load_full() else {
+            return;
+        };
+
+        let now = Instant::now();
+        let blocked_successors = if state.pending.contains_key(&state.next_ticket) {
+            0
+        } else {
+            state.pending.len() as u64
+        };
+        let Some(mut hol) = state.data_submit_hol.take() else {
+            if blocked_successors > 0 {
+                state.data_submit_hol = Some(WalV8DataSubmitHol {
+                    started_at: now,
+                    last_updated_at: now,
+                    blocked_successors,
+                    successor_ticket_wait_ns: 0,
+                    max_successors: blocked_successors,
+                });
+            }
+
+            return;
+        };
+
+        let elapsed_ns = now
+            .saturating_duration_since(hol.last_updated_at)
+            .as_nanos()
+            .min(u64::MAX as u128) as u64;
+        hol.successor_ticket_wait_ns = hol
+            .successor_ticket_wait_ns
+            .saturating_add(elapsed_ns.saturating_mul(hol.blocked_successors));
+        if blocked_successors == 0 {
+            let wait_ns = now
+                .saturating_duration_since(hol.started_at)
+                .as_nanos()
+                .min(u64::MAX as u128) as u64;
+            profile.record_wal_v8_data_submit_hol(
+                wait_ns,
+                hol.successor_ticket_wait_ns,
+                hol.max_successors,
+            );
+
+            return;
+        }
+
+        hol.last_updated_at = now;
+        hol.blocked_successors = blocked_successors;
+        hol.max_successors = hol.max_successors.max(blocked_successors);
+        state.data_submit_hol = Some(hol);
     }
 
     /// Submit every currently ready ticket separately, preserving each
@@ -687,6 +781,11 @@ impl WalV8ParallelIo {
             }
             state.next_ticket = next_ticket;
             state.next_file_offset = Some(cursor);
+            #[cfg(feature = "bench")]
+            if !state.submit_any_ready_ticket {
+                self.update_data_submit_hol(state);
+            }
+
             return Ok(selected.len());
         }
 
@@ -1737,6 +1836,8 @@ impl WalV8ParallelWriter {
     #[cfg(feature = "bench")]
     pub(crate) fn set_write_profile(&self, profile: Arc<crate::mem_table::WriteProfile>) {
         self.io.set_profile(Arc::clone(&profile));
+        self.coordinator
+            .set_hol_diagnostics_profile(Arc::clone(&profile));
         if self.coordinator.next_ticket() == self.initial_ticket {
             self.coordinator
                 .set_data_completion_timestamps_enabled(profile.wal_sync_diagnostics_enabled());
@@ -1760,6 +1861,27 @@ impl WalV8ParallelWriter {
             profile.set_wal_sync_diagnostics_enabled(enabled);
             self.coordinator
                 .set_data_completion_timestamps_enabled(enabled);
+
+            Ok(())
+        })
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn set_wal_hol_diagnostics_enabled(
+        &self,
+        profile: &crate::mem_table::WriteProfile,
+        enabled: bool,
+    ) -> Result<()> {
+        self.coordinator.with_next_ticket(|next_ticket| {
+            ensure!(
+                !enabled
+                    || profile.wal_hol_diagnostics_enabled()
+                    || next_ticket == self.initial_ticket,
+                "WAL HOL diagnostics must be enabled before the first WAL ticket"
+            );
+            profile.set_wal_hol_diagnostics_enabled(enabled);
+            self.coordinator.set_hol_diagnostics_enabled(enabled);
+            self.io.set_hol_diagnostics_enabled(enabled);
 
             Ok(())
         })

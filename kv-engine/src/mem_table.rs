@@ -223,6 +223,22 @@ pub struct WriteProfile {
     /// Aggregate time in v8 Leader's synchronous positional DATA write calls.
     /// Parallel mode uses the shared worker's submission/CQE counters instead.
     pub wal_v8_data_write_call_ns: AtomicU64,
+    /// DATA submission HOL episodes with ready successors behind a missing head.
+    pub wal_v8_data_submit_hol_episodes: AtomicU64,
+    /// Wall time spent with ready successors behind a missing head.
+    pub wal_v8_data_submit_hol_wait_ns: AtomicU64,
+    /// Successor-ticket wait, integrating ready successors over each HOL episode.
+    pub wal_v8_data_submit_hol_successor_ticket_wait_ns: AtomicU64,
+    /// Maximum ready successors observed behind a missing head.
+    pub wal_v8_data_submit_hol_max_successors: AtomicU64,
+    /// Digest-ready tickets that waited for their ordered prefix predecessor.
+    pub wal_v8_digest_order_hol_tickets: AtomicU64,
+    /// Time digest-ready tickets waited for their ordered prefix predecessor.
+    pub wal_v8_digest_order_hol_wait_ns: AtomicU64,
+    /// DATA-complete tickets held behind an earlier ticket without DATA completion.
+    pub wal_v8_data_completion_hol_tickets: AtomicU64,
+    /// Time DATA-complete tickets waited behind an earlier ticket without DATA completion.
+    pub wal_v8_data_completion_hol_wait_ns: AtomicU64,
     /// Number of WAL commit groups that reached fdatasync.
     pub wal_commit_groups: AtomicU64,
     /// Number of WAL commit groups that only contained one pending buffer.
@@ -253,6 +269,9 @@ pub struct WriteProfile {
     /// Enables per-SQE synchronization tracking for explicit diagnostic runs.
     #[cfg(feature = "bench")]
     wal_sync_diagnostics_enabled: AtomicBool,
+    /// Enables opt-in V8 ordering HOL diagnostics for benchmark runs.
+    #[cfg(feature = "bench")]
+    wal_hol_diagnostics_enabled: AtomicBool,
 }
 
 /// One logical `fdatasync` call and the WAL progress observed while it ran.
@@ -334,6 +353,8 @@ impl WriteProfile {
         self.wal_sync_observations.lock().clear();
         #[cfg(feature = "bench")]
         self.wal_sync_diagnostics_enabled.store(false, o);
+        #[cfg(feature = "bench")]
+        self.wal_hol_diagnostics_enabled.store(false, o);
         self.wal_worker_eventfd_notifications.store(0, o);
         self.wal_worker_eventfd_writes.store(0, o);
         self.wal_preallocation_ns.store(0, o);
@@ -361,6 +382,15 @@ impl WriteProfile {
         self.wal_v8_post_encode_hash_reread_bytes.store(0, o);
         self.wal_v8_cpu_timing_sampled_tickets.store(0, o);
         self.wal_v8_data_write_call_ns.store(0, o);
+        self.wal_v8_data_submit_hol_episodes.store(0, o);
+        self.wal_v8_data_submit_hol_wait_ns.store(0, o);
+        self.wal_v8_data_submit_hol_successor_ticket_wait_ns
+            .store(0, o);
+        self.wal_v8_data_submit_hol_max_successors.store(0, o);
+        self.wal_v8_digest_order_hol_tickets.store(0, o);
+        self.wal_v8_digest_order_hol_wait_ns.store(0, o);
+        self.wal_v8_data_completion_hol_tickets.store(0, o);
+        self.wal_v8_data_completion_hol_wait_ns.store(0, o);
         self.wal_commit_groups.store(0, o);
         self.wal_commit_solo_groups.store(0, o);
         self.wal_commit_buffers.store(0, o);
@@ -427,6 +457,18 @@ impl WriteProfile {
             wal_v8_post_encode_hash_reread_bytes: self.wal_v8_post_encode_hash_reread_bytes.load(o),
             wal_v8_cpu_timing_sampled_tickets: self.wal_v8_cpu_timing_sampled_tickets.load(o),
             wal_v8_data_write_call_ns: self.wal_v8_data_write_call_ns.load(o),
+            wal_v8_data_submit_hol_episodes: self.wal_v8_data_submit_hol_episodes.load(o),
+            wal_v8_data_submit_hol_wait_ns: self.wal_v8_data_submit_hol_wait_ns.load(o),
+            wal_v8_data_submit_hol_successor_ticket_wait_ns: self
+                .wal_v8_data_submit_hol_successor_ticket_wait_ns
+                .load(o),
+            wal_v8_data_submit_hol_max_successors: self
+                .wal_v8_data_submit_hol_max_successors
+                .load(o),
+            wal_v8_digest_order_hol_tickets: self.wal_v8_digest_order_hol_tickets.load(o),
+            wal_v8_digest_order_hol_wait_ns: self.wal_v8_digest_order_hol_wait_ns.load(o),
+            wal_v8_data_completion_hol_tickets: self.wal_v8_data_completion_hol_tickets.load(o),
+            wal_v8_data_completion_hol_wait_ns: self.wal_v8_data_completion_hol_wait_ns.load(o),
             wal_commit_groups: self.wal_commit_groups.load(o),
             wal_commit_solo_groups: self.wal_commit_solo_groups.load(o),
             wal_commit_buffers: self.wal_commit_buffers.load(o),
@@ -438,6 +480,16 @@ impl WriteProfile {
             wal_frontier_write_ns: self.wal_frontier_write_ns.load(o),
             wal_sync_coalesce_wait_calls: self.wal_sync_coalesce_wait_calls.load(o),
             wal_sync_coalesce_wait_ns: self.wal_sync_coalesce_wait_ns.load(o),
+            wal_hol_diagnostics_enabled: {
+                #[cfg(feature = "bench")]
+                {
+                    self.wal_hol_diagnostics_enabled.load(o)
+                }
+                #[cfg(not(feature = "bench"))]
+                {
+                    false
+                }
+            },
             op_count: self.op_count.load(o),
         }
     }
@@ -569,6 +621,49 @@ impl WriteProfile {
     pub(crate) fn wal_sync_diagnostics_enabled(&self) -> bool {
         self.wal_sync_diagnostics_enabled
             .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn set_wal_hol_diagnostics_enabled(&self, enabled: bool) {
+        self.wal_hol_diagnostics_enabled
+            .store(enabled, std::sync::atomic::Ordering::Release);
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn wal_hol_diagnostics_enabled(&self) -> bool {
+        self.wal_hol_diagnostics_enabled
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn record_wal_v8_data_submit_hol(
+        &self,
+        wait_ns: u64,
+        successor_ticket_wait_ns: u64,
+        max_successors: u64,
+    ) {
+        let o = std::sync::atomic::Ordering::Relaxed;
+        self.wal_v8_data_submit_hol_episodes.fetch_add(1, o);
+        self.wal_v8_data_submit_hol_wait_ns.fetch_add(wait_ns, o);
+        self.wal_v8_data_submit_hol_successor_ticket_wait_ns
+            .fetch_add(successor_ticket_wait_ns, o);
+        self.wal_v8_data_submit_hol_max_successors
+            .fetch_max(max_successors, o);
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn record_wal_v8_digest_order_hol(&self, wait_ns: u64) {
+        let o = std::sync::atomic::Ordering::Relaxed;
+        self.wal_v8_digest_order_hol_tickets.fetch_add(1, o);
+        self.wal_v8_digest_order_hol_wait_ns.fetch_add(wait_ns, o);
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn record_wal_v8_data_completion_hol(&self, wait_ns: u64) {
+        let o = std::sync::atomic::Ordering::Relaxed;
+        self.wal_v8_data_completion_hol_tickets.fetch_add(1, o);
+        self.wal_v8_data_completion_hol_wait_ns
+            .fetch_add(wait_ns, o);
     }
 
     #[cfg(feature = "bench")]
@@ -764,6 +859,14 @@ pub struct WriteProfileSnapshot {
     pub wal_v8_post_encode_hash_reread_bytes: u64,
     pub wal_v8_cpu_timing_sampled_tickets: u64,
     pub wal_v8_data_write_call_ns: u64,
+    pub wal_v8_data_submit_hol_episodes: u64,
+    pub wal_v8_data_submit_hol_wait_ns: u64,
+    pub wal_v8_data_submit_hol_successor_ticket_wait_ns: u64,
+    pub wal_v8_data_submit_hol_max_successors: u64,
+    pub wal_v8_digest_order_hol_tickets: u64,
+    pub wal_v8_digest_order_hol_wait_ns: u64,
+    pub wal_v8_data_completion_hol_tickets: u64,
+    pub wal_v8_data_completion_hol_wait_ns: u64,
     pub wal_commit_groups: u64,
     pub wal_commit_solo_groups: u64,
     pub wal_commit_buffers: u64,
@@ -775,6 +878,7 @@ pub struct WriteProfileSnapshot {
     pub wal_frontier_write_ns: u64,
     pub wal_sync_coalesce_wait_calls: u64,
     pub wal_sync_coalesce_wait_ns: u64,
+    pub wal_hol_diagnostics_enabled: bool,
     pub op_count: u64,
 }
 
@@ -895,6 +999,28 @@ impl WriteProfileSnapshot {
             wal_v8_data_write_call_ns: self
                 .wal_v8_data_write_call_ns
                 .saturating_sub(before.wal_v8_data_write_call_ns),
+            wal_v8_data_submit_hol_episodes: self
+                .wal_v8_data_submit_hol_episodes
+                .saturating_sub(before.wal_v8_data_submit_hol_episodes),
+            wal_v8_data_submit_hol_wait_ns: self
+                .wal_v8_data_submit_hol_wait_ns
+                .saturating_sub(before.wal_v8_data_submit_hol_wait_ns),
+            wal_v8_data_submit_hol_successor_ticket_wait_ns: self
+                .wal_v8_data_submit_hol_successor_ticket_wait_ns
+                .saturating_sub(before.wal_v8_data_submit_hol_successor_ticket_wait_ns),
+            wal_v8_data_submit_hol_max_successors: self.wal_v8_data_submit_hol_max_successors,
+            wal_v8_digest_order_hol_tickets: self
+                .wal_v8_digest_order_hol_tickets
+                .saturating_sub(before.wal_v8_digest_order_hol_tickets),
+            wal_v8_digest_order_hol_wait_ns: self
+                .wal_v8_digest_order_hol_wait_ns
+                .saturating_sub(before.wal_v8_digest_order_hol_wait_ns),
+            wal_v8_data_completion_hol_tickets: self
+                .wal_v8_data_completion_hol_tickets
+                .saturating_sub(before.wal_v8_data_completion_hol_tickets),
+            wal_v8_data_completion_hol_wait_ns: self
+                .wal_v8_data_completion_hol_wait_ns
+                .saturating_sub(before.wal_v8_data_completion_hol_wait_ns),
             wal_commit_groups: self
                 .wal_commit_groups
                 .saturating_sub(before.wal_commit_groups),
@@ -924,6 +1050,7 @@ impl WriteProfileSnapshot {
             wal_sync_coalesce_wait_ns: self
                 .wal_sync_coalesce_wait_ns
                 .saturating_sub(before.wal_sync_coalesce_wait_ns),
+            wal_hol_diagnostics_enabled: self.wal_hol_diagnostics_enabled,
             op_count: self.op_count.saturating_sub(before.op_count),
         }
     }
@@ -3752,6 +3879,19 @@ impl MemTable {
             wal.set_wal_sync_diagnostics_enabled(&profile, enabled)
         } else {
             profile.set_wal_sync_diagnostics_enabled(enabled);
+            Ok(())
+        }
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn set_wal_hol_diagnostics_enabled(&self, enabled: bool) -> Result<()> {
+        let profile = self.write_profile.load_full();
+
+        if let Some(wal) = &self.wal {
+            wal.set_wal_hol_diagnostics_enabled(&profile, enabled)
+        } else {
+            profile.set_wal_hol_diagnostics_enabled(enabled);
+
             Ok(())
         }
     }

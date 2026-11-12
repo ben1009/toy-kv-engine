@@ -283,6 +283,10 @@ struct Args {
     /// Requires a bench build and PITR V8 (the default when `--pitr` is used).
     #[arg(long, requires = "pitr")]
     wal_sync_diagnostics: bool,
+    /// Capture V8 submission, digest, and durable-prefix ordering HOL waits.
+    /// Requires a bench build with PITR V8 Parallel I/O.
+    #[arg(long, requires = "pitr")]
+    wal_hol_diagnostics: bool,
     #[arg(long)]
     vlog: bool,
     #[arg(long)]
@@ -364,6 +368,7 @@ struct HarnessConfig {
     wal_io_mode: WalIoModeArg,
     wal_io_mode_explicit: bool,
     wal_sync_diagnostics: bool,
+    wal_hol_diagnostics: bool,
     vlog_override: bool,
     profile: bool,
     pitr: bool,
@@ -479,6 +484,7 @@ impl HarnessConfig {
             wal_io_mode,
             wal_io_mode_explicit,
             wal_sync_diagnostics: args.wal_sync_diagnostics,
+            wal_hol_diagnostics: args.wal_hol_diagnostics,
             vlog_override: args.vlog,
             profile: args.profile,
             pitr: args.pitr,
@@ -1089,6 +1095,16 @@ struct WalPipelineRecord {
     commit_bytes: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     v8_data_submit_order: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    v8_hol_diagnostics_enabled: Option<bool>,
+    v8_data_submit_hol_episodes: u64,
+    v8_data_submit_hol_wait_ns: u64,
+    v8_data_submit_hol_successor_ticket_wait_ns: u64,
+    v8_data_submit_hol_max_successors: u64,
+    v8_digest_order_hol_tickets: u64,
+    v8_digest_order_hol_wait_ns: u64,
+    v8_data_completion_hol_tickets: u64,
+    v8_data_completion_hol_wait_ns: u64,
     cqe_count: u64,
     inflight_groups_max: u64,
     outstanding_write_sqes_max: u64,
@@ -1244,6 +1260,7 @@ impl From<kv_engine_wrapper::mem_table::WalSyncObservation> for WalSyncObservati
 fn wal_pipeline_record(
     engine: &KvEngine,
     detailed: bool,
+    hol_diagnostics_enabled: bool,
     wal_run_info: WalRunInfo,
     wal_io_start: Option<WalIoDiagnosticsRecord>,
 ) -> Result<Option<WalPipelineRecord>> {
@@ -1281,6 +1298,18 @@ fn wal_pipeline_record(
                     _ => "ticket_prefix",
                 },
             ),
+        v8_hol_diagnostics_enabled: (wal_run_info.format_version == 8
+            && wal_run_info.io_mode == "parallel")
+            .then_some(hol_diagnostics_enabled),
+        v8_data_submit_hol_episodes: profile.wal_v8_data_submit_hol_episodes,
+        v8_data_submit_hol_wait_ns: profile.wal_v8_data_submit_hol_wait_ns,
+        v8_data_submit_hol_successor_ticket_wait_ns: profile
+            .wal_v8_data_submit_hol_successor_ticket_wait_ns,
+        v8_data_submit_hol_max_successors: profile.wal_v8_data_submit_hol_max_successors,
+        v8_digest_order_hol_tickets: profile.wal_v8_digest_order_hol_tickets,
+        v8_digest_order_hol_wait_ns: profile.wal_v8_digest_order_hol_wait_ns,
+        v8_data_completion_hol_tickets: profile.wal_v8_data_completion_hol_tickets,
+        v8_data_completion_hol_wait_ns: profile.wal_v8_data_completion_hol_wait_ns,
         cqe_count: profile.wal_cqe_count,
         inflight_groups_max: profile.wal_inflight_groups_max,
         outstanding_write_sqes_max: profile.wal_outstanding_write_sqes_max,
@@ -4214,6 +4243,7 @@ fn run_wal_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
         engine.set_wal_sync_diagnostics_enabled(
             (cfg.profile || cfg.wal_sync_diagnostics) && wal_run_info.runtime_counters_available(),
         )?;
+        engine.set_wal_hol_diagnostics_enabled(cfg.wal_hol_diagnostics)?;
     }
     let value = vec![b'x'; cfg.value_size];
     let num_keys = cfg.num;
@@ -4340,6 +4370,7 @@ fn run_wal_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
     let wal_pipeline = wal_pipeline_record(
         &engine,
         cfg.profile || cfg.wal_sync_diagnostics,
+        cfg.wal_hol_diagnostics,
         wal_run_info,
         wal_io_start,
     )?;
@@ -4431,6 +4462,7 @@ fn run_wal_batch_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>
         engine.set_wal_sync_diagnostics_enabled(
             (cfg.profile || cfg.wal_sync_diagnostics) && wal_run_info.runtime_counters_available(),
         )?;
+        engine.set_wal_hol_diagnostics_enabled(cfg.wal_hol_diagnostics)?;
     }
     #[cfg(feature = "bench")]
     let wal_io_start = engine
@@ -4542,6 +4574,7 @@ fn run_wal_batch_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>
     let wal_pipeline = wal_pipeline_record(
         &engine,
         cfg.profile || cfg.wal_sync_diagnostics,
+        cfg.wal_hol_diagnostics,
         wal_run_info,
         wal_io_start,
     )?;
@@ -9299,6 +9332,17 @@ fn validate_config(cfg: &HarnessConfig) -> Result<()> {
             "--wal-sync-diagnostics requires PITR V8"
         );
     }
+    if cfg.wal_hol_diagnostics {
+        anyhow::ensure!(
+            cfg!(feature = "bench"),
+            "--wal-hol-diagnostics requires a bench build"
+        );
+        anyhow::ensure!(
+            cfg.pitr_format.unwrap_or(PitrFormatArg::V8) == PitrFormatArg::V8
+                && cfg.wal_io_mode == WalIoModeArg::Parallel,
+            "--wal-hol-diagnostics requires PITR V8 Parallel I/O"
+        );
+    }
     if cfg.prepare_golden || cfg.golden_path.is_some() || cfg.clone_golden {
         anyhow::ensure!(
             cfg.suite == Suite::SteadyState,
@@ -9698,6 +9742,49 @@ mod tests {
                 .contains("requires PITR V8")
         );
         assert!(Args::try_parse_from(["write-perf", "--wal-sync-diagnostics"]).is_err());
+    }
+
+    #[test]
+    fn wal_hol_diagnostics_require_bench_build_and_v8_parallel() {
+        let parallel = HarnessConfig::from_args(
+            Args::try_parse_from([
+                "write-perf",
+                "--pitr",
+                "--wal-io-mode",
+                "parallel",
+                "--wal-hol-diagnostics",
+            ])
+            .expect("parse V8 HOL diagnostics option"),
+        );
+        let result = validate_config(&parallel);
+        if cfg!(feature = "bench") {
+            result.expect("bench build can capture V8 parallel HOL diagnostics");
+        } else {
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("requires a bench build")
+            );
+        }
+
+        let leader = HarnessConfig::from_args(
+            Args::try_parse_from([
+                "write-perf",
+                "--pitr",
+                "--wal-io-mode",
+                "leader",
+                "--wal-hol-diagnostics",
+            ])
+            .expect("parse incompatible Leader diagnostics option"),
+        );
+        assert!(
+            validate_config(&leader)
+                .unwrap_err()
+                .to_string()
+                .contains("requires PITR V8 Parallel I/O")
+        );
+        assert!(Args::try_parse_from(["write-perf", "--wal-hol-diagnostics"]).is_err());
     }
 
     #[derive(Debug, Deserialize)]
@@ -10897,6 +10984,7 @@ mod tests {
             wal_io_mode: WalIoModeArg::Leader,
             wal_io_mode_explicit: false,
             wal_sync_diagnostics: false,
+            wal_hol_diagnostics: false,
             vlog_override: false,
             profile: true,
             clients: 1,
@@ -13430,6 +13518,7 @@ mod tests {
             wal_io_mode: WalIoModeArg::Leader,
             wal_io_mode_explicit: false,
             wal_sync_diagnostics: false,
+            wal_hol_diagnostics: false,
             vlog_override: false,
             profile: false,
             clients: 1,
