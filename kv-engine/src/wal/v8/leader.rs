@@ -791,6 +791,16 @@ impl WalV8ExtentPreallocator {
     }
 
     fn ensure_prepared_through(&self, required_end: u64) -> Result<()> {
+        self.ensure_prepared_through_with(required_end, |start, end| {
+            fallocate_wal_range(&self.data_file, start, end)
+        })
+    }
+
+    fn ensure_prepared_through_with(
+        &self,
+        required_end: u64,
+        mut fallocate: impl FnMut(u64, u64) -> Result<()>,
+    ) -> Result<()> {
         ensure!(
             required_end <= self.max_file_size,
             "V8 sliding extent preparation exceeds the WAL segment limit"
@@ -858,7 +868,7 @@ impl WalV8ExtentPreallocator {
                 {
                     fallocate_calls = fallocate_calls.saturating_add(1);
                 }
-                fallocate_wal_range(&self.data_file, start, end)
+                fallocate(start, end)
             },
         );
         #[cfg(feature = "bench")]
@@ -3810,6 +3820,111 @@ mod tests {
         assert_eq!(calls, [(0, 1024 * 1024)]);
     }
 
+    #[test]
+    fn sliding_extent_fallback_retains_and_transfers_quota_credit() -> Result<()> {
+        const SEGMENT_LIMIT: u64 = 64 * 1024;
+        const WINDOW_BYTES: u64 = FRAME_LEN_U64 * 4;
+
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("active-v8.wal");
+        let fixture = accounted_extent_preallocator_fixture(&path, SEGMENT_LIMIT, WINDOW_BYTES)?;
+        let slack_bytes = fixture.window_end - fixture.required_end;
+
+        let mut calls = Vec::new();
+        fixture
+            .preallocator
+            .ensure_prepared_through_with(fixture.required_end, |start, end| {
+                calls.push((start, end));
+                if end == fixture.window_end {
+                    Err(io::Error::from_raw_os_error(libc::ENOSPC).into())
+                } else {
+                    Ok(())
+                }
+            })?;
+
+        assert_eq!(
+            calls,
+            [
+                (fixture.start_offset, fixture.window_end),
+                (fixture.start_offset, fixture.required_end)
+            ]
+        );
+        assert_eq!(
+            fixture.preallocator.state.lock().prepared_end,
+            fixture.required_end
+        );
+        assert_eq!(
+            fixture.owner.image_owner().snapshot().source_spool_bytes,
+            FIXED_IMAGE_TEST_BYTES + slack_bytes
+        );
+        assert!(matches!(
+            fixture.owner.reserve_extent_slack(FRAME_LEN_U64),
+            Err(WalV7ReservationError::SourceSpoolLimit { .. })
+        ));
+
+        fixture
+            .preallocator
+            .ensure_prepared_through_with(fixture.window_end, |start, end| {
+                calls.push((start, end));
+                Ok(())
+            })?;
+        assert_eq!(
+            calls.last(),
+            Some(&(fixture.required_end, fixture.window_end))
+        );
+
+        fixture
+            .preallocator
+            .consume_source_credit(fixture.required_end, fixture.window_end)?;
+        assert_eq!(
+            fixture.owner.image_owner().snapshot().source_spool_bytes,
+            FIXED_IMAGE_TEST_BYTES
+        );
+        let probe = fixture.owner.reserve_extent_slack(FRAME_LEN_U64)?;
+        fixture.owner.release_extent_slack(probe, FRAME_LEN_U64)?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn sliding_extent_fallback_keeps_quota_when_exact_prefix_fails() -> Result<()> {
+        const SEGMENT_LIMIT: u64 = 64 * 1024;
+        const WINDOW_BYTES: u64 = FRAME_LEN_U64 * 4;
+
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("active-v8.wal");
+        let fixture = accounted_extent_preallocator_fixture(&path, SEGMENT_LIMIT, WINDOW_BYTES)?;
+        let slack_bytes = fixture.window_end - fixture.required_end;
+
+        let mut calls = Vec::new();
+        let error = fixture
+            .preallocator
+            .ensure_prepared_through_with(fixture.required_end, |start, end| {
+                calls.push((start, end));
+                Err(io::Error::from_raw_os_error(libc::ENOSPC).into())
+            })
+            .expect_err("exact-prefix allocation should fail");
+
+        assert!(error.to_string().contains("required V8 WAL prefix"));
+        assert_eq!(
+            calls,
+            [
+                (fixture.start_offset, fixture.window_end),
+                (fixture.start_offset, fixture.required_end)
+            ]
+        );
+        let state = fixture.preallocator.state.lock();
+        assert_eq!(state.prepared_end, fixture.start_offset);
+        assert!(state.window_preallocation_disabled);
+        drop(state);
+        assert_eq!(
+            fixture.owner.image_owner().snapshot().source_spool_bytes,
+            FIXED_IMAGE_TEST_BYTES + slack_bytes
+        );
+
+        Ok(())
+    }
+
     #[cfg(feature = "bench")]
     #[test]
     fn frontier_write_mode_parses_only_supported_values() {
@@ -4500,6 +4615,60 @@ mod tests {
     }
 
     const FIXED_IMAGE_TEST_BYTES: u64 = HEADER_LEN_U64 + FRAME_LEN_U64;
+
+    struct AccountedExtentPreallocatorFixture {
+        owner: Arc<WalV8ReservationOwner>,
+        preallocator: WalV8ExtentPreallocator,
+        start_offset: u64,
+        required_end: u64,
+        window_end: u64,
+    }
+
+    fn accounted_extent_preallocator_fixture(
+        path: &Path,
+        max_file_size: u64,
+        window_bytes: u64,
+    ) -> Result<AccountedExtentPreallocatorFixture> {
+        let installed = install_empty(path, header())?;
+        let start_offset = installed.image_len;
+        let required_end = start_offset + FRAME_LEN_U64;
+        let window_end = start_offset + window_bytes;
+        let slack_bytes = window_end - required_end;
+        let max_source_spool_bytes = max_file_size + FIXED_IMAGE_TEST_BYTES + slack_bytes;
+        let sync_file = OpenOptions::new().read(true).write(true).open(path)?;
+        let (writer, owner) = open_accounted_writer(
+            path,
+            &installed,
+            max_file_size,
+            max_source_spool_bytes,
+            FRAME_LEN_U64,
+            sync_file,
+        )?;
+        drop(writer);
+
+        let data_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_DIRECT)
+            .open(path)?;
+        let sync_file = OpenOptions::new().read(true).write(true).open(path)?;
+        let preallocator = WalV8ExtentPreallocator::new(
+            data_file,
+            &sync_file,
+            start_offset,
+            max_file_size,
+            window_bytes,
+            Some(Arc::clone(&owner)),
+        )?;
+
+        Ok(AccountedExtentPreallocatorFixture {
+            owner,
+            preallocator,
+            start_offset,
+            required_end,
+            window_end,
+        })
+    }
 
     #[test]
     fn spool_pressure_rejects_before_ticket_and_preserves_workspace() -> Result<()> {
