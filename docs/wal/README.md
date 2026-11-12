@@ -85,6 +85,7 @@ the retained and rejected experiments.
 - [RFC 026 V7/V8 CPU affinity on GCP, 2026-11-11](benchmarks/rfc-026-v7-v8-cpu-affinity-gcp-20261111.md)
 - [RFC 026 V7/V8 io-wq affinity sweep on GCP, 2026-11-11](benchmarks/rfc-026-v7-v8-iowq-affinity-sweep-gcp-20261111.md)
 - [RFC 026 V8 ordering HOL diagnostics on GCP, 2026-11-12](benchmarks/rfc-026-v8-ordering-hol-gcp-20261112.md)
+- [RFC 026 V8 sliding extent initialization on GCP, 2026-11-12](benchmarks/rfc-026-v8-sliding-initialize-gcp-20261112.md)
 - [RFC 026 V8 CQE-to-reaper timeline on GCP, 2026-11-12](benchmarks/rfc-026-v8-cqe-reaper-gcp-20261112.md)
 - [RFC 026 V8 ext4 extent preparation on GCP, 2026-11-12](benchmarks/rfc-026-v8-ext4-extent-preparation-gcp-20261112.md)
 - [RFC 026 V8 bounded extent preparation on GCP, 2026-11-12](benchmarks/rfc-026-v8-bounded-extent-gcp-20261112.md)

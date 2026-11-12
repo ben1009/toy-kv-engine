@@ -177,13 +177,22 @@ pub struct WalExtentPreparationDiagnostics {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[doc(hidden)]
 pub struct WalV8SlidingExtentPreparationDiagnostics {
+    pub mode: WalExtentPreparationMode,
     pub start_offset: u64,
     pub max_file_size: u64,
     pub window_bytes: u64,
+    pub initialization_chunk_bytes: u64,
     pub prepared_end: u64,
+    pub allocated_end: u64,
     pub fallocate_calls: u64,
     pub allocated_bytes: u64,
+    pub initialization_chunks: u64,
+    pub initialized_bytes: u64,
     pub elapsed_ns: u64,
+    pub fallocate_elapsed_ns: u64,
+    pub initialization_elapsed_ns: u64,
+    pub wait_calls: u64,
+    pub wait_ns: u64,
 }
 
 /// How the benchmark prepared an Active V8 WAL suffix.
@@ -194,6 +203,7 @@ pub enum WalExtentPreparationMode {
     Fallocate,
     Initialize,
     SlidingFallocate,
+    SlidingInitialize,
 }
 
 /// Size of a batch header (v2/v3): commit_ts (8) + entry_count (4) + data_crc32 (4) = 16 bytes.

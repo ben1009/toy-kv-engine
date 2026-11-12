@@ -1248,10 +1248,18 @@ struct WalV8SlidingExtentPreparationRecord {
     start_offset: u64,
     max_file_size: u64,
     window_bytes: u64,
+    initialization_chunk_bytes: u64,
     prepared_end: u64,
+    allocated_end: u64,
     fallocate_calls: u64,
     allocated_bytes: u64,
+    initialization_chunks: u64,
+    initialized_bytes: u64,
     elapsed_ns: u64,
+    fallocate_elapsed_ns: u64,
+    initialization_elapsed_ns: u64,
+    wait_calls: u64,
+    wait_ns: u64,
 }
 
 #[cfg(feature = "bench")]
@@ -1261,6 +1269,7 @@ impl WalV8SlidingExtentPreparationRecord {
             && self.start_offset == other.start_offset
             && self.max_file_size == other.max_file_size
             && self.window_bytes == other.window_bytes
+            && self.initialization_chunk_bytes == other.initialization_chunk_bytes
     }
 }
 
@@ -1272,6 +1281,7 @@ impl From<WalExtentPreparationDiagnostics> for WalExtentPreparationRecord {
                 WalExtentPreparationMode::Fallocate => "fallocate",
                 WalExtentPreparationMode::Initialize => "initialize",
                 WalExtentPreparationMode::SlidingFallocate => "sliding-fallocate",
+                WalExtentPreparationMode::SlidingInitialize => "sliding-initialize",
             },
             start_offset: diagnostics.start_offset,
             end_offset: diagnostics.end_offset,
@@ -1286,14 +1296,27 @@ impl From<WalExtentPreparationDiagnostics> for WalExtentPreparationRecord {
 impl From<WalV8SlidingExtentPreparationDiagnostics> for WalV8SlidingExtentPreparationRecord {
     fn from(diagnostics: WalV8SlidingExtentPreparationDiagnostics) -> Self {
         Self {
-            mode: "sliding-fallocate",
+            mode: match diagnostics.mode {
+                WalExtentPreparationMode::Fallocate => "fallocate",
+                WalExtentPreparationMode::Initialize => "initialize",
+                WalExtentPreparationMode::SlidingFallocate => "sliding-fallocate",
+                WalExtentPreparationMode::SlidingInitialize => "sliding-initialize",
+            },
             start_offset: diagnostics.start_offset,
             max_file_size: diagnostics.max_file_size,
             window_bytes: diagnostics.window_bytes,
+            initialization_chunk_bytes: diagnostics.initialization_chunk_bytes,
             prepared_end: diagnostics.prepared_end,
+            allocated_end: diagnostics.allocated_end,
             fallocate_calls: diagnostics.fallocate_calls,
             allocated_bytes: diagnostics.allocated_bytes,
+            initialization_chunks: diagnostics.initialization_chunks,
+            initialized_bytes: diagnostics.initialized_bytes,
             elapsed_ns: diagnostics.elapsed_ns,
+            fallocate_elapsed_ns: diagnostics.fallocate_elapsed_ns,
+            initialization_elapsed_ns: diagnostics.initialization_elapsed_ns,
+            wait_calls: diagnostics.wait_calls,
+            wait_ns: diagnostics.wait_ns,
         }
     }
 }
@@ -9596,14 +9619,14 @@ fn validate_v8_extent_preparation(
             "V8 extent preparation requires PITR V8 Parallel I/O"
         );
         let extent_mode = extent_mode.context(
-            "TOYKV_BENCH_V8_EXTENT_PREP requires `fallocate`, `initialize`, or `sliding-fallocate`",
+            "TOYKV_BENCH_V8_EXTENT_PREP requires `fallocate`, `initialize`, `sliding-fallocate`, or `sliding-initialize`",
         )?;
         anyhow::ensure!(
             matches!(
                 extent_mode.to_str(),
-                Some("fallocate" | "initialize" | "sliding-fallocate")
+                Some("fallocate" | "initialize" | "sliding-fallocate" | "sliding-initialize")
             ),
-            "TOYKV_BENCH_V8_EXTENT_PREP must be `fallocate`, `initialize`, or `sliding-fallocate`"
+            "TOYKV_BENCH_V8_EXTENT_PREP must be `fallocate`, `initialize`, `sliding-fallocate`, or `sliding-initialize`"
         );
         let extent_bytes = extent_bytes
             .context("TOYKV_BENCH_V8_EXTENT_PREP_BYTES is required with extent preparation")?;
@@ -9632,14 +9655,16 @@ mod tests {
         let args = Args::try_parse_from(["write-perf", "--pitr"]).expect("parse PITR args");
         let cfg = HarnessConfig::from_args(args);
 
-        for window_bytes in [1 << 20, 4 << 20] {
-            let window_bytes = window_bytes.to_string();
-            validate_v8_extent_preparation(
-                &cfg,
-                Some(std::ffi::OsStr::new("sliding-fallocate")),
-                Some(std::ffi::OsStr::new(&window_bytes)),
-            )
-            .expect("accept aligned sliding fallocate window");
+        for mode in ["sliding-fallocate", "sliding-initialize"] {
+            for window_bytes in [1 << 20, 4 << 20] {
+                let window_bytes = window_bytes.to_string();
+                validate_v8_extent_preparation(
+                    &cfg,
+                    Some(std::ffi::OsStr::new(mode)),
+                    Some(std::ffi::OsStr::new(&window_bytes)),
+                )
+                .expect("accept aligned sliding preparation window");
+            }
         }
 
         assert!(
@@ -9661,10 +9686,18 @@ mod tests {
                 start_offset: 4096,
                 max_file_size: 1 << 20,
                 window_bytes: 1 << 17,
+                initialization_chunk_bytes: 1 << 17,
                 prepared_end: 4096,
+                allocated_end: 4096,
                 fallocate_calls: 0,
                 allocated_bytes: 0,
+                initialization_chunks: 0,
+                initialized_bytes: 0,
                 elapsed_ns: 0,
+                fallocate_elapsed_ns: 0,
+                initialization_elapsed_ns: 0,
+                wait_calls: 0,
+                wait_ns: 0,
             }),
             ..WalIoDiagnosticsRecord::default()
         };
