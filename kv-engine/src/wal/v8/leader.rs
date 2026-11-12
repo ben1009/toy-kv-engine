@@ -321,11 +321,11 @@ fn benchmark_submits_any_ready_ticket() -> Result<bool> {
         let value = value
             .into_string()
             .map_err(|_| anyhow::anyhow!("{SUBMIT_ORDER_ENV} is not valid UTF-8"))?;
-        return match value.as_str() {
+        match value.as_str() {
             "ordered" => Ok(false),
             "ready" => Ok(true),
             _ => anyhow::bail!("{SUBMIT_ORDER_ENV} must be 'ordered' or 'ready'"),
-        };
+        }
     }
 
     #[cfg(not(feature = "bench"))]
