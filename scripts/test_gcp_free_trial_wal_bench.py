@@ -26,7 +26,10 @@ from gcp_wal_matrix import (
     validate_rfc026_rows,
 )
 from gcp_wal_profile_runner import (
+    _expected_frontier_mode_for_arm,
+    _load_benchmark_record,
     _run_one as run_profile_one,
+    _validate_wal_io_metadata,
     build_profile_plan,
     build_profile_schedule,
     run_suite as run_profile_suite,
@@ -127,6 +130,97 @@ def fake_keygen(command, **_kwargs):
 
 
 class GcpFreeTrialWalBenchTests(unittest.TestCase):
+    def test_benchmark_record_loader_requires_exactly_one_valid_json_record(self) -> None:
+        valid = json.dumps({"result": {}, "params": {}, "latency": {}})
+        with tempfile.TemporaryDirectory() as temp:
+            result_path = Path(temp) / "result.json"
+            for contents, expected_count in (("diagnostic only\n", 0), (f"{valid}\n{valid}\n", 2)):
+                result_path.write_text(contents, encoding="utf-8")
+                with self.subTest(expected_count=expected_count), self.assertRaisesRegex(
+                    ValueError, f"found {expected_count}"
+                ):
+                    _load_benchmark_record(result_path)
+
+            result_path.write_text(f"{valid}\n[hotpath] details\n", encoding="utf-8")
+            self.assertEqual(_load_benchmark_record(result_path), {
+                "result": {}, "params": {}, "latency": {},
+            })
+
+    def test_v8_io_metadata_requires_stable_active_inode_and_reports_modes(self) -> None:
+        handles = {
+            name: {"o_direct": name == "data", "device": 7, "inode": 11}
+            for name in ("data", "frontier", "sync")
+        }
+        pipeline = {"wal_io_start": handles, "wal_io_end": handles, "wal_io_stable": True}
+        self.assertEqual(_validate_wal_io_metadata(pipeline, 8), {
+            "wal_data_o_direct": True,
+            "wal_frontier_o_direct": False,
+            "wal_sync_o_direct": False,
+            "wal_io_device": 7,
+            "wal_io_inode": 11,
+        })
+        with self.assertRaisesRegex(ValueError, "expected V8 FRONTIER O_DIRECT=True"):
+            _validate_wal_io_metadata(pipeline, 8, "direct")
+
+        direct_handles = {
+            **handles,
+            "frontier": {**handles["frontier"], "o_direct": True},
+        }
+        direct_pipeline = {
+            "wal_io_start": direct_handles,
+            "wal_io_end": direct_handles,
+            "wal_io_stable": True,
+        }
+        self.assertTrue(_validate_wal_io_metadata(direct_pipeline, 8, "direct")["wal_frontier_o_direct"])
+        self.assertEqual(_validate_wal_io_metadata({}, 7), {})
+        self.assertEqual(_expected_frontier_mode_for_arm("v8_parallel", "direct"), "direct")
+        self.assertEqual(_expected_frontier_mode_for_arm("v8_leader", "direct"), "buffered")
+        leader_handles = {
+            **handles,
+            "data": {**handles["data"], "o_direct": False},
+        }
+        leader_pipeline = {
+            "wal_io_start": leader_handles,
+            "wal_io_end": leader_handles,
+            "wal_io_stable": True,
+        }
+        self.assertFalse(
+            _validate_wal_io_metadata(
+                leader_pipeline,
+                8,
+                expected_data_o_direct=False,
+            )["wal_data_o_direct"]
+        )
+
+        buffered_data = {
+            **handles,
+            "data": {**handles["data"], "o_direct": False},
+        }
+        direct_sync = {
+            **handles,
+            "sync": {**handles["sync"], "o_direct": True},
+        }
+        for invalid_handles, message in (
+            (buffered_data, "expected V8 DATA O_DIRECT=True"),
+            (direct_sync, "expected V8 sync O_DIRECT=False"),
+        ):
+            invalid = {
+                "wal_io_start": invalid_handles,
+                "wal_io_end": invalid_handles,
+                "wal_io_stable": True,
+            }
+            with self.subTest(message=message), self.assertRaisesRegex(ValueError, message):
+                _validate_wal_io_metadata(invalid, 8)
+
+        changed_inode = {**handles, "frontier": {**handles["frontier"], "inode": 12}}
+        invalid_pipelines = (
+            {**pipeline, "wal_io_stable": False},
+            {**pipeline, "wal_io_end": changed_inode},
+        )
+        for invalid in invalid_pipelines:
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                _validate_wal_io_metadata(invalid, 8)
+
     def test_writer_defaults_are_suite_specific_and_duplicates_are_rejected(self) -> None:
         common = ["--project", "project", "--zone", "us-central1-a", "--commit", "a" * 40, "--preflight-only"]
         legacy = BENCH.parse_args(common)
@@ -242,6 +336,16 @@ def value(name, default=None):
     except ValueError: return default
 
 version = value('--pitr-format', 'v4')
+wal_mode = value('--wal-io-mode', 'parallel')
+handles = {
+    name: {'o_direct': name == 'data' and wal_mode == 'parallel', 'device': 7, 'inode': 11}
+    for name in ('data', 'frontier', 'sync')
+}
+pipeline = {'sync_count': 12}
+if version == 'v8':
+    pipeline.update({
+        'wal_io_start': handles, 'wal_io_end': handles, 'wal_io_stable': True,
+    })
 record = {
     'params': {
         'num': int(value('--num')), 'threads': int(value('--threads')),
@@ -252,11 +356,12 @@ record = {
     'result': {
         'ops': int(value('--num')), 'ops_per_sec': 1000.0,
         'process_cpu_user_ms': 10, 'process_cpu_system_ms': 5,
-        'wal_pipeline': {'sync_count': 12},
+        'wal_pipeline': pipeline,
     },
     'latency': {'p99_ms': 1.25},
 }
 print(json.dumps(record))
+print('[hotpath] diagnostic report follows')
 """, encoding="utf-8")
             fake_binary.chmod(0o755)
             results = root / "results"
@@ -426,6 +531,21 @@ print(json.dumps(record))
         next_record = {
             **valid_record,
             "params": {**valid_record["params"], "wal_format_version": 8},
+            "result": {
+                **valid_record["result"],
+                "wal_pipeline": {
+                    "sync_count": 12,
+                    "wal_io_start": {
+                        name: {"o_direct": name == "data", "device": 7, "inode": 11}
+                        for name in ("data", "frontier", "sync")
+                    },
+                    "wal_io_end": {
+                        name: {"o_direct": name == "data", "device": 7, "inode": 11}
+                        for name in ("data", "frontier", "sync")
+                    },
+                    "wal_io_stable": True,
+                },
+            },
         }
         invalid_records = [
             ("null", None),

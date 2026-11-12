@@ -37,6 +37,12 @@ and do not define the current writer selection.
 - [Io_uring Benchmark Results](benchmarks/io-uring-bench.md)
 - [Performance Profiling Report](benchmarks/perf-profile.md)
 - [GCP Free Trial WAL benchmark runner](wal/benchmarks/gcp-free-trial-wal-bench.md)
+- [GCP V8 point sync diagnostic, 2026-11-10](wal/benchmarks/rfc-026-v8-point-sync-gcp-20261110.md)
+- [GCP V8 FRONTIER I/O A/B, 2026-11-11](wal/benchmarks/rfc-026-v8-frontier-io-ab-gcp-20261111.md)
+- [GCP V7/V8 CPU affinity, 2026-11-11](wal/benchmarks/rfc-026-v7-v8-cpu-affinity-gcp-20261111.md)
+- [GCP V8 ordering HOL diagnostics, 2026-11-12](wal/benchmarks/rfc-026-v8-ordering-hol-gcp-20261112.md)
+- [GCP V8 sliding extent initialization, 2026-11-12](wal/benchmarks/rfc-026-v8-sliding-initialize-gcp-20261112.md)
+- [GCP V8 sliding fallocate full matrix, 2026-11-12](wal/benchmarks/rfc-026-v8-sliding-fallocate-matrix-gcp-20261112.md)
 
 ## Backup
 

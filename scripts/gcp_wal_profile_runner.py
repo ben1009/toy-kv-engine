@@ -132,6 +132,79 @@ def _build_command(binary: Path, row: dict[str, Any], db_root: Path) -> tuple[li
     return command, expected_batch, wal_mode
 
 
+def _load_benchmark_record(result_path: Path) -> dict[str, Any]:
+    records: list[dict[str, Any]] = []
+    with result_path.open(encoding="utf-8") as stream:
+        for line in stream:
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(value, dict) and all(key in value for key in ("result", "params", "latency")):
+                records.append(value)
+
+    if len(records) != 1:
+        raise ValueError(f"expected one benchmark JSON record, found {len(records)}")
+    return records[0]
+
+
+def _validate_wal_io_metadata(
+    pipeline: dict[str, Any], expected_version: int, expected_frontier_mode: str = "buffered",
+    expected_data_o_direct: bool = True,
+) -> dict[str, Any]:
+    if expected_version != 8:
+        return {}
+    if expected_frontier_mode not in ("buffered", "direct"):
+        raise ValueError(f"unsupported expected V8 FRONTIER mode: {expected_frontier_mode!r}")
+
+    start = pipeline.get("wal_io_start")
+    end = pipeline.get("wal_io_end")
+    if not isinstance(start, dict) or not isinstance(end, dict):
+        raise ValueError("V8 benchmark record is missing start/end WAL I/O metadata")
+    if pipeline.get("wal_io_stable") is not True or start != end:
+        raise ValueError("V8 active WAL I/O metadata changed during the benchmark")
+
+    identities: set[tuple[int, int]] = set()
+    for snapshot in (start, end):
+        for handle_name in ("data", "frontier", "sync"):
+            handle = snapshot.get(handle_name)
+            if not isinstance(handle, dict):
+                raise ValueError(f"V8 WAL I/O metadata is missing the {handle_name} handle")
+            if type(handle.get("o_direct")) is not bool:
+                raise ValueError(f"V8 WAL {handle_name} handle is missing its O_DIRECT flag")
+            device = handle.get("device")
+            inode = handle.get("inode")
+            if type(device) is not int or type(inode) is not int or device < 0 or inode <= 0:
+                raise ValueError(f"V8 WAL {handle_name} handle has invalid device/inode metadata")
+            identities.add((device, inode))
+
+    if len(identities) != 1:
+        raise ValueError("V8 DATA, FRONTIER, and sync handles do not identify one WAL inode")
+    if start["data"]["o_direct"] is not expected_data_o_direct:
+        raise ValueError(f"expected V8 DATA O_DIRECT={expected_data_o_direct}")
+    if start["sync"]["o_direct"] is not False:
+        raise ValueError("expected V8 sync O_DIRECT=False")
+    expected_frontier_direct = expected_frontier_mode == "direct"
+    if start["frontier"]["o_direct"] is not expected_frontier_direct:
+        raise ValueError(
+            f"expected V8 FRONTIER O_DIRECT={expected_frontier_direct}, "
+            f"got {start['frontier']['o_direct']}"
+        )
+
+    device, inode = next(iter(identities))
+    return {
+        "wal_data_o_direct": start["data"]["o_direct"],
+        "wal_frontier_o_direct": start["frontier"]["o_direct"],
+        "wal_sync_o_direct": start["sync"]["o_direct"],
+        "wal_io_device": device,
+        "wal_io_inode": inode,
+    }
+
+
+def _expected_frontier_mode_for_arm(arm: str, configured_mode: str) -> str:
+    return configured_mode if arm == "v8_parallel" else "buffered"
+
+
 def _run_one(
     row: dict[str, Any], *, binary: Path, result_root: Path, db_root: Path,
     timeout_seconds: int,
@@ -249,16 +322,17 @@ def _run_one(
     # successful: perf also propagates benchmark and timeout exit statuses.
     if exit_code == 0 or (result_path.is_file() and result_path.stat().st_size):
         try:
-            parsed_record = json.loads(result_path.read_text(encoding="utf-8"))
-            if not isinstance(parsed_record, dict):
-                raise ValueError("benchmark JSON must be an object")
-            record = parsed_record
+            record = _load_benchmark_record(result_path)
         except (OSError, ValueError) as error:
             if exit_code == 0:
                 exit_code = 65
             (run_dir / "validation-error.txt").write_text(f"invalid benchmark JSON: {error}\n", encoding="utf-8")
 
-    metrics: dict[str, Any] = {"ops": "", "puts_per_second": "", "p99_ms": "", "cpu_seconds": "", "sync_count": ""}
+    metrics: dict[str, Any] = {
+        "ops": "", "puts_per_second": "", "p99_ms": "", "cpu_seconds": "", "sync_count": "",
+        "wal_data_o_direct": "", "wal_frontier_o_direct": "", "wal_sync_o_direct": "",
+        "wal_io_device": "", "wal_io_inode": "",
+    }
     if record is not None:
         try:
             result = record["result"]
@@ -276,19 +350,28 @@ def _run_one(
             elif not isinstance(pipeline, dict):
                 raise ValueError("benchmark wal_pipeline must be an object or null")
             cpu_seconds = (float(result["process_cpu_user_ms"]) + float(result["process_cpu_system_ms"])) / 1000
+            expected_version = 7 if row["arm"] == "v7_parallel" else 8
+            expected_frontier_mode = _expected_frontier_mode_for_arm(
+                row["arm"], os.environ.get("TOYKV_WAL_V8_FRONTIER_MODE", "buffered")
+            )
             parsed_metrics = {
                 "ops": ops,
                 "puts_per_second": float(result["ops_per_sec"]),
                 "p99_ms": float(latency["p99_ms"]),
                 "cpu_seconds": cpu_seconds,
                 "sync_count": pipeline.get("sync_count", ""),
+                **_validate_wal_io_metadata(
+                    pipeline,
+                    expected_version,
+                    expected_frontier_mode,
+                    expected_data_o_direct=row["arm"] == "v8_parallel",
+                ),
             }
             if any(not math.isfinite(parsed_metrics[key]) or parsed_metrics[key] < 0
                    for key in ("puts_per_second", "p99_ms", "cpu_seconds")):
                 raise ValueError("benchmark emitted non-finite or negative metrics")
             metrics = parsed_metrics
 
-            expected_version = 7 if row["arm"] == "v7_parallel" else 8
             expected_params = {
                 "num": int(row["num"]), "threads": writer, "value_size": 1024,
                 "batch_size": expected_batch, "wal_format_version": expected_version,
@@ -329,6 +412,7 @@ def run_suite(
     summary_fields = [
         "writer", "workload", "arm", "perf_status", "exit_code", "ops", "puts_per_second",
         "p99_ms", "cpu_seconds", "sync_count", "duration_seconds", "error",
+        "wal_data_o_direct", "wal_frontier_o_direct", "wal_sync_o_direct", "wal_io_device", "wal_io_inode",
     ]
     with (results_dir / "summary.tsv").open("w", encoding="utf-8", newline="") as stream:
         csv.DictWriter(stream, fieldnames=summary_fields, delimiter="\t").writeheader()

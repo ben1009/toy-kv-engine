@@ -1866,6 +1866,40 @@ mod tests {
     }
 
     #[test]
+    fn active_recovery_discards_a_completed_successor_behind_a_missing_head() -> Result<()> {
+        let (mut image, physical_header_digest, generation_zero, _) = empty_image()?;
+        let normalized_len = u64::try_from(image.len())?;
+        let first_data_offset = normalized_len;
+        let (first_data_end, _, _, _) =
+            append_batch(&mut image, physical_header_digest, first_data_offset, 0, 10)?;
+        append_batch(&mut image, physical_header_digest, first_data_end, 1, 20)?;
+
+        let first_data_start = usize::try_from(first_data_offset)?;
+        let first_data_end = usize::try_from(first_data_end)?;
+        image[first_data_start..first_data_end].fill(0);
+
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("active-v8.wal");
+        std::fs::write(&path, image)?;
+        let original = std::fs::metadata(&path)?;
+        let installed = crate::wal::v8::install::recover_and_install_active(
+            &path,
+            &[active_boundary(generation_zero)],
+            test_header().predecessor,
+            LIVE_WAL_V5_LIMITS,
+            crate::wal::MAX_WAL_FILE_SIZE,
+        )?;
+
+        let normalized = std::fs::metadata(&path)?;
+        assert_ne!(original.ino(), normalized.ino());
+        assert_eq!(installed.next_ticket, 0);
+        assert_eq!(installed.image_len, normalized_len);
+        assert!(installed_batches(&path, &installed)?.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
     fn active_recovery_reports_newer_structurally_invalid_frontiers() -> Result<()> {
         for (byte_offset, expected_reason) in [
             (60, "frame CRC mismatch"),

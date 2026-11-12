@@ -130,6 +130,17 @@ impl WalIoEvent<'_> {
         self.progress
             .record_group_completion(result, self.during_sync(), self.event_at());
     }
+
+    #[cfg(feature = "bench")]
+    fn record_completion_timeline(&self, timeline: WalV8GroupCompletionTimeline) {
+        self.progress.record_completion_timeline(timeline);
+    }
+
+    #[cfg(feature = "bench")]
+    fn mark_completion_timeline_send_started(&self, group_id: u64) {
+        self.progress
+            .mark_completion_timeline_send_started(group_id);
+    }
 }
 
 #[cfg(feature = "bench")]
@@ -145,6 +156,26 @@ struct WalSyncProgressState {
     written_frontier: u64,
     durable_frontier: u64,
     completed_groups: BTreeMap<u64, (u64, u64, u64, Instant)>,
+    completion_timelines: HashMap<u64, WalV8GroupCompletionTimeline>,
+}
+
+#[cfg(feature = "bench")]
+#[derive(Clone, Debug)]
+pub(crate) struct WalV8GroupCompletionTimeline {
+    pub(crate) group_id: u64,
+    pub(crate) ticket_start: u64,
+    pub(crate) ticket_end: u64,
+    pub(crate) worker_tid: Option<u64>,
+    pub(crate) request_start: u64,
+    pub(crate) request_end: u64,
+    pub(crate) request_id: u64,
+    pub(crate) sqe_submitted_at: Option<Instant>,
+    pub(crate) cqe_observed_at: Option<Instant>,
+    pub(crate) cqe_observed_monotonic_ns: Option<u64>,
+    pub(crate) group_finished_at: Option<Instant>,
+    pub(crate) group_finished_monotonic_ns: Option<u64>,
+    pub(crate) result_send_started_at: Option<Instant>,
+    pub(crate) reaper_recv_at: Option<Instant>,
 }
 
 #[cfg(feature = "bench")]
@@ -194,6 +225,39 @@ impl WalSyncProgress {
     #[cfg(feature = "bench")]
     pub(crate) fn set_profile(&self, profile: std::sync::Arc<crate::mem_table::WriteProfile>) {
         self.profile.store(Some(profile));
+    }
+
+    #[cfg(feature = "bench")]
+    fn completion_timeline_sample_every(&self) -> u64 {
+        self.profile().map_or(0, |profile| {
+            profile.wal_v8_completion_timeline_sample_every()
+        })
+    }
+
+    #[cfg(feature = "bench")]
+    fn record_completion_timeline(&self, timeline: WalV8GroupCompletionTimeline) {
+        let mut state = self.state.lock();
+        state
+            .completion_timelines
+            .insert(timeline.group_id, timeline);
+    }
+
+    #[cfg(feature = "bench")]
+    fn mark_completion_timeline_send_started(&self, group_id: u64) {
+        if let Some(timeline) = self.state.lock().completion_timelines.get_mut(&group_id) {
+            timeline.result_send_started_at = Some(Instant::now());
+        }
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn take_completion_timeline(
+        &self,
+        group_id: u64,
+        reaper_recv_at: Instant,
+    ) -> Option<WalV8GroupCompletionTimeline> {
+        let mut timeline = self.state.lock().completion_timelines.remove(&group_id)?;
+        timeline.reaper_recv_at = Some(reaper_recv_at);
+        Some(timeline)
     }
 
     /// Let a format with its own logical durability groups report those groups
@@ -827,6 +891,43 @@ struct GroupState {
     next_ready_index: usize,
     remaining_writes: usize,
     error: Option<String>,
+    #[cfg(feature = "bench")]
+    completion_timeline: Option<GroupCompletionTimeline>,
+}
+
+#[cfg(feature = "bench")]
+struct GroupCompletionTimeline {
+    request_id: u64,
+    sqe_submitted_at: Option<Instant>,
+    cqe_observed_at: Option<Instant>,
+    cqe_observed_monotonic_ns: Option<u64>,
+}
+
+#[cfg(feature = "bench")]
+fn monotonic_now_ns() -> Option<u64> {
+    let mut timestamp = std::mem::MaybeUninit::<libc::timespec>::uninit();
+    // SAFETY: `clock_gettime` initializes the timespec on success.
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, timestamp.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    // SAFETY: the successful call above initialized the timespec.
+    let timestamp = unsafe { timestamp.assume_init() };
+    u64::try_from(timestamp.tv_sec)
+        .ok()?
+        .checked_mul(1_000_000_000)?
+        .checked_add(u64::try_from(timestamp.tv_nsec).ok()?)
+}
+
+#[cfg(all(feature = "bench", target_os = "linux"))]
+fn current_kernel_tid() -> Option<u64> {
+    // SAFETY: `gettid` takes no arguments and has no memory-safety requirements.
+    let tid = unsafe { libc::syscall(libc::SYS_gettid) };
+    u64::try_from(tid).ok()
+}
+
+#[cfg(all(feature = "bench", not(target_os = "linux")))]
+fn current_kernel_tid() -> Option<u64> {
+    None
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -857,6 +958,8 @@ struct WriteSubmission {
 
 enum WorkerEvent<B> {
     BufferRetired(B),
+    #[cfg(feature = "bench")]
+    CompletionTimeline(WalV8GroupCompletionTimeline),
     GroupFinished(GroupWriteResult),
 }
 
@@ -880,6 +983,7 @@ struct WorkerCore<B: WorkerBuffer> {
     groups: HashMap<GroupId, GroupState>,
     group_order: VecDeque<GroupId>,
     writes: HashMap<RequestId, OwnedWrite<B>>,
+    allow_out_of_order_groups: bool,
     next_ticket: Option<u64>,
     next_file_offset: Option<u64>,
     next_group_id: u64,
@@ -893,10 +997,15 @@ struct WorkerCore<B: WorkerBuffer> {
 
 impl<B: WorkerBuffer> WorkerCore<B> {
     fn new() -> Self {
+        Self::with_ordering(false)
+    }
+
+    fn with_ordering(allow_out_of_order_groups: bool) -> Self {
         Self {
             groups: HashMap::new(),
             group_order: VecDeque::new(),
             writes: HashMap::new(),
+            allow_out_of_order_groups,
             next_ticket: None,
             next_file_offset: None,
             next_group_id: 0,
@@ -916,21 +1025,39 @@ impl<B: WorkerBuffer> WorkerCore<B> {
         {
             return Err(WorkerError::Poisoned);
         }
-        if let Some(next_ticket) = self.next_ticket
-            && group.tickets.start != next_ticket
-        {
-            return Err(WorkerError::TicketHole);
-        }
         if self.groups.len() >= MAX_INFLIGHT_GROUPS {
             return Err(WorkerError::TooManyGroups);
         }
 
         let file_start = group.allocation_range.start;
-        if self
-            .next_file_offset
-            .is_some_and(|next_file_offset| file_start != next_file_offset)
-        {
-            return Err(WorkerError::InvalidWriteRange);
+        if self.allow_out_of_order_groups {
+            // V8's benchmark-only mode submits uniquely admitted ticket ranges
+            // at their preassigned offsets. Gaps are allowed, but live groups
+            // must never overlap in either logical or physical space.
+            if self.groups.values().any(|existing| {
+                group.tickets.start < existing.tickets.end
+                    && existing.tickets.start < group.tickets.end
+            }) {
+                return Err(WorkerError::DuplicateGroup);
+            }
+            if self.groups.values().any(|existing| {
+                file_start < existing.file_range.end
+                    && existing.file_range.start < group.allocation_range.end
+            }) {
+                return Err(WorkerError::InvalidWriteRange);
+            }
+        } else {
+            if let Some(next_ticket) = self.next_ticket
+                && group.tickets.start != next_ticket
+            {
+                return Err(WorkerError::TicketHole);
+            }
+            if self
+                .next_file_offset
+                .is_some_and(|next_file_offset| file_start != next_file_offset)
+            {
+                return Err(WorkerError::InvalidWriteRange);
+            }
         }
         let file_end = group.allocation_range.end;
 
@@ -972,8 +1099,20 @@ impl<B: WorkerBuffer> WorkerCore<B> {
         self.next_group_id = next_group_id;
         self.next_request_id = next_request_id;
         self.next_buffer_id = next_buffer_id;
-        self.next_ticket = Some(group.tickets.end);
-        self.next_file_offset = Some(file_end);
+        self.next_ticket = Some(self.next_ticket.map_or(group.tickets.end, |next_ticket| {
+            if self.allow_out_of_order_groups {
+                next_ticket.max(group.tickets.end)
+            } else {
+                group.tickets.end
+            }
+        }));
+        self.next_file_offset = Some(self.next_file_offset.map_or(file_end, |next_file_offset| {
+            if self.allow_out_of_order_groups {
+                next_file_offset.max(file_end)
+            } else {
+                file_end
+            }
+        }));
         self.group_order.push_back(group_id);
         let request_ids = request_ids_start..next_request_id;
         self.groups.insert(
@@ -987,11 +1126,42 @@ impl<B: WorkerBuffer> WorkerCore<B> {
                 request_ids,
                 next_ready_index: 0,
                 error: None,
+                #[cfg(feature = "bench")]
+                completion_timeline: None,
             },
         );
         self.assert_invariants();
 
         Ok(group_id)
+    }
+
+    #[cfg(feature = "bench")]
+    fn sample_completion_timeline(&mut self, group_id: GroupId, sample_every: u64) {
+        if sample_every == 0 {
+            return;
+        }
+
+        let group = self
+            .groups
+            .get_mut(&group_id)
+            .expect("assigned group exists");
+        let remainder = group.request_ids.start % sample_every;
+        let offset = if remainder == 0 {
+            0
+        } else {
+            sample_every - remainder
+        };
+        let Some(request_id) = group.request_ids.start.checked_add(offset) else {
+            return;
+        };
+        if request_id < group.request_ids.end {
+            group.completion_timeline = Some(GroupCompletionTimeline {
+                request_id,
+                sqe_submitted_at: None,
+                cqe_observed_at: None,
+                cqe_observed_monotonic_ns: None,
+            });
+        }
     }
 
     /// Stage SQEs across groups in round-robin order without waiting for any
@@ -1075,9 +1245,20 @@ impl<B: WorkerBuffer> WorkerCore<B> {
             return Err(WorkerError::RequestNotStaged);
         }
 
+        #[cfg(feature = "bench")]
+        let group_id = write.group_id;
         write.state = WriteState::Submitted;
         self.staged_sqes -= 1;
         self.outstanding_sqes += 1;
+        #[cfg(feature = "bench")]
+        if let Some(timeline) = self
+            .groups
+            .get_mut(&group_id)
+            .and_then(|group| group.completion_timeline.as_mut())
+            && timeline.request_id == request_id.0
+        {
+            timeline.sqe_submitted_at = Some(Instant::now());
+        }
         self.assert_invariants();
 
         Ok(())
@@ -1130,6 +1311,17 @@ impl<B: WorkerBuffer> WorkerCore<B> {
             .ok_or(WorkerError::UnknownRequest)?;
         if !matches!(state, WriteState::Submitted | WriteState::Ambiguous) {
             return Err(WorkerError::RequestNotOutstanding);
+        }
+
+        #[cfg(feature = "bench")]
+        if let Some(timeline) = self
+            .groups
+            .get_mut(&group_id)
+            .and_then(|group| group.completion_timeline.as_mut())
+            && timeline.request_id == request_id.0
+        {
+            timeline.cqe_observed_at = Some(Instant::now());
+            timeline.cqe_observed_monotonic_ns = monotonic_now_ns();
         }
 
         self.outstanding_sqes -= 1;
@@ -1260,7 +1452,7 @@ impl<B: WorkerBuffer> WorkerCore<B> {
             let write_count = group.request_ids.end - group.request_ids.start;
             let write_bytes = group.write_bytes;
             self.group_order.retain(|queued_id| *queued_id != group_id);
-            for request_id in group.request_ids.map(RequestId) {
+            for request_id in group.request_ids.clone().map(RequestId) {
                 let write = self.writes.remove(&request_id);
                 debug_assert!(write.is_some_and(|write| write.state.is_terminal()));
             }
@@ -1275,6 +1467,29 @@ impl<B: WorkerBuffer> WorkerCore<B> {
             } else {
                 group.error
             };
+            #[cfg(feature = "bench")]
+            if error.is_none()
+                && let Some(timeline) = group.completion_timeline
+            {
+                events.push(WorkerEvent::CompletionTimeline(
+                    WalV8GroupCompletionTimeline {
+                        group_id: group_id.0,
+                        ticket_start: group.tickets.start,
+                        ticket_end: group.tickets.end,
+                        worker_tid: current_kernel_tid(),
+                        request_start: group.request_ids.start,
+                        request_end: group.request_ids.end,
+                        request_id: timeline.request_id,
+                        sqe_submitted_at: timeline.sqe_submitted_at,
+                        cqe_observed_at: timeline.cqe_observed_at,
+                        cqe_observed_monotonic_ns: timeline.cqe_observed_monotonic_ns,
+                        group_finished_at: Some(Instant::now()),
+                        group_finished_monotonic_ns: monotonic_now_ns(),
+                        result_send_started_at: None,
+                        reaper_recv_at: None,
+                    },
+                ));
+            }
             events.push(WorkerEvent::GroupFinished(GroupWriteResult {
                 group_id: group_id.0,
                 tickets: group.tickets,
@@ -1403,11 +1618,28 @@ impl<B: WorkerBuffer> WorkerCore<B> {
         debug_assert!(self.staged_sqes + self.outstanding_sqes <= MAX_OUTSTANDING_SQES);
         debug_assert!(self.stage_cursor < self.group_order.len().max(1));
 
-        for pair in self.group_order.iter().collect::<Vec<_>>().windows(2) {
-            let first = self.groups.get(pair[0]).expect("ordered group exists");
-            let second = self.groups.get(pair[1]).expect("ordered group exists");
-            debug_assert!(first.tickets.end <= second.tickets.start);
-            debug_assert!(first.file_range.end <= second.file_range.start);
+        if self.allow_out_of_order_groups {
+            for (index, first_id) in self.group_order.iter().enumerate() {
+                let first = self.groups.get(first_id).expect("ordered group exists");
+                for second_id in self.group_order.iter().skip(index + 1) {
+                    let second = self.groups.get(second_id).expect("ordered group exists");
+                    debug_assert!(
+                        first.tickets.end <= second.tickets.start
+                            || second.tickets.end <= first.tickets.start
+                    );
+                    debug_assert!(
+                        first.file_range.end <= second.file_range.start
+                            || second.file_range.end <= first.file_range.start
+                    );
+                }
+            }
+        } else {
+            for pair in self.group_order.iter().collect::<Vec<_>>().windows(2) {
+                let first = self.groups.get(pair[0]).expect("ordered group exists");
+                let second = self.groups.get(pair[1]).expect("ordered group exists");
+                debug_assert!(first.tickets.end <= second.tickets.start);
+                debug_assert!(first.file_range.end <= second.file_range.start);
+            }
         }
     }
 }
@@ -1603,11 +1835,138 @@ impl<B: WorkerBuffer> Clone for IoWorkerClient<B> {
     }
 }
 
+#[cfg(all(feature = "bench", target_os = "linux"))]
+fn configure_bench_io_worker_affinity() -> Result<Option<(String, libc::cpu_set_t)>> {
+    const IOWQ_AFFINITY_ENV: &str = "TOYKV_BENCH_IOWQ_AFFINITY";
+
+    let Ok(iowq_affinity) = std::env::var(IOWQ_AFFINITY_ENV) else {
+        return Ok(None);
+    };
+
+    let inherited_mask = current_cpu_affinity()?;
+
+    Ok(Some((iowq_affinity, inherited_mask)))
+}
+
+#[cfg(all(feature = "bench", target_os = "linux"))]
+fn register_bench_iowq_affinity(
+    ring: &io_uring::IoUring,
+    value: &str,
+    inherited_mask: &libc::cpu_set_t,
+) -> Result<()> {
+    const AFFINITY_ENV: &str = "TOYKV_BENCH_IOWQ_AFFINITY";
+
+    let allowed_cpus = (0..libc::CPU_SETSIZE as usize)
+        // SAFETY: each CPU index is bounded by CPU_SETSIZE and inherited_mask is initialized.
+        .filter(|cpu| unsafe { libc::CPU_ISSET(*cpu, inherited_mask) })
+        .collect::<Vec<_>>();
+    ensure!(
+        !allowed_cpus.is_empty(),
+        "WAL worker has an empty inherited CPU affinity mask"
+    );
+    if std::env::var_os("TOYKV_BENCH_IOWQ_DEBUG").is_some() {
+        eprintln!("benchmark WAL I/O worker inherited CPUs: {allowed_cpus:?}");
+    }
+
+    let mut requested_mask = *inherited_mask;
+    match value {
+        "all" => {}
+        value if value.starts_with("cpu:") || value.starts_with("cpus:") => {
+            let cpu_list = value
+                .strip_prefix("cpu:")
+                .or_else(|| value.strip_prefix("cpus:"))
+                .context("missing CPU prefix in io_uring affinity mode")?;
+            let mut cpus = cpu_list
+                .split(',')
+                .map(|cpu| {
+                    cpu.parse::<usize>()
+                        .with_context(|| format!("invalid CPU in {AFFINITY_ENV}={value:?}"))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            cpus.sort_unstable();
+            ensure!(
+                !cpus.is_empty(),
+                "{AFFINITY_ENV} CPU list must not be empty"
+            );
+            ensure!(
+                cpus.windows(2).all(|pair| pair[0] != pair[1]),
+                "{AFFINITY_ENV} CPU list must not contain duplicates"
+            );
+            ensure!(
+                cpus.iter().all(|cpu| *cpu < libc::CPU_SETSIZE as usize),
+                "{AFFINITY_ENV} contains a CPU ID outside cpu_set_t"
+            );
+            ensure!(
+                cpus.iter().all(|cpu| allowed_cpus.contains(cpu)),
+                "{AFFINITY_ENV} contains CPUs outside the WAL worker's inherited affinity mask"
+            );
+            // SAFETY: cpu_set_t is an integer bitset, so zero is a valid empty mask.
+            requested_mask = unsafe { std::mem::zeroed::<libc::cpu_set_t>() };
+            for cpu in cpus {
+                // SAFETY: every CPU was checked against CPU_SETSIZE and requested_mask is writable.
+                unsafe { libc::CPU_SET(cpu, &mut requested_mask) };
+            }
+        }
+        _ => bail!("{AFFINITY_ENV} must be 'all', 'cpu:<id>', or 'cpus:<id>,<id>'"),
+    }
+
+    ring.submitter()
+        .register_iowq_aff(&requested_mask)
+        .with_context(|| format!("register io_uring worker affinity {value:?}"))?;
+    if std::env::var_os("TOYKV_BENCH_IOWQ_DEBUG").is_some() {
+        let registered_cpus = (0..libc::CPU_SETSIZE as usize)
+            // SAFETY: each CPU index is bounded by CPU_SETSIZE and requested_mask is initialized.
+            .filter(|cpu| unsafe { libc::CPU_ISSET(*cpu, &requested_mask) })
+            .collect::<Vec<_>>();
+        eprintln!("benchmark io-wq registered CPUs: {registered_cpus:?}");
+    }
+    Ok(())
+}
+
+#[cfg(all(feature = "bench", target_os = "linux"))]
+fn current_cpu_affinity() -> Result<libc::cpu_set_t> {
+    // SAFETY: `cpu_set_t` is an integer bitset, so zero is a valid empty mask.
+    let mut current_mask = unsafe { std::mem::zeroed::<libc::cpu_set_t>() };
+    // SAFETY: the initialized mask is writable and pid 0 asks for this thread's affinity.
+    let result = unsafe {
+        libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut current_mask)
+    };
+    ensure!(
+        result == 0,
+        "read WAL worker CPU affinity: {}",
+        io::Error::last_os_error()
+    );
+    let has_allowed_cpu = (0..libc::CPU_SETSIZE as usize).any(|cpu| {
+        // SAFETY: cpu is bounded by CPU_SETSIZE and current_mask is initialized.
+        unsafe { libc::CPU_ISSET(cpu, &current_mask) }
+    });
+    ensure!(has_allowed_cpu, "WAL worker has an empty CPU affinity mask");
+
+    Ok(current_mask)
+}
+
 impl<B: WorkerBuffer> IoWorker<B> {
     pub(crate) fn spawn(
         wal_file: Arc<File>,
         buffer_pool: Arc<ArrayQueue<B>>,
         async_write_min_bytes: Option<usize>,
+    ) -> Result<Self> {
+        Self::spawn_with_group_ordering(wal_file, buffer_pool, async_write_min_bytes, false)
+    }
+
+    pub(crate) fn spawn_out_of_order(
+        wal_file: Arc<File>,
+        buffer_pool: Arc<ArrayQueue<B>>,
+        async_write_min_bytes: Option<usize>,
+    ) -> Result<Self> {
+        Self::spawn_with_group_ordering(wal_file, buffer_pool, async_write_min_bytes, true)
+    }
+
+    fn spawn_with_group_ordering(
+        wal_file: Arc<File>,
+        buffer_pool: Arc<ArrayQueue<B>>,
+        async_write_min_bytes: Option<usize>,
+        allow_out_of_order_groups: bool,
     ) -> Result<Self> {
         let (command_tx, command_rx) = unbounded();
         let (completion_tx, completion_rx) = unbounded::<GroupWriteResult>();
@@ -1630,6 +1989,17 @@ impl<B: WorkerBuffer> IoWorker<B> {
         let join = thread::Builder::new()
             .name("wal-io-worker".to_owned())
             .spawn(move || {
+                #[cfg(all(feature = "bench", target_os = "linux"))]
+                let bench_io_affinity = match configure_bench_io_worker_affinity() {
+                    Ok(affinity) => affinity,
+                    Err(error) => {
+                        let _ = startup_tx.send(Err(
+                            error.context("failed to configure WAL I/O worker affinity")
+                        ));
+                        return Err(anyhow!("WAL I/O worker affinity configuration failed"));
+                    }
+                };
+
                 // This thread creates, submits to, and reaps the ring. Let
                 // completion task work run at kernel transitions instead of
                 // interrupting userspace, and advertise the single issuer.
@@ -1652,6 +2022,17 @@ impl<B: WorkerBuffer> IoWorker<B> {
                         return Err(anyhow!("WAL io_uring initialization failed"));
                     }
                 };
+                #[cfg(all(feature = "bench", target_os = "linux"))]
+                if let Some((iowq_affinity, inherited_mask)) = bench_io_affinity.as_ref()
+                    && let Err(error) =
+                        register_bench_iowq_affinity(&ring, iowq_affinity, inherited_mask)
+                {
+                    let _ = startup_tx
+                        .send(Err(error.context("failed to set io_uring worker affinity")));
+                    return Err(anyhow!(
+                        "WAL io_uring worker affinity initialization failed"
+                    ));
+                }
                 if let Err(error) = ring.submitter().register_files(&[worker_file.as_raw_fd()]) {
                     let _ = startup_tx.send(Err(
                         anyhow!(error).context("failed to register WAL file with io_uring")
@@ -1671,6 +2052,7 @@ impl<B: WorkerBuffer> IoWorker<B> {
                     &worker_wake,
                     worker_sync_progress,
                     async_write_min_bytes,
+                    allow_out_of_order_groups,
                 )
             })
             .context("failed to spawn WAL I/O worker")?;
@@ -1857,8 +2239,9 @@ fn run_worker<B: WorkerBuffer>(
     wake: &WorkerWake,
     sync_progress: Arc<WalSyncProgress>,
     async_write_min_bytes: Option<usize>,
+    allow_out_of_order_groups: bool,
 ) -> Result<()> {
-    let mut core = WorkerCore::<B>::new();
+    let mut core = WorkerCore::<B>::with_ordering(allow_out_of_order_groups);
     let mut group_permits = HashMap::<GroupId, GroupPermit>::new();
     let mut ring_staged = VecDeque::<RequestId>::new();
     let mut shutdown_reply = None;
@@ -1947,7 +2330,20 @@ fn run_worker_loop<B: WorkerBuffer>(
             while core.can_receive_command(*stopping) {
                 match commands.try_recv() {
                     Ok(WorkerCommand::Group { id, group, permit }) => {
-                        enqueue_group_command(id, group, permit, core, group_permits, completions)?;
+                        #[cfg(feature = "bench")]
+                        let timeline_sample_every =
+                            sync_progress.completion_timeline_sample_every();
+                        #[cfg(not(feature = "bench"))]
+                        let timeline_sample_every = 0;
+                        enqueue_group_command(
+                            id,
+                            group,
+                            permit,
+                            core,
+                            group_permits,
+                            completions,
+                            timeline_sample_every,
+                        )?;
                     }
                     Ok(WorkerCommand::Shutdown(reply)) => {
                         *shutdown_reply = Some(reply);
@@ -2051,7 +2447,19 @@ fn run_worker_loop<B: WorkerBuffer>(
             }
             match commands.recv() {
                 Ok(WorkerCommand::Group { id, group, permit }) => {
-                    enqueue_group_command(id, group, permit, core, group_permits, completions)?;
+                    #[cfg(feature = "bench")]
+                    let timeline_sample_every = sync_progress.completion_timeline_sample_every();
+                    #[cfg(not(feature = "bench"))]
+                    let timeline_sample_every = 0;
+                    enqueue_group_command(
+                        id,
+                        group,
+                        permit,
+                        core,
+                        group_permits,
+                        completions,
+                        timeline_sample_every,
+                    )?;
                 }
                 Ok(WorkerCommand::Shutdown(reply)) => {
                     *shutdown_reply = Some(reply);
@@ -2081,10 +2489,15 @@ fn enqueue_group_command<B: WorkerBuffer>(
     core: &mut WorkerCore<B>,
     group_permits: &mut HashMap<GroupId, GroupPermit>,
     completions: &Sender<GroupWriteResult>,
+    timeline_sample_every: u64,
 ) -> Result<()> {
     let tickets = group.tickets.clone();
     match core.enqueue(group) {
         Ok(assigned_id) if assigned_id == id => {
+            #[cfg(feature = "bench")]
+            core.sample_completion_timeline(id, timeline_sample_every);
+            #[cfg(not(feature = "bench"))]
+            let _ = timeline_sample_every;
             group_permits.insert(id, permit);
         }
         Ok(_) => bail!("WAL worker assigned an unexpected group identifier"),
@@ -2295,10 +2708,16 @@ fn process_worker_events<B: WorkerBuffer>(
     completion_tx: &Sender<GroupWriteResult>,
     io_event: &WalIoEvent<'_>,
 ) {
+    #[cfg(feature = "bench")]
+    let mut pending_timeline = None;
     for event in events {
         match event {
             WorkerEvent::BufferRetired(buffer) => {
                 buffer.retire(buffer_pool);
+            }
+            #[cfg(feature = "bench")]
+            WorkerEvent::CompletionTimeline(timeline) => {
+                pending_timeline = Some(timeline);
             }
             WorkerEvent::GroupFinished(result) => {
                 #[cfg(all(test, feature = "chaos-testing"))]
@@ -2306,6 +2725,12 @@ fn process_worker_events<B: WorkerBuffer>(
 
                 io_event.record_group_completion(&result);
                 group_permits.remove(&GroupId(result.group_id));
+                #[cfg(feature = "bench")]
+                if let Some(timeline) = pending_timeline.take() {
+                    debug_assert_eq!(timeline.group_id, result.group_id);
+                    io_event.record_completion_timeline(timeline);
+                    io_event.mark_completion_timeline_send_started(result.group_id);
+                }
                 #[cfg(all(test, feature = "chaos-testing"))]
                 if completion_tx.send(result).is_ok() && injected_failure {
                     crate::chaos::failpoint::note_parallel_wal_injected_group_failure();
@@ -2470,6 +2895,8 @@ mod tests {
                     drop(buffer);
                     None
                 }
+                #[cfg(feature = "bench")]
+                WorkerEvent::CompletionTimeline(_) => None,
             })
             .expect("group completion event")
     }
@@ -2619,6 +3046,59 @@ mod tests {
     }
 
     #[test]
+    fn worker_can_stage_v8_groups_in_ticket_order_independent_arrival_order() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut core = WorkerCore::with_ordering(true);
+        core.enqueue(make_group(1..2, 8192, 1, 4096, &drops))
+            .expect("enqueue ready successor ticket first");
+        core.enqueue(make_group(0..1, 4096, 1, 4096, &drops))
+            .expect("enqueue delayed head ticket second");
+
+        let requests = submitted_ids(&mut core, 256);
+        assert_eq!(requests.len(), 2);
+        assert_eq!(core.inflight_group_count(), 2);
+
+        let mut results = Vec::new();
+        for request_id in requests.into_iter().rev() {
+            for event in core
+                .complete_write(request_id, 4096)
+                .expect("complete full-length out-of-order write")
+            {
+                match event {
+                    WorkerEvent::BufferRetired(buffer) => drop(buffer),
+                    WorkerEvent::GroupFinished(result) => results.push(result),
+                    #[cfg(feature = "bench")]
+                    WorkerEvent::CompletionTimeline(_) => {}
+                }
+            }
+        }
+        results.sort_by_key(|result| result.tickets.start);
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].tickets, 0..1);
+        assert_eq!(results[1].tickets, 1..2);
+        assert!(core.is_idle());
+        assert_eq!(drops.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn worker_rejects_overlapping_v8_groups_when_ordering_is_relaxed() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut core = WorkerCore::with_ordering(true);
+        core.enqueue(make_group(1..2, 8192, 1, 4096, &drops))
+            .expect("enqueue first group");
+        assert!(matches!(
+            core.enqueue(make_group(1..2, 12_288, 1, 4096, &drops)),
+            Err(WorkerError::DuplicateGroup)
+        ));
+        assert!(matches!(
+            core.enqueue(make_group(0..1, 8192, 1, 4096, &drops)),
+            Err(WorkerError::InvalidWriteRange)
+        ));
+        assert_eq!(core.group_count(), 1);
+    }
+
+    #[test]
     fn worker_accepts_data_groups_split_by_multiple_frontier_frames() {
         let drops = Arc::new(AtomicUsize::new(0));
         let mut core = WorkerCore::new();
@@ -2650,6 +3130,8 @@ mod tests {
                 match event {
                     WorkerEvent::BufferRetired(buffer) => drop(buffer),
                     WorkerEvent::GroupFinished(result) => results.push(result),
+                    #[cfg(feature = "bench")]
+                    WorkerEvent::CompletionTimeline(_) => {}
                 }
             }
         }
@@ -3097,6 +3579,8 @@ mod tests {
                     drop(buffer);
                 }
                 WorkerEvent::GroupFinished(_) => group_finished = true,
+                #[cfg(feature = "bench")]
+                WorkerEvent::CompletionTimeline(_) => {}
             }
         }
 
@@ -3254,6 +3738,7 @@ mod tests {
             &mut core,
             &mut group_permits,
             &completion_tx,
+            0,
         )
         .expect("reject poisoned group without stopping the worker");
         enqueue_group_command(
@@ -3263,6 +3748,7 @@ mod tests {
             &mut core,
             &mut group_permits,
             &completion_tx,
+            0,
         )
         .expect("reject later poisoned group without a ticket-hole failure");
 

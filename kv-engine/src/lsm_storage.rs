@@ -10071,12 +10071,12 @@ impl KvEngine {
     ///
     /// Diagnostics must be enabled before its first ticket is admitted. They
     /// can be disabled later, but cannot be re-enabled on that WAL because the
-    /// worker cannot reconstruct observations for the disabled interval.
+    /// writer cannot reconstruct completion timestamps for the disabled interval.
     ///
     /// # Errors
     ///
-    /// Returns an error if diagnostics are enabled after the active parallel
-    /// WAL has admitted a ticket.
+    /// Returns an error if diagnostics are enabled after the active V8 WAL has
+    /// admitted a ticket.
     pub fn set_wal_sync_diagnostics_enabled(&self, enabled: bool) -> Result<()> {
         let _active_memtable = self.inner.active_memtable_lock.read();
 
@@ -10085,6 +10085,68 @@ impl KvEngine {
             .load()
             .memtable
             .set_wal_sync_diagnostics_enabled(enabled)
+    }
+
+    #[cfg(feature = "bench")]
+    /// Enable benchmark-only V8 ordering head-of-line diagnostics.
+    pub fn set_wal_hol_diagnostics_enabled(&self, enabled: bool) -> Result<()> {
+        let _active_memtable = self.inner.active_memtable_lock.read();
+
+        self.inner
+            .state
+            .load()
+            .memtable
+            .set_wal_hol_diagnostics_enabled(enabled)
+    }
+
+    #[cfg(feature = "bench")]
+    /// Sample every Nth V8 Parallel DATA request through durable publication.
+    /// Passing `None` disables timestamp collection.
+    pub fn set_wal_v8_completion_timeline_sample_every(
+        &self,
+        sample_every: Option<u64>,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            sample_every.is_none_or(|every| every > 0),
+            "completion timeline sample interval must be greater than zero"
+        );
+        let _active_memtable = self.inner.active_memtable_lock.read();
+        self.inner
+            .write_profile
+            .set_wal_v8_completion_timeline_sample_every(sample_every.unwrap_or_default());
+
+        Ok(())
+    }
+
+    #[cfg(feature = "bench")]
+    /// Samples captured by the opt-in V8 Parallel completion timeline.
+    pub fn wal_v8_completion_timeline_observations(
+        &self,
+    ) -> Vec<crate::mem_table::WalV8CompletionTimelineObservation> {
+        self.inner
+            .write_profile
+            .wal_v8_completion_timeline_observations()
+    }
+
+    #[cfg(feature = "bench")]
+    /// Number of timeline samples discarded after reaching the bounded sample limit.
+    pub fn wal_v8_completion_timeline_dropped_samples(&self) -> u64 {
+        self.inner
+            .write_profile
+            .wal_v8_completion_timeline_dropped_samples()
+    }
+
+    /// I/O flags and inode identity for the active V8 WAL handles.
+    #[cfg(feature = "bench")]
+    #[doc(hidden)]
+    pub fn benchmark_wal_io_diagnostics(&self) -> Option<crate::wal::WalIoDiagnostics> {
+        let _active_memtable = self.inner.active_memtable_lock.read();
+
+        self.inner
+            .state
+            .load()
+            .memtable
+            .benchmark_wal_io_diagnostics()
     }
 
     /// Per-call durability progress captured during the last profiled workload.
@@ -38372,22 +38434,41 @@ mod tests {
         // Held across the whole close: the guard `wait_for_quiescence` is waiting
         // for, dropped only once this task is polled after its sleep.
         let guard_engine = std::sync::Arc::clone(&engine);
+        let (guard_admitted, guard_admitted_rx) = tokio::sync::oneshot::channel();
         let guard = runtime.spawn(async move {
             let _guard = guard_engine
                 .inner
                 .lifecycle
                 .admit_scan()
                 .expect("admit a scan the close has to wait for");
+            guard_admitted
+                .send(())
+                .expect("test is waiting for scan admission");
             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         });
         let ticks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let ticker_ticks = std::sync::Arc::clone(&ticks);
+        let (ticker_started, ticker_started_rx) = tokio::sync::oneshot::channel();
         let ticker = runtime.spawn(async move {
+            let mut ticker_started = Some(ticker_started);
             loop {
                 tokio::time::sleep(std::time::Duration::from_millis(1)).await;
                 ticker_ticks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if let Some(ticker_started) = ticker_started.take() {
+                    let _ = ticker_started.send(());
+                }
             }
         });
+
+        // A current-thread runtime does not poll spawned tasks until block_on
+        // starts. Establish both test preconditions before close can stop new
+        // lifecycle admissions, avoiding a scheduling race under sanitizers.
+        runtime
+            .block_on(guard_admitted_rx)
+            .expect("scan guard was admitted before close");
+        runtime
+            .block_on(ticker_started_rx)
+            .expect("ticker ran before close");
 
         let close_runtime = std::sync::Arc::clone(&runtime);
         let (sender, receiver) = std::sync::mpsc::channel();

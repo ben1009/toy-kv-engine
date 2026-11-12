@@ -15,6 +15,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(feature = "bench")]
+use std::collections::BTreeMap;
+
 use anyhow::{Context, Result, ensure};
 use parking_lot::{Condvar, Mutex};
 
@@ -73,6 +76,15 @@ struct CoordinatorInner {
     /// DATA submitter can identify a lone admitted head without taking the
     /// coordinator lock under its submission lock.
     admitted_ticket_end: AtomicU64,
+    /// Avoid timestamping every DATA completion unless detailed sync
+    /// diagnostics are enabled for this WAL.
+    #[cfg(feature = "bench")]
+    data_completion_timestamps_enabled: std::sync::atomic::AtomicBool,
+    /// Fast opt-in gate for ordering HOL instrumentation.
+    #[cfg(feature = "bench")]
+    hol_diagnostics_enabled: std::sync::atomic::AtomicBool,
+    #[cfg(feature = "bench")]
+    profile: arc_swap::ArcSwapOption<crate::mem_table::WriteProfile>,
     segment_incarnation: [u8; 16],
     physical_header_digest: [u8; 32],
     initial_prefix_digest: WalV8Digest,
@@ -110,6 +122,10 @@ struct CoordinatorState {
     durable_followers: usize,
     #[cfg(feature = "bench")]
     ordered_link_hash_cpu_ns: u64,
+    #[cfg(feature = "bench")]
+    completion_timeline_frontier_ready_end: u64,
+    #[cfg(feature = "bench")]
+    completion_timeline_samples: BTreeMap<u64, PendingCompletionTimeline>,
 }
 
 struct TicketState {
@@ -122,6 +138,18 @@ struct TicketState {
     data_complete: bool,
     #[cfg(feature = "bench")]
     data_write_started_at: Option<Instant>,
+    #[cfg(feature = "bench")]
+    data_completed_at: Option<Instant>,
+    #[cfg(feature = "bench")]
+    digest_hol_started_at: Option<Instant>,
+    #[cfg(feature = "bench")]
+    data_completion_hol_started_at: Option<Instant>,
+}
+
+#[cfg(feature = "bench")]
+struct PendingCompletionTimeline {
+    group: crate::wal::parallel_worker::WalV8GroupCompletionTimeline,
+    prefix_ready_at: Option<Instant>,
 }
 
 /// Immutable view of one ticket in the admission window.
@@ -138,6 +166,8 @@ pub(crate) struct WalV8TicketProgress {
     pub(crate) data_complete: bool,
     #[cfg(feature = "bench")]
     pub(crate) data_write_elapsed_ns: Option<u64>,
+    #[cfg(feature = "bench")]
+    pub(crate) data_completed_at: Option<Instant>,
 }
 
 /// Atomic view of the durability decision point. `next_not_ready` is the
@@ -260,11 +290,21 @@ impl WalV8ParallelCoordinator {
                     durable_followers: 0,
                     #[cfg(feature = "bench")]
                     ordered_link_hash_cpu_ns: 0,
+                    #[cfg(feature = "bench")]
+                    completion_timeline_frontier_ready_end: config.next_ticket,
+                    #[cfg(feature = "bench")]
+                    completion_timeline_samples: BTreeMap::new(),
                 }),
                 changed: Condvar::new(),
                 durability_changed: Condvar::new(),
                 durable_published: Condvar::new(),
                 admitted_ticket_end: AtomicU64::new(config.next_ticket),
+                #[cfg(feature = "bench")]
+                data_completion_timestamps_enabled: std::sync::atomic::AtomicBool::new(false),
+                #[cfg(feature = "bench")]
+                hol_diagnostics_enabled: std::sync::atomic::AtomicBool::new(false),
+                #[cfg(feature = "bench")]
+                profile: arc_swap::ArcSwapOption::empty(),
                 segment_incarnation: header.incarnation,
                 physical_header_digest,
                 initial_prefix_digest,
@@ -309,6 +349,29 @@ impl WalV8ParallelCoordinator {
 
     pub(crate) fn admitted_ticket_end(&self) -> u64 {
         self.inner.admitted_ticket_end.load(Ordering::Acquire)
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn set_data_completion_timestamps_enabled(&self, enabled: bool) {
+        self.inner
+            .data_completion_timestamps_enabled
+            .store(enabled, Ordering::Release);
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn set_hol_diagnostics_profile(&self, profile: Arc<crate::mem_table::WriteProfile>) {
+        let enabled = profile.wal_hol_diagnostics_enabled();
+        self.inner.profile.store(Some(profile));
+        self.inner
+            .hol_diagnostics_enabled
+            .store(enabled, Ordering::Release);
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn set_hol_diagnostics_enabled(&self, enabled: bool) {
+        self.inner
+            .hol_diagnostics_enabled
+            .store(enabled, Ordering::Release);
     }
 
     /// Return the contiguous head prefix whose DATA frames are ready to submit.
@@ -435,6 +498,10 @@ impl WalV8ParallelCoordinator {
             return Ok(());
         }
         state.tickets[index].frames_ready = true;
+        #[cfg(feature = "bench")]
+        refresh_data_completion_order_hol(&self.inner, &mut state);
+        #[cfg(feature = "bench")]
+        advance_completion_timeline_prefix(&mut state);
         signal_change(&self.inner, &mut state);
 
         Ok(())
@@ -506,15 +573,41 @@ impl WalV8ParallelCoordinator {
                 poison_locked(&self.inner, &mut state);
                 anyhow::bail!("conflicting v8 digest-ready event")
             }
-            None => state.tickets[index].digest_ready = Some(digest),
+            None => {
+                state.tickets[index].digest_ready = Some(digest);
+                #[cfg(feature = "bench")]
+                if self.inner.hol_diagnostics_enabled.load(Ordering::Acquire)
+                    && digest.segment_ticket > state.folded_ticket_end
+                {
+                    state.tickets[index].digest_hol_started_at = Some(Instant::now());
+                }
+            }
         }
         #[cfg(feature = "bench")]
         let cpu_before = state.ordered_link_hash_cpu_ns;
         let folded_before = state.folded_ticket_end;
-        if let Err(error) = fold_ready_digests(&mut state) {
+        let hol_profile: Option<Arc<crate::mem_table::WriteProfile>> = {
+            #[cfg(feature = "bench")]
+            {
+                self.inner
+                    .hol_diagnostics_enabled
+                    .load(Ordering::Acquire)
+                    .then(|| self.inner.profile.load_full())
+                    .flatten()
+            }
+            #[cfg(not(feature = "bench"))]
+            {
+                None
+            }
+        };
+        if let Err(error) = fold_ready_digests(&mut state, hol_profile.as_deref()) {
             poison_locked(&self.inner, &mut state);
             return Err(error);
         }
+        #[cfg(feature = "bench")]
+        refresh_data_completion_order_hol(&self.inner, &mut state);
+        #[cfg(feature = "bench")]
+        advance_completion_timeline_prefix(&mut state);
         #[cfg(feature = "bench")]
         let ordered_link_hash_cpu_ns = state.ordered_link_hash_cpu_ns.saturating_sub(cpu_before);
         #[cfg(not(feature = "bench"))]
@@ -557,6 +650,18 @@ impl WalV8ParallelCoordinator {
             return Ok(());
         }
         state.tickets[index].data_complete = true;
+        #[cfg(feature = "bench")]
+        if self
+            .inner
+            .data_completion_timestamps_enabled
+            .load(Ordering::Acquire)
+        {
+            state.tickets[index].data_completed_at = Some(Instant::now());
+        }
+        #[cfg(feature = "bench")]
+        refresh_data_completion_order_hol(&self.inner, &mut state);
+        #[cfg(feature = "bench")]
+        advance_completion_timeline_prefix(&mut state);
         signal_change(&self.inner, &mut state);
         signal_durability_progress(&self.inner, &mut state);
 
@@ -627,6 +732,12 @@ impl WalV8ParallelCoordinator {
             poison_locked(&self.inner, &mut state);
             anyhow::bail!("v8 DATA-completion group partially duplicates prior completion")
         }
+        #[cfg(feature = "bench")]
+        let data_completed_at = self
+            .inner
+            .data_completion_timestamps_enabled
+            .load(Ordering::Acquire)
+            .then(Instant::now);
         for entry in state
             .tickets
             .iter_mut()
@@ -634,9 +745,60 @@ impl WalV8ParallelCoordinator {
             .take(ticket_count)
         {
             entry.data_complete = true;
+            #[cfg(feature = "bench")]
+            {
+                entry.data_completed_at = data_completed_at;
+            }
         }
+        #[cfg(feature = "bench")]
+        refresh_data_completion_order_hol(&self.inner, &mut state);
+        #[cfg(feature = "bench")]
+        advance_completion_timeline_prefix(&mut state);
         signal_change(&self.inner, &mut state);
         signal_durability_progress(&self.inner, &mut state);
+
+        Ok(())
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn record_data_completion_timeline(
+        &self,
+        group: crate::wal::parallel_worker::WalV8GroupCompletionTimeline,
+    ) -> Result<()> {
+        let mut state = self.inner.state.lock();
+        ensure!(!state.poisoned, "v8 Parallel coordinator is poisoned");
+        ensure!(
+            group.ticket_start < group.ticket_end
+                && group.ticket_start >= state.durable_ticket_end
+                && group.ticket_end <= state.next_ticket,
+            "v8 completion timeline names an invalid ticket range"
+        );
+        ensure!(
+            group.request_start <= group.request_id && group.request_id < group.request_end,
+            "v8 completion timeline request is outside its group"
+        );
+        ensure!(
+            group.ticket_end > state.completion_timeline_frontier_ready_end,
+            "v8 completion timeline was recorded after its prefix became ready"
+        );
+        ensure!(
+            state.completion_timeline_samples.len() < self.inner.max_inflight_tickets,
+            "v8 completion timeline exceeded the bounded ticket window"
+        );
+        ensure!(
+            !state
+                .completion_timeline_samples
+                .contains_key(&group.ticket_end),
+            "v8 completion timeline duplicates a ticket range"
+        );
+        state.completion_timeline_samples.insert(
+            group.ticket_end,
+            PendingCompletionTimeline {
+                group,
+                prefix_ready_at: None,
+            },
+        );
+        advance_completion_timeline_prefix(&mut state);
 
         Ok(())
     }
@@ -783,9 +945,86 @@ impl WalV8ParallelCoordinator {
         state.durable_prefix_digest = reservation.prefix_digest;
         state.last_frontier_end = frontier_end;
         state.pending_frontier = None;
+        #[cfg(feature = "bench")]
+        let covered_timeline_samples = {
+            let covered_ends = state
+                .completion_timeline_samples
+                .range(..=reservation.ticket_end)
+                .map(|(ticket_end, _)| *ticket_end)
+                .collect::<Vec<_>>();
+            covered_ends
+                .into_iter()
+                .filter_map(|ticket_end| state.completion_timeline_samples.remove(&ticket_end))
+                .collect::<Vec<_>>()
+        };
         signal_change(&self.inner, &mut state);
         signal_durability_progress(&self.inner, &mut state);
         self.inner.durable_published.notify_all();
+        drop(state);
+
+        #[cfg(feature = "bench")]
+        let durable_published_at = Instant::now();
+
+        #[cfg(feature = "bench")]
+        if let Some(profile) = self.inner.profile.load_full() {
+            for sample in covered_timeline_samples {
+                let Some(prefix_ready_at) = sample.prefix_ready_at else {
+                    continue;
+                };
+                let group = sample.group;
+                let Some(submit_to_cqe_observed_ns) =
+                    completion_timeline_duration_ns(group.sqe_submitted_at, group.cqe_observed_at)
+                else {
+                    continue;
+                };
+                let Some(cqe_observed_to_group_finished_ns) =
+                    completion_timeline_duration_ns(group.cqe_observed_at, group.group_finished_at)
+                else {
+                    continue;
+                };
+                let Some(group_finished_to_result_send_start_ns) = completion_timeline_duration_ns(
+                    group.group_finished_at,
+                    group.result_send_started_at,
+                ) else {
+                    continue;
+                };
+                let Some(result_send_to_reaper_ns) = completion_timeline_duration_ns(
+                    group.result_send_started_at,
+                    group.reaper_recv_at,
+                ) else {
+                    continue;
+                };
+                let Some(reaper_to_prefix_ready_ns) =
+                    completion_timeline_duration_ns(group.reaper_recv_at, Some(prefix_ready_at))
+                else {
+                    continue;
+                };
+                let Some(prefix_ready_to_durable_ns) = completion_timeline_duration_ns(
+                    Some(prefix_ready_at),
+                    Some(durable_published_at),
+                ) else {
+                    continue;
+                };
+                let observation = crate::mem_table::WalV8CompletionTimelineObservation {
+                    group_id: group.group_id,
+                    ticket_start: group.ticket_start,
+                    ticket_end: group.ticket_end,
+                    worker_tid: group.worker_tid,
+                    request_id: group.request_id,
+                    request_start: group.request_start,
+                    request_end: group.request_end,
+                    submit_to_cqe_observed_ns,
+                    cqe_observed_monotonic_ns: group.cqe_observed_monotonic_ns,
+                    group_finished_monotonic_ns: group.group_finished_monotonic_ns,
+                    cqe_observed_to_group_finished_ns,
+                    group_finished_to_result_send_start_ns,
+                    result_send_start_to_reaper_recv_ns: result_send_to_reaper_ns,
+                    reaper_recv_to_prefix_ready_ns: reaper_to_prefix_ready_ns,
+                    prefix_ready_to_durable_ns,
+                };
+                profile.record_wal_v8_completion_timeline(observation);
+            }
+        }
 
         Ok(())
     }
@@ -875,6 +1114,21 @@ impl WalV8ParallelCoordinator {
 
     pub(crate) fn last_frontier_end(&self) -> u64 {
         self.inner.state.lock().last_frontier_end
+    }
+
+    /// Keep all admitted DATA and reserved FRONTIER ranges stable while
+    /// reclaiming a speculative physical suffix. The callback must not enter
+    /// the coordinator or acquire the submission lock.
+    pub(crate) fn with_allocation_tail<T>(
+        &self,
+        update: impl FnOnce(u64) -> Result<T>,
+    ) -> Result<T> {
+        let state = self.inner.state.lock();
+        ensure!(!state.poisoned, "v8 Parallel coordinator is poisoned");
+        let result = update(state.next_data_offset);
+        drop(state);
+
+        result
     }
 
     pub(crate) fn change_generation(&self) -> u64 {
@@ -1149,6 +1403,12 @@ impl WalV8AdmissionPublisher for WalV8ParallelCoordinator {
             data_complete: false,
             #[cfg(feature = "bench")]
             data_write_started_at: None,
+            #[cfg(feature = "bench")]
+            data_completed_at: None,
+            #[cfg(feature = "bench")]
+            digest_hol_started_at: None,
+            #[cfg(feature = "bench")]
+            data_completion_hol_started_at: None,
         });
         state.next_ticket = next_ticket;
         state.next_data_offset = data_end;
@@ -1251,6 +1511,8 @@ impl TicketState {
             data_write_elapsed_ns: self
                 .data_write_started_at
                 .map(|started| started.elapsed().as_nanos().min(u64::MAX as u128) as u64),
+            #[cfg(feature = "bench")]
+            data_completed_at: self.data_completed_at,
         }
     }
 
@@ -1264,7 +1526,13 @@ impl TicketState {
 
 /// Fold producer digests in strict ticket order, even when later producers
 /// finish hashing first. The fold is bounded by the admitted ticket window.
-fn fold_ready_digests(state: &mut CoordinatorState) -> Result<()> {
+fn fold_ready_digests(
+    state: &mut CoordinatorState,
+    hol_profile: Option<&crate::mem_table::WriteProfile>,
+) -> Result<()> {
+    #[cfg(not(feature = "bench"))]
+    let _ = hol_profile;
+
     loop {
         let index = usize::try_from(
             state
@@ -1286,6 +1554,8 @@ fn fold_ready_digests(state: &mut CoordinatorState) -> Result<()> {
         let logical_batch_bytes = u64::try_from(ticket.plan.logical_batch_bytes)
             .context("v8 folded logical batch length exceeds u64")?;
         #[cfg(feature = "bench")]
+        let digest_hol_started_at = ticket.digest_hol_started_at;
+        #[cfg(feature = "bench")]
         let hash_started = super::digest::should_sample_hash_cpu(state.folded_ticket_end)
             .then(super::digest::thread_cpu_time_ns);
         let prefix_digest = super::digest::advance_prefix(
@@ -1305,11 +1575,98 @@ fn fold_ready_digests(state: &mut CoordinatorState) -> Result<()> {
             .checked_add(1)
             .context("v8 folded ticket cursor overflows")?;
         state.tickets[index].prefix_digest_after = Some(prefix_digest);
+        #[cfg(feature = "bench")]
+        {
+            state.tickets[index].digest_hol_started_at = None;
+            if let (Some(profile), Some(started_at)) = (hol_profile, digest_hol_started_at) {
+                profile.record_wal_v8_digest_order_hol(elapsed_ns(started_at, Instant::now()));
+            }
+        }
         state.folded_ticket_end = next_ticket;
         state.folded_prefix_digest = prefix_digest;
     }
 
     Ok(())
+}
+
+#[cfg(feature = "bench")]
+fn refresh_data_completion_order_hol(inner: &CoordinatorInner, state: &mut CoordinatorState) {
+    if !inner.hol_diagnostics_enabled.load(Ordering::Acquire) {
+        return;
+    }
+    let Some(profile) = inner.profile.load_full() else {
+        return;
+    };
+
+    let now = Instant::now();
+    let mut prefix_open = true;
+    for ticket in &mut state.tickets {
+        let ready = ticket.data_complete;
+        if prefix_open && ready {
+            if let Some(started_at) = ticket.data_completion_hol_started_at.take() {
+                profile.record_wal_v8_data_completion_hol(elapsed_ns(started_at, now));
+            }
+        } else if ready {
+            ticket.data_completion_hol_started_at.get_or_insert(now);
+        } else {
+            prefix_open = false;
+        }
+    }
+}
+
+#[cfg(feature = "bench")]
+fn advance_completion_timeline_prefix(state: &mut CoordinatorState) {
+    state.completion_timeline_frontier_ready_end = state
+        .completion_timeline_frontier_ready_end
+        .max(state.durable_ticket_end);
+    let previous_end = state.completion_timeline_frontier_ready_end;
+    while let Some(index) = state
+        .completion_timeline_frontier_ready_end
+        .checked_sub(state.durable_ticket_end)
+        .and_then(|offset| usize::try_from(offset).ok())
+    {
+        let Some(ticket) = state.tickets.get(index) else {
+            break;
+        };
+        if ticket.assignment.segment_ticket != state.completion_timeline_frontier_ready_end
+            || !ticket.is_frontier_ready()
+        {
+            break;
+        }
+        state.completion_timeline_frontier_ready_end += 1;
+    }
+
+    if state.completion_timeline_frontier_ready_end > previous_end {
+        let now = Instant::now();
+        let ready_end = state.completion_timeline_frontier_ready_end;
+        for sample in state
+            .completion_timeline_samples
+            .range_mut((
+                std::ops::Bound::Excluded(previous_end),
+                std::ops::Bound::Included(ready_end),
+            ))
+            .map(|(_, sample)| sample)
+        {
+            sample.prefix_ready_at = Some(now);
+        }
+    }
+}
+
+#[cfg(feature = "bench")]
+fn completion_timeline_duration_ns(start: Option<Instant>, end: Option<Instant>) -> Option<u64> {
+    Some(
+        end?.checked_duration_since(start?)?
+            .as_nanos()
+            .min(u64::MAX as u128) as u64,
+    )
+}
+
+#[cfg(feature = "bench")]
+fn elapsed_ns(started_at: Instant, ended_at: Instant) -> u64 {
+    ended_at
+        .saturating_duration_since(started_at)
+        .as_nanos()
+        .min(u64::MAX as u128) as u64
 }
 
 fn validate_plan(plan: WalV8AdmissionPlan) -> Result<()> {
@@ -2258,6 +2615,37 @@ mod tests {
         assert_eq!(coordinator.frontier_ready_prefix().len(), 2);
         assert_eq!(coordinator.durable_ticket_end(), 0);
         waiter.join().expect("late-digest subscriber panicked");
+        let frontier = coordinator.reserve_frontier(2)?;
+        coordinator.publish_durable_frontier(frontier)?;
+        first_encoded.disarm_after_durable();
+        second_encoded.disarm_after_durable();
+
+        Ok(())
+    }
+
+    #[test]
+    fn out_of_order_data_completion_keeps_durable_frontier_contiguous() -> Result<()> {
+        let coordinator = coordinator(8)?;
+        let first = batch(10);
+        let second = batch(20);
+        let mut first_encoded = admit(&first, &coordinator)?.encode()?;
+        let mut second_encoded = admit(&second, &coordinator)?.encode()?;
+        mark_producer_ready(&mut first_encoded, &coordinator, false)?;
+        mark_producer_ready(&mut second_encoded, &coordinator, false)?;
+
+        coordinator.mark_data_group_complete(1..2)?;
+        assert!(coordinator.frontier_ready_prefix().is_empty());
+        assert_eq!(coordinator.durable_ticket_end(), 0);
+
+        coordinator.mark_data_group_complete(0..1)?;
+        assert_eq!(
+            coordinator
+                .frontier_ready_prefix()
+                .iter()
+                .map(|ticket| ticket.assignment.segment_ticket)
+                .collect::<Vec<_>>(),
+            [0, 1]
+        );
         let frontier = coordinator.reserve_frontier(2)?;
         coordinator.publish_durable_frontier(frontier)?;
         first_encoded.disarm_after_durable();

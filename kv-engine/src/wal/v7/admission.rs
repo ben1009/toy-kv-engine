@@ -520,6 +520,58 @@ impl WalV7ReservationOwner {
         })
     }
 
+    /// Reserve source-spool bytes for an extent allocated ahead of admitted
+    /// WAL frames. The reservation belongs to this image and remains charged
+    /// until durable source cleanup retires the image owner.
+    pub(crate) fn reserve_image_source_spool(
+        &self,
+        bytes: u64,
+    ) -> Result<u64, WalV7ReservationError> {
+        if bytes == 0 {
+            return Err(WalV7ReservationError::EmptyReservation);
+        }
+
+        let mut state = self.state.lock();
+        if state.retired {
+            return Err(WalV7ReservationError::ReservationOwnerRetired);
+        }
+        let reservation = self.ledger.reserve(WalV7ResourceCharge {
+            source_spool_bytes: bytes,
+            ..WalV7ResourceCharge::default()
+        })?;
+        let id = reservation.id;
+        state.reservations.insert(id, reservation);
+
+        Ok(id)
+    }
+
+    /// Transfer source-spool coverage from an unused extent suffix to the
+    /// batch reservation that now occupies it.
+    pub(crate) fn release_image_source_spool(
+        &self,
+        id: u64,
+        bytes: u64,
+    ) -> Result<(), WalV7ReservationError> {
+        if bytes == 0 {
+            return Ok(());
+        }
+
+        let mut state = self.state.lock();
+        let inactive = {
+            let reservation = state
+                .reservations
+                .get_mut(&id)
+                .ok_or(WalV7ReservationError::UnknownReservation)?;
+            self.ledger.release_source_spool_bytes(reservation, bytes)?;
+            !reservation.active
+        };
+        if inactive {
+            state.reservations.remove(&id);
+        }
+
+        Ok(())
+    }
+
     /// Reserve temporary canonicalization memory before the point-operation
     /// index is allocated. The caller drops this token as soon as preparation
     /// has consumed the index.
@@ -1072,6 +1124,56 @@ impl WalV7ResourceLedger {
         }
         state.charged = next;
         reservation.charge = retained;
+
+        Ok(())
+    }
+
+    /// Release source-spool coverage from a retained preallocation window.
+    pub(crate) fn release_source_spool_bytes(
+        &self,
+        reservation: &mut WalV7Reservation,
+        bytes: u64,
+    ) -> Result<(), WalV7ReservationError> {
+        if !Arc::ptr_eq(&reservation.ledger, &self.inner) {
+            return Err(WalV7ReservationError::ForeignReservation);
+        }
+        if bytes == 0 {
+            return Ok(());
+        }
+
+        let mut state = self.inner.state.lock();
+        let issued_charge = state
+            .reservations
+            .get(&reservation.id)
+            .copied()
+            .ok_or(WalV7ReservationError::UnknownReservation)?;
+        if issued_charge != reservation.charge {
+            return Err(WalV7ReservationError::ReservationMismatch);
+        }
+        let retired = WalV7ResourceCharge {
+            source_spool_bytes: bytes,
+            ..WalV7ResourceCharge::default()
+        };
+        let retained = issued_charge
+            .checked_sub(retired)
+            .ok_or(WalV7ReservationError::AccountingUnderflow)?;
+        let next = state
+            .charged
+            .checked_sub(retired)
+            .ok_or(WalV7ReservationError::AccountingUnderflow)?;
+
+        if retained.is_empty() {
+            state.reservations.remove(&reservation.id);
+            reservation.active = false;
+        } else {
+            state.reservations.insert(reservation.id, retained);
+        }
+        state.charged = next;
+        reservation.charge = retained;
+        state.source_spool_generation = state.source_spool_generation.wrapping_add(1);
+        drop(state);
+        self.inner.source_spool_changed.notify_all();
+        self.inner.async_source_spool_changed.notify_waiters();
 
         Ok(())
     }

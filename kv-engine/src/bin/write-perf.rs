@@ -17,6 +17,11 @@ use wrapper::kv_engine_wrapper;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use clap::{Parser, ValueEnum};
+#[cfg(feature = "bench")]
+use kv_engine_wrapper::wal::{
+    WalExtentPreparationDiagnostics, WalExtentPreparationMode, WalIoDiagnostics,
+    WalIoHandleMetadata, WalV8SlidingExtentPreparationDiagnostics,
+};
 use kv_engine_wrapper::{
     BackupOptions, CreateBackupOutcome, EnablePitrOutcome, MAX_STATUS_PAGE_SIZE,
     PersistedPitrConfig, PitrOptions, PitrResumeOutcome, PitrRuntimeOptions, PitrStatus,
@@ -51,6 +56,9 @@ const ENGINE_NAME: &str = "kv-engine";
 const STEADY_STATE_SEED_VERSION: &str = "splitmix64-v2";
 const STEADY_STATE_OPERATION_STREAM_LABEL: u64 = 0x0180_0001;
 const STEADY_STATE_KEY_STREAM_LABEL: u64 = 0x0180_0002;
+const WAL_V8_EXTENT_PREPARATION_ENV: &str = "TOYKV_BENCH_V8_EXTENT_PREP";
+const WAL_V8_EXTENT_PREPARATION_BYTES_ENV: &str = "TOYKV_BENCH_V8_EXTENT_PREP_BYTES";
+const WAL_V8_EXTENT_PREPARATION_CHUNK_BYTES: u64 = 128 * 1024;
 const STEADY_STATE_VALUE_STREAM_LABEL: u64 = 0x0180_0003;
 const STEADY_STATE_WARMUP_STREAM_LABEL: u64 = 0x0180_0010;
 const STEADY_STATE_MEASUREMENT_STREAM_LABEL: u64 = 0x0180_0011;
@@ -277,6 +285,18 @@ struct Args {
     /// Select the WAL scheduler for WAL comparisons (parallel by default; v6 PITR uses Leader).
     #[arg(long, value_enum)]
     wal_io_mode: Option<WalIoModeArg>,
+    /// Capture per-sync V8 durability timing without enabling broad profiling.
+    /// Requires a bench build and PITR V8 (the default when `--pitr` is used).
+    #[arg(long, requires = "pitr")]
+    wal_sync_diagnostics: bool,
+    /// Capture V8 submission, digest, and durable-prefix ordering HOL waits.
+    /// Requires a bench build with PITR V8 Parallel I/O.
+    #[arg(long, requires = "pitr")]
+    wal_hol_diagnostics: bool,
+    /// Sample V8 DATA requests across CQE observation, reaper, ready-prefix, and durability
+    /// stages. Requires a bench build with PITR V8 Parallel I/O.
+    #[arg(long, requires = "pitr")]
+    wal_completion_timeline: bool,
     #[arg(long)]
     vlog: bool,
     #[arg(long)]
@@ -357,6 +377,9 @@ struct HarnessConfig {
     wal_override: Option<bool>,
     wal_io_mode: WalIoModeArg,
     wal_io_mode_explicit: bool,
+    wal_sync_diagnostics: bool,
+    wal_hol_diagnostics: bool,
+    wal_completion_timeline: bool,
     vlog_override: bool,
     profile: bool,
     pitr: bool,
@@ -471,6 +494,9 @@ impl HarnessConfig {
             wal_override,
             wal_io_mode,
             wal_io_mode_explicit,
+            wal_sync_diagnostics: args.wal_sync_diagnostics,
+            wal_hol_diagnostics: args.wal_hol_diagnostics,
+            wal_completion_timeline: args.wal_completion_timeline,
             vlog_override: args.vlog,
             profile: args.profile,
             pitr: args.pitr,
@@ -1046,6 +1072,29 @@ struct WalSyncObservationRecord {
     write_cqes_completed: u64,
     groups_completed: u64,
     groups_covered: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tickets_covered: Option<u64>,
+    frontier_write_ns: u64,
+    fdatasync_ns: u64,
+    durability_io_ns: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data_completion_to_frontier_start_ns: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    coalescing_budget_us: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    coalescing_waited: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    coalescing_wait_ns: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ready_tickets_before_coalescing: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ready_tickets_after_coalescing: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ready_tickets_gained_during_coalescing: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    admitted_tickets_before_coalescing: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    admitted_tickets_after_coalescing: Option<u64>,
     duration_ns: u64,
     succeeded: bool,
 }
@@ -1056,6 +1105,20 @@ struct WalPipelineRecord {
     commit_solo_groups: u64,
     commit_buffers: u64,
     commit_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    v8_data_submit_order: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    v8_hol_diagnostics_enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    v8_completion_timeline: Option<WalV8CompletionTimelineRunRecord>,
+    v8_data_submit_hol_episodes: u64,
+    v8_data_submit_hol_wait_ns: u64,
+    v8_data_submit_hol_successor_ticket_wait_ns: u64,
+    v8_data_submit_hol_max_successors: u64,
+    v8_digest_order_hol_tickets: u64,
+    v8_digest_order_hol_wait_ns: u64,
+    v8_data_completion_hol_tickets: u64,
+    v8_data_completion_hol_wait_ns: u64,
     cqe_count: u64,
     inflight_groups_max: u64,
     outstanding_write_sqes_max: u64,
@@ -1079,6 +1142,216 @@ struct WalPipelineRecord {
     wal_allocated_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     sync_observations: Option<Vec<WalSyncObservationRecord>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wal_io_start: Option<WalIoDiagnosticsRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wal_io_end: Option<WalIoDiagnosticsRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wal_io_stable: Option<bool>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+struct WalV8CompletionTimelineRunRecord {
+    sample_every: u64,
+    dropped_samples: u64,
+    samples: Vec<WalV8CompletionTimelineRecord>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
+struct WalV8CompletionTimelineRecord {
+    group_id: u64,
+    ticket_start: u64,
+    ticket_end: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    worker_tid: Option<u64>,
+    request_id: u64,
+    request_start: u64,
+    request_end: u64,
+    submit_to_cqe_observed_ns: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cqe_observed_monotonic_ns: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    group_finished_monotonic_ns: Option<u64>,
+    cqe_observed_to_group_finished_ns: u64,
+    group_finished_to_result_send_start_ns: u64,
+    result_send_start_to_reaper_recv_ns: u64,
+    reaper_recv_to_prefix_ready_ns: u64,
+    prefix_ready_to_durable_ns: u64,
+}
+
+#[cfg(feature = "bench")]
+impl From<kv_engine_wrapper::mem_table::WalV8CompletionTimelineObservation>
+    for WalV8CompletionTimelineRecord
+{
+    fn from(observation: kv_engine_wrapper::mem_table::WalV8CompletionTimelineObservation) -> Self {
+        Self {
+            group_id: observation.group_id,
+            ticket_start: observation.ticket_start,
+            ticket_end: observation.ticket_end,
+            worker_tid: observation.worker_tid,
+            request_id: observation.request_id,
+            request_start: observation.request_start,
+            request_end: observation.request_end,
+            submit_to_cqe_observed_ns: observation.submit_to_cqe_observed_ns,
+            cqe_observed_monotonic_ns: observation.cqe_observed_monotonic_ns,
+            group_finished_monotonic_ns: observation.group_finished_monotonic_ns,
+            cqe_observed_to_group_finished_ns: observation.cqe_observed_to_group_finished_ns,
+            group_finished_to_result_send_start_ns: observation
+                .group_finished_to_result_send_start_ns,
+            result_send_start_to_reaper_recv_ns: observation.result_send_start_to_reaper_recv_ns,
+            reaper_recv_to_prefix_ready_ns: observation.reaper_recv_to_prefix_ready_ns,
+            prefix_ready_to_durable_ns: observation.prefix_ready_to_durable_ns,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+struct WalIoHandleRecord {
+    o_direct: Option<bool>,
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(feature = "bench")]
+impl From<WalIoHandleMetadata> for WalIoHandleRecord {
+    fn from(metadata: WalIoHandleMetadata) -> Self {
+        Self {
+            o_direct: metadata.o_direct,
+            device: metadata.device,
+            inode: metadata.inode,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+struct WalIoDiagnosticsRecord {
+    data: WalIoHandleRecord,
+    frontier: WalIoHandleRecord,
+    sync: WalIoHandleRecord,
+    extent_preparation: Option<WalExtentPreparationRecord>,
+    sliding_extent_preparation: Option<WalV8SlidingExtentPreparationRecord>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+struct WalExtentPreparationRecord {
+    mode: &'static str,
+    start_offset: u64,
+    end_offset: u64,
+    allocated_bytes: u64,
+    initialized_bytes: u64,
+    elapsed_ns: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+struct WalV8SlidingExtentPreparationRecord {
+    mode: &'static str,
+    start_offset: u64,
+    max_file_size: u64,
+    window_bytes: u64,
+    initialization_chunk_bytes: u64,
+    prepared_end: u64,
+    allocated_end: u64,
+    fallocate_calls: u64,
+    allocated_bytes: u64,
+    initialization_chunks: u64,
+    initialized_bytes: u64,
+    elapsed_ns: u64,
+    fallocate_elapsed_ns: u64,
+    initialization_elapsed_ns: u64,
+    wait_calls: u64,
+    wait_ns: u64,
+}
+
+#[cfg(feature = "bench")]
+impl WalV8SlidingExtentPreparationRecord {
+    fn same_configuration(&self, other: &Self) -> bool {
+        self.mode == other.mode
+            && self.start_offset == other.start_offset
+            && self.max_file_size == other.max_file_size
+            && self.window_bytes == other.window_bytes
+            && self.initialization_chunk_bytes == other.initialization_chunk_bytes
+    }
+}
+
+#[cfg(feature = "bench")]
+impl From<WalExtentPreparationDiagnostics> for WalExtentPreparationRecord {
+    fn from(diagnostics: WalExtentPreparationDiagnostics) -> Self {
+        Self {
+            mode: match diagnostics.mode {
+                WalExtentPreparationMode::Fallocate => "fallocate",
+                WalExtentPreparationMode::Initialize => "initialize",
+                WalExtentPreparationMode::SlidingFallocate => "sliding-fallocate",
+                WalExtentPreparationMode::SlidingInitialize => "sliding-initialize",
+            },
+            start_offset: diagnostics.start_offset,
+            end_offset: diagnostics.end_offset,
+            allocated_bytes: diagnostics.allocated_bytes,
+            initialized_bytes: diagnostics.initialized_bytes,
+            elapsed_ns: diagnostics.elapsed_ns,
+        }
+    }
+}
+
+#[cfg(feature = "bench")]
+impl From<WalV8SlidingExtentPreparationDiagnostics> for WalV8SlidingExtentPreparationRecord {
+    fn from(diagnostics: WalV8SlidingExtentPreparationDiagnostics) -> Self {
+        Self {
+            mode: match diagnostics.mode {
+                WalExtentPreparationMode::Fallocate => "fallocate",
+                WalExtentPreparationMode::Initialize => "initialize",
+                WalExtentPreparationMode::SlidingFallocate => "sliding-fallocate",
+                WalExtentPreparationMode::SlidingInitialize => "sliding-initialize",
+            },
+            start_offset: diagnostics.start_offset,
+            max_file_size: diagnostics.max_file_size,
+            window_bytes: diagnostics.window_bytes,
+            initialization_chunk_bytes: diagnostics.initialization_chunk_bytes,
+            prepared_end: diagnostics.prepared_end,
+            allocated_end: diagnostics.allocated_end,
+            fallocate_calls: diagnostics.fallocate_calls,
+            allocated_bytes: diagnostics.allocated_bytes,
+            initialization_chunks: diagnostics.initialization_chunks,
+            initialized_bytes: diagnostics.initialized_bytes,
+            elapsed_ns: diagnostics.elapsed_ns,
+            fallocate_elapsed_ns: diagnostics.fallocate_elapsed_ns,
+            initialization_elapsed_ns: diagnostics.initialization_elapsed_ns,
+            wait_calls: diagnostics.wait_calls,
+            wait_ns: diagnostics.wait_ns,
+        }
+    }
+}
+
+#[cfg(feature = "bench")]
+impl From<WalIoDiagnostics> for WalIoDiagnosticsRecord {
+    fn from(diagnostics: WalIoDiagnostics) -> Self {
+        Self {
+            data: diagnostics.data.into(),
+            frontier: diagnostics.frontier.into(),
+            sync: diagnostics.sync.into(),
+            extent_preparation: diagnostics.extent_preparation.map(Into::into),
+            sliding_extent_preparation: diagnostics.sliding_extent_preparation.map(Into::into),
+        }
+    }
+}
+
+#[cfg(feature = "bench")]
+impl WalIoDiagnosticsRecord {
+    fn stable_with(&self, other: &Self) -> bool {
+        let sliding_configuration_stable = match (
+            &self.sliding_extent_preparation,
+            &other.sliding_extent_preparation,
+        ) {
+            (Some(start), Some(end)) => start.same_configuration(end),
+            (None, None) => true,
+            _ => false,
+        };
+
+        self.data == other.data
+            && self.frontier == other.frontier
+            && self.sync == other.sync
+            && self.extent_preparation == other.extent_preparation
+            && sliding_configuration_stable
+    }
 }
 
 /// V8 CPU times are raw sums from sampled tickets, not extrapolated totals.
@@ -1143,6 +1416,22 @@ impl From<kv_engine_wrapper::mem_table::WalSyncObservation> for WalSyncObservati
             write_cqes_completed: observation.write_cqes_completed,
             groups_completed: observation.groups_completed,
             groups_covered: observation.groups_covered,
+            tickets_covered: observation.tickets_covered,
+            frontier_write_ns: observation.frontier_write_ns,
+            fdatasync_ns: observation.duration_ns,
+            durability_io_ns: observation
+                .frontier_write_ns
+                .saturating_add(observation.duration_ns),
+            data_completion_to_frontier_start_ns: observation.data_completion_to_frontier_start_ns,
+            coalescing_budget_us: observation.coalescing_budget_us,
+            coalescing_waited: observation.coalescing_waited,
+            coalescing_wait_ns: observation.coalescing_wait_ns,
+            ready_tickets_before_coalescing: observation.ready_tickets_before_coalescing,
+            ready_tickets_after_coalescing: observation.ready_tickets_after_coalescing,
+            ready_tickets_gained_during_coalescing: observation
+                .ready_tickets_gained_during_coalescing,
+            admitted_tickets_before_coalescing: observation.admitted_tickets_before_coalescing,
+            admitted_tickets_after_coalescing: observation.admitted_tickets_after_coalescing,
             duration_ns: observation.duration_ns,
             succeeded: observation.succeeded,
         }
@@ -1153,7 +1442,10 @@ impl From<kv_engine_wrapper::mem_table::WalSyncObservation> for WalSyncObservati
 fn wal_pipeline_record(
     engine: &KvEngine,
     detailed: bool,
+    hol_diagnostics_enabled: bool,
+    completion_timeline_enabled: bool,
     wal_run_info: WalRunInfo,
+    wal_io_start: Option<WalIoDiagnosticsRecord>,
 ) -> Result<Option<WalPipelineRecord>> {
     if !wal_run_info.runtime_counters_available() {
         return Ok(None);
@@ -1161,6 +1453,13 @@ fn wal_pipeline_record(
 
     let profile = engine.write_profile();
     let (wal_file_length_bytes, wal_allocated_bytes) = engine.benchmark_wal_file_usage()?;
+    let wal_io_end = engine
+        .benchmark_wal_io_diagnostics()
+        .map(WalIoDiagnosticsRecord::from);
+    let wal_io_stable = wal_io_start
+        .as_ref()
+        .zip(wal_io_end.as_ref())
+        .map(|(start, end)| start.stable_with(end));
     let sync_observations = detailed.then(|| {
         engine
             .write_profile_sync_observations()
@@ -1168,12 +1467,45 @@ fn wal_pipeline_record(
             .map(WalSyncObservationRecord::from)
             .collect()
     });
+    let v8_completion_timeline =
+        completion_timeline_enabled.then(|| WalV8CompletionTimelineRunRecord {
+            sample_every: profile
+                .wal_v8_completion_timeline_sample_every
+                .unwrap_or_default(),
+            dropped_samples: engine.wal_v8_completion_timeline_dropped_samples(),
+            samples: engine
+                .wal_v8_completion_timeline_observations()
+                .into_iter()
+                .map(WalV8CompletionTimelineRecord::from)
+                .collect(),
+        });
 
     Ok(Some(WalPipelineRecord {
         commit_groups: profile.wal_commit_groups,
         commit_solo_groups: profile.wal_commit_solo_groups,
         commit_buffers: profile.wal_commit_buffers,
         commit_bytes: profile.wal_commit_bytes,
+        v8_data_submit_order: (wal_run_info.format_version == 8
+            && wal_run_info.io_mode == "parallel")
+            .then(
+                || match std::env::var("TOYKV_BENCH_V8_DATA_SUBMIT_ORDER").as_deref() {
+                    Ok("ready") => "any_ready_ticket",
+                    _ => "ticket_prefix",
+                },
+            ),
+        v8_hol_diagnostics_enabled: (wal_run_info.format_version == 8
+            && wal_run_info.io_mode == "parallel")
+            .then_some(hol_diagnostics_enabled),
+        v8_completion_timeline,
+        v8_data_submit_hol_episodes: profile.wal_v8_data_submit_hol_episodes,
+        v8_data_submit_hol_wait_ns: profile.wal_v8_data_submit_hol_wait_ns,
+        v8_data_submit_hol_successor_ticket_wait_ns: profile
+            .wal_v8_data_submit_hol_successor_ticket_wait_ns,
+        v8_data_submit_hol_max_successors: profile.wal_v8_data_submit_hol_max_successors,
+        v8_digest_order_hol_tickets: profile.wal_v8_digest_order_hol_tickets,
+        v8_digest_order_hol_wait_ns: profile.wal_v8_digest_order_hol_wait_ns,
+        v8_data_completion_hol_tickets: profile.wal_v8_data_completion_hol_tickets,
+        v8_data_completion_hol_wait_ns: profile.wal_v8_data_completion_hol_wait_ns,
         cqe_count: profile.wal_cqe_count,
         inflight_groups_max: profile.wal_inflight_groups_max,
         outstanding_write_sqes_max: profile.wal_outstanding_write_sqes_max,
@@ -1194,6 +1526,9 @@ fn wal_pipeline_record(
         wal_file_length_bytes,
         wal_allocated_bytes,
         sync_observations,
+        wal_io_start,
+        wal_io_end,
+        wal_io_stable,
     }))
 }
 
@@ -1235,6 +1570,601 @@ fn process_cpu_delta(
             Some((end.system_ms - start.system_ms).max(0.0)),
         ),
         _ => (None, None),
+    }
+}
+
+#[cfg(all(feature = "bench", target_os = "linux"))]
+mod bench_cpu_affinity {
+    use std::{fs, io, path::PathBuf};
+
+    use super::{Arc, KvEngine};
+    use anyhow::{Context, Result, anyhow, ensure};
+    use serde::Serialize;
+
+    const MODE_ENV: &str = "TOYKV_BENCH_AFFINITY_MODE";
+    const REPORT_ENV: &str = "TOYKV_BENCH_AFFINITY_REPORT";
+    const TOPOLOGY_ENV: &str = "TOYKV_BENCH_AFFINITY_TOPOLOGY";
+    const IOWQ_AFFINITY_ENV: &str = "TOYKV_BENCH_IOWQ_AFFINITY";
+    const WAL_IO_WORKER_CPU_ENV: &str = "TOYKV_BENCH_WAL_IO_WORKER_CPU";
+    const IO_WQ_INITIAL_WARMUP_PUTS: usize = 32_768;
+
+    #[derive(Clone, Debug, Serialize)]
+    pub struct ThreadPlacement {
+        tid: libc::pid_t,
+        name: String,
+        allowed_cpus: Vec<usize>,
+    }
+
+    #[derive(Clone, Debug, Serialize)]
+    struct WalHelperPlacement {
+        tid: libc::pid_t,
+        name: String,
+        cpu: usize,
+    }
+
+    #[derive(Serialize)]
+    pub struct WriterPlacement {
+        writer_index: usize,
+        tid: libc::pid_t,
+        pinned_cpu: Option<usize>,
+        allowed_cpus: Vec<usize>,
+    }
+
+    pub struct Capture {
+        mode: String,
+        format_version: u16,
+        writer_count: usize,
+        warmup_puts: usize,
+        io_wq_worker_count_after_warmup: usize,
+        report_path: PathBuf,
+        topology: Vec<Vec<usize>>,
+        writer_cpus: Vec<usize>,
+        helper_cpus: Vec<usize>,
+        io_worker_cpu_after_warmup: Option<usize>,
+        iowq_affinity: String,
+        expected_iowq_cpus: Vec<usize>,
+        before: Vec<ThreadPlacement>,
+        after_pinning: Vec<ThreadPlacement>,
+        wal_helpers: Vec<WalHelperPlacement>,
+    }
+
+    impl Capture {
+        pub fn new(
+            engine: &Arc<KvEngine>,
+            value: &[u8],
+            pitr: bool,
+            format_version: u16,
+            writer_count: usize,
+            workload_puts: usize,
+        ) -> Result<Option<Self>> {
+            let Ok(mode) = std::env::var(MODE_ENV) else {
+                return Ok(None);
+            };
+            ensure!(
+                matches!(mode.as_str(), "none" | "wal" | "wal_writers"),
+                "{MODE_ENV} must be none, wal, or wal_writers"
+            );
+            ensure!(
+                matches!(format_version, 7 | 8),
+                "CPU affinity experiment supports only V7/V8 PITR WAL"
+            );
+            let report_path = std::env::var_os(REPORT_ENV)
+                .map(PathBuf::from)
+                .with_context(|| format!("{REPORT_ENV} is required for CPU affinity capture"))?;
+            let topology = parse_topology()?;
+            ensure!(
+                topology.len() == 8 && topology.iter().all(|siblings| siblings.len() == 2),
+                "the C4 affinity experiment expects 8 cores with 2 SMT siblings each"
+            );
+            ensure!(
+                (writer_count == 8 || writer_count == 16)
+                    && topology.iter().map(Vec::len).sum::<usize>() == 16,
+                "the C4 affinity experiment supports 8 or 16 writers on 16 logical CPUs"
+            );
+            let allowed_cpus = read_thread(current_tid())?.allowed_cpus;
+            ensure!(
+                topology
+                    .iter()
+                    .flatten()
+                    .all(|cpu| allowed_cpus.contains(cpu)),
+                "the supplied topology includes CPUs outside the process affinity mask"
+            );
+            let iowq_affinity = std::env::var(IOWQ_AFFINITY_ENV).with_context(|| {
+                format!("{IOWQ_AFFINITY_ENV} is required for CPU affinity capture")
+            })?;
+            let expected_iowq_cpus = parse_iowq_cpus(&iowq_affinity, &allowed_cpus)?;
+            for siblings in &topology {
+                let actual = parse_linux_cpu_list(&fs::read_to_string(format!(
+                    "/sys/devices/system/cpu/cpu{}/topology/thread_siblings_list",
+                    siblings[0]
+                ))?)?;
+                ensure!(
+                    actual == *siblings,
+                    "{TOPOLOGY_ENV} does not match Linux sibling topology for CPU {}",
+                    siblings[0]
+                );
+            }
+            let helper_cpus = if mode == "none" {
+                Vec::new()
+            } else {
+                topology
+                    .iter()
+                    .take(5)
+                    .map(|siblings| siblings[1])
+                    .collect()
+            };
+            let io_worker_cpu_after_warmup = std::env::var(WAL_IO_WORKER_CPU_ENV)
+                .ok()
+                .filter(|value| !value.is_empty())
+                .map(|value| {
+                    value.parse::<usize>().with_context(|| {
+                        format!("invalid CPU in {WAL_IO_WORKER_CPU_ENV}={value:?}")
+                    })
+                })
+                .transpose()?;
+            if mode == "none" {
+                ensure!(
+                    io_worker_cpu_after_warmup.is_none(),
+                    "{WAL_IO_WORKER_CPU_ENV} must be empty when {MODE_ENV}=none"
+                );
+            } else {
+                ensure!(
+                    helper_cpus.first() == io_worker_cpu_after_warmup.as_ref(),
+                    "{WAL_IO_WORKER_CPU_ENV} must match the WAL I/O worker's requested CPU"
+                );
+            }
+            let writer_cpus = if mode == "wal_writers" {
+                if writer_count == 8 {
+                    topology.iter().map(|siblings| siblings[0]).collect()
+                } else {
+                    topology.iter().flatten().copied().collect()
+                }
+            } else {
+                Vec::new()
+            };
+
+            let warmup_puts = workload_puts.min(IO_WQ_INITIAL_WARMUP_PUTS);
+            warmup_io_wq(engine, value, writer_count, 0, warmup_puts, pitr)?;
+            let io_wq_worker_count_after_warmup = count_io_wq_workers()?;
+            ensure!(
+                io_wq_worker_count_after_warmup > 0,
+                "io-wq warmup created no workers after {warmup_puts} puts"
+            );
+            engine.reset_write_profile();
+
+            let before = thread_snapshot()?;
+            let wal_helpers = if mode == "none" {
+                Vec::new()
+            } else {
+                pin_wal_helpers(&before, &helper_cpus, format_version)?
+            };
+            let after_pinning = thread_snapshot()?;
+
+            Ok(Some(Self {
+                mode,
+                format_version,
+                writer_count,
+                warmup_puts,
+                io_wq_worker_count_after_warmup,
+                report_path,
+                topology,
+                writer_cpus,
+                helper_cpus,
+                io_worker_cpu_after_warmup,
+                iowq_affinity,
+                expected_iowq_cpus,
+                before,
+                after_pinning,
+                wal_helpers,
+            }))
+        }
+
+        pub fn writer_cpu(&self, writer_index: usize) -> Option<usize> {
+            self.writer_cpus.get(writer_index).copied()
+        }
+
+        pub fn finish(self, mut writers: Vec<WriterPlacement>) -> Result<()> {
+            ensure!(
+                writers.len() == self.writer_count,
+                "captured {} writer masks, expected {}",
+                writers.len(),
+                self.writer_count
+            );
+            writers.sort_by_key(|writer| writer.writer_index);
+            ensure!(
+                writers
+                    .iter()
+                    .enumerate()
+                    .all(|(index, writer)| writer.writer_index == index),
+                "writer placement indices are not a complete sequence"
+            );
+            let after = thread_snapshot()?;
+            let after_wal_helpers = after
+                .iter()
+                .filter(|thread| thread.name.starts_with("wal-"))
+                .collect::<Vec<_>>();
+            if self.mode != "none" {
+                ensure!(
+                    after_wal_helpers.len() == self.wal_helpers.len(),
+                    "persistent WAL helper thread set changed during the measured workload"
+                );
+            }
+            for helper in &self.wal_helpers {
+                ensure!(
+                    after.iter().any(|thread| {
+                        thread.tid == helper.tid && thread.allowed_cpus == [helper.cpu]
+                    }),
+                    "WAL helper {} (TID {}) no longer has its requested CPU mask",
+                    helper.name,
+                    helper.tid
+                );
+            }
+            let io_uring_workers_after_pinning = self
+                .after_pinning
+                .iter()
+                .filter(|thread| thread.name.starts_with("iou-wrk-"))
+                .collect::<Vec<_>>();
+            ensure!(
+                !io_uring_workers_after_pinning.is_empty(),
+                "no live io_uring workers were available to verify affinity after warmup"
+            );
+            ensure!(
+                io_uring_workers_after_pinning
+                    .iter()
+                    .all(|thread| thread.allowed_cpus == self.expected_iowq_cpus),
+                "post-warmup io_uring worker masks do not match requested {IOWQ_AFFINITY_ENV}={:?}: {io_uring_workers_after_pinning:?}",
+                self.iowq_affinity,
+            );
+            let io_uring_workers_after = after
+                .iter()
+                .filter(|thread| thread.name.starts_with("iou-wrk-"))
+                .collect::<Vec<_>>();
+            let io_uring_worker_count_after = io_uring_workers_after.len();
+            ensure!(
+                io_uring_workers_after
+                    .iter()
+                    .all(|thread| thread.allowed_cpus == self.expected_iowq_cpus),
+                "io_uring worker masks do not match requested {IOWQ_AFFINITY_ENV}={:?}: {io_uring_workers_after:?}",
+                self.iowq_affinity,
+            );
+            if self.mode == "wal_writers" {
+                ensure!(
+                    writers.iter().all(|writer| {
+                        writer.pinned_cpu.is_some_and(|cpu| {
+                            self.writer_cpus.get(writer.writer_index) == Some(&cpu)
+                                && writer.allowed_cpus == [cpu]
+                        })
+                    }),
+                    "writer CPU masks do not match the requested placement"
+                );
+            }
+            let report = serde_json::json!({
+                "mode": self.mode,
+                "format_version": self.format_version,
+                "writer_count": self.writer_count,
+                "warmup_puts": self.warmup_puts,
+                "io_wq_worker_count_after_warmup": self.io_wq_worker_count_after_warmup,
+                "cpu_topology_siblings": self.topology,
+                "writer_cpus": self.writer_cpus,
+                "wal_helper_cpus": self.helper_cpus,
+                "wal_io_worker_cpu_after_io_wq_warmup": self.io_worker_cpu_after_warmup,
+                "wal_helpers": self.wal_helpers,
+                "io_wq_affinity": self.iowq_affinity,
+                "expected_io_wq_cpus": self.expected_iowq_cpus,
+                "threads_before": self.before,
+                "threads_after_pinning": self.after_pinning,
+                "io_uring_workers_after_pinning": io_uring_workers_after_pinning,
+                "io_uring_workers_after": io_uring_workers_after,
+                "writers": writers,
+                "threads_after_workload": after,
+                "io_uring_worker_count_after": io_uring_worker_count_after,
+            });
+            fs::write(&self.report_path, serde_json::to_vec_pretty(&report)?)?;
+            Ok(())
+        }
+    }
+
+    pub fn place_writer(writer_index: usize, cpu: Option<usize>) -> Result<WriterPlacement> {
+        if let Some(cpu) = cpu {
+            set_affinity(0, cpu)?;
+        }
+        let tid = current_tid();
+        let thread = read_thread(tid)?;
+        Ok(WriterPlacement {
+            writer_index,
+            tid,
+            pinned_cpu: cpu,
+            allowed_cpus: thread.allowed_cpus,
+        })
+    }
+
+    fn warmup_io_wq(
+        engine: &Arc<KvEngine>,
+        value: &[u8],
+        writer_count: usize,
+        base_index: usize,
+        warmup_puts: usize,
+        pitr: bool,
+    ) -> Result<()> {
+        ensure!(
+            writer_count > 0,
+            "io-wq warmup requires at least one writer"
+        );
+        if warmup_puts == 0 {
+            return Ok(());
+        }
+        let warmup_thread_count = writer_count.saturating_mul(2).min(warmup_puts);
+        let per_thread = warmup_puts / warmup_thread_count;
+        let remainder = warmup_puts % warmup_thread_count;
+        let start_barrier = Arc::new(std::sync::Barrier::new(warmup_thread_count + 1));
+        let mut handles = Vec::with_capacity(warmup_thread_count);
+        for writer_index in 0..warmup_thread_count {
+            let engine = Arc::clone(engine);
+            let value = value.to_vec();
+            let thread_ops = per_thread + usize::from(writer_index < remainder);
+            let start_index = base_index + writer_index * per_thread + remainder.min(writer_index);
+            let start_barrier = Arc::clone(&start_barrier);
+            handles.push(std::thread::spawn(move || -> Result<()> {
+                start_barrier.wait();
+                for index in start_index..start_index + thread_ops {
+                    let key = format!("affinity-warmup-{index:08}");
+                    super::with_pitr_admission_retry(pitr, || engine.put(key.as_bytes(), &value))?;
+                }
+
+                Ok(())
+            }));
+        }
+        start_barrier.wait();
+
+        let mut first_error = None;
+        for handle in handles {
+            match handle.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    first_error.get_or_insert(error);
+                }
+                Err(_) => {
+                    first_error.get_or_insert_with(|| anyhow!("io-wq warmup thread panicked"));
+                }
+            }
+        }
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+
+        Ok(())
+    }
+
+    fn count_io_wq_workers() -> Result<usize> {
+        Ok(thread_snapshot()?
+            .iter()
+            .filter(|thread| thread.name.starts_with("iou-wrk-"))
+            .count())
+    }
+
+    fn pin_wal_helpers(
+        threads: &[ThreadPlacement],
+        cpus: &[usize],
+        format_version: u16,
+    ) -> Result<Vec<WalHelperPlacement>> {
+        let mut helpers = Vec::new();
+        for thread in threads
+            .iter()
+            .filter(|thread| thread.name.starts_with("wal-"))
+        {
+            let Some((role, cpu_index)) = wal_role(&thread.name) else {
+                anyhow::bail!("unrecognized persistent WAL thread name {:?}", thread.name);
+            };
+            let cpu = *cpus
+                .get(cpu_index)
+                .with_context(|| format!("missing CPU assignment for WAL role {role}"))?;
+            ensure!(
+                thread.allowed_cpus.contains(&cpu),
+                "WAL role {role} cannot be pinned to unavailable CPU {cpu}"
+            );
+            set_affinity(thread.tid, cpu)?;
+            helpers.push(WalHelperPlacement {
+                tid: thread.tid,
+                name: thread.name.clone(),
+                cpu,
+            });
+        }
+
+        let has_role = |prefix: &str| helpers.iter().any(|helper| helper.name.starts_with(prefix));
+        ensure!(has_role("wal-io-worker"), "WAL I/O worker was not found");
+        if format_version == 7 {
+            ensure!(
+                has_role("wal-sync-coord") && has_role("wal-ordered-pa"),
+                "V7 sync coordinator or ordered packer was not found"
+            );
+        } else {
+            ensure!(
+                has_role("wal-v8-completi"),
+                "V8 completion reaper was not found"
+            );
+        }
+        Ok(helpers)
+    }
+
+    fn wal_role(name: &str) -> Option<(&'static str, usize)> {
+        if name.starts_with("wal-io-worker") {
+            Some(("io-worker", 0))
+        } else if name.starts_with("wal-sync-coord") {
+            Some(("sync-coordinator", 1))
+        } else if name.starts_with("wal-v8-completi") {
+            Some(("v8-completion-reaper", 1))
+        } else if name.starts_with("wal-ordered-pa") {
+            Some(("ordered-packer", 2))
+        } else if name.starts_with("wal-v7-extent-i") {
+            Some(("v7-extent-initializer", 3))
+        } else if name.starts_with("wal-extent-init") {
+            Some(("extent-initializer", 4))
+        } else {
+            None
+        }
+    }
+
+    fn parse_topology() -> Result<Vec<Vec<usize>>> {
+        let value = std::env::var(TOPOLOGY_ENV)
+            .with_context(|| format!("{TOPOLOGY_ENV} is required for CPU affinity capture"))?;
+        let topology = value
+            .split(';')
+            .map(|core| {
+                let mut siblings = core
+                    .split(',')
+                    .map(|cpu| {
+                        cpu.parse::<usize>()
+                            .with_context(|| format!("invalid CPU in {TOPOLOGY_ENV}"))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                siblings.sort_unstable();
+                ensure!(
+                    siblings.len() == 2 && siblings[0] != siblings[1],
+                    "each {TOPOLOGY_ENV} core group must contain two unique siblings"
+                );
+                ensure!(
+                    siblings.iter().all(|cpu| *cpu < libc::CPU_SETSIZE as usize),
+                    "{TOPOLOGY_ENV} contains a CPU ID outside cpu_set_t"
+                );
+                Ok(siblings)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let all_cpus = topology
+            .iter()
+            .flatten()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+        ensure!(
+            all_cpus.len() == topology.len() * 2,
+            "{TOPOLOGY_ENV} must not repeat a logical CPU"
+        );
+        Ok(topology)
+    }
+
+    fn parse_iowq_cpus(value: &str, allowed_cpus: &[usize]) -> Result<Vec<usize>> {
+        if value == "all" {
+            return Ok(allowed_cpus.to_vec());
+        }
+
+        let cpu_list = value
+            .strip_prefix("cpu:")
+            .or_else(|| value.strip_prefix("cpus:"))
+            .with_context(|| {
+                format!("{IOWQ_AFFINITY_ENV} must be 'all', 'cpu:<id>', or 'cpus:<id>,<id>'")
+            })?;
+        let mut cpus = cpu_list
+            .split(',')
+            .map(|cpu| {
+                let cpu = cpu
+                    .parse::<usize>()
+                    .with_context(|| format!("invalid CPU in {IOWQ_AFFINITY_ENV}={value:?}"))?;
+                ensure!(
+                    cpu < libc::CPU_SETSIZE as usize,
+                    "io-wq CPU {cpu} exceeds cpu_set_t"
+                );
+                ensure!(
+                    allowed_cpus.contains(&cpu),
+                    "io-wq CPU {cpu} is outside the process affinity mask"
+                );
+                Ok(cpu)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        cpus.sort_unstable();
+        ensure!(
+            !cpus.is_empty(),
+            "io-wq affinity CPU list must not be empty"
+        );
+        ensure!(
+            cpus.windows(2).all(|pair| pair[0] != pair[1]),
+            "io-wq affinity CPU list must not contain duplicates"
+        );
+        Ok(cpus)
+    }
+
+    fn set_affinity(tid: libc::pid_t, cpu: usize) -> Result<()> {
+        ensure!(
+            cpu < libc::CPU_SETSIZE as usize,
+            "CPU {cpu} exceeds cpu_set_t"
+        );
+        // SAFETY: cpu_set_t is an integer bitset; zero initializes an empty mask.
+        let mut mask = unsafe { std::mem::zeroed::<libc::cpu_set_t>() };
+        // SAFETY: `cpu` was checked against CPU_SETSIZE and `mask` is writable.
+        unsafe { libc::CPU_SET(cpu, &mut mask) };
+        // SAFETY: the mask is initialized and `tid` is either zero (current thread)
+        // or a TID read from /proc/self/task; the full mask size is supplied.
+        let result =
+            unsafe { libc::sched_setaffinity(tid, std::mem::size_of::<libc::cpu_set_t>(), &mask) };
+        ensure!(
+            result == 0,
+            "set CPU affinity for TID {tid} to CPU {cpu}: {}",
+            io::Error::last_os_error()
+        );
+        Ok(())
+    }
+
+    fn current_tid() -> libc::pid_t {
+        // SAFETY: gettid has no pointers or preconditions and returns this thread's ID.
+        unsafe { libc::gettid() }
+    }
+
+    fn thread_snapshot() -> Result<Vec<ThreadPlacement>> {
+        let mut threads = Vec::new();
+        for entry in fs::read_dir("/proc/self/task")? {
+            let entry = entry?;
+            let tid = entry
+                .file_name()
+                .to_str()
+                .context("non-UTF8 TID in /proc/self/task")?
+                .parse::<libc::pid_t>()
+                .context("invalid TID in /proc/self/task")?;
+            match read_thread(tid) {
+                Ok(thread) => threads.push(thread),
+                Err(error)
+                    if error
+                        .downcast_ref::<io::Error>()
+                        .is_some_and(|error| error.kind() == io::ErrorKind::NotFound) =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        threads.sort_by_key(|thread| thread.tid);
+        Ok(threads)
+    }
+
+    fn read_thread(tid: libc::pid_t) -> Result<ThreadPlacement> {
+        let status = fs::read_to_string(format!("/proc/self/task/{tid}/status"))?;
+        let field = |name: &str| -> Result<&str> {
+            status
+                .lines()
+                .find_map(|line| line.strip_prefix(name))
+                .map(str::trim)
+                .with_context(|| format!("missing {name} for TID {tid}"))
+        };
+        let name = field("Name:")?.to_owned();
+        let allowed_cpus = parse_linux_cpu_list(field("Cpus_allowed_list:")?)?;
+        Ok(ThreadPlacement {
+            tid,
+            name,
+            allowed_cpus,
+        })
+    }
+
+    fn parse_linux_cpu_list(value: &str) -> Result<Vec<usize>> {
+        let mut cpus = Vec::new();
+        for part in value.trim().split(',') {
+            let (start, end) = match part.split_once('-') {
+                Some((start, end)) => (start.parse::<usize>()?, end.parse::<usize>()?),
+                None => {
+                    let cpu = part.parse::<usize>()?;
+                    (cpu, cpu)
+                }
+            };
+            ensure!(start <= end, "invalid CPU range {part:?}");
+            cpus.extend(start..=end);
+        }
+        Ok(cpus)
     }
 }
 
@@ -3507,24 +4437,85 @@ fn run_wal_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
     {
         engine.reset_write_profile();
         engine.set_wal_sync_diagnostics_enabled(
-            cfg.profile && wal_run_info.runtime_counters_available(),
+            (cfg.profile || cfg.wal_sync_diagnostics) && wal_run_info.runtime_counters_available(),
+        )?;
+        engine.set_wal_hol_diagnostics_enabled(cfg.wal_hol_diagnostics)?;
+        engine.set_wal_v8_completion_timeline_sample_every(
+            cfg.wal_completion_timeline.then_some(128),
         )?;
     }
     let value = vec![b'x'; cfg.value_size];
     let num_keys = cfg.num;
     let writer_threads = cfg.threads;
     let retry_pitr_barrier = cfg.pitr;
+    #[cfg(all(feature = "bench", target_os = "linux"))]
+    let affinity_capture = bench_cpu_affinity::Capture::new(
+        &engine,
+        &value,
+        retry_pitr_barrier,
+        wal_run_info.format_version,
+        writer_threads,
+        num_keys,
+    )?;
+    #[cfg(all(feature = "bench", target_os = "linux"))]
+    let affinity_enabled = affinity_capture.is_some();
+    #[cfg(feature = "bench")]
+    let wal_io_start = engine
+        .benchmark_wal_io_diagnostics()
+        .map(WalIoDiagnosticsRecord::from);
+    #[cfg(all(feature = "bench", target_os = "linux"))]
+    let affinity_writer_placements = Arc::new(Mutex::new(Vec::new()));
+    #[cfg(all(feature = "bench", target_os = "linux"))]
+    let affinity_ready = affinity_enabled.then(|| Arc::new(Barrier::new(writer_threads + 1)));
+    #[cfg(all(feature = "bench", target_os = "linux"))]
+    let affinity_start = affinity_enabled.then(|| Arc::new(Barrier::new(writer_threads + 1)));
     let baseline = collect_counters(&engine)?;
+    #[cfg(all(feature = "bench", target_os = "linux"))]
+    let mut cpu_start = process_cpu_times();
+    #[cfg(not(all(feature = "bench", target_os = "linux")))]
     let cpu_start = process_cpu_times();
     let per_thread = num_keys / writer_threads;
     let remainder = num_keys % writer_threads;
+    #[cfg(all(feature = "bench", target_os = "linux"))]
+    let mut start = Instant::now();
+    #[cfg(not(all(feature = "bench", target_os = "linux")))]
     let start = Instant::now();
     let mut handles = vec![];
     for t in 0..writer_threads {
         let eng = engine.clone();
         let val = value.clone();
         let sample_every = cfg.latency_sample_every;
+        #[cfg(all(feature = "bench", target_os = "linux"))]
+        let affinity_writer_cpu = affinity_capture
+            .as_ref()
+            .and_then(|capture| capture.writer_cpu(t));
+        #[cfg(all(feature = "bench", target_os = "linux"))]
+        let affinity_writer_placements = Arc::clone(&affinity_writer_placements);
+        #[cfg(all(feature = "bench", target_os = "linux"))]
+        let writer_ready = affinity_ready.as_ref().map(Arc::clone);
+        #[cfg(all(feature = "bench", target_os = "linux"))]
+        let writer_start = affinity_start.as_ref().map(Arc::clone);
         handles.push(std::thread::spawn(move || -> Result<Vec<u64>> {
+            #[cfg(all(feature = "bench", target_os = "linux"))]
+            if affinity_enabled {
+                match bench_cpu_affinity::place_writer(t, affinity_writer_cpu) {
+                    Ok(placement) => affinity_writer_placements.lock().push(placement),
+                    Err(error) => {
+                        if let (Some(ready), Some(start_gate)) =
+                            (writer_ready.as_ref(), writer_start.as_ref())
+                        {
+                            ready.wait();
+                            start_gate.wait();
+                        }
+                        return Err(error);
+                    }
+                }
+            }
+            #[cfg(all(feature = "bench", target_os = "linux"))]
+            if let (Some(ready), Some(start_gate)) = (writer_ready, writer_start) {
+                ready.wait();
+                start_gate.wait();
+            }
             let thread_ops = per_thread + usize::from(t < remainder);
             let start_idx = t * per_thread + remainder.min(t);
             let mut latency_samples = Vec::new();
@@ -3542,6 +4533,13 @@ fn run_wal_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
 
             Ok(latency_samples)
         }));
+    }
+    #[cfg(all(feature = "bench", target_os = "linux"))]
+    if let (Some(ready), Some(start_gate)) = (affinity_ready.as_ref(), affinity_start.as_ref()) {
+        ready.wait();
+        cpu_start = process_cpu_times();
+        start = Instant::now();
+        start_gate.wait();
     }
     let mut latency_samples = Vec::new();
     let mut writer_error = None;
@@ -3563,8 +4561,19 @@ fn run_wal_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
     let elapsed = start.elapsed();
     let (process_cpu_user_ms, process_cpu_system_ms) =
         process_cpu_delta(cpu_start, process_cpu_times());
+    #[cfg(all(feature = "bench", target_os = "linux"))]
+    if let Some(capture) = affinity_capture {
+        capture.finish(std::mem::take(&mut *affinity_writer_placements.lock()))?;
+    }
     #[cfg(feature = "bench")]
-    let wal_pipeline = wal_pipeline_record(&engine, cfg.profile, wal_run_info)?;
+    let wal_pipeline = wal_pipeline_record(
+        &engine,
+        cfg.profile || cfg.wal_sync_diagnostics,
+        cfg.wal_hol_diagnostics,
+        cfg.wal_completion_timeline,
+        wal_run_info,
+        wal_io_start,
+    )?;
     #[cfg(not(feature = "bench"))]
     let wal_pipeline = None;
     #[cfg(feature = "bench")]
@@ -3651,9 +4660,17 @@ fn run_wal_batch_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>
     {
         engine.reset_write_profile();
         engine.set_wal_sync_diagnostics_enabled(
-            cfg.profile && wal_run_info.runtime_counters_available(),
+            (cfg.profile || cfg.wal_sync_diagnostics) && wal_run_info.runtime_counters_available(),
+        )?;
+        engine.set_wal_hol_diagnostics_enabled(cfg.wal_hol_diagnostics)?;
+        engine.set_wal_v8_completion_timeline_sample_every(
+            cfg.wal_completion_timeline.then_some(128),
         )?;
     }
+    #[cfg(feature = "bench")]
+    let wal_io_start = engine
+        .benchmark_wal_io_diagnostics()
+        .map(WalIoDiagnosticsRecord::from);
     let value = vec![b'x'; cfg.value_size];
     let num_keys = cfg.num;
     let writer_threads = cfg.threads;
@@ -3757,7 +4774,14 @@ fn run_wal_batch_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>
         .map(|capture| capture.finish(timeline_spans))
         .transpose()?;
     #[cfg(feature = "bench")]
-    let wal_pipeline = wal_pipeline_record(&engine, cfg.profile, wal_run_info)?;
+    let wal_pipeline = wal_pipeline_record(
+        &engine,
+        cfg.profile || cfg.wal_sync_diagnostics,
+        cfg.wal_hol_diagnostics,
+        cfg.wal_completion_timeline,
+        wal_run_info,
+        wal_io_start,
+    )?;
     #[cfg(not(feature = "bench"))]
     let wal_pipeline = None;
     #[cfg(feature = "bench")]
@@ -8502,6 +9526,38 @@ fn validate_config(cfg: &HarnessConfig) -> Result<()> {
             );
         }
     }
+    if cfg.wal_sync_diagnostics {
+        anyhow::ensure!(
+            cfg!(feature = "bench"),
+            "--wal-sync-diagnostics requires a bench build"
+        );
+        anyhow::ensure!(
+            cfg.pitr_format.unwrap_or(PitrFormatArg::V8) == PitrFormatArg::V8,
+            "--wal-sync-diagnostics requires PITR V8"
+        );
+    }
+    if cfg.wal_hol_diagnostics {
+        anyhow::ensure!(
+            cfg!(feature = "bench"),
+            "--wal-hol-diagnostics requires a bench build"
+        );
+        anyhow::ensure!(
+            cfg.pitr_format.unwrap_or(PitrFormatArg::V8) == PitrFormatArg::V8
+                && cfg.wal_io_mode == WalIoModeArg::Parallel,
+            "--wal-hol-diagnostics requires PITR V8 Parallel I/O"
+        );
+    }
+    if cfg.wal_completion_timeline {
+        anyhow::ensure!(
+            cfg!(feature = "bench"),
+            "--wal-completion-timeline requires a bench build"
+        );
+        anyhow::ensure!(
+            cfg.pitr_format.unwrap_or(PitrFormatArg::V8) == PitrFormatArg::V8
+                && cfg.wal_io_mode == WalIoModeArg::Parallel,
+            "--wal-completion-timeline requires PITR V8 Parallel I/O"
+        );
+    }
     if cfg.prepare_golden || cfg.golden_path.is_some() || cfg.clone_golden {
         anyhow::ensure!(
             cfg.suite == Suite::SteadyState,
@@ -8540,12 +9596,129 @@ fn validate_run_mode(cfg: &HarnessConfig, bench_arg: Option<&str>) -> Result<()>
         "--prepare-golden does not support --bench"
     );
 
+    let extent_mode = std::env::var_os(WAL_V8_EXTENT_PREPARATION_ENV);
+    let extent_bytes = std::env::var_os(WAL_V8_EXTENT_PREPARATION_BYTES_ENV);
+    validate_v8_extent_preparation(cfg, extent_mode.as_deref(), extent_bytes.as_deref())?;
+
+    Ok(())
+}
+
+fn validate_v8_extent_preparation(
+    cfg: &HarnessConfig,
+    extent_mode: Option<&std::ffi::OsStr>,
+    extent_bytes: Option<&std::ffi::OsStr>,
+) -> Result<()> {
+    if extent_mode.is_some() || extent_bytes.is_some() {
+        anyhow::ensure!(
+            cfg!(feature = "bench"),
+            "V8 extent preparation requires a bench build"
+        );
+        anyhow::ensure!(
+            cfg.pitr_format.unwrap_or(PitrFormatArg::V8) == PitrFormatArg::V8
+                && cfg.wal_io_mode == WalIoModeArg::Parallel,
+            "V8 extent preparation requires PITR V8 Parallel I/O"
+        );
+        let extent_mode = extent_mode.context(
+            "TOYKV_BENCH_V8_EXTENT_PREP requires `fallocate`, `initialize`, `sliding-fallocate`, or `sliding-initialize`",
+        )?;
+        anyhow::ensure!(
+            matches!(
+                extent_mode.to_str(),
+                Some("fallocate" | "initialize" | "sliding-fallocate" | "sliding-initialize")
+            ),
+            "TOYKV_BENCH_V8_EXTENT_PREP must be `fallocate`, `initialize`, `sliding-fallocate`, or `sliding-initialize`"
+        );
+        let extent_bytes = extent_bytes
+            .context("TOYKV_BENCH_V8_EXTENT_PREP_BYTES is required with extent preparation")?;
+        let extent_bytes = extent_bytes
+            .to_str()
+            .context("TOYKV_BENCH_V8_EXTENT_PREP_BYTES is not valid UTF-8")?
+            .parse::<u64>()
+            .context("TOYKV_BENCH_V8_EXTENT_PREP_BYTES must be an unsigned integer")?;
+        anyhow::ensure!(
+            extent_bytes > 0 && extent_bytes.is_multiple_of(WAL_V8_EXTENT_PREPARATION_CHUNK_BYTES),
+            "TOYKV_BENCH_V8_EXTENT_PREP_BYTES must be a positive multiple of {}",
+            WAL_V8_EXTENT_PREPARATION_CHUNK_BYTES
+        );
+    }
+
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn sliding_extent_preparation_is_accepted_by_run_mode_validation() {
+        let args = Args::try_parse_from(["write-perf", "--pitr"]).expect("parse PITR args");
+        let cfg = HarnessConfig::from_args(args);
+
+        for mode in ["sliding-fallocate", "sliding-initialize"] {
+            for window_bytes in [1 << 20, 4 << 20] {
+                let window_bytes = window_bytes.to_string();
+                validate_v8_extent_preparation(
+                    &cfg,
+                    Some(std::ffi::OsStr::new(mode)),
+                    Some(std::ffi::OsStr::new(&window_bytes)),
+                )
+                .expect("accept aligned sliding preparation window");
+            }
+        }
+
+        assert!(
+            validate_v8_extent_preparation(
+                &cfg,
+                Some(std::ffi::OsStr::new("sliding-fallocate")),
+                Some(std::ffi::OsStr::new("1025")),
+            )
+            .is_err()
+        );
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn sliding_extent_progress_does_not_mark_io_handles_unstable() {
+        let start = WalIoDiagnosticsRecord {
+            sliding_extent_preparation: Some(WalV8SlidingExtentPreparationRecord {
+                mode: "sliding-fallocate",
+                start_offset: 4096,
+                max_file_size: 1 << 20,
+                window_bytes: 1 << 17,
+                initialization_chunk_bytes: 1 << 17,
+                prepared_end: 4096,
+                allocated_end: 4096,
+                fallocate_calls: 0,
+                allocated_bytes: 0,
+                initialization_chunks: 0,
+                initialized_bytes: 0,
+                elapsed_ns: 0,
+                fallocate_elapsed_ns: 0,
+                initialization_elapsed_ns: 0,
+                wait_calls: 0,
+                wait_ns: 0,
+            }),
+            ..WalIoDiagnosticsRecord::default()
+        };
+        let mut end = start.clone();
+        let preparation = end
+            .sliding_extent_preparation
+            .as_mut()
+            .expect("sliding prep should be recorded");
+        preparation.prepared_end += preparation.window_bytes;
+        preparation.fallocate_calls = 1;
+        preparation.allocated_bytes = preparation.window_bytes;
+        preparation.elapsed_ns = 100;
+
+        assert!(start.stable_with(&end));
+
+        end.sliding_extent_preparation
+            .as_mut()
+            .expect("sliding prep should be recorded")
+            .window_bytes *= 2;
+        assert!(!start.stable_with(&end));
+    }
 
     #[test]
     fn pitr_benchmark_retries_only_unadmitted_barrier_rejections() {
@@ -8864,6 +10037,129 @@ mod tests {
         );
 
         assert!(Args::try_parse_from(["write-perf", "--pitr-format", "v6"]).is_err());
+    }
+
+    #[test]
+    fn wal_sync_diagnostics_require_bench_build_and_v8_pitr() {
+        let v8 = HarnessConfig::from_args(
+            Args::try_parse_from(["write-perf", "--pitr", "--wal-sync-diagnostics"])
+                .expect("parse V8 diagnostics option"),
+        );
+        let result = validate_config(&v8);
+        if cfg!(feature = "bench") {
+            result.expect("bench build can capture V8 sync diagnostics");
+        } else {
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("requires a bench build")
+            );
+        }
+
+        let v7 = HarnessConfig::from_args(
+            Args::try_parse_from([
+                "write-perf",
+                "--pitr",
+                "--pitr-format",
+                "v7",
+                "--wal-sync-diagnostics",
+            ])
+            .expect("parse incompatible V7 diagnostics option"),
+        );
+        assert!(
+            validate_config(&v7)
+                .unwrap_err()
+                .to_string()
+                .contains("requires PITR V8")
+        );
+        assert!(Args::try_parse_from(["write-perf", "--wal-sync-diagnostics"]).is_err());
+    }
+
+    #[test]
+    fn wal_hol_diagnostics_require_bench_build_and_v8_parallel() {
+        let parallel = HarnessConfig::from_args(
+            Args::try_parse_from([
+                "write-perf",
+                "--pitr",
+                "--wal-io-mode",
+                "parallel",
+                "--wal-hol-diagnostics",
+            ])
+            .expect("parse V8 HOL diagnostics option"),
+        );
+        let result = validate_config(&parallel);
+        if cfg!(feature = "bench") {
+            result.expect("bench build can capture V8 parallel HOL diagnostics");
+        } else {
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("requires a bench build")
+            );
+        }
+
+        let leader = HarnessConfig::from_args(
+            Args::try_parse_from([
+                "write-perf",
+                "--pitr",
+                "--wal-io-mode",
+                "leader",
+                "--wal-hol-diagnostics",
+            ])
+            .expect("parse incompatible Leader diagnostics option"),
+        );
+        assert!(
+            validate_config(&leader)
+                .unwrap_err()
+                .to_string()
+                .contains("requires PITR V8 Parallel I/O")
+        );
+        assert!(Args::try_parse_from(["write-perf", "--wal-hol-diagnostics"]).is_err());
+    }
+
+    #[test]
+    fn wal_completion_timeline_requires_bench_build_and_v8_parallel() {
+        let parallel = HarnessConfig::from_args(
+            Args::try_parse_from([
+                "write-perf",
+                "--pitr",
+                "--wal-io-mode",
+                "parallel",
+                "--wal-completion-timeline",
+            ])
+            .expect("parse V8 completion timeline option"),
+        );
+        let result = validate_config(&parallel);
+        if cfg!(feature = "bench") {
+            result.expect("bench build can capture V8 completion timeline samples");
+        } else {
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("requires a bench build")
+            );
+        }
+
+        let leader = HarnessConfig::from_args(
+            Args::try_parse_from([
+                "write-perf",
+                "--pitr",
+                "--wal-io-mode",
+                "leader",
+                "--wal-completion-timeline",
+            ])
+            .expect("parse incompatible Leader timeline option"),
+        );
+        assert!(
+            validate_config(&leader)
+                .unwrap_err()
+                .to_string()
+                .contains("requires PITR V8 Parallel I/O")
+        );
+        assert!(Args::try_parse_from(["write-perf", "--wal-completion-timeline"]).is_err());
     }
 
     #[derive(Debug, Deserialize)]
@@ -10062,6 +11358,9 @@ mod tests {
             wal_override: None,
             wal_io_mode: WalIoModeArg::Leader,
             wal_io_mode_explicit: false,
+            wal_sync_diagnostics: false,
+            wal_hol_diagnostics: false,
+            wal_completion_timeline: false,
             vlog_override: false,
             profile: true,
             clients: 1,
@@ -10103,6 +11402,45 @@ mod tests {
                     v8_data_write_call_ns: 0,
                     sync_coalesce_wait_calls: 3,
                     sync_coalesce_wait_ns: 9000,
+                    wal_io_start: cfg!(feature = "bench").then_some(WalIoDiagnosticsRecord {
+                        data: WalIoHandleRecord {
+                            o_direct: Some(true),
+                            device: 7,
+                            inode: 11,
+                        },
+                        frontier: WalIoHandleRecord {
+                            o_direct: Some(false),
+                            device: 7,
+                            inode: 11,
+                        },
+                        sync: WalIoHandleRecord {
+                            o_direct: Some(false),
+                            device: 7,
+                            inode: 11,
+                        },
+                        extent_preparation: None,
+                        sliding_extent_preparation: None,
+                    }),
+                    wal_io_end: cfg!(feature = "bench").then_some(WalIoDiagnosticsRecord {
+                        data: WalIoHandleRecord {
+                            o_direct: Some(true),
+                            device: 7,
+                            inode: 11,
+                        },
+                        frontier: WalIoHandleRecord {
+                            o_direct: Some(false),
+                            device: 7,
+                            inode: 11,
+                        },
+                        sync: WalIoHandleRecord {
+                            o_direct: Some(false),
+                            device: 7,
+                            inode: 11,
+                        },
+                        extent_preparation: None,
+                        sliding_extent_preparation: None,
+                    }),
+                    wal_io_stable: cfg!(feature = "bench").then_some(true),
                     ..WalPipelineRecord::default()
                 }),
                 ..MeasurementResult::default()
@@ -10130,6 +11468,23 @@ mod tests {
             assert_eq!(
                 json["result"]["wal_pipeline"]["sync_coalesce_wait_ns"],
                 9000
+            );
+            assert_eq!(
+                json["result"]["wal_pipeline"]["wal_io_start"]["data"]["o_direct"],
+                true
+            );
+            assert_eq!(
+                json["result"]["wal_pipeline"]["wal_io_start"]["frontier"]["o_direct"],
+                false
+            );
+            assert_eq!(json["result"]["wal_pipeline"]["wal_io_stable"], true);
+            assert_eq!(
+                json["result"]["wal_pipeline"]["wal_io_start"]["data"]["inode"],
+                11
+            );
+            assert_eq!(
+                json["result"]["wal_pipeline"]["wal_io_end"]["frontier"]["inode"],
+                11
             );
         } else {
             assert!(json["result"].get("wal_pipeline").is_none());
@@ -12542,6 +13897,9 @@ mod tests {
             wal_override: None,
             wal_io_mode: WalIoModeArg::Leader,
             wal_io_mode_explicit: false,
+            wal_sync_diagnostics: false,
+            wal_hol_diagnostics: false,
+            wal_completion_timeline: false,
             vlog_override: false,
             profile: false,
             clients: 1,
@@ -12683,8 +14041,12 @@ mod tests {
                 write_cqes_completed: 4,
                 groups_completed: 2,
                 groups_covered: 3,
+                tickets_covered: Some(4),
+                frontier_write_ns: 100_000,
+                data_completion_to_frontier_start_ns: Some(20_000),
                 duration_ns: 250_000,
                 succeeded: true,
+                ..kv_engine_wrapper::mem_table::WalSyncObservation::default()
             });
 
         let json = serde_json::to_value(observation).expect("serialize sync observation");
@@ -12702,6 +14064,11 @@ mod tests {
         assert_eq!(json["write_cqes_completed"], 4);
         assert_eq!(json["groups_completed"], 2);
         assert_eq!(json["groups_covered"], 3);
+        assert_eq!(json["tickets_covered"], 4);
+        assert_eq!(json["frontier_write_ns"], 100_000);
+        assert_eq!(json["fdatasync_ns"], 250_000);
+        assert_eq!(json["durability_io_ns"], 350_000);
+        assert_eq!(json["data_completion_to_frontier_start_ns"], 20_000);
         assert_eq!(json["duration_ns"], 250_000);
         assert_eq!(json["succeeded"], true);
     }
