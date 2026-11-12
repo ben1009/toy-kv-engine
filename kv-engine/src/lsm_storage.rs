@@ -38434,22 +38434,41 @@ mod tests {
         // Held across the whole close: the guard `wait_for_quiescence` is waiting
         // for, dropped only once this task is polled after its sleep.
         let guard_engine = std::sync::Arc::clone(&engine);
+        let (guard_admitted, guard_admitted_rx) = tokio::sync::oneshot::channel();
         let guard = runtime.spawn(async move {
             let _guard = guard_engine
                 .inner
                 .lifecycle
                 .admit_scan()
                 .expect("admit a scan the close has to wait for");
+            guard_admitted
+                .send(())
+                .expect("test is waiting for scan admission");
             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         });
         let ticks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let ticker_ticks = std::sync::Arc::clone(&ticks);
+        let (ticker_started, ticker_started_rx) = tokio::sync::oneshot::channel();
         let ticker = runtime.spawn(async move {
+            let mut ticker_started = Some(ticker_started);
             loop {
                 tokio::time::sleep(std::time::Duration::from_millis(1)).await;
                 ticker_ticks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if let Some(ticker_started) = ticker_started.take() {
+                    let _ = ticker_started.send(());
+                }
             }
         });
+
+        // A current-thread runtime does not poll spawned tasks until block_on
+        // starts. Establish both test preconditions before close can stop new
+        // lifecycle admissions, avoiding a scheduling race under sanitizers.
+        runtime
+            .block_on(guard_admitted_rx)
+            .expect("scan guard was admitted before close");
+        runtime
+            .block_on(ticker_started_rx)
+            .expect("ticker ran before close");
 
         let close_runtime = std::sync::Arc::clone(&runtime);
         let (sender, receiver) = std::sync::mpsc::channel();
