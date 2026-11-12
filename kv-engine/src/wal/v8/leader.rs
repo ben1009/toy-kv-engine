@@ -47,7 +47,7 @@ use crate::{
 #[cfg(feature = "bench")]
 use crate::wal::{
     WalExtentPreparationDiagnostics, WalExtentPreparationMode, WalIoDiagnostics,
-    WalIoHandleMetadata,
+    WalIoHandleMetadata, WalV8SlidingExtentPreparationDiagnostics,
 };
 
 #[cfg(feature = "bench")]
@@ -204,6 +204,23 @@ pub(crate) struct WalV8ParallelWriter {
 }
 
 #[cfg(feature = "bench")]
+struct WalV8SlidingExtentPreparation {
+    data_file: File,
+    start_offset: u64,
+    max_file_size: u64,
+    window_bytes: u64,
+    state: Mutex<WalV8SlidingExtentPreparationState>,
+}
+
+#[cfg(feature = "bench")]
+struct WalV8SlidingExtentPreparationState {
+    prepared_end: u64,
+    fallocate_calls: u64,
+    allocated_bytes: u64,
+    elapsed_ns: u64,
+}
+
+#[cfg(feature = "bench")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WalV8FrontierWriteMode {
     Buffered,
@@ -253,8 +270,9 @@ impl WalExtentPreparationMode {
         let mode = match mode.to_str() {
             Some("fallocate") => Self::Fallocate,
             Some("initialize") => Self::Initialize,
+            Some("sliding-fallocate") => Self::SlidingFallocate,
             Some(value) => anyhow::bail!(
-                "invalid {WAL_V8_EXTENT_PREPARATION_ENV} {value:?}; expected `fallocate` or `initialize`"
+                "invalid {WAL_V8_EXTENT_PREPARATION_ENV} {value:?}; expected `fallocate`, `initialize`, or `sliding-fallocate`"
             ),
             None => anyhow::bail!("{WAL_V8_EXTENT_PREPARATION_ENV} is not valid UTF-8"),
         };
@@ -277,6 +295,7 @@ impl WalExtentPreparationMode {
         match self {
             Self::Fallocate => "fallocate",
             Self::Initialize => "initialize",
+            Self::SlidingFallocate => "sliding-fallocate",
         }
     }
 }
@@ -290,6 +309,10 @@ fn prepare_v8_extent_suffix(
     mode: WalExtentPreparationMode,
     bytes: u64,
 ) -> Result<WalExtentPreparationDiagnostics> {
+    ensure!(
+        mode != WalExtentPreparationMode::SlidingFallocate,
+        "sliding V8 extent preparation cannot use one-shot suffix preparation"
+    );
     ensure!(
         WalIoHandleMetadata::from_file(data_file)?.o_direct == Some(true),
         "V8 extent preparation requires an O_DIRECT DATA worker"
@@ -372,6 +395,128 @@ fn prepare_v8_extent_suffix(
         initialized_bytes,
         elapsed_ns: u64::try_from(started_at.elapsed().as_nanos()).unwrap_or(u64::MAX),
     })
+}
+
+#[cfg(feature = "bench")]
+impl WalV8SlidingExtentPreparation {
+    fn new(
+        data_file: File,
+        sync_file: &File,
+        start_offset: u64,
+        max_file_size: u64,
+        window_bytes: u64,
+    ) -> Result<Self> {
+        ensure!(
+            WalIoHandleMetadata::from_file(&data_file)?.o_direct == Some(true),
+            "sliding V8 extent preparation requires an O_DIRECT DATA worker"
+        );
+        let data_metadata = data_file
+            .metadata()
+            .context("inspect V8 WAL before sliding extent preparation")?;
+        let sync_metadata = sync_file
+            .metadata()
+            .context("inspect V8 WAL sync handle before sliding extent preparation")?;
+        ensure!(
+            data_metadata.is_file()
+                && sync_metadata.is_file()
+                && data_metadata.dev() == sync_metadata.dev()
+                && data_metadata.ino() == sync_metadata.ino()
+                && data_metadata.len() == start_offset,
+            "sliding V8 extent preparation requires the untouched installed Active WAL inode"
+        );
+        ensure!(
+            window_bytes > 0
+                && window_bytes.is_multiple_of(WAL_V8_EXTENT_PREPARATION_CHUNK_BYTES as u64),
+            "sliding V8 extent preparation window is not aligned"
+        );
+        ensure!(
+            start_offset <= max_file_size,
+            "sliding V8 extent preparation starts beyond the WAL segment limit"
+        );
+
+        Ok(Self {
+            data_file,
+            start_offset,
+            max_file_size,
+            window_bytes,
+            state: Mutex::new(WalV8SlidingExtentPreparationState {
+                prepared_end: start_offset,
+                fallocate_calls: 0,
+                allocated_bytes: 0,
+                elapsed_ns: 0,
+            }),
+        })
+    }
+
+    fn ensure_prepared_through(&self, required_end: u64) -> Result<()> {
+        ensure!(
+            required_end <= self.max_file_size,
+            "sliding V8 extent preparation exceeds the WAL segment limit"
+        );
+        let mut state = self.state.lock();
+        if required_end <= state.prepared_end {
+            return Ok(());
+        }
+
+        let relative_end = required_end
+            .checked_sub(self.start_offset)
+            .context("sliding V8 extent preparation precedes its initial cursor")?;
+        let windows = relative_end
+            .checked_add(self.window_bytes - 1)
+            .context("sliding V8 extent preparation window count overflows")?
+            / self.window_bytes;
+        let target_end = self
+            .start_offset
+            .checked_add(
+                windows
+                    .checked_mul(self.window_bytes)
+                    .context("sliding V8 extent preparation window length overflows")?,
+            )
+            .context("sliding V8 extent preparation end overflows")?
+            .min(self.max_file_size);
+        ensure!(
+            target_end >= required_end && target_end > state.prepared_end,
+            "sliding V8 extent preparation did not cover the requested write"
+        );
+
+        let prepared_start = state.prepared_end;
+        let offset = libc::off_t::try_from(prepared_start)
+            .context("sliding V8 extent preparation offset exceeds off_t")?;
+        let len = libc::off_t::try_from(target_end - prepared_start)
+            .context("sliding V8 extent preparation length exceeds off_t")?;
+        let started_at = Instant::now();
+        // SAFETY: the checked range is within the configured WAL file cap and
+        // the owned descriptor remains live for the syscall.
+        let result = unsafe { libc::fallocate(self.data_file.as_raw_fd(), 0, offset, len) };
+        ensure!(
+            result == 0,
+            "V8 benchmark sliding fallocate failed: {}",
+            io::Error::last_os_error()
+        );
+        let elapsed_ns = u64::try_from(started_at.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        state.prepared_end = target_end;
+        state.fallocate_calls = state.fallocate_calls.saturating_add(1);
+        state.allocated_bytes = state
+            .allocated_bytes
+            .saturating_add(target_end - prepared_start);
+        state.elapsed_ns = state.elapsed_ns.saturating_add(elapsed_ns);
+
+        Ok(())
+    }
+
+    fn diagnostics(&self) -> WalV8SlidingExtentPreparationDiagnostics {
+        let state = self.state.lock();
+
+        WalV8SlidingExtentPreparationDiagnostics {
+            start_offset: self.start_offset,
+            max_file_size: self.max_file_size,
+            window_bytes: self.window_bytes,
+            prepared_end: state.prepared_end,
+            fallocate_calls: state.fallocate_calls,
+            allocated_bytes: state.allocated_bytes,
+            elapsed_ns: state.elapsed_ns,
+        }
+    }
 }
 
 #[cfg(feature = "bench")]
@@ -500,6 +645,8 @@ struct WalV8ParallelIo {
     profile: arc_swap::ArcSwapOption<crate::mem_table::WriteProfile>,
     #[cfg(feature = "bench")]
     hol_diagnostics_enabled: std::sync::atomic::AtomicBool,
+    #[cfg(feature = "bench")]
+    extent_preparation: Option<Arc<WalV8SlidingExtentPreparation>>,
     completion_thread: Mutex<Option<thread::JoinHandle<()>>>,
 }
 
@@ -508,6 +655,7 @@ impl WalV8ParallelIo {
         worker_file: File,
         coordinator: WalV8ParallelCoordinator,
         first_ticket: u64,
+        #[cfg(feature = "bench")] extent_preparation: Option<Arc<WalV8SlidingExtentPreparation>>,
     ) -> Result<Arc<Self>> {
         let submit_any_ready_ticket = benchmark_submits_any_ready_ticket()?;
         let worker_file = Arc::new(worker_file);
@@ -581,8 +729,29 @@ impl WalV8ParallelIo {
             profile: arc_swap::ArcSwapOption::empty(),
             #[cfg(feature = "bench")]
             hol_diagnostics_enabled: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(feature = "bench")]
+            extent_preparation,
             completion_thread: Mutex::new(Some(completion_thread)),
         }))
+    }
+
+    fn ensure_extent_prepared_through(&self, required_end: u64) -> Result<()> {
+        #[cfg(feature = "bench")]
+        if let Some(preparation) = &self.extent_preparation {
+            return preparation.ensure_prepared_through(required_end);
+        }
+
+        #[cfg(not(feature = "bench"))]
+        let _ = required_end;
+
+        Ok(())
+    }
+
+    #[cfg(feature = "bench")]
+    fn extent_preparation_diagnostics(&self) -> Option<WalV8SlidingExtentPreparationDiagnostics> {
+        self.extent_preparation
+            .as_ref()
+            .map(|preparation| preparation.diagnostics())
     }
 
     #[cfg(feature = "bench")]
@@ -767,6 +936,7 @@ impl WalV8ParallelIo {
             let ticket_end = ticket
                 .checked_add(1)
                 .context("v8 out-of-order DATA ticket overflows")?;
+            self.ensure_extent_prepared_through(allocation_end)?;
             let write = WriteBuffer::new(pending.buffer, pending.file_offset, write_len);
             let group = WriteGroup::new(ticket..ticket_end, vec![write])
                 .map_err(|error| anyhow::anyhow!("build v8 out-of-order DATA group: {error:?}"))?;
@@ -935,6 +1105,7 @@ impl WalV8ParallelIo {
                 &frontier_offsets,
             )
             .map_err(|error| anyhow::anyhow!("build v8 DATA worker group: {error:?}"))?;
+            self.ensure_extent_prepared_through(cursor)?;
             self.client
                 .submit_group(group)
                 .context("submit v8 DATA worker group")?;
@@ -1295,6 +1466,7 @@ impl WalV8LeaderWriter {
             frontier: WalIoHandleMetadata::from_file(&write_file)?,
             sync: WalIoHandleMetadata::from_file(&sync_file)?,
             extent_preparation: None,
+            sliding_extent_preparation: None,
         };
 
         Ok(Self {
@@ -1392,16 +1564,36 @@ impl WalV8LeaderWriter {
             io_diagnostics.data = WalIoHandleMetadata::from_file(&worker_file)?;
         }
         #[cfg(feature = "bench")]
-        if let Some((mode, bytes)) = WalExtentPreparationMode::from_environment()? {
-            io_diagnostics.extent_preparation = Some(prepare_v8_extent_suffix(
-                &worker_file,
-                &self.sync_file,
-                self.coordinator.last_frontier_end(),
-                self.max_file_size,
-                mode,
-                bytes,
-            )?);
-        }
+        let extent_preparation = match WalExtentPreparationMode::from_environment()? {
+            Some((WalExtentPreparationMode::SlidingFallocate, window_bytes)) => {
+                let start_offset = self.coordinator.last_frontier_end();
+                let preparation = Arc::new(WalV8SlidingExtentPreparation::new(
+                    worker_file
+                        .try_clone()
+                        .context("clone v8 WAL handle for sliding extent preparation")?,
+                    &self.sync_file,
+                    start_offset,
+                    self.max_file_size,
+                    window_bytes,
+                )?);
+                io_diagnostics.sliding_extent_preparation = Some(preparation.diagnostics());
+
+                Some(preparation)
+            }
+            Some((mode, bytes)) => {
+                io_diagnostics.extent_preparation = Some(prepare_v8_extent_suffix(
+                    &worker_file,
+                    &self.sync_file,
+                    self.coordinator.last_frontier_end(),
+                    self.max_file_size,
+                    mode,
+                    bytes,
+                )?);
+
+                None
+            }
+            None => None,
+        };
         #[cfg(feature = "bench")]
         let frontier_file = match WalV8FrontierWriteMode::from_environment()? {
             WalV8FrontierWriteMode::Buffered => self.write_file,
@@ -1427,7 +1619,13 @@ impl WalV8LeaderWriter {
         #[cfg(not(feature = "bench"))]
         let frontier_file = self.write_file;
         let initial_ticket = self.coordinator.next_ticket();
-        let io = WalV8ParallelIo::spawn(worker_file, self.coordinator.clone(), initial_ticket)?;
+        let io = WalV8ParallelIo::spawn(
+            worker_file,
+            self.coordinator.clone(),
+            initial_ticket,
+            #[cfg(feature = "bench")]
+            extent_preparation,
+        )?;
         #[cfg(feature = "bench")]
         if let Some(profile) = self.profile.load_full() {
             io.set_profile(profile);
@@ -2014,7 +2212,10 @@ impl WalV8LeaderWriter {
 impl WalV8ParallelWriter {
     #[cfg(feature = "bench")]
     pub(crate) fn io_diagnostics(&self) -> WalIoDiagnostics {
-        self.io_diagnostics
+        let mut diagnostics = self.io_diagnostics;
+        diagnostics.sliding_extent_preparation = self.io.extent_preparation_diagnostics();
+
+        diagnostics
     }
 
     #[cfg(feature = "bench")]
@@ -2354,6 +2555,12 @@ impl WalV8ParallelWriter {
                     && reservation.frame_offset + FRAME_LEN_U64 <= self.max_file_size,
                 "v8 Parallel FRONTIER physical boundaries are invalid"
             );
+            self.io.ensure_extent_prepared_through(
+                reservation
+                    .frame_offset
+                    .checked_add(FRAME_LEN_U64)
+                    .context("v8 Parallel FRONTIER extent end overflows")?,
+            )?;
             let frontier = WalV8Frontier {
                 generation: previous
                     .frontier
@@ -2811,6 +3018,14 @@ mod tests {
             .unwrap(),
             Some((WalExtentPreparationMode::Initialize, chunk_bytes))
         );
+        assert_eq!(
+            WalExtentPreparationMode::from_values(
+                Some(OsStr::new("sliding-fallocate")),
+                Some(OsStr::new("1048576")),
+            )
+            .unwrap(),
+            Some((WalExtentPreparationMode::SlidingFallocate, 1024 * 1024,))
+        );
         assert!(WalExtentPreparationMode::from_values(None, Some(OsStr::new("131072"))).is_err());
         assert!(WalExtentPreparationMode::from_values(Some(OsStr::new("none")), None).is_err());
         assert!(
@@ -3017,10 +3232,13 @@ mod tests {
             };
             #[cfg(feature = "bench")]
             {
-                let expected_len = if std::env::var_os(EXTENT_PREPARATION_ENV).is_some() {
-                    installed.image_len + WAL_V8_EXTENT_PREPARATION_CHUNK_BYTES as u64
-                } else {
-                    installed.image_len
+                let extent_mode = std::env::var_os(EXTENT_PREPARATION_ENV);
+                let expected_len = match extent_mode.as_deref().and_then(OsStr::to_str) {
+                    Some("fallocate" | "initialize") => {
+                        installed.image_len + WAL_V8_EXTENT_PREPARATION_CHUNK_BYTES as u64
+                    }
+                    None | Some("sliding-fallocate") => installed.image_len,
+                    Some(other) => anyhow::bail!("unexpected V8 extent preparation mode {other:?}"),
                 };
                 ensure!(
                     std::fs::metadata(wal_path)?.len() == expected_len,
@@ -3051,7 +3269,7 @@ mod tests {
         #[cfg(not(feature = "bench"))]
         let frontier_modes = ["buffered"];
         #[cfg(feature = "bench")]
-        let extent_preparation_modes = ["none", "fallocate", "initialize"];
+        let extent_preparation_modes = ["none", "fallocate", "initialize", "sliding-fallocate"];
         #[cfg(not(feature = "bench"))]
         let extent_preparation_modes = ["none"];
 
@@ -3128,6 +3346,17 @@ mod tests {
                     );
                     assert_eq!(std::fs::read_to_string(&marker_path)?.trim(), crash_point);
                     assert!(!ack_path.exists(), "crashed V8 write was acknowledged");
+
+                    #[cfg(feature = "bench")]
+                    if extent_preparation_mode == "sliding-fallocate" {
+                        ensure!(
+                            std::fs::metadata(&wal_path)?.len()
+                                == HEADER_LEN_U64
+                                    + FRAME_LEN_U64
+                                    + WAL_V8_EXTENT_PREPARATION_CHUNK_BYTES as u64,
+                            "sliding V8 extent preparation did not cover the first DATA write"
+                        );
+                    }
 
                     let recovered = super::super::install::recover_and_install_active(
                         &wal_path,

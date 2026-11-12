@@ -20,7 +20,7 @@ use clap::{Parser, ValueEnum};
 #[cfg(feature = "bench")]
 use kv_engine_wrapper::wal::{
     WalExtentPreparationDiagnostics, WalExtentPreparationMode, WalIoDiagnostics,
-    WalIoHandleMetadata,
+    WalIoHandleMetadata, WalV8SlidingExtentPreparationDiagnostics,
 };
 use kv_engine_wrapper::{
     BackupOptions, CreateBackupOutcome, EnablePitrOutcome, MAX_STATUS_PAGE_SIZE,
@@ -1229,6 +1229,7 @@ struct WalIoDiagnosticsRecord {
     frontier: WalIoHandleRecord,
     sync: WalIoHandleRecord,
     extent_preparation: Option<WalExtentPreparationRecord>,
+    sliding_extent_preparation: Option<WalV8SlidingExtentPreparationRecord>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -1241,6 +1242,28 @@ struct WalExtentPreparationRecord {
     elapsed_ns: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize)]
+struct WalV8SlidingExtentPreparationRecord {
+    mode: &'static str,
+    start_offset: u64,
+    max_file_size: u64,
+    window_bytes: u64,
+    prepared_end: u64,
+    fallocate_calls: u64,
+    allocated_bytes: u64,
+    elapsed_ns: u64,
+}
+
+#[cfg(feature = "bench")]
+impl WalV8SlidingExtentPreparationRecord {
+    fn same_configuration(&self, other: &Self) -> bool {
+        self.mode == other.mode
+            && self.start_offset == other.start_offset
+            && self.max_file_size == other.max_file_size
+            && self.window_bytes == other.window_bytes
+    }
+}
+
 #[cfg(feature = "bench")]
 impl From<WalExtentPreparationDiagnostics> for WalExtentPreparationRecord {
     fn from(diagnostics: WalExtentPreparationDiagnostics) -> Self {
@@ -1248,11 +1271,28 @@ impl From<WalExtentPreparationDiagnostics> for WalExtentPreparationRecord {
             mode: match diagnostics.mode {
                 WalExtentPreparationMode::Fallocate => "fallocate",
                 WalExtentPreparationMode::Initialize => "initialize",
+                WalExtentPreparationMode::SlidingFallocate => "sliding-fallocate",
             },
             start_offset: diagnostics.start_offset,
             end_offset: diagnostics.end_offset,
             allocated_bytes: diagnostics.allocated_bytes,
             initialized_bytes: diagnostics.initialized_bytes,
+            elapsed_ns: diagnostics.elapsed_ns,
+        }
+    }
+}
+
+#[cfg(feature = "bench")]
+impl From<WalV8SlidingExtentPreparationDiagnostics> for WalV8SlidingExtentPreparationRecord {
+    fn from(diagnostics: WalV8SlidingExtentPreparationDiagnostics) -> Self {
+        Self {
+            mode: "sliding-fallocate",
+            start_offset: diagnostics.start_offset,
+            max_file_size: diagnostics.max_file_size,
+            window_bytes: diagnostics.window_bytes,
+            prepared_end: diagnostics.prepared_end,
+            fallocate_calls: diagnostics.fallocate_calls,
+            allocated_bytes: diagnostics.allocated_bytes,
             elapsed_ns: diagnostics.elapsed_ns,
         }
     }
@@ -1266,7 +1306,28 @@ impl From<WalIoDiagnostics> for WalIoDiagnosticsRecord {
             frontier: diagnostics.frontier.into(),
             sync: diagnostics.sync.into(),
             extent_preparation: diagnostics.extent_preparation.map(Into::into),
+            sliding_extent_preparation: diagnostics.sliding_extent_preparation.map(Into::into),
         }
+    }
+}
+
+#[cfg(feature = "bench")]
+impl WalIoDiagnosticsRecord {
+    fn stable_with(&self, other: &Self) -> bool {
+        let sliding_configuration_stable = match (
+            &self.sliding_extent_preparation,
+            &other.sliding_extent_preparation,
+        ) {
+            (Some(start), Some(end)) => start.same_configuration(end),
+            (None, None) => true,
+            _ => false,
+        };
+
+        self.data == other.data
+            && self.frontier == other.frontier
+            && self.sync == other.sync
+            && self.extent_preparation == other.extent_preparation
+            && sliding_configuration_stable
     }
 }
 
@@ -1375,7 +1436,7 @@ fn wal_pipeline_record(
     let wal_io_stable = wal_io_start
         .as_ref()
         .zip(wal_io_end.as_ref())
-        .map(|(start, end)| start == end);
+        .map(|(start, end)| start.stable_with(end));
     let sync_observations = detailed.then(|| {
         engine
             .write_profile_sync_observations()
@@ -9514,6 +9575,16 @@ fn validate_run_mode(cfg: &HarnessConfig, bench_arg: Option<&str>) -> Result<()>
 
     let extent_mode = std::env::var_os(WAL_V8_EXTENT_PREPARATION_ENV);
     let extent_bytes = std::env::var_os(WAL_V8_EXTENT_PREPARATION_BYTES_ENV);
+    validate_v8_extent_preparation(cfg, extent_mode.as_deref(), extent_bytes.as_deref())?;
+
+    Ok(())
+}
+
+fn validate_v8_extent_preparation(
+    cfg: &HarnessConfig,
+    extent_mode: Option<&std::ffi::OsStr>,
+    extent_bytes: Option<&std::ffi::OsStr>,
+) -> Result<()> {
     if extent_mode.is_some() || extent_bytes.is_some() {
         anyhow::ensure!(
             cfg!(feature = "bench"),
@@ -9524,11 +9595,15 @@ fn validate_run_mode(cfg: &HarnessConfig, bench_arg: Option<&str>) -> Result<()>
                 && cfg.wal_io_mode == WalIoModeArg::Parallel,
             "V8 extent preparation requires PITR V8 Parallel I/O"
         );
-        let extent_mode = extent_mode
-            .context("TOYKV_BENCH_V8_EXTENT_PREP requires `fallocate` or `initialize`")?;
+        let extent_mode = extent_mode.context(
+            "TOYKV_BENCH_V8_EXTENT_PREP requires `fallocate`, `initialize`, or `sliding-fallocate`",
+        )?;
         anyhow::ensure!(
-            matches!(extent_mode.to_str(), Some("fallocate" | "initialize")),
-            "TOYKV_BENCH_V8_EXTENT_PREP must be `fallocate` or `initialize`"
+            matches!(
+                extent_mode.to_str(),
+                Some("fallocate" | "initialize" | "sliding-fallocate")
+            ),
+            "TOYKV_BENCH_V8_EXTENT_PREP must be `fallocate`, `initialize`, or `sliding-fallocate`"
         );
         let extent_bytes = extent_bytes
             .context("TOYKV_BENCH_V8_EXTENT_PREP_BYTES is required with extent preparation")?;
@@ -9550,6 +9625,67 @@ fn validate_run_mode(cfg: &HarnessConfig, bench_arg: Option<&str>) -> Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn sliding_extent_preparation_is_accepted_by_run_mode_validation() {
+        let args = Args::try_parse_from(["write-perf", "--pitr"]).expect("parse PITR args");
+        let cfg = HarnessConfig::from_args(args);
+
+        for window_bytes in [1 << 20, 4 << 20] {
+            let window_bytes = window_bytes.to_string();
+            validate_v8_extent_preparation(
+                &cfg,
+                Some(std::ffi::OsStr::new("sliding-fallocate")),
+                Some(std::ffi::OsStr::new(&window_bytes)),
+            )
+            .expect("accept aligned sliding fallocate window");
+        }
+
+        assert!(
+            validate_v8_extent_preparation(
+                &cfg,
+                Some(std::ffi::OsStr::new("sliding-fallocate")),
+                Some(std::ffi::OsStr::new("1025")),
+            )
+            .is_err()
+        );
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn sliding_extent_progress_does_not_mark_io_handles_unstable() {
+        let start = WalIoDiagnosticsRecord {
+            sliding_extent_preparation: Some(WalV8SlidingExtentPreparationRecord {
+                mode: "sliding-fallocate",
+                start_offset: 4096,
+                max_file_size: 1 << 20,
+                window_bytes: 1 << 17,
+                prepared_end: 4096,
+                fallocate_calls: 0,
+                allocated_bytes: 0,
+                elapsed_ns: 0,
+            }),
+            ..WalIoDiagnosticsRecord::default()
+        };
+        let mut end = start.clone();
+        let preparation = end
+            .sliding_extent_preparation
+            .as_mut()
+            .expect("sliding prep should be recorded");
+        preparation.prepared_end += preparation.window_bytes;
+        preparation.fallocate_calls = 1;
+        preparation.allocated_bytes = preparation.window_bytes;
+        preparation.elapsed_ns = 100;
+
+        assert!(start.stable_with(&end));
+
+        end.sliding_extent_preparation
+            .as_mut()
+            .expect("sliding prep should be recorded")
+            .window_bytes *= 2;
+        assert!(!start.stable_with(&end));
+    }
 
     #[test]
     fn pitr_benchmark_retries_only_unadmitted_barrier_rejections() {
@@ -11250,6 +11386,7 @@ mod tests {
                             inode: 11,
                         },
                         extent_preparation: None,
+                        sliding_extent_preparation: None,
                     }),
                     wal_io_end: cfg!(feature = "bench").then_some(WalIoDiagnosticsRecord {
                         data: WalIoHandleRecord {
@@ -11268,6 +11405,7 @@ mod tests {
                             inode: 11,
                         },
                         extent_preparation: None,
+                        sliding_extent_preparation: None,
                     }),
                     wal_io_stable: cfg!(feature = "bench").then_some(true),
                     ..WalPipelineRecord::default()
