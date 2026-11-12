@@ -42,7 +42,9 @@ use crate::{
         parallel_worker::{
             GroupWriteResult, IoWorker, IoWorkerClient, WorkerBuffer, WriteBuffer, WriteGroup,
         },
-        v7::admission::{WalV7OwnedBatchReservation, WalV7OwnedPreparationReservation},
+        v7::admission::{
+            WalV7OwnedBatchReservation, WalV7OwnedPreparationReservation, WalV7ReservationError,
+        },
     },
 };
 
@@ -81,6 +83,7 @@ const MAX_GROUP_TICKETS: usize = 8;
 // under contention; explicit Leader groups retain their separate smaller cap.
 const MAX_PARALLEL_INFLIGHT_TICKETS: usize = 32;
 const DATA_GROUP_JOIN_BUDGET: Duration = Duration::from_micros(10);
+const WAL_V8_PRODUCTION_EXTENT_WINDOW_BYTES: u64 = 1 << 20;
 
 #[cfg(feature = "bench")]
 fn data_completion_to_frontier_start_ns(
@@ -662,7 +665,6 @@ impl WalV8SlidingExtentPreparation {
     }
 }
 
-#[cfg(feature = "bench")]
 fn sliding_extent_target_end(
     start_offset: u64,
     max_file_size: u64,
@@ -685,6 +687,308 @@ fn sliding_extent_target_end(
         )
         .context("sliding V8 extent preparation end overflows")?
         .min(max_file_size))
+}
+
+struct WalV8ExtentSlack {
+    start: u64,
+    end: u64,
+    reservation_id: u64,
+    charged_bytes: u64,
+}
+
+struct WalV8ExtentPreallocationState {
+    prepared_end: u64,
+    slack: Vec<WalV8ExtentSlack>,
+    #[cfg(feature = "bench")]
+    fallocate_calls: u64,
+    #[cfg(feature = "bench")]
+    allocated_bytes: u64,
+    #[cfg(feature = "bench")]
+    elapsed_ns: u64,
+}
+
+/// Sliding ext4 extent allocation for V8. Each window's unused suffix is
+/// charged to the image owner, then its charge transfers to the normal DATA or
+/// FRONTIER reservation as that range is assigned.
+struct WalV8ExtentPreallocator {
+    data_file: File,
+    start_offset: u64,
+    max_file_size: u64,
+    window_bytes: u64,
+    source_allocation_unit: u64,
+    reservation_owner: Option<Arc<WalV8ReservationOwner>>,
+    state: Mutex<WalV8ExtentPreallocationState>,
+}
+
+impl WalV8ExtentPreallocator {
+    fn new(
+        data_file: File,
+        sync_file: &File,
+        start_offset: u64,
+        max_file_size: u64,
+        window_bytes: u64,
+        reservation_owner: Option<Arc<WalV8ReservationOwner>>,
+    ) -> Result<Self> {
+        ensure!(
+            is_o_direct_file(&data_file)?,
+            "V8 sliding extent preparation requires an O_DIRECT DATA worker"
+        );
+        let data_metadata = data_file
+            .metadata()
+            .context("inspect V8 WAL before sliding extent preparation")?;
+        let sync_metadata = sync_file
+            .metadata()
+            .context("inspect V8 WAL sync handle before sliding extent preparation")?;
+        ensure!(
+            data_metadata.is_file()
+                && sync_metadata.is_file()
+                && data_metadata.dev() == sync_metadata.dev()
+                && data_metadata.ino() == sync_metadata.ino()
+                && data_metadata.len() == start_offset,
+            "V8 sliding extent preparation requires the untouched installed Active WAL inode"
+        );
+        ensure!(
+            window_bytes > 0 && window_bytes.is_multiple_of(FRAME_LEN_U64),
+            "V8 sliding extent window must be a positive multiple of the frame size"
+        );
+        ensure!(
+            start_offset <= max_file_size,
+            "V8 sliding extent preparation starts beyond the WAL segment limit"
+        );
+        if let Some(owner) = &reservation_owner {
+            ensure!(
+                max_file_size <= MAX_WAL_FILE_SIZE,
+                "V8 sliding extent preparation exceeds the maximum WAL file size"
+            );
+            ensure!(
+                owner.source_allocation_unit() > 0,
+                "V8 source allocation unit is zero"
+            );
+        }
+
+        Ok(Self {
+            data_file,
+            start_offset,
+            max_file_size,
+            window_bytes,
+            source_allocation_unit: reservation_owner
+                .as_ref()
+                .map_or(FRAME_LEN_U64, |owner| owner.source_allocation_unit()),
+            reservation_owner,
+            state: Mutex::new(WalV8ExtentPreallocationState {
+                prepared_end: start_offset,
+                slack: Vec::new(),
+                #[cfg(feature = "bench")]
+                fallocate_calls: 0,
+                #[cfg(feature = "bench")]
+                allocated_bytes: 0,
+                #[cfg(feature = "bench")]
+                elapsed_ns: 0,
+            }),
+        })
+    }
+
+    fn ensure_prepared_through(&self, required_end: u64) -> Result<()> {
+        ensure!(
+            required_end <= self.max_file_size,
+            "V8 sliding extent preparation exceeds the WAL segment limit"
+        );
+        let mut state = self.state.lock();
+        if required_end <= state.prepared_end {
+            return Ok(());
+        }
+
+        let mut target_end = sliding_extent_target_end(
+            self.start_offset,
+            self.max_file_size,
+            self.window_bytes,
+            required_end,
+        )?;
+        if self.reservation_owner.is_none() {
+            // The window suffix has no quota owner in test-only writers, so
+            // keep those paths exact rather than allocating uncharged space.
+            target_end = required_end;
+        }
+        let mut slack_reservation = None;
+        if target_end > required_end
+            && let Some(owner) = &self.reservation_owner
+        {
+            let slack_bytes = target_end - required_end;
+            let charged_bytes = round_up_extent_charge(slack_bytes, self.source_allocation_unit)?;
+            match owner.reserve_extent_slack(charged_bytes) {
+                Ok(reservation_id) => slack_reservation = Some((reservation_id, charged_bytes)),
+                Err(WalV7ReservationError::SourceSpoolLimit { .. }) => {
+                    // Ticket reservations already cover the exact DATA and
+                    // worst-case FRONTIER prefix. If quota cannot cover the
+                    // speculative suffix, allocate only that required prefix.
+                    target_end = required_end;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+
+        let prepared_start = state.prepared_end;
+        #[cfg(feature = "bench")]
+        let started_at = Instant::now();
+        #[cfg(feature = "bench")]
+        state.fallocate_calls = state.fallocate_calls.saturating_add(1);
+        if let Err(error) = fallocate_wal_range(&self.data_file, prepared_start, target_end) {
+            // Keep any window reservation charged: a failed fallocate may
+            // have allocated a partial range before returning an error.
+            return Err(error).context("fallocate sliding V8 WAL extent");
+        }
+        #[cfg(feature = "bench")]
+        let allocated_bytes = target_end - prepared_start;
+
+        if let Some((reservation_id, charged_bytes)) = slack_reservation {
+            state.slack.push(WalV8ExtentSlack {
+                start: required_end,
+                end: target_end,
+                reservation_id,
+                charged_bytes,
+            });
+        }
+        state.prepared_end = target_end;
+        #[cfg(feature = "bench")]
+        {
+            state.allocated_bytes = state.allocated_bytes.saturating_add(allocated_bytes);
+            state.elapsed_ns = state
+                .elapsed_ns
+                .saturating_add(u64::try_from(started_at.elapsed().as_nanos()).unwrap_or(u64::MAX));
+        }
+
+        ensure!(
+            state.prepared_end >= required_end,
+            "V8 sliding extent preparation did not cover the requested write"
+        );
+
+        Ok(())
+    }
+
+    /// Transfer quota coverage for a unique DATA or FRONTIER write range from
+    /// window slack to the write's existing batch reservation.
+    fn consume_source_credit(&self, start: u64, end: u64) -> Result<()> {
+        ensure!(start <= end, "V8 extent source-credit range is reversed");
+        if start == end {
+            return Ok(());
+        }
+
+        let Some(owner) = &self.reservation_owner else {
+            return Ok(());
+        };
+        let mut state = self.state.lock();
+        let first = state.slack.partition_point(|window| window.end <= start);
+        for window in &mut state.slack[first..] {
+            if window.start >= end {
+                break;
+            }
+            let overlap_start = start.max(window.start);
+            let overlap_end = end.min(window.end);
+            if overlap_start >= overlap_end || window.charged_bytes == 0 {
+                continue;
+            }
+            let overlap_bytes = overlap_end - overlap_start;
+            let released_bytes =
+                round_up_extent_charge(overlap_bytes, self.source_allocation_unit)?
+                    .min(window.charged_bytes);
+            owner.release_extent_slack(window.reservation_id, released_bytes)?;
+            window.charged_bytes -= released_bytes;
+        }
+
+        Ok(())
+    }
+
+    #[cfg(feature = "bench")]
+    fn diagnostics(&self) -> WalV8SlidingExtentPreparationDiagnostics {
+        let state = self.state.lock();
+
+        WalV8SlidingExtentPreparationDiagnostics {
+            mode: WalExtentPreparationMode::SlidingFallocate,
+            start_offset: self.start_offset,
+            max_file_size: self.max_file_size,
+            window_bytes: self.window_bytes,
+            initialization_chunk_bytes: WAL_V8_EXTENT_PREPARATION_CHUNK_BYTES as u64,
+            prepared_end: state.prepared_end,
+            allocated_end: state.prepared_end,
+            fallocate_calls: state.fallocate_calls,
+            allocated_bytes: state.allocated_bytes,
+            initialization_chunks: 0,
+            initialized_bytes: 0,
+            elapsed_ns: state.elapsed_ns,
+            fallocate_elapsed_ns: state.elapsed_ns,
+            initialization_elapsed_ns: 0,
+            wait_calls: 0,
+            wait_ns: 0,
+        }
+    }
+}
+
+fn round_up_extent_charge(bytes: u64, unit: u64) -> Result<u64> {
+    ensure!(unit > 0, "V8 source allocation unit is zero");
+    bytes
+        .checked_add(unit - 1)
+        .context("V8 extent source charge overflows")?
+        .checked_div(unit)
+        .context("V8 source allocation unit is zero")?
+        .checked_mul(unit)
+        .context("V8 extent source charge overflows")
+}
+
+fn fallocate_wal_range(file: &File, start: u64, end: u64) -> Result<()> {
+    ensure!(end > start, "V8 fallocate range is empty");
+    let offset = libc::off_t::try_from(start).context("V8 fallocate offset exceeds off_t")?;
+    let len = libc::off_t::try_from(end - start).context("V8 fallocate length exceeds off_t")?;
+    // SAFETY: both values are checked, and the owned descriptor remains live.
+    let result = unsafe { libc::fallocate(file.as_raw_fd(), 0, offset, len) };
+    ensure!(
+        result == 0,
+        "V8 fallocate failed: {}",
+        io::Error::last_os_error()
+    );
+
+    Ok(())
+}
+
+fn is_o_direct_file(file: &File) -> Result<bool> {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: the descriptor is valid for the lifetime of `file`, and
+        // F_GETFL does not dereference its third argument.
+        let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+        ensure!(
+            flags >= 0,
+            "failed to query V8 WAL handle flags with F_GETFL: {}",
+            io::Error::last_os_error()
+        );
+
+        Ok(flags & libc::O_DIRECT != 0)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = file;
+        Ok(false)
+    }
+}
+
+fn is_ext_family_filesystem(file: &File) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+        // SAFETY: file is live, and stat points to writable storage of the required size.
+        if unsafe { libc::fstatfs(file.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
+            return false;
+        }
+
+        // SAFETY: a successful fstatfs initialized stat.
+        unsafe { stat.assume_init() }.f_type == libc::EXT4_SUPER_MAGIC
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = file;
+        false
+    }
 }
 
 #[cfg(feature = "bench")]
@@ -962,6 +1266,7 @@ struct WalV8ParallelIo {
     profile: arc_swap::ArcSwapOption<crate::mem_table::WriteProfile>,
     #[cfg(feature = "bench")]
     hol_diagnostics_enabled: std::sync::atomic::AtomicBool,
+    extent_preallocator: Option<Arc<WalV8ExtentPreallocator>>,
     #[cfg(feature = "bench")]
     extent_preparation: Option<Arc<WalV8SlidingExtentPreparation>>,
     completion_thread: Mutex<Option<thread::JoinHandle<()>>>,
@@ -972,6 +1277,7 @@ impl WalV8ParallelIo {
         worker_file: File,
         coordinator: WalV8ParallelCoordinator,
         first_ticket: u64,
+        extent_preallocator: Option<Arc<WalV8ExtentPreallocator>>,
         #[cfg(feature = "bench")] extent_preparation: Option<Arc<WalV8SlidingExtentPreparation>>,
     ) -> Result<Arc<Self>> {
         let submit_any_ready_ticket = benchmark_submits_any_ready_ticket()?;
@@ -1046,6 +1352,7 @@ impl WalV8ParallelIo {
             profile: arc_swap::ArcSwapOption::empty(),
             #[cfg(feature = "bench")]
             hol_diagnostics_enabled: std::sync::atomic::AtomicBool::new(false),
+            extent_preallocator,
             #[cfg(feature = "bench")]
             extent_preparation,
             completion_thread: Mutex::new(Some(completion_thread)),
@@ -1053,13 +1360,22 @@ impl WalV8ParallelIo {
     }
 
     fn ensure_extent_prepared_through(&self, required_end: u64) -> Result<()> {
-        #[cfg(feature = "bench")]
-        if let Some(preparation) = &self.extent_preparation {
-            return preparation.ensure_prepared_through(required_end);
+        if let Some(preallocator) = &self.extent_preallocator {
+            preallocator.ensure_prepared_through(required_end)?;
         }
 
-        #[cfg(not(feature = "bench"))]
-        let _ = required_end;
+        #[cfg(feature = "bench")]
+        if let Some(preparation) = &self.extent_preparation {
+            preparation.ensure_prepared_through(required_end)?;
+        }
+
+        Ok(())
+    }
+
+    fn consume_extent_source_credit(&self, start: u64, end: u64) -> Result<()> {
+        if let Some(preallocator) = &self.extent_preallocator {
+            preallocator.consume_source_credit(start, end)?;
+        }
 
         Ok(())
     }
@@ -1080,9 +1396,14 @@ impl WalV8ParallelIo {
 
     #[cfg(feature = "bench")]
     fn extent_preparation_diagnostics(&self) -> Option<WalV8SlidingExtentPreparationDiagnostics> {
-        self.extent_preparation
+        self.extent_preallocator
             .as_ref()
-            .map(|preparation| preparation.diagnostics())
+            .map(|preallocator| preallocator.diagnostics())
+            .or_else(|| {
+                self.extent_preparation
+                    .as_ref()
+                    .map(|preparation| preparation.diagnostics())
+            })
     }
 
     #[cfg(feature = "bench")]
@@ -1273,6 +1594,7 @@ impl WalV8ParallelIo {
                 .checked_add(1)
                 .context("v8 out-of-order DATA ticket overflows")?;
             self.ensure_extent_prepared_through(allocation_end)?;
+            self.consume_extent_source_credit(pending.file_offset, allocation_end)?;
             let write = WriteBuffer::new(pending.buffer, pending.file_offset, write_len);
             let group = WriteGroup::new(ticket..ticket_end, vec![write])
                 .map_err(|error| anyhow::anyhow!("build v8 out-of-order DATA group: {error:?}"))?;
@@ -1442,6 +1764,7 @@ impl WalV8ParallelIo {
             )
             .map_err(|error| anyhow::anyhow!("build v8 DATA worker group: {error:?}"))?;
             self.ensure_extent_prepared_through(cursor)?;
+            self.consume_extent_source_credit(allocation_start, cursor)?;
             self.client
                 .submit_group(group)
                 .context("submit v8 DATA worker group")?;
@@ -1900,37 +2223,61 @@ impl WalV8LeaderWriter {
             io_diagnostics.data = WalIoHandleMetadata::from_file(&worker_file)?;
         }
         #[cfg(feature = "bench")]
-        let extent_preparation = match WalExtentPreparationMode::from_environment()? {
-            Some((mode, window_bytes)) if mode.is_sliding() => {
-                let start_offset = self.coordinator.last_frontier_end();
-                let preparation = Arc::new(WalV8SlidingExtentPreparation::new(
-                    worker_file
-                        .try_clone()
-                        .context("clone v8 WAL handle for sliding extent preparation")?,
-                    &self.sync_file,
-                    start_offset,
-                    self.max_file_size,
-                    window_bytes,
-                    mode,
-                )?);
-                io_diagnostics.sliding_extent_preparation = Some(preparation.diagnostics());
+        let (extent_preallocator, extent_preparation) =
+            match WalExtentPreparationMode::from_environment()? {
+                Some((mode, window_bytes)) if mode.is_sliding() => {
+                    let start_offset = self.coordinator.last_frontier_end();
+                    if mode == WalExtentPreparationMode::SlidingFallocate
+                        && let Some(owner) = &self.reservation_owner
+                    {
+                        let preallocator = Arc::new(WalV8ExtentPreallocator::new(
+                            worker_file
+                                .try_clone()
+                                .context("clone v8 WAL handle for sliding extent preparation")?,
+                            &self.sync_file,
+                            start_offset,
+                            self.max_file_size,
+                            window_bytes,
+                            Some(Arc::clone(owner)),
+                        )?);
+                        io_diagnostics.sliding_extent_preparation =
+                            Some(preallocator.diagnostics());
 
-                Some(preparation)
-            }
-            Some((mode, bytes)) => {
-                io_diagnostics.extent_preparation = Some(prepare_v8_extent_suffix(
-                    &worker_file,
-                    &self.sync_file,
-                    self.coordinator.last_frontier_end(),
-                    self.max_file_size,
-                    mode,
-                    bytes,
-                )?);
+                        (Some(preallocator), None)
+                    } else {
+                        // Unit tests and non-PITR benchmark constructors have
+                        // no image quota owner. Preserve their explicit
+                        // benchmark preparation behavior without enabling it
+                        // in the production path.
+                        let preparation = Arc::new(WalV8SlidingExtentPreparation::new(
+                            worker_file
+                                .try_clone()
+                                .context("clone v8 WAL handle for sliding extent preparation")?,
+                            &self.sync_file,
+                            start_offset,
+                            self.max_file_size,
+                            window_bytes,
+                            mode,
+                        )?);
+                        io_diagnostics.sliding_extent_preparation = Some(preparation.diagnostics());
 
-                None
-            }
-            None => None,
-        };
+                        (None, Some(preparation))
+                    }
+                }
+                Some((mode, bytes)) => {
+                    io_diagnostics.extent_preparation = Some(prepare_v8_extent_suffix(
+                        &worker_file,
+                        &self.sync_file,
+                        self.coordinator.last_frontier_end(),
+                        self.max_file_size,
+                        mode,
+                        bytes,
+                    )?);
+
+                    (None, None)
+                }
+                None => (None, None),
+            };
         #[cfg(feature = "bench")]
         let frontier_file = match WalV8FrontierWriteMode::from_environment()? {
             WalV8FrontierWriteMode::Buffered => self.write_file,
@@ -1955,11 +2302,30 @@ impl WalV8LeaderWriter {
         }
         #[cfg(not(feature = "bench"))]
         let frontier_file = self.write_file;
+        #[cfg(not(feature = "bench"))]
+        let extent_preallocator = if let Some(owner) = &self.reservation_owner
+            && is_ext_family_filesystem(&worker_file)
+            && is_o_direct_file(&worker_file)?
+        {
+            Some(Arc::new(WalV8ExtentPreallocator::new(
+                worker_file
+                    .try_clone()
+                    .context("clone v8 WAL handle for production extent preparation")?,
+                &self.sync_file,
+                self.coordinator.last_frontier_end(),
+                self.max_file_size,
+                WAL_V8_PRODUCTION_EXTENT_WINDOW_BYTES,
+                Some(Arc::clone(owner)),
+            )?))
+        } else {
+            None
+        };
         let initial_ticket = self.coordinator.next_ticket();
         let io = WalV8ParallelIo::spawn(
             worker_file,
             self.coordinator.clone(),
             initial_ticket,
+            extent_preallocator,
             #[cfg(feature = "bench")]
             extent_preparation,
         )?;
@@ -2892,12 +3258,13 @@ impl WalV8ParallelWriter {
                     && reservation.frame_offset + FRAME_LEN_U64 <= self.max_file_size,
                 "v8 Parallel FRONTIER physical boundaries are invalid"
             );
-            self.io.ensure_extent_prepared_through(
-                reservation
-                    .frame_offset
-                    .checked_add(FRAME_LEN_U64)
-                    .context("v8 Parallel FRONTIER extent end overflows")?,
-            )?;
+            let frontier_end = reservation
+                .frame_offset
+                .checked_add(FRAME_LEN_U64)
+                .context("v8 Parallel FRONTIER extent end overflows")?;
+            self.io.ensure_extent_prepared_through(frontier_end)?;
+            self.io
+                .consume_extent_source_credit(reservation.frame_offset, frontier_end)?;
             let frontier = WalV8Frontier {
                 generation: previous
                     .frontier

@@ -7,7 +7,7 @@ use parking_lot::Mutex;
 
 use crate::wal::v7::admission::{
     WalV7OwnedBatchReservation, WalV7OwnedPreparationReservation, WalV7Reservation,
-    WalV7ReservationOwner, WalV7ResourceCharge, WalV7RetainedResources,
+    WalV7ReservationError, WalV7ReservationOwner, WalV7ResourceCharge, WalV7RetainedResources,
 };
 
 use super::{WAL_V8_HEADER_LEN, codec::WAL_V8_FRAME_LEN, install::WalV8InstalledRecovery};
@@ -158,6 +158,28 @@ impl WalV8ReservationOwner {
         self.image_owner
             .reserve_preparation_buffer(bytes)
             .map_err(Into::into)
+    }
+
+    pub(crate) fn source_allocation_unit(&self) -> u64 {
+        self.source_allocation_unit
+    }
+
+    /// Reserve bytes for unused space in a V8 sliding-preallocation window.
+    ///
+    /// The image owner retains this charge after the writer is dropped. As DATA
+    /// or FRONTIER frames occupy the reserved range, callers release the
+    /// corresponding credit; any unused suffix stays charged until source
+    /// cleanup retires the image.
+    pub(crate) fn reserve_extent_slack(&self, bytes: u64) -> Result<u64, WalV7ReservationError> {
+        self.image_owner.reserve_image_source_spool(bytes)
+    }
+
+    pub(crate) fn release_extent_slack(
+        &self,
+        id: u64,
+        bytes: u64,
+    ) -> Result<(), WalV7ReservationError> {
+        self.image_owner.release_image_source_spool(id, bytes)
     }
 
     /// Reserve physical source space, logical WAL quota, and buffers before
