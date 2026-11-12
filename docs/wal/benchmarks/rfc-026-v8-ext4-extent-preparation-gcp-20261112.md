@@ -12,8 +12,10 @@ Zero-initializing the allocated suffix raised V8's timed throughput further,
 but the 512 MiB initialization took about 759 ms outside the timed benchmark.
 Charging that one-time work to this 100,000-put run reduces its effective rate
 to 32.50k puts/s, slightly below `fallocate` alone at 33.22k puts/s. The next
-useful test is bounded/background extent preparation that overlaps writes,
-with preparation cost included in end-to-end throughput.
+bounded-preparation follow-up is recorded in the
+[sliding extent preparation report](rfc-026-v8-bounded-extent-gcp-20261112.md):
+1 MiB and 4 MiB windows both reached about 33.8–33.9k puts/s with six runs per
+arm and allocation work included in the measured workload.
 
 No production WAL behavior changed. The preparation control and crash-recovery
 coverage are available only with the `bench` feature.
@@ -103,10 +105,11 @@ another timed gain and sharply reduces aggregate sync time, but the full
 This does not qualify a production change. The benchmark preallocates one
 512 MiB suffix before timing, while V7 prepares bounded regions concurrently
 with writes. A next experiment should implement a benchmark-only bounded
-preparation window with a `prepared_file_end` guard, then compare no extra
-preparation, `fallocate` only, and incremental zero initialization. It should
-charge all preparation I/O to the end-to-end run and retain the existing
-recovery normalization checks.
+preparation window with a `prepared_file_end` guard. That follow-up has now
+compared no extra preparation with sliding `fallocate` at 1 MiB and 4 MiB
+windows, charging allocation calls during the workload. The measured gain is
+large, but the matrix still needs writer-count and batch-workload coverage
+before any production adoption.
 
 ## Implementation, validation, and provenance
 
