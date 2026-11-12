@@ -1300,12 +1300,13 @@ fn wal_pipeline_record(
                     _ => "ticket_prefix",
                 },
             ),
-        v8_polar_advance: (wal_run_info.format_version == 8
-            && wal_run_info.io_mode == "parallel")
-            .then(|| match std::env::var("TOYKV_BENCH_V8_POLAR_ADVANCE").as_deref() {
-                Ok("1") => "batch_advance",
-                _ => "legacy_per_group",
-            }),
+        v8_polar_advance: (wal_run_info.format_version == 8 && wal_run_info.io_mode == "parallel")
+            .then(
+                || match std::env::var("TOYKV_BENCH_V8_POLAR_ADVANCE").as_deref() {
+                    Ok("1") => "batch_advance",
+                    _ => "legacy_per_group",
+                },
+            ),
         v8_hol_diagnostics_enabled: (wal_run_info.format_version == 8
             && wal_run_info.io_mode == "parallel")
             .then_some(hol_diagnostics_enabled),

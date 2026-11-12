@@ -406,9 +406,7 @@ impl WalV8ParallelIo {
                                 Err(_) => break,
                             }
                         }
-                        if let Err(error) =
-                            reap_v8_group_results(&completion_coordinator, batch)
-                        {
+                        if let Err(error) = reap_v8_group_results(&completion_coordinator, batch) {
                             log::error!("v8 WAL completion advance failed: {error:#}");
                             completion_coordinator.poison();
                         }

@@ -1474,10 +1474,8 @@ fn fold_ready_digests(
 fn advance_data_complete_prefix(state: &mut CoordinatorState) -> bool {
     let previous = state.data_completed_ticket_end;
     loop {
-        let offset = usize::try_from(
-            state.data_completed_ticket_end - state.durable_ticket_end,
-        )
-        .expect("bounded v8 DATA completion window fits usize");
+        let offset = usize::try_from(state.data_completed_ticket_end - state.durable_ticket_end)
+            .expect("bounded v8 DATA completion window fits usize");
         let Some(ticket) = state.tickets.get(offset) else {
             break;
         };
