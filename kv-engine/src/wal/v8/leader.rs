@@ -831,7 +831,9 @@ impl WalV8ExtentPreallocator {
         #[cfg(feature = "bench")]
         let started_at = Instant::now();
         #[cfg(feature = "bench")]
-        state.fallocate_calls = state.fallocate_calls.saturating_add(1);
+        {
+            state.fallocate_calls = state.fallocate_calls.saturating_add(1);
+        }
         if let Err(error) = fallocate_wal_range(&self.data_file, prepared_start, target_end) {
             // Keep any window reservation charged: a failed fallocate may
             // have allocated a partial range before returning an error.
