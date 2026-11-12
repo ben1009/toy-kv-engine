@@ -2494,7 +2494,8 @@ mod tests {
         assert_eq!(coordinator.inner.state.lock().data_completed_ticket_end, 0);
         assert!(coordinator.frontier_ready_prefix().is_empty());
 
-        coordinator.mark_data_groups_complete(&[0..1])?;
+        let head = 0..1;
+        coordinator.mark_data_groups_complete(std::slice::from_ref(&head))?;
         assert_eq!(coordinator.inner.state.lock().data_completed_ticket_end, 3);
         assert_eq!(coordinator.durability_generation(), generation + 1);
         assert_eq!(coordinator.frontier_ready_prefix().len(), 3);
