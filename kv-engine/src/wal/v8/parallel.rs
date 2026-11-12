@@ -92,6 +92,9 @@ struct CoordinatorInner {
 
 struct CoordinatorState {
     durable_ticket_end: u64,
+    /// Contiguous DATA completion cursor (Polar-style advance, not durable state).
+    #[cfg(feature = "bench")]
+    data_completed_ticket_end: u64,
     durable_prefix_digest: WalV8Digest,
     folded_ticket_end: u64,
     folded_prefix_digest: WalV8Digest,
@@ -250,6 +253,8 @@ impl WalV8ParallelCoordinator {
             inner: Arc::new(CoordinatorInner {
                 state: Mutex::new(CoordinatorState {
                     durable_ticket_end: config.next_ticket,
+                    #[cfg(feature = "bench")]
+                    data_completed_ticket_end: config.next_ticket,
                     durable_prefix_digest: config.durable_prefix_digest,
                     folded_ticket_end: config.next_ticket,
                     folded_prefix_digest: config.durable_prefix_digest,
@@ -639,6 +644,8 @@ impl WalV8ParallelCoordinator {
         }
         #[cfg(feature = "bench")]
         refresh_data_completion_order_hol(&self.inner, &mut state);
+        #[cfg(feature = "bench")]
+        advance_data_complete_prefix(&mut state);
         signal_change(&self.inner, &mut state);
         signal_durability_progress(&self.inner, &mut state);
 
@@ -648,89 +655,121 @@ impl WalV8ParallelCoordinator {
     /// Publish a worker group's DATA completion atomically so frontier
     /// formation cannot observe a partial completion from one group.
     pub(crate) fn mark_data_group_complete(&self, tickets: Range<u64>) -> Result<()> {
+        self.mark_data_groups_complete_inner(&[tickets], false)
+    }
+
+    /// Polar-style completion advance: ingest a burst of unordered worker
+    /// results with one coordinator lock and one progress notification.
+    /// Only benchmark builds may select this path; durable publication remains
+    /// ordered and still requires every ticket in the frontier prefix.
+    #[cfg(feature = "bench")]
+    pub(crate) fn mark_data_groups_complete(&self, groups: &[Range<u64>]) -> Result<()> {
+        self.mark_data_groups_complete_inner(groups, true)
+    }
+
+    fn mark_data_groups_complete_inner(
+        &self,
+        groups: &[Range<u64>],
+        prefix_only_notifications: bool,
+    ) -> Result<()> {
         let mut state = self.inner.state.lock();
         ensure!(!state.poisoned, "v8 Parallel coordinator is poisoned");
-        let Some(ticket_count) = tickets.end.checked_sub(tickets.start) else {
-            poison_locked(&self.inner, &mut state);
-            anyhow::bail!("v8 DATA completion group has an invalid ticket range")
-        };
-        let Ok(ticket_count) = usize::try_from(ticket_count) else {
-            poison_locked(&self.inner, &mut state);
-            anyhow::bail!("v8 DATA completion group exceeds addressable tickets")
-        };
-        if ticket_count == 0 {
-            poison_locked(&self.inner, &mut state);
-            anyhow::bail!("v8 DATA completion group is empty")
-        }
-        let Some(start_index) = state
-            .tickets
-            .iter()
-            .position(|entry| entry.assignment.segment_ticket == tickets.start)
-        else {
-            poison_locked(&self.inner, &mut state);
-            anyhow::bail!("v8 DATA-completion group names an unknown ticket")
-        };
-        let Some(end_index) = start_index.checked_add(ticket_count) else {
-            poison_locked(&self.inner, &mut state);
-            anyhow::bail!("v8 DATA-completion group index overflows")
-        };
-        if end_index > state.tickets.len() {
-            poison_locked(&self.inner, &mut state);
-            anyhow::bail!("v8 DATA-completion group extends past admitted tickets")
-        }
-        let mut all_complete = true;
-        for (offset, entry) in state
-            .tickets
-            .iter()
-            .skip(start_index)
-            .take(ticket_count)
-            .enumerate()
-        {
-            let expected_ticket = tickets
-                .start
-                .checked_add(u64::try_from(offset)?)
-                .context("v8 DATA-completion ticket overflows")?;
-            if entry.assignment.segment_ticket != expected_ticket || !entry.frames_ready {
+        let mut changed = false;
+        for tickets in groups {
+            let Some(ticket_count) = tickets.end.checked_sub(tickets.start) else {
                 poison_locked(&self.inner, &mut state);
-                anyhow::bail!("v8 DATA-completion group does not match ready admitted tickets")
+                anyhow::bail!("v8 DATA completion group has an invalid ticket range")
+            };
+            let Ok(ticket_count) = usize::try_from(ticket_count) else {
+                poison_locked(&self.inner, &mut state);
+                anyhow::bail!("v8 DATA completion group exceeds addressable tickets")
+            };
+            if ticket_count == 0 {
+                poison_locked(&self.inner, &mut state);
+                anyhow::bail!("v8 DATA completion group is empty")
             }
-            all_complete &= entry.data_complete;
-        }
-        if all_complete {
-            return Ok(());
-        }
-        if state
-            .tickets
-            .iter()
-            .skip(start_index)
-            .take(ticket_count)
-            .any(|entry| entry.data_complete)
-        {
-            poison_locked(&self.inner, &mut state);
-            anyhow::bail!("v8 DATA-completion group partially duplicates prior completion")
-        }
-        #[cfg(feature = "bench")]
-        let data_completed_at = self
-            .inner
-            .data_completion_timestamps_enabled
-            .load(Ordering::Acquire)
-            .then(Instant::now);
-        for entry in state
-            .tickets
-            .iter_mut()
-            .skip(start_index)
-            .take(ticket_count)
-        {
-            entry.data_complete = true;
-            #[cfg(feature = "bench")]
+            let Some(start_index) = state
+                .tickets
+                .iter()
+                .position(|entry| entry.assignment.segment_ticket == tickets.start)
+            else {
+                poison_locked(&self.inner, &mut state);
+                anyhow::bail!("v8 DATA-completion group names an unknown ticket")
+            };
+            let Some(end_index) = start_index.checked_add(ticket_count) else {
+                poison_locked(&self.inner, &mut state);
+                anyhow::bail!("v8 DATA-completion group index overflows")
+            };
+            if end_index > state.tickets.len() {
+                poison_locked(&self.inner, &mut state);
+                anyhow::bail!("v8 DATA-completion group extends past admitted tickets")
+            }
+            let mut all_complete = true;
+            for (offset, entry) in state
+                .tickets
+                .iter()
+                .skip(start_index)
+                .take(ticket_count)
+                .enumerate()
             {
-                entry.data_completed_at = data_completed_at;
+                let expected_ticket = tickets
+                    .start
+                    .checked_add(u64::try_from(offset)?)
+                    .context("v8 DATA-completion ticket overflows")?;
+                if entry.assignment.segment_ticket != expected_ticket || !entry.frames_ready {
+                    poison_locked(&self.inner, &mut state);
+                    anyhow::bail!("v8 DATA-completion group does not match ready admitted tickets")
+                }
+                all_complete &= entry.data_complete;
+            }
+            if all_complete {
+                continue;
+            }
+            if state
+                .tickets
+                .iter()
+                .skip(start_index)
+                .take(ticket_count)
+                .any(|entry| entry.data_complete)
+            {
+                poison_locked(&self.inner, &mut state);
+                anyhow::bail!("v8 DATA-completion group partially duplicates prior completion")
+            }
+            #[cfg(feature = "bench")]
+            let data_completed_at = self
+                .inner
+                .data_completion_timestamps_enabled
+                .load(Ordering::Acquire)
+                .then(Instant::now);
+            for entry in state
+                .tickets
+                .iter_mut()
+                .skip(start_index)
+                .take(ticket_count)
+            {
+                entry.data_complete = true;
+                #[cfg(feature = "bench")]
+                {
+                    entry.data_completed_at = data_completed_at;
+                }
+            }
+            changed = true;
+        }
+        if changed {
+            #[cfg(feature = "bench")]
+            refresh_data_completion_order_hol(&self.inner, &mut state);
+            #[cfg(feature = "bench")]
+            let advanced = advance_data_complete_prefix(&mut state);
+            #[cfg(not(feature = "bench"))]
+            let advanced = false;
+            signal_change(&self.inner, &mut state);
+            // An out-of-order successor cannot extend the contiguous DATA
+            // prefix; waking the durability driver is wasted in that case.
+            // Preserve the existing wake behavior in the default path.
+            if !prefix_only_notifications || advanced {
+                signal_durability_progress(&self.inner, &mut state);
             }
         }
-        #[cfg(feature = "bench")]
-        refresh_data_completion_order_hol(&self.inner, &mut state);
-        signal_change(&self.inner, &mut state);
-        signal_durability_progress(&self.inner, &mut state);
 
         Ok(())
     }
@@ -1427,6 +1466,27 @@ fn fold_ready_digests(
     }
 
     Ok(())
+}
+
+/// Advance only through consecutively completed DATA tickets. Later
+/// completions remain recorded as holes in the bounded ticket window.
+#[cfg(feature = "bench")]
+fn advance_data_complete_prefix(state: &mut CoordinatorState) -> bool {
+    let previous = state.data_completed_ticket_end;
+    loop {
+        let offset = usize::try_from(
+            state.data_completed_ticket_end - state.durable_ticket_end,
+        )
+        .expect("bounded v8 DATA completion window fits usize");
+        let Some(ticket) = state.tickets.get(offset) else {
+            break;
+        };
+        if !ticket.data_complete {
+            break;
+        }
+        state.data_completed_ticket_end += 1;
+    }
+    state.data_completed_ticket_end != previous
 }
 
 #[cfg(feature = "bench")]
@@ -2413,6 +2473,40 @@ mod tests {
         first_encoded.disarm_after_durable();
         second_encoded.disarm_after_durable();
 
+        Ok(())
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn batched_data_completion_advances_across_holes_without_early_durability() -> Result<()> {
+        let coordinator = coordinator(8)?;
+        let first_batch = batch(10);
+        let second_batch = batch(20);
+        let third_batch = batch(30);
+        let mut first = admit(&first_batch, &coordinator)?.encode()?;
+        let mut second = admit(&second_batch, &coordinator)?.encode()?;
+        let mut third = admit(&third_batch, &coordinator)?.encode()?;
+        mark_producer_ready(&mut first, &coordinator, false)?;
+        mark_producer_ready(&mut second, &coordinator, false)?;
+        mark_producer_ready(&mut third, &coordinator, false)?;
+
+        let generation = coordinator.durability_generation();
+        coordinator.mark_data_groups_complete(&[2..3, 1..2])?;
+        assert_eq!(coordinator.durability_generation(), generation);
+        assert_eq!(coordinator.inner.state.lock().data_completed_ticket_end, 0);
+        assert!(coordinator.frontier_ready_prefix().is_empty());
+
+        coordinator.mark_data_groups_complete(&[0..1])?;
+        assert_eq!(coordinator.inner.state.lock().data_completed_ticket_end, 3);
+        assert_eq!(coordinator.durability_generation(), generation + 1);
+        assert_eq!(coordinator.frontier_ready_prefix().len(), 3);
+        assert_eq!(coordinator.durable_ticket_end(), 0);
+
+        let frontier = coordinator.reserve_frontier(3)?;
+        coordinator.publish_durable_frontier(frontier)?;
+        first.disarm_after_durable();
+        second.disarm_after_durable();
+        third.disarm_after_durable();
         Ok(())
     }
 
