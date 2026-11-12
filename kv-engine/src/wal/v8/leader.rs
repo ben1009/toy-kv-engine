@@ -334,6 +334,16 @@ fn benchmark_submits_any_ready_ticket() -> Result<bool> {
     }
 }
 
+#[cfg(feature = "bench")]
+fn benchmark_polar_completion_advance() -> Result<bool> {
+    const VAR: &str = "TOYKV_BENCH_V8_POLAR_ADVANCE";
+    match std::env::var(VAR).as_deref() {
+        Err(std::env::VarError::NotPresent) | Ok("0") => Ok(false),
+        Ok("1") => Ok(true),
+        _ => anyhow::bail!("{VAR} must be 0 or 1"),
+    }
+}
+
 /// DATA submission over the repository's bounded io_uring worker. Production
 /// submits only contiguous ticket ranges. A benchmark-only mode can submit
 /// each ready ticket independently at its preassigned file offset.
@@ -360,6 +370,8 @@ impl WalV8ParallelIo {
         first_ticket: u64,
     ) -> Result<Arc<Self>> {
         let submit_any_ready_ticket = benchmark_submits_any_ready_ticket()?;
+        #[cfg(feature = "bench")]
+        let polar_advance = benchmark_polar_completion_advance()?;
         let worker_file = Arc::new(worker_file);
         let buffer_pool = Arc::new(ArrayQueue::<WalV8DataBuffer>::new(1));
         let mut worker = if submit_any_ready_ticket {
@@ -380,6 +392,26 @@ impl WalV8ParallelIo {
             .name("wal-v8-completion-reaper".to_owned())
             .spawn(move || {
                 while let Ok(result) = completions.recv() {
+                    #[cfg(feature = "bench")]
+                    if polar_advance {
+                        // Like PolarDB's Advance stage, consume a burst of
+                        // unordered completions before publishing the prefix.
+                        // No delay is introduced to wait for a larger batch.
+                        const MAX_BATCH: usize = 32;
+                        let mut batch = Vec::with_capacity(MAX_BATCH);
+                        batch.push(result);
+                        for _ in 1..MAX_BATCH {
+                            match completions.try_recv() {
+                                Ok(next) => batch.push(next),
+                                Err(_) => break,
+                            }
+                        }
+                        if let Err(error) = reap_v8_group_results(&completion_coordinator, batch) {
+                            log::error!("v8 WAL completion advance failed: {error:#}");
+                            completion_coordinator.poison();
+                        }
+                        continue;
+                    }
                     if let Err(error) = reap_v8_group_result(&completion_coordinator, result) {
                         log::error!("v8 WAL completion reaper failed: {error:#}");
                         completion_coordinator.poison();
@@ -808,6 +840,26 @@ impl Drop for WalV8DataPackingGuard<'_> {
             self.io.frames_ready.notify_all();
         }
     }
+}
+
+#[cfg(feature = "bench")]
+fn reap_v8_group_results(
+    coordinator: &WalV8ParallelCoordinator,
+    results: Vec<GroupWriteResult>,
+) -> Result<()> {
+    let mut groups = Vec::with_capacity(results.len());
+    for result in results {
+        if let Some(error) = result.error {
+            coordinator.poison();
+            anyhow::bail!("v8 DATA worker group {} failed: {error}", result.group_id);
+        }
+        #[cfg(feature = "chaos-testing")]
+        crate::chaos::failpoint::wal_crash_point("wal_v8.parallel.after_data_write");
+        groups.push(result.tickets);
+    }
+    coordinator
+        .mark_data_groups_complete(&groups)
+        .context("advance v8 DATA completion prefix")
 }
 
 fn reap_v8_group_result(

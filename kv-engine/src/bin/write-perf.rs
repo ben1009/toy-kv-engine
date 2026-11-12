@@ -1096,6 +1096,8 @@ struct WalPipelineRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     v8_data_submit_order: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    v8_polar_advance: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     v8_hol_diagnostics_enabled: Option<bool>,
     v8_data_submit_hol_episodes: u64,
     v8_data_submit_hol_wait_ns: u64,
@@ -1296,6 +1298,13 @@ fn wal_pipeline_record(
                 || match std::env::var("TOYKV_BENCH_V8_DATA_SUBMIT_ORDER").as_deref() {
                     Ok("ready") => "any_ready_ticket",
                     _ => "ticket_prefix",
+                },
+            ),
+        v8_polar_advance: (wal_run_info.format_version == 8 && wal_run_info.io_mode == "parallel")
+            .then(
+                || match std::env::var("TOYKV_BENCH_V8_POLAR_ADVANCE").as_deref() {
+                    Ok("1") => "batch_advance",
+                    _ => "legacy_per_group",
                 },
             ),
         v8_hol_diagnostics_enabled: (wal_run_info.format_version == 8
