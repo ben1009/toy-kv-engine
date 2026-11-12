@@ -130,6 +130,17 @@ impl WalIoEvent<'_> {
         self.progress
             .record_group_completion(result, self.during_sync(), self.event_at());
     }
+
+    #[cfg(feature = "bench")]
+    fn record_completion_timeline(&self, timeline: WalV8GroupCompletionTimeline) {
+        self.progress.record_completion_timeline(timeline);
+    }
+
+    #[cfg(feature = "bench")]
+    fn mark_completion_timeline_send_started(&self, group_id: u64) {
+        self.progress
+            .mark_completion_timeline_send_started(group_id);
+    }
 }
 
 #[cfg(feature = "bench")]
@@ -145,6 +156,26 @@ struct WalSyncProgressState {
     written_frontier: u64,
     durable_frontier: u64,
     completed_groups: BTreeMap<u64, (u64, u64, u64, Instant)>,
+    completion_timelines: HashMap<u64, WalV8GroupCompletionTimeline>,
+}
+
+#[cfg(feature = "bench")]
+#[derive(Clone, Debug)]
+pub(crate) struct WalV8GroupCompletionTimeline {
+    pub(crate) group_id: u64,
+    pub(crate) ticket_start: u64,
+    pub(crate) ticket_end: u64,
+    pub(crate) worker_tid: Option<u64>,
+    pub(crate) request_start: u64,
+    pub(crate) request_end: u64,
+    pub(crate) request_id: u64,
+    pub(crate) sqe_submitted_at: Option<Instant>,
+    pub(crate) cqe_observed_at: Option<Instant>,
+    pub(crate) cqe_observed_monotonic_ns: Option<u64>,
+    pub(crate) group_finished_at: Option<Instant>,
+    pub(crate) group_finished_monotonic_ns: Option<u64>,
+    pub(crate) result_send_started_at: Option<Instant>,
+    pub(crate) reaper_recv_at: Option<Instant>,
 }
 
 #[cfg(feature = "bench")]
@@ -194,6 +225,39 @@ impl WalSyncProgress {
     #[cfg(feature = "bench")]
     pub(crate) fn set_profile(&self, profile: std::sync::Arc<crate::mem_table::WriteProfile>) {
         self.profile.store(Some(profile));
+    }
+
+    #[cfg(feature = "bench")]
+    fn completion_timeline_sample_every(&self) -> u64 {
+        self.profile().map_or(0, |profile| {
+            profile.wal_v8_completion_timeline_sample_every()
+        })
+    }
+
+    #[cfg(feature = "bench")]
+    fn record_completion_timeline(&self, timeline: WalV8GroupCompletionTimeline) {
+        let mut state = self.state.lock();
+        state
+            .completion_timelines
+            .insert(timeline.group_id, timeline);
+    }
+
+    #[cfg(feature = "bench")]
+    fn mark_completion_timeline_send_started(&self, group_id: u64) {
+        if let Some(timeline) = self.state.lock().completion_timelines.get_mut(&group_id) {
+            timeline.result_send_started_at = Some(Instant::now());
+        }
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn take_completion_timeline(
+        &self,
+        group_id: u64,
+        reaper_recv_at: Instant,
+    ) -> Option<WalV8GroupCompletionTimeline> {
+        let mut timeline = self.state.lock().completion_timelines.remove(&group_id)?;
+        timeline.reaper_recv_at = Some(reaper_recv_at);
+        Some(timeline)
     }
 
     /// Let a format with its own logical durability groups report those groups
@@ -827,6 +891,43 @@ struct GroupState {
     next_ready_index: usize,
     remaining_writes: usize,
     error: Option<String>,
+    #[cfg(feature = "bench")]
+    completion_timeline: Option<GroupCompletionTimeline>,
+}
+
+#[cfg(feature = "bench")]
+struct GroupCompletionTimeline {
+    request_id: u64,
+    sqe_submitted_at: Option<Instant>,
+    cqe_observed_at: Option<Instant>,
+    cqe_observed_monotonic_ns: Option<u64>,
+}
+
+#[cfg(feature = "bench")]
+fn monotonic_now_ns() -> Option<u64> {
+    let mut timestamp = std::mem::MaybeUninit::<libc::timespec>::uninit();
+    // SAFETY: `clock_gettime` initializes the timespec on success.
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, timestamp.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    // SAFETY: the successful call above initialized the timespec.
+    let timestamp = unsafe { timestamp.assume_init() };
+    u64::try_from(timestamp.tv_sec)
+        .ok()?
+        .checked_mul(1_000_000_000)?
+        .checked_add(u64::try_from(timestamp.tv_nsec).ok()?)
+}
+
+#[cfg(all(feature = "bench", target_os = "linux"))]
+fn current_kernel_tid() -> Option<u64> {
+    // SAFETY: `gettid` takes no arguments and has no memory-safety requirements.
+    let tid = unsafe { libc::syscall(libc::SYS_gettid) };
+    u64::try_from(tid).ok()
+}
+
+#[cfg(all(feature = "bench", not(target_os = "linux")))]
+fn current_kernel_tid() -> Option<u64> {
+    None
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -857,6 +958,8 @@ struct WriteSubmission {
 
 enum WorkerEvent<B> {
     BufferRetired(B),
+    #[cfg(feature = "bench")]
+    CompletionTimeline(WalV8GroupCompletionTimeline),
     GroupFinished(GroupWriteResult),
 }
 
@@ -1023,11 +1126,42 @@ impl<B: WorkerBuffer> WorkerCore<B> {
                 request_ids,
                 next_ready_index: 0,
                 error: None,
+                #[cfg(feature = "bench")]
+                completion_timeline: None,
             },
         );
         self.assert_invariants();
 
         Ok(group_id)
+    }
+
+    #[cfg(feature = "bench")]
+    fn sample_completion_timeline(&mut self, group_id: GroupId, sample_every: u64) {
+        if sample_every == 0 {
+            return;
+        }
+
+        let group = self
+            .groups
+            .get_mut(&group_id)
+            .expect("assigned group exists");
+        let remainder = group.request_ids.start % sample_every;
+        let offset = if remainder == 0 {
+            0
+        } else {
+            sample_every - remainder
+        };
+        let Some(request_id) = group.request_ids.start.checked_add(offset) else {
+            return;
+        };
+        if request_id < group.request_ids.end {
+            group.completion_timeline = Some(GroupCompletionTimeline {
+                request_id,
+                sqe_submitted_at: None,
+                cqe_observed_at: None,
+                cqe_observed_monotonic_ns: None,
+            });
+        }
     }
 
     /// Stage SQEs across groups in round-robin order without waiting for any
@@ -1111,9 +1245,20 @@ impl<B: WorkerBuffer> WorkerCore<B> {
             return Err(WorkerError::RequestNotStaged);
         }
 
+        #[cfg(feature = "bench")]
+        let group_id = write.group_id;
         write.state = WriteState::Submitted;
         self.staged_sqes -= 1;
         self.outstanding_sqes += 1;
+        #[cfg(feature = "bench")]
+        if let Some(timeline) = self
+            .groups
+            .get_mut(&group_id)
+            .and_then(|group| group.completion_timeline.as_mut())
+            && timeline.request_id == request_id.0
+        {
+            timeline.sqe_submitted_at = Some(Instant::now());
+        }
         self.assert_invariants();
 
         Ok(())
@@ -1166,6 +1311,17 @@ impl<B: WorkerBuffer> WorkerCore<B> {
             .ok_or(WorkerError::UnknownRequest)?;
         if !matches!(state, WriteState::Submitted | WriteState::Ambiguous) {
             return Err(WorkerError::RequestNotOutstanding);
+        }
+
+        #[cfg(feature = "bench")]
+        if let Some(timeline) = self
+            .groups
+            .get_mut(&group_id)
+            .and_then(|group| group.completion_timeline.as_mut())
+            && timeline.request_id == request_id.0
+        {
+            timeline.cqe_observed_at = Some(Instant::now());
+            timeline.cqe_observed_monotonic_ns = monotonic_now_ns();
         }
 
         self.outstanding_sqes -= 1;
@@ -1296,7 +1452,7 @@ impl<B: WorkerBuffer> WorkerCore<B> {
             let write_count = group.request_ids.end - group.request_ids.start;
             let write_bytes = group.write_bytes;
             self.group_order.retain(|queued_id| *queued_id != group_id);
-            for request_id in group.request_ids.map(RequestId) {
+            for request_id in group.request_ids.clone().map(RequestId) {
                 let write = self.writes.remove(&request_id);
                 debug_assert!(write.is_some_and(|write| write.state.is_terminal()));
             }
@@ -1311,6 +1467,29 @@ impl<B: WorkerBuffer> WorkerCore<B> {
             } else {
                 group.error
             };
+            #[cfg(feature = "bench")]
+            if error.is_none()
+                && let Some(timeline) = group.completion_timeline
+            {
+                events.push(WorkerEvent::CompletionTimeline(
+                    WalV8GroupCompletionTimeline {
+                        group_id: group_id.0,
+                        ticket_start: group.tickets.start,
+                        ticket_end: group.tickets.end,
+                        worker_tid: current_kernel_tid(),
+                        request_start: group.request_ids.start,
+                        request_end: group.request_ids.end,
+                        request_id: timeline.request_id,
+                        sqe_submitted_at: timeline.sqe_submitted_at,
+                        cqe_observed_at: timeline.cqe_observed_at,
+                        cqe_observed_monotonic_ns: timeline.cqe_observed_monotonic_ns,
+                        group_finished_at: Some(Instant::now()),
+                        group_finished_monotonic_ns: monotonic_now_ns(),
+                        result_send_started_at: None,
+                        reaper_recv_at: None,
+                    },
+                ));
+            }
             events.push(WorkerEvent::GroupFinished(GroupWriteResult {
                 group_id: group_id.0,
                 tickets: group.tickets,
@@ -2151,7 +2330,20 @@ fn run_worker_loop<B: WorkerBuffer>(
             while core.can_receive_command(*stopping) {
                 match commands.try_recv() {
                     Ok(WorkerCommand::Group { id, group, permit }) => {
-                        enqueue_group_command(id, group, permit, core, group_permits, completions)?;
+                        #[cfg(feature = "bench")]
+                        let timeline_sample_every =
+                            sync_progress.completion_timeline_sample_every();
+                        #[cfg(not(feature = "bench"))]
+                        let timeline_sample_every = 0;
+                        enqueue_group_command(
+                            id,
+                            group,
+                            permit,
+                            core,
+                            group_permits,
+                            completions,
+                            timeline_sample_every,
+                        )?;
                     }
                     Ok(WorkerCommand::Shutdown(reply)) => {
                         *shutdown_reply = Some(reply);
@@ -2255,7 +2447,19 @@ fn run_worker_loop<B: WorkerBuffer>(
             }
             match commands.recv() {
                 Ok(WorkerCommand::Group { id, group, permit }) => {
-                    enqueue_group_command(id, group, permit, core, group_permits, completions)?;
+                    #[cfg(feature = "bench")]
+                    let timeline_sample_every = sync_progress.completion_timeline_sample_every();
+                    #[cfg(not(feature = "bench"))]
+                    let timeline_sample_every = 0;
+                    enqueue_group_command(
+                        id,
+                        group,
+                        permit,
+                        core,
+                        group_permits,
+                        completions,
+                        timeline_sample_every,
+                    )?;
                 }
                 Ok(WorkerCommand::Shutdown(reply)) => {
                     *shutdown_reply = Some(reply);
@@ -2285,10 +2489,15 @@ fn enqueue_group_command<B: WorkerBuffer>(
     core: &mut WorkerCore<B>,
     group_permits: &mut HashMap<GroupId, GroupPermit>,
     completions: &Sender<GroupWriteResult>,
+    timeline_sample_every: u64,
 ) -> Result<()> {
     let tickets = group.tickets.clone();
     match core.enqueue(group) {
         Ok(assigned_id) if assigned_id == id => {
+            #[cfg(feature = "bench")]
+            core.sample_completion_timeline(id, timeline_sample_every);
+            #[cfg(not(feature = "bench"))]
+            let _ = timeline_sample_every;
             group_permits.insert(id, permit);
         }
         Ok(_) => bail!("WAL worker assigned an unexpected group identifier"),
@@ -2499,10 +2708,16 @@ fn process_worker_events<B: WorkerBuffer>(
     completion_tx: &Sender<GroupWriteResult>,
     io_event: &WalIoEvent<'_>,
 ) {
+    #[cfg(feature = "bench")]
+    let mut pending_timeline = None;
     for event in events {
         match event {
             WorkerEvent::BufferRetired(buffer) => {
                 buffer.retire(buffer_pool);
+            }
+            #[cfg(feature = "bench")]
+            WorkerEvent::CompletionTimeline(timeline) => {
+                pending_timeline = Some(timeline);
             }
             WorkerEvent::GroupFinished(result) => {
                 #[cfg(all(test, feature = "chaos-testing"))]
@@ -2510,6 +2725,12 @@ fn process_worker_events<B: WorkerBuffer>(
 
                 io_event.record_group_completion(&result);
                 group_permits.remove(&GroupId(result.group_id));
+                #[cfg(feature = "bench")]
+                if let Some(timeline) = pending_timeline.take() {
+                    debug_assert_eq!(timeline.group_id, result.group_id);
+                    io_event.record_completion_timeline(timeline);
+                    io_event.mark_completion_timeline_send_started(result.group_id);
+                }
                 #[cfg(all(test, feature = "chaos-testing"))]
                 if completion_tx.send(result).is_ok() && injected_failure {
                     crate::chaos::failpoint::note_parallel_wal_injected_group_failure();
@@ -2674,6 +2895,8 @@ mod tests {
                     drop(buffer);
                     None
                 }
+                #[cfg(feature = "bench")]
+                WorkerEvent::CompletionTimeline(_) => None,
             })
             .expect("group completion event")
     }
@@ -2844,6 +3067,8 @@ mod tests {
                 match event {
                     WorkerEvent::BufferRetired(buffer) => drop(buffer),
                     WorkerEvent::GroupFinished(result) => results.push(result),
+                    #[cfg(feature = "bench")]
+                    WorkerEvent::CompletionTimeline(_) => {}
                 }
             }
         }
@@ -2905,6 +3130,8 @@ mod tests {
                 match event {
                     WorkerEvent::BufferRetired(buffer) => drop(buffer),
                     WorkerEvent::GroupFinished(result) => results.push(result),
+                    #[cfg(feature = "bench")]
+                    WorkerEvent::CompletionTimeline(_) => {}
                 }
             }
         }
@@ -3352,6 +3579,8 @@ mod tests {
                     drop(buffer);
                 }
                 WorkerEvent::GroupFinished(_) => group_finished = true,
+                #[cfg(feature = "bench")]
+                WorkerEvent::CompletionTimeline(_) => {}
             }
         }
 
@@ -3509,6 +3738,7 @@ mod tests {
             &mut core,
             &mut group_permits,
             &completion_tx,
+            0,
         )
         .expect("reject poisoned group without stopping the worker");
         enqueue_group_command(
@@ -3518,6 +3748,7 @@ mod tests {
             &mut core,
             &mut group_permits,
             &completion_tx,
+            0,
         )
         .expect("reject later poisoned group without a ticket-hole failure");
 

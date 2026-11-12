@@ -10099,6 +10099,43 @@ impl KvEngine {
             .set_wal_hol_diagnostics_enabled(enabled)
     }
 
+    #[cfg(feature = "bench")]
+    /// Sample every Nth V8 Parallel DATA request through durable publication.
+    /// Passing `None` disables timestamp collection.
+    pub fn set_wal_v8_completion_timeline_sample_every(
+        &self,
+        sample_every: Option<u64>,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            sample_every.is_none_or(|every| every > 0),
+            "completion timeline sample interval must be greater than zero"
+        );
+        let _active_memtable = self.inner.active_memtable_lock.read();
+        self.inner
+            .write_profile
+            .set_wal_v8_completion_timeline_sample_every(sample_every.unwrap_or_default());
+
+        Ok(())
+    }
+
+    #[cfg(feature = "bench")]
+    /// Samples captured by the opt-in V8 Parallel completion timeline.
+    pub fn wal_v8_completion_timeline_observations(
+        &self,
+    ) -> Vec<crate::mem_table::WalV8CompletionTimelineObservation> {
+        self.inner
+            .write_profile
+            .wal_v8_completion_timeline_observations()
+    }
+
+    #[cfg(feature = "bench")]
+    /// Number of timeline samples discarded after reaching the bounded sample limit.
+    pub fn wal_v8_completion_timeline_dropped_samples(&self) -> u64 {
+        self.inner
+            .write_profile
+            .wal_v8_completion_timeline_dropped_samples()
+    }
+
     /// I/O flags and inode identity for the active V8 WAL handles.
     #[cfg(feature = "bench")]
     #[doc(hidden)]

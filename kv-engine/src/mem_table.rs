@@ -272,6 +272,15 @@ pub struct WriteProfile {
     /// Enables opt-in V8 ordering HOL diagnostics for benchmark runs.
     #[cfg(feature = "bench")]
     wal_hol_diagnostics_enabled: AtomicBool,
+    /// Sample one request per N io_uring user_data values for V8 completion timing.
+    /// Zero disables the timeline without adding timestamps to worker groups.
+    #[cfg(feature = "bench")]
+    wal_v8_completion_timeline_sample_every: AtomicU64,
+    /// Bounded samples spanning DATA submission through durable publication.
+    #[cfg(feature = "bench")]
+    wal_v8_completion_timeline: Mutex<Vec<WalV8CompletionTimelineObservation>>,
+    #[cfg(feature = "bench")]
+    wal_v8_completion_timeline_dropped_samples: AtomicU64,
 }
 
 /// One logical `fdatasync` call and the WAL progress observed while it ran.
@@ -324,6 +333,31 @@ pub struct WalSyncObservation {
     pub succeeded: bool,
 }
 
+/// One sampled V8 DATA request and the group/frontier stages that followed it.
+/// Durations are nanoseconds. CQE time is when the userspace worker observed
+/// the CQE; `worker_tid` plus `request_id` correlates it with io_uring submit
+/// and complete tracepoints.
+#[cfg(feature = "bench")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WalV8CompletionTimelineObservation {
+    pub group_id: u64,
+    pub ticket_start: u64,
+    pub ticket_end: u64,
+    /// Linux TID that submitted this request to its io_uring instance.
+    pub worker_tid: Option<u64>,
+    pub request_id: u64,
+    pub request_start: u64,
+    pub request_end: u64,
+    pub submit_to_cqe_observed_ns: u64,
+    pub cqe_observed_monotonic_ns: Option<u64>,
+    pub group_finished_monotonic_ns: Option<u64>,
+    pub cqe_observed_to_group_finished_ns: u64,
+    pub group_finished_to_result_send_start_ns: u64,
+    pub result_send_start_to_reaper_recv_ns: u64,
+    pub reaper_recv_to_prefix_ready_ns: u64,
+    pub prefix_ready_to_durable_ns: u64,
+}
+
 impl WriteProfile {
     #[cfg(feature = "bench")]
     pub(crate) fn reset(&self) {
@@ -355,6 +389,10 @@ impl WriteProfile {
         self.wal_sync_diagnostics_enabled.store(false, o);
         #[cfg(feature = "bench")]
         self.wal_hol_diagnostics_enabled.store(false, o);
+        #[cfg(feature = "bench")]
+        self.wal_v8_completion_timeline.lock().clear();
+        #[cfg(feature = "bench")]
+        self.wal_v8_completion_timeline_dropped_samples.store(0, o);
         self.wal_worker_eventfd_notifications.store(0, o);
         self.wal_worker_eventfd_writes.store(0, o);
         self.wal_preallocation_ns.store(0, o);
@@ -490,6 +528,19 @@ impl WriteProfile {
                     false
                 }
             },
+            wal_v8_completion_timeline_sample_every: {
+                #[cfg(feature = "bench")]
+                {
+                    match self.wal_v8_completion_timeline_sample_every.load(o) {
+                        0 => None,
+                        every => Some(every),
+                    }
+                }
+                #[cfg(not(feature = "bench"))]
+                {
+                    None
+                }
+            },
             op_count: self.op_count.load(o),
         }
     }
@@ -525,6 +576,46 @@ impl WriteProfile {
     pub(crate) fn record_wal_v8_data_write_call_ns(&self, nanos: u64) {
         self.wal_v8_data_write_call_ns
             .fetch_add(nanos, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn set_wal_v8_completion_timeline_sample_every(&self, every: u64) {
+        self.wal_v8_completion_timeline_sample_every
+            .store(every, std::sync::atomic::Ordering::Release);
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn wal_v8_completion_timeline_sample_every(&self) -> u64 {
+        self.wal_v8_completion_timeline_sample_every
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn record_wal_v8_completion_timeline(
+        &self,
+        observation: WalV8CompletionTimelineObservation,
+    ) {
+        const MAX_SAMPLES: usize = 4096;
+        let mut samples = self.wal_v8_completion_timeline.lock();
+        if samples.len() < MAX_SAMPLES {
+            samples.push(observation);
+        } else {
+            self.wal_v8_completion_timeline_dropped_samples
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn wal_v8_completion_timeline_observations(
+        &self,
+    ) -> Vec<WalV8CompletionTimelineObservation> {
+        self.wal_v8_completion_timeline.lock().clone()
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn wal_v8_completion_timeline_dropped_samples(&self) -> u64 {
+        self.wal_v8_completion_timeline_dropped_samples
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     #[cfg(feature = "bench")]
@@ -879,6 +970,7 @@ pub struct WriteProfileSnapshot {
     pub wal_sync_coalesce_wait_calls: u64,
     pub wal_sync_coalesce_wait_ns: u64,
     pub wal_hol_diagnostics_enabled: bool,
+    pub wal_v8_completion_timeline_sample_every: Option<u64>,
     pub op_count: u64,
 }
 
@@ -1051,6 +1143,7 @@ impl WriteProfileSnapshot {
                 .wal_sync_coalesce_wait_ns
                 .saturating_sub(before.wal_sync_coalesce_wait_ns),
             wal_hol_diagnostics_enabled: self.wal_hol_diagnostics_enabled,
+            wal_v8_completion_timeline_sample_every: self.wal_v8_completion_timeline_sample_every,
             op_count: self.op_count.saturating_sub(before.op_count),
         }
     }

@@ -15,6 +15,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(feature = "bench")]
+use std::collections::BTreeMap;
+
 use anyhow::{Context, Result, ensure};
 use parking_lot::{Condvar, Mutex};
 
@@ -119,6 +122,10 @@ struct CoordinatorState {
     durable_followers: usize,
     #[cfg(feature = "bench")]
     ordered_link_hash_cpu_ns: u64,
+    #[cfg(feature = "bench")]
+    completion_timeline_frontier_ready_end: u64,
+    #[cfg(feature = "bench")]
+    completion_timeline_samples: BTreeMap<u64, PendingCompletionTimeline>,
 }
 
 struct TicketState {
@@ -137,6 +144,12 @@ struct TicketState {
     digest_hol_started_at: Option<Instant>,
     #[cfg(feature = "bench")]
     data_completion_hol_started_at: Option<Instant>,
+}
+
+#[cfg(feature = "bench")]
+struct PendingCompletionTimeline {
+    group: crate::wal::parallel_worker::WalV8GroupCompletionTimeline,
+    prefix_ready_at: Option<Instant>,
 }
 
 /// Immutable view of one ticket in the admission window.
@@ -277,6 +290,10 @@ impl WalV8ParallelCoordinator {
                     durable_followers: 0,
                     #[cfg(feature = "bench")]
                     ordered_link_hash_cpu_ns: 0,
+                    #[cfg(feature = "bench")]
+                    completion_timeline_frontier_ready_end: config.next_ticket,
+                    #[cfg(feature = "bench")]
+                    completion_timeline_samples: BTreeMap::new(),
                 }),
                 changed: Condvar::new(),
                 durability_changed: Condvar::new(),
@@ -483,6 +500,8 @@ impl WalV8ParallelCoordinator {
         state.tickets[index].frames_ready = true;
         #[cfg(feature = "bench")]
         refresh_data_completion_order_hol(&self.inner, &mut state);
+        #[cfg(feature = "bench")]
+        advance_completion_timeline_prefix(&mut state);
         signal_change(&self.inner, &mut state);
 
         Ok(())
@@ -588,6 +607,8 @@ impl WalV8ParallelCoordinator {
         #[cfg(feature = "bench")]
         refresh_data_completion_order_hol(&self.inner, &mut state);
         #[cfg(feature = "bench")]
+        advance_completion_timeline_prefix(&mut state);
+        #[cfg(feature = "bench")]
         let ordered_link_hash_cpu_ns = state.ordered_link_hash_cpu_ns.saturating_sub(cpu_before);
         #[cfg(not(feature = "bench"))]
         let ordered_link_hash_cpu_ns = 0;
@@ -639,6 +660,8 @@ impl WalV8ParallelCoordinator {
         }
         #[cfg(feature = "bench")]
         refresh_data_completion_order_hol(&self.inner, &mut state);
+        #[cfg(feature = "bench")]
+        advance_completion_timeline_prefix(&mut state);
         signal_change(&self.inner, &mut state);
         signal_durability_progress(&self.inner, &mut state);
 
@@ -729,8 +752,53 @@ impl WalV8ParallelCoordinator {
         }
         #[cfg(feature = "bench")]
         refresh_data_completion_order_hol(&self.inner, &mut state);
+        #[cfg(feature = "bench")]
+        advance_completion_timeline_prefix(&mut state);
         signal_change(&self.inner, &mut state);
         signal_durability_progress(&self.inner, &mut state);
+
+        Ok(())
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn record_data_completion_timeline(
+        &self,
+        group: crate::wal::parallel_worker::WalV8GroupCompletionTimeline,
+    ) -> Result<()> {
+        let mut state = self.inner.state.lock();
+        ensure!(!state.poisoned, "v8 Parallel coordinator is poisoned");
+        ensure!(
+            group.ticket_start < group.ticket_end
+                && group.ticket_start >= state.durable_ticket_end
+                && group.ticket_end <= state.next_ticket,
+            "v8 completion timeline names an invalid ticket range"
+        );
+        ensure!(
+            group.request_start <= group.request_id && group.request_id < group.request_end,
+            "v8 completion timeline request is outside its group"
+        );
+        ensure!(
+            group.ticket_end > state.completion_timeline_frontier_ready_end,
+            "v8 completion timeline was recorded after its prefix became ready"
+        );
+        ensure!(
+            state.completion_timeline_samples.len() < self.inner.max_inflight_tickets,
+            "v8 completion timeline exceeded the bounded ticket window"
+        );
+        ensure!(
+            !state
+                .completion_timeline_samples
+                .contains_key(&group.ticket_end),
+            "v8 completion timeline duplicates a ticket range"
+        );
+        state.completion_timeline_samples.insert(
+            group.ticket_end,
+            PendingCompletionTimeline {
+                group,
+                prefix_ready_at: None,
+            },
+        );
+        advance_completion_timeline_prefix(&mut state);
 
         Ok(())
     }
@@ -877,9 +945,86 @@ impl WalV8ParallelCoordinator {
         state.durable_prefix_digest = reservation.prefix_digest;
         state.last_frontier_end = frontier_end;
         state.pending_frontier = None;
+        #[cfg(feature = "bench")]
+        let covered_timeline_samples = {
+            let covered_ends = state
+                .completion_timeline_samples
+                .range(..=reservation.ticket_end)
+                .map(|(ticket_end, _)| *ticket_end)
+                .collect::<Vec<_>>();
+            covered_ends
+                .into_iter()
+                .filter_map(|ticket_end| state.completion_timeline_samples.remove(&ticket_end))
+                .collect::<Vec<_>>()
+        };
         signal_change(&self.inner, &mut state);
         signal_durability_progress(&self.inner, &mut state);
         self.inner.durable_published.notify_all();
+        drop(state);
+
+        #[cfg(feature = "bench")]
+        let durable_published_at = Instant::now();
+
+        #[cfg(feature = "bench")]
+        if let Some(profile) = self.inner.profile.load_full() {
+            for sample in covered_timeline_samples {
+                let Some(prefix_ready_at) = sample.prefix_ready_at else {
+                    continue;
+                };
+                let group = sample.group;
+                let Some(submit_to_cqe_observed_ns) =
+                    completion_timeline_duration_ns(group.sqe_submitted_at, group.cqe_observed_at)
+                else {
+                    continue;
+                };
+                let Some(cqe_observed_to_group_finished_ns) =
+                    completion_timeline_duration_ns(group.cqe_observed_at, group.group_finished_at)
+                else {
+                    continue;
+                };
+                let Some(group_finished_to_result_send_start_ns) = completion_timeline_duration_ns(
+                    group.group_finished_at,
+                    group.result_send_started_at,
+                ) else {
+                    continue;
+                };
+                let Some(result_send_to_reaper_ns) = completion_timeline_duration_ns(
+                    group.result_send_started_at,
+                    group.reaper_recv_at,
+                ) else {
+                    continue;
+                };
+                let Some(reaper_to_prefix_ready_ns) =
+                    completion_timeline_duration_ns(group.reaper_recv_at, Some(prefix_ready_at))
+                else {
+                    continue;
+                };
+                let Some(prefix_ready_to_durable_ns) = completion_timeline_duration_ns(
+                    Some(prefix_ready_at),
+                    Some(durable_published_at),
+                ) else {
+                    continue;
+                };
+                let observation = crate::mem_table::WalV8CompletionTimelineObservation {
+                    group_id: group.group_id,
+                    ticket_start: group.ticket_start,
+                    ticket_end: group.ticket_end,
+                    worker_tid: group.worker_tid,
+                    request_id: group.request_id,
+                    request_start: group.request_start,
+                    request_end: group.request_end,
+                    submit_to_cqe_observed_ns,
+                    cqe_observed_monotonic_ns: group.cqe_observed_monotonic_ns,
+                    group_finished_monotonic_ns: group.group_finished_monotonic_ns,
+                    cqe_observed_to_group_finished_ns,
+                    group_finished_to_result_send_start_ns,
+                    result_send_start_to_reaper_recv_ns: result_send_to_reaper_ns,
+                    reaper_recv_to_prefix_ready_ns: reaper_to_prefix_ready_ns,
+                    prefix_ready_to_durable_ns,
+                };
+                profile.record_wal_v8_completion_timeline(observation);
+            }
+        }
 
         Ok(())
     }
@@ -1452,6 +1597,53 @@ fn refresh_data_completion_order_hol(inner: &CoordinatorInner, state: &mut Coord
             prefix_open = false;
         }
     }
+}
+
+#[cfg(feature = "bench")]
+fn advance_completion_timeline_prefix(state: &mut CoordinatorState) {
+    state.completion_timeline_frontier_ready_end = state
+        .completion_timeline_frontier_ready_end
+        .max(state.durable_ticket_end);
+    let previous_end = state.completion_timeline_frontier_ready_end;
+    while let Some(index) = state
+        .completion_timeline_frontier_ready_end
+        .checked_sub(state.durable_ticket_end)
+        .and_then(|offset| usize::try_from(offset).ok())
+    {
+        let Some(ticket) = state.tickets.get(index) else {
+            break;
+        };
+        if ticket.assignment.segment_ticket != state.completion_timeline_frontier_ready_end
+            || !ticket.is_frontier_ready()
+        {
+            break;
+        }
+        state.completion_timeline_frontier_ready_end += 1;
+    }
+
+    if state.completion_timeline_frontier_ready_end > previous_end {
+        let now = Instant::now();
+        let ready_end = state.completion_timeline_frontier_ready_end;
+        for sample in state
+            .completion_timeline_samples
+            .range_mut((
+                std::ops::Bound::Excluded(previous_end),
+                std::ops::Bound::Included(ready_end),
+            ))
+            .map(|(_, sample)| sample)
+        {
+            sample.prefix_ready_at = Some(now);
+        }
+    }
+}
+
+#[cfg(feature = "bench")]
+fn completion_timeline_duration_ns(start: Option<Instant>, end: Option<Instant>) -> Option<u64> {
+    Some(
+        end?.checked_duration_since(start?)?
+            .as_nanos()
+            .min(u64::MAX as u128) as u64,
+    )
 }
 
 #[cfg(feature = "bench")]

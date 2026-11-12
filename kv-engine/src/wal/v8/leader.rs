@@ -375,12 +375,26 @@ impl WalV8ParallelIo {
         // submission groups are not V8 durability groups.
         progress.suppress_commit_group_metrics();
         let completions = worker.take_completions();
+        #[cfg(feature = "bench")]
+        let completion_progress = Arc::clone(&progress);
         let completion_coordinator = coordinator.clone();
         let completion_thread = thread::Builder::new()
             .name("wal-v8-completion-reaper".to_owned())
             .spawn(move || {
                 while let Ok(result) = completions.recv() {
-                    if let Err(error) = reap_v8_group_result(&completion_coordinator, result) {
+                    #[cfg(feature = "bench")]
+                    let timeline = completion_progress
+                        .take_completion_timeline(result.group_id, Instant::now());
+                    if let Err(error) = {
+                        #[cfg(feature = "bench")]
+                        {
+                            reap_v8_group_result(&completion_coordinator, result, timeline)
+                        }
+                        #[cfg(not(feature = "bench"))]
+                        {
+                            reap_v8_group_result(&completion_coordinator, result)
+                        }
+                    } {
                         log::error!("v8 WAL completion reaper failed: {error:#}");
                         completion_coordinator.poison();
                     }
@@ -813,6 +827,9 @@ impl Drop for WalV8DataPackingGuard<'_> {
 fn reap_v8_group_result(
     coordinator: &WalV8ParallelCoordinator,
     result: GroupWriteResult,
+    #[cfg(feature = "bench")] timeline: Option<
+        crate::wal::parallel_worker::WalV8GroupCompletionTimeline,
+    >,
 ) -> Result<()> {
     if let Some(error) = result.error {
         coordinator.poison();
@@ -820,6 +837,11 @@ fn reap_v8_group_result(
     }
     #[cfg(feature = "chaos-testing")]
     crate::chaos::failpoint::wal_crash_point("wal_v8.parallel.after_data_write");
+
+    #[cfg(feature = "bench")]
+    if let Some(timeline) = timeline {
+        coordinator.record_data_completion_timeline(timeline)?;
+    }
 
     coordinator
         .mark_data_group_complete(result.tickets)
