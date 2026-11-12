@@ -45,7 +45,10 @@ use crate::{
 };
 
 #[cfg(feature = "bench")]
-use crate::wal::{WalIoDiagnostics, WalIoHandleMetadata};
+use crate::wal::{
+    WalExtentPreparationDiagnostics, WalExtentPreparationMode, WalIoDiagnostics,
+    WalIoHandleMetadata,
+};
 
 #[cfg(feature = "bench")]
 use super::parallel::WalV8TicketProgress;
@@ -222,6 +225,153 @@ impl WalV8FrontierWriteMode {
             ),
         }
     }
+}
+
+#[cfg(feature = "bench")]
+const WAL_V8_EXTENT_PREPARATION_ENV: &str = "TOYKV_BENCH_V8_EXTENT_PREP";
+#[cfg(feature = "bench")]
+const WAL_V8_EXTENT_PREPARATION_BYTES_ENV: &str = "TOYKV_BENCH_V8_EXTENT_PREP_BYTES";
+#[cfg(feature = "bench")]
+const WAL_V8_EXTENT_PREPARATION_CHUNK_BYTES: usize = 128 * 1024;
+
+#[cfg(feature = "bench")]
+impl WalExtentPreparationMode {
+    fn from_environment() -> Result<Option<(Self, u64)>> {
+        let mode = std::env::var_os(WAL_V8_EXTENT_PREPARATION_ENV);
+        let bytes = std::env::var_os(WAL_V8_EXTENT_PREPARATION_BYTES_ENV);
+        Self::from_values(mode.as_deref(), bytes.as_deref())
+    }
+
+    fn from_values(mode: Option<&OsStr>, bytes: Option<&OsStr>) -> Result<Option<(Self, u64)>> {
+        let Some(mode) = mode else {
+            ensure!(
+                bytes.is_none(),
+                "{WAL_V8_EXTENT_PREPARATION_BYTES_ENV} requires {WAL_V8_EXTENT_PREPARATION_ENV}"
+            );
+            return Ok(None);
+        };
+        let mode = match mode.to_str() {
+            Some("fallocate") => Self::Fallocate,
+            Some("initialize") => Self::Initialize,
+            Some(value) => anyhow::bail!(
+                "invalid {WAL_V8_EXTENT_PREPARATION_ENV} {value:?}; expected `fallocate` or `initialize`"
+            ),
+            None => anyhow::bail!("{WAL_V8_EXTENT_PREPARATION_ENV} is not valid UTF-8"),
+        };
+        let bytes = bytes.context(format!("{WAL_V8_EXTENT_PREPARATION_BYTES_ENV} is required"))?;
+        let bytes = bytes
+            .to_str()
+            .context("V8 extent preparation byte count is not valid UTF-8")?
+            .parse::<u64>()
+            .context("V8 extent preparation byte count must be an unsigned integer")?;
+        ensure!(
+            bytes > 0 && bytes.is_multiple_of(WAL_V8_EXTENT_PREPARATION_CHUNK_BYTES as u64),
+            "V8 extent preparation bytes must be a positive multiple of {}",
+            WAL_V8_EXTENT_PREPARATION_CHUNK_BYTES
+        );
+
+        Ok(Some((mode, bytes)))
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Fallocate => "fallocate",
+            Self::Initialize => "initialize",
+        }
+    }
+}
+
+#[cfg(feature = "bench")]
+fn prepare_v8_extent_suffix(
+    data_file: &File,
+    sync_file: &File,
+    start_offset: u64,
+    max_file_size: u64,
+    mode: WalExtentPreparationMode,
+    bytes: u64,
+) -> Result<WalExtentPreparationDiagnostics> {
+    ensure!(
+        WalIoHandleMetadata::from_file(data_file)?.o_direct == Some(true),
+        "V8 extent preparation requires an O_DIRECT DATA worker"
+    );
+    let before = data_file
+        .metadata()
+        .context("inspect V8 WAL before extent preparation")?;
+    let sync_metadata = sync_file
+        .metadata()
+        .context("inspect V8 WAL sync handle before extent preparation")?;
+    ensure!(
+        before.is_file()
+            && sync_metadata.is_file()
+            && before.dev() == sync_metadata.dev()
+            && before.ino() == sync_metadata.ino()
+            && before.len() == start_offset,
+        "V8 extent preparation requires the untouched installed Active WAL inode"
+    );
+    let end_offset = start_offset
+        .checked_add(bytes)
+        .context("V8 extent preparation range overflows")?;
+    ensure!(
+        end_offset <= max_file_size,
+        "V8 extent preparation exceeds the configured WAL segment size"
+    );
+
+    let started_at = Instant::now();
+    let allocated_bytes_before = before.blocks().saturating_mul(512);
+    let offset = libc::off_t::try_from(start_offset)
+        .context("V8 extent preparation offset exceeds off_t")?;
+    let len = libc::off_t::try_from(bytes).context("V8 extent preparation length exceeds off_t")?;
+    // SAFETY: both values are checked, and the owned descriptor remains live.
+    let result = unsafe { libc::fallocate(data_file.as_raw_fd(), 0, offset, len) };
+    ensure!(
+        result == 0,
+        "V8 benchmark fallocate failed: {}",
+        io::Error::last_os_error()
+    );
+
+    let initialized_bytes = if mode == WalExtentPreparationMode::Initialize {
+        let chunk_bytes = WAL_V8_EXTENT_PREPARATION_CHUNK_BYTES;
+        let mut zeros = DirectBuf::new(chunk_bytes);
+        zeros.zero_range(0, chunk_bytes);
+        let mut current_offset = start_offset;
+        while current_offset < end_offset {
+            data_file
+                .write_all_at(zeros.initialized_slice(0, chunk_bytes), current_offset)
+                .with_context(|| format!("initialize V8 WAL extent at offset {current_offset}"))?;
+            current_offset += chunk_bytes as u64;
+        }
+        bytes
+    } else {
+        0
+    };
+    sync_file
+        .sync_data()
+        .context("sync V8 WAL extent preparation before benchmark")?;
+
+    let after = data_file
+        .metadata()
+        .context("inspect V8 WAL after extent preparation")?;
+    ensure!(
+        after.dev() == before.dev() && after.ino() == before.ino() && after.len() == end_offset,
+        "V8 extent preparation did not preserve the WAL inode and expected range"
+    );
+    let allocated_bytes = after
+        .blocks()
+        .saturating_mul(512)
+        .saturating_sub(allocated_bytes_before);
+    ensure!(
+        allocated_bytes >= bytes,
+        "V8 fallocate reported fewer allocated bytes than the requested suffix"
+    );
+
+    Ok(WalExtentPreparationDiagnostics {
+        mode,
+        start_offset,
+        end_offset,
+        allocated_bytes,
+        initialized_bytes,
+        elapsed_ns: u64::try_from(started_at.elapsed().as_nanos()).unwrap_or(u64::MAX),
+    })
 }
 
 #[cfg(feature = "bench")]
@@ -1144,6 +1294,7 @@ impl WalV8LeaderWriter {
             data: WalIoHandleMetadata::from_file(&write_file)?,
             frontier: WalIoHandleMetadata::from_file(&write_file)?,
             sync: WalIoHandleMetadata::from_file(&sync_file)?,
+            extent_preparation: None,
         };
 
         Ok(Self {
@@ -1239,6 +1390,17 @@ impl WalV8LeaderWriter {
         #[cfg(feature = "bench")]
         {
             io_diagnostics.data = WalIoHandleMetadata::from_file(&worker_file)?;
+        }
+        #[cfg(feature = "bench")]
+        if let Some((mode, bytes)) = WalExtentPreparationMode::from_environment()? {
+            io_diagnostics.extent_preparation = Some(prepare_v8_extent_suffix(
+                &worker_file,
+                &self.sync_file,
+                self.coordinator.last_frontier_end(),
+                self.max_file_size,
+                mode,
+                bytes,
+            )?);
         }
         #[cfg(feature = "bench")]
         let frontier_file = match WalV8FrontierWriteMode::from_environment()? {
@@ -2625,6 +2787,44 @@ mod tests {
         assert!(WalV8FrontierWriteMode::from_value(Some(OsStr::new("invalid"))).is_err());
     }
 
+    #[cfg(feature = "bench")]
+    #[test]
+    fn v8_extent_preparation_parses_modes_and_aligned_lengths() {
+        let chunk_bytes = WAL_V8_EXTENT_PREPARATION_CHUNK_BYTES as u64;
+        assert_eq!(
+            WalExtentPreparationMode::from_values(None, None).unwrap(),
+            None
+        );
+        assert_eq!(
+            WalExtentPreparationMode::from_values(
+                Some(OsStr::new("fallocate")),
+                Some(OsStr::new("262144")),
+            )
+            .unwrap(),
+            Some((WalExtentPreparationMode::Fallocate, chunk_bytes * 2))
+        );
+        assert_eq!(
+            WalExtentPreparationMode::from_values(
+                Some(OsStr::new("initialize")),
+                Some(OsStr::new("131072")),
+            )
+            .unwrap(),
+            Some((WalExtentPreparationMode::Initialize, chunk_bytes))
+        );
+        assert!(WalExtentPreparationMode::from_values(None, Some(OsStr::new("131072"))).is_err());
+        assert!(WalExtentPreparationMode::from_values(Some(OsStr::new("none")), None).is_err());
+        assert!(
+            WalExtentPreparationMode::from_values(Some(OsStr::new("fallocate")), None).is_err()
+        );
+        assert!(
+            WalExtentPreparationMode::from_values(
+                Some(OsStr::new("initialize")),
+                Some(OsStr::new("4096"))
+            )
+            .is_err()
+        );
+    }
+
     fn header() -> WalV8Header {
         let archive_epoch_id = ArchiveEpochId([0x22; 16]);
 
@@ -2776,6 +2976,8 @@ mod tests {
         const CHILD_ACK_ENV: &str = "TOY_KV_V8_PARALLEL_CRASH_CHILD_ACK";
         const CHILD_FRONTIER_MODE_ENV: &str = "TOY_KV_V8_PARALLEL_CRASH_FRONTIER_MODE";
         const FRONTIER_MODE_ENV: &str = "TOYKV_WAL_V8_FRONTIER_MODE";
+        const EXTENT_PREPARATION_ENV: &str = "TOYKV_BENCH_V8_EXTENT_PREP";
+        const EXTENT_PREPARATION_BYTES_ENV: &str = "TOYKV_BENCH_V8_EXTENT_PREP_BYTES";
         const TEST_NAME: &str =
             "wal::v8::leader::tests::failpoint_parallel_writer_crashes_at_durability_boundaries";
         const CRASH_POINTS: [(&str, u64, u64); 4] = [
@@ -2801,7 +3003,9 @@ mod tests {
                 MAX_WAL_FILE_SIZE,
             )?;
             #[cfg(feature = "bench")]
-            let writer = if std::env::var(CHILD_FRONTIER_MODE_ENV).as_deref() == Ok("direct") {
+            let writer = if std::env::var(CHILD_FRONTIER_MODE_ENV).as_deref() == Ok("direct")
+                || std::env::var_os(EXTENT_PREPARATION_ENV).is_some()
+            {
                 let worker_file = OpenOptions::new()
                     .read(true)
                     .write(true)
@@ -2811,6 +3015,23 @@ mod tests {
             } else {
                 open_writer(wal_path, &installed)?.into_parallel()?
             };
+            #[cfg(feature = "bench")]
+            {
+                let expected_len = if std::env::var_os(EXTENT_PREPARATION_ENV).is_some() {
+                    installed.image_len + WAL_V8_EXTENT_PREPARATION_CHUNK_BYTES as u64
+                } else {
+                    installed.image_len
+                };
+                ensure!(
+                    std::fs::metadata(wal_path)?.len() == expected_len,
+                    "V8 crash fixture has an unexpected pre-write physical length"
+                );
+                ensure!(
+                    std::env::var_os(EXTENT_PREPARATION_BYTES_ENV).is_some()
+                        == std::env::var_os(EXTENT_PREPARATION_ENV).is_some(),
+                    "V8 crash fixture extent mode and byte count must be configured together"
+                );
+            }
             #[cfg(not(feature = "bench"))]
             let writer = open_writer(wal_path, &installed)?.into_parallel()?;
             let value = batch(10);
@@ -2829,91 +3050,114 @@ mod tests {
         let frontier_modes = ["buffered", "direct"];
         #[cfg(not(feature = "bench"))]
         let frontier_modes = ["buffered"];
+        #[cfg(feature = "bench")]
+        let extent_preparation_modes = ["none", "fallocate", "initialize"];
+        #[cfg(not(feature = "bench"))]
+        let extent_preparation_modes = ["none"];
 
         for frontier_mode in frontier_modes {
-            for (crash_point, expected_min_ticket_end, expected_max_ticket_end) in CRASH_POINTS {
-                let directory = tempfile::tempdir_in(&parent)?;
-                let wal_path = directory.path().join("active-v8.wal");
-                let ack_path = directory.path().join("acknowledged");
-                let marker_path = directory.path().join("crash.marker");
-                let anchor = create_empty_active(&wal_path, header())?;
+            for extent_preparation_mode in extent_preparation_modes {
+                for (crash_point, expected_min_ticket_end, expected_max_ticket_end) in CRASH_POINTS
+                {
+                    let directory = tempfile::tempdir_in(&parent)?;
+                    let wal_path = directory.path().join("active-v8.wal");
+                    let ack_path = directory.path().join("acknowledged");
+                    let marker_path = directory.path().join("crash.marker");
+                    let anchor = create_empty_active(&wal_path, header())?;
 
-                let mut child = Command::new(std::env::current_exe()?);
-                child
-                    .arg("--exact")
-                    .arg(TEST_NAME)
-                    .arg("--nocapture")
-                    .env(CHILD_WAL_ENV, &wal_path)
-                    .env(CHILD_ACK_ENV, &ack_path)
-                    .env(CHILD_FRONTIER_MODE_ENV, frontier_mode)
-                    .env(FRONTIER_MODE_ENV, frontier_mode)
-                    .env(
-                        crate::chaos::failpoint::PARALLEL_WAL_CRASH_POINT_ENV,
-                        crash_point,
-                    )
-                    .env(
-                        crate::chaos::failpoint::PARALLEL_WAL_CRASH_OCCURRENCE_ENV,
-                        "1",
-                    )
-                    .env(
-                        crate::chaos::failpoint::PARALLEL_WAL_CRASH_MARKER_ENV,
-                        &marker_path,
-                    )
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::inherit());
-                let mut child = child.spawn()?;
-                let deadline = Instant::now() + Duration::from_secs(30);
-                loop {
-                    if marker_path.is_file() {
-                        break;
+                    let mut child = Command::new(std::env::current_exe()?);
+                    child
+                        .arg("--exact")
+                        .arg(TEST_NAME)
+                        .arg("--nocapture")
+                        .env(CHILD_WAL_ENV, &wal_path)
+                        .env(CHILD_ACK_ENV, &ack_path)
+                        .env(CHILD_FRONTIER_MODE_ENV, frontier_mode)
+                        .env(FRONTIER_MODE_ENV, frontier_mode)
+                        .env_remove(EXTENT_PREPARATION_ENV)
+                        .env_remove(EXTENT_PREPARATION_BYTES_ENV)
+                        .env(
+                            crate::chaos::failpoint::PARALLEL_WAL_CRASH_POINT_ENV,
+                            crash_point,
+                        )
+                        .env(
+                            crate::chaos::failpoint::PARALLEL_WAL_CRASH_OCCURRENCE_ENV,
+                            "1",
+                        )
+                        .env(
+                            crate::chaos::failpoint::PARALLEL_WAL_CRASH_MARKER_ENV,
+                            &marker_path,
+                        )
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::inherit());
+                    #[cfg(feature = "bench")]
+                    if extent_preparation_mode != "none" {
+                        child
+                            .env(EXTENT_PREPARATION_ENV, extent_preparation_mode)
+                            .env(
+                                EXTENT_PREPARATION_BYTES_ENV,
+                                WAL_V8_EXTENT_PREPARATION_CHUNK_BYTES.to_string(),
+                            );
                     }
-                    if let Some(status) = child.try_wait()? {
-                        anyhow::bail!(
-                            "V8 writer child exited before reaching {crash_point} in {frontier_mode} mode: {status}"
-                        );
+                    let mut child = child.spawn()?;
+                    let deadline = Instant::now() + Duration::from_secs(30);
+                    loop {
+                        if marker_path.is_file() {
+                            break;
+                        }
+                        if let Some(status) = child.try_wait()? {
+                            anyhow::bail!(
+                                "V8 writer child exited before reaching {crash_point} in {frontier_mode}/{extent_preparation_mode} mode: {status}"
+                            );
+                        }
+                        if Instant::now() >= deadline {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            anyhow::bail!(
+                                "V8 writer child did not reach {crash_point} in {frontier_mode}/{extent_preparation_mode} mode"
+                            );
+                        }
+                        thread::sleep(Duration::from_millis(10));
                     }
-                    if Instant::now() >= deadline {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        anyhow::bail!(
-                            "V8 writer child did not reach {crash_point} in {frontier_mode} mode"
-                        );
-                    }
-                    thread::sleep(Duration::from_millis(10));
-                }
 
-                child.kill()?;
-                let status = child.wait()?;
-                ensure!(
-                    status.signal() == Some(libc::SIGKILL),
-                    "V8 writer child was not killed at {crash_point} in {frontier_mode} mode: {status}"
-                );
-                assert_eq!(std::fs::read_to_string(&marker_path)?.trim(), crash_point);
-                assert!(!ack_path.exists(), "crashed V8 write was acknowledged");
+                    child.kill()?;
+                    let status = child.wait()?;
+                    ensure!(
+                        status.signal() == Some(libc::SIGKILL),
+                        "V8 writer child was not killed at {crash_point} in {frontier_mode}/{extent_preparation_mode} mode: {status}"
+                    );
+                    assert_eq!(std::fs::read_to_string(&marker_path)?.trim(), crash_point);
+                    assert!(!ack_path.exists(), "crashed V8 write was acknowledged");
 
-                let recovered = super::super::install::recover_and_install_active(
-                    &wal_path,
-                    &[anchor],
-                    header().predecessor,
-                    LIVE_WAL_V5_LIMITS,
-                    MAX_WAL_FILE_SIZE,
-                )?;
-                assert!(
-                    (expected_min_ticket_end..=expected_max_ticket_end)
-                        .contains(&recovered.active_boundary.ticket_end),
-                    "recovered ticket end {} is outside the permitted range for {crash_point}",
-                    recovered.active_boundary.ticket_end,
-                );
-                let batches = replayed_batches(&wal_path, &recovered)?;
-                assert_eq!(
-                    batches.len() as u64,
-                    recovered.active_boundary.ticket_end,
-                    "replay count differs from recovered boundary at {crash_point} in {frontier_mode} mode"
-                );
-                if recovered.active_boundary.ticket_end == 1 {
-                    assert_eq!(batches, [batch(10)]);
-                } else {
-                    assert!(batches.is_empty());
+                    let recovered = super::super::install::recover_and_install_active(
+                        &wal_path,
+                        &[anchor],
+                        header().predecessor,
+                        LIVE_WAL_V5_LIMITS,
+                        MAX_WAL_FILE_SIZE,
+                    )?;
+                    assert_eq!(
+                        std::fs::metadata(&wal_path)?.len(),
+                        recovered.image_len,
+                        "recovery retained a preallocated suffix after {crash_point} in {frontier_mode}/{extent_preparation_mode} mode"
+                    );
+                    assert!(
+                        (expected_min_ticket_end..=expected_max_ticket_end)
+                            .contains(&recovered.active_boundary.ticket_end),
+                        "recovered ticket end {} is outside the permitted range for {crash_point}",
+                        recovered.active_boundary.ticket_end,
+                    );
+                    let batches = replayed_batches(&wal_path, &recovered)?;
+                    assert_eq!(
+                        batches.len() as u64,
+                        recovered.active_boundary.ticket_end,
+                        "replay count differs from recovered boundary at {crash_point} in {frontier_mode} mode"
+                    );
+                    if recovered.active_boundary.ticket_end == 1 {
+                        assert_eq!(batches, [batch(10)]);
+                    } else {
+                        assert!(batches.is_empty());
+                    }
                 }
             }
         }

@@ -18,7 +18,10 @@ use wrapper::kv_engine_wrapper;
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use clap::{Parser, ValueEnum};
 #[cfg(feature = "bench")]
-use kv_engine_wrapper::wal::{WalIoDiagnostics, WalIoHandleMetadata};
+use kv_engine_wrapper::wal::{
+    WalExtentPreparationDiagnostics, WalExtentPreparationMode, WalIoDiagnostics,
+    WalIoHandleMetadata,
+};
 use kv_engine_wrapper::{
     BackupOptions, CreateBackupOutcome, EnablePitrOutcome, MAX_STATUS_PAGE_SIZE,
     PersistedPitrConfig, PitrOptions, PitrResumeOutcome, PitrRuntimeOptions, PitrStatus,
@@ -53,6 +56,9 @@ const ENGINE_NAME: &str = "kv-engine";
 const STEADY_STATE_SEED_VERSION: &str = "splitmix64-v2";
 const STEADY_STATE_OPERATION_STREAM_LABEL: u64 = 0x0180_0001;
 const STEADY_STATE_KEY_STREAM_LABEL: u64 = 0x0180_0002;
+const WAL_V8_EXTENT_PREPARATION_ENV: &str = "TOYKV_BENCH_V8_EXTENT_PREP";
+const WAL_V8_EXTENT_PREPARATION_BYTES_ENV: &str = "TOYKV_BENCH_V8_EXTENT_PREP_BYTES";
+const WAL_V8_EXTENT_PREPARATION_CHUNK_BYTES: u64 = 128 * 1024;
 const STEADY_STATE_VALUE_STREAM_LABEL: u64 = 0x0180_0003;
 const STEADY_STATE_WARMUP_STREAM_LABEL: u64 = 0x0180_0010;
 const STEADY_STATE_MEASUREMENT_STREAM_LABEL: u64 = 0x0180_0011;
@@ -1222,6 +1228,34 @@ struct WalIoDiagnosticsRecord {
     data: WalIoHandleRecord,
     frontier: WalIoHandleRecord,
     sync: WalIoHandleRecord,
+    extent_preparation: Option<WalExtentPreparationRecord>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+struct WalExtentPreparationRecord {
+    mode: &'static str,
+    start_offset: u64,
+    end_offset: u64,
+    allocated_bytes: u64,
+    initialized_bytes: u64,
+    elapsed_ns: u64,
+}
+
+#[cfg(feature = "bench")]
+impl From<WalExtentPreparationDiagnostics> for WalExtentPreparationRecord {
+    fn from(diagnostics: WalExtentPreparationDiagnostics) -> Self {
+        Self {
+            mode: match diagnostics.mode {
+                WalExtentPreparationMode::Fallocate => "fallocate",
+                WalExtentPreparationMode::Initialize => "initialize",
+            },
+            start_offset: diagnostics.start_offset,
+            end_offset: diagnostics.end_offset,
+            allocated_bytes: diagnostics.allocated_bytes,
+            initialized_bytes: diagnostics.initialized_bytes,
+            elapsed_ns: diagnostics.elapsed_ns,
+        }
+    }
 }
 
 #[cfg(feature = "bench")]
@@ -1231,6 +1265,7 @@ impl From<WalIoDiagnostics> for WalIoDiagnosticsRecord {
             data: diagnostics.data.into(),
             frontier: diagnostics.frontier.into(),
             sync: diagnostics.sync.into(),
+            extent_preparation: diagnostics.extent_preparation.map(Into::into),
         }
     }
 }
@@ -9477,6 +9512,38 @@ fn validate_run_mode(cfg: &HarnessConfig, bench_arg: Option<&str>) -> Result<()>
         "--prepare-golden does not support --bench"
     );
 
+    let extent_mode = std::env::var_os(WAL_V8_EXTENT_PREPARATION_ENV);
+    let extent_bytes = std::env::var_os(WAL_V8_EXTENT_PREPARATION_BYTES_ENV);
+    if extent_mode.is_some() || extent_bytes.is_some() {
+        anyhow::ensure!(
+            cfg!(feature = "bench"),
+            "V8 extent preparation requires a bench build"
+        );
+        anyhow::ensure!(
+            cfg.pitr_format.unwrap_or(PitrFormatArg::V8) == PitrFormatArg::V8
+                && cfg.wal_io_mode == WalIoModeArg::Parallel,
+            "V8 extent preparation requires PITR V8 Parallel I/O"
+        );
+        let extent_mode = extent_mode
+            .context("TOYKV_BENCH_V8_EXTENT_PREP requires `fallocate` or `initialize`")?;
+        anyhow::ensure!(
+            matches!(extent_mode.to_str(), Some("fallocate" | "initialize")),
+            "TOYKV_BENCH_V8_EXTENT_PREP must be `fallocate` or `initialize`"
+        );
+        let extent_bytes = extent_bytes
+            .context("TOYKV_BENCH_V8_EXTENT_PREP_BYTES is required with extent preparation")?;
+        let extent_bytes = extent_bytes
+            .to_str()
+            .context("TOYKV_BENCH_V8_EXTENT_PREP_BYTES is not valid UTF-8")?
+            .parse::<u64>()
+            .context("TOYKV_BENCH_V8_EXTENT_PREP_BYTES must be an unsigned integer")?;
+        anyhow::ensure!(
+            extent_bytes > 0 && extent_bytes.is_multiple_of(WAL_V8_EXTENT_PREPARATION_CHUNK_BYTES),
+            "TOYKV_BENCH_V8_EXTENT_PREP_BYTES must be a positive multiple of {}",
+            WAL_V8_EXTENT_PREPARATION_CHUNK_BYTES
+        );
+    }
+
     Ok(())
 }
 
@@ -11182,6 +11249,7 @@ mod tests {
                             device: 7,
                             inode: 11,
                         },
+                        extent_preparation: None,
                     }),
                     wal_io_end: cfg!(feature = "bench").then_some(WalIoDiagnosticsRecord {
                         data: WalIoHandleRecord {
@@ -11199,6 +11267,7 @@ mod tests {
                             device: 7,
                             inode: 11,
                         },
+                        extent_preparation: None,
                     }),
                     wal_io_stable: cfg!(feature = "bench").then_some(true),
                     ..WalPipelineRecord::default()

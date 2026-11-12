@@ -155,6 +155,29 @@ pub struct WalIoDiagnostics {
     pub data: WalIoHandleMetadata,
     pub frontier: WalIoHandleMetadata,
     pub sync: WalIoHandleMetadata,
+    pub extent_preparation: Option<WalExtentPreparationDiagnostics>,
+}
+
+/// Benchmark-only V8 WAL extent preparation performed before timed writes.
+#[cfg(feature = "bench")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[doc(hidden)]
+pub struct WalExtentPreparationDiagnostics {
+    pub mode: WalExtentPreparationMode,
+    pub start_offset: u64,
+    pub end_offset: u64,
+    pub allocated_bytes: u64,
+    pub initialized_bytes: u64,
+    pub elapsed_ns: u64,
+}
+
+/// How the benchmark prepared an Active V8 WAL suffix.
+#[cfg(feature = "bench")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[doc(hidden)]
+pub enum WalExtentPreparationMode {
+    Fallocate,
+    Initialize,
 }
 
 /// Size of a batch header (v2/v3): commit_ts (8) + entry_count (4) + data_crc32 (4) = 16 bytes.
