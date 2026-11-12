@@ -42,6 +42,7 @@ and do not define the current writer selection.
 - [GCP V7/V8 CPU affinity, 2026-11-11](wal/benchmarks/rfc-026-v7-v8-cpu-affinity-gcp-20261111.md)
 - [GCP V8 ordering HOL diagnostics, 2026-11-12](wal/benchmarks/rfc-026-v8-ordering-hol-gcp-20261112.md)
 - [GCP V8 sliding extent initialization, 2026-11-12](wal/benchmarks/rfc-026-v8-sliding-initialize-gcp-20261112.md)
+- [GCP V8 sliding fallocate full matrix, 2026-11-12](wal/benchmarks/rfc-026-v8-sliding-fallocate-matrix-gcp-20261112.md)
 
 ## Backup
 
