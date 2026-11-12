@@ -1116,6 +1116,21 @@ impl WalV8ParallelCoordinator {
         self.inner.state.lock().last_frontier_end
     }
 
+    /// Keep all admitted DATA and reserved FRONTIER ranges stable while
+    /// reclaiming a speculative physical suffix. The callback must not enter
+    /// the coordinator or acquire the submission lock.
+    pub(crate) fn with_allocation_tail<T>(
+        &self,
+        update: impl FnOnce(u64) -> Result<T>,
+    ) -> Result<T> {
+        let state = self.inner.state.lock();
+        ensure!(!state.poisoned, "v8 Parallel coordinator is poisoned");
+        let result = update(state.next_data_offset);
+        drop(state);
+
+        result
+    }
+
     pub(crate) fn change_generation(&self) -> u64 {
         self.inner.state.lock().change_generation
     }

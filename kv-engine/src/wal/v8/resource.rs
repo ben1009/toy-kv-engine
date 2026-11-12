@@ -168,8 +168,9 @@ impl WalV8ReservationOwner {
     ///
     /// The image owner retains this charge after the writer is dropped. As DATA
     /// or FRONTIER frames occupy the reserved range, callers release the
-    /// corresponding credit; any unused suffix stays charged until source
-    /// cleanup retires the image.
+    /// corresponding credit; an unused suffix stays charged until it is
+    /// durably truncated under quota pressure or source cleanup retires the
+    /// image.
     pub(crate) fn reserve_extent_slack(&self, bytes: u64) -> Result<u64, WalV7ReservationError> {
         self.image_owner.reserve_image_source_spool(bytes)
     }

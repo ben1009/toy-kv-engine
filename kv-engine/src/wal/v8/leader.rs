@@ -930,6 +930,44 @@ impl WalV8ExtentPreallocator {
         Ok(())
     }
 
+    /// Discard unused physical space before retrying quota admission. The
+    /// caller must exclude new coordinate assignments until this returns and
+    /// include every admitted DATA and reserved FRONTIER in `allocated_tail`.
+    fn discard_speculative_tail(&self, allocated_tail: u64) -> Result<()> {
+        ensure!(
+            (self.start_offset..=self.max_file_size).contains(&allocated_tail)
+                && allocated_tail.is_multiple_of(FRAME_LEN_U64),
+            "invalid v8 extent reclamation tail"
+        );
+        let Some(owner) = &self.reservation_owner else {
+            return Ok(());
+        };
+        let mut state = self.state.lock();
+        state.window_preallocation_disabled = true;
+        if state.slack.iter().all(|window| window.charged_bytes == 0) {
+            return Ok(());
+        }
+
+        // Keep this conservative even if truncation or sync fails after
+        // changing the inode. All assigned ranges retain batch quota; only
+        // the speculative suffix may be removed, and its charge stays held
+        // until that removal is durable.
+        state.prepared_end = state.prepared_end.min(allocated_tail);
+        self.data_file
+            .set_len(allocated_tail)
+            .context("truncate speculative v8 WAL extent tail")?;
+        self.data_file
+            .sync_data()
+            .context("sync reclaimed v8 WAL extent tail")?;
+        for window in &mut state.slack {
+            owner.release_extent_slack(window.reservation_id, window.charged_bytes)?;
+            window.charged_bytes = 0;
+        }
+        state.slack.clear();
+
+        Ok(())
+    }
+
     #[cfg(feature = "bench")]
     fn diagnostics(&self) -> WalV8SlidingExtentPreparationDiagnostics {
         let state = self.state.lock();
@@ -1821,6 +1859,7 @@ impl WalV8ParallelIo {
                 return Ok(0);
             }
 
+            self.ensure_extent_prepared_through(cursor)?;
             let mut writes = Vec::with_capacity(selected.len());
             for ticket in &selected {
                 let pending = state
@@ -1828,6 +1867,12 @@ impl WalV8ParallelIo {
                     .remove(ticket)
                     .context("v8 worker pending DATA disappeared")?;
                 let write_len = pending.buffer.len();
+                let write_end = pending
+                    .file_offset
+                    .checked_add(u64::try_from(write_len)?)
+                    .context("v8 DATA source-credit range overflows")?;
+                // The driver transfers credit for FRONTIER gaps separately.
+                self.consume_extent_source_credit(pending.file_offset, write_end)?;
                 writes.push(WriteBuffer::new(
                     pending.buffer,
                     pending.file_offset,
@@ -1842,8 +1887,6 @@ impl WalV8ParallelIo {
                 &frontier_offsets,
             )
             .map_err(|error| anyhow::anyhow!("build v8 DATA worker group: {error:?}"))?;
-            self.ensure_extent_prepared_through(cursor)?;
-            self.consume_extent_source_credit(allocation_start, cursor)?;
             self.client
                 .submit_group(group)
                 .context("submit v8 DATA worker group")?;
@@ -3142,6 +3185,31 @@ impl WalV8ParallelWriter {
         self.admit_prepared_batch_inner(prepared, commit_ts, recorded_at, || {})
     }
 
+    fn reserve_batch_resources(
+        &self,
+        logical_bytes: u64,
+        frame_bytes: u64,
+    ) -> Result<Option<WalV7OwnedBatchReservation>> {
+        let Some(owner) = &self.reservation_owner else {
+            return Ok(None);
+        };
+        let reservation = owner.reserve_batch(logical_bytes, frame_bytes);
+        if let Err(error) = &reservation
+            && matches!(
+                error.downcast_ref::<WalV7ReservationError>(),
+                Some(WalV7ReservationError::SourceSpoolLimit { .. })
+            )
+            && let Some(preallocator) = &self.io.extent_preallocator
+        {
+            self.coordinator
+                .with_allocation_tail(|tail| preallocator.discard_speculative_tail(tail))?;
+
+            return owner.reserve_batch(logical_bytes, frame_bytes).map(Some);
+        }
+
+        reservation.map(Some)
+    }
+
     fn admit_prepared_batch_inner<'a, F>(
         &self,
         prepared: WalV8PreparedBatch<'a>,
@@ -3155,11 +3223,7 @@ impl WalV8ParallelWriter {
         ensure!(!self.is_poisoned(), "v8 Parallel WAL is poisoned");
         let logical_bytes = u64::try_from(prepared.logical_batch_bytes())?;
         let frame_bytes = u64::try_from(prepared.frame_buffer_bytes())?;
-        let mut reservation = self
-            .reservation_owner
-            .as_ref()
-            .map(|owner| owner.reserve_batch(logical_bytes, frame_bytes))
-            .transpose()?;
+        let mut reservation = self.reserve_batch_resources(logical_bytes, frame_bytes)?;
 
         // Own the allocation before publishing the ticket. Initialization is
         // payload-sized work, so defer it to finish after the MVCC sequencer
@@ -3925,6 +3989,36 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn sliding_extent_reclamation_failure_retains_quota() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("active-v8.wal");
+        let mut fixture =
+            accounted_extent_preallocator_fixture(&path, 64 * 1024, FRAME_LEN_U64 * 4)?;
+        fixture
+            .preallocator
+            .ensure_prepared_through_with(fixture.required_end, |_, _| Ok(()))?;
+        let source_bytes = fixture.owner.image_owner().snapshot().source_spool_bytes;
+        fixture.preallocator.data_file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECT)
+            .open(&path)?;
+
+        fixture
+            .preallocator
+            .discard_speculative_tail(fixture.required_end)
+            .expect_err("read-only descriptor must reject tail truncation");
+        let state = fixture.preallocator.state.lock();
+        assert_eq!(state.prepared_end, fixture.required_end);
+        assert!(state.window_preallocation_disabled);
+        assert_eq!(
+            fixture.owner.image_owner().snapshot().source_spool_bytes,
+            source_bytes
+        );
+
+        Ok(())
+    }
+
     #[cfg(feature = "bench")]
     #[test]
     fn frontier_write_mode_parses_only_supported_values() {
@@ -4615,6 +4709,47 @@ mod tests {
     }
 
     const FIXED_IMAGE_TEST_BYTES: u64 = HEADER_LEN_U64 + FRAME_LEN_U64;
+
+    fn open_extent_accounted_parallel_writer(
+        path: &Path,
+        installed: &WalV8InstalledRecovery,
+        max_file_size: u64,
+        max_source_spool_bytes: u64,
+        window_bytes: u64,
+    ) -> Result<(
+        WalV8ParallelWriter,
+        Arc<WalV8ReservationOwner>,
+        Arc<WalV8ExtentPreallocator>,
+    )> {
+        let sync_file = OpenOptions::new().read(true).write(true).open(path)?;
+        let (leader, owner) = open_accounted_writer(
+            path,
+            installed,
+            max_file_size,
+            max_source_spool_bytes,
+            FRAME_LEN_U64,
+            sync_file.try_clone()?,
+        )?;
+        let worker_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_DIRECT)
+            .open(path)?;
+        let preallocator = Arc::new(WalV8ExtentPreallocator::new(
+            worker_file.try_clone()?,
+            &sync_file,
+            installed.image_len,
+            max_file_size,
+            window_bytes,
+            Some(Arc::clone(&owner)),
+        )?);
+        let mut writer = leader.into_parallel_with_worker_file(worker_file)?;
+        Arc::get_mut(&mut writer.io)
+            .context("new V8 writer unexpectedly shares its I/O state")?
+            .extent_preallocator = Some(Arc::clone(&preallocator));
+
+        Ok((writer, owner, preallocator))
+    }
 
     struct AccountedExtentPreallocatorFixture {
         owner: Arc<WalV8ReservationOwner>,
@@ -5572,6 +5707,153 @@ mod tests {
         drop(frontier);
         reader.join().expect("published cursor reader panicked");
         assert_eq!(snapshot?, expected);
+
+        Ok(())
+    }
+
+    #[test]
+    fn parallel_frontier_gaps_keep_unused_extent_space_charged() -> Result<()> {
+        const SEGMENT_LIMIT: u64 = 256 * 1024;
+        const WINDOW_BYTES: u64 = FRAME_LEN_U64 * 8;
+
+        let parent = Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/wal-v8-tests");
+        std::fs::create_dir_all(&parent)?;
+        let directory = tempfile::tempdir_in(parent)?;
+        let path = directory.path().join("accounted-v8.wal");
+        let installed = install_empty(&path, header())?;
+        let (writer, owner, preallocator) = open_extent_accounted_parallel_writer(
+            &path,
+            &installed,
+            SEGMENT_LIMIT,
+            2 * SEGMENT_LIMIT,
+            WINDOW_BYTES,
+        )?;
+
+        let mut previous_frontier_end = installed.image_len;
+        for commit_ts in 10..20 {
+            let batch = batch(commit_ts);
+            let (commit, _) = writer.append_prepared_batch(
+                writer.preflight_batch(&batch, LIVE_WAL_V5_LIMITS)?,
+                commit_ts,
+                batch.recorded_at,
+            )?;
+            assert_eq!(commit.first_data_offset, previous_frontier_end);
+            previous_frontier_end = commit.frontier_offset + FRAME_LEN_U64;
+
+            let prepared_end = preallocator.state.lock().prepared_end;
+            assert_eq!(std::fs::metadata(&path)?.len(), prepared_end);
+            assert_eq!(
+                owner.image_owner().snapshot().source_spool_bytes,
+                prepared_end,
+                "DATA submission must leave the unused extent suffix charged after commit {commit_ts}"
+            );
+        }
+        assert!(previous_frontier_end > installed.image_len + 2 * WINDOW_BYTES);
+
+        Ok(())
+    }
+
+    #[test]
+    fn parallel_extent_slack_does_not_block_batch_admission() -> Result<()> {
+        const SEGMENT_LIMIT: u64 = 64 * 1024;
+
+        let parent = Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/wal-v8-tests");
+        std::fs::create_dir_all(&parent)?;
+        let directory = tempfile::tempdir_in(parent)?;
+        let path = directory.path().join("pressured-v8.wal");
+        let installed = install_empty(&path, header())?;
+        let (writer, owner, preallocator) = open_extent_accounted_parallel_writer(
+            &path,
+            &installed,
+            SEGMENT_LIMIT,
+            2 * SEGMENT_LIMIT + FRAME_LEN_U64,
+            WAL_V8_PRODUCTION_EXTENT_WINDOW_BYTES,
+        )?;
+        let batches = [batch(10), batch(20)];
+        for batch in &batches {
+            writer.append_prepared_batch(
+                writer.preflight_batch(batch, LIVE_WAL_V5_LIMITS)?,
+                batch.commit_ts,
+                batch.recorded_at,
+            )?;
+        }
+
+        assert!(preallocator.state.lock().window_preallocation_disabled);
+        assert_eq!(std::fs::metadata(&path)?.len(), writer.image_len()?);
+        assert_eq!(
+            owner.image_owner().snapshot().source_spool_bytes,
+            writer.image_len()?
+        );
+        let (_, boundary) = writer.active_boundaries()?;
+        drop(writer);
+        drop(preallocator);
+        drop(owner);
+
+        let recovered = super::super::install::recover_and_install_active(
+            &path,
+            &[boundary],
+            header().predecessor,
+            LIVE_WAL_V5_LIMITS,
+            SEGMENT_LIMIT,
+        )?;
+        assert_eq!(replayed_batches(&path, &recovered)?, batches);
+
+        Ok(())
+    }
+
+    #[test]
+    fn parallel_extent_pressure_preserves_admitted_data() -> Result<()> {
+        const SEGMENT_LIMIT: u64 = 64 * 1024;
+
+        let parent = Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/wal-v8-tests");
+        std::fs::create_dir_all(&parent)?;
+        let directory = tempfile::tempdir_in(parent)?;
+        let path = directory.path().join("pending-v8.wal");
+        let installed = install_empty(&path, header())?;
+        let (writer, owner, preallocator) = open_extent_accounted_parallel_writer(
+            &path,
+            &installed,
+            SEGMENT_LIMIT,
+            2 * SEGMENT_LIMIT + 2 * FRAME_LEN_U64,
+            WAL_V8_PRODUCTION_EXTENT_WINDOW_BYTES,
+        )?;
+        let batches = [batch(10), batch(20), batch(30)];
+        writer.append_prepared_batch(
+            writer.preflight_batch(&batches[0], LIVE_WAL_V5_LIMITS)?,
+            batches[0].commit_ts,
+            batches[0].recorded_at,
+        )?;
+        let second = writer.admit_prepared_batch(
+            writer.preflight_batch(&batches[1], LIVE_WAL_V5_LIMITS)?,
+            batches[1].commit_ts,
+            batches[1].recorded_at,
+        )?;
+        let second_data_end = second.assignment().first_data_offset + FRAME_LEN_U64;
+        second.finish()?;
+
+        let third = writer.admit_prepared_batch(
+            writer.preflight_batch(&batches[2], LIVE_WAL_V5_LIMITS)?,
+            batches[2].commit_ts,
+            batches[2].recorded_at,
+        )?;
+        assert!(preallocator.state.lock().window_preallocation_disabled);
+        assert_eq!(std::fs::metadata(&path)?.len(), second_data_end);
+        let third_ticket = third.assignment().segment_ticket;
+        third.finish()?;
+        writer.wait_durable(third_ticket)?;
+        let (_, boundary) = writer.active_boundaries()?;
+        drop(writer);
+        drop(preallocator);
+        drop(owner);
+
+        let recovered = super::super::install::recover_and_install_active(
+            &path,
+            &[boundary],
+            header().predecessor,
+            LIVE_WAL_V5_LIMITS,
+            SEGMENT_LIMIT,
+        )?;
+        assert_eq!(replayed_batches(&path, &recovered)?, batches);
 
         Ok(())
     }
