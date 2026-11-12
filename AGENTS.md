@@ -363,23 +363,26 @@ for them again. Pass the project explicitly to every cloud command. Do not put
 project identifiers, public IPs, credentials, access tokens, or private keys in
 tracked files.
 
-Before provisioning:
+Before creating the benchmark VM:
 
 1. Confirm the active `gcloud` identity and that Billing Overview still shows
    Free Trial. Set `--confirm-free-trial` only after that attestation. Never
    enable Paid billing, APIs, or quotas.
-2. Run the benchmark runner with `--preflight-only` using the same machine,
-   runtime, network, and cost arguments planned for the run. The current user
-   authorization is a maximum 60-minute VM lifetime and a $2 estimated-spend
-   ceiling; do not raise either without explicit authorization. The estimate is
-   an admission guard, not a hard GCP billing cap.
-3. Audit effective ingress rules before creating a VM. If the default VPC has
-   broad SSH or other conflicting ingress rules, stop using it. Do not weaken or
-   delete shared firewall rules. Use a temporary isolated VPC and regional
-   subnet managed by Terraform, with an internet-egress route for bootstrap and
-   downloads and SSH restricted to the supplied CIDR (prefer `/32`). Use the
-   repository's Terraform configuration as the resource/authentication pattern;
-   keep temporary state outside the repository and destroy it after the run.
+2. Audit effective ingress rules on the default VPC. If it has broad SSH or
+   other conflicting ingress rules, do not use it or weaken or delete its shared
+   rules. Provision a temporary isolated VPC and regional subnet with Terraform,
+   including the internet-egress route needed for bootstrap and downloads. Audit
+   the isolated network's effective ingress too, and restrict the benchmark's
+   temporary SSH rule to the supplied CIDR (prefer `/32`). Use the repository's
+   Terraform configuration as the resource/authentication pattern, and keep
+   temporary state outside the repository.
+3. After the selected network and subnet exist, run the benchmark runner with
+   `--preflight-only` using the same machine, runtime, network, and cost
+   arguments planned for the run. Require this preflight to pass before creating
+   the VM. The current user authorization is a maximum 60-minute VM lifetime
+   and a $2 estimated-spend ceiling; do not raise either without explicit
+   authorization. The estimate is an admission guard, not a hard GCP billing
+   cap.
 
 Run the smallest experiment that answers the current diagnostic question. Keep
 experimental source patches and runner changes isolated from PR branches; record
