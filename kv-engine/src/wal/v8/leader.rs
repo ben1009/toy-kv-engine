@@ -699,6 +699,7 @@ struct WalV8ExtentSlack {
 struct WalV8ExtentPreallocationState {
     prepared_end: u64,
     slack: Vec<WalV8ExtentSlack>,
+    window_preallocation_disabled: bool,
     #[cfg(feature = "bench")]
     fallocate_calls: u64,
     #[cfg(feature = "bench")]
@@ -778,6 +779,7 @@ impl WalV8ExtentPreallocator {
             state: Mutex::new(WalV8ExtentPreallocationState {
                 prepared_end: start_offset,
                 slack: Vec::new(),
+                window_preallocation_disabled: false,
                 #[cfg(feature = "bench")]
                 fallocate_calls: 0,
                 #[cfg(feature = "bench")]
@@ -798,12 +800,16 @@ impl WalV8ExtentPreallocator {
             return Ok(());
         }
 
-        let mut target_end = sliding_extent_target_end(
-            self.start_offset,
-            self.max_file_size,
-            self.window_bytes,
-            required_end,
-        )?;
+        let mut target_end = if state.window_preallocation_disabled {
+            required_end
+        } else {
+            sliding_extent_target_end(
+                self.start_offset,
+                self.max_file_size,
+                self.window_bytes,
+                required_end,
+            )?
+        };
         if self.reservation_owner.is_none() {
             // The window suffix has no quota owner in test-only writers, so
             // keep those paths exact rather than allocating uncharged space.
@@ -828,21 +834,9 @@ impl WalV8ExtentPreallocator {
         }
 
         let prepared_start = state.prepared_end;
-        #[cfg(feature = "bench")]
-        let started_at = Instant::now();
-        #[cfg(feature = "bench")]
-        {
-            state.fallocate_calls = state.fallocate_calls.saturating_add(1);
-        }
-        if let Err(error) = fallocate_wal_range(&self.data_file, prepared_start, target_end) {
-            // Keep any window reservation charged: a failed fallocate may
-            // have allocated a partial range before returning an error.
-            return Err(error).context("fallocate sliding V8 WAL extent");
-        }
-        #[cfg(feature = "bench")]
-        let allocated_bytes = target_end - prepared_start;
-
-        if let Some((reservation_id, charged_bytes)) = slack_reservation {
+        if let Some((reservation_id, charged_bytes)) = slack_reservation.take() {
+            // Keep the charge reachable even if fallocate fails after
+            // partially allocating the speculative suffix.
             state.slack.push(WalV8ExtentSlack {
                 start: required_end,
                 end: target_end,
@@ -850,13 +844,39 @@ impl WalV8ExtentPreallocator {
                 charged_bytes,
             });
         }
+        #[cfg(feature = "bench")]
+        let started_at = Instant::now();
+        #[cfg(feature = "bench")]
+        let mut fallocate_calls = 0_u64;
+        let prepared_end = fallocate_sliding_extent_with_fallback(
+            prepared_start,
+            required_end,
+            target_end,
+            &mut state.window_preallocation_disabled,
+            |start, end| {
+                #[cfg(feature = "bench")]
+                {
+                    fallocate_calls = fallocate_calls.saturating_add(1);
+                }
+                fallocate_wal_range(&self.data_file, start, end)
+            },
+        );
+        #[cfg(feature = "bench")]
+        {
+            state.fallocate_calls = state.fallocate_calls.saturating_add(fallocate_calls);
+            state.elapsed_ns = state
+                .elapsed_ns
+                .saturating_add(u64::try_from(started_at.elapsed().as_nanos()).unwrap_or(u64::MAX));
+        }
+        let prepared_end = prepared_end?;
+        target_end = prepared_end;
+        #[cfg(feature = "bench")]
+        let allocated_bytes = target_end - prepared_start;
+
         state.prepared_end = target_end;
         #[cfg(feature = "bench")]
         {
             state.allocated_bytes = state.allocated_bytes.saturating_add(allocated_bytes);
-            state.elapsed_ns = state
-                .elapsed_ns
-                .saturating_add(u64::try_from(started_at.elapsed().as_nanos()).unwrap_or(u64::MAX));
         }
 
         ensure!(
@@ -942,13 +962,60 @@ fn fallocate_wal_range(file: &File, start: u64, end: u64) -> Result<()> {
     let len = libc::off_t::try_from(end - start).context("V8 fallocate length exceeds off_t")?;
     // SAFETY: both values are checked, and the owned descriptor remains live.
     let result = unsafe { libc::fallocate(file.as_raw_fd(), 0, offset, len) };
-    ensure!(
-        result == 0,
-        "V8 fallocate failed: {}",
-        io::Error::last_os_error()
-    );
+    if result != 0 {
+        return Err(io::Error::last_os_error()).context("V8 fallocate syscall failed");
+    }
 
     Ok(())
+}
+
+fn fallocate_sliding_extent_with_fallback(
+    prepared_start: u64,
+    required_end: u64,
+    target_end: u64,
+    window_preallocation_disabled: &mut bool,
+    mut fallocate: impl FnMut(u64, u64) -> Result<()>,
+) -> Result<u64> {
+    ensure!(
+        prepared_start < required_end,
+        "V8 fallocate prefix is empty"
+    );
+    ensure!(
+        target_end >= required_end,
+        "V8 fallocate window misses the required prefix"
+    );
+
+    let window_end = if *window_preallocation_disabled {
+        required_end
+    } else {
+        target_end
+    };
+    match fallocate(prepared_start, window_end) {
+        Ok(()) => Ok(window_end),
+        Err(window_error)
+            if window_end > required_end && is_fallocate_capacity_error(&window_error) =>
+        {
+            *window_preallocation_disabled = true;
+            fallocate(prepared_start, required_end).with_context(|| {
+                format!(
+                    "fallocate required V8 WAL prefix after speculative window failure: {window_error:#}"
+                )
+            })?;
+            Ok(required_end)
+        }
+        Err(error) => Err(error).context("fallocate sliding V8 WAL extent"),
+    }
+}
+
+fn is_fallocate_capacity_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<io::Error>().is_some_and(|error| {
+            matches!(
+                error.raw_os_error(),
+                Some(libc::ENOSPC) | Some(libc::EDQUOT) | Some(libc::EFBIG)
+            )
+        })
+    })
 }
 
 fn is_o_direct_file(file: &File) -> Result<bool> {
@@ -3681,6 +3748,67 @@ mod tests {
     use crate::wal::v7::admission::{
         WalV7ResourceCharge, WalV7ResourceLedger, WalV7ResourceLimits, WalV7RetainedResources,
     };
+
+    #[test]
+    fn sliding_extent_falls_back_to_exact_prefix_after_capacity_error() -> Result<()> {
+        let mut preallocation_disabled = false;
+        let mut calls = Vec::new();
+        let prepared_end = fallocate_sliding_extent_with_fallback(
+            0,
+            4096,
+            1024 * 1024,
+            &mut preallocation_disabled,
+            |start, end| {
+                calls.push((start, end));
+                if end == 1024 * 1024 {
+                    Err(io::Error::from_raw_os_error(libc::ENOSPC).into())
+                } else {
+                    Ok(())
+                }
+            },
+        )?;
+
+        assert_eq!(prepared_end, 4096);
+        assert!(preallocation_disabled);
+        assert_eq!(calls, [(0, 1024 * 1024), (0, 4096)]);
+
+        calls.clear();
+        let prepared_end = fallocate_sliding_extent_with_fallback(
+            4096,
+            8192,
+            2 * 1024 * 1024,
+            &mut preallocation_disabled,
+            |start, end| {
+                calls.push((start, end));
+                Ok(())
+            },
+        )?;
+
+        assert_eq!(prepared_end, 8192);
+        assert_eq!(calls, [(4096, 8192)]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn sliding_extent_does_not_retry_non_capacity_errors() {
+        let mut preallocation_disabled = false;
+        let mut calls = Vec::new();
+        let result = fallocate_sliding_extent_with_fallback(
+            0,
+            4096,
+            1024 * 1024,
+            &mut preallocation_disabled,
+            |start, end| {
+                calls.push((start, end));
+                Err(io::Error::from_raw_os_error(libc::EIO).into())
+            },
+        );
+
+        assert!(result.is_err());
+        assert!(!preallocation_disabled);
+        assert_eq!(calls, [(0, 1024 * 1024)]);
+    }
 
     #[cfg(feature = "bench")]
     #[test]
