@@ -356,12 +356,14 @@ On flush and compaction, newly produced SST blocks are inserted into the block c
 
 ## GCP Benchmark Workflow
 
-For GCP WAL benchmarks, read `docs/wal/benchmarks/gcp-free-trial-wal-bench.md` and
-`infra/gcp/test-environment/README.md` first. Reuse the project, zone, SSH source
-CIDR, and spend limits already supplied in the active session instead of asking
-for them again. Pass the project explicitly to every cloud command. Do not put
-project identifiers, public IPs, credentials, access tokens, or private keys in
-tracked files.
+For any GCP work, first fetch and read the current
+[`infra/gcp/test-environment/README.md`](https://github.com/ben1009/toy-kv-engine/blob/main/infra/gcp/test-environment/README.md)
+from `main`, before running `gcloud`, Terraform, SSH, or other cloud commands.
+Then read `docs/wal/benchmarks/gcp-free-trial-wal-bench.md` for WAL-specific
+work. Reuse the project, zone, SSH source CIDR, and spend limits already supplied
+in the active session instead of asking for them again. Pass the project
+explicitly to every cloud command. Do not put project identifiers, public IPs,
+credentials, access tokens, or private keys in tracked files.
 
 Before creating the benchmark VM:
 

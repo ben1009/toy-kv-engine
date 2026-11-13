@@ -49,14 +49,14 @@ Values are sample p50/p95 in microseconds, except counts. Composite percentiles 
 | Follower total wait thread CPU | 4.1 | 10.6 |
 | Follower coordinator lock wait | 0.5 | 1.3 |
 | notify to follower resume | 22.6 | 56.4 |
-| Followers woken by last notify | 15 | 15 |
+| Waiters recorded at last notification | 15 | 15 |
 
 ## What this says
 
 - `fdatasync` consumed about 9 μs of thread CPU at p50 while taking about 95 μs wall time. The syscall interval is mostly waiting, not CPU execution.
 - At 16 writers, sampled advances covered 16 tickets. Coalescing plus FRONTIER write and sync had a 285 μs p50; the full driver interval was 366 μs p50 and 481 μs p95.
 - Publish lock wait stayed below 1.3 μs at p95, and publish itself was about 4.5 μs p50. These samples do not support Coordinator mutex contention as a large part of the cycle.
-- Followers waited 346 μs p50 with about 4 μs thread CPU. The last notify woke 15 followers at p50; notify-to-resume was 23 μs p50 and 56 μs p95. This captures follower wait and wake timing, not durable-publish-to-`put()` return or MVCC publication.
+- Followers waited 346 μs p50 with about 4 μs thread CPU. The sampler recorded 15 durability waiters at the last notification (p50); this is not a measured count of followers actually woken. The reported notify-to-resume interval is measured from the latest notification timestamp observed after the follower reacquires the coordinator lock. If a driver handoff records a newer notification first, this interval can be shorter than the elapsed time since the notification that woke the follower. Treat it as an approximate diagnostic, not exact wake latency. It does not measure durable-publish-to-`put()` return or MVCC publication.
 - Resource-retirement wall time (before and after publication combined) was 47 μs p50 and 85 μs p95 in the sampled 16-writer advances. It is a follow-up candidate, but this run does not isolate its causal impact.
 
 ## Verification and retained artifacts
@@ -64,3 +64,36 @@ Values are sample p50/p95 in microseconds, except counts. Composite percentiles 
 The runner summary reports `complete: true` with 4/4 runs. `remote-exit.json` reports `failed: false` and 4 starts. The downloaded archive checksum passed: `297501ab14d23b7c034a6b2dde424e8a35ad88c11787f7d15f26024edb4a932b`. The archive and checksum metadata are retained locally; the VM/network were left intact.
 
 The initial run bundle remains separately preserved. Its workloads completed, but an overly strict validator rejected expected sliding-fallocate progress changes, and the original sampler did not advance its sequence, so it contained no driver phase samples. The corrected run above uses the recorded sampler and runner patches. The sampler fix was subsequently committed and pushed as `25ceb3c6`; the runner-validator patch remains local and was not included in that push.
+
+## Sampler instrumentation overhead follow-up
+
+This follow-up reuses the retained GCP environment and compares the same V8 Point configuration with
+the sampler disabled and enabled every 64 completed durability advances. The source was commit
+`905e561f`. It completed five counterbalanced off/on pairs, for 10 successful 100,000-put runs. The
+run used 16 writers, 1 KiB values, Sliding Fallocate 4 MiB, Direct FRONTIER, and fixed 400 μs
+coalescing. No `perf`, Hotpath, timeline, or eBPF capture was enabled; ordinary benchmark counters
+remained enabled.
+
+| Metric | Sampler off | Sampler on | Change |
+| --- | ---: | ---: | ---: |
+| Throughput median | 33.25k puts/s | 33.08k puts/s | −0.5% by arm medians |
+| Paired throughput change, median | — | — | −1.12%; 3/5 pairs lower |
+| Sampled p99 median | 1.012 ms | 1.320 ms | Variable across runs; no stable tail conclusion |
+| Process CPU median | 7.313 s | 7.470 s | +2.2% |
+| Sync count median | 6,346 | 6,362 | +0.25% |
+| Sampled completed advances per enabled run | — | 99 | 99 in each run; zero dropped samples |
+
+The measured throughput difference is within the run-to-run variation and does not establish a clear sampler-induced regression or gain. The small increase in process CPU is consistent with modest instrumentation cost, but five pairs are insufficient to characterize it precisely. The p99 samples vary substantially and should not be used to claim a stable tail-latency change.
+
+Each run confirmed stable WAL handle identity with DATA `O_DIRECT=true`, FRONTIER `O_DIRECT=true`, and
+the sync handle buffered (`O_DIRECT=false`). All three handles referred to the same inode within
+that run. The result set is retained under the ignored local path
+`bench-results/gcp-v8-durability-sampler-overhead-final-20261113T150315Z`; the transferred archive
+checksum matched (`091fdfc7f775ecd74288f51657f72915819b73435195ebe23dbe3a3571134b08`). The archive
+at `collection-attempt-01/results.tar.gz` and its checksum metadata remain local rather than being
+committed. The summary is complete at 10/10 runs, and `remote-exit.json` reports no failure and 10
+starts. Every planned run ID has a successful `result.json` and matching `run-metadata.json` in its
+run directory. Earlier invalid or wrapper-rejected attempts remain preserved separately and are
+excluded from these metrics.
+
+No cloud cleanup was performed; the VM and associated environment were retained after collection.
