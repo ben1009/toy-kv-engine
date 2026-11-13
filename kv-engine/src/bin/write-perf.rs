@@ -297,7 +297,7 @@ struct Args {
     /// stages. Requires a bench build with PITR V8 Parallel I/O.
     #[arg(long, requires = "pitr")]
     wal_completion_timeline: bool,
-    /// Sample one out of every N V8 Parallel durability advances and follower waits.
+    /// Sample every Nth completed V8 Parallel durability advance and follower wait.
     /// Captures phase wall/thread CPU time; requires a bench build with PITR V8 Parallel I/O.
     #[arg(long, requires = "pitr")]
     wal_v8_durability_sample_every: Option<u64>,
@@ -1190,7 +1190,12 @@ struct WalV8CompletionTimelineRecord {
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 struct WalV8DurabilityDiagnosticsRunRecord {
     sample_every: u64,
-    phase_dropped_samples: u64,
+    driver_attempts: u64,
+    empty_driver_attempts: u64,
+    advance_attempts: u64,
+    completed_advances: u64,
+    sampled_advances: u64,
+    dropped_samples: u64,
     phases: Vec<WalV8DurabilityPhaseRecord>,
     follower_wait_dropped_samples: u64,
     follower_waits: Vec<WalV8FollowerWaitRecord>,
@@ -1199,6 +1204,8 @@ struct WalV8DurabilityDiagnosticsRunRecord {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
 struct WalV8DurabilityPhaseRecord {
     sample_id: u64,
+    driver_attempt_sequence: u64,
+    advance_sequence: u64,
     ticket_start: u64,
     ticket_end: u64,
     tickets_covered: u64,
@@ -1271,6 +1278,8 @@ impl From<kv_engine_wrapper::mem_table::WalV8DurabilityPhaseObservation>
     fn from(observation: kv_engine_wrapper::mem_table::WalV8DurabilityPhaseObservation) -> Self {
         Self {
             sample_id: observation.sample_id,
+            driver_attempt_sequence: observation.driver_attempt_sequence,
+            advance_sequence: observation.advance_sequence,
             ticket_start: observation.ticket_start,
             ticket_end: observation.ticket_end,
             tickets_covered: observation.tickets_covered,
@@ -1592,9 +1601,15 @@ fn wal_pipeline_record(
                 .collect(),
         });
     let v8_durability_diagnostics = profile.wal_v8_durability_sample_every.map(|sample_every| {
+        let counts = engine.wal_v8_durability_diagnostic_counts();
         WalV8DurabilityDiagnosticsRunRecord {
             sample_every,
-            phase_dropped_samples: engine.wal_v8_durability_phase_dropped_samples(),
+            driver_attempts: counts.driver_attempts,
+            empty_driver_attempts: counts.empty_driver_attempts,
+            advance_attempts: counts.advance_attempts,
+            completed_advances: counts.completed_advances,
+            sampled_advances: counts.sampled_advances,
+            dropped_samples: counts.dropped_samples,
             phases: engine
                 .wal_v8_durability_phase_observations()
                 .into_iter()

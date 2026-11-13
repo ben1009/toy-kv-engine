@@ -286,7 +286,13 @@ pub struct WriteProfile {
     #[cfg(feature = "bench")]
     wal_v8_durability_sample_every: AtomicU64,
     #[cfg(feature = "bench")]
-    wal_v8_durability_advance_sample_sequence: AtomicU64,
+    wal_v8_durability_driver_attempt_count: AtomicU64,
+    #[cfg(feature = "bench")]
+    wal_v8_durability_empty_driver_attempt_count: AtomicU64,
+    #[cfg(feature = "bench")]
+    wal_v8_durability_advance_attempt_count: AtomicU64,
+    #[cfg(feature = "bench")]
+    wal_v8_durability_completed_advance_sequence: AtomicU64,
     #[cfg(feature = "bench")]
     wal_v8_durability_follower_sample_sequence: AtomicU64,
     #[cfg(feature = "bench")]
@@ -380,6 +386,8 @@ pub struct WalV8CompletionTimelineObservation {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct WalV8DurabilityPhaseObservation {
     pub sample_id: u64,
+    pub driver_attempt_sequence: u64,
+    pub advance_sequence: u64,
     pub ticket_start: u64,
     pub ticket_end: u64,
     pub tickets_covered: u64,
@@ -402,6 +410,24 @@ pub struct WalV8DurabilityPhaseObservation {
     pub coordinator_publish_cpu_ns: u64,
     pub notify_all_wall_ns: u64,
     pub followers_waiting_at_publish: u64,
+}
+
+/// Aggregate counters for one opt-in V8 durability sampling run.
+#[cfg(feature = "bench")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WalV8DurabilityDiagnosticCounts {
+    /// Driver loop iterations entered while sampling was enabled.
+    pub driver_attempts: u64,
+    /// Driver attempts that found no ready ticket prefix.
+    pub empty_driver_attempts: u64,
+    /// Non-empty advance cycles started, including cycles that later failed.
+    pub advance_attempts: u64,
+    /// Advances successfully published as durable.
+    pub completed_advances: u64,
+    /// Successfully retained phase observations.
+    pub sampled_advances: u64,
+    /// Selected phase observations not retained due to a failed cycle or sample cap.
+    pub dropped_samples: u64,
 }
 
 /// One sampled caller that waited for the current V8 durability driver.
@@ -459,7 +485,12 @@ impl WriteProfile {
         {
             self.wal_v8_completion_timeline_sample_every.store(0, o);
             self.wal_v8_durability_sample_every.store(0, o);
-            self.wal_v8_durability_advance_sample_sequence.store(0, o);
+            self.wal_v8_durability_driver_attempt_count.store(0, o);
+            self.wal_v8_durability_empty_driver_attempt_count
+                .store(0, o);
+            self.wal_v8_durability_advance_attempt_count.store(0, o);
+            self.wal_v8_durability_completed_advance_sequence
+                .store(0, o);
             self.wal_v8_durability_follower_sample_sequence.store(0, o);
             self.wal_v8_durability_phases.lock().clear();
             self.wal_v8_durability_phase_dropped_samples.store(0, o);
@@ -717,16 +748,86 @@ impl WriteProfile {
     }
 
     #[cfg(feature = "bench")]
-    pub(crate) fn next_wal_v8_durability_advance_sample(&self) -> Option<u64> {
+    pub(crate) fn record_wal_v8_durability_driver_attempt(&self) -> Option<u64> {
+        if self.wal_v8_durability_sample_every() == 0 {
+            return None;
+        }
+
+        Some(
+            self.wal_v8_durability_driver_attempt_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                .saturating_add(1),
+        )
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn next_wal_v8_durability_advance_sample_candidate(&self) -> Option<u64> {
         let every = self.wal_v8_durability_sample_every();
         if every == 0 {
             return None;
         }
-        let sample_id = self
-            .wal_v8_durability_advance_sample_sequence
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+
+        let next_advance_sequence = self
+            .wal_v8_durability_completed_advance_sequence
+            .load(std::sync::atomic::Ordering::Relaxed)
             .saturating_add(1);
-        sample_id.is_multiple_of(every).then_some(sample_id)
+        next_advance_sequence
+            .is_multiple_of(every)
+            .then_some(next_advance_sequence)
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn record_wal_v8_durability_empty_driver_attempt(&self) {
+        self.wal_v8_durability_empty_driver_attempt_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn record_wal_v8_durability_advance_attempt(&self) {
+        self.wal_v8_durability_advance_attempt_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn complete_wal_v8_durability_advance(&self) -> u64 {
+        self.wal_v8_durability_completed_advance_sequence
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .saturating_add(1)
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn wal_v8_durability_driver_attempt_count(&self) -> u64 {
+        self.wal_v8_durability_driver_attempt_count
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn wal_v8_durability_empty_driver_attempt_count(&self) -> u64 {
+        self.wal_v8_durability_empty_driver_attempt_count
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn wal_v8_durability_advance_attempt_count(&self) -> u64 {
+        self.wal_v8_durability_advance_attempt_count
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn wal_v8_durability_completed_advance_sequence(&self) -> u64 {
+        self.wal_v8_durability_completed_advance_sequence
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn wal_v8_durability_phase_sample_count(&self) -> u64 {
+        self.wal_v8_durability_phases.lock().len() as u64
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn drop_wal_v8_durability_phase_sample(&self) {
+        self.wal_v8_durability_phase_dropped_samples
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     #[cfg(feature = "bench")]
@@ -768,6 +869,18 @@ impl WriteProfile {
     pub(crate) fn wal_v8_durability_phase_dropped_samples(&self) -> u64 {
         self.wal_v8_durability_phase_dropped_samples
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn wal_v8_durability_diagnostic_counts(&self) -> WalV8DurabilityDiagnosticCounts {
+        WalV8DurabilityDiagnosticCounts {
+            driver_attempts: self.wal_v8_durability_driver_attempt_count(),
+            empty_driver_attempts: self.wal_v8_durability_empty_driver_attempt_count(),
+            advance_attempts: self.wal_v8_durability_advance_attempt_count(),
+            completed_advances: self.wal_v8_durability_completed_advance_sequence(),
+            sampled_advances: self.wal_v8_durability_phase_sample_count(),
+            dropped_samples: self.wal_v8_durability_phase_dropped_samples(),
+        }
     }
 
     #[cfg(feature = "bench")]
@@ -4626,6 +4739,44 @@ mod tests {
 
     const TEST_V7_MAX_FILE_SIZE: u64 = 1 << 30;
     const TEST_V8_MAX_IMAGE_LEN: u64 = 1 << 30;
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn v8_durability_sampling_tracks_completed_advances() {
+        let profile = super::WriteProfile::default();
+        profile.set_wal_v8_durability_sample_every(2);
+
+        assert_eq!(profile.record_wal_v8_durability_driver_attempt(), Some(1));
+        profile.record_wal_v8_durability_empty_driver_attempt();
+        assert_eq!(profile.record_wal_v8_durability_driver_attempt(), Some(2));
+        profile.record_wal_v8_durability_empty_driver_attempt();
+
+        // Empty driver attempts do not consume the next completed-advance sample.
+        assert_eq!(
+            profile.next_wal_v8_durability_advance_sample_candidate(),
+            None
+        );
+        assert_eq!(profile.complete_wal_v8_durability_advance(), 1);
+        assert_eq!(
+            profile.next_wal_v8_durability_advance_sample_candidate(),
+            Some(2)
+        );
+
+        profile.record_wal_v8_durability_advance_attempt();
+        assert_eq!(profile.complete_wal_v8_durability_advance(), 2);
+        assert_eq!(
+            profile.next_wal_v8_durability_advance_sample_candidate(),
+            None
+        );
+
+        let counts = profile.wal_v8_durability_diagnostic_counts();
+        assert_eq!(counts.driver_attempts, 2);
+        assert_eq!(counts.empty_driver_attempts, 2);
+        assert_eq!(counts.advance_attempts, 1);
+        assert_eq!(counts.completed_advances, 2);
+        assert_eq!(counts.sampled_advances, 0);
+        assert_eq!(counts.dropped_samples, 0);
+    }
 
     #[cfg(target_os = "linux")]
     fn install_empty_v8(path: &Path) -> Result<(WalV8Header, ActiveBoundary)> {

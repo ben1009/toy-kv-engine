@@ -209,6 +209,36 @@ pub(crate) struct WalV8ParallelWriter {
 }
 
 #[cfg(feature = "bench")]
+struct WalV8DurabilityPhaseSampleGuard {
+    profile: Arc<crate::mem_table::WriteProfile>,
+    recorded: bool,
+}
+
+#[cfg(feature = "bench")]
+impl WalV8DurabilityPhaseSampleGuard {
+    fn new(profile: Arc<crate::mem_table::WriteProfile>) -> Self {
+        Self {
+            profile,
+            recorded: false,
+        }
+    }
+
+    fn record(mut self, observation: crate::mem_table::WalV8DurabilityPhaseObservation) {
+        self.profile.record_wal_v8_durability_phase(observation);
+        self.recorded = true;
+    }
+}
+
+#[cfg(feature = "bench")]
+impl Drop for WalV8DurabilityPhaseSampleGuard {
+    fn drop(&mut self) {
+        if !self.recorded {
+            self.profile.drop_wal_v8_durability_phase_sample();
+        }
+    }
+}
+
+#[cfg(feature = "bench")]
 struct WalV8SlidingExtentPreparation {
     data_file: File,
     start_offset: u64,
@@ -3286,15 +3316,21 @@ impl WalV8ParallelWriter {
             #[cfg(feature = "bench")]
             let profile = self.profile.load_full();
             #[cfg(feature = "bench")]
-            let phase_sample_id = profile
+            let driver_attempt_sequence = profile
                 .as_ref()
-                .and_then(|profile| profile.next_wal_v8_durability_advance_sample());
+                .and_then(|profile| profile.record_wal_v8_durability_driver_attempt());
             #[cfg(feature = "bench")]
-            let frontier_lock_wait_started = phase_sample_id.map(|_| Instant::now());
+            let phase_sample_candidate = driver_attempt_sequence.and_then(|_| {
+                profile
+                    .as_ref()
+                    .and_then(|profile| profile.next_wal_v8_durability_advance_sample_candidate())
+            });
             #[cfg(feature = "bench")]
-            let driver_wall_started = phase_sample_id.map(|_| Instant::now());
+            let frontier_lock_wait_started = phase_sample_candidate.map(|_| Instant::now());
             #[cfg(feature = "bench")]
-            let driver_cpu_started = phase_sample_id.map(|_| digest::thread_cpu_time_ns());
+            let driver_wall_started = phase_sample_candidate.map(|_| Instant::now());
+            #[cfg(feature = "bench")]
+            let driver_cpu_started = phase_sample_candidate.map(|_| digest::thread_cpu_time_ns());
             let observed_generation = self.coordinator.durability_generation();
             let mut previous = self.frontier.lock();
             #[cfg(feature = "bench")]
@@ -3316,6 +3352,21 @@ impl WalV8ParallelWriter {
             #[cfg(feature = "bench")]
             let mut coalescing_cpu_ns = 0_u64;
             let mut snapshot = self.coordinator.frontier_ready_snapshot();
+            #[cfg(feature = "bench")]
+            let has_ready_prefix = !snapshot.ready_prefix.is_empty();
+            #[cfg(feature = "bench")]
+            if has_ready_prefix && driver_attempt_sequence.is_some() {
+                profile
+                    .as_ref()
+                    .expect("sampled durability driver has a write profile")
+                    .record_wal_v8_durability_advance_attempt();
+            }
+            #[cfg(feature = "bench")]
+            let phase_sample_id = has_ready_prefix.then_some(phase_sample_candidate).flatten();
+            #[cfg(feature = "bench")]
+            let phase_sample_guard = phase_sample_id
+                .and_then(|_| profile.as_ref().cloned())
+                .map(WalV8DurabilityPhaseSampleGuard::new);
             if !snapshot.ready_prefix.is_empty()
                 && snapshot.ready_prefix.len() < snapshot.admitted_ticket_count
                 && let Some(latency) = previous.last_sync_latency
@@ -3390,6 +3441,13 @@ impl WalV8ParallelWriter {
             let ready = snapshot.ready_prefix;
 
             if ready.is_empty() {
+                #[cfg(feature = "bench")]
+                if driver_attempt_sequence.is_some() {
+                    profile
+                        .as_ref()
+                        .expect("sampled durability driver has a write profile")
+                        .record_wal_v8_durability_empty_driver_attempt();
+                }
                 drop(previous);
                 let wake = self
                     .coordinator
@@ -3601,6 +3659,17 @@ impl WalV8ParallelWriter {
             };
             #[cfg(not(feature = "bench"))]
             self.coordinator.publish_durable_frontier(reservation)?;
+            #[cfg(feature = "bench")]
+            let advance_sequence = if driver_attempt_sequence.is_some() {
+                Some(
+                    profile
+                        .as_ref()
+                        .expect("sampled durability driver has a write profile")
+                        .complete_wal_v8_durability_advance(),
+                )
+            } else {
+                None
+            };
             // The shared worker tracks completed groups for its diagnostics.
             // Retire the physical DATA groups covered by this V8 durability
             // boundary so long-running diagnostic runs keep that map bounded.
@@ -3619,17 +3688,28 @@ impl WalV8ParallelWriter {
             previous.digest = frontier_digest;
             cycle_guard.complete();
             #[cfg(feature = "bench")]
-            if let (Some(profile), Some(sample_id), Some(wall_started), Some(cpu_started)) = (
-                profile.as_ref(),
+            if let (
+                Some(sample_id),
+                Some(driver_attempt_sequence),
+                Some(wall_started),
+                Some(cpu_started),
+            ) = (
                 phase_sample_id,
+                driver_attempt_sequence,
                 driver_wall_started,
                 driver_cpu_started,
             ) {
+                let advance_sequence =
+                    advance_sequence.expect("sampled durability advance has a completed sequence");
+                debug_assert_eq!(sample_id, advance_sequence);
                 let publish_metrics =
                     publish_metrics.expect("sampled durability advance records publish metrics");
-                profile.record_wal_v8_durability_phase(
-                    crate::mem_table::WalV8DurabilityPhaseObservation {
+                phase_sample_guard
+                    .expect("sampled durability advance has a sample guard")
+                    .record(crate::mem_table::WalV8DurabilityPhaseObservation {
                         sample_id,
+                        driver_attempt_sequence,
+                        advance_sequence,
                         ticket_start: first_ticket,
                         ticket_end: frontier_ticket_end,
                         tickets_covered: frontier_ticket_end.saturating_sub(first_ticket),
@@ -3654,8 +3734,7 @@ impl WalV8ParallelWriter {
                         coordinator_publish_cpu_ns: publish_metrics.publish_cpu_ns,
                         notify_all_wall_ns: publish_metrics.notify_all_wall_ns,
                         followers_waiting_at_publish: publish_metrics.followers_waiting,
-                    },
-                );
+                    });
             }
         }
     }

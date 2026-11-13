@@ -10137,8 +10137,9 @@ impl KvEngine {
     }
 
     #[cfg(feature = "bench")]
-    /// Sample one out of every `sample_every` V8 Parallel durability-driver
-    /// attempts and follower waits. Passing `None` disables phase timing.
+    /// Sample every Nth completed V8 Parallel durability advance and follower
+    /// wait. Driver attempt counters are also collected while enabled.
+    /// Passing `None` disables phase timing and counters.
     pub fn set_wal_v8_durability_sample_every(&self, sample_every: Option<u64>) -> Result<()> {
         anyhow::ensure!(
             sample_every.is_none_or(|every| every > 0),
@@ -10163,7 +10164,17 @@ impl KvEngine {
     }
 
     #[cfg(feature = "bench")]
-    /// Number of phase samples dropped after reaching the bounded sample limit.
+    /// Driver-attempt, advance, and retained-sample counts for V8 diagnostics.
+    pub fn wal_v8_durability_diagnostic_counts(
+        &self,
+    ) -> crate::mem_table::WalV8DurabilityDiagnosticCounts {
+        self.inner
+            .write_profile
+            .wal_v8_durability_diagnostic_counts()
+    }
+
+    #[cfg(feature = "bench")]
+    /// Number of selected phase samples omitted after an advance failure or the sample cap.
     pub fn wal_v8_durability_phase_dropped_samples(&self) -> u64 {
         self.inner
             .write_profile
