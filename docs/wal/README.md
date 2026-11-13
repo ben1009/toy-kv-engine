@@ -91,6 +91,7 @@ the retained and rejected experiments.
 - [RFC 026 V8 ext4 extent preparation on GCP, 2026-11-12](benchmarks/rfc-026-v8-ext4-extent-preparation-gcp-20261112.md)
 - [RFC 026 V8 bounded extent preparation on GCP, 2026-11-12](benchmarks/rfc-026-v8-bounded-extent-gcp-20261112.md)
 - [RFC 026 V7/V8 FRONTIER and coalescing comparison on GCP, 2026-11-13](benchmarks/rfc-026-v7-v8-frontier-gcp-20261113.md)
+- [RFC 026 V7/V8 Point CPU and scheduler diagnosis on GCP, 2026-11-13](benchmarks/rfc-026-v7-v8-point-perf-sched-gcp-20261113.md)
 - [RFC 026 V8 DATA submission-order probe on GCP, 2026-11-11](benchmarks/rfc-026-v8-data-submit-order-gcp-20261111.md)
 - [RFC 026 V8 coalescing budget A/B on GCP, 2026-11-11](benchmarks/rfc-026-v8-coalescing-budget-gcp-20261111.md)
 - [RFC 026 V8 low-overhead coalescing confirmation on GCP, 2026-11-11](benchmarks/rfc-026-v8-low-overhead-budget-gcp-20261111.md)
