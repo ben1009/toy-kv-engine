@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import base64
 import csv
-import hashlib
 import importlib.util
 import json
 import os
@@ -135,33 +134,61 @@ def fake_keygen(command, **_kwargs):
 class GcpFreeTrialWalBenchTests(unittest.TestCase):
     def _make_result_bundle(
         self, root: Path, *, complete: bool, include_run_metadata: bool = True,
-    ) -> tuple[Path, str]:
-        source_root = root / "source"
-        results = source_root / "results"
-        run_dir = results / "w16-point-r1-v7_parallel"
-        run_dir.mkdir(parents=True)
-        (results / "summary.json").write_text(
-            json.dumps({"complete": complete, "runs_planned": 1, "runs_completed": int(complete)}),
-            encoding="utf-8",
+    ) -> Path:
+        # Match the VM layout so archive paths are rooted at "results/".
+        results = root / "results"
+        results.mkdir(parents=True)
+        plan = build_benchmark_plan(
+            full_matrix=False, writers=(16,), machine_type=BENCH.MACHINE_TYPE,
+            machine_spec=BENCH.MACHINE_SPECS[BENCH.MACHINE_TYPE], num=64,
         )
-        (results / "summary.tsv").write_text("writer\tworkload\n16\tpoint\n", encoding="utf-8")
-        (results / "benchmark-plan.json").write_text('{"runs_planned":1}\n', encoding="utf-8")
-        (results / "remote-exit.json").write_text(
-            json.dumps({"failed": not complete, "runs_started": 1}), encoding="utf-8"
+        (results / "benchmark-plan.json").write_text(json.dumps(plan), encoding="utf-8")
+        (results / "rfc026-schedule.tsv").write_text("run_index\n", encoding="utf-8")
+        (results / "summary.tsv").write_text("writer\tblock\tposition\tformat\texit_code\n", encoding="utf-8")
+        schedule = build_batch64_schedule((16,))
+        rows = []
+        for run in schedule:
+            run_id = BENCH._run_identifier(run, "batch64")
+            run_dir = results / run_id
+            run_dir.mkdir()
+            exit_code = 0 if complete or run != schedule[-1] else 1
+            row = {
+                "writer": run["writer"], "block": run["block"], "position": run["position"],
+                "format": run["arm"], "exit_code": exit_code,
+            }
+            rows.append(row)
+            (run_dir / "result.json").write_text(json.dumps({"result": {"ops_per_sec": 123}}), encoding="utf-8")
+            if include_run_metadata:
+                (run_dir / "run-metadata.json").write_text(json.dumps(row), encoding="utf-8")
+            (run_dir / "stderr.log").write_text("", encoding="utf-8")
+            (run_dir / "timeline.json").write_text("{}\n", encoding="utf-8")
+        (results / "summary.json").write_text(json.dumps({
+            "complete": complete, "runs_planned": len(schedule), "runs_completed": len(schedule),
+            "matrix_validation": {
+                "complete": complete, "planned": len(schedule), "observed": len(schedule),
+            },
+            "results": rows,
+        }), encoding="utf-8")
+        (results / "remote-exit.json").write_text(json.dumps({
+            "failed": not complete, "runs_started": len(schedule),
+        }), encoding="utf-8")
+        (results / "profile-schedule.tsv").write_text("writer\tworkload\n", encoding="utf-8")
+        (results / "rust-toolchain.txt").write_text("nightly\n", encoding="utf-8")
+        return results
+
+    def _run_remote_bundle(self, command: str, results_root: Path, temp_root: Path) -> subprocess.CompletedProcess[str]:
+        remote_root = "GCP_WAL_RESULTS_ROOT=/mnt/gcp-wal-bench/results"
+        command = command.replace(remote_root, f"GCP_WAL_RESULTS_ROOT={BENCH.shlex.quote(str(results_root))}")
+        bundle_tmp = temp_root / "remote-tmp"
+        bundle_tmp.mkdir(exist_ok=True)
+        environment = {**os.environ, "TMPDIR": str(bundle_tmp)}
+        return subprocess.run(
+            ["bash", "-euc", command], capture_output=True, text=True, check=False, env=environment,
         )
-        (results / "rfc026-schedule.tsv").write_text("", encoding="utf-8")
-        (run_dir / "result.json").write_text('{"result":{"ops_per_sec":123}}\n', encoding="utf-8")
-        if include_run_metadata:
-            (run_dir / "run-metadata.json").write_text(
-                json.dumps({"exit_code": 0 if complete else 1}), encoding="utf-8"
-            )
-        archive = root / "results.tar.gz"
-        with tarfile.open(archive, "w:gz") as bundle:
-            for path in results.rglob("*"):
-                if path.is_file():
-                    bundle.add(path, arcname=path.relative_to(source_root).as_posix())
-        digest = hashlib.sha256(archive.read_bytes()).hexdigest()
-        return archive, digest
+
+    @staticmethod
+    def _archive_metadata(output: str) -> dict[str, str]:
+        return dict(line.split("=", 1) for line in output.splitlines() if "=" in line)
 
     def test_benchmark_record_loader_requires_exactly_one_valid_json_record(self) -> None:
         valid = json.dumps({"result": {}, "params": {}, "latency": {}})
@@ -1139,10 +1166,14 @@ print('[hotpath] diagnostic report follows')
                     raise OSError("No space left on device")
 
             success = subprocess.CompletedProcess([], 0, "", "")
+
+            def make_known_hosts(*args, **_kwargs):
+                Path(args[5]).write_text("host-key\n", encoding="utf-8")
+
             with (
                 patch.object(BENCH.shutil, "which", return_value="/usr/bin/tool"),
                 patch.object(BENCH, "audit_ssh_firewall_rules"),
-                patch.object(BENCH, "wait_for_verified_host_keys"),
+                patch.object(BENCH, "wait_for_verified_host_keys", side_effect=make_known_hosts),
                 patch.object(BENCH.subprocess, "run", side_effect=fake_keygen),
                 patch.object(BENCH, "ssh_command", return_value=success),
                 patch.object(BENCH, "scp_to_vm", return_value=success),
@@ -1211,13 +1242,11 @@ print('[hotpath] diagnostic report follows')
             def wait_for_host_keys(_gcloud, _instance, _project, _zone, _ip, known_hosts, _deadline):
                 known_hosts.write_text("verified host key\n", encoding="utf-8")
 
-            incomplete = {
-                "results": False,
-                "results_verified": False,
-                "summary_complete": False,
-                "bootstrap_log": True,
-                "benchmark_started": True,
-            }
+            def fail_collection(_ip, key, known_hosts, _results_dir, *, before_connect):
+                self.assertTrue(key.is_file())
+                self.assertTrue(known_hosts.is_file())
+                raise BENCH.BenchError("firewall audit failed before artifact transfer")
+
             with (
                 patch.object(BENCH.shutil, "which", return_value="/usr/bin/tool"),
                 patch.object(BENCH, "audit_ssh_firewall_rules"),
@@ -1225,7 +1254,7 @@ print('[hotpath] diagnostic report follows')
                 patch.object(BENCH.subprocess, "run", side_effect=fake_keygen),
                 patch.object(BENCH, "ssh_command", side_effect=ssh),
                 patch.object(BENCH, "scp_to_vm", return_value=successful_ssh),
-                patch.object(BENCH, "collect_artifacts", return_value=incomplete),
+                patch.object(BENCH, "collect_artifacts", side_effect=fail_collection),
                 patch.object(BENCH, "cleanup_gcp_resources") as cleanup,
             ):
                 result = BENCH.provision_and_run(
@@ -1236,11 +1265,56 @@ print('[hotpath] diagnostic report follows')
             cleanup.assert_not_called()
             lifecycle = json.loads((results / "lifecycle.json").read_text(encoding="utf-8"))
             self.assertTrue(lifecycle["benchmark_attempted"])
-            self.assertTrue(lifecycle["benchmark_started"])
             self.assertTrue(lifecycle["retained"])
             self.assertTrue((results / "retained-ssh-key").is_file())
+            self.assertTrue((results / "retained-known-hosts").is_file())
             reconnect = (results / "reconnect.txt").read_text(encoding="utf-8")
             self.assertIn("Do not destroy the VM, firewall, VPC, subnet, route, or Terraform state", reconnect)
+
+    def test_reconnect_instruction_failure_keeps_vm_for_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            results = Path(temp) / "results"
+            args = BENCH.argparse.Namespace(
+                project="test-project", zone="us-central1-a", network="walbench-net", subnet="walbench-subnet",
+                ssh_source_range="203.0.113.10/32", max_runtime_minutes=60, commit="a" * 40, num=64,
+                machine_type=BENCH.MACHINE_TYPE, writers=(16,), full_rfc026_matrix=True,
+                v8_small_ticket_profile=False, keep_vm_after_run=False,
+            )
+            gcloud = ProvisionGcloud()
+            successful_ssh = subprocess.CompletedProcess([], 0, "", "")
+
+            def ssh(_key, _known_hosts, _ip, command, *, timeout):
+                if command == "true":
+                    return successful_ssh
+                return subprocess.CompletedProcess([], 1, "", "benchmark did not complete")
+
+            def wait_for_host_keys(_gcloud, _instance, _project, _zone, _ip, known_hosts, _deadline):
+                known_hosts.write_text("verified host key\n", encoding="utf-8")
+
+            def fail_collection(*_args, **_kwargs):
+                raise BENCH.BenchError("firewall audit failed before artifact transfer")
+
+            with (
+                patch.object(BENCH.shutil, "which", return_value="/usr/bin/tool"),
+                patch.object(BENCH, "audit_ssh_firewall_rules"),
+                patch.object(BENCH, "wait_for_verified_host_keys", side_effect=wait_for_host_keys),
+                patch.object(BENCH.subprocess, "run", side_effect=fake_keygen),
+                patch.object(BENCH, "ssh_command", side_effect=ssh),
+                patch.object(BENCH, "scp_to_vm", return_value=successful_ssh),
+                patch.object(BENCH, "collect_artifacts", side_effect=fail_collection),
+                patch.object(BENCH, "retained_vm_reconnect_instructions", side_effect=OSError("disk full")),
+                patch.object(BENCH, "cleanup_gcp_resources") as cleanup,
+            ):
+                result = BENCH.provision_and_run(
+                    args, gcloud, results, {"boot_image": {"name": "pinned-image"}}
+                )
+
+            self.assertEqual(result, 1)
+            cleanup.assert_not_called()
+            lifecycle = json.loads((results / "lifecycle.json").read_text(encoding="utf-8"))
+            self.assertTrue(lifecycle["retained"])
+            self.assertTrue((results / "retained-ssh-key").is_file())
+            self.assertFalse((results / "reconnect.txt").exists())
 
     def test_firewall_audit_rejects_broad_ssh_allow(self) -> None:
         rule = {
@@ -1412,34 +1486,76 @@ print('[hotpath] diagnostic report follows')
             mock_run.assert_called_once()
             sleep.assert_not_called()
 
-    def test_collection_retries_and_keeps_a_transferred_partial_matrix(self) -> None:
+    def test_remote_archive_script_runs_and_keeps_diagnostics_and_provenance(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
+            results = root / "remote" / "results"
+            run_dir = results / "w16-point-v8_parallel"
+            run_dir.mkdir(parents=True)
+            for name in (
+                "profile-schedule.tsv", "rust-toolchain.txt", "write-perf.sha256", "perf-version.txt",
+            ):
+                (results / name).write_text("fixture\n", encoding="utf-8")
+            for name in ("stderr.log", "timeline.json", "perf.data", "perf-report.txt"):
+                (run_dir / name).write_bytes(b"capture")
+            (run_dir / "ignored.db").write_bytes(b"should not be bundled")
+
+            command = BENCH._build_remote_archive_command(root=str(results), max_bytes=1024 * 1024)
+            result = self._run_remote_bundle(command, results, root)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            metadata = self._archive_metadata(result.stdout)
+            self.assertEqual(metadata["ARCHIVE_FILES"], "8")
+            archive = Path(metadata["ARCHIVE_PATH"])
+            self.assertEqual(archive.parent, root / "remote-tmp")
+            with tarfile.open(archive, "r:gz") as bundle:
+                names = set(bundle.getnames())
+            for name in (
+                "results/profile-schedule.tsv", "results/rust-toolchain.txt",
+                "results/write-perf.sha256", "results/perf-version.txt",
+                "results/w16-point-v8_parallel/stderr.log", "results/w16-point-v8_parallel/timeline.json",
+                "results/w16-point-v8_parallel/perf.data", "results/w16-point-v8_parallel/perf-report.txt",
+            ):
+                self.assertIn(name, names)
+            self.assertFalse(any(name.endswith("ignored.db") for name in names))
+
+            too_small = BENCH._build_remote_archive_command(root=str(results), max_bytes=1)
+            rejected = self._run_remote_bundle(too_small, results, root)
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("exceeds 1 byte limit", rejected.stderr)
+
+    def test_collection_retries_and_preserves_partial_bundle_for_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            remote_results = self._make_result_bundle(root, complete=False)
             key = root / "key"
             known_hosts = root / "known_hosts"
             key.write_text("private", encoding="utf-8")
             known_hosts.write_text("host-key", encoding="utf-8")
-            archive, digest = self._make_result_bundle(root, complete=False)
             calls = 0
-            events = []
+            events: list[str] = []
+            archives: dict[str, Path] = {}
 
-            def pack(_key, _known_hosts, _ip, _command, *, timeout):
+            def pack(_key, _known_hosts, _ip, command, *, timeout):
                 self.assertEqual(events[-1], "audit")
                 events.append("ssh")
-                return subprocess.CompletedProcess([], 0, f"ARCHIVE_SHA256={digest}\n", "")
+                packed = self._run_remote_bundle(command, remote_results, root)
+                self.assertEqual(packed.returncode, 0, packed.stderr)
+                metadata = self._archive_metadata(packed.stdout)
+                archives[metadata["ARCHIVE_PATH"]] = Path(metadata["ARCHIVE_PATH"])
+                return packed
 
             def scp(_ip, remote, destination, _key, _known_hosts, *, recursive=False, timeout):
                 nonlocal calls
                 self.assertFalse(recursive)
-                self.assertEqual(events[-1], "ssh" if remote.endswith(".tar.gz") else "audit")
+                self.assertEqual(events[-1], "audit")
                 events.append("scp")
                 if remote.endswith(".tar.gz"):
                     calls += 1
                     if calls == 1:
                         return subprocess.CompletedProcess([], 1, "", "temporary transfer failure")
-                    shutil.copyfile(archive, destination)
+                    shutil.copyfile(archives[remote], destination)
                     return subprocess.CompletedProcess([], 0, "", "")
-                destination.write_text("boot log", encoding="utf-8")
+                destination.write_text("bootstrap details", encoding="utf-8")
                 return subprocess.CompletedProcess([], 0, "", "")
 
             with (
@@ -1453,22 +1569,31 @@ print('[hotpath] diagnostic report follows')
             self.assertTrue(result["results"])
             self.assertFalse(result["summary_complete"])
             self.assertFalse(result["results_verified"])
-            self.assertTrue((root / "collected" / "results" / "w16-point-r1-v7_parallel" / "result.json").is_file())
+            self.assertTrue((root / "collected" / "results" / "summary.json").is_file())
+            self.assertTrue((root / "collection-attempt-02" / "results.tar.gz").is_file())
+            self.assertTrue((root / "collection-attempt-02" / "bundle-metadata.json").is_file())
             self.assertEqual(calls, 2)
-            self.assertEqual(events, ["audit", "ssh", "scp", "audit", "ssh", "scp", "audit", "scp"])
+            self.assertEqual(
+                events,
+                ["audit", "ssh", "audit", "scp", "audit", "ssh", "audit", "scp", "audit", "scp"],
+            )
 
     def test_collection_rejects_complete_summary_with_missing_run_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            archive, digest = self._make_result_bundle(root, complete=True, include_run_metadata=False)
+            remote_results = self._make_result_bundle(root, complete=True, include_run_metadata=False)
+            archives: dict[str, Path] = {}
 
-            def pack(_key, _known_hosts, _ip, _command, *, timeout):
-                return subprocess.CompletedProcess([], 0, f"ARCHIVE_SHA256={digest}\n", "")
+            def pack(_key, _known_hosts, _ip, command, *, timeout):
+                packed = self._run_remote_bundle(command, remote_results, root)
+                metadata = self._archive_metadata(packed.stdout)
+                archives[metadata["ARCHIVE_PATH"]] = Path(metadata["ARCHIVE_PATH"])
+                return packed
 
             def scp(_ip, remote, destination, _key, _known_hosts, *, recursive=False, timeout):
                 self.assertFalse(recursive)
-                if remote.endswith(".tar.gz"):
-                    shutil.copyfile(archive, destination)
+                if remote in archives:
+                    shutil.copyfile(archives[remote], destination)
                 else:
                     destination.write_text("bootstrap details", encoding="utf-8")
                 return subprocess.CompletedProcess([], 0, "", "")
@@ -1484,9 +1609,183 @@ print('[hotpath] diagnostic report follows')
 
             self.assertTrue(result["results"])
             self.assertFalse(result["results_verified"])
-            attempt = json.loads((root / "artifact-collection.json").read_text(encoding="utf-8"))["attempts"][0]
-            self.assertEqual(attempt["run_metadata_count"], 0)
-            self.assertEqual(attempt["result_json_count"], 1)
+            attempts = json.loads((root / "artifact-collection.json").read_text(encoding="utf-8"))["attempts"]
+            self.assertEqual(len(attempts), 2)
+            self.assertIn(
+                "missing result.json or run-metadata.json",
+                " ".join(attempts[0]["validation"]["errors"]),
+            )
+            self.assertTrue((root / "collection-attempt-01" / "results.tar.gz").is_file())
+
+    def test_collection_retries_after_copying_an_unverified_result_set(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            remote_results = self._make_result_bundle(root, complete=False)
+            archives: dict[str, Path] = {}
+            pack_count = 0
+
+            def pack(_key, _known_hosts, _ip, command, *, timeout):
+                nonlocal pack_count
+                pack_count += 1
+                if pack_count == 2:
+                    summary_path = remote_results / "summary.json"
+                    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+                    summary["complete"] = True
+                    summary["matrix_validation"]["complete"] = True
+                    for row in summary["results"]:
+                        row["exit_code"] = 0
+                        run_id = BENCH._summary_row_identifier(row, "batch64")
+                        metadata_path = remote_results / run_id / "run-metadata.json"
+                        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                        metadata["exit_code"] = 0
+                        metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+                    summary_path.write_text(json.dumps(summary), encoding="utf-8")
+                    (remote_results / "remote-exit.json").write_text(
+                        json.dumps({"failed": False, "runs_started": summary["runs_planned"]}),
+                        encoding="utf-8",
+                    )
+                packed = self._run_remote_bundle(command, remote_results, root)
+                self.assertEqual(packed.returncode, 0, packed.stderr)
+                metadata = self._archive_metadata(packed.stdout)
+                archives[metadata["ARCHIVE_PATH"]] = Path(metadata["ARCHIVE_PATH"])
+                return packed
+
+            def scp(_ip, remote, destination, _key, _known_hosts, *, recursive=False, timeout):
+                self.assertFalse(recursive)
+                if remote in archives:
+                    shutil.copyfile(archives[remote], destination)
+                else:
+                    destination.write_text("bootstrap details", encoding="utf-8")
+                return subprocess.CompletedProcess([], 0, "", "")
+
+            with (
+                patch.object(BENCH, "ssh_command", side_effect=pack),
+                patch.object(BENCH, "scp_from_vm", side_effect=scp),
+                patch.object(BENCH.time, "sleep"),
+            ):
+                result = BENCH.collect_artifacts(
+                    "192.0.2.1", root / "key", root / "known_hosts", root, before_connect=lambda: None
+                )
+
+            self.assertTrue(result["results_verified"])
+            self.assertEqual(pack_count, 2)
+            collection = json.loads((root / "artifact-collection.json").read_text(encoding="utf-8"))
+            self.assertEqual([attempt["results_verified"] for attempt in collection["attempts"]], [False, True])
+            for attempt in (1, 2):
+                staging = root / f"collection-attempt-{attempt:02d}"
+                self.assertTrue((staging / "results.tar.gz").is_file())
+                bundle_metadata = json.loads((staging / "bundle-metadata.json").read_text(encoding="utf-8"))
+                self.assertTrue(bundle_metadata["bundle_checksum_verified"])
+
+    def test_result_verifier_checks_per_run_pairing_and_remote_exit(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            results = self._make_result_bundle(Path(temp), complete=True)
+            schedule = build_batch64_schedule((16,))
+            first_id = BENCH._run_identifier(schedule[0], "batch64")
+            extra_dir = results / "w99-extra"
+            extra_dir.mkdir()
+            shutil.move(results / first_id / "run-metadata.json", extra_dir / "run-metadata.json")
+            invalid_pairing = BENCH._verify_result_set(results)
+            self.assertFalse(invalid_pairing["verified"])
+            self.assertTrue(any("run directories do not match schedule" in error for error in invalid_pairing["errors"]))
+
+            shutil.move(extra_dir / "run-metadata.json", results / first_id / "run-metadata.json")
+            extra_dir.rmdir()
+            (results / "remote-exit.json").write_text(json.dumps({"failed": True, "runs_started": 12}), encoding="utf-8")
+            invalid_exit = BENCH._verify_result_set(results)
+            self.assertFalse(invalid_exit["verified"])
+            self.assertTrue(any("remote exit record reports failure" in error for error in invalid_exit["errors"]))
+
+            (results / "remote-exit.json").write_text(
+                json.dumps({"failed": False, "runs_started": len(schedule) - 1}), encoding="utf-8"
+            )
+            mismatched_exit = BENCH._verify_result_set(results)
+            self.assertFalse(mismatched_exit["verified"])
+            self.assertTrue(any("remote exit run count does not match the plan" in error
+                                for error in mismatched_exit["errors"]))
+
+    def test_profile_result_verification_uses_schedule_and_requires_perf_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            results = Path(temp) / "results"
+            results.mkdir()
+            schedule = build_profile_schedule((1,))
+            with (results / "profile-schedule.tsv").open("w", encoding="utf-8", newline="") as stream:
+                writer = csv.DictWriter(stream, fieldnames=schedule[0].keys(), delimiter="\t")
+                writer.writeheader()
+                writer.writerows(schedule)
+            rows = []
+            captures = 0
+            for item in schedule:
+                run_id = BENCH._run_identifier(item, "v8-small-ticket-profile")
+                run_dir = results / run_id
+                run_dir.mkdir()
+                status = "captured" if item["perf_capture"] else "not_requested"
+                if item["perf_capture"]:
+                    captures += 1
+                    (run_dir / "perf.data").write_bytes(b"perf")
+                    (run_dir / "perf-report.txt").write_text("report", encoding="utf-8")
+                (run_dir / "result.json").write_text(
+                    json.dumps({"result": {}, "params": {}, "latency": {}}) + "\n[hotpath] sample\n",
+                    encoding="utf-8",
+                )
+                row = {
+                    "writer": item["writer"], "workload": item["workload"], "arm": item["arm"],
+                    "exit_code": 0, "ops": item["num"], "perf_status": status,
+                }
+                rows.append(row)
+                (run_dir / "run-metadata.json").write_text(json.dumps(row), encoding="utf-8")
+            (results / "summary.json").write_text(json.dumps({
+                "complete": True, "suite": "v8-small-ticket-profile", "runs_planned": len(schedule),
+                "runs_completed": len(schedule), "results": rows,
+                "matrix_validation": {"complete": True, "planned": len(schedule), "observed": len(schedule)},
+                "perf_captures_planned": captures, "perf_captures_completed": captures,
+                "perf_capture_complete": True,
+            }), encoding="utf-8")
+            (results / "remote-exit.json").write_text(
+                json.dumps({"failed": False, "runs_started": len(schedule)}), encoding="utf-8"
+            )
+            self.assertTrue(BENCH._verify_result_set(results)["verified"])
+            capture_row = next(row for row in schedule if row["perf_capture"])
+            capture_id = BENCH._run_identifier(capture_row, "v8-small-ticket-profile")
+            (results / capture_id / "perf.data").unlink()
+            rejected = BENCH._verify_result_set(results)
+            self.assertFalse(rejected["verified"])
+            self.assertTrue(any("profile capture artifacts are incomplete" in error for error in rejected["errors"]))
+
+    def test_collection_rejects_corrupt_archive_transfer(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            remote_results = self._make_result_bundle(root, complete=True)
+            archives: dict[str, Path] = {}
+
+            def pack(_key, _known_hosts, _ip, command, *, timeout):
+                packed = self._run_remote_bundle(command, remote_results, root)
+                metadata = self._archive_metadata(packed.stdout)
+                archives[metadata["ARCHIVE_PATH"]] = Path(metadata["ARCHIVE_PATH"])
+                return packed
+
+            def scp(_ip, remote, destination, _key, _known_hosts, *, recursive=False, timeout):
+                if remote in archives:
+                    shutil.copyfile(archives[remote], destination)
+                    with destination.open("ab") as stream:
+                        stream.write(b"corrupted transfer")
+                else:
+                    destination.write_text("bootstrap details", encoding="utf-8")
+                return subprocess.CompletedProcess([], 0, "", "")
+
+            with (
+                patch.object(BENCH, "ssh_command", side_effect=pack),
+                patch.object(BENCH, "scp_from_vm", side_effect=scp),
+                patch.object(BENCH.time, "sleep"),
+            ):
+                result = BENCH.collect_artifacts(
+                    "192.0.2.1", root / "key", root / "known_hosts", root, before_connect=lambda: None
+                )
+            self.assertFalse(result["results_verified"])
+            attempts = json.loads((root / "artifact-collection.json").read_text(encoding="utf-8"))["attempts"]
+            self.assertEqual(len(attempts), 2)
+            self.assertFalse(attempts[0]["bundle_checksum_verified"])
+            self.assertTrue((root / "collection-attempt-01" / "results.tar.gz").is_file())
 
     def test_collection_keeps_bootstrap_log_when_results_are_unavailable(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -1525,22 +1824,26 @@ print('[hotpath] diagnostic report follows')
             with self.subTest(rejected_audit=rejected_audit), tempfile.TemporaryDirectory() as temp:
                 root = Path(temp)
                 events = []
-                archive, digest = self._make_result_bundle(root, complete=True)
+                results = self._make_result_bundle(root, complete=True)
+                archives: dict[str, Path] = {}
 
                 def audit():
                     events.append("audit")
                     if events.count("audit") == rejected_audit:
                         raise BENCH.BenchError("SSH firewall policy changed")
 
-                def pack(_key, _known_hosts, _ip, _command, *, timeout):
+                def pack(_key, _known_hosts, _ip, command, *, timeout):
                     events.append("ssh")
-                    return subprocess.CompletedProcess([], 0, f"ARCHIVE_SHA256={digest}\n", "")
+                    result = self._run_remote_bundle(command, results, root)
+                    metadata = self._archive_metadata(result.stdout)
+                    archives[metadata["ARCHIVE_PATH"]] = Path(metadata["ARCHIVE_PATH"])
+                    return result
 
                 def scp(_ip, remote, destination, _key, _known_hosts, *, recursive=False, timeout):
                     events.append("scp")
                     self.assertFalse(recursive)
-                    if remote.endswith(".tar.gz"):
-                        shutil.copyfile(archive, destination)
+                    if remote in archives:
+                        shutil.copyfile(archives[remote], destination)
                     else:
                         destination.write_text("boot log", encoding="utf-8")
                     return subprocess.CompletedProcess([], 0, "", "")
@@ -1555,10 +1858,10 @@ print('[hotpath] diagnostic report follows')
                         )
                 self.assertEqual(
                     events,
-                    ["audit"] if rejected_audit == 1 else ["audit", "ssh", "scp", "audit"],
+                    ["audit"] if rejected_audit == 1 else ["audit", "ssh", "audit"],
                 )
                 if rejected_audit == 2:
-                    self.assertTrue((root / "collected" / "results" / "summary.json").is_file())
+                    self.assertFalse((root / "collected" / "results" / "summary.json").exists())
 
     def test_results_directory_is_private_under_permissive_umask(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

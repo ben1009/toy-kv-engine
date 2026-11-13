@@ -394,10 +394,15 @@ result set is missing or unverified, retain the VM, boot disk, temporary SSH
 rule, isolated VPC, subnet, route, and Terraform state. Do not run
 `terraform destroy` or delete cloud resources while they may be the only copy
 of completed results. Use the saved reconnect instructions to recover them.
-Treat a result set as verified only after the archive checksum passes,
-`summary.json` reports `complete: true` with matching planned/completed run
-counts, and every completed run has both its `result.json` and
-`run-metadata.json` locally. Only then tear down the VM and temporary firewall,
+Treat a result set as verified only after the transferred archive checksum
+passes and both the archive and checksum metadata are retained locally.
+Require `summary.json` to report `complete: true` with matching
+planned/completed run counts, and `remote-exit.json` to report `failed: false`
+with `runs_started` matching the planned count. Validate the benchmark plan for
+normal matrices, or `profile-schedule.tsv` and the profile summary for
+`v8-small-ticket-profile`. In either suite, require every planned run ID to have
+a successful `result.json` and matching `run-metadata.json` in the same local
+run directory. Only then tear down the VM and temporary firewall,
 destroy the isolated Terraform network, verify all resources are absent, and
 report the result directory, observed I/O metadata, cleanup verification, and
 any failed or incomplete steps. PR #549 is explicitly not authorized to merge

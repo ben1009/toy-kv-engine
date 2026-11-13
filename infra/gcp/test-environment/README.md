@@ -116,8 +116,9 @@ from the first Terraform apply and `max_runtime_hours` (24 by default, at most
 starting, or reapplying the VM does not reset the deadline. The VPC, subnet, and
 SSH firewall rule remain managed by Terraform after the VM expires.
 
-Before destroying an environment used for benchmarks, verify the complete
-result set is present off-host, including its run counts and per-run result and
+Before destroying an environment used for benchmarks, verify that every result
+set produced by the benchmark is present off-host. For the WAL benchmark runner,
+this includes its planned/completed run counts and each run's paired result and
 metadata files. Local SSD can be the only remaining copy after an interrupted
 transfer. If results are incomplete or unverified, preserve the VM and Terraform
 state and recover them before running `terraform destroy`. The VM's

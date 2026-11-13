@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+import csv
 from collections.abc import Callable
 from datetime import datetime, timezone
 import ipaddress
@@ -33,7 +34,9 @@ import uuid
 from gcp_wal_matrix import (
     FULL_DEFAULT_WRITERS,
     LEGACY_DEFAULT_WRITERS,
+    build_batch64_schedule,
     build_benchmark_plan,
+    build_rfc026_schedule,
     validate_writer_counts,
 )
 MACHINE_TYPE = "c4-standard-8-lssd"
@@ -48,6 +51,69 @@ PROFILE_RUNNER = Path(__file__).with_name("gcp_wal_profile_runner.py")
 REPO_URL = "https://github.com/ben1009/toy-kv-engine.git"
 MAX_RUNTIME_MINUTES = 180
 MIN_RUNTIME_MINUTES = 60
+MAX_ARTIFACT_BUNDLE_BYTES = 512 * 1024 * 1024
+
+REMOTE_ARCHIVE_SCRIPT = r'''
+import hashlib
+import os
+from pathlib import Path
+import tempfile
+import tarfile
+
+root = Path(os.environ["GCP_WAL_RESULTS_ROOT"])
+max_bytes = int(os.environ["GCP_WAL_MAX_ARCHIVE_BYTES"])
+if not root.is_dir():
+    raise SystemExit("benchmark results directory is missing")
+root_names = {
+    "summary.json", "summary.tsv", "comparison.tsv", "benchmark-plan.json",
+    "rfc026-schedule.tsv", "profile-schedule.tsv", "commit.txt", "remote-exit.json",
+    "finished_utc.txt", "remote-finished-utc.txt", "remote-status.txt", "host.txt",
+    "os-release.txt", "uname.txt", "lscpu.txt", "lsblk.txt", "findmnt.txt", "df.txt",
+    "setup.log", "rust-toolchain.txt", "rust-toolchain.toml", "write-perf.sha256", "perf-version.txt",
+}
+run_names = {
+    "result.json", "run-metadata.json", "environment.txt", "start_utc.txt", "end_utc.txt",
+    "start_epoch.txt", "command.sh", "stderr.log", "timeline.json", "perf.data",
+    "perf-report.txt", "perf-record.log", "perf-command.sh", "validation-error.txt",
+}
+selected = [path for path in root.iterdir() if path.is_file() and path.name in root_names]
+for run_dir in sorted(root.glob("w*")):
+    if run_dir.is_dir():
+        selected.extend(path for path in run_dir.iterdir() if path.is_file() and path.name in run_names)
+
+descriptor, archive_name = tempfile.mkstemp(prefix="gcp-wal-bench-results-", suffix=".tar.gz")
+os.close(descriptor)
+archive = Path(archive_name)
+try:
+    with tarfile.open(archive, "w:gz") as bundle:
+        for path in sorted(selected):
+            bundle.add(path, arcname=path.relative_to(root.parent).as_posix())
+    archive_bytes = archive.stat().st_size
+    if archive_bytes > max_bytes:
+        raise SystemExit(f"compact result bundle exceeds {max_bytes} byte limit: {archive_bytes}")
+    digest = hashlib.sha256()
+    with archive.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    print(f"ARCHIVE_PATH={archive}")
+    print(f"ARCHIVE_SHA256={digest.hexdigest()}")
+    print(f"ARCHIVE_BYTES={archive_bytes}")
+    print(f"ARCHIVE_FILES={len(selected)}")
+except BaseException:
+    archive.unlink(missing_ok=True)
+    raise
+'''
+
+
+def _build_remote_archive_command(
+    *, root: str = "/mnt/gcp-wal-bench/results", max_bytes: int = MAX_ARTIFACT_BUNDLE_BYTES
+) -> str:
+    return " ".join((
+        f"GCP_WAL_RESULTS_ROOT={shlex.quote(root)}",
+        f"GCP_WAL_MAX_ARCHIVE_BYTES={max_bytes}",
+        "python3 -c",
+        shlex.quote(REMOTE_ARCHIVE_SCRIPT),
+    ))
 
 
 class BenchError(RuntimeError):
@@ -1075,22 +1141,26 @@ def retained_vm_reconnect_instructions(
     firewall: str,
     project: str,
     connect_command: str,
+    cleanup_uncertain: bool = False,
 ) -> str:
     cleanup_command = (
         "gcloud compute firewall-rules delete "
         f"{shlex.quote(firewall)} --project={shlex.quote(project)} --quiet"
     )
 
-    return (
-        "VM retained until its GCP auto-delete deadline.\n"
+    return "".join((
+        (
+            "Cloud cleanup could not be verified; the VM may have been deleted or may still be running.\n"
+            if cleanup_uncertain else "VM retained until its GCP auto-delete deadline.\n"
+        ),
         "Do not destroy the VM, firewall, VPC, subnet, route, or Terraform state until the complete local result set is recovered.\n"
         f"Auto-delete deadline: {termination_timestamp}\n"
         f"VPC: {network}\n"
         f"Subnet: {subnet}\n"
         f"SSH firewall rule: {firewall}\n"
         f"Delete the temporary SSH firewall rule after the VM is gone: {cleanup_command}\n"
-        f"{connect_command}\n"
-    )
+        f"{connect_command}\n",
+    ))
 
 
 def create_private_results_directory(path: Path) -> None:
@@ -1104,11 +1174,215 @@ def gcloud_base(project: str, zone: str) -> list[str]:
     return ["--project", project, "--zone", zone]
 
 
+def _run_identifier(row: dict[str, Any], suite: str) -> str:
+    if suite == "v8-small-ticket-profile":
+        return f"w{row['writer']}-{row['workload']}-{row['arm']}"
+    if suite == "rfc026-full":
+        return f"w{row['writer']}-{row['workload']}-r{row['repetition']}-{row['arm']}"
+    if suite == "batch64":
+        return f"w{row['writer']}-b{row['block']}-p{row['position']}-{row['arm']}"
+    raise ValueError(f"unsupported benchmark suite: {suite!r}")
+
+
+def _summary_row_identifier(row: dict[str, Any], suite: str) -> str:
+    if suite == "v8-small-ticket-profile":
+        return f"w{int(row['writer'])}-{row['workload']}-{row['arm']}"
+    if suite == "rfc026-full":
+        return f"w{int(row['writer'])}-{row['workload']}-r{int(row['repetition'])}-{row['arm']}"
+    if suite == "batch64":
+        return f"w{int(row['writer'])}-b{int(row['block'])}-p{int(row['position'])}-{row['format']}"
+    raise ValueError(f"unsupported benchmark suite: {suite!r}")
+
+
+def _expected_run_metadata(row: dict[str, Any], suite: str) -> dict[str, Any]:
+    if suite == "v8-small-ticket-profile":
+        return {key: row[key] for key in ("writer", "workload", "arm", "perf_capture")}
+    if suite == "rfc026-full":
+        return {key: row[key] for key in ("writer", "workload", "repetition", "arm")}
+    if suite == "batch64":
+        return {
+            "writer": row["writer"], "block": row["block"], "position": row["position"], "format": row["arm"],
+        }
+    raise ValueError(f"unsupported benchmark suite: {suite!r}")
+
+
+def _verify_result_set(results: Path) -> dict[str, Any]:
+    """Validate suite metadata and one successful result/metadata pair per planned run."""
+    import json
+
+    errors: list[str] = []
+    try:
+        summary = json.loads((results / "summary.json").read_text(encoding="utf-8"))
+        remote_exit = json.loads((results / "remote-exit.json").read_text(encoding="utf-8"))
+        if not isinstance(summary, dict) or not isinstance(remote_exit, dict):
+            raise ValueError("summary and remote exit metadata must be JSON objects")
+        suite = summary.get("suite")
+        if suite == "v8-small-ticket-profile":
+            with (results / "profile-schedule.tsv").open(encoding="utf-8", newline="") as stream:
+                schedule_rows = list(csv.DictReader(stream, delimiter="\t"))
+            schedule: list[dict[str, Any]] = []
+            for row in schedule_rows:
+                if not {"writer", "workload", "arm", "perf_capture"}.issubset(row):
+                    raise ValueError("profile schedule is missing required columns")
+                schedule.append({
+                    **row,
+                    "writer": int(row["writer"]),
+                    "perf_capture": row["perf_capture"].strip().lower() == "true",
+                })
+            planned = len(schedule)
+            matrix_validation = summary.get("matrix_validation")
+            if not isinstance(matrix_validation, dict) or matrix_validation.get("complete") is not True:
+                errors.append("profile matrix validation is incomplete")
+            if not isinstance(matrix_validation, dict) or matrix_validation.get("planned") != planned:
+                errors.append("profile validation planned count does not match its schedule")
+            if not isinstance(matrix_validation, dict) or matrix_validation.get("observed") != summary.get("runs_completed"):
+                errors.append("profile validation observed count does not match its summary")
+        else:
+            plan = json.loads((results / "benchmark-plan.json").read_text(encoding="utf-8"))
+            if not isinstance(plan, dict):
+                raise ValueError("benchmark plan must be a JSON object")
+            suite = plan.get("suite")
+            if suite == "rfc026-full":
+                schedule = build_rfc026_schedule(plan["writers"])
+            elif suite == "batch64":
+                schedule = build_batch64_schedule(plan["writers"])
+            else:
+                raise ValueError(f"unsupported benchmark plan suite: {suite!r}")
+            planned = plan.get("runs_planned")
+            if type(planned) is not int or planned != len(schedule):
+                errors.append("benchmark plan run count does not match its schedule")
+            matrix_validation = summary.get("matrix_validation")
+            if not isinstance(matrix_validation, dict) or matrix_validation.get("complete") is not True:
+                errors.append("benchmark matrix validation is incomplete")
+            if not isinstance(matrix_validation, dict) or matrix_validation.get("planned") != planned:
+                errors.append("matrix validation planned count does not match its plan")
+            if not isinstance(matrix_validation, dict) or matrix_validation.get("observed") != planned:
+                errors.append("matrix validation observed count does not match its plan")
+
+        summary_planned = summary.get("runs_planned")
+        completed = summary.get("runs_completed")
+        if type(summary_planned) is not int or summary_planned != planned:
+            errors.append("summary planned count does not match the run schedule")
+        if type(completed) is not int or completed != planned:
+            errors.append("summary completed count does not match the run schedule")
+        if summary.get("complete") is not True:
+            errors.append("summary does not report a complete run")
+        if remote_exit.get("failed") is not False:
+            errors.append("remote exit record reports failure")
+        if type(remote_exit.get("runs_started")) is not int or remote_exit.get("runs_started") != planned:
+            errors.append("remote exit run count does not match the plan")
+
+        expected: dict[str, dict[str, Any]] = {}
+        for row in schedule:
+            run_id = _run_identifier(row, suite)
+            if run_id in expected:
+                errors.append(f"duplicate run identifier in schedule: {run_id}")
+            expected[run_id] = _expected_run_metadata(row, suite)
+        actual_directories = {path.name for path in results.glob("w*") if path.is_dir()}
+        if actual_directories != set(expected):
+            missing = sorted(set(expected) - actual_directories)
+            unexpected = sorted(actual_directories - set(expected))
+            errors.append(f"run directories do not match schedule (missing={missing}, unexpected={unexpected})")
+
+        summary_rows = summary.get("results")
+        if not isinstance(summary_rows, list) or len(summary_rows) != planned:
+            errors.append("summary does not contain one row for every planned run")
+        else:
+            summary_ids: list[str] = []
+            for row in summary_rows:
+                if not isinstance(row, dict):
+                    errors.append("summary contains a non-object run row")
+                    continue
+                try:
+                    summary_ids.append(_summary_row_identifier(row, suite))
+                except (KeyError, TypeError, ValueError) as error:
+                    errors.append(f"summary contains an invalid run identifier: {error}")
+                    continue
+                if row.get("exit_code") != 0:
+                    errors.append(f"summary run {summary_ids[-1]} did not succeed")
+            if len(summary_ids) != len(set(summary_ids)) or set(summary_ids) != set(expected):
+                errors.append("summary run identifiers do not match the unique planned runs")
+
+        profile_capture_count = 0
+        for run_id, identity in expected.items():
+            perf_capture_expected = bool(identity.pop("perf_capture", False))
+            run_dir = results / run_id
+            result_path = run_dir / "result.json"
+            metadata_path = run_dir / "run-metadata.json"
+            if not result_path.is_file() or not metadata_path.is_file():
+                errors.append(f"run {run_id} is missing result.json or run-metadata.json")
+                continue
+            try:
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                if not isinstance(metadata, dict):
+                    raise ValueError("run metadata must be a JSON object")
+                if any(metadata.get(key) != value for key, value in identity.items()):
+                    errors.append(f"run metadata identity does not match {run_id}")
+                if type(metadata.get("exit_code")) is not int or metadata["exit_code"] != 0:
+                    errors.append(f"run metadata for {run_id} does not report success")
+                if suite == "v8-small-ticket-profile":
+                    if perf_capture_expected:
+                        status = str(metadata.get("perf_status", ""))
+                        captured = status == "captured" or status.startswith("report_failed:")
+                        perf_path = run_dir / "perf.data"
+                        report_path = run_dir / "perf-report.txt"
+                        if not captured or not perf_path.is_file() or perf_path.stat().st_size == 0 or not report_path.is_file():
+                            errors.append(f"profile capture artifacts are incomplete for {run_id}")
+                        else:
+                            profile_capture_count += 1
+                    elif metadata.get("perf_status") != "not_requested":
+                        errors.append(f"unexpected profile capture status for {run_id}")
+                try:
+                    if suite == "v8-small-ticket-profile":
+                        from gcp_wal_profile_runner import _load_benchmark_record
+
+                        _load_benchmark_record(result_path)
+                    else:
+                        record = json.loads(result_path.read_text(encoding="utf-8"))
+                        if not isinstance(record, dict):
+                            raise ValueError("benchmark result must be a JSON object")
+                except (OSError, json.JSONDecodeError, ValueError) as error:
+                    errors.append(f"run {run_id} result is invalid: {error}")
+            except (OSError, json.JSONDecodeError, ValueError) as error:
+                errors.append(f"run {run_id} metadata is invalid: {error}")
+
+        if suite == "v8-small-ticket-profile":
+            captures_planned = sum(bool(row["perf_capture"]) for row in schedule)
+            if summary.get("perf_captures_planned") != captures_planned:
+                errors.append("profile planned capture count does not match schedule")
+            if summary.get("perf_captures_completed") != captures_planned or summary.get("perf_capture_complete") is not True:
+                errors.append("profile perf captures are incomplete")
+            if profile_capture_count != captures_planned:
+                errors.append("profile capture artifacts do not match planned captures")
+    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError, csv.Error) as error:
+        errors.append(f"result metadata is invalid: {error}")
+        planned = 0
+        completed = 0
+        suite = None
+
+    return {
+        "verified": not errors,
+        "suite": suite,
+        "runs_planned": planned,
+        "runs_completed": completed,
+        "errors": errors,
+    }
+
+
+def _sha256_file(path: Path) -> str:
+    import hashlib
+
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def collect_artifacts(
     ip: str, key: Path, known_hosts: Path, results_dir: Path, *, before_connect: Callable[[], None]
 ) -> dict[str, Any]:
     """Bundle and verify compact benchmark artifacts before teardown."""
-    import hashlib
     import tarfile
     from pathlib import PurePosixPath
 
@@ -1121,55 +1395,61 @@ def collect_artifacts(
         staging = results_dir / f"collection-attempt-{attempt_number:02d}"
         staging.mkdir(parents=True, exist_ok=False)
         before_connect()
+        attempt: dict[str, Any] = {"number": attempt_number, "results_collected": False}
+        remote_archive_path: str | None = None
+        phase = "archive"
         try:
-            remote_pack = r"""python3 - <<'PY'
-import hashlib
-import json
-from pathlib import Path
-import tarfile
-
-root = Path("/mnt/gcp-wal-bench/results")
-if not root.is_dir():
-    raise SystemExit("benchmark results directory is missing")
-root_names = {
-    "summary.json", "summary.tsv", "comparison.tsv", "benchmark-plan.json",
-    "rfc026-schedule.tsv", "commit.txt", "remote-exit.json", "finished_utc.txt",
-    "uname.txt", "lscpu.txt", "lsblk.txt", "findmnt.txt",
-}
-run_names = {
-    "result.json", "run-metadata.json", "environment.txt", "start_utc.txt",
-    "end_utc.txt", "command.sh",
-}
-selected = [p for p in root.iterdir() if p.is_file() and p.name in root_names]
-for run_dir in sorted(root.glob("w*")):
-    if run_dir.is_dir():
-        selected.extend(p for p in run_dir.iterdir() if p.is_file() and p.name in run_names)
-archive = Path("/tmp/gcp-wal-bench-results-compact.tar.gz")
-archive.unlink(missing_ok=True)
-with tarfile.open(archive, "w:gz") as bundle:
-    for path in sorted(selected):
-        bundle.add(path, arcname=path.relative_to(root.parent).as_posix())
-digest = hashlib.sha256(archive.read_bytes()).hexdigest()
-print(f"ARCHIVE_SHA256={digest}")
-print(f"ARCHIVE_BYTES={archive.stat().st_size}")
-print(f"ARCHIVE_FILES={len(selected)}")
-PY"""
+            remote_pack = _build_remote_archive_command()
             packed = ssh_command(key, known_hosts, ip, remote_pack, timeout=90)
             if packed.returncode:
                 raise BenchError(f"Could not build compact result bundle: {packed.stderr.strip()}")
+            remote_path_match = re.search(r"ARCHIVE_PATH=(/[A-Za-z0-9._/-]+)", packed.stdout)
             remote_digest = re.search(r"ARCHIVE_SHA256=([0-9a-f]{64})", packed.stdout)
-            if remote_digest is None:
-                raise BenchError("Remote compact result bundle did not report a SHA-256 digest")
+            remote_bytes = re.search(r"ARCHIVE_BYTES=(\d+)", packed.stdout)
+            remote_files = re.search(r"ARCHIVE_FILES=(\d+)", packed.stdout)
+            if None in (remote_path_match, remote_digest, remote_bytes, remote_files):
+                raise BenchError("Remote compact result bundle did not report complete archive metadata")
+            remote_archive_path = remote_path_match.group(1)
+            remote_archive = PurePosixPath(remote_archive_path)
+            if (
+                not remote_archive.is_absolute()
+                or ".." in remote_archive.parts
+                or not remote_archive.name.startswith("gcp-wal-bench-results-")
+                or not remote_archive.name.endswith(".tar.gz")
+            ):
+                raise BenchError("Remote compact result bundle reported an unsafe archive path")
+            archive_bytes = int(remote_bytes.group(1))
+            archive_files = int(remote_files.group(1))
+            attempt.update({
+                "remote_archive_path": remote_archive_path,
+                "remote_bundle_sha256": remote_digest.group(1),
+                "bundle_bytes": archive_bytes,
+                "bundle_files": archive_files,
+            })
+            if archive_bytes > MAX_ARTIFACT_BUNDLE_BYTES:
+                raise BenchError(
+                    f"Compact result bundle exceeds the {MAX_ARTIFACT_BUNDLE_BYTES} byte transfer limit; "
+                    "preserving the VM for artifact recovery"
+                )
+            phase = "transfer_firewall_audit"
+            before_connect()
+            phase = "transfer"
             archive_path = staging / "results.tar.gz"
             transfer = scp_from_vm(
-                ip, "/tmp/gcp-wal-bench-results-compact.tar.gz", archive_path, key, known_hosts,
+                ip, remote_archive_path, archive_path, key, known_hosts,
                 timeout=120,
             )
             if transfer.returncode:
                 raise BenchError(f"Could not transfer compact result bundle: {transfer.stderr.strip()}")
-            local_digest = hashlib.sha256(archive_path.read_bytes()).hexdigest()
-            if local_digest != remote_digest.group(1):
+            local_digest = _sha256_file(archive_path)
+            attempt["local_bundle_sha256"] = local_digest
+            attempt["local_bundle_bytes"] = archive_path.stat().st_size
+            attempt["bundle_checksum_verified"] = local_digest == remote_digest.group(1)
+            write_json(staging / "bundle-metadata.json", attempt)
+            if not attempt["bundle_checksum_verified"]:
                 raise BenchError("Compact result bundle SHA-256 mismatch")
+            if archive_path.stat().st_size != archive_bytes:
+                raise BenchError("Compact result bundle byte count mismatch")
             unpacked = staging / "unpacked"
             unpacked.mkdir()
             with tarfile.open(archive_path, "r:gz") as bundle:
@@ -1180,57 +1460,45 @@ PY"""
                         raise BenchError("Compact result bundle contains an unsafe archive member")
                 bundle.extractall(unpacked, members=members)
             local_results = unpacked / "results"
-            summary_path = local_results / "summary.json"
-            try:
-                summary = json.loads(summary_path.read_text(encoding="utf-8"))
-                plan = json.loads((local_results / "benchmark-plan.json").read_text(encoding="utf-8"))
-                remote_exit = json.loads((local_results / "remote-exit.json").read_text(encoding="utf-8"))
-                if not all(isinstance(value, dict) for value in (summary, plan, remote_exit)):
-                    raise ValueError("benchmark result metadata must contain JSON objects")
-                run_metadata_count = len(list(local_results.glob("w*/run-metadata.json")))
-                result_json_count = len(list(local_results.glob("w*/result.json")))
-                runs_planned = summary.get("runs_planned")
-                runs_completed = summary.get("runs_completed")
-                summary_complete = bool(
-                    summary.get("complete") is True
-                    and type(runs_planned) is int
-                    and runs_planned > 0
-                    and plan.get("runs_planned") == runs_planned
-                    and type(runs_completed) is int
-                    and runs_completed == runs_planned
-                    and remote_exit.get("failed") is False
-                    and remote_exit.get("runs_started") == runs_planned
-                    and run_metadata_count == runs_completed
-                    and result_json_count == runs_completed
-                )
-            except (OSError, json.JSONDecodeError, ValueError, TypeError, AttributeError):
-                summary = {}
-                summary_complete = False
-                run_metadata_count = 0
-                result_json_count = 0
             results_collected = local_results.is_dir()
-            results_verified = results_collected and summary_complete
-            attempt = {
-                "number": attempt_number,
+            validation = _verify_result_set(local_results) if results_collected else {
+                "verified": False, "errors": ["results directory is missing"], "runs_planned": 0, "runs_completed": 0,
+            }
+            summary_complete = bool(validation["verified"])
+            results_verified = summary_complete
+            attempt.update({
                 "returncode": transfer.returncode,
                 "stderr": transfer.stderr[-4000:],
                 "results_collected": results_collected,
                 "results_verified": results_verified,
-                "run_metadata_count": run_metadata_count,
-                "result_json_count": result_json_count,
-                "bundle_sha256": local_digest,
-                "bundle_bytes": archive_path.stat().st_size,
-                "bundle_files": len(members),
-            }
+                "summary_complete": summary_complete,
+                "validation": validation,
+                "unpacked_bundle_files": len(members),
+            })
             if results_collected:
                 collected.mkdir(parents=True, exist_ok=True)
-                os.replace(local_results, collected / "results")
-                attempts.append(attempt)
-                shutil.rmtree(staging, ignore_errors=True)
-                break
+                collected_results = collected / "results"
+                shutil.rmtree(collected_results, ignore_errors=True)
+                shutil.copytree(local_results, collected_results)
+                shutil.rmtree(unpacked, ignore_errors=True)
+                attempt["local_results"] = str(collected_results)
             attempts.append(attempt)
+            write_json(staging / "bundle-metadata.json", attempt)
+            if results_verified:
+                break
         except (BenchError, OSError, json.JSONDecodeError, tarfile.TarError, subprocess.TimeoutExpired) as error:
-            attempts.append({"number": attempt_number, "error": str(error), "results_collected": False})
+            if phase == "transfer_firewall_audit":
+                raise
+            attempt["error"] = str(error)
+            attempt["results_collected"] = results_collected
+            attempt["results_verified"] = False
+            if remote_archive_path is not None:
+                attempt["remote_archive_path"] = remote_archive_path
+            attempts.append(attempt)
+            try:
+                write_json(staging / "bundle-metadata.json", attempt)
+            except OSError:
+                pass
         if attempt_number < 2:
             time.sleep(5)
 
@@ -1449,7 +1717,12 @@ def provision_and_run(
                  "remote_execution_uncertain": False, "collected": False,
                  "summary_complete": False, "results_verified": False,
                  "retained": False, "cleanup": []}
-    results_dir.mkdir(parents=True, exist_ok=True)
+    results_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(results_dir, 0o700)
+    key = results_dir / "retained-ssh-key"
+    known_hosts = results_dir / "retained-known-hosts"
+    lifecycle["recovery_key"] = str(key)
+    lifecycle["recovery_known_hosts"] = str(known_hosts)
     lifecycle_path = results_dir / "lifecycle.json"
 
     def persist_lifecycle() -> None:
@@ -1474,8 +1747,6 @@ def provision_and_run(
     audit_ssh_firewall_rules(gcloud, args.project, args.network, network_region, tag, args.ssh_source_range)
 
     with tempfile.TemporaryDirectory(prefix="gcp-wal-bench-") as temporary:
-        key = Path(temporary) / "bench_ed25519"
-        known_hosts = Path(temporary) / "known_hosts"
         keygen = subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(key)],
                                 text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
                                 shell=False)
@@ -1485,8 +1756,59 @@ def provision_and_run(
         key_metadata = Path(temporary) / "ssh-keys"
         key_metadata.write_text(f"bench:{public_key}\n", encoding="utf-8")
         os.chmod(key, 0o600)
+        with key.open("rb") as stream:
+            os.fsync(stream.fileno())
+        key_directory_fd = os.open(results_dir, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(key_directory_fd)
+        finally:
+            os.close(key_directory_fd)
 
         connected = False
+        ip: str | None = None
+
+        def save_reconnect_instructions(*, cleanup_uncertain: bool = False) -> None:
+            if not ip:
+                raise BenchError("cannot write reconnect instructions before the VM address is known")
+            if not key.is_file():
+                raise BenchError(f"retained SSH private key is unavailable at {key}")
+            os.chmod(key, 0o600)
+            if known_hosts.is_file():
+                os.chmod(known_hosts, 0o600)
+                with known_hosts.open("rb") as stream:
+                    os.fsync(stream.fileno())
+            connect_command = shlex.join([
+                "ssh", "-i", str(key), "-o", "IdentitiesOnly=yes",
+                "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes",
+                "-o", "ConnectTimeout=8", "-o", "ServerAliveInterval=30",
+                "-o", "ServerAliveCountMax=3",
+                "-o", f"UserKnownHostsFile={known_hosts}",
+                "-o", "GlobalKnownHostsFile=/dev/null", f"bench@{ip}",
+            ])
+            reconnect_path = results_dir / "reconnect.txt"
+            temporary_reconnect = reconnect_path.with_name(".reconnect.txt.tmp")
+            temporary_reconnect.write_text(
+                retained_vm_reconnect_instructions(
+                    termination_timestamp=lifecycle.get("termination_timestamp", "see instance.json"),
+                    network=lifecycle.get("network"),
+                    subnet=lifecycle.get("subnet"),
+                    firewall=firewall,
+                    project=args.project,
+                    connect_command=connect_command,
+                    cleanup_uncertain=cleanup_uncertain,
+                ),
+                encoding="utf-8",
+            )
+            os.chmod(temporary_reconnect, 0o600)
+            with temporary_reconnect.open("rb") as stream:
+                os.fsync(stream.fileno())
+            os.replace(temporary_reconnect, reconnect_path)
+            directory_fd = os.open(results_dir, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+
         try:
             create = [
                 "beta", "compute", "instances", "create", instance,
@@ -1547,6 +1869,9 @@ def provision_and_run(
             if deadline <= time.monotonic():
                 raise BenchError("Less than ten minutes remain before the VM auto-delete deadline")
             wait_for_verified_host_keys(gcloud, instance, args.project, args.zone, ip, known_hosts, deadline)
+            os.chmod(known_hosts, 0o600)
+            with known_hosts.open("rb") as stream:
+                os.fsync(stream.fileno())
 
             # Create ingress only after the VM exists, so an interruption before
             # VM creation cannot orphan a firewall rule. The server-side VM
@@ -1667,33 +1992,7 @@ def provision_and_run(
                                 persist_lifecycle()
                         if should_retain_vm(args, return_code, lifecycle):
                             lifecycle["retained"] = True
-                            retained_key = results_dir / "retained-ssh-key"
-                            retained_known_hosts = results_dir / "retained-known-hosts"
-                            shutil.copyfile(key, retained_key)
-                            os.chmod(retained_key, 0o600)
-                            shutil.copyfile(known_hosts, retained_known_hosts)
-                            os.chmod(retained_known_hosts, 0o600)
-                            connect_command = shlex.join([
-                                "ssh", "-i", str(retained_key), "-o", "IdentitiesOnly=yes",
-                                "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes",
-                                "-o", "ConnectTimeout=8", "-o", "ServerAliveInterval=30",
-                                "-o", "ServerAliveCountMax=3",
-                                "-o", f"UserKnownHostsFile={retained_known_hosts}",
-                                "-o", "GlobalKnownHostsFile=/dev/null", f"bench@{ip}",
-                            ])
-                            (results_dir / "reconnect.txt").write_text(
-                                retained_vm_reconnect_instructions(
-                                    termination_timestamp=lifecycle.get(
-                                        "termination_timestamp", "see instance.json"
-                                    ),
-                                    network=lifecycle.get("network"),
-                                    subnet=lifecycle.get("subnet"),
-                                    firewall=firewall,
-                                    project=args.project,
-                                    connect_command=connect_command,
-                                ),
-                                encoding="utf-8",
-                            )
+                            save_reconnect_instructions()
                             lifecycle["retained"] = True
                             lifecycle["cleanup"].append(
                                 "VM and restricted SSH firewall retained; only the VM has a server-side delete deadline"
@@ -1708,6 +2007,14 @@ def provision_and_run(
                         return_code = 1
                         if should_retain_vm(args, return_code, lifecycle):
                             lifecycle["retained"] = True
+                            try:
+                                save_reconnect_instructions()
+                            except BaseException as recovery_error:
+                                print(
+                                    f"VM cleanup is disabled, but reconnect instructions could not be saved: "
+                                    f"{recovery_error}; recovery key path: {key}",
+                                    file=sys.stderr,
+                                )
                         lifecycle["cleanup"].append(f"local artifact/retention step failed: {error}")
                         persist_lifecycle()
             finally:
@@ -1730,6 +2037,22 @@ def provision_and_run(
                     lifecycle["cleanup_verification"] = cleanup_verification
                 if cleanup_failed:
                     return_code = 1
+                    if lifecycle["created"]:
+                        lifecycle["retained"] = True
+                        lifecycle["cleanup"].append(
+                            "resource cleanup could not be verified; preserving local recovery credentials"
+                        )
+                        try:
+                            save_reconnect_instructions(cleanup_uncertain=True)
+                        except BaseException as recovery_error:
+                            print(
+                                f"Cloud cleanup is uncertain and reconnect instructions could not be saved: "
+                                f"{recovery_error}; recovery key path: {key}",
+                                file=sys.stderr,
+                            )
+                elif not lifecycle["retained"]:
+                    for credential in (key, Path(str(key) + ".pub"), known_hosts):
+                        credential.unlink(missing_ok=True)
                 persist_lifecycle()
 
     return return_code
