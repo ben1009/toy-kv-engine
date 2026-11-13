@@ -10272,11 +10272,15 @@ mod tests {
             ])
             .expect("parse incompatible Leader diagnostics option"),
         );
+        let leader_error = validate_config(&leader).unwrap_err().to_string();
+        let expected_leader_error = if cfg!(feature = "bench") {
+            "requires PITR V8 Parallel I/O"
+        } else {
+            "requires a bench build"
+        };
         assert!(
-            validate_config(&leader)
-                .unwrap_err()
-                .to_string()
-                .contains("requires PITR V8 Parallel I/O")
+            leader_error.contains(expected_leader_error),
+            "{leader_error}"
         );
         assert!(Args::try_parse_from(["write-perf", "--wal-hol-diagnostics"]).is_err());
     }
@@ -10315,11 +10319,15 @@ mod tests {
             ])
             .expect("parse incompatible Leader timeline option"),
         );
+        let leader_error = validate_config(&leader).unwrap_err().to_string();
+        let expected_leader_error = if cfg!(feature = "bench") {
+            "requires PITR V8 Parallel I/O"
+        } else {
+            "requires a bench build"
+        };
         assert!(
-            validate_config(&leader)
-                .unwrap_err()
-                .to_string()
-                .contains("requires PITR V8 Parallel I/O")
+            leader_error.contains(expected_leader_error),
+            "{leader_error}"
         );
         assert!(Args::try_parse_from(["write-perf", "--wal-completion-timeline"]).is_err());
     }
@@ -10376,11 +10384,15 @@ mod tests {
             ])
             .expect("parse incompatible Leader sampling option"),
         );
+        let leader_error = validate_config(&leader).unwrap_err().to_string();
+        let expected_leader_error = if cfg!(feature = "bench") {
+            "requires PITR V8 Parallel I/O"
+        } else {
+            "requires a bench build"
+        };
         assert!(
-            validate_config(&leader)
-                .unwrap_err()
-                .to_string()
-                .contains("requires PITR V8 Parallel I/O")
+            leader_error.contains(expected_leader_error),
+            "{leader_error}"
         );
         assert!(
             Args::try_parse_from(["write-perf", "--wal-v8-durability-sample-every", "64"]).is_err()
