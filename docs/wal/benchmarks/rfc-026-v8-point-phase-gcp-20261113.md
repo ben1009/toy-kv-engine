@@ -61,3 +61,43 @@ Sampled completion timeline (segments are not one matched end-to-end path):
 - Terraform first could not create its state lock in quota-limited `/tmp`; state was relocated to `/var/tmp`, destroy ran with locking enabled, and the state was empty before the temporary state copy was removed.
 - VM, auto-delete boot disk, temporary SSH rule, egress route, subnet, and isolated VPC were verified absent; Terraform state is empty. See `cleanup-verification.json` and `lifecycle.json`.
 - Billing/API/quota settings were not changed. The run used the existing Free Trial attestation and a $1.50 maximum-estimated-spend guard under the previously authorized $2 ceiling.
+
+## Follow-up: low-overhead V8 FRONTIER/coalescing comparison
+
+The follow-up uses the current branch source commit `ac076aa64d171ccfd434d4c935b3ebad4823e546`. It isolates the four FRONTIER/coalescing configurations proposed above while keeping V8 Parallel and 1 MiB Sliding Fallocate fixed.
+
+### Run configuration
+
+- GCP `c4-standard-16-lssd`, 16 writers, 100,000 Point puts per run, 1 KiB values; five counterbalanced blocks, 20 runs total.
+- V8 `sliding-fallocate`, 1 MiB window, in all arms.
+- No `perf`, Hotpath, per-sync diagnostics, or completion timeline. The `bench` feature's aggregate WAL counters remained enabled. Latency sampling was every 100 operations; p99 is a sampled estimate.
+- Kernel `7.0.0-1017-gcp`; ext4 on `/dev/md127`, mounted at `/mnt/gcp-wal-bench` with `rw,noatime,stripe=256`.
+- All 20 runs reported stable WAL handle metadata: DATA `O_DIRECT=true`, Sync buffered, FRONTIER mode matching the arm, and all three handles on the same WAL inode. Sliding Fallocate mode and the 1 MiB window were confirmed in every run.
+
+### Results
+
+Medians across five runs per arm:
+
+| FRONTIER / coalescing | Throughput (k puts/s) | Change vs A | p50 (ms) | p95 (ms) | Sampled p99 (ms) | Sync count | Process CPU (s) | FRONTIER write + `fdatasync` (s) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| A: Buffered / Dynamic | 31.84 | — | 0.500 | 0.674 | 0.851 | 6,332 | 7.07 | 1.054 |
+| B: Buffered / 100 μs | 30.82 | −3.23% | 0.494 | 0.786 | 1.656 | 9,467 | 7.77 | 1.612 |
+| C: Direct / Dynamic | 33.30 | +4.56% | 0.460 | 0.671 | 1.245 | 8,162 | 7.41 | 1.171 |
+| D: Direct / 400 μs | 33.81 | +6.16% | 0.464 | 0.611 | 0.842 | 6,321 | 7.12 | 0.883 |
+
+The durability column is the median, across runs, of each run's aggregate FRONTIER write time plus aggregate `fdatasync` time. It is not wall-clock time and overlaps other work.
+
+Paired throughput changes by block:
+
+- D vs A: median **+6.81%**, positive in **5/5** blocks.
+- C vs A: median **+5.79%**, positive in **5/5** blocks.
+- D vs C: median **+1.30%**, positive in **4/5** blocks. The additional gain from fixing the budget at 400 μs over Direct/Dynamic was modest in this run.
+- B vs A: median **−3.23%**, positive in **1/5** blocks; B's median Sync count was about **49.5%** higher.
+
+Direct/400 reduced median aggregate FRONTIER-write-plus-Sync time about **16.2%** versus Buffered/Dynamic while keeping the Sync count nearly unchanged. Its sampled p50/p95 were lower than A, while sampled p99 was effectively unchanged. Five runs do not qualify a stable tail-latency improvement. Per-sync dynamic budget-choice counts were not collected, so the comparison measures end-to-end results rather than how often the dynamic policy selects each budget.
+
+### Conclusion and cleanup
+
+Direct FRONTIER improved throughput over Buffered/Dynamic in all five paired blocks for this 16-writer Point workload. Direct/400 had the highest median throughput, but its incremental paired gain over Direct/Dynamic was small. This supports keeping Direct/400 as a candidate for this workload; it does not qualify it as a general default for other writer counts or workloads.
+
+All 20 runs passed and their JSON parameters and I/O metadata were independently checked. The aggregate report is included here; raw per-run JSON remains local and no archive was uploaded. The VM, auto-delete boot disk, temporary SSH firewall, route, subnet, and isolated VPC were verified absent after cleanup. The run used the existing Free Trial attestation and a $1.50 estimated-spend guard; billing, APIs, and quotas were not changed.
