@@ -3,7 +3,7 @@
 ## Run configuration
 
 - Source commit: `fb51a88a97be087361285a35bb5a6fad58109d30` (merged PR #549 baseline).
-- Machine: `c4-standard-16-lssd`, 16 writers, two NVMe Local SSDs in RAID0; kernel and filesystem are in `collected/results/uname.txt` and `findmnt.txt`.
+- Machine: `c4-standard-16-lssd`, 16 writers, two NVMe Local SSDs in RAID0. The benchmark ran on Linux kernel `7.0.0-1017-gcp` (`#19~24.04.1-Ubuntu`, x86_64). The benchmark filesystem was `/dev/md127` mounted at `/mnt/gcp-wal-bench` as ext4 with `rw,noatime,stripe=256`.
 - Workloads: Point (100,000 puts) and Batch16 (500,000 puts); one V7 and one V8 run for each, arm order counterbalanced.
 - V8 only: `sliding-fallocate`, 1 MiB window, validated from runtime metadata; DATA `O_DIRECT=true`, FRONTIER and sync handles buffered.
 - No CPU pinning, perf capture, or Hotpath sampling. V8 sync/HOL/completion-timeline diagnostics were enabled.
