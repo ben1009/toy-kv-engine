@@ -54,6 +54,25 @@ class BenchError(RuntimeError):
     """Raised for a failed preflight or benchmark orchestration step."""
 
 
+def _is_transient_gcloud_error(detail: str) -> bool:
+    lowered = detail.lower()
+    transient_markers = (
+        "connectionerror",
+        "connection aborted",
+        "connection reset",
+        "remote end closed connection",
+        "remotedisconnected",
+        "timed out",
+        "timeout",
+        "temporarily unavailable",
+        "service unavailable",
+        "rate limit",
+    )
+    return any(marker in lowered for marker in transient_markers) or bool(
+        re.search(r"\b(?:429|500|502|503|504)\b", lowered)
+    )
+
+
 class Gcloud:
     def __init__(self, project: str, log_path: Path):
         self.project = project
@@ -107,11 +126,31 @@ class Gcloud:
         return result
 
     def json(self, args: list[str], *, timeout: int = 120) -> Any:
-        result = self.run([*args, "--format=json"], timeout=timeout)
-        try:
-            return json.loads(result.stdout)
-        except json.JSONDecodeError as error:
-            raise BenchError(f"gcloud returned invalid JSON for {shlex.join(args)}") from error
+        command_args = [*args, "--format=json"]
+        for attempt in range(3):
+            try:
+                result = self.run(command_args, check=False, timeout=timeout)
+            except BenchError as error:
+                if attempt == 2 or not _is_transient_gcloud_error(str(error)):
+                    raise
+                time.sleep(2**attempt)
+                continue
+
+            if result.returncode:
+                detail = result.stderr.strip() or result.stdout.strip()
+                if attempt == 2 or not _is_transient_gcloud_error(detail):
+                    raise BenchError(
+                        f"gcloud command failed ({result.returncode}): {shlex.join(['gcloud', *command_args])}\n{detail}"
+                    )
+                time.sleep(2**attempt)
+                continue
+
+            try:
+                return json.loads(result.stdout)
+            except json.JSONDecodeError as error:
+                raise BenchError(f"gcloud returned invalid JSON for {shlex.join(args)}") from error
+
+        raise BenchError(f"gcloud command failed after retries: {shlex.join(['gcloud', *command_args])}")
 
     def _log(self, record: dict[str, Any]) -> None:
         with self.log_path.open("a", encoding="utf-8") as stream:
@@ -1009,13 +1048,23 @@ def write_json(path: Path, value: Any) -> None:
 
 
 def should_retain_vm(args: argparse.Namespace, return_code: int, lifecycle: dict[str, Any]) -> bool:
-    return bool(
+    explicitly_requested = bool(
         getattr(args, "keep_vm_after_run", False)
-        and return_code == 0
         and lifecycle.get("created")
         and lifecycle.get("benchmark_started")
         and lifecycle.get("collected")
+        and lifecycle.get("results_verified")
     )
+    needs_artifact_recovery = bool(
+        lifecycle.get("created")
+        and (
+            lifecycle.get("benchmark_attempted")
+            or lifecycle.get("benchmark_started")
+            or lifecycle.get("remote_execution_uncertain")
+        )
+        and not lifecycle.get("results_verified")
+    )
+    return explicitly_requested or needs_artifact_recovery
 
 
 def retained_vm_reconnect_instructions(
@@ -1034,6 +1083,7 @@ def retained_vm_reconnect_instructions(
 
     return (
         "VM retained until its GCP auto-delete deadline.\n"
+        "Do not destroy the VM, firewall, VPC, subnet, route, or Terraform state until the complete local result set is recovered.\n"
         f"Auto-delete deadline: {termination_timestamp}\n"
         f"VPC: {network}\n"
         f"Subnet: {subnet}\n"
@@ -1057,7 +1107,11 @@ def gcloud_base(project: str, zone: str) -> list[str]:
 def collect_artifacts(
     ip: str, key: Path, known_hosts: Path, results_dir: Path, *, before_connect: Callable[[], None]
 ) -> dict[str, Any]:
-    """Retry result transfer into isolated staging directories before teardown."""
+    """Bundle and verify compact benchmark artifacts before teardown."""
+    import hashlib
+    import tarfile
+    from pathlib import PurePosixPath
+
     collected = results_dir / "collected"
     attempts: list[dict[str, Any]] = []
     results_collected = False
@@ -1066,30 +1120,116 @@ def collect_artifacts(
     for attempt_number in range(1, 3):
         staging = results_dir / f"collection-attempt-{attempt_number:02d}"
         staging.mkdir(parents=True, exist_ok=False)
+        before_connect()
         try:
-            before_connect()
+            remote_pack = r"""python3 - <<'PY'
+import hashlib
+import json
+from pathlib import Path
+import tarfile
+
+root = Path("/mnt/gcp-wal-bench/results")
+if not root.is_dir():
+    raise SystemExit("benchmark results directory is missing")
+root_names = {
+    "summary.json", "summary.tsv", "comparison.tsv", "benchmark-plan.json",
+    "rfc026-schedule.tsv", "commit.txt", "remote-exit.json", "finished_utc.txt",
+    "uname.txt", "lscpu.txt", "lsblk.txt", "findmnt.txt",
+}
+run_names = {
+    "result.json", "run-metadata.json", "environment.txt", "start_utc.txt",
+    "end_utc.txt", "command.sh",
+}
+selected = [p for p in root.iterdir() if p.is_file() and p.name in root_names]
+for run_dir in sorted(root.glob("w*")):
+    if run_dir.is_dir():
+        selected.extend(p for p in run_dir.iterdir() if p.is_file() and p.name in run_names)
+archive = Path("/tmp/gcp-wal-bench-results-compact.tar.gz")
+archive.unlink(missing_ok=True)
+with tarfile.open(archive, "w:gz") as bundle:
+    for path in sorted(selected):
+        bundle.add(path, arcname=path.relative_to(root.parent).as_posix())
+digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+print(f"ARCHIVE_SHA256={digest}")
+print(f"ARCHIVE_BYTES={archive.stat().st_size}")
+print(f"ARCHIVE_FILES={len(selected)}")
+PY"""
+            packed = ssh_command(key, known_hosts, ip, remote_pack, timeout=90)
+            if packed.returncode:
+                raise BenchError(f"Could not build compact result bundle: {packed.stderr.strip()}")
+            remote_digest = re.search(r"ARCHIVE_SHA256=([0-9a-f]{64})", packed.stdout)
+            if remote_digest is None:
+                raise BenchError("Remote compact result bundle did not report a SHA-256 digest")
+            archive_path = staging / "results.tar.gz"
             transfer = scp_from_vm(
-                ip, "/mnt/gcp-wal-bench/results", staging, key, known_hosts,
-                recursive=True, timeout=240,
+                ip, "/tmp/gcp-wal-bench-results-compact.tar.gz", archive_path, key, known_hosts,
+                timeout=120,
             )
-            local_results = staging / "results"
-            results_collected = transfer.returncode == 0 and local_results.is_dir()
-            attempt = {"number": attempt_number, "returncode": transfer.returncode,
-                       "stderr": transfer.stderr[-4000:], "results_collected": results_collected}
+            if transfer.returncode:
+                raise BenchError(f"Could not transfer compact result bundle: {transfer.stderr.strip()}")
+            local_digest = hashlib.sha256(archive_path.read_bytes()).hexdigest()
+            if local_digest != remote_digest.group(1):
+                raise BenchError("Compact result bundle SHA-256 mismatch")
+            unpacked = staging / "unpacked"
+            unpacked.mkdir()
+            with tarfile.open(archive_path, "r:gz") as bundle:
+                members = bundle.getmembers()
+                for member in members:
+                    path = PurePosixPath(member.name)
+                    if path.is_absolute() or ".." in path.parts or not member.isfile():
+                        raise BenchError("Compact result bundle contains an unsafe archive member")
+                bundle.extractall(unpacked, members=members)
+            local_results = unpacked / "results"
+            summary_path = local_results / "summary.json"
+            try:
+                summary = json.loads(summary_path.read_text(encoding="utf-8"))
+                plan = json.loads((local_results / "benchmark-plan.json").read_text(encoding="utf-8"))
+                remote_exit = json.loads((local_results / "remote-exit.json").read_text(encoding="utf-8"))
+                if not all(isinstance(value, dict) for value in (summary, plan, remote_exit)):
+                    raise ValueError("benchmark result metadata must contain JSON objects")
+                run_metadata_count = len(list(local_results.glob("w*/run-metadata.json")))
+                result_json_count = len(list(local_results.glob("w*/result.json")))
+                runs_planned = summary.get("runs_planned")
+                runs_completed = summary.get("runs_completed")
+                summary_complete = bool(
+                    summary.get("complete") is True
+                    and type(runs_planned) is int
+                    and runs_planned > 0
+                    and plan.get("runs_planned") == runs_planned
+                    and type(runs_completed) is int
+                    and runs_completed == runs_planned
+                    and remote_exit.get("failed") is False
+                    and remote_exit.get("runs_started") == runs_planned
+                    and run_metadata_count == runs_completed
+                    and result_json_count == runs_completed
+                )
+            except (OSError, json.JSONDecodeError, ValueError, TypeError, AttributeError):
+                summary = {}
+                summary_complete = False
+                run_metadata_count = 0
+                result_json_count = 0
+            results_collected = local_results.is_dir()
+            results_verified = results_collected and summary_complete
+            attempt = {
+                "number": attempt_number,
+                "returncode": transfer.returncode,
+                "stderr": transfer.stderr[-4000:],
+                "results_collected": results_collected,
+                "results_verified": results_verified,
+                "run_metadata_count": run_metadata_count,
+                "result_json_count": result_json_count,
+                "bundle_sha256": local_digest,
+                "bundle_bytes": archive_path.stat().st_size,
+                "bundle_files": len(members),
+            }
             if results_collected:
-                summary_path = local_results / "summary.json"
-                try:
-                    summary = json.loads(summary_path.read_text(encoding="utf-8"))
-                    summary_complete = summary.get("complete") is True
-                except (OSError, json.JSONDecodeError):
-                    summary_complete = False
                 collected.mkdir(parents=True, exist_ok=True)
                 os.replace(local_results, collected / "results")
                 attempts.append(attempt)
                 shutil.rmtree(staging, ignore_errors=True)
                 break
             attempts.append(attempt)
-        except (OSError, subprocess.TimeoutExpired) as error:
+        except (BenchError, OSError, json.JSONDecodeError, tarfile.TarError, subprocess.TimeoutExpired) as error:
             attempts.append({"number": attempt_number, "error": str(error), "results_collected": False})
         if attempt_number < 2:
             time.sleep(5)
@@ -1116,6 +1256,7 @@ def collect_artifacts(
     write_json(results_dir / "artifact-collection.json", {
         "attempts": attempts,
         "results_collected": results_collected,
+        "results_verified": results_collected and summary_complete,
         "summary_complete": summary_complete,
         "bootstrap_log_collected": boot_log_collected,
         "benchmark_started": benchmark_started,
@@ -1123,6 +1264,7 @@ def collect_artifacts(
     return {
         "bootstrap_log": boot_log_collected,
         "results": results_collected,
+        "results_verified": results_collected and summary_complete,
         "summary_complete": summary_complete,
         "benchmark_started": benchmark_started,
         "attempts": attempts,
@@ -1303,8 +1445,10 @@ def provision_and_run(
     lifecycle = {"project": args.project, "zone": args.zone,
                  "instance": instance, "firewall": firewall, "created": False, "firewall_created": False,
                  "network": args.network, "subnet": args.subnet,
-                 "benchmark_started": False,
-                 "remote_execution_uncertain": False, "collected": False, "retained": False, "cleanup": []}
+                 "benchmark_attempted": False, "benchmark_started": False,
+                 "remote_execution_uncertain": False, "collected": False,
+                 "summary_complete": False, "results_verified": False,
+                 "retained": False, "cleanup": []}
     results_dir.mkdir(parents=True, exist_ok=True)
     lifecycle_path = results_dir / "lifecycle.json"
 
@@ -1472,6 +1616,8 @@ def provision_and_run(
                 audit_ssh_firewall_rules(
                     gcloud, args.project, args.network, network_region, tag, args.ssh_source_range
                 )
+                lifecycle["benchmark_attempted"] = True
+                persist_lifecycle()
                 run = ssh_command(key, known_hosts, ip, remote_command, timeout=remaining)
             except subprocess.TimeoutExpired as error:
                 lifecycle["remote_execution_uncertain"] = True
@@ -1505,19 +1651,22 @@ def provision_and_run(
                             lifecycle["benchmark_started"] = bool(
                                 lifecycle["benchmark_started"] or collection.get("benchmark_started")
                             )
-                            persist_lifecycle()
                             lifecycle["collected"] = bool(collection.get("results"))
+                            lifecycle["summary_complete"] = bool(collection.get("summary_complete"))
+                            lifecycle["results_verified"] = bool(collection.get("results_verified"))
+                            lifecycle["retained"] = should_retain_vm(args, return_code, lifecycle)
                             persist_lifecycle()
-                            if not lifecycle["collected"]:
+                            if not lifecycle["results_verified"]:
                                 return_code = 1
                                 lifecycle["cleanup"].append(
-                                    "result transfer incomplete after retries; see artifact-collection.json and local logs"
+                                    "result set is incomplete or unverified; preserving the VM and network for recovery"
                                 )
                                 persist_lifecycle()
                             elif not collection.get("bootstrap_log"):
                                 lifecycle["cleanup"].append("bootstrap log could not be collected; benchmark results are local")
                                 persist_lifecycle()
                         if should_retain_vm(args, return_code, lifecycle):
+                            lifecycle["retained"] = True
                             retained_key = results_dir / "retained-ssh-key"
                             retained_known_hosts = results_dir / "retained-known-hosts"
                             shutil.copyfile(key, retained_key)
@@ -1552,15 +1701,18 @@ def provision_and_run(
                             try:
                                 persist_lifecycle()
                             except BaseException:
-                                lifecycle["retained"] = False
+                                # The in-memory retention flag still prevents teardown if
+                                # the local filesystem cannot persist recovery metadata.
                                 raise
                     except BaseException as error:
                         return_code = 1
+                        if should_retain_vm(args, return_code, lifecycle):
+                            lifecycle["retained"] = True
                         lifecycle["cleanup"].append(f"local artifact/retention step failed: {error}")
                         persist_lifecycle()
             finally:
-                # Local log/collection I/O can fail (for example, a full disk).
-                # It must never prevent teardown of the cloud resources.
+                # Do not destroy the only remaining copy of a completed or
+                # uncertain benchmark until its full result set is verified locally.
                 if lifecycle["retained"]:
                     cleanup_messages, cleanup_verification, cleanup_failed = [], {}, False
                 else:

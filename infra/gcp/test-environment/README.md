@@ -113,18 +113,25 @@ tools for the new configuration before updating that marker.
 The VM is configured for server-side deletion at an absolute deadline derived
 from the first Terraform apply and `max_runtime_hours` (24 by default, at most
 168). Terraform state stores this lifetime anchor; keep that state. Stopping,
-starting, or reapplying the VM does not reset the deadline. To start a new
-environment lifetime, destroy and recreate the environment. The VPC, subnet,
-and SSH firewall rule remain managed by Terraform after the VM expires:
+starting, or reapplying the VM does not reset the deadline. The VPC, subnet, and
+SSH firewall rule remain managed by Terraform after the VM expires.
+
+Before destroying an environment used for benchmarks, verify the complete
+result set is present off-host, including its run counts and per-run result and
+metadata files. Local SSD can be the only remaining copy after an interrupted
+transfer. If results are incomplete or unverified, preserve the VM and Terraform
+state and recover them before running `terraform destroy`. The VM's
+server-side deletion deadline remains the fallback, so recover data before it
+expires. After results are verified or the environment has no results to
+recover, destroy and recreate the environment to start a new lifetime:
 
 ```bash
 terraform destroy -var-file=terraform.tfvars
 ```
 
-Destroying or expiring the VM loses Local SSD contents. Copy any needed results
-off the host first. The Terraform cost guard only checks your supplied estimate
-against the configured lifetime; it cannot limit charges for other resources,
-network traffic, or an incorrect estimate.
+Destroying or expiring the VM loses Local SSD contents. The Terraform cost guard
+only checks your supplied estimate against the configured lifetime; it cannot
+limit charges for other resources, network traffic, or an incorrect estimate.
 
 The VM has no attached service account, so workloads on the host cannot obtain
 Google Cloud credentials from its metadata server. SSH access uses the supplied
@@ -179,9 +186,9 @@ source ~/.cargo/env && rustc --version # When install_rust_toolchain is true.
 
 For a new bootstrap/provider revision, save a small marker file under the
 workspace, reboot the host, reconnect, and verify the marker, mount and
-filesystem UUID are unchanged. When the environment is no longer needed, run
-`terraform destroy -var-file=terraform.tfvars` and confirm the named VM, boot
-disk, SSH rule, subnet and VPC are absent from `gcloud compute` inventory. This
-live check uses the existing Free Trial project; it must not upgrade billing or
-enable services. It is separate from CI so pull requests cannot create billed
-resources automatically.
+filesystem UUID are unchanged. When the complete result set has been copied
+off-host and verified, run `terraform destroy -var-file=terraform.tfvars` and
+confirm the named VM, boot disk, SSH rule, subnet and VPC are absent from
+`gcloud compute` inventory. This live check uses the existing Free Trial
+project; it must not upgrade billing or enable services. It is separate from CI
+so pull requests cannot create billed resources automatically.

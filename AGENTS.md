@@ -389,11 +389,19 @@ experimental source patches and runner changes isolated from PR branches; record
 the source commit and patch checksum with the results. Profiling or Hotpath runs
 are diagnostic and must not be reported as unprofiled throughput scores.
 
-After collection, verify the VM, boot disk, temporary SSH rule, route, subnet,
-and isolated VPC are deleted. Copy the result artifacts locally before teardown
-and report the result directory, observed I/O metadata, cleanup verification,
-and any failed or incomplete steps. PR #549 is explicitly not authorized to
-merge unless the user changes that instruction.
+If a benchmark was attempted or remote execution is uncertain and the local
+result set is missing or unverified, retain the VM, boot disk, temporary SSH
+rule, isolated VPC, subnet, route, and Terraform state. Do not run
+`terraform destroy` or delete cloud resources while they may be the only copy
+of completed results. Use the saved reconnect instructions to recover them.
+Treat a result set as verified only after the archive checksum passes,
+`summary.json` reports `complete: true` with matching planned/completed run
+counts, and every completed run has both its `result.json` and
+`run-metadata.json` locally. Only then tear down the VM and temporary firewall,
+destroy the isolated Terraform network, verify all resources are absent, and
+report the result directory, observed I/O metadata, cleanup verification, and
+any failed or incomplete steps. PR #549 is explicitly not authorized to merge
+unless the user changes that instruction.
 
 ## Useful Binaries
 

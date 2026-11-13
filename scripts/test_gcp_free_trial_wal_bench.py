@@ -4,14 +4,17 @@ from __future__ import annotations
 
 import base64
 import csv
+import hashlib
 import importlib.util
 import json
 import os
 from pathlib import Path
+import shutil
+import stat
 import struct
 import subprocess
-import stat
 import tempfile
+import tarfile
 import time
 import unittest
 from unittest.mock import patch
@@ -130,6 +133,36 @@ def fake_keygen(command, **_kwargs):
 
 
 class GcpFreeTrialWalBenchTests(unittest.TestCase):
+    def _make_result_bundle(
+        self, root: Path, *, complete: bool, include_run_metadata: bool = True,
+    ) -> tuple[Path, str]:
+        source_root = root / "source"
+        results = source_root / "results"
+        run_dir = results / "w16-point-r1-v7_parallel"
+        run_dir.mkdir(parents=True)
+        (results / "summary.json").write_text(
+            json.dumps({"complete": complete, "runs_planned": 1, "runs_completed": int(complete)}),
+            encoding="utf-8",
+        )
+        (results / "summary.tsv").write_text("writer\tworkload\n16\tpoint\n", encoding="utf-8")
+        (results / "benchmark-plan.json").write_text('{"runs_planned":1}\n', encoding="utf-8")
+        (results / "remote-exit.json").write_text(
+            json.dumps({"failed": not complete, "runs_started": 1}), encoding="utf-8"
+        )
+        (results / "rfc026-schedule.tsv").write_text("", encoding="utf-8")
+        (run_dir / "result.json").write_text('{"result":{"ops_per_sec":123}}\n', encoding="utf-8")
+        if include_run_metadata:
+            (run_dir / "run-metadata.json").write_text(
+                json.dumps({"exit_code": 0 if complete else 1}), encoding="utf-8"
+            )
+        archive = root / "results.tar.gz"
+        with tarfile.open(archive, "w:gz") as bundle:
+            for path in results.rglob("*"):
+                if path.is_file():
+                    bundle.add(path, arcname=path.relative_to(source_root).as_posix())
+        digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+        return archive, digest
+
     def test_benchmark_record_loader_requires_exactly_one_valid_json_record(self) -> None:
         valid = json.dumps({"result": {}, "params": {}, "latency": {}})
         with tempfile.TemporaryDirectory() as temp:
@@ -242,14 +275,35 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             BENCH.parse_args([*common, "--v8-small-ticket-profile", "--full-rfc026-matrix"])
 
-    def test_vm_retention_requires_successful_run_and_collected_artifacts(self) -> None:
+    def test_vm_retention_keeps_unverified_benchmark_for_artifact_recovery(self) -> None:
         args = BENCH.argparse.Namespace(keep_vm_after_run=True)
-        complete = {"created": True, "benchmark_started": True, "collected": True}
+        complete = {
+            "created": True,
+            "benchmark_attempted": True,
+            "benchmark_started": True,
+            "collected": True,
+            "results_verified": True,
+        }
         self.assertTrue(BENCH.should_retain_vm(args, 0, complete))
-        self.assertFalse(BENCH.should_retain_vm(args, 1, complete))
+        self.assertTrue(BENCH.should_retain_vm(args, 1, complete))
         self.assertFalse(BENCH.should_retain_vm(args, 0, {**complete, "collected": False}))
         self.assertFalse(BENCH.should_retain_vm(
             BENCH.argparse.Namespace(keep_vm_after_run=False), 0, complete,
+        ))
+        self.assertTrue(BENCH.should_retain_vm(
+            BENCH.argparse.Namespace(keep_vm_after_run=False),
+            1,
+            {"created": True, "benchmark_attempted": True, "results_verified": False},
+        ))
+        self.assertTrue(BENCH.should_retain_vm(
+            BENCH.argparse.Namespace(keep_vm_after_run=False),
+            1,
+            {"created": True, "remote_execution_uncertain": True, "results_verified": False},
+        ))
+        self.assertFalse(BENCH.should_retain_vm(
+            BENCH.argparse.Namespace(keep_vm_after_run=False),
+            1,
+            {"created": True, "benchmark_attempted": False, "results_verified": False},
         ))
 
     def test_retained_vm_reconnect_instructions_include_quoted_firewall_cleanup(self) -> None:
@@ -1075,7 +1129,10 @@ print('[hotpath] diagnostic report follows')
             def collect(*_args, **_kwargs):
                 nonlocal disk_full
                 disk_full = True
-                return {"results": True, "bootstrap_log": True, "summary_complete": True}
+                return {
+                    "results": True, "results_verified": True,
+                    "bootstrap_log": True, "summary_complete": True,
+                }
 
             def fsync(_fd):
                 if disk_full:
@@ -1133,6 +1190,57 @@ print('[hotpath] diagnostic report follows')
                 cleanup.assert_called_once()
                 self.assertTrue(cleanup.call_args.kwargs["vm_created"])
                 self.assertFalse(cleanup.call_args.kwargs["firewall_created"])
+
+    def test_incomplete_result_collection_retains_vm_for_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            results = Path(temp) / "results"
+            args = BENCH.argparse.Namespace(
+                project="test-project", zone="us-central1-a", network="walbench-net", subnet="walbench-subnet",
+                ssh_source_range="203.0.113.10/32", max_runtime_minutes=60, commit="a" * 40, num=64,
+                machine_type=BENCH.MACHINE_TYPE, writers=(16,), full_rfc026_matrix=True,
+                v8_small_ticket_profile=False, keep_vm_after_run=False,
+            )
+            gcloud = ProvisionGcloud()
+            successful_ssh = subprocess.CompletedProcess([], 0, "", "")
+
+            def ssh(_key, _known_hosts, _ip, command, *, timeout):
+                if command == "true":
+                    return successful_ssh
+                return subprocess.CompletedProcess([], 1, "", "summary generation failed")
+
+            def wait_for_host_keys(_gcloud, _instance, _project, _zone, _ip, known_hosts, _deadline):
+                known_hosts.write_text("verified host key\n", encoding="utf-8")
+
+            incomplete = {
+                "results": False,
+                "results_verified": False,
+                "summary_complete": False,
+                "bootstrap_log": True,
+                "benchmark_started": True,
+            }
+            with (
+                patch.object(BENCH.shutil, "which", return_value="/usr/bin/tool"),
+                patch.object(BENCH, "audit_ssh_firewall_rules"),
+                patch.object(BENCH, "wait_for_verified_host_keys", side_effect=wait_for_host_keys),
+                patch.object(BENCH.subprocess, "run", side_effect=fake_keygen),
+                patch.object(BENCH, "ssh_command", side_effect=ssh),
+                patch.object(BENCH, "scp_to_vm", return_value=successful_ssh),
+                patch.object(BENCH, "collect_artifacts", return_value=incomplete),
+                patch.object(BENCH, "cleanup_gcp_resources") as cleanup,
+            ):
+                result = BENCH.provision_and_run(
+                    args, gcloud, results, {"boot_image": {"name": "pinned-image"}}
+                )
+
+            self.assertEqual(result, 1)
+            cleanup.assert_not_called()
+            lifecycle = json.loads((results / "lifecycle.json").read_text(encoding="utf-8"))
+            self.assertTrue(lifecycle["benchmark_attempted"])
+            self.assertTrue(lifecycle["benchmark_started"])
+            self.assertTrue(lifecycle["retained"])
+            self.assertTrue((results / "retained-ssh-key").is_file())
+            reconnect = (results / "reconnect.txt").read_text(encoding="utf-8")
+            self.assertIn("Do not destroy the VM, firewall, VPC, subnet, route, or Terraform state", reconnect)
 
     def test_firewall_audit_rejects_broad_ssh_allow(self) -> None:
         rule = {
@@ -1274,6 +1382,36 @@ print('[hotpath] diagnostic report follows')
             self.assertNotIn("secret", path.read_text(encoding="utf-8"))
             self.assertEqual(logged["stdout_bytes"], len(completed.stdout.encode("utf-8")))
 
+    def test_gcloud_json_retries_transient_read_failures(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            gcloud = BENCH.Gcloud("project", Path(temp) / "gcloud.jsonl")
+            responses = [
+                subprocess.CompletedProcess([], 1, "", "ConnectionError: RemoteDisconnected"),
+                subprocess.CompletedProcess([], 0, '{"status":"UP"}', ""),
+            ]
+            with (
+                patch.object(BENCH.subprocess, "run", side_effect=responses) as mock_run,
+                patch.object(BENCH.time, "sleep") as sleep,
+            ):
+                self.assertEqual(gcloud.json(["compute", "zones", "describe", "zone-a"]), {"status": "UP"})
+
+            self.assertEqual(mock_run.call_count, 2)
+            sleep.assert_called_once_with(1)
+
+    def test_gcloud_json_does_not_retry_nontransient_failures(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            gcloud = BENCH.Gcloud("project", Path(temp) / "gcloud.jsonl")
+            failure = subprocess.CompletedProcess([], 403, "", "Permission denied")
+            with (
+                patch.object(BENCH.subprocess, "run", return_value=failure) as mock_run,
+                patch.object(BENCH.time, "sleep") as sleep,
+            ):
+                with self.assertRaisesRegex(BENCH.BenchError, "Permission denied"):
+                    gcloud.json(["compute", "zones", "describe", "zone-a"])
+
+            mock_run.assert_called_once()
+            sleep.assert_not_called()
+
     def test_collection_retries_and_keeps_a_transferred_partial_matrix(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -1281,33 +1419,74 @@ print('[hotpath] diagnostic report follows')
             known_hosts = root / "known_hosts"
             key.write_text("private", encoding="utf-8")
             known_hosts.write_text("host-key", encoding="utf-8")
+            archive, digest = self._make_result_bundle(root, complete=False)
             calls = 0
             events = []
 
-            def scp(_ip, _remote, destination, _key, _known_hosts, *, recursive=False, timeout):
-                nonlocal calls
+            def pack(_key, _known_hosts, _ip, _command, *, timeout):
                 self.assertEqual(events[-1], "audit")
+                events.append("ssh")
+                return subprocess.CompletedProcess([], 0, f"ARCHIVE_SHA256={digest}\n", "")
+
+            def scp(_ip, remote, destination, _key, _known_hosts, *, recursive=False, timeout):
+                nonlocal calls
+                self.assertFalse(recursive)
+                self.assertEqual(events[-1], "ssh" if remote.endswith(".tar.gz") else "audit")
                 events.append("scp")
-                if recursive:
+                if remote.endswith(".tar.gz"):
                     calls += 1
                     if calls == 1:
                         return subprocess.CompletedProcess([], 1, "", "temporary transfer failure")
-                    result_dir = destination / "results"
-                    result_dir.mkdir(parents=True)
-                    (result_dir / "summary.json").write_text('{"complete": false}\n', encoding="utf-8")
+                    shutil.copyfile(archive, destination)
                     return subprocess.CompletedProcess([], 0, "", "")
                 destination.write_text("boot log", encoding="utf-8")
                 return subprocess.CompletedProcess([], 0, "", "")
 
-            with patch.object(BENCH, "scp_from_vm", side_effect=scp), patch.object(BENCH.time, "sleep"):
+            with (
+                patch.object(BENCH, "ssh_command", side_effect=pack),
+                patch.object(BENCH, "scp_from_vm", side_effect=scp),
+                patch.object(BENCH.time, "sleep"),
+            ):
                 result = BENCH.collect_artifacts(
                     "192.0.2.1", key, known_hosts, root, before_connect=lambda: events.append("audit")
                 )
             self.assertTrue(result["results"])
             self.assertFalse(result["summary_complete"])
-            self.assertTrue((root / "collected" / "results" / "summary.json").is_file())
+            self.assertFalse(result["results_verified"])
+            self.assertTrue((root / "collected" / "results" / "w16-point-r1-v7_parallel" / "result.json").is_file())
             self.assertEqual(calls, 2)
-            self.assertEqual(events, ["audit", "scp"] * 3)
+            self.assertEqual(events, ["audit", "ssh", "scp", "audit", "ssh", "scp", "audit", "scp"])
+
+    def test_collection_rejects_complete_summary_with_missing_run_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            archive, digest = self._make_result_bundle(root, complete=True, include_run_metadata=False)
+
+            def pack(_key, _known_hosts, _ip, _command, *, timeout):
+                return subprocess.CompletedProcess([], 0, f"ARCHIVE_SHA256={digest}\n", "")
+
+            def scp(_ip, remote, destination, _key, _known_hosts, *, recursive=False, timeout):
+                self.assertFalse(recursive)
+                if remote.endswith(".tar.gz"):
+                    shutil.copyfile(archive, destination)
+                else:
+                    destination.write_text("bootstrap details", encoding="utf-8")
+                return subprocess.CompletedProcess([], 0, "", "")
+
+            with (
+                patch.object(BENCH, "ssh_command", side_effect=pack),
+                patch.object(BENCH, "scp_from_vm", side_effect=scp),
+                patch.object(BENCH.time, "sleep"),
+            ):
+                result = BENCH.collect_artifacts(
+                    "192.0.2.1", root / "key", root / "known_hosts", root, before_connect=lambda: None
+                )
+
+            self.assertTrue(result["results"])
+            self.assertFalse(result["results_verified"])
+            attempt = json.loads((root / "artifact-collection.json").read_text(encoding="utf-8"))["attempts"][0]
+            self.assertEqual(attempt["run_metadata_count"], 0)
+            self.assertEqual(attempt["result_json_count"], 1)
 
     def test_collection_keeps_bootstrap_log_when_results_are_unavailable(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -1318,15 +1497,22 @@ print('[hotpath] diagnostic report follows')
             known_hosts.write_text("host-key", encoding="utf-8")
 
             def scp(_ip, remote, destination, _key, _known_hosts, *, recursive=False, timeout):
-                if recursive:
-                    return subprocess.CompletedProcess([], 1, "", "Local SSD setup failed")
+                self.assertFalse(recursive)
                 self.assertEqual(remote, "/var/log/gcp-free-trial-wal-bench.log")
                 destination.write_text(
                     "bootstrap details\nWAL_BENCHMARK_STARTED 2026-11-04T10:00:00Z\n", encoding="utf-8"
                 )
                 return subprocess.CompletedProcess([], 0, "", "")
 
-            with patch.object(BENCH, "scp_from_vm", side_effect=scp), patch.object(BENCH.time, "sleep"):
+            with (
+                patch.object(
+                    BENCH,
+                    "ssh_command",
+                    return_value=subprocess.CompletedProcess([], 1, "", "Local SSD setup failed"),
+                ),
+                patch.object(BENCH, "scp_from_vm", side_effect=scp),
+                patch.object(BENCH.time, "sleep"),
+            ):
                 result = BENCH.collect_artifacts("192.0.2.1", key, known_hosts, root, before_connect=lambda: None)
 
             self.assertFalse(result["results"])
@@ -1339,26 +1525,38 @@ print('[hotpath] diagnostic report follows')
             with self.subTest(rejected_audit=rejected_audit), tempfile.TemporaryDirectory() as temp:
                 root = Path(temp)
                 events = []
+                archive, digest = self._make_result_bundle(root, complete=True)
 
                 def audit():
                     events.append("audit")
                     if events.count("audit") == rejected_audit:
                         raise BENCH.BenchError("SSH firewall policy changed")
 
-                def scp(_ip, _remote, destination, _key, _known_hosts, *, recursive=False, timeout):
+                def pack(_key, _known_hosts, _ip, _command, *, timeout):
+                    events.append("ssh")
+                    return subprocess.CompletedProcess([], 0, f"ARCHIVE_SHA256={digest}\n", "")
+
+                def scp(_ip, remote, destination, _key, _known_hosts, *, recursive=False, timeout):
                     events.append("scp")
-                    self.assertTrue(recursive)
-                    result_dir = destination / "results"
-                    result_dir.mkdir()
-                    (result_dir / "summary.json").write_text('{"complete": true}\n', encoding="utf-8")
+                    self.assertFalse(recursive)
+                    if remote.endswith(".tar.gz"):
+                        shutil.copyfile(archive, destination)
+                    else:
+                        destination.write_text("boot log", encoding="utf-8")
                     return subprocess.CompletedProcess([], 0, "", "")
 
-                with patch.object(BENCH, "scp_from_vm", side_effect=scp):
+                with (
+                    patch.object(BENCH, "ssh_command", side_effect=pack),
+                    patch.object(BENCH, "scp_from_vm", side_effect=scp),
+                ):
                     with self.assertRaisesRegex(BENCH.BenchError, "SSH firewall policy changed"):
                         BENCH.collect_artifacts(
                             "192.0.2.1", root / "key", root / "known_hosts", root, before_connect=audit
                         )
-                self.assertEqual(events, ["audit"] if rejected_audit == 1 else ["audit", "scp", "audit"])
+                self.assertEqual(
+                    events,
+                    ["audit"] if rejected_audit == 1 else ["audit", "ssh", "scp", "audit"],
+                )
                 if rejected_audit == 2:
                     self.assertTrue((root / "collected" / "results" / "summary.json").is_file())
 
