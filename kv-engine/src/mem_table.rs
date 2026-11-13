@@ -730,17 +730,6 @@ impl WriteProfile {
     }
 
     #[cfg(feature = "bench")]
-    pub(crate) fn next_wal_v8_durability_advance_is_sampled(&self) -> bool {
-        let every = self.wal_v8_durability_sample_every();
-        every > 0
-            && self
-                .wal_v8_durability_advance_sample_sequence
-                .load(std::sync::atomic::Ordering::Relaxed)
-                .saturating_add(1)
-                .is_multiple_of(every)
-    }
-
-    #[cfg(feature = "bench")]
     pub(crate) fn next_wal_v8_follower_sample(&self) -> Option<u64> {
         let every = self.wal_v8_durability_sample_every();
         if every == 0 {

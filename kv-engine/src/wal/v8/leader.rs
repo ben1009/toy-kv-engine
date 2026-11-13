@@ -3286,15 +3286,15 @@ impl WalV8ParallelWriter {
             #[cfg(feature = "bench")]
             let profile = self.profile.load_full();
             #[cfg(feature = "bench")]
-            let phase_sample_candidate = profile
+            let phase_sample_id = profile
                 .as_ref()
-                .is_some_and(|profile| profile.next_wal_v8_durability_advance_is_sampled());
+                .and_then(|profile| profile.next_wal_v8_durability_advance_sample());
             #[cfg(feature = "bench")]
-            let frontier_lock_wait_started = phase_sample_candidate.then(Instant::now);
+            let frontier_lock_wait_started = phase_sample_id.map(|_| Instant::now());
             #[cfg(feature = "bench")]
-            let driver_wall_started = phase_sample_candidate.then(Instant::now);
+            let driver_wall_started = phase_sample_id.map(|_| Instant::now());
             #[cfg(feature = "bench")]
-            let driver_cpu_started = phase_sample_candidate.then(digest::thread_cpu_time_ns);
+            let driver_cpu_started = phase_sample_id.map(|_| digest::thread_cpu_time_ns());
             let observed_generation = self.coordinator.durability_generation();
             let mut previous = self.frontier.lock();
             #[cfg(feature = "bench")]
@@ -3316,18 +3316,6 @@ impl WalV8ParallelWriter {
             #[cfg(feature = "bench")]
             let mut coalescing_cpu_ns = 0_u64;
             let mut snapshot = self.coordinator.frontier_ready_snapshot();
-            #[cfg(feature = "bench")]
-            let phase_sample_id = (phase_sample_candidate && !snapshot.ready_prefix.is_empty())
-                .then(|| {
-                    profile
-                        .as_ref()
-                        .and_then(|profile| profile.next_wal_v8_durability_advance_sample())
-                })
-                .flatten();
-            #[cfg(feature = "bench")]
-            let driver_wall_started = phase_sample_id.and(driver_wall_started);
-            #[cfg(feature = "bench")]
-            let driver_cpu_started = phase_sample_id.and(driver_cpu_started);
             if !snapshot.ready_prefix.is_empty()
                 && snapshot.ready_prefix.len() < snapshot.admitted_ticket_count
                 && let Some(latency) = previous.last_sync_latency
