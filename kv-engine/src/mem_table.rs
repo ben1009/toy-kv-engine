@@ -281,6 +281,22 @@ pub struct WriteProfile {
     wal_v8_completion_timeline: Mutex<Vec<WalV8CompletionTimelineObservation>>,
     #[cfg(feature = "bench")]
     wal_v8_completion_timeline_dropped_samples: AtomicU64,
+    /// Interval for sampled durability phase diagnostics. Zero disables all
+    /// phase and follower timestamps.
+    #[cfg(feature = "bench")]
+    wal_v8_durability_sample_every: AtomicU64,
+    #[cfg(feature = "bench")]
+    wal_v8_durability_advance_sample_sequence: AtomicU64,
+    #[cfg(feature = "bench")]
+    wal_v8_durability_follower_sample_sequence: AtomicU64,
+    #[cfg(feature = "bench")]
+    wal_v8_durability_phases: Mutex<Vec<WalV8DurabilityPhaseObservation>>,
+    #[cfg(feature = "bench")]
+    wal_v8_durability_phase_dropped_samples: AtomicU64,
+    #[cfg(feature = "bench")]
+    wal_v8_follower_waits: Mutex<Vec<WalV8FollowerWaitObservation>>,
+    #[cfg(feature = "bench")]
+    wal_v8_follower_wait_dropped_samples: AtomicU64,
 }
 
 /// One logical `fdatasync` call and the WAL progress observed while it ran.
@@ -358,6 +374,52 @@ pub struct WalV8CompletionTimelineObservation {
     pub prefix_ready_to_durable_ns: u64,
 }
 
+/// One sampled, actual V8 durability advance. Wall and thread CPU durations
+/// are both captured so blocked I/O can be distinguished from CPU work.
+#[cfg(feature = "bench")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WalV8DurabilityPhaseObservation {
+    pub sample_id: u64,
+    pub ticket_start: u64,
+    pub ticket_end: u64,
+    pub tickets_covered: u64,
+    pub driver_wall_ns: u64,
+    pub driver_cpu_ns: u64,
+    pub frontier_lock_wait_ns: u64,
+    pub coalescing_wall_ns: u64,
+    pub coalescing_cpu_ns: u64,
+    pub preparation_wall_ns: u64,
+    pub preparation_cpu_ns: u64,
+    pub frontier_write_wall_ns: u64,
+    pub frontier_write_cpu_ns: u64,
+    pub fdatasync_wall_ns: u64,
+    pub fdatasync_cpu_ns: u64,
+    pub resource_retire_before_publish_wall_ns: u64,
+    pub resource_retire_after_publish_wall_ns: u64,
+    pub coordinator_publish_lock_wait_ns: u64,
+    pub coordinator_publish_lock_wait_cpu_ns: u64,
+    pub coordinator_publish_wall_ns: u64,
+    pub coordinator_publish_cpu_ns: u64,
+    pub notify_all_wall_ns: u64,
+    pub followers_waiting_at_publish: u64,
+}
+
+/// One sampled caller that waited for the current V8 durability driver.
+#[cfg(feature = "bench")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WalV8FollowerWaitObservation {
+    pub sample_id: u64,
+    pub requested_ticket_end: u64,
+    pub durable_ticket_end_on_resume: u64,
+    pub coordinator_lock_wait_ns: u64,
+    pub coordinator_lock_wait_cpu_ns: u64,
+    pub total_wait_wall_ns: u64,
+    pub total_wait_cpu_ns: u64,
+    pub condvar_wait_count: u64,
+    pub notify_to_resume_ns: Option<u64>,
+    pub followers_woken_by_last_notify: u64,
+}
+
 impl WriteProfile {
     #[cfg(feature = "bench")]
     pub(crate) fn reset(&self) {
@@ -393,6 +455,17 @@ impl WriteProfile {
         self.wal_v8_completion_timeline.lock().clear();
         #[cfg(feature = "bench")]
         self.wal_v8_completion_timeline_dropped_samples.store(0, o);
+        #[cfg(feature = "bench")]
+        {
+            self.wal_v8_completion_timeline_sample_every.store(0, o);
+            self.wal_v8_durability_sample_every.store(0, o);
+            self.wal_v8_durability_advance_sample_sequence.store(0, o);
+            self.wal_v8_durability_follower_sample_sequence.store(0, o);
+            self.wal_v8_durability_phases.lock().clear();
+            self.wal_v8_durability_phase_dropped_samples.store(0, o);
+            self.wal_v8_follower_waits.lock().clear();
+            self.wal_v8_follower_wait_dropped_samples.store(0, o);
+        }
         self.wal_worker_eventfd_notifications.store(0, o);
         self.wal_worker_eventfd_writes.store(0, o);
         self.wal_preallocation_ns.store(0, o);
@@ -541,6 +614,19 @@ impl WriteProfile {
                     None
                 }
             },
+            wal_v8_durability_sample_every: {
+                #[cfg(feature = "bench")]
+                {
+                    match self.wal_v8_durability_sample_every.load(o) {
+                        0 => None,
+                        every => Some(every),
+                    }
+                }
+                #[cfg(not(feature = "bench"))]
+                {
+                    None
+                }
+            },
             op_count: self.op_count.load(o),
         }
     }
@@ -615,6 +701,106 @@ impl WriteProfile {
     #[cfg(feature = "bench")]
     pub(crate) fn wal_v8_completion_timeline_dropped_samples(&self) -> u64 {
         self.wal_v8_completion_timeline_dropped_samples
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn set_wal_v8_durability_sample_every(&self, every: u64) {
+        self.wal_v8_durability_sample_every
+            .store(every, std::sync::atomic::Ordering::Release);
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn wal_v8_durability_sample_every(&self) -> u64 {
+        self.wal_v8_durability_sample_every
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn next_wal_v8_durability_advance_sample(&self) -> Option<u64> {
+        let every = self.wal_v8_durability_sample_every();
+        if every == 0 {
+            return None;
+        }
+        let sample_id = self
+            .wal_v8_durability_advance_sample_sequence
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .saturating_add(1);
+        sample_id.is_multiple_of(every).then_some(sample_id)
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn next_wal_v8_durability_advance_is_sampled(&self) -> bool {
+        let every = self.wal_v8_durability_sample_every();
+        every > 0
+            && self
+                .wal_v8_durability_advance_sample_sequence
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .saturating_add(1)
+                .is_multiple_of(every)
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn next_wal_v8_follower_sample(&self) -> Option<u64> {
+        let every = self.wal_v8_durability_sample_every();
+        if every == 0 {
+            return None;
+        }
+        let sample_id = self
+            .wal_v8_durability_follower_sample_sequence
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .saturating_add(1);
+        sample_id.is_multiple_of(every).then_some(sample_id)
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn record_wal_v8_durability_phase(
+        &self,
+        observation: WalV8DurabilityPhaseObservation,
+    ) {
+        const MAX_SAMPLES: usize = 4096;
+        let mut samples = self.wal_v8_durability_phases.lock();
+        if samples.len() < MAX_SAMPLES {
+            samples.push(observation);
+        } else {
+            self.wal_v8_durability_phase_dropped_samples
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn wal_v8_durability_phase_observations(
+        &self,
+    ) -> Vec<WalV8DurabilityPhaseObservation> {
+        self.wal_v8_durability_phases.lock().clone()
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn wal_v8_durability_phase_dropped_samples(&self) -> u64 {
+        self.wal_v8_durability_phase_dropped_samples
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn record_wal_v8_follower_wait(&self, observation: WalV8FollowerWaitObservation) {
+        const MAX_SAMPLES: usize = 4096;
+        let mut samples = self.wal_v8_follower_waits.lock();
+        if samples.len() < MAX_SAMPLES {
+            samples.push(observation);
+        } else {
+            self.wal_v8_follower_wait_dropped_samples
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn wal_v8_follower_wait_observations(&self) -> Vec<WalV8FollowerWaitObservation> {
+        self.wal_v8_follower_waits.lock().clone()
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn wal_v8_follower_wait_dropped_samples(&self) -> u64 {
+        self.wal_v8_follower_wait_dropped_samples
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
@@ -971,6 +1157,7 @@ pub struct WriteProfileSnapshot {
     pub wal_sync_coalesce_wait_ns: u64,
     pub wal_hol_diagnostics_enabled: bool,
     pub wal_v8_completion_timeline_sample_every: Option<u64>,
+    pub wal_v8_durability_sample_every: Option<u64>,
     pub op_count: u64,
 }
 
@@ -1144,6 +1331,7 @@ impl WriteProfileSnapshot {
                 .saturating_sub(before.wal_sync_coalesce_wait_ns),
             wal_hol_diagnostics_enabled: self.wal_hol_diagnostics_enabled,
             wal_v8_completion_timeline_sample_every: self.wal_v8_completion_timeline_sample_every,
+            wal_v8_durability_sample_every: self.wal_v8_durability_sample_every,
             op_count: self.op_count.saturating_sub(before.op_count),
         }
     }

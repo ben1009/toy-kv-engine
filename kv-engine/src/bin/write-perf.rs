@@ -297,6 +297,10 @@ struct Args {
     /// stages. Requires a bench build with PITR V8 Parallel I/O.
     #[arg(long, requires = "pitr")]
     wal_completion_timeline: bool,
+    /// Sample one out of every N V8 Parallel durability advances and follower waits.
+    /// Captures phase wall/thread CPU time; requires a bench build with PITR V8 Parallel I/O.
+    #[arg(long, requires = "pitr")]
+    wal_v8_durability_sample_every: Option<u64>,
     #[arg(long)]
     vlog: bool,
     #[arg(long)]
@@ -380,6 +384,7 @@ struct HarnessConfig {
     wal_sync_diagnostics: bool,
     wal_hol_diagnostics: bool,
     wal_completion_timeline: bool,
+    wal_v8_durability_sample_every: Option<u64>,
     vlog_override: bool,
     profile: bool,
     pitr: bool,
@@ -497,6 +502,7 @@ impl HarnessConfig {
             wal_sync_diagnostics: args.wal_sync_diagnostics,
             wal_hol_diagnostics: args.wal_hol_diagnostics,
             wal_completion_timeline: args.wal_completion_timeline,
+            wal_v8_durability_sample_every: args.wal_v8_durability_sample_every,
             vlog_override: args.vlog,
             profile: args.profile,
             pitr: args.pitr,
@@ -1111,6 +1117,8 @@ struct WalPipelineRecord {
     v8_hol_diagnostics_enabled: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     v8_completion_timeline: Option<WalV8CompletionTimelineRunRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    v8_durability_diagnostics: Option<WalV8DurabilityDiagnosticsRunRecord>,
     v8_data_submit_hol_episodes: u64,
     v8_data_submit_hol_wait_ns: u64,
     v8_data_submit_hol_successor_ticket_wait_ns: u64,
@@ -1179,6 +1187,57 @@ struct WalV8CompletionTimelineRecord {
     prefix_ready_to_durable_ns: u64,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+struct WalV8DurabilityDiagnosticsRunRecord {
+    sample_every: u64,
+    phase_dropped_samples: u64,
+    phases: Vec<WalV8DurabilityPhaseRecord>,
+    follower_wait_dropped_samples: u64,
+    follower_waits: Vec<WalV8FollowerWaitRecord>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
+struct WalV8DurabilityPhaseRecord {
+    sample_id: u64,
+    ticket_start: u64,
+    ticket_end: u64,
+    tickets_covered: u64,
+    driver_wall_ns: u64,
+    driver_cpu_ns: u64,
+    frontier_lock_wait_ns: u64,
+    coalescing_wall_ns: u64,
+    coalescing_cpu_ns: u64,
+    preparation_wall_ns: u64,
+    preparation_cpu_ns: u64,
+    frontier_write_wall_ns: u64,
+    frontier_write_cpu_ns: u64,
+    fdatasync_wall_ns: u64,
+    fdatasync_cpu_ns: u64,
+    resource_retire_before_publish_wall_ns: u64,
+    resource_retire_after_publish_wall_ns: u64,
+    coordinator_publish_lock_wait_ns: u64,
+    coordinator_publish_lock_wait_cpu_ns: u64,
+    coordinator_publish_wall_ns: u64,
+    coordinator_publish_cpu_ns: u64,
+    notify_all_wall_ns: u64,
+    followers_waiting_at_publish: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
+struct WalV8FollowerWaitRecord {
+    sample_id: u64,
+    requested_ticket_end: u64,
+    durable_ticket_end_on_resume: u64,
+    coordinator_lock_wait_ns: u64,
+    coordinator_lock_wait_cpu_ns: u64,
+    total_wait_wall_ns: u64,
+    total_wait_cpu_ns: u64,
+    condvar_wait_count: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    notify_to_resume_ns: Option<u64>,
+    followers_woken_by_last_notify: u64,
+}
+
 #[cfg(feature = "bench")]
 impl From<kv_engine_wrapper::mem_table::WalV8CompletionTimelineObservation>
     for WalV8CompletionTimelineRecord
@@ -1201,6 +1260,59 @@ impl From<kv_engine_wrapper::mem_table::WalV8CompletionTimelineObservation>
             result_send_start_to_reaper_recv_ns: observation.result_send_start_to_reaper_recv_ns,
             reaper_recv_to_prefix_ready_ns: observation.reaper_recv_to_prefix_ready_ns,
             prefix_ready_to_durable_ns: observation.prefix_ready_to_durable_ns,
+        }
+    }
+}
+
+#[cfg(feature = "bench")]
+impl From<kv_engine_wrapper::mem_table::WalV8DurabilityPhaseObservation>
+    for WalV8DurabilityPhaseRecord
+{
+    fn from(observation: kv_engine_wrapper::mem_table::WalV8DurabilityPhaseObservation) -> Self {
+        Self {
+            sample_id: observation.sample_id,
+            ticket_start: observation.ticket_start,
+            ticket_end: observation.ticket_end,
+            tickets_covered: observation.tickets_covered,
+            driver_wall_ns: observation.driver_wall_ns,
+            driver_cpu_ns: observation.driver_cpu_ns,
+            frontier_lock_wait_ns: observation.frontier_lock_wait_ns,
+            coalescing_wall_ns: observation.coalescing_wall_ns,
+            coalescing_cpu_ns: observation.coalescing_cpu_ns,
+            preparation_wall_ns: observation.preparation_wall_ns,
+            preparation_cpu_ns: observation.preparation_cpu_ns,
+            frontier_write_wall_ns: observation.frontier_write_wall_ns,
+            frontier_write_cpu_ns: observation.frontier_write_cpu_ns,
+            fdatasync_wall_ns: observation.fdatasync_wall_ns,
+            fdatasync_cpu_ns: observation.fdatasync_cpu_ns,
+            resource_retire_before_publish_wall_ns: observation
+                .resource_retire_before_publish_wall_ns,
+            resource_retire_after_publish_wall_ns: observation
+                .resource_retire_after_publish_wall_ns,
+            coordinator_publish_lock_wait_ns: observation.coordinator_publish_lock_wait_ns,
+            coordinator_publish_lock_wait_cpu_ns: observation.coordinator_publish_lock_wait_cpu_ns,
+            coordinator_publish_wall_ns: observation.coordinator_publish_wall_ns,
+            coordinator_publish_cpu_ns: observation.coordinator_publish_cpu_ns,
+            notify_all_wall_ns: observation.notify_all_wall_ns,
+            followers_waiting_at_publish: observation.followers_waiting_at_publish,
+        }
+    }
+}
+
+#[cfg(feature = "bench")]
+impl From<kv_engine_wrapper::mem_table::WalV8FollowerWaitObservation> for WalV8FollowerWaitRecord {
+    fn from(observation: kv_engine_wrapper::mem_table::WalV8FollowerWaitObservation) -> Self {
+        Self {
+            sample_id: observation.sample_id,
+            requested_ticket_end: observation.requested_ticket_end,
+            durable_ticket_end_on_resume: observation.durable_ticket_end_on_resume,
+            coordinator_lock_wait_ns: observation.coordinator_lock_wait_ns,
+            coordinator_lock_wait_cpu_ns: observation.coordinator_lock_wait_cpu_ns,
+            total_wait_wall_ns: observation.total_wait_wall_ns,
+            total_wait_cpu_ns: observation.total_wait_cpu_ns,
+            condvar_wait_count: observation.condvar_wait_count,
+            notify_to_resume_ns: observation.notify_to_resume_ns,
+            followers_woken_by_last_notify: observation.followers_woken_by_last_notify,
         }
     }
 }
@@ -1479,6 +1591,23 @@ fn wal_pipeline_record(
                 .map(WalV8CompletionTimelineRecord::from)
                 .collect(),
         });
+    let v8_durability_diagnostics = profile.wal_v8_durability_sample_every.map(|sample_every| {
+        WalV8DurabilityDiagnosticsRunRecord {
+            sample_every,
+            phase_dropped_samples: engine.wal_v8_durability_phase_dropped_samples(),
+            phases: engine
+                .wal_v8_durability_phase_observations()
+                .into_iter()
+                .map(WalV8DurabilityPhaseRecord::from)
+                .collect(),
+            follower_wait_dropped_samples: engine.wal_v8_follower_wait_dropped_samples(),
+            follower_waits: engine
+                .wal_v8_follower_wait_observations()
+                .into_iter()
+                .map(WalV8FollowerWaitRecord::from)
+                .collect(),
+        }
+    });
 
     Ok(Some(WalPipelineRecord {
         commit_groups: profile.wal_commit_groups,
@@ -1497,6 +1626,7 @@ fn wal_pipeline_record(
             && wal_run_info.io_mode == "parallel")
             .then_some(hol_diagnostics_enabled),
         v8_completion_timeline,
+        v8_durability_diagnostics,
         v8_data_submit_hol_episodes: profile.wal_v8_data_submit_hol_episodes,
         v8_data_submit_hol_wait_ns: profile.wal_v8_data_submit_hol_wait_ns,
         v8_data_submit_hol_successor_ticket_wait_ns: profile
@@ -4443,6 +4573,7 @@ fn run_wal_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
         engine.set_wal_v8_completion_timeline_sample_every(
             cfg.wal_completion_timeline.then_some(128),
         )?;
+        engine.set_wal_v8_durability_sample_every(cfg.wal_v8_durability_sample_every)?;
     }
     let value = vec![b'x'; cfg.value_size];
     let num_keys = cfg.num;
@@ -4666,6 +4797,7 @@ fn run_wal_batch_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>
         engine.set_wal_v8_completion_timeline_sample_every(
             cfg.wal_completion_timeline.then_some(128),
         )?;
+        engine.set_wal_v8_durability_sample_every(cfg.wal_v8_durability_sample_every)?;
     }
     #[cfg(feature = "bench")]
     let wal_io_start = engine
@@ -9558,6 +9690,21 @@ fn validate_config(cfg: &HarnessConfig) -> Result<()> {
             "--wal-completion-timeline requires PITR V8 Parallel I/O"
         );
     }
+    if let Some(sample_every) = cfg.wal_v8_durability_sample_every {
+        anyhow::ensure!(
+            sample_every > 0,
+            "--wal-v8-durability-sample-every must be greater than zero"
+        );
+        anyhow::ensure!(
+            cfg!(feature = "bench"),
+            "--wal-v8-durability-sample-every requires a bench build"
+        );
+        anyhow::ensure!(
+            cfg.pitr_format.unwrap_or(PitrFormatArg::V8) == PitrFormatArg::V8
+                && cfg.wal_io_mode == WalIoModeArg::Parallel,
+            "--wal-v8-durability-sample-every requires PITR V8 Parallel I/O"
+        );
+    }
     if cfg.prepare_golden || cfg.golden_path.is_some() || cfg.clone_golden {
         anyhow::ensure!(
             cfg.suite == Suite::SteadyState,
@@ -10160,6 +10307,69 @@ mod tests {
                 .contains("requires PITR V8 Parallel I/O")
         );
         assert!(Args::try_parse_from(["write-perf", "--wal-completion-timeline"]).is_err());
+    }
+
+    #[test]
+    fn wal_v8_durability_sampling_requires_bench_build_and_v8_parallel() {
+        let parallel = HarnessConfig::from_args(
+            Args::try_parse_from([
+                "write-perf",
+                "--pitr",
+                "--wal-io-mode",
+                "parallel",
+                "--wal-v8-durability-sample-every",
+                "64",
+            ])
+            .expect("parse V8 durability sampling option"),
+        );
+        let result = validate_config(&parallel);
+        if cfg!(feature = "bench") {
+            result.expect("bench build can capture V8 durability phases");
+        } else {
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("requires a bench build")
+            );
+        }
+
+        let zero_interval = HarnessConfig::from_args(
+            Args::try_parse_from([
+                "write-perf",
+                "--pitr",
+                "--wal-v8-durability-sample-every",
+                "0",
+            ])
+            .expect("parse zero sampling interval for validation"),
+        );
+        assert!(
+            validate_config(&zero_interval)
+                .unwrap_err()
+                .to_string()
+                .contains("greater than zero")
+        );
+
+        let leader = HarnessConfig::from_args(
+            Args::try_parse_from([
+                "write-perf",
+                "--pitr",
+                "--wal-io-mode",
+                "leader",
+                "--wal-v8-durability-sample-every",
+                "64",
+            ])
+            .expect("parse incompatible Leader sampling option"),
+        );
+        assert!(
+            validate_config(&leader)
+                .unwrap_err()
+                .to_string()
+                .contains("requires PITR V8 Parallel I/O")
+        );
+        assert!(
+            Args::try_parse_from(["write-perf", "--wal-v8-durability-sample-every", "64"]).is_err()
+        );
     }
 
     #[derive(Debug, Deserialize)]
@@ -11361,6 +11571,7 @@ mod tests {
             wal_sync_diagnostics: false,
             wal_hol_diagnostics: false,
             wal_completion_timeline: false,
+            wal_v8_durability_sample_every: None,
             vlog_override: false,
             profile: true,
             clients: 1,
@@ -13900,6 +14111,7 @@ mod tests {
             wal_sync_diagnostics: false,
             wal_hol_diagnostics: false,
             wal_completion_timeline: false,
+            wal_v8_durability_sample_every: None,
             vlog_override: false,
             profile: false,
             clients: 1,

@@ -10136,6 +10136,56 @@ impl KvEngine {
             .wal_v8_completion_timeline_dropped_samples()
     }
 
+    #[cfg(feature = "bench")]
+    /// Sample one out of every `sample_every` V8 Parallel durability-driver
+    /// attempts and follower waits. Passing `None` disables phase timing.
+    pub fn set_wal_v8_durability_sample_every(&self, sample_every: Option<u64>) -> Result<()> {
+        anyhow::ensure!(
+            sample_every.is_none_or(|every| every > 0),
+            "durability phase sample interval must be greater than zero"
+        );
+        let _active_memtable = self.inner.active_memtable_lock.read();
+        self.inner
+            .write_profile
+            .set_wal_v8_durability_sample_every(sample_every.unwrap_or_default());
+
+        Ok(())
+    }
+
+    #[cfg(feature = "bench")]
+    /// Samples captured by the opt-in V8 Parallel durability phase diagnostics.
+    pub fn wal_v8_durability_phase_observations(
+        &self,
+    ) -> Vec<crate::mem_table::WalV8DurabilityPhaseObservation> {
+        self.inner
+            .write_profile
+            .wal_v8_durability_phase_observations()
+    }
+
+    #[cfg(feature = "bench")]
+    /// Number of phase samples dropped after reaching the bounded sample limit.
+    pub fn wal_v8_durability_phase_dropped_samples(&self) -> u64 {
+        self.inner
+            .write_profile
+            .wal_v8_durability_phase_dropped_samples()
+    }
+
+    #[cfg(feature = "bench")]
+    /// Sampled callers that waited for the active V8 Parallel durability driver.
+    pub fn wal_v8_follower_wait_observations(
+        &self,
+    ) -> Vec<crate::mem_table::WalV8FollowerWaitObservation> {
+        self.inner.write_profile.wal_v8_follower_wait_observations()
+    }
+
+    #[cfg(feature = "bench")]
+    /// Number of sampled follower waits dropped after reaching the bounded limit.
+    pub fn wal_v8_follower_wait_dropped_samples(&self) -> u64 {
+        self.inner
+            .write_profile
+            .wal_v8_follower_wait_dropped_samples()
+    }
+
     /// I/O flags and inode identity for the active V8 WAL handles.
     #[cfg(feature = "bench")]
     #[doc(hidden)]
