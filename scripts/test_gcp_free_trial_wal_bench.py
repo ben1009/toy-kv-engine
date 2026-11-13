@@ -167,7 +167,7 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
             "matrix_validation": {
                 "complete": complete, "planned": len(schedule), "observed": len(schedule),
             },
-            "results": rows,
+            "results": [{key: str(value) for key, value in row.items()} for row in rows],
         }), encoding="utf-8")
         (results / "remote-exit.json").write_text(json.dumps({
             "failed": not complete, "runs_started": len(schedule),
@@ -1703,6 +1703,18 @@ print('[hotpath] diagnostic report follows')
             self.assertFalse(mismatched_exit["verified"])
             self.assertTrue(any("remote exit run count does not match the plan" in error
                                 for error in mismatched_exit["errors"]))
+
+    def test_result_verifier_accepts_csv_string_exit_code_in_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            results = self._make_result_bundle(Path(temp), complete=True)
+            summary = json.loads((results / "summary.json").read_text(encoding="utf-8"))
+            self.assertTrue(all(row["exit_code"] == "0" for row in summary["results"]))
+
+            schedule = build_batch64_schedule((16,))
+            run_id = BENCH._run_identifier(schedule[0], "batch64")
+            metadata = json.loads((results / run_id / "run-metadata.json").read_text(encoding="utf-8"))
+            self.assertIs(type(metadata["exit_code"]), int)
+            self.assertTrue(BENCH._verify_result_set(results)["verified"])
 
     def test_profile_result_verification_uses_schedule_and_requires_perf_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

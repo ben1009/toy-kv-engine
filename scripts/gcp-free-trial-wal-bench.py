@@ -1298,7 +1298,11 @@ def _verify_result_set(results: Path) -> dict[str, Any]:
                 except (KeyError, TypeError, ValueError) as error:
                     errors.append(f"summary contains an invalid run identifier: {error}")
                     continue
-                if row.get("exit_code") != 0:
+                summary_exit_code = row.get("exit_code")
+                if not (
+                    (type(summary_exit_code) is int and summary_exit_code == 0)
+                    or summary_exit_code == "0"
+                ):
                     errors.append(f"summary run {summary_ids[-1]} did not succeed")
             if len(summary_ids) != len(set(summary_ids)) or set(summary_ids) != set(expected):
                 errors.append("summary run identifiers do not match the unique planned runs")
