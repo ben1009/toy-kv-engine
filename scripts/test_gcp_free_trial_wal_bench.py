@@ -496,6 +496,73 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
         self.assertEqual(paired["v8_throughput_wins"], 1)
         self.assertAlmostEqual(paired["median_paired_change_pct_v8_vs_v7"]["throughput_pct"], 10.0)
 
+    def test_commit_order_trace_analyzer_splits_wal_returns_by_group_and_size(self) -> None:
+        records = []
+        for commit_ts, ticket, frontier_end, return_order in (
+            (1, 0, 3, 40),
+            (2, 1, 3, 10),
+            (3, 2, 3, 10),
+            (4, 3, 5, 20),
+            (5, 4, 5, 30),
+            (6, 5, 7, 50),
+        ):
+            record = {
+                "commit_ts": commit_ts,
+                "wal_ticket": ticket,
+                "frontier_ticket_end": frontier_end,
+            }
+            for stage_index, stage in enumerate(TRACE_STAGES):
+                monotonic_ns = stage_index * 100_000 + commit_ts * 10
+                if stage == "wal_return":
+                    monotonic_ns = 300_000 + return_order * 1_000
+                record[stage] = {
+                    "monotonic_ns": monotonic_ns,
+                    "sequence": commit_ts * 10 + stage_index,
+                    "thread_id": 1,
+                }
+            records.append(record)
+
+        analysis = analyze_trace({"records": records})
+        grouped = analysis["wal_return_inversions_by_frontier_group"]
+        self.assertEqual(grouped["frontier_groups"], 3)
+        self.assertEqual(grouped["intra_group"]["timestamp_inversion_pairs"], 2)
+        self.assertEqual(grouped["intra_group"]["timestamp_pair_count"], 3)
+        self.assertEqual(grouped["intra_group"]["timestamp_tie_pairs_excluded"], 1)
+        self.assertEqual(grouped["inter_group"]["timestamp_inversion_pairs"], 2)
+        self.assertEqual(grouped["inter_group"]["timestamp_pair_count"], 11)
+
+        by_size = analysis["wal_return_inversions_by_complete_group_size"]
+        self.assertEqual(by_size["complete_groups"], 2)
+        self.assertEqual(by_size["incomplete_groups"], 1)
+        self.assertEqual(by_size["incomplete_group_details"], [{
+            "frontier_ticket_end": 7,
+            "expected_group_size": 2,
+            "observed_record_count": 1,
+        }])
+        size_two = by_size["by_group_size"]["2"]
+        self.assertEqual(size_two["groups"], 1)
+        self.assertEqual(size_two["records"], 2)
+        self.assertEqual(size_two["timestamp_inversion_pairs"], 0)
+        self.assertEqual(size_two["timestamp_pair_count"], 1)
+        size_three = by_size["by_group_size"]["3"]
+        self.assertEqual(size_three["timestamp_inversion_pairs"], 2)
+        self.assertEqual(size_three["timestamp_pair_count"], 2)
+        self.assertEqual(size_three["timestamp_tie_pairs_excluded"], 1)
+        self.assertEqual(size_three["timestamp_inversion_rate"], 1.0)
+        self.assertEqual(size_three["median_group_inversion_rate"], 1.0)
+
+    def test_commit_order_trace_analyzer_rejects_invalid_frontier_group(self) -> None:
+        record = {"commit_ts": 1, "wal_ticket": 0, "frontier_ticket_end": 0}
+        for stage_index, stage in enumerate(TRACE_STAGES):
+            record[stage] = {
+                "monotonic_ns": stage_index + 1,
+                "sequence": stage_index + 1,
+                "thread_id": 1,
+            }
+
+        with self.assertRaisesRegex(ValueError, "frontier ticket end"):
+            analyze_trace({"records": [record]})
+
     def test_commit_order_trace_result_verifier_checks_trace_and_score_pairs(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             results = Path(temp) / "results"

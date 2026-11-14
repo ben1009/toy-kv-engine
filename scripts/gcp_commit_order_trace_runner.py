@@ -121,6 +121,28 @@ def _percentile(values: list[int], percentile: float) -> int | None:
     return ordered[max(0, index)]
 
 
+def _return_pair_inversion_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
+    ordered = sorted(records, key=lambda record: int(record["commit_ts"]))
+    inversions = 0
+    comparable_pairs = 0
+    tie_pairs = 0
+    for index, earlier in enumerate(ordered):
+        earlier_return_ns = int(earlier["wal_return"]["monotonic_ns"])
+        for later in ordered[index + 1:]:
+            later_return_ns = int(later["wal_return"]["monotonic_ns"])
+            if earlier_return_ns == later_return_ns:
+                tie_pairs += 1
+            else:
+                comparable_pairs += 1
+                inversions += int(earlier_return_ns > later_return_ns)
+    return {
+        "timestamp_inversion_pairs": inversions,
+        "timestamp_pair_count": comparable_pairs,
+        "timestamp_tie_pairs_excluded": tie_pairs,
+        "timestamp_inversion_rate": inversions / comparable_pairs if comparable_pairs else None,
+    }
+
+
 def analyze_trace(trace: dict[str, Any]) -> dict[str, Any]:
     records = trace.get("records")
     if not isinstance(records, list):
@@ -143,6 +165,9 @@ def analyze_trace(trace: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("trace contains duplicate WAL tickets")
 
     for record in complete:
+        frontier_ticket_end = record.get("frontier_ticket_end")
+        if type(frontier_ticket_end) is not int or frontier_ticket_end <= int(record["wal_ticket"]):
+            raise ValueError("trace contains an invalid frontier ticket end")
         for stage in TRACE_STAGES:
             event = record[stage]
             if any(type(event.get(field)) is not int for field in ("sequence", "monotonic_ns", "thread_id")):
@@ -203,10 +228,121 @@ def analyze_trace(trace: dict[str, Any]) -> dict[str, Any]:
             "negative_duration_records": sum(duration < 0 for duration in durations),
         }
 
+    ordered_records = sorted(complete, key=lambda record: int(record["commit_ts"]))
+    frontier_groups: dict[int, list[dict[str, Any]]] = {}
+    for record in complete:
+        frontier_groups.setdefault(int(record["frontier_ticket_end"]), []).append(record)
+
+    category_counts = {
+        category: {
+            "timestamp_inversion_pairs": 0,
+            "timestamp_pair_count": 0,
+            "timestamp_tie_pairs_excluded": 0,
+        }
+        for category in ("intra_group", "inter_group")
+    }
+    for index, earlier in enumerate(ordered_records):
+        for later in ordered_records[index + 1:]:
+            category = (
+                "intra_group"
+                if earlier["frontier_ticket_end"] == later["frontier_ticket_end"]
+                else "inter_group"
+            )
+            earlier_return_ns = int(earlier["wal_return"]["monotonic_ns"])
+            later_return_ns = int(later["wal_return"]["monotonic_ns"])
+            counts = category_counts[category]
+            if earlier_return_ns == later_return_ns:
+                counts["timestamp_tie_pairs_excluded"] += 1
+            else:
+                counts["timestamp_pair_count"] += 1
+                counts["timestamp_inversion_pairs"] += int(earlier_return_ns > later_return_ns)
+
+    return_ordering: dict[str, Any] = {"frontier_groups": len(frontier_groups)}
+    for category, counts in category_counts.items():
+        comparable_pairs = counts["timestamp_pair_count"]
+        return_ordering[category] = {
+            **counts,
+            "timestamp_inversion_rate": (
+                counts["timestamp_inversion_pairs"] / comparable_pairs if comparable_pairs else None
+            ),
+        }
+
+    size_summaries: dict[int, dict[str, Any]] = {}
+    incomplete_groups = 0
+    incomplete_group_details = []
+    previous_ticket_end = 0
+    for frontier_ticket_end in sorted(frontier_groups):
+        group_records = sorted(frontier_groups[frontier_ticket_end], key=lambda record: int(record["wal_ticket"]))
+        expected_size = frontier_ticket_end - previous_ticket_end
+        is_complete_group = expected_size > 0 and len(group_records) == expected_size and all(
+            int(record["wal_ticket"]) == previous_ticket_end + index
+            for index, record in enumerate(group_records)
+        )
+        if is_complete_group:
+            group_size = expected_size
+            group_summary = _return_pair_inversion_summary(group_records)
+            size_summary = size_summaries.setdefault(
+                group_size,
+                {
+                    "groups": 0,
+                    "records": 0,
+                    "timestamp_inversion_pairs": 0,
+                    "timestamp_pair_count": 0,
+                    "timestamp_tie_pairs_excluded": 0,
+                    "group_inversion_rates": [],
+                },
+            )
+            size_summary["groups"] += 1
+            size_summary["records"] += len(group_records)
+            for field in (
+                "timestamp_inversion_pairs",
+                "timestamp_pair_count",
+                "timestamp_tie_pairs_excluded",
+            ):
+                size_summary[field] += group_summary[field]
+            if group_summary["timestamp_inversion_rate"] is not None:
+                size_summary["group_inversion_rates"].append(group_summary["timestamp_inversion_rate"])
+        else:
+            incomplete_groups += 1
+            incomplete_group_details.append({
+                "frontier_ticket_end": frontier_ticket_end,
+                "expected_group_size": expected_size,
+                "observed_record_count": len(group_records),
+            })
+        previous_ticket_end = frontier_ticket_end
+
+    complete_group_summaries: dict[str, dict[str, Any]] = {}
+    for group_size, summary in sorted(size_summaries.items()):
+        comparable_pairs = summary["timestamp_pair_count"]
+        complete_group_summaries[str(group_size)] = {
+            **{
+                field: value
+                for field, value in summary.items()
+                if field != "group_inversion_rates"
+            },
+            "timestamp_inversion_rate": (
+                summary["timestamp_inversion_pairs"] / comparable_pairs if comparable_pairs else None
+            ),
+            "median_group_inversion_rate": _median(summary["group_inversion_rates"]),
+        }
+
+    group_size_ordering = {
+        "complete_groups": sum(summary["groups"] for summary in size_summaries.values()),
+        "incomplete_groups": incomplete_groups,
+        "incomplete_group_details": incomplete_group_details,
+        "by_group_size": complete_group_summaries,
+        "note": (
+            "Group-size summaries include only contiguous, fully observed ticket ranges. The trace may end "
+            "partway through a durable group; such groups are excluded from size-stratified rates."
+        ),
+    }
+
     return {
         "complete_records": len(complete),
         "pairwise_timestamp_inversions": stage_results,
         "stage_intervals": interval_results,
+        "wal_return_inversions_by_frontier_group": return_ordering,
+        "wal_return_inversions_by_complete_group_size": group_size_ordering,
         "ordering_note": (
             "Inversion rates compare only distinct monotonic clock readings. Events sharing one clock reading "
             "are unordered ties and excluded from that stage's denominator; this includes tickets covered by "

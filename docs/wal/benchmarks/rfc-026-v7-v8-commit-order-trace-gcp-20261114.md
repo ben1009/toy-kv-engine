@@ -62,6 +62,19 @@ This accounts for the overall inversion totals: all 1,303 V7 inversions and 2,35
 
 The observed difference is therefore concentrated in the order in which writers covered by one durable publication return. It does not point to cross-group Driver Handoff as the source of most inversions. This remains descriptive evidence from one 1,024-record trace per version: pair comparisons are dependent, and captured groups at the trace boundaries may be partial. The result does not identify whether intra-group ordering comes from notification behavior, scheduling, or another part of the writer return path.
 
+### Comparison at the same complete group size
+
+The offline analyzer now stratifies by the number of ticketed Point writes in a group and excludes any group whose full contiguous ticket range was not captured. This avoids attributing the difference solely to the larger groups in V8.
+
+| Version | Fully observed groups | Complete 16-ticket groups | Records | WAL-return inversions / comparable pairs | Pair-weighted rate | Median per-group rate |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| V7 | 88 | 33 | 528 | 695 / 3,960 | 17.55% | 14.17% |
+| V8 | 68 | 59 | 944 | 2,209 / 7,080 | 31.20% | 28.33% |
+
+The final observed group was incomplete in each trace and excluded from this size-stratified table: V7 captured 3 of 16 tickets and V8 captured 14 of 16. At the same complete 16-ticket group size, V8's pair-weighted inversion rate remains higher by 13.65 percentage points (about 1.78×). Thus the larger share of full groups does not by itself explain the observed intra-group difference. This is still one trace per version, and pair comparisons within a group share records; treat the rates as descriptive, not independent statistical evidence.
+
+The reproducible calculation is in `scripts/gcp_commit_order_trace_runner.py`; offline tests cover intra/inter-group classification, complete-size stratification, a truncated tail group, and equal-time ties.
+
 ## Interpretation and next measurement
 
 The trace narrows the next question to writer wakeup and resume ordering within each durability group. A follow-up should correlate each frontier group with its writers' return events and capture wakeup-to-running delay for those same writers. The current data do not justify changing the MVCC sequencer or WAL protocol.
