@@ -1207,7 +1207,8 @@ struct WalV8DurabilityDiagnosticsRunRecord {
 struct WalV8AckRecord {
     ticket: u64,
     durable_publish_to_wal_return_ns: u64,
-    wal_return_to_memtable_publish_ns: u64,
+    wal_return_to_memtable_start_ns: u64,
+    memtable_publish_wall_ns: u64,
     mvcc_publish_commit_ts_ns: u64,
     wal_return_to_put_return_ns: u64,
 }
@@ -1428,7 +1429,8 @@ impl From<kv_engine_wrapper::mem_table::WalV8AckObservation> for WalV8AckRecord 
         Self {
             ticket: observation.ticket,
             durable_publish_to_wal_return_ns: observation.durable_publish_to_wal_return_ns,
-            wal_return_to_memtable_publish_ns: observation.wal_return_to_memtable_publish_ns,
+            wal_return_to_memtable_start_ns: observation.wal_return_to_memtable_start_ns,
+            memtable_publish_wall_ns: observation.memtable_publish_wall_ns,
             mvcc_publish_commit_ts_ns: observation.mvcc_publish_commit_ts_ns,
             wal_return_to_put_return_ns: observation.wal_return_to_put_return_ns,
         }

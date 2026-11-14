@@ -455,7 +455,8 @@ pub struct WalV8DurabilityPhaseObservation {
 pub struct WalV8AckObservation {
     pub ticket: u64,
     pub durable_publish_to_wal_return_ns: u64,
-    pub wal_return_to_memtable_publish_ns: u64,
+    pub wal_return_to_memtable_start_ns: u64,
+    pub memtable_publish_wall_ns: u64,
     pub mvcc_publish_commit_ts_ns: u64,
     pub wal_return_to_put_return_ns: u64,
 }

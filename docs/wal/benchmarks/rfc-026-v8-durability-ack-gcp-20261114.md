@@ -43,7 +43,8 @@ Values are p50 / p95 across 98 sampled successful advances (μs); intervals over
 | fdatasync wall | 101.8 / 119.6 |
 | Coordinator publish wall | 4.5 / 5.2 |
 | Durable publish → WAL return | 30.6 / 64.4 |
-| WAL return → MemTable publish start | 2.4 / 4.7 |
+| WAL return → MemTable publish start | Not captured in this run |
+| MemTable publish duration | 2.4 / 4.7 |
 | MVCC commit timestamp publication | 20.0 / 103.0 |
 | WAL return → Put internal return | 26.9 / 109.1 |
 
@@ -52,6 +53,8 @@ Coalescing return counts per sampled advance (p50): waits=4, returns=4, prefix-g
 ## Interpretation
 
 The ticket-correlated ACK path is now measured end to end in the benchmark output. The sampled results separate the WAL wait from post-WAL MemTable/MVCC publication; they do not by themselves establish which stage causes the V7/V8 throughput gap. This single run is useful for locating the next experiment, not for claiming a stable performance change.
+
+The earlier ACK field was mislabeled: the reported 2.4 / 4.7 μs measured the duration of MemTable publication, not the interval from WAL return to publication start. The code now exports those as separate measurements; the WAL-return-to-start interval was not recorded by this run.
 
 The retained VM and Terraform network were not manually deleted. The VM remains subject to its already configured 60-minute server-side deadline. The prior incomplete collection directory and archives were left untouched.
 

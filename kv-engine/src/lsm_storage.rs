@@ -19376,7 +19376,14 @@ impl LsmStorageInner {
                 if let (Some(started), Some(observation)) =
                     (publish_started, ack_timing.observation.as_mut())
                 {
-                    observation.wal_return_to_memtable_publish_ns =
+                    if let Some(wal_return_at) = ack_timing.wal_return_at {
+                        observation.wal_return_to_memtable_start_ns = started
+                            .saturating_duration_since(wal_return_at)
+                            .as_nanos()
+                            .min(u64::MAX as u128)
+                            as u64;
+                    }
+                    observation.memtable_publish_wall_ns =
                         started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
                 }
                 // Advance current_ts AFTER publish — readers must not see the
