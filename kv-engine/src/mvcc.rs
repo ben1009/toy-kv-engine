@@ -1116,7 +1116,7 @@ impl LsmMvccInner {
                 .map(|_| crate::wal::v8::digest::thread_cpu_time_ns());
             publication = self.publication.lock();
             #[cfg(feature = "bench")]
-            if let Some(sample) = sample.as_deref_mut() {
+            if let Some(sample) = sample {
                 sample.observation.publication_lock_acquisitions += 1;
                 if let Some(started) = lock_wait_started {
                     sample.observation.publication_lock_wait_wall_ns = sample
