@@ -49,9 +49,22 @@ The median durable-publication-to-WAL-return interval was 60.0 μs for V7 and 38
 
 The inversion percentages are descriptive for one trace per version. Pairwise comparisons share records and are not independent statistical samples. Equal-time frontier pairs also prevent a strict within-group ordering claim.
 
+### WAL-return inversions by durability group
+
+I grouped records by `frontier_ticket_end`, which is assigned to every ticket covered by the same durable-frontier publication. For each pair ordered by `commit_ts`, I classified the WAL-return inversion as intra-group when both records had the same frontier end, and inter-group otherwise. All 1,024 records in each trace had a frontier group; the intra-group pair counts exactly match the equal-timestamp frontier pairs excluded above.
+
+| Version | Intra-group inversions / pairs | Intra-group rate | Inter-group inversions / pairs | Inter-group rate |
+| --- | ---: | ---: | ---: | ---: |
+| V7 | 1,303 / 6,249 | 20.85% | 0 / 517,527 | 0% |
+| V8 | 2,355 / 7,464 | 31.55% | 4 / 516,312 | 0.00077% |
+
+This accounts for the overall inversion totals: all 1,303 V7 inversions and 2,355 of 2,359 V8 inversions occurred within a durability group. Of the 1,056 additional V8 inversions in this trace, 1,052 were intra-group and four were inter-group. The captured records represented 89 V7 groups and 69 V8 groups; 33 and 59 groups, respectively, contained all 16 traced writers.
+
+The observed difference is therefore concentrated in the order in which writers covered by one durable publication return. It does not point to cross-group Driver Handoff as the source of most inversions. This remains descriptive evidence from one 1,024-record trace per version: pair comparisons are dependent, and captured groups at the trace boundaries may be partial. The result does not identify whether intra-group ordering comes from notification behavior, scheduling, or another part of the writer return path.
+
 ## Interpretation and next measurement
 
-The trace narrows the next question to the boundary between durable publication and individual WAL returns. A follow-up should correlate each frontier group with its writers' return events and capture wakeup-to-running delay for those same writers. The current data do not justify changing the MVCC sequencer or WAL protocol.
+The trace narrows the next question to writer wakeup and resume ordering within each durability group. A follow-up should correlate each frontier group with its writers' return events and capture wakeup-to-running delay for those same writers. The current data do not justify changing the MVCC sequencer or WAL protocol.
 
 ## Result verification and retention
 
