@@ -3927,6 +3927,36 @@ impl Wal {
         self.submit_and_commit_inner(ticket, Some(profile))
     }
 
+    #[cfg(feature = "bench")]
+    pub(crate) fn submit_and_commit_profiled_with_publish_timestamp(
+        &self,
+        ticket: u64,
+        profile: &crate::mem_table::WriteProfile,
+    ) -> Result<Option<std::time::Instant>> {
+        let Some(writer) = &self.v8_parallel else {
+            self.submit_and_commit_profiled(ticket, profile)?;
+
+            return Ok(None);
+        };
+        if !profile.wal_v8_ack_ticket_is_sampled(ticket) {
+            self.submit_and_commit_profiled(ticket, profile)?;
+
+            return Ok(None);
+        }
+        if let Err(error) = writer.wait_durable(ticket) {
+            self.record_v8_parallel_error(writer, &error);
+
+            return Err(error);
+        }
+        self.refresh_v8_parallel_cursor(writer);
+        let published_at = writer.take_durable_publish_sample_timestamp(ticket);
+        if published_at.is_none() {
+            profile.drop_wal_v8_ack_publish_timestamp();
+        }
+
+        Ok(published_at)
+    }
+
     fn submit_and_commit_inner(
         &self,
         ticket: u64,

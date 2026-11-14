@@ -299,6 +299,11 @@ pub struct WriteProfile {
     wal_v8_durability_phases: Mutex<Vec<WalV8DurabilityPhaseObservation>>,
     #[cfg(feature = "bench")]
     wal_v8_durability_phase_dropped_samples: AtomicU64,
+    /// Sampled caller-side ACK stages correlated by V8 ticket.
+    #[cfg(feature = "bench")]
+    wal_v8_ack_observations: Mutex<Vec<WalV8AckObservation>>,
+    #[cfg(feature = "bench")]
+    wal_v8_ack_dropped_samples: AtomicU64,
     #[cfg(feature = "bench")]
     wal_v8_follower_waits: Mutex<Vec<WalV8FollowerWaitObservation>>,
     #[cfg(feature = "bench")]
@@ -405,6 +410,9 @@ pub struct WalV8DurabilityPhaseObservation {
     pub coalescing_condvar_wait_count: u64,
     pub coalescing_condvar_reacquire_count: u64,
     pub coalescing_condvar_non_timeout_returns: u64,
+    pub coalescing_condvar_prefix_growth_returns: u64,
+    pub coalescing_condvar_generation_changed_returns: u64,
+    pub coalescing_condvar_timeout_returns: u64,
     pub coalescing_loop_check_count: u64,
     pub preparation_wall_ns: u64,
     pub preparation_cpu_ns: u64,
@@ -419,6 +427,10 @@ pub struct WalV8DurabilityPhaseObservation {
     pub resource_retire_before_publish_lock_hold_wall_ns: u64,
     pub resource_retire_before_publish_lock_hold_cpu_ns: u64,
     pub resource_retire_before_publish_tickets: u64,
+    pub resource_retire_before_publish_collect_cpu_ns: u64,
+    pub resource_retire_before_publish_remove_cpu_ns: u64,
+    pub resource_retire_before_publish_release_cpu_ns: u64,
+    pub resource_retire_before_publish_finish_cpu_ns: u64,
     pub resource_retire_after_publish_wall_ns: u64,
     pub resource_retire_after_publish_cpu_ns: u64,
     pub resource_retire_after_publish_lock_wait_wall_ns: u64,
@@ -426,12 +438,26 @@ pub struct WalV8DurabilityPhaseObservation {
     pub resource_retire_after_publish_lock_hold_wall_ns: u64,
     pub resource_retire_after_publish_lock_hold_cpu_ns: u64,
     pub resource_retire_after_publish_tickets: u64,
+    pub resource_retire_after_publish_collect_cpu_ns: u64,
+    pub resource_retire_after_publish_remove_cpu_ns: u64,
+    pub resource_retire_after_publish_finish_cpu_ns: u64,
     pub coordinator_publish_lock_wait_ns: u64,
     pub coordinator_publish_lock_wait_cpu_ns: u64,
     pub coordinator_publish_wall_ns: u64,
     pub coordinator_publish_cpu_ns: u64,
     pub notify_all_wall_ns: u64,
     pub followers_waiting_at_publish: u64,
+}
+
+/// Sampled V8 Point-write stages after the durable FRONTIER was published.
+#[cfg(feature = "bench")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WalV8AckObservation {
+    pub ticket: u64,
+    pub durable_publish_to_wal_return_ns: u64,
+    pub wal_return_to_memtable_publish_ns: u64,
+    pub mvcc_publish_commit_ts_ns: u64,
+    pub wal_return_to_put_return_ns: u64,
 }
 
 /// Aggregate counters for one opt-in V8 durability sampling run.
@@ -516,6 +542,8 @@ impl WriteProfile {
             self.wal_v8_durability_follower_sample_sequence.store(0, o);
             self.wal_v8_durability_phases.lock().clear();
             self.wal_v8_durability_phase_dropped_samples.store(0, o);
+            self.wal_v8_ack_observations.lock().clear();
+            self.wal_v8_ack_dropped_samples.store(0, o);
             self.wal_v8_follower_waits.lock().clear();
             self.wal_v8_follower_wait_dropped_samples.store(0, o);
         }
@@ -878,6 +906,45 @@ impl WriteProfile {
             self.wal_v8_durability_phase_dropped_samples
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn wal_v8_ack_ticket_is_sampled(&self, ticket: u64) -> bool {
+        let every = self.wal_v8_durability_sample_every();
+
+        every > 0
+            && ticket
+                .checked_add(1)
+                .is_some_and(|ticket_end| ticket_end.is_multiple_of(every))
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn record_wal_v8_ack_observation(&self, observation: WalV8AckObservation) {
+        const MAX_SAMPLES: usize = 4096;
+        let mut samples = self.wal_v8_ack_observations.lock();
+        if samples.len() < MAX_SAMPLES {
+            samples.push(observation);
+        } else {
+            self.wal_v8_ack_dropped_samples
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn wal_v8_ack_observations(&self) -> Vec<WalV8AckObservation> {
+        self.wal_v8_ack_observations.lock().clone()
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn wal_v8_ack_dropped_samples(&self) -> u64 {
+        self.wal_v8_ack_dropped_samples
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn drop_wal_v8_ack_publish_timestamp(&self) {
+        self.wal_v8_ack_dropped_samples
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     #[cfg(feature = "bench")]
@@ -4133,6 +4200,30 @@ impl MemTable {
         }
 
         Ok(())
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn commit_wal_ticket_with_publish_timestamp(
+        &self,
+        ticket: Option<u64>,
+    ) -> Result<Option<Instant>> {
+        let Some(ticket) = ticket else {
+            return Ok(None);
+        };
+        let Some(wal) = &self.wal else {
+            return Ok(None);
+        };
+
+        let started = Instant::now();
+        let profile = self.write_profile.load();
+        let published_at =
+            wal.submit_and_commit_profiled_with_publish_timestamp(ticket, &profile)?;
+        profile.wal_sync_ns.fetch_add(
+            started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+
+        Ok(published_at)
     }
 
     /// Implement this in MVCC.

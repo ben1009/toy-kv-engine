@@ -219,6 +219,24 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
             "wal_io_device": 7,
             "wal_io_inode": 11,
         })
+        evolving_extent_metadata = {
+            "wal_io_start": {
+                **handles,
+                "sliding_extent_preparation": {"fallocate_calls": 0, "allocated_bytes": 0},
+            },
+            "wal_io_end": {
+                **handles,
+                "sliding_extent_preparation": {"fallocate_calls": 104, "allocated_bytes": 436207616},
+            },
+            "wal_io_stable": True,
+        }
+        self.assertEqual(_validate_wal_io_metadata(evolving_extent_metadata, 8), {
+            "wal_data_o_direct": True,
+            "wal_frontier_o_direct": False,
+            "wal_sync_o_direct": False,
+            "wal_io_device": 7,
+            "wal_io_inode": 11,
+        })
         with self.assertRaisesRegex(ValueError, "expected V8 FRONTIER O_DIRECT=True"):
             _validate_wal_io_metadata(pipeline, 8, "direct")
 

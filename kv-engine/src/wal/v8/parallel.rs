@@ -132,6 +132,8 @@ struct CoordinatorState {
     last_durability_notify_at: Option<Instant>,
     #[cfg(feature = "bench")]
     last_durability_notify_waiters: u64,
+    #[cfg(feature = "bench")]
+    durable_publish_sample_timestamps: BTreeMap<u64, Instant>,
 }
 
 #[cfg(feature = "bench")]
@@ -244,6 +246,9 @@ pub(crate) struct WalV8CoalescingObservation {
     pub(crate) condvar_reacquire_count: u64,
     /// Non-timeout returns, including spurious condition-variable wakeups.
     pub(crate) condvar_non_timeout_returns: u64,
+    pub(crate) condvar_prefix_growth_returns: u64,
+    pub(crate) condvar_generation_changed_returns: u64,
+    pub(crate) condvar_timeout_returns: u64,
     pub(crate) loop_check_count: u64,
     pub(crate) condvar_wait_cpu_ns: u64,
 }
@@ -367,6 +372,8 @@ impl WalV8ParallelCoordinator {
                     last_durability_notify_at: None,
                     #[cfg(feature = "bench")]
                     last_durability_notify_waiters: 0,
+                    #[cfg(feature = "bench")]
+                    durable_publish_sample_timestamps: BTreeMap::new(),
                 }),
                 changed: Condvar::new(),
                 durability_changed: Condvar::new(),
@@ -581,6 +588,14 @@ impl WalV8ParallelCoordinator {
             {
                 state.frontier_coalesce_waiters += 1;
             }
+            let prior_generation = state.durability_generation;
+            let prior_ready = capture_metrics.then(|| {
+                state
+                    .tickets
+                    .iter()
+                    .take_while(|ticket| ticket.is_frontier_ready())
+                    .count()
+            });
             let condvar_cpu_started = capture_metrics.then(super::digest::thread_cpu_time_ns);
             let condvar_wall_started = capture_metrics.then(Instant::now);
             let wait_result = self
@@ -598,6 +613,26 @@ impl WalV8ParallelCoordinator {
                     observation.condvar_wait_wall_ns = observation
                         .condvar_wait_wall_ns
                         .saturating_add(started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+                }
+                if wait_result.timed_out() {
+                    observation.condvar_timeout_returns =
+                        observation.condvar_timeout_returns.saturating_add(1);
+                }
+                if state.durability_generation != prior_generation {
+                    observation.condvar_generation_changed_returns = observation
+                        .condvar_generation_changed_returns
+                        .saturating_add(1);
+                }
+                if prior_ready.is_some_and(|before| {
+                    state
+                        .tickets
+                        .iter()
+                        .take_while(|ticket| ticket.is_frontier_ready())
+                        .count()
+                        > before
+                }) {
+                    observation.condvar_prefix_growth_returns =
+                        observation.condvar_prefix_growth_returns.saturating_add(1);
                 }
                 observation.condvar_reacquire_count =
                     observation.condvar_reacquire_count.saturating_add(1);
@@ -1151,6 +1186,41 @@ impl WalV8ParallelCoordinator {
         state.last_frontier_end = frontier_end;
         state.pending_frontier = None;
         #[cfg(feature = "bench")]
+        let durable_published_at = Instant::now();
+        #[cfg(feature = "bench")]
+        if let Some(profile) = self.inner.profile.load_full() {
+            let every = profile.wal_v8_durability_sample_every();
+            if every > 0 {
+                let first_sample_end = state
+                    .durable_ticket_end
+                    .checked_sub(ticket_span)
+                    .and_then(|previous_end| previous_end.checked_div(every))
+                    .and_then(|sample| sample.checked_add(1))
+                    .and_then(|sample| sample.checked_mul(every));
+                if let Some(mut sample_end) = first_sample_end {
+                    while sample_end <= reservation.ticket_end {
+                        state
+                            .durable_publish_sample_timestamps
+                            .insert(sample_end, durable_published_at);
+                        sample_end = match sample_end.checked_add(every) {
+                            Some(next) => next,
+                            None => break,
+                        };
+                    }
+                }
+                while state.durable_publish_sample_timestamps.len() > 4096 {
+                    let Some(oldest) = state
+                        .durable_publish_sample_timestamps
+                        .first_key_value()
+                        .map(|(ticket_end, _)| *ticket_end)
+                    else {
+                        break;
+                    };
+                    state.durable_publish_sample_timestamps.remove(&oldest);
+                }
+            }
+        }
+        #[cfg(feature = "bench")]
         let covered_timeline_samples = {
             let covered_ends = state
                 .completion_timeline_samples
@@ -1179,9 +1249,6 @@ impl WalV8ParallelCoordinator {
             .map(|started| started.elapsed().as_nanos().min(u64::MAX as u128) as u64)
             .unwrap_or_default();
         drop(state);
-
-        #[cfg(feature = "bench")]
-        let durable_published_at = Instant::now();
 
         #[cfg(feature = "bench")]
         if let Some(profile) = self.inner.profile.load_full() {
@@ -1299,6 +1366,17 @@ impl WalV8ParallelCoordinator {
 
     pub(crate) fn durable_ticket_end(&self) -> u64 {
         self.inner.state.lock().durable_ticket_end
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn take_durable_publish_sample_timestamp(&self, ticket: u64) -> Option<Instant> {
+        let ticket_end = ticket.checked_add(1)?;
+
+        self.inner
+            .state
+            .lock()
+            .durable_publish_sample_timestamps
+            .remove(&ticket_end)
     }
 
     /// Return the published durable ticket/image ends and admission end from

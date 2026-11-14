@@ -1199,6 +1199,17 @@ struct WalV8DurabilityDiagnosticsRunRecord {
     phases: Vec<WalV8DurabilityPhaseRecord>,
     follower_wait_dropped_samples: u64,
     follower_waits: Vec<WalV8FollowerWaitRecord>,
+    ack_dropped_samples: u64,
+    ack_samples: Vec<WalV8AckRecord>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
+struct WalV8AckRecord {
+    ticket: u64,
+    durable_publish_to_wal_return_ns: u64,
+    wal_return_to_memtable_publish_ns: u64,
+    mvcc_publish_commit_ts_ns: u64,
+    wal_return_to_put_return_ns: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
@@ -1223,6 +1234,9 @@ struct WalV8DurabilityPhaseRecord {
     coalescing_condvar_wait_count: u64,
     coalescing_condvar_reacquire_count: u64,
     coalescing_condvar_non_timeout_returns: u64,
+    coalescing_condvar_prefix_growth_returns: u64,
+    coalescing_condvar_generation_changed_returns: u64,
+    coalescing_condvar_timeout_returns: u64,
     coalescing_loop_check_count: u64,
     preparation_wall_ns: u64,
     preparation_cpu_ns: u64,
@@ -1237,6 +1251,10 @@ struct WalV8DurabilityPhaseRecord {
     resource_retire_before_publish_lock_hold_wall_ns: u64,
     resource_retire_before_publish_lock_hold_cpu_ns: u64,
     resource_retire_before_publish_tickets: u64,
+    resource_retire_before_publish_collect_cpu_ns: u64,
+    resource_retire_before_publish_remove_cpu_ns: u64,
+    resource_retire_before_publish_release_cpu_ns: u64,
+    resource_retire_before_publish_finish_cpu_ns: u64,
     resource_retire_after_publish_wall_ns: u64,
     resource_retire_after_publish_cpu_ns: u64,
     resource_retire_after_publish_lock_wait_wall_ns: u64,
@@ -1244,6 +1262,9 @@ struct WalV8DurabilityPhaseRecord {
     resource_retire_after_publish_lock_hold_wall_ns: u64,
     resource_retire_after_publish_lock_hold_cpu_ns: u64,
     resource_retire_after_publish_tickets: u64,
+    resource_retire_after_publish_collect_cpu_ns: u64,
+    resource_retire_after_publish_remove_cpu_ns: u64,
+    resource_retire_after_publish_finish_cpu_ns: u64,
     coordinator_publish_lock_wait_ns: u64,
     coordinator_publish_lock_wait_cpu_ns: u64,
     coordinator_publish_wall_ns: u64,
@@ -1320,6 +1341,11 @@ impl From<kv_engine_wrapper::mem_table::WalV8DurabilityPhaseObservation>
             coalescing_condvar_reacquire_count: observation.coalescing_condvar_reacquire_count,
             coalescing_condvar_non_timeout_returns: observation
                 .coalescing_condvar_non_timeout_returns,
+            coalescing_condvar_prefix_growth_returns: observation
+                .coalescing_condvar_prefix_growth_returns,
+            coalescing_condvar_generation_changed_returns: observation
+                .coalescing_condvar_generation_changed_returns,
+            coalescing_condvar_timeout_returns: observation.coalescing_condvar_timeout_returns,
             coalescing_loop_check_count: observation.coalescing_loop_check_count,
             preparation_wall_ns: observation.preparation_wall_ns,
             preparation_cpu_ns: observation.preparation_cpu_ns,
@@ -1341,6 +1367,14 @@ impl From<kv_engine_wrapper::mem_table::WalV8DurabilityPhaseObservation>
                 .resource_retire_before_publish_lock_hold_cpu_ns,
             resource_retire_before_publish_tickets: observation
                 .resource_retire_before_publish_tickets,
+            resource_retire_before_publish_collect_cpu_ns: observation
+                .resource_retire_before_publish_collect_cpu_ns,
+            resource_retire_before_publish_remove_cpu_ns: observation
+                .resource_retire_before_publish_remove_cpu_ns,
+            resource_retire_before_publish_release_cpu_ns: observation
+                .resource_retire_before_publish_release_cpu_ns,
+            resource_retire_before_publish_finish_cpu_ns: observation
+                .resource_retire_before_publish_finish_cpu_ns,
             resource_retire_after_publish_wall_ns: observation
                 .resource_retire_after_publish_wall_ns,
             resource_retire_after_publish_cpu_ns: observation.resource_retire_after_publish_cpu_ns,
@@ -1354,6 +1388,12 @@ impl From<kv_engine_wrapper::mem_table::WalV8DurabilityPhaseObservation>
                 .resource_retire_after_publish_lock_hold_cpu_ns,
             resource_retire_after_publish_tickets: observation
                 .resource_retire_after_publish_tickets,
+            resource_retire_after_publish_collect_cpu_ns: observation
+                .resource_retire_after_publish_collect_cpu_ns,
+            resource_retire_after_publish_remove_cpu_ns: observation
+                .resource_retire_after_publish_remove_cpu_ns,
+            resource_retire_after_publish_finish_cpu_ns: observation
+                .resource_retire_after_publish_finish_cpu_ns,
             coordinator_publish_lock_wait_ns: observation.coordinator_publish_lock_wait_ns,
             coordinator_publish_lock_wait_cpu_ns: observation.coordinator_publish_lock_wait_cpu_ns,
             coordinator_publish_wall_ns: observation.coordinator_publish_wall_ns,
@@ -1378,6 +1418,19 @@ impl From<kv_engine_wrapper::mem_table::WalV8FollowerWaitObservation> for WalV8F
             condvar_wait_count: observation.condvar_wait_count,
             notify_to_resume_ns: observation.notify_to_resume_ns,
             followers_woken_by_last_notify: observation.followers_woken_by_last_notify,
+        }
+    }
+}
+
+#[cfg(feature = "bench")]
+impl From<kv_engine_wrapper::mem_table::WalV8AckObservation> for WalV8AckRecord {
+    fn from(observation: kv_engine_wrapper::mem_table::WalV8AckObservation) -> Self {
+        Self {
+            ticket: observation.ticket,
+            durable_publish_to_wal_return_ns: observation.durable_publish_to_wal_return_ns,
+            wal_return_to_memtable_publish_ns: observation.wal_return_to_memtable_publish_ns,
+            mvcc_publish_commit_ts_ns: observation.mvcc_publish_commit_ts_ns,
+            wal_return_to_put_return_ns: observation.wal_return_to_put_return_ns,
         }
     }
 }
@@ -1676,6 +1729,12 @@ fn wal_pipeline_record(
                 .wal_v8_follower_wait_observations()
                 .into_iter()
                 .map(WalV8FollowerWaitRecord::from)
+                .collect(),
+            ack_dropped_samples: engine.wal_v8_ack_dropped_samples(),
+            ack_samples: engine
+                .wal_v8_ack_observations()
+                .into_iter()
+                .map(WalV8AckRecord::from)
                 .collect(),
         }
     });
