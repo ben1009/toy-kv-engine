@@ -652,13 +652,11 @@ impl LsmMvccInner {
         if let Some(sample) = sample.as_deref_mut() {
             sample.observation.spin_limit = spin_limit;
         }
-        let mut spin_iterations = 0;
-        for _ in 0..spin_limit {
-            spin_iterations += 1;
+        for _spin_iteration in 0..spin_limit {
             if self.frontier.load(Ordering::Acquire) > commit_ts {
                 #[cfg(feature = "bench")]
                 if let Some(sample) = sample.as_deref_mut() {
-                    sample.observation.spin_iterations = spin_iterations;
+                    sample.observation.spin_iterations = _spin_iteration + 1;
                     sample.observation.spin_exit = MvccPublicationSpinExit::FrontierAdvanced;
                 }
 
@@ -668,7 +666,7 @@ impl LsmMvccInner {
         }
         #[cfg(feature = "bench")]
         if let Some(sample) = sample.as_deref_mut() {
-            sample.observation.spin_iterations = spin_iterations;
+            sample.observation.spin_iterations = spin_limit;
             sample.observation.spin_exit = MvccPublicationSpinExit::BudgetExhausted;
         }
         #[cfg(feature = "bench")]
@@ -1081,6 +1079,7 @@ impl LsmMvccInner {
                 MvccPublicationPath::OutOfOrder
             };
         }
+        #[cfg(feature = "bench")]
         let frontier_before_advance = publication.next_to_publish;
         if commit_ts == publication.next_to_publish {
             // Preserve the allocation-free in-order path.
