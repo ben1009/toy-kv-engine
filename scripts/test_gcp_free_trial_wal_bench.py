@@ -19,13 +19,24 @@ import unittest
 from unittest.mock import patch
 
 from gcp_wal_matrix import (
+    COMMIT_ORDER_TRACE_NUM,
+    COMMIT_ORDER_TRACE_WRITERS,
     FULL_DEFAULT_WRITERS,
     LEGACY_DEFAULT_WRITERS,
     build_benchmark_plan,
     build_batch64_schedule,
+    build_commit_order_trace_plan,
+    build_commit_order_trace_schedule,
     build_rfc026_schedule,
+    validate_commit_order_trace_rows,
     validate_batch64_rows,
     validate_rfc026_rows,
+)
+from gcp_commit_order_trace_runner import (
+    TRACE_STAGES,
+    _inversion_count,
+    analyze_trace,
+    summarize_score_pairs,
 )
 from gcp_wal_profile_runner import (
     _expected_frontier_mode_for_arm,
@@ -315,6 +326,16 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
         self.assertTrue(retained_profile.keep_vm_after_run)
         profile_subset = BENCH.parse_args([*common, "--v8-small-ticket-profile", "--writers", "8"])
         self.assertEqual(profile_subset.writers, (8,))
+        trace_args = [
+            *common, "--commit-order-trace", "--num", "100000", "--source-patch-sha256", "a" * 64,
+        ]
+        trace = BENCH.parse_args(trace_args)
+        self.assertEqual(trace.writers, (16,))
+        self.assertEqual(trace.machine_type, "c4-standard-16-lssd")
+        with self.assertRaises(SystemExit):
+            BENCH.parse_args([*trace_args, "--writers", "8"])
+        with self.assertRaises(SystemExit):
+            BENCH.parse_args([*common, "--commit-order-trace", "--num", "100000"])
         with self.assertRaises(SystemExit):
             BENCH.parse_args([*common, "--writers", "2", "2"])
         with self.assertRaises(SystemExit):
@@ -390,6 +411,175 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
         self.assertEqual(profile["runs_planned"], 28)
         self.assertEqual(profile["perf_captures_planned"], 7)
         self.assertTrue(profile["diagnostic_only"])
+
+    def test_commit_order_trace_schedule_is_bounded_and_counterbalanced(self) -> None:
+        schedule = build_commit_order_trace_schedule()
+        self.assertEqual(len(schedule), 12)
+        self.assertEqual(sum(row["phase"] == "trace" for row in schedule), 2)
+        score_rows = [row for row in schedule if row["phase"] == "score"]
+        self.assertEqual(len(score_rows), 10)
+        self.assertTrue(all(row["writer"] == COMMIT_ORDER_TRACE_WRITERS for row in schedule))
+        self.assertTrue(all(row["num"] == COMMIT_ORDER_TRACE_NUM for row in schedule))
+        self.assertEqual(
+            [tuple(row["arm"] for row in score_rows[index:index + 2]) for index in range(0, 10, 2)],
+            [
+                ("v7_parallel", "v8_parallel"),
+                ("v8_parallel", "v7_parallel"),
+                ("v7_parallel", "v8_parallel"),
+                ("v8_parallel", "v7_parallel"),
+                ("v7_parallel", "v8_parallel"),
+            ],
+        )
+        validation = validate_commit_order_trace_rows([{
+            "writer": row["writer"], "workload": row["workload"], "phase": row["phase"],
+            "repetition": row["repetition"], "arm": row["arm"], "ops": row["num"], "exit_code": 0,
+        } for row in schedule])
+        self.assertTrue(validation["complete"])
+        plan = build_commit_order_trace_plan(
+            machine_type="c4-standard-16-lssd",
+            machine_spec={"vcpus": 16, "ssd_count": 2, "ssd_gib": 750},
+        )
+        self.assertEqual(plan["runs_planned"], 12)
+        self.assertEqual(plan["trace_records_per_diagnostic_run"], 1024)
+
+    def test_commit_order_trace_analyzer_counts_stage_inversions_and_pairs(self) -> None:
+        self.assertEqual(_inversion_count([1, 3, 2]), 1)
+        records = []
+        for commit_ts in (1, 2, 3):
+            record = {
+                "commit_ts": commit_ts, "wal_ticket": commit_ts - 1,
+                "frontier_ticket_end": commit_ts,
+            }
+            for stage_index, stage in enumerate(TRACE_STAGES):
+                order = (3 - commit_ts) if stage_index >= 3 else commit_ts
+                record[stage] = {
+                    "monotonic_ns": stage_index * 100_000 + order * 1_000 + commit_ts,
+                    "sequence": commit_ts * 10 + stage_index,
+                    "thread_id": 1,
+                }
+            records.append(record)
+        analysis = analyze_trace({"records": records})
+        self.assertEqual(analysis["complete_records"], 3)
+        self.assertEqual(analysis["pairwise_timestamp_inversions"]["wal_return"]["timestamp_inversion_pairs"], 3)
+        self.assertEqual(analysis["pairwise_timestamp_inversions"]["timestamp_reserved"]["timestamp_inversion_pairs"], 0)
+        self.assertEqual(analysis["pairwise_timestamp_inversions"]["wal_return"]["timestamp_tie_pairs_excluded"], 0)
+
+        tied_records = []
+        for commit_ts in (1, 2, 3):
+            record = {
+                "commit_ts": commit_ts, "wal_ticket": commit_ts - 1,
+                "frontier_ticket_end": commit_ts,
+            }
+            for stage_index, stage in enumerate(TRACE_STAGES):
+                monotonic_ns = 1 if stage == "durable_frontier_published" else stage_index + 1
+                record[stage] = {
+                    "monotonic_ns": monotonic_ns, "sequence": commit_ts * 10 + stage_index, "thread_id": 1,
+                }
+            tied_records.append(record)
+        tied_analysis = analyze_trace({"records": tied_records})
+        frontier_order = tied_analysis["pairwise_timestamp_inversions"]["durable_frontier_published"]
+        self.assertEqual(frontier_order["timestamp_pair_count"], 0)
+        self.assertEqual(frontier_order["timestamp_tie_pairs_excluded"], 3)
+        self.assertIsNone(frontier_order["timestamp_inversion_rate"])
+
+        with self.assertRaisesRegex(ValueError, "incomplete"):
+            analyze_trace({"records": [{"commit_ts": 1}]})
+
+        score_rows = [
+            {"phase": "score", "repetition": 1, "arm": "v7_parallel", "exit_code": 0,
+             "puts_per_second": 100.0, "p99_ms": 1.0, "cpu_seconds": 1.2},
+            {"phase": "score", "repetition": 1, "arm": "v8_parallel", "exit_code": 0,
+             "puts_per_second": 110.0, "p99_ms": 0.9, "cpu_seconds": 1.1},
+        ]
+        paired = summarize_score_pairs(score_rows)
+        self.assertEqual(paired["paired_runs"], 1)
+        self.assertEqual(paired["v8_throughput_wins"], 1)
+        self.assertAlmostEqual(paired["median_paired_change_pct_v8_vs_v7"]["throughput_pct"], 10.0)
+
+    def test_commit_order_trace_result_verifier_checks_trace_and_score_pairs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            results = Path(temp) / "results"
+            results.mkdir()
+            schedule = build_commit_order_trace_schedule()
+            plan = build_commit_order_trace_plan(
+                machine_type="c4-standard-16-lssd",
+                machine_spec={"vcpus": 16, "ssd_count": 2, "ssd_gib": 750},
+                commit="a" * 40,
+                binary_sha256="b" * 64,
+                source_patch_sha256="c" * 64,
+            )
+            (results / "benchmark-plan.json").write_text(json.dumps(plan), encoding="utf-8")
+            (results / "source-patch.sha256").write_text("c" * 64 + "\n", encoding="utf-8")
+            (results / "write-perf.sha256").write_text("b" * 64 + "\n", encoding="utf-8")
+            summary_rows = []
+            for item in schedule:
+                run_id = BENCH._run_identifier(item, "commit-order-trace")
+                run_dir = results / run_id
+                run_dir.mkdir()
+                version = 7 if item["arm"] == "v7_parallel" else 8
+                trace = None
+                if item["trace_limit"]:
+                    trace = {
+                        "limit": item["trace_limit"], "selected_records": item["trace_limit"],
+                        "dropped_records": 0, "dropped_frontier_events": 0, "incomplete_records": 0,
+                        "records": [{
+                            "commit_ts": value, "wal_ticket": value, "frontier_ticket_end": value + 1,
+                            **{
+                                stage: {"sequence": value + index, "monotonic_ns": value + index, "thread_id": 1}
+                                for index, stage in enumerate(TRACE_STAGES)
+                            },
+                        } for value in range(1, item["trace_limit"] + 1)],
+                    }
+                record = {
+                    "params": {
+                        "num": COMMIT_ORDER_TRACE_NUM, "threads": COMMIT_ORDER_TRACE_WRITERS,
+                        "value_size": 1024, "wal_format_version": version, "wal_io_mode": "parallel",
+                    },
+                    "result": {
+                        "ops": COMMIT_ORDER_TRACE_NUM,
+                        "wal_pipeline": {"commit_order_trace": trace},
+                    },
+                }
+                row = {
+                    **{key: item[key] for key in (
+                        "writer", "workload", "phase", "repetition", "arm", "trace_limit",
+                    )},
+                    "exit_code": 0, "ops": COMMIT_ORDER_TRACE_NUM,
+                }
+                summary_rows.append(row)
+                (run_dir / "result.json").write_text(json.dumps(record), encoding="utf-8")
+                (run_dir / "run-metadata.json").write_text(json.dumps(row), encoding="utf-8")
+
+            validation = validate_commit_order_trace_rows(summary_rows)
+            score_comparison = summarize_score_pairs([
+                {**row, "puts_per_second": 1.0, "p99_ms": 1.0, "cpu_seconds": 1.0}
+                for row in summary_rows if row["phase"] == "score"
+            ])
+            (results / "summary.json").write_text(json.dumps({
+                "suite": "commit-order-trace", "complete": True,
+                "runs_planned": len(schedule), "runs_completed": len(schedule),
+                "source_commit": "a" * 40, "source_patch_sha256": "c" * 64,
+                "binary_sha256": "b" * 64, "trace_analysis": {}, "score_comparison": score_comparison,
+                "matrix_validation": validation, "results": summary_rows,
+            }), encoding="utf-8")
+            (results / "commit-order-trace-analysis.json").write_text(json.dumps({
+                "commit": "a" * 40, "source_patch_sha256": "c" * 64,
+                "binary_sha256": "b" * 64, "traced_runs": {}, "score_comparison": score_comparison,
+            }), encoding="utf-8")
+            (results / "remote-exit.json").write_text(json.dumps({
+                "failed": False, "runs_started": len(schedule),
+            }), encoding="utf-8")
+            self.assertTrue(BENCH._verify_result_set(results)["verified"])
+
+            trace_run = next(item for item in schedule if item["trace_limit"])
+            run_id = BENCH._run_identifier(trace_run, "commit-order-trace")
+            result_path = results / run_id / "result.json"
+            record = json.loads(result_path.read_text(encoding="utf-8"))
+            record["result"]["wal_pipeline"]["commit_order_trace"]["dropped_frontier_events"] = 1
+            result_path.write_text(json.dumps(record), encoding="utf-8")
+            rejected = BENCH._verify_result_set(results)
+            self.assertFalse(rejected["verified"])
+            self.assertTrue(any("dropped or incomplete" in error for error in rejected["errors"]))
 
     def test_small_ticket_profile_schedule_and_completeness_validation(self) -> None:
         schedule = build_profile_schedule((1, 8, 16))
@@ -1247,7 +1437,8 @@ print('[hotpath] diagnostic report follows')
                 project="test-project", zone="us-central1-a", network="walbench-net", subnet="walbench-subnet",
                 ssh_source_range="203.0.113.10/32", max_runtime_minutes=60, commit="a" * 40, num=64,
                 machine_type=BENCH.MACHINE_TYPE, writers=(16,), full_rfc026_matrix=True,
-                v8_small_ticket_profile=False, keep_vm_after_run=False,
+                v8_small_ticket_profile=False, commit_order_trace=False, source_patch_sha256=None,
+                keep_vm_after_run=False,
             )
             gcloud = ProvisionGcloud()
             successful_ssh = subprocess.CompletedProcess([], 0, "", "")
@@ -1273,7 +1464,7 @@ print('[hotpath] diagnostic report follows')
                 patch.object(BENCH, "ssh_command", side_effect=ssh),
                 patch.object(BENCH, "scp_to_vm", return_value=successful_ssh),
                 patch.object(BENCH, "collect_artifacts", side_effect=fail_collection),
-                patch.object(BENCH, "cleanup_gcp_resources") as cleanup,
+                patch.object(BENCH, "cleanup_gcp_resources", return_value=([], {}, False)) as cleanup,
             ):
                 result = BENCH.provision_and_run(
                     args, gcloud, results, {"boot_image": {"name": "pinned-image"}}
@@ -1296,7 +1487,8 @@ print('[hotpath] diagnostic report follows')
                 project="test-project", zone="us-central1-a", network="walbench-net", subnet="walbench-subnet",
                 ssh_source_range="203.0.113.10/32", max_runtime_minutes=60, commit="a" * 40, num=64,
                 machine_type=BENCH.MACHINE_TYPE, writers=(16,), full_rfc026_matrix=True,
-                v8_small_ticket_profile=False, keep_vm_after_run=False,
+                v8_small_ticket_profile=False, commit_order_trace=False, source_patch_sha256=None,
+                keep_vm_after_run=False,
             )
             gcloud = ProvisionGcloud()
             successful_ssh = subprocess.CompletedProcess([], 0, "", "")
@@ -1321,7 +1513,7 @@ print('[hotpath] diagnostic report follows')
                 patch.object(BENCH, "scp_to_vm", return_value=successful_ssh),
                 patch.object(BENCH, "collect_artifacts", side_effect=fail_collection),
                 patch.object(BENCH, "retained_vm_reconnect_instructions", side_effect=OSError("disk full")),
-                patch.object(BENCH, "cleanup_gcp_resources") as cleanup,
+                patch.object(BENCH, "cleanup_gcp_resources", return_value=([], {}, False)) as cleanup,
             ):
                 result = BENCH.provision_and_run(
                     args, gcloud, results, {"boot_image": {"name": "pinned-image"}}

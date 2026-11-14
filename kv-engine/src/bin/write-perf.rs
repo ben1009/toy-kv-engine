@@ -306,6 +306,10 @@ struct Args {
     /// data.
     #[arg(long)]
     mvcc_publication_sample_every: Option<u64>,
+    /// Capture all commit-order stages for the first bounded number of Point puts.
+    /// Requires a bench build, PITR, and a Linux target.
+    #[arg(long, requires = "pitr")]
+    commit_order_trace_limit: Option<u64>,
     #[arg(long)]
     vlog: bool,
     #[arg(long)]
@@ -391,6 +395,7 @@ struct HarnessConfig {
     wal_completion_timeline: bool,
     wal_v8_durability_sample_every: Option<u64>,
     mvcc_publication_sample_every: Option<u64>,
+    commit_order_trace_limit: Option<u64>,
     vlog_override: bool,
     profile: bool,
     pitr: bool,
@@ -510,6 +515,7 @@ impl HarnessConfig {
             wal_completion_timeline: args.wal_completion_timeline,
             wal_v8_durability_sample_every: args.wal_v8_durability_sample_every,
             mvcc_publication_sample_every: args.mvcc_publication_sample_every,
+            commit_order_trace_limit: args.commit_order_trace_limit,
             vlog_override: args.vlog,
             profile: args.profile,
             pitr: args.pitr,
@@ -1128,6 +1134,8 @@ struct WalPipelineRecord {
     v8_durability_diagnostics: Option<WalV8DurabilityDiagnosticsRunRecord>,
     #[serde(skip_serializing_if = "Option::is_none")]
     mvcc_publication_diagnostics: Option<MvccPublicationDiagnosticsRunRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    commit_order_trace: Option<CommitOrderTraceRunRecord>,
     v8_data_submit_hol_episodes: u64,
     v8_data_submit_hol_wait_ns: u64,
     v8_data_submit_hol_successor_ticket_wait_ns: u64,
@@ -1256,6 +1264,37 @@ struct MvccPublicationRecord {
     condvar_wait_cpu_ns: u64,
     total_wall_ns: u64,
     total_thread_cpu_ns: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+struct CommitOrderTraceRunRecord {
+    limit: u64,
+    selected_records: u64,
+    dropped_records: u64,
+    dropped_frontier_events: u64,
+    incomplete_records: u64,
+    records: Vec<CommitOrderTraceRecord>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
+struct CommitOrderTraceRecord {
+    commit_ts: u64,
+    wal_ticket: Option<u64>,
+    frontier_ticket_end: Option<u64>,
+    timestamp_reserved: Option<CommitOrderTraceEventRecord>,
+    wal_ticket_admitted: Option<CommitOrderTraceEventRecord>,
+    durable_frontier_published: Option<CommitOrderTraceEventRecord>,
+    wal_return: Option<CommitOrderTraceEventRecord>,
+    memtable_publish_complete: Option<CommitOrderTraceEventRecord>,
+    mvcc_publication_entry: Option<CommitOrderTraceEventRecord>,
+    mvcc_publication_complete: Option<CommitOrderTraceEventRecord>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
+struct CommitOrderTraceEventRecord {
+    sequence: u64,
+    monotonic_ns: u64,
+    thread_id: u64,
 }
 
 #[cfg(feature = "bench")]
@@ -1525,6 +1564,35 @@ impl From<kv_engine_wrapper::mem_table::WalV8AckObservation> for WalV8AckRecord 
             memtable_publish_wall_ns: observation.memtable_publish_wall_ns,
             mvcc_publish_commit_ts_ns: observation.mvcc_publish_commit_ts_ns,
             wal_return_to_put_return_ns: observation.wal_return_to_put_return_ns,
+        }
+    }
+}
+
+#[cfg(feature = "bench")]
+impl From<kv_engine_wrapper::mem_table::CommitOrderTraceEvent> for CommitOrderTraceEventRecord {
+    fn from(event: kv_engine_wrapper::mem_table::CommitOrderTraceEvent) -> Self {
+        Self {
+            sequence: event.sequence,
+            monotonic_ns: event.monotonic_ns,
+            thread_id: event.thread_id,
+        }
+    }
+}
+
+#[cfg(feature = "bench")]
+impl From<kv_engine_wrapper::mem_table::CommitOrderTraceObservation> for CommitOrderTraceRecord {
+    fn from(observation: kv_engine_wrapper::mem_table::CommitOrderTraceObservation) -> Self {
+        Self {
+            commit_ts: observation.commit_ts,
+            wal_ticket: observation.wal_ticket,
+            frontier_ticket_end: observation.frontier_ticket_end,
+            timestamp_reserved: observation.timestamp_reserved.map(Into::into),
+            wal_ticket_admitted: observation.wal_ticket_admitted.map(Into::into),
+            durable_frontier_published: observation.durable_frontier_published.map(Into::into),
+            wal_return: observation.wal_return.map(Into::into),
+            memtable_publish_complete: observation.memtable_publish_complete.map(Into::into),
+            mvcc_publication_entry: observation.mvcc_publication_entry.map(Into::into),
+            mvcc_publication_complete: observation.mvcc_publication_complete.map(Into::into),
         }
     }
 }
@@ -1842,6 +1910,20 @@ fn wal_pipeline_record(
             thread_cpu_time_supported: cfg!(target_os = "linux"),
             samples: diagnostics.samples.into_iter().map(Into::into).collect(),
         });
+    let commit_order_trace_snapshot = engine.commit_order_trace_snapshot();
+    let commit_order_trace =
+        (commit_order_trace_snapshot.limit > 0).then(|| CommitOrderTraceRunRecord {
+            limit: commit_order_trace_snapshot.limit,
+            selected_records: commit_order_trace_snapshot.selected_records,
+            dropped_records: commit_order_trace_snapshot.dropped_records,
+            dropped_frontier_events: commit_order_trace_snapshot.dropped_frontier_events,
+            incomplete_records: commit_order_trace_snapshot.incomplete_records,
+            records: commit_order_trace_snapshot
+                .records
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+        });
 
     Ok(Some(WalPipelineRecord {
         commit_groups: profile.wal_commit_groups,
@@ -1862,6 +1944,7 @@ fn wal_pipeline_record(
         v8_completion_timeline,
         v8_durability_diagnostics,
         mvcc_publication_diagnostics,
+        commit_order_trace,
         v8_data_submit_hol_episodes: profile.wal_v8_data_submit_hol_episodes,
         v8_data_submit_hol_wait_ns: profile.wal_v8_data_submit_hol_wait_ns,
         v8_data_submit_hol_successor_ticket_wait_ns: profile
@@ -4802,6 +4885,7 @@ fn run_wal_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
     {
         engine.reset_write_profile();
         engine.set_mvcc_publication_sample_every(cfg.mvcc_publication_sample_every)?;
+        engine.set_commit_order_trace_limit(cfg.commit_order_trace_limit)?;
         engine.set_wal_sync_diagnostics_enabled(
             (cfg.profile || cfg.wal_sync_diagnostics) && wal_run_info.runtime_counters_available(),
         )?;
@@ -5027,6 +5111,7 @@ fn run_wal_batch_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>
     {
         engine.reset_write_profile();
         engine.set_mvcc_publication_sample_every(cfg.mvcc_publication_sample_every)?;
+        engine.set_commit_order_trace_limit(cfg.commit_order_trace_limit)?;
         engine.set_wal_sync_diagnostics_enabled(
             (cfg.profile || cfg.wal_sync_diagnostics) && wal_run_info.runtime_counters_available(),
         )?;
@@ -9952,6 +10037,34 @@ fn validate_config(cfg: &HarnessConfig) -> Result<()> {
             "--mvcc-publication-sample-every requires a bench build"
         );
     }
+    if let Some(limit) = cfg.commit_order_trace_limit {
+        anyhow::ensure!(
+            limit > 0
+                && limit
+                    <= kv_engine_wrapper::mem_table::WriteProfile::MAX_COMMIT_ORDER_TRACE_RECORDS,
+            "--commit-order-trace-limit must be between 1 and the bounded record cap"
+        );
+        anyhow::ensure!(
+            cfg!(feature = "bench"),
+            "--commit-order-trace-limit requires a bench build"
+        );
+        anyhow::ensure!(
+            cfg!(target_os = "linux"),
+            "--commit-order-trace-limit requires Linux"
+        );
+        anyhow::ensure!(cfg.pitr, "--commit-order-trace-limit requires PITR");
+        anyhow::ensure!(
+            matches!(
+                cfg.pitr_format.unwrap_or(PitrFormatArg::V8),
+                PitrFormatArg::V7 | PitrFormatArg::V8
+            ),
+            "--commit-order-trace-limit requires PITR V7 or V8"
+        );
+        anyhow::ensure!(
+            cfg.wal_io_mode == WalIoModeArg::Parallel,
+            "--commit-order-trace-limit requires parallel WAL I/O"
+        );
+    }
     if cfg.prepare_golden || cfg.golden_path.is_some() || cfg.clone_golden {
         anyhow::ensure!(
             cfg.suite == Suite::SteadyState,
@@ -10628,6 +10741,78 @@ mod tests {
         );
         assert!(
             Args::try_parse_from(["write-perf", "--wal-v8-durability-sample-every", "64"]).is_err()
+        );
+    }
+
+    #[test]
+    fn commit_order_trace_requires_bench_linux_and_parallel_pitr() {
+        let parallel = HarnessConfig::from_args(
+            Args::try_parse_from([
+                "write-perf",
+                "--pitr",
+                "--pitr-format",
+                "v8",
+                "--wal-io-mode",
+                "parallel",
+                "--commit-order-trace-limit",
+                "128",
+            ])
+            .expect("parse commit-order trace option"),
+        );
+        let parallel_result = validate_config(&parallel);
+        if cfg!(all(feature = "bench", target_os = "linux")) {
+            parallel_result.expect("Linux bench build can trace parallel PITR writes");
+        } else {
+            let error = parallel_result.unwrap_err().to_string();
+            let expected = if cfg!(feature = "bench") {
+                "requires Linux"
+            } else {
+                "requires a bench build"
+            };
+            assert!(error.contains(expected), "{error}");
+        }
+
+        let leader = HarnessConfig::from_args(
+            Args::try_parse_from([
+                "write-perf",
+                "--pitr",
+                "--pitr-format",
+                "v8",
+                "--wal-io-mode",
+                "leader",
+                "--commit-order-trace-limit",
+                "128",
+            ])
+            .expect("parse incompatible Leader trace option"),
+        );
+        let error = validate_config(&leader).unwrap_err().to_string();
+        let expected = if !cfg!(feature = "bench") {
+            "requires a bench build"
+        } else if !cfg!(target_os = "linux") {
+            "requires Linux"
+        } else {
+            "requires parallel WAL I/O"
+        };
+        assert!(error.contains(expected), "{error}");
+
+        let zero_limit = HarnessConfig::from_args(
+            Args::try_parse_from([
+                "write-perf",
+                "--pitr",
+                "--pitr-format",
+                "v7",
+                "--wal-io-mode",
+                "parallel",
+                "--commit-order-trace-limit",
+                "0",
+            ])
+            .expect("parse zero trace limit for validation"),
+        );
+        assert!(
+            validate_config(&zero_limit)
+                .unwrap_err()
+                .to_string()
+                .contains("between 1 and the bounded record cap")
         );
     }
 
@@ -11832,6 +12017,7 @@ mod tests {
             wal_completion_timeline: false,
             wal_v8_durability_sample_every: None,
             mvcc_publication_sample_every: None,
+            commit_order_trace_limit: None,
             vlog_override: false,
             profile: true,
             clients: 1,
@@ -14373,6 +14559,7 @@ mod tests {
             wal_completion_timeline: false,
             wal_v8_durability_sample_every: None,
             mvcc_publication_sample_every: None,
+            commit_order_trace_limit: None,
             vlog_override: false,
             profile: false,
             clients: 1,

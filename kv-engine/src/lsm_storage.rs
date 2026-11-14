@@ -10095,6 +10095,35 @@ impl KvEngine {
     }
 
     #[cfg(feature = "bench")]
+    /// Capture a bounded, per-Put event trace from commit timestamp reservation through MVCC
+    /// publication. The trace records the first `limit` reservations after it is enabled.
+    /// Passing `None` disables tracing and clears retained records.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the record limit exceeds the hard cap or tracing is requested on a
+    /// non-Linux target.
+    pub fn set_commit_order_trace_limit(&self, limit: Option<u64>) -> Result<()> {
+        let limit = limit.unwrap_or_default();
+        anyhow::ensure!(
+            limit <= crate::mem_table::WriteProfile::MAX_COMMIT_ORDER_TRACE_RECORDS,
+            "commit-order trace limit exceeds the bounded record cap"
+        );
+        #[cfg(not(target_os = "linux"))]
+        anyhow::ensure!(limit == 0, "commit-order tracing requires Linux");
+
+        self.inner.write_profile.configure_commit_order_trace(limit);
+
+        Ok(())
+    }
+
+    #[cfg(feature = "bench")]
+    /// Snapshot the bounded cross-stage commit-order trace.
+    pub fn commit_order_trace_snapshot(&self) -> crate::mem_table::CommitOrderTraceSnapshot {
+        self.inner.write_profile.commit_order_trace_snapshot()
+    }
+
+    #[cfg(feature = "bench")]
     /// Snapshot bounded samples from synchronous MVCC publication.
     pub fn mvcc_publication_diagnostics(
         &self,
@@ -19361,6 +19390,12 @@ impl LsmStorageInner {
                     .map_or(0, |(commit_ts, _, _)| *commit_ts),
             )?;
             #[cfg(feature = "bench")]
+            if let (Some(ticket), Some((commit_ts, _, _))) = (ticket, publish_data.as_ref()) {
+                memtable
+                    .write_profile()
+                    .record_commit_order_wal_return(*commit_ts, ticket);
+            }
+            #[cfg(feature = "bench")]
             if let (Some(ticket), Some(durable_published_at)) = (ticket, durable_published_at) {
                 ack_timing.wal_return_at = Some(std::time::Instant::now());
                 ack_timing.observation = Some(crate::mem_table::WalV8AckObservation {
@@ -19404,6 +19439,10 @@ impl LsmStorageInner {
                     )])?;
                 }
                 #[cfg(feature = "bench")]
+                memtable
+                    .write_profile()
+                    .record_commit_order_memtable_publish_complete(commit_ts);
+                #[cfg(feature = "bench")]
                 if let (Some(started), Some(observation)) =
                     (publish_started, ack_timing.observation.as_mut())
                 {
@@ -19423,11 +19462,19 @@ impl LsmStorageInner {
                     && let Some(ref mvcc) = self.mvcc
                 {
                     #[cfg(feature = "bench")]
+                    memtable
+                        .write_profile()
+                        .record_commit_order_mvcc_publication_entry(commit_ts);
+                    #[cfg(feature = "bench")]
                     let publish_commit_started = ack_timing
                         .observation
                         .is_some()
                         .then(std::time::Instant::now);
                     mvcc.publish_commit_ts(commit_ts)?;
+                    #[cfg(feature = "bench")]
+                    memtable
+                        .write_profile()
+                        .record_commit_order_mvcc_publication_complete(commit_ts);
                     #[cfg(feature = "bench")]
                     if let (Some(started), Some(observation)) =
                         (publish_commit_started, ack_timing.observation.as_mut())

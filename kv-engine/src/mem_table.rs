@@ -308,6 +308,19 @@ pub struct WriteProfile {
     wal_v8_follower_waits: Mutex<Vec<WalV8FollowerWaitObservation>>,
     #[cfg(feature = "bench")]
     wal_v8_follower_wait_dropped_samples: AtomicU64,
+    /// Remaining reservations in the bounded Point-write ordering trace.
+    #[cfg(feature = "bench")]
+    commit_order_trace_remaining: AtomicU64,
+    #[cfg(feature = "bench")]
+    commit_order_trace_accepting: AtomicBool,
+    #[cfg(feature = "bench")]
+    commit_order_trace_cutoff_commit_ts: AtomicU64,
+    #[cfg(feature = "bench")]
+    commit_order_trace_limit: AtomicU64,
+    #[cfg(feature = "bench")]
+    commit_order_trace_dropped_records: AtomicU64,
+    #[cfg(feature = "bench")]
+    commit_order_trace: Mutex<CommitOrderTraceState>,
 }
 
 /// One logical `fdatasync` call and the WAL progress observed while it ran.
@@ -461,6 +474,98 @@ pub struct WalV8AckObservation {
     pub wal_return_to_put_return_ns: u64,
 }
 
+/// One event in a bounded Point-write ordering trace.
+#[cfg(feature = "bench")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CommitOrderTraceEvent {
+    /// Recorder order, used only to break equal-timestamp ties.
+    pub sequence: u64,
+    pub monotonic_ns: u64,
+    pub thread_id: u64,
+}
+
+/// Cross-stage events associated with one commit timestamp and WAL ticket.
+#[cfg(feature = "bench")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CommitOrderTraceObservation {
+    pub commit_ts: u64,
+    pub wal_ticket: Option<u64>,
+    pub frontier_ticket_end: Option<u64>,
+    pub timestamp_reserved: Option<CommitOrderTraceEvent>,
+    pub wal_ticket_admitted: Option<CommitOrderTraceEvent>,
+    pub durable_frontier_published: Option<CommitOrderTraceEvent>,
+    pub wal_return: Option<CommitOrderTraceEvent>,
+    pub memtable_publish_complete: Option<CommitOrderTraceEvent>,
+    pub mvcc_publication_entry: Option<CommitOrderTraceEvent>,
+    pub mvcc_publication_complete: Option<CommitOrderTraceEvent>,
+}
+
+/// Bounded snapshot of cross-stage Point-write ordering events.
+#[cfg(feature = "bench")]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CommitOrderTraceSnapshot {
+    pub limit: u64,
+    pub selected_records: u64,
+    pub dropped_records: u64,
+    pub dropped_frontier_events: u64,
+    pub incomplete_records: u64,
+    pub records: Vec<CommitOrderTraceObservation>,
+}
+
+#[cfg(feature = "bench")]
+#[derive(Default)]
+struct CommitOrderTraceState {
+    next_event_sequence: u64,
+    records: std::collections::BTreeMap<u64, CommitOrderTraceObservation>,
+    ticket_to_commit_ts: std::collections::BTreeMap<u64, u64>,
+    durable_frontier_events: Vec<(u64, u64, CommitOrderTraceEvent)>,
+    dropped_frontier_events: u64,
+}
+
+#[cfg(feature = "bench")]
+impl CommitOrderTraceState {
+    fn next_event(&mut self, monotonic_ns: u64, thread_id: u64) -> CommitOrderTraceEvent {
+        self.next_event_sequence = self.next_event_sequence.saturating_add(1);
+
+        CommitOrderTraceEvent {
+            sequence: self.next_event_sequence,
+            monotonic_ns,
+            thread_id,
+        }
+    }
+}
+
+#[cfg(all(feature = "bench", target_os = "linux"))]
+fn benchmark_monotonic_ns() -> u64 {
+    let mut timestamp = std::mem::MaybeUninit::<libc::timespec>::uninit();
+    // SAFETY: `timestamp` points to writable storage for `clock_gettime`.
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, timestamp.as_mut_ptr()) } != 0 {
+        return 0;
+    }
+
+    // SAFETY: `clock_gettime` initialized the timestamp after returning zero.
+    let timestamp = unsafe { timestamp.assume_init() };
+    (timestamp.tv_sec as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(timestamp.tv_nsec as u64)
+}
+
+#[cfg(all(feature = "bench", target_os = "linux"))]
+fn benchmark_thread_id() -> u64 {
+    // SAFETY: `gettid` takes no pointer arguments and returns the calling thread ID.
+    unsafe { libc::syscall(libc::SYS_gettid) as u64 }
+}
+
+#[cfg(all(feature = "bench", not(target_os = "linux")))]
+fn benchmark_monotonic_ns() -> u64 {
+    0
+}
+
+#[cfg(all(feature = "bench", not(target_os = "linux")))]
+fn benchmark_thread_id() -> u64 {
+    0
+}
+
 /// Aggregate counters for one opt-in V8 durability sampling run.
 #[cfg(feature = "bench")]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -496,6 +601,259 @@ pub struct WalV8FollowerWaitObservation {
 }
 
 impl WriteProfile {
+    /// Hard limit for opt-in commit-order trace records retained by a benchmark run.
+    pub const MAX_COMMIT_ORDER_TRACE_RECORDS: u64 = 16_384;
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn configure_commit_order_trace(&self, limit: u64) {
+        self.commit_order_trace_accepting
+            .store(false, std::sync::atomic::Ordering::Release);
+        let mut trace = self.commit_order_trace.lock();
+        trace.next_event_sequence = 0;
+        trace.records.clear();
+        trace.ticket_to_commit_ts.clear();
+        trace.durable_frontier_events.clear();
+        trace.dropped_frontier_events = 0;
+        self.commit_order_trace_dropped_records
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.commit_order_trace_cutoff_commit_ts
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.commit_order_trace_limit
+            .store(limit, std::sync::atomic::Ordering::Relaxed);
+        self.commit_order_trace_remaining
+            .store(limit, std::sync::atomic::Ordering::Relaxed);
+        self.commit_order_trace_accepting
+            .store(limit > 0, std::sync::atomic::Ordering::Release);
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn record_commit_order_timestamp_reserved(&self, commit_ts: u64) {
+        if !self
+            .commit_order_trace_accepting
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return;
+        }
+
+        let remaining = match self.commit_order_trace_remaining.fetch_update(
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+            |remaining| remaining.checked_sub(1),
+        ) {
+            std::result::Result::Ok(remaining) => remaining,
+            std::result::Result::Err(_) => {
+                self.commit_order_trace_accepting
+                    .store(false, std::sync::atomic::Ordering::Release);
+                return;
+            }
+        };
+
+        let monotonic_ns = benchmark_monotonic_ns();
+        let thread_id = benchmark_thread_id();
+        let mut trace = self.commit_order_trace.lock();
+        let event = trace.next_event(monotonic_ns, thread_id);
+        let observation = CommitOrderTraceObservation {
+            commit_ts,
+            timestamp_reserved: Some(event),
+            ..CommitOrderTraceObservation::default()
+        };
+        if trace.records.insert(commit_ts, observation).is_some() {
+            self.commit_order_trace_dropped_records
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.commit_order_trace_cutoff_commit_ts
+            .fetch_max(commit_ts, std::sync::atomic::Ordering::Release);
+        if remaining == 1 {
+            self.commit_order_trace_accepting
+                .store(false, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn record_commit_order_ticket_admitted(&self, commit_ts: u64, ticket: u64) {
+        if !self.commit_order_trace_contains(commit_ts) {
+            return;
+        }
+
+        let monotonic_ns = benchmark_monotonic_ns();
+        let thread_id = benchmark_thread_id();
+        let mut trace = self.commit_order_trace.lock();
+        let event = trace.next_event(monotonic_ns, thread_id);
+        let durable_event = trace
+            .durable_frontier_events
+            .iter()
+            .find(|(ticket_start, ticket_end, _)| *ticket_start <= ticket && ticket < *ticket_end)
+            .map(|(_, ticket_end, durable_event)| (*ticket_end, *durable_event));
+        if let Some(observation) = trace.records.get_mut(&commit_ts) {
+            observation.wal_ticket = Some(ticket);
+            observation.wal_ticket_admitted = Some(event);
+            if let Some((ticket_end, durable_event)) = durable_event {
+                observation.frontier_ticket_end = Some(ticket_end);
+                observation.durable_frontier_published = Some(durable_event);
+            }
+            trace.ticket_to_commit_ts.insert(ticket, commit_ts);
+        }
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn record_commit_order_wal_return(&self, commit_ts: u64, ticket: u64) {
+        if !self.commit_order_trace_contains(commit_ts) {
+            return;
+        }
+
+        let monotonic_ns = benchmark_monotonic_ns();
+        let thread_id = benchmark_thread_id();
+        let mut trace = self.commit_order_trace.lock();
+        let event = trace.next_event(monotonic_ns, thread_id);
+        if let Some(observation) = trace.records.get_mut(&commit_ts)
+            && observation.wal_ticket == Some(ticket)
+        {
+            observation.wal_return = Some(event);
+        }
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn record_commit_order_memtable_publish_complete(&self, commit_ts: u64) {
+        self.record_commit_order_stage(commit_ts, |observation, event| {
+            observation.memtable_publish_complete = Some(event);
+        });
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn record_commit_order_mvcc_publication_entry(&self, commit_ts: u64) {
+        self.record_commit_order_stage(commit_ts, |observation, event| {
+            observation.mvcc_publication_entry = Some(event);
+        });
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn record_commit_order_mvcc_publication_complete(&self, commit_ts: u64) {
+        self.record_commit_order_stage(commit_ts, |observation, event| {
+            observation.mvcc_publication_complete = Some(event);
+        });
+    }
+
+    #[cfg(feature = "bench")]
+    fn record_commit_order_stage(
+        &self,
+        commit_ts: u64,
+        update: impl FnOnce(&mut CommitOrderTraceObservation, CommitOrderTraceEvent),
+    ) {
+        if !self.commit_order_trace_contains(commit_ts) {
+            return;
+        }
+
+        let monotonic_ns = benchmark_monotonic_ns();
+        let thread_id = benchmark_thread_id();
+        let mut trace = self.commit_order_trace.lock();
+        let event = trace.next_event(monotonic_ns, thread_id);
+        if let Some(observation) = trace.records.get_mut(&commit_ts) {
+            update(observation, event);
+        }
+    }
+
+    #[cfg(feature = "bench")]
+    fn commit_order_trace_contains(&self, commit_ts: u64) -> bool {
+        let cutoff = self
+            .commit_order_trace_cutoff_commit_ts
+            .load(std::sync::atomic::Ordering::Acquire);
+
+        commit_ts > 0
+            && commit_ts <= cutoff
+            && self
+                .commit_order_trace_limit
+                .load(std::sync::atomic::Ordering::Relaxed)
+                > 0
+    }
+
+    /// Record the durable frontier transition before waking WAL waiters.
+    #[cfg(feature = "bench")]
+    pub(crate) fn record_commit_order_frontier_published(
+        &self,
+        ticket_start: u64,
+        ticket_end: u64,
+    ) {
+        if ticket_start >= ticket_end
+            || self
+                .commit_order_trace_limit
+                .load(std::sync::atomic::Ordering::Relaxed)
+                == 0
+        {
+            return;
+        }
+
+        let monotonic_ns = benchmark_monotonic_ns();
+        let thread_id = benchmark_thread_id();
+        let mut trace = self.commit_order_trace.lock();
+        let has_mapped_ticket = trace
+            .ticket_to_commit_ts
+            .range(ticket_start..ticket_end)
+            .next()
+            .is_some();
+        let has_unadmitted_record = trace
+            .records
+            .values()
+            .any(|record| record.wal_ticket.is_none());
+        if !has_mapped_ticket && !has_unadmitted_record {
+            return;
+        }
+
+        let event = trace.next_event(monotonic_ns, thread_id);
+        if has_unadmitted_record {
+            if trace.durable_frontier_events.len() < Self::MAX_COMMIT_ORDER_TRACE_RECORDS as usize {
+                trace
+                    .durable_frontier_events
+                    .push((ticket_start, ticket_end, event));
+            } else {
+                trace.dropped_frontier_events = trace.dropped_frontier_events.saturating_add(1);
+            }
+        }
+        let CommitOrderTraceState {
+            records,
+            ticket_to_commit_ts,
+            ..
+        } = &mut *trace;
+        for (_, commit_ts) in ticket_to_commit_ts.range(ticket_start..ticket_end) {
+            if let Some(observation) = records.get_mut(commit_ts)
+                && observation.durable_frontier_published.is_none()
+            {
+                observation.frontier_ticket_end = Some(ticket_end);
+                observation.durable_frontier_published = Some(event);
+            }
+        }
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn commit_order_trace_snapshot(&self) -> CommitOrderTraceSnapshot {
+        let trace = self.commit_order_trace.lock();
+        let records = trace.records.values().copied().collect::<Vec<_>>();
+        let incomplete_records = records
+            .iter()
+            .filter(|observation| {
+                observation.timestamp_reserved.is_none()
+                    || observation.wal_ticket_admitted.is_none()
+                    || observation.durable_frontier_published.is_none()
+                    || observation.wal_return.is_none()
+                    || observation.memtable_publish_complete.is_none()
+                    || observation.mvcc_publication_entry.is_none()
+                    || observation.mvcc_publication_complete.is_none()
+            })
+            .count() as u64;
+
+        CommitOrderTraceSnapshot {
+            limit: self
+                .commit_order_trace_limit
+                .load(std::sync::atomic::Ordering::Relaxed),
+            selected_records: records.len() as u64,
+            dropped_records: self
+                .commit_order_trace_dropped_records
+                .load(std::sync::atomic::Ordering::Relaxed),
+            dropped_frontier_events: trace.dropped_frontier_events,
+            incomplete_records,
+            records,
+        }
+    }
+
     #[cfg(feature = "bench")]
     pub(crate) fn reset(&self) {
         let o = std::sync::atomic::Ordering::Relaxed;
@@ -547,6 +905,7 @@ impl WriteProfile {
             self.wal_v8_ack_dropped_samples.store(0, o);
             self.wal_v8_follower_waits.lock().clear();
             self.wal_v8_follower_wait_dropped_samples.store(0, o);
+            self.configure_commit_order_trace(0);
         }
         self.wal_worker_eventfd_notifications.store(0, o);
         self.wal_worker_eventfd_writes.store(0, o);
@@ -4890,6 +5249,79 @@ mod tests {
         assert_eq!(counts.completed_advances, 2);
         assert_eq!(counts.sampled_advances, 0);
         assert_eq!(counts.dropped_samples, 0);
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn commit_order_trace_is_bounded_and_associates_durable_tickets() {
+        let profile = super::WriteProfile::default();
+        profile.configure_commit_order_trace(2);
+
+        profile.record_commit_order_timestamp_reserved(10);
+        profile.record_commit_order_timestamp_reserved(11);
+        profile.record_commit_order_timestamp_reserved(12);
+
+        profile.record_commit_order_ticket_admitted(10, 4);
+        profile.record_commit_order_ticket_admitted(11, 5);
+        profile.record_commit_order_frontier_published(4, 5);
+        profile.record_commit_order_wal_return(10, 4);
+        profile.record_commit_order_memtable_publish_complete(10);
+        profile.record_commit_order_mvcc_publication_entry(10);
+        profile.record_commit_order_mvcc_publication_complete(10);
+
+        let snapshot = profile.commit_order_trace_snapshot();
+        assert_eq!(snapshot.limit, 2);
+        assert_eq!(snapshot.selected_records, 2);
+        assert_eq!(snapshot.dropped_records, 0);
+        assert_eq!(snapshot.dropped_frontier_events, 0);
+        assert_eq!(snapshot.incomplete_records, 1);
+        assert_eq!(snapshot.records.len(), 2);
+
+        let complete = &snapshot.records[0];
+        assert_eq!(complete.commit_ts, 10);
+        assert_eq!(complete.wal_ticket, Some(4));
+        assert_eq!(complete.frontier_ticket_end, Some(5));
+        let reserved = complete.timestamp_reserved.unwrap();
+        let admitted = complete.wal_ticket_admitted.unwrap();
+        let durable = complete.durable_frontier_published.unwrap();
+        let wal_return = complete.wal_return.unwrap();
+        let memtable = complete.memtable_publish_complete.unwrap();
+        let mvcc_entry = complete.mvcc_publication_entry.unwrap();
+        let mvcc_complete = complete.mvcc_publication_complete.unwrap();
+        assert!(reserved.sequence < admitted.sequence);
+        assert!(admitted.sequence < durable.sequence);
+        assert!(durable.sequence < wal_return.sequence);
+        assert!(wal_return.sequence < memtable.sequence);
+        assert!(memtable.sequence < mvcc_entry.sequence);
+        assert!(mvcc_entry.sequence < mvcc_complete.sequence);
+        assert_eq!(snapshot.records[1].commit_ts, 11);
+        assert!(snapshot.records[1].wal_ticket_admitted.is_some());
+        assert!(snapshot.records[1].durable_frontier_published.is_none());
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn commit_order_trace_links_frontier_published_before_admission_is_recorded() {
+        let profile = super::WriteProfile::default();
+        profile.configure_commit_order_trace(1);
+
+        profile.record_commit_order_timestamp_reserved(10);
+        profile.record_commit_order_frontier_published(4, 5);
+        profile.record_commit_order_ticket_admitted(10, 4);
+        profile.record_commit_order_wal_return(10, 4);
+        profile.record_commit_order_memtable_publish_complete(10);
+        profile.record_commit_order_mvcc_publication_entry(10);
+        profile.record_commit_order_mvcc_publication_complete(10);
+
+        let snapshot = profile.commit_order_trace_snapshot();
+        assert_eq!(snapshot.dropped_frontier_events, 0);
+        assert_eq!(snapshot.incomplete_records, 0);
+        let record = &snapshot.records[0];
+        assert_eq!(record.frontier_ticket_end, Some(5));
+        assert!(
+            record.durable_frontier_published.unwrap().sequence
+                < record.wal_ticket_admitted.unwrap().sequence
+        );
     }
 
     #[cfg(target_os = "linux")]

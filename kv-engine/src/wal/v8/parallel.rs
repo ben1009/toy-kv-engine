@@ -1181,12 +1181,21 @@ impl WalV8ParallelCoordinator {
             state.tickets.pop_front();
         }
         state.reserved_bytes -= prefix_reserved_bytes;
+        #[cfg(feature = "bench")]
+        let durable_ticket_start = state.durable_ticket_end;
         state.durable_ticket_end = reservation.ticket_end;
         state.durable_prefix_digest = reservation.prefix_digest;
         state.last_frontier_end = frontier_end;
         state.pending_frontier = None;
         #[cfg(feature = "bench")]
         let durable_published_at = Instant::now();
+        #[cfg(feature = "bench")]
+        if let Some(profile) = self.inner.profile.load_full() {
+            profile.record_commit_order_frontier_published(
+                durable_ticket_start,
+                reservation.ticket_end,
+            );
+        }
         #[cfg(feature = "bench")]
         if let Some(profile) = self.inner.profile.load_full() {
             let every = profile.wal_v8_durability_sample_every();
@@ -1842,6 +1851,10 @@ impl WalV8AdmissionPublisher for WalV8ParallelCoordinator {
         self.inner
             .admitted_ticket_end
             .store(next_ticket, Ordering::Release);
+        #[cfg(feature = "bench")]
+        if let Some(profile) = self.inner.profile.load_full() {
+            profile.record_commit_order_ticket_admitted(plan.commit_ts, ticket);
+        }
         signal_change(&self.inner, &mut state);
 
         Ok((

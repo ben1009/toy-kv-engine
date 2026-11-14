@@ -1213,6 +1213,10 @@ impl LsmMvccInner {
         }
         let _write_guard = self.write_lock.lock();
         let commit_ts = self.reserve_commit_ts()?;
+        #[cfg(feature = "bench")]
+        memtable
+            .write_profile()
+            .record_commit_order_timestamp_reserved(commit_ts);
         let _unwind_guard = self.guard_versioned_commit_unwind(memtable, commit_ts);
         let encoded_key = encode_internal_key(user_key, commit_ts);
         let mut prefixed = Vec::with_capacity(1 + value.len());
@@ -1243,6 +1247,12 @@ impl LsmMvccInner {
                 return Err(error);
             }
         };
+        #[cfg(feature = "bench")]
+        if let Some(ticket) = ticket {
+            memtable
+                .write_profile()
+                .record_commit_order_ticket_admitted(commit_ts, ticket);
+        }
         // Do NOT advance current_ts here — readers would see the timestamp
         // before the data is published to the skiplist. The caller must
         // advance current_ts after commit_wal_ticket + publish_raw_batch succeed.
@@ -1275,6 +1285,10 @@ impl LsmMvccInner {
 
         let write_guard = self.write_lock.lock();
         let commit_ts = self.reserve_commit_ts()?;
+        #[cfg(feature = "bench")]
+        memtable
+            .write_profile()
+            .record_commit_order_timestamp_reserved(commit_ts);
         let _unwind_guard = self.guard_versioned_commit_unwind(memtable, commit_ts);
         let encoded_key = encode_internal_key(user_key, commit_ts);
         let recorded_at = self.pitr_recorded_at_for_commit(commit_ts)?;
@@ -1323,6 +1337,10 @@ impl LsmMvccInner {
 
         let _write_guard = self.write_lock.lock();
         let commit_ts = self.reserve_commit_ts()?;
+        #[cfg(feature = "bench")]
+        memtable
+            .write_profile()
+            .record_commit_order_timestamp_reserved(commit_ts);
         let _unwind_guard = self.guard_versioned_commit_unwind(memtable, commit_ts);
         let encoded_key = encode_internal_key(user_key, commit_ts);
         let (ticket, frame_job) = match memtable.admit_prepared_v7_pitr_wal_batch_only(
