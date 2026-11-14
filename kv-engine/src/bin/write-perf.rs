@@ -301,6 +301,11 @@ struct Args {
     /// Captures phase wall/thread CPU time; requires a bench build with PITR V8 Parallel I/O.
     #[arg(long, requires = "pitr")]
     wal_v8_durability_sample_every: Option<u64>,
+    /// Sample every Nth commit timestamp through synchronous MVCC publication.
+    /// Captures publication order, frontier distance, lock wait, spin, and condition-variable
+    /// data.
+    #[arg(long)]
+    mvcc_publication_sample_every: Option<u64>,
     #[arg(long)]
     vlog: bool,
     #[arg(long)]
@@ -385,6 +390,7 @@ struct HarnessConfig {
     wal_hol_diagnostics: bool,
     wal_completion_timeline: bool,
     wal_v8_durability_sample_every: Option<u64>,
+    mvcc_publication_sample_every: Option<u64>,
     vlog_override: bool,
     profile: bool,
     pitr: bool,
@@ -503,6 +509,7 @@ impl HarnessConfig {
             wal_hol_diagnostics: args.wal_hol_diagnostics,
             wal_completion_timeline: args.wal_completion_timeline,
             wal_v8_durability_sample_every: args.wal_v8_durability_sample_every,
+            mvcc_publication_sample_every: args.mvcc_publication_sample_every,
             vlog_override: args.vlog,
             profile: args.profile,
             pitr: args.pitr,
@@ -1119,6 +1126,8 @@ struct WalPipelineRecord {
     v8_completion_timeline: Option<WalV8CompletionTimelineRunRecord>,
     #[serde(skip_serializing_if = "Option::is_none")]
     v8_durability_diagnostics: Option<WalV8DurabilityDiagnosticsRunRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mvcc_publication_diagnostics: Option<MvccPublicationDiagnosticsRunRecord>,
     v8_data_submit_hol_episodes: u64,
     v8_data_submit_hol_wait_ns: u64,
     v8_data_submit_hol_successor_ticket_wait_ns: u64,
@@ -1211,6 +1220,89 @@ struct WalV8AckRecord {
     memtable_publish_wall_ns: u64,
     mvcc_publish_commit_ts_ns: u64,
     wal_return_to_put_return_ns: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+struct MvccPublicationDiagnosticsRunRecord {
+    sample_every: u64,
+    selected_samples: u64,
+    dropped_samples: u64,
+    thread_cpu_time_supported: bool,
+    samples: Vec<MvccPublicationRecord>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
+struct MvccPublicationRecord {
+    sample_sequence: u64,
+    commit_ts: u64,
+    next_to_publish_at_entry: u64,
+    distance_at_entry: i64,
+    next_to_publish_at_decision: u64,
+    distance_at_decision: i64,
+    path: &'static str,
+    frontier_timestamps_advanced: u64,
+    waited_for_predecessor: bool,
+    publication_lock_acquisitions: u64,
+    publication_lock_wait_wall_ns: u64,
+    publication_lock_wait_cpu_ns: u64,
+    spin_limit: u32,
+    spin_iterations: u32,
+    spin_exit: &'static str,
+    condvar_wait_calls: u64,
+    condvar_returns: u64,
+    condvar_frontier_advanced_returns: u64,
+    condvar_timeout_returns: u64,
+    condvar_wait_wall_ns: u64,
+    condvar_wait_cpu_ns: u64,
+    total_wall_ns: u64,
+    total_thread_cpu_ns: u64,
+}
+
+#[cfg(feature = "bench")]
+impl From<kv_engine_wrapper::mvcc::MvccPublicationObservation> for MvccPublicationRecord {
+    fn from(observation: kv_engine_wrapper::mvcc::MvccPublicationObservation) -> Self {
+        let path = match observation.path {
+            kv_engine_wrapper::mvcc::MvccPublicationPath::Unclassified => "unclassified",
+            kv_engine_wrapper::mvcc::MvccPublicationPath::Poisoned => "poisoned",
+            kv_engine_wrapper::mvcc::MvccPublicationPath::AlreadyPublished => "already_published",
+            kv_engine_wrapper::mvcc::MvccPublicationPath::InOrder => "in_order",
+            kv_engine_wrapper::mvcc::MvccPublicationPath::OutOfOrder => "out_of_order",
+        };
+
+        Self {
+            sample_sequence: observation.sample_sequence,
+            commit_ts: observation.commit_ts,
+            next_to_publish_at_entry: observation.next_to_publish_at_entry,
+            distance_at_entry: observation.distance_at_entry,
+            next_to_publish_at_decision: observation.next_to_publish_at_decision,
+            distance_at_decision: observation.distance_at_decision,
+            path,
+            frontier_timestamps_advanced: observation.frontier_timestamps_advanced,
+            waited_for_predecessor: observation.waited_for_predecessor,
+            publication_lock_acquisitions: observation.publication_lock_acquisitions,
+            publication_lock_wait_wall_ns: observation.publication_lock_wait_wall_ns,
+            publication_lock_wait_cpu_ns: observation.publication_lock_wait_cpu_ns,
+            spin_limit: observation.spin_limit,
+            spin_iterations: observation.spin_iterations,
+            spin_exit: match observation.spin_exit {
+                kv_engine_wrapper::mvcc::MvccPublicationSpinExit::NotRequired => "not_required",
+                kv_engine_wrapper::mvcc::MvccPublicationSpinExit::FrontierAdvanced => {
+                    "frontier_advanced"
+                }
+                kv_engine_wrapper::mvcc::MvccPublicationSpinExit::BudgetExhausted => {
+                    "budget_exhausted"
+                }
+            },
+            condvar_wait_calls: observation.condvar_wait_calls,
+            condvar_returns: observation.condvar_returns,
+            condvar_frontier_advanced_returns: observation.condvar_frontier_advanced_returns,
+            condvar_timeout_returns: observation.condvar_timeout_returns,
+            condvar_wait_wall_ns: observation.condvar_wait_wall_ns,
+            condvar_wait_cpu_ns: observation.condvar_wait_cpu_ns,
+            total_wall_ns: observation.total_wall_ns,
+            total_thread_cpu_ns: observation.total_thread_cpu_ns,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
@@ -1740,6 +1832,16 @@ fn wal_pipeline_record(
                 .collect(),
         }
     });
+    let mvcc_publication_diagnostics = engine
+        .mvcc_publication_diagnostics()
+        .filter(|diagnostics| diagnostics.sample_every > 0)
+        .map(|diagnostics| MvccPublicationDiagnosticsRunRecord {
+            sample_every: diagnostics.sample_every,
+            selected_samples: diagnostics.selected_samples,
+            dropped_samples: diagnostics.dropped_samples,
+            thread_cpu_time_supported: cfg!(target_os = "linux"),
+            samples: diagnostics.samples.into_iter().map(Into::into).collect(),
+        });
 
     Ok(Some(WalPipelineRecord {
         commit_groups: profile.wal_commit_groups,
@@ -1759,6 +1861,7 @@ fn wal_pipeline_record(
             .then_some(hol_diagnostics_enabled),
         v8_completion_timeline,
         v8_durability_diagnostics,
+        mvcc_publication_diagnostics,
         v8_data_submit_hol_episodes: profile.wal_v8_data_submit_hol_episodes,
         v8_data_submit_hol_wait_ns: profile.wal_v8_data_submit_hol_wait_ns,
         v8_data_submit_hol_successor_ticket_wait_ns: profile
@@ -4698,6 +4801,7 @@ fn run_wal_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
     #[cfg(feature = "bench")]
     {
         engine.reset_write_profile();
+        engine.set_mvcc_publication_sample_every(cfg.mvcc_publication_sample_every)?;
         engine.set_wal_sync_diagnostics_enabled(
             (cfg.profile || cfg.wal_sync_diagnostics) && wal_run_info.runtime_counters_available(),
         )?;
@@ -4922,6 +5026,7 @@ fn run_wal_batch_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>
     #[cfg(feature = "bench")]
     {
         engine.reset_write_profile();
+        engine.set_mvcc_publication_sample_every(cfg.mvcc_publication_sample_every)?;
         engine.set_wal_sync_diagnostics_enabled(
             (cfg.profile || cfg.wal_sync_diagnostics) && wal_run_info.runtime_counters_available(),
         )?;
@@ -9837,6 +9942,16 @@ fn validate_config(cfg: &HarnessConfig) -> Result<()> {
             "--wal-v8-durability-sample-every requires PITR V8 Parallel I/O"
         );
     }
+    if let Some(sample_every) = cfg.mvcc_publication_sample_every {
+        anyhow::ensure!(
+            sample_every > 0,
+            "--mvcc-publication-sample-every must be greater than zero"
+        );
+        anyhow::ensure!(
+            cfg!(feature = "bench"),
+            "--mvcc-publication-sample-every requires a bench build"
+        );
+    }
     if cfg.prepare_golden || cfg.golden_path.is_some() || cfg.clone_golden {
         anyhow::ensure!(
             cfg.suite == Suite::SteadyState,
@@ -11716,6 +11831,7 @@ mod tests {
             wal_hol_diagnostics: false,
             wal_completion_timeline: false,
             wal_v8_durability_sample_every: None,
+            mvcc_publication_sample_every: None,
             vlog_override: false,
             profile: true,
             clients: 1,
@@ -14256,6 +14372,7 @@ mod tests {
             wal_hol_diagnostics: false,
             wal_completion_timeline: false,
             wal_v8_durability_sample_every: None,
+            mvcc_publication_sample_every: None,
             vlog_override: false,
             profile: false,
             clients: 1,

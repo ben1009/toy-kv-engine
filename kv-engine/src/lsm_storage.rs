@@ -10075,6 +10075,37 @@ impl KvEngine {
     }
 
     #[cfg(feature = "bench")]
+    /// Sample synchronous MVCC publication internals for benchmark runs.
+    /// Passing `None` disables sampling and clears previously retained samples.
+    pub fn set_mvcc_publication_sample_every(&self, sample_every: Option<u64>) -> Result<()> {
+        anyhow::ensure!(
+            sample_every.is_none_or(|every| every > 0),
+            "MVCC publication sample interval must be greater than zero"
+        );
+        if let Some(mvcc) = self.inner.mvcc.as_deref() {
+            mvcc.set_benchmark_publication_sample_every(sample_every.unwrap_or_default());
+        } else {
+            anyhow::ensure!(
+                sample_every.is_none(),
+                "MVCC publication sampling requires MVCC to be enabled"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[cfg(feature = "bench")]
+    /// Snapshot bounded samples from synchronous MVCC publication.
+    pub fn mvcc_publication_diagnostics(
+        &self,
+    ) -> Option<crate::mvcc::MvccPublicationDiagnosticsSnapshot> {
+        self.inner
+            .mvcc
+            .as_deref()
+            .map(crate::mvcc::LsmMvccInner::benchmark_publication_diagnostics)
+    }
+
+    #[cfg(feature = "bench")]
     /// Enable detailed WAL sync observations for the active WAL.
     ///
     /// Diagnostics must be enabled before its first ticket is admitted. They
