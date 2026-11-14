@@ -238,6 +238,24 @@ impl Drop for WalV8DurabilityPhaseSampleGuard {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct WalV8RetirementObservation {
+    #[cfg(feature = "bench")]
+    wall_ns: u64,
+    #[cfg(feature = "bench")]
+    cpu_ns: u64,
+    #[cfg(feature = "bench")]
+    lock_wait_wall_ns: u64,
+    #[cfg(feature = "bench")]
+    lock_wait_cpu_ns: u64,
+    #[cfg(feature = "bench")]
+    lock_hold_wall_ns: u64,
+    #[cfg(feature = "bench")]
+    lock_hold_cpu_ns: u64,
+    #[cfg(feature = "bench")]
+    tickets: u64,
+}
+
 #[cfg(feature = "bench")]
 struct WalV8SlidingExtentPreparation {
     data_file: File,
@@ -3348,6 +3366,8 @@ impl WalV8ParallelWriter {
             #[cfg(feature = "bench")]
             let mut coalescing_observation = None;
             #[cfg(feature = "bench")]
+            let mut coalescing_detail = None;
+            #[cfg(feature = "bench")]
             let mut coalescing_wall_ns = 0_u64;
             #[cfg(feature = "bench")]
             let mut coalescing_cpu_ns = 0_u64;
@@ -3396,6 +3416,16 @@ impl WalV8ParallelWriter {
                 let phase_started = phase_sample_id.map(|_| Instant::now());
                 #[cfg(feature = "bench")]
                 let phase_cpu_started = phase_sample_id.map(|_| digest::thread_cpu_time_ns());
+                #[cfg(feature = "bench")]
+                let waited = if phase_sample_id.is_some() {
+                    let observation = self.coordinator.coalesce_frontier_ready_sampled(budget);
+                    let waited = observation.waited;
+                    coalescing_detail = Some(observation);
+                    waited
+                } else {
+                    self.coordinator.coalesce_frontier_ready(budget)
+                };
+                #[cfg(not(feature = "bench"))]
                 let waited = self.coordinator.coalesce_frontier_ready(budget);
                 #[cfg(feature = "bench")]
                 {
@@ -3641,12 +3671,13 @@ impl WalV8ParallelWriter {
             crate::chaos::failpoint::wal_crash_point("wal_v8.parallel.after_fdatasync");
 
             #[cfg(feature = "bench")]
-            let retire_before_publish_started = phase_sample_id.map(|_| Instant::now());
-            self.retire_frontier_resources(first_ticket, frontier_ticket_end)?;
-            #[cfg(feature = "bench")]
-            let resource_retire_before_publish_wall_ns = retire_before_publish_started
-                .map(|started| started.elapsed().as_nanos().min(u64::MAX as u128) as u64)
-                .unwrap_or_default();
+            let resource_retire_before_publish = self.retire_frontier_resources(
+                first_ticket,
+                frontier_ticket_end,
+                phase_sample_id.is_some(),
+            )?;
+            #[cfg(not(feature = "bench"))]
+            let _ = self.retire_frontier_resources(first_ticket, frontier_ticket_end, false)?;
             #[cfg(feature = "bench")]
             let publish_metrics = if phase_sample_id.is_some() {
                 Some(
@@ -3674,15 +3705,18 @@ impl WalV8ParallelWriter {
             // Retire the physical DATA groups covered by this V8 durability
             // boundary so long-running diagnostic runs keep that map bounded.
             #[cfg(feature = "bench")]
-            let retire_after_publish_started = phase_sample_id.map(|_| Instant::now());
+            let sample_guard_retirement = phase_sample_id.is_some();
             self.io.progress.mark_durable(frontier_ticket_end);
             #[cfg(feature = "chaos-testing")]
             crate::chaos::failpoint::wal_crash_point("wal_v8.parallel.after_durable_publish");
-            self.retire_frontier_guards(first_ticket, frontier_ticket_end)?;
+            #[cfg(not(feature = "bench"))]
+            let _ = self.retire_frontier_guards(first_ticket, frontier_ticket_end, false)?;
             #[cfg(feature = "bench")]
-            let resource_retire_after_publish_wall_ns = retire_after_publish_started
-                .map(|started| started.elapsed().as_nanos().min(u64::MAX as u128) as u64)
-                .unwrap_or_default();
+            let resource_retire_after_publish = self.retire_frontier_guards(
+                first_ticket,
+                frontier_ticket_end,
+                sample_guard_retirement,
+            )?;
             previous.frontier = frontier;
             previous.offset = reservation.frame_offset;
             previous.digest = frontier_digest;
@@ -3719,14 +3753,69 @@ impl WalV8ParallelWriter {
                         frontier_lock_wait_ns,
                         coalescing_wall_ns,
                         coalescing_cpu_ns,
+                        coalescing_active_wall_ns: coalescing_wall_ns.saturating_sub(
+                            coalescing_detail.map_or(0, |detail| {
+                                detail
+                                    .state_lock_wait_wall_ns
+                                    .saturating_add(detail.condvar_wait_wall_ns)
+                            }),
+                        ),
+                        coalescing_active_cpu_ns: coalescing_cpu_ns.saturating_sub(
+                            coalescing_detail.map_or(0, |detail| {
+                                detail
+                                    .state_lock_wait_cpu_ns
+                                    .saturating_add(detail.condvar_wait_cpu_ns)
+                            }),
+                        ),
+                        coalescing_state_lock_wait_wall_ns: coalescing_detail
+                            .map_or(0, |detail| detail.state_lock_wait_wall_ns),
+                        coalescing_state_lock_wait_cpu_ns: coalescing_detail
+                            .map_or(0, |detail| detail.state_lock_wait_cpu_ns),
+                        coalescing_condvar_wait_wall_ns: coalescing_detail
+                            .map_or(0, |detail| detail.condvar_wait_wall_ns),
+                        coalescing_condvar_wait_cpu_ns: coalescing_detail
+                            .map_or(0, |detail| detail.condvar_wait_cpu_ns),
+                        coalescing_condvar_wait_count: coalescing_detail
+                            .map_or(0, |detail| detail.condvar_wait_count),
+                        coalescing_condvar_reacquire_count: coalescing_detail
+                            .map_or(0, |detail| detail.condvar_reacquire_count),
+                        coalescing_condvar_non_timeout_returns: coalescing_detail
+                            .map_or(0, |detail| detail.condvar_non_timeout_returns),
+                        coalescing_loop_check_count: coalescing_detail
+                            .map_or(0, |detail| detail.loop_check_count),
                         preparation_wall_ns,
                         preparation_cpu_ns,
                         frontier_write_wall_ns: phase_frontier_write_wall_ns,
                         frontier_write_cpu_ns: phase_frontier_write_cpu_ns,
                         fdatasync_wall_ns: phase_fdatasync_wall_ns,
                         fdatasync_cpu_ns: phase_fdatasync_cpu_ns,
-                        resource_retire_before_publish_wall_ns,
-                        resource_retire_after_publish_wall_ns,
+                        resource_retire_before_publish_wall_ns: resource_retire_before_publish
+                            .wall_ns,
+                        resource_retire_before_publish_cpu_ns: resource_retire_before_publish
+                            .cpu_ns,
+                        resource_retire_before_publish_lock_wait_wall_ns:
+                            resource_retire_before_publish.lock_wait_wall_ns,
+                        resource_retire_before_publish_lock_wait_cpu_ns:
+                            resource_retire_before_publish.lock_wait_cpu_ns,
+                        resource_retire_before_publish_lock_hold_wall_ns:
+                            resource_retire_before_publish.lock_hold_wall_ns,
+                        resource_retire_before_publish_lock_hold_cpu_ns:
+                            resource_retire_before_publish.lock_hold_cpu_ns,
+                        resource_retire_before_publish_tickets: resource_retire_before_publish
+                            .tickets,
+                        resource_retire_after_publish_wall_ns: resource_retire_after_publish
+                            .wall_ns,
+                        resource_retire_after_publish_cpu_ns: resource_retire_after_publish.cpu_ns,
+                        resource_retire_after_publish_lock_wait_wall_ns:
+                            resource_retire_after_publish.lock_wait_wall_ns,
+                        resource_retire_after_publish_lock_wait_cpu_ns:
+                            resource_retire_after_publish.lock_wait_cpu_ns,
+                        resource_retire_after_publish_lock_hold_wall_ns:
+                            resource_retire_after_publish.lock_hold_wall_ns,
+                        resource_retire_after_publish_lock_hold_cpu_ns:
+                            resource_retire_after_publish.lock_hold_cpu_ns,
+                        resource_retire_after_publish_tickets: resource_retire_after_publish
+                            .tickets,
                         coordinator_publish_lock_wait_ns: publish_metrics.coordinator_lock_wait_ns,
                         coordinator_publish_lock_wait_cpu_ns: publish_metrics
                             .coordinator_lock_wait_cpu_ns,
@@ -3739,11 +3828,38 @@ impl WalV8ParallelWriter {
         }
     }
 
-    fn retire_frontier_resources(&self, first_ticket: u64, ticket_end: u64) -> Result<()> {
+    fn retire_frontier_resources(
+        &self,
+        first_ticket: u64,
+        ticket_end: u64,
+        sample: bool,
+    ) -> Result<WalV8RetirementObservation> {
+        #[cfg(not(feature = "bench"))]
+        let _ = sample;
+        #[cfg(feature = "bench")]
+        let started = sample.then(Instant::now);
+        #[cfg(feature = "bench")]
+        let cpu_started = sample.then(digest::thread_cpu_time_ns);
         if self.reservation_owner.is_none() {
-            return Ok(());
+            return Ok(WalV8RetirementObservation::default());
         }
+        #[cfg(feature = "bench")]
+        let lock_wait_started = sample.then(Instant::now);
+        #[cfg(feature = "bench")]
+        let lock_wait_cpu_started = sample.then(digest::thread_cpu_time_ns);
         let mut resources = self.frontier_resources.lock();
+        #[cfg(feature = "bench")]
+        let lock_wait_wall_ns = lock_wait_started
+            .map(|started| started.elapsed().as_nanos().min(u64::MAX as u128) as u64)
+            .unwrap_or_default();
+        #[cfg(feature = "bench")]
+        let lock_wait_cpu_ns = lock_wait_cpu_started
+            .map(|started| digest::thread_cpu_time_ns().saturating_sub(started))
+            .unwrap_or_default();
+        #[cfg(feature = "bench")]
+        let lock_hold_started = sample.then(Instant::now);
+        #[cfg(feature = "bench")]
+        let lock_hold_cpu_started = sample.then(digest::thread_cpu_time_ns);
         let tickets: Vec<u64> = resources
             .range(first_ticket..ticket_end)
             .map(|(&t, _)| t)
@@ -3767,11 +3883,65 @@ impl WalV8ParallelWriter {
                 .context("retire durable v8 batch resources")?;
         }
 
-        Ok(())
+        #[cfg(feature = "bench")]
+        let lock_hold_wall_ns = lock_hold_started
+            .map(|started| started.elapsed().as_nanos().min(u64::MAX as u128) as u64)
+            .unwrap_or_default();
+        #[cfg(feature = "bench")]
+        let lock_hold_cpu_ns = lock_hold_cpu_started
+            .map(|started| digest::thread_cpu_time_ns().saturating_sub(started))
+            .unwrap_or_default();
+        drop(resources);
+
+        #[allow(unused_mut)]
+        let mut observation = WalV8RetirementObservation::default();
+        #[cfg(feature = "bench")]
+        {
+            observation.tickets = u64::try_from(expected).unwrap_or(u64::MAX);
+            observation.wall_ns = started
+                .map(|started| started.elapsed().as_nanos().min(u64::MAX as u128) as u64)
+                .unwrap_or_default();
+            observation.cpu_ns = cpu_started
+                .map(|started| digest::thread_cpu_time_ns().saturating_sub(started))
+                .unwrap_or_default();
+            observation.lock_wait_wall_ns = lock_wait_wall_ns;
+            observation.lock_wait_cpu_ns = lock_wait_cpu_ns;
+            observation.lock_hold_wall_ns = lock_hold_wall_ns;
+            observation.lock_hold_cpu_ns = lock_hold_cpu_ns;
+        }
+
+        Ok(observation)
     }
 
-    fn retire_frontier_guards(&self, first_ticket: u64, ticket_end: u64) -> Result<()> {
+    fn retire_frontier_guards(
+        &self,
+        first_ticket: u64,
+        ticket_end: u64,
+        sample: bool,
+    ) -> Result<WalV8RetirementObservation> {
+        #[cfg(not(feature = "bench"))]
+        let _ = sample;
+        #[cfg(feature = "bench")]
+        let started = sample.then(Instant::now);
+        #[cfg(feature = "bench")]
+        let cpu_started = sample.then(digest::thread_cpu_time_ns);
+        #[cfg(feature = "bench")]
+        let lock_wait_started = sample.then(Instant::now);
+        #[cfg(feature = "bench")]
+        let lock_wait_cpu_started = sample.then(digest::thread_cpu_time_ns);
         let mut guards = self.producer_guards.lock();
+        #[cfg(feature = "bench")]
+        let lock_wait_wall_ns = lock_wait_started
+            .map(|started| started.elapsed().as_nanos().min(u64::MAX as u128) as u64)
+            .unwrap_or_default();
+        #[cfg(feature = "bench")]
+        let lock_wait_cpu_ns = lock_wait_cpu_started
+            .map(|started| digest::thread_cpu_time_ns().saturating_sub(started))
+            .unwrap_or_default();
+        #[cfg(feature = "bench")]
+        let lock_hold_started = sample.then(Instant::now);
+        #[cfg(feature = "bench")]
+        let lock_hold_cpu_started = sample.then(digest::thread_cpu_time_ns);
         let tickets: Vec<u64> = guards
             .range(first_ticket..ticket_end)
             .map(|(&ticket, _)| ticket)
@@ -3788,7 +3958,34 @@ impl WalV8ParallelWriter {
             encoded.disarm_after_durable();
         }
 
-        Ok(())
+        #[cfg(feature = "bench")]
+        let lock_hold_wall_ns = lock_hold_started
+            .map(|started| started.elapsed().as_nanos().min(u64::MAX as u128) as u64)
+            .unwrap_or_default();
+        #[cfg(feature = "bench")]
+        let lock_hold_cpu_ns = lock_hold_cpu_started
+            .map(|started| digest::thread_cpu_time_ns().saturating_sub(started))
+            .unwrap_or_default();
+        drop(guards);
+
+        #[allow(unused_mut)]
+        let mut observation = WalV8RetirementObservation::default();
+        #[cfg(feature = "bench")]
+        {
+            observation.tickets = u64::try_from(expected).unwrap_or(u64::MAX);
+            observation.wall_ns = started
+                .map(|started| started.elapsed().as_nanos().min(u64::MAX as u128) as u64)
+                .unwrap_or_default();
+            observation.cpu_ns = cpu_started
+                .map(|started| digest::thread_cpu_time_ns().saturating_sub(started))
+                .unwrap_or_default();
+            observation.lock_wait_wall_ns = lock_wait_wall_ns;
+            observation.lock_wait_cpu_ns = lock_wait_cpu_ns;
+            observation.lock_hold_wall_ns = lock_hold_wall_ns;
+            observation.lock_hold_cpu_ns = lock_hold_cpu_ns;
+        }
+
+        Ok(observation)
     }
 
     pub(crate) fn sync(&self) -> Result<()> {

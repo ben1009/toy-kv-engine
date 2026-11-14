@@ -1214,6 +1214,16 @@ struct WalV8DurabilityPhaseRecord {
     frontier_lock_wait_ns: u64,
     coalescing_wall_ns: u64,
     coalescing_cpu_ns: u64,
+    coalescing_active_wall_ns: u64,
+    coalescing_active_cpu_ns: u64,
+    coalescing_state_lock_wait_wall_ns: u64,
+    coalescing_state_lock_wait_cpu_ns: u64,
+    coalescing_condvar_wait_wall_ns: u64,
+    coalescing_condvar_wait_cpu_ns: u64,
+    coalescing_condvar_wait_count: u64,
+    coalescing_condvar_reacquire_count: u64,
+    coalescing_condvar_non_timeout_returns: u64,
+    coalescing_loop_check_count: u64,
     preparation_wall_ns: u64,
     preparation_cpu_ns: u64,
     frontier_write_wall_ns: u64,
@@ -1221,7 +1231,19 @@ struct WalV8DurabilityPhaseRecord {
     fdatasync_wall_ns: u64,
     fdatasync_cpu_ns: u64,
     resource_retire_before_publish_wall_ns: u64,
+    resource_retire_before_publish_cpu_ns: u64,
+    resource_retire_before_publish_lock_wait_wall_ns: u64,
+    resource_retire_before_publish_lock_wait_cpu_ns: u64,
+    resource_retire_before_publish_lock_hold_wall_ns: u64,
+    resource_retire_before_publish_lock_hold_cpu_ns: u64,
+    resource_retire_before_publish_tickets: u64,
     resource_retire_after_publish_wall_ns: u64,
+    resource_retire_after_publish_cpu_ns: u64,
+    resource_retire_after_publish_lock_wait_wall_ns: u64,
+    resource_retire_after_publish_lock_wait_cpu_ns: u64,
+    resource_retire_after_publish_lock_hold_wall_ns: u64,
+    resource_retire_after_publish_lock_hold_cpu_ns: u64,
+    resource_retire_after_publish_tickets: u64,
     coordinator_publish_lock_wait_ns: u64,
     coordinator_publish_lock_wait_cpu_ns: u64,
     coordinator_publish_wall_ns: u64,
@@ -1288,6 +1310,17 @@ impl From<kv_engine_wrapper::mem_table::WalV8DurabilityPhaseObservation>
             frontier_lock_wait_ns: observation.frontier_lock_wait_ns,
             coalescing_wall_ns: observation.coalescing_wall_ns,
             coalescing_cpu_ns: observation.coalescing_cpu_ns,
+            coalescing_active_wall_ns: observation.coalescing_active_wall_ns,
+            coalescing_active_cpu_ns: observation.coalescing_active_cpu_ns,
+            coalescing_state_lock_wait_wall_ns: observation.coalescing_state_lock_wait_wall_ns,
+            coalescing_state_lock_wait_cpu_ns: observation.coalescing_state_lock_wait_cpu_ns,
+            coalescing_condvar_wait_wall_ns: observation.coalescing_condvar_wait_wall_ns,
+            coalescing_condvar_wait_cpu_ns: observation.coalescing_condvar_wait_cpu_ns,
+            coalescing_condvar_wait_count: observation.coalescing_condvar_wait_count,
+            coalescing_condvar_reacquire_count: observation.coalescing_condvar_reacquire_count,
+            coalescing_condvar_non_timeout_returns: observation
+                .coalescing_condvar_non_timeout_returns,
+            coalescing_loop_check_count: observation.coalescing_loop_check_count,
             preparation_wall_ns: observation.preparation_wall_ns,
             preparation_cpu_ns: observation.preparation_cpu_ns,
             frontier_write_wall_ns: observation.frontier_write_wall_ns,
@@ -1296,8 +1329,31 @@ impl From<kv_engine_wrapper::mem_table::WalV8DurabilityPhaseObservation>
             fdatasync_cpu_ns: observation.fdatasync_cpu_ns,
             resource_retire_before_publish_wall_ns: observation
                 .resource_retire_before_publish_wall_ns,
+            resource_retire_before_publish_cpu_ns: observation
+                .resource_retire_before_publish_cpu_ns,
+            resource_retire_before_publish_lock_wait_wall_ns: observation
+                .resource_retire_before_publish_lock_wait_wall_ns,
+            resource_retire_before_publish_lock_wait_cpu_ns: observation
+                .resource_retire_before_publish_lock_wait_cpu_ns,
+            resource_retire_before_publish_lock_hold_wall_ns: observation
+                .resource_retire_before_publish_lock_hold_wall_ns,
+            resource_retire_before_publish_lock_hold_cpu_ns: observation
+                .resource_retire_before_publish_lock_hold_cpu_ns,
+            resource_retire_before_publish_tickets: observation
+                .resource_retire_before_publish_tickets,
             resource_retire_after_publish_wall_ns: observation
                 .resource_retire_after_publish_wall_ns,
+            resource_retire_after_publish_cpu_ns: observation.resource_retire_after_publish_cpu_ns,
+            resource_retire_after_publish_lock_wait_wall_ns: observation
+                .resource_retire_after_publish_lock_wait_wall_ns,
+            resource_retire_after_publish_lock_wait_cpu_ns: observation
+                .resource_retire_after_publish_lock_wait_cpu_ns,
+            resource_retire_after_publish_lock_hold_wall_ns: observation
+                .resource_retire_after_publish_lock_hold_wall_ns,
+            resource_retire_after_publish_lock_hold_cpu_ns: observation
+                .resource_retire_after_publish_lock_hold_cpu_ns,
+            resource_retire_after_publish_tickets: observation
+                .resource_retire_after_publish_tickets,
             coordinator_publish_lock_wait_ns: observation.coordinator_publish_lock_wait_ns,
             coordinator_publish_lock_wait_cpu_ns: observation.coordinator_publish_lock_wait_cpu_ns,
             coordinator_publish_wall_ns: observation.coordinator_publish_wall_ns,

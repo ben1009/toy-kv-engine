@@ -233,6 +233,21 @@ pub(crate) struct WalV8FrontierReadySnapshot {
     pub(crate) next_not_ready: Option<WalV8TicketProgress>,
 }
 
+#[cfg(feature = "bench")]
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct WalV8CoalescingObservation {
+    pub(crate) waited: bool,
+    pub(crate) state_lock_wait_wall_ns: u64,
+    pub(crate) state_lock_wait_cpu_ns: u64,
+    pub(crate) condvar_wait_wall_ns: u64,
+    pub(crate) condvar_wait_count: u64,
+    pub(crate) condvar_reacquire_count: u64,
+    /// Non-timeout returns, including spurious condition-variable wakeups.
+    pub(crate) condvar_non_timeout_returns: u64,
+    pub(crate) loop_check_count: u64,
+    pub(crate) condvar_wait_cpu_ns: u64,
+}
+
 /// DATA group membership comes from admission, including tickets whose
 /// producers have not encoded or framed their bytes yet.
 pub(crate) struct WalV8DataGroupWindow {
@@ -467,38 +482,137 @@ impl WalV8ParallelCoordinator {
     /// ready durability prefix. A lone producer or fully ready window never
     /// waits, and close/poison terminates the optional wait immediately.
     pub(crate) fn coalesce_frontier_ready(&self, budget: Duration) -> bool {
-        let mut state = self.inner.state.lock();
-        let deadline = Instant::now() + budget;
-        let mut waited = false;
-        while !state.closed
-            && !state.poisoned
-            && state
-                .tickets
-                .front()
-                .is_some_and(TicketState::is_frontier_ready)
-            && state
-                .tickets
-                .iter()
-                .any(|ticket| !ticket.is_frontier_ready())
+        #[cfg(feature = "bench")]
         {
+            self.coalesce_frontier_ready_observed(budget, false).waited
+        }
+        #[cfg(not(feature = "bench"))]
+        {
+            let mut state = self.inner.state.lock();
+            let deadline = Instant::now() + budget;
+            let mut waited = false;
+            loop {
+                if state.closed
+                    || state.poisoned
+                    || !state
+                        .tickets
+                        .front()
+                        .is_some_and(TicketState::is_frontier_ready)
+                    || !state
+                        .tickets
+                        .iter()
+                        .any(|ticket| !ticket.is_frontier_ready())
+                {
+                    break;
+                }
+                let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                    break;
+                };
+                waited = true;
+                #[cfg(test)]
+                {
+                    state.frontier_coalesce_waiters += 1;
+                }
+                self.inner
+                    .durability_changed
+                    .wait_for(&mut state, remaining);
+                #[cfg(test)]
+                {
+                    state.frontier_coalesce_waiters -= 1;
+                }
+            }
+
+            waited
+        }
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn coalesce_frontier_ready_sampled(
+        &self,
+        budget: Duration,
+    ) -> WalV8CoalescingObservation {
+        self.coalesce_frontier_ready_observed(budget, true)
+    }
+
+    #[cfg(feature = "bench")]
+    fn coalesce_frontier_ready_observed(
+        &self,
+        budget: Duration,
+        capture_metrics: bool,
+    ) -> WalV8CoalescingObservation {
+        let lock_wait_started = capture_metrics.then(Instant::now);
+        let lock_wait_cpu_started = capture_metrics.then(super::digest::thread_cpu_time_ns);
+        let mut observation = WalV8CoalescingObservation::default();
+        let mut state = self.inner.state.lock();
+        {
+            observation.state_lock_wait_wall_ns = lock_wait_started
+                .map(|started| started.elapsed().as_nanos().min(u64::MAX as u128) as u64)
+                .unwrap_or_default();
+            observation.state_lock_wait_cpu_ns = lock_wait_cpu_started
+                .map(|started| super::digest::thread_cpu_time_ns().saturating_sub(started))
+                .unwrap_or_default();
+        }
+        let deadline = Instant::now() + budget;
+        loop {
+            if capture_metrics {
+                observation.loop_check_count = observation.loop_check_count.saturating_add(1);
+            }
+            if state.closed
+                || state.poisoned
+                || !state
+                    .tickets
+                    .front()
+                    .is_some_and(TicketState::is_frontier_ready)
+                || !state
+                    .tickets
+                    .iter()
+                    .any(|ticket| !ticket.is_frontier_ready())
+            {
+                break;
+            }
             let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
                 break;
             };
-            waited = true;
+            observation.waited = true;
+            if capture_metrics {
+                observation.condvar_wait_count = observation.condvar_wait_count.saturating_add(1);
+            }
             #[cfg(test)]
             {
                 state.frontier_coalesce_waiters += 1;
             }
-            self.inner
+            let condvar_cpu_started = capture_metrics.then(super::digest::thread_cpu_time_ns);
+            let condvar_wall_started = capture_metrics.then(Instant::now);
+            let wait_result = self
+                .inner
                 .durability_changed
                 .wait_for(&mut state, remaining);
+            if capture_metrics {
+                if let Some(started) = condvar_cpu_started {
+                    observation.condvar_wait_cpu_ns =
+                        observation.condvar_wait_cpu_ns.saturating_add(
+                            super::digest::thread_cpu_time_ns().saturating_sub(started),
+                        );
+                }
+                if let Some(started) = condvar_wall_started {
+                    observation.condvar_wait_wall_ns = observation
+                        .condvar_wait_wall_ns
+                        .saturating_add(started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+                }
+                observation.condvar_reacquire_count =
+                    observation.condvar_reacquire_count.saturating_add(1);
+                if !wait_result.timed_out() {
+                    observation.condvar_non_timeout_returns =
+                        observation.condvar_non_timeout_returns.saturating_add(1);
+                }
+            }
             #[cfg(test)]
             {
                 state.frontier_coalesce_waiters -= 1;
             }
         }
 
-        waited
+        observation
     }
 
     /// Snapshot the frontier-ready prefix and the first admitted ticket that
