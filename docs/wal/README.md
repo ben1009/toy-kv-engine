@@ -94,6 +94,7 @@ the retained and rejected experiments.
 - [RFC 026 V7/V8 Point CPU and scheduler diagnosis on GCP, 2026-11-13](benchmarks/rfc-026-v7-v8-point-perf-sched-gcp-20261113.md)
 - [RFC 026 V8 durability phase sampling on GCP, 2026-11-13](benchmarks/rfc-026-v8-durability-sampling-gcp-20261113.md)
 - [RFC 026 V7/V8 Point MVCC publication and sampler overhead on GCP, 2026-11-14](benchmarks/rfc-026-v7-v8-mvcc-publication-gcp-20261114.md)
+- [RFC 026 V7/V8 Point MVCC publication path diagnostics on GCP, 2026-11-14](benchmarks/rfc-026-v7-v8-mvcc-publication-paths-gcp-20261114.md)
 - [RFC 026 V8 DATA submission-order probe on GCP, 2026-11-11](benchmarks/rfc-026-v8-data-submit-order-gcp-20261111.md)
 - [RFC 026 V8 coalescing budget A/B on GCP, 2026-11-11](benchmarks/rfc-026-v8-coalescing-budget-gcp-20261111.md)
 - [RFC 026 V8 low-overhead coalescing confirmation on GCP, 2026-11-11](benchmarks/rfc-026-v8-low-overhead-budget-gcp-20261111.md)

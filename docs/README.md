@@ -44,6 +44,7 @@ and do not define the current writer selection.
 - [GCP V7/V8 Point CPU and scheduler diagnosis, 2026-11-13](wal/benchmarks/rfc-026-v7-v8-point-perf-sched-gcp-20261113.md)
 - [GCP V8 durability phase sampling, 2026-11-13](wal/benchmarks/rfc-026-v8-durability-sampling-gcp-20261113.md)
 - [GCP V7/V8 Point MVCC publication and sampler overhead, 2026-11-14](wal/benchmarks/rfc-026-v7-v8-mvcc-publication-gcp-20261114.md)
+- [GCP V7/V8 Point MVCC publication path diagnostics, 2026-11-14](wal/benchmarks/rfc-026-v7-v8-mvcc-publication-paths-gcp-20261114.md)
 - [GCP V8 sliding extent initialization, 2026-11-12](wal/benchmarks/rfc-026-v8-sliding-initialize-gcp-20261112.md)
 - [GCP V8 sliding fallocate full matrix, 2026-11-12](wal/benchmarks/rfc-026-v8-sliding-fallocate-matrix-gcp-20261112.md)
 
