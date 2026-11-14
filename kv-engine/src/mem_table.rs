@@ -513,7 +513,7 @@ pub struct CommitOrderTraceSnapshot {
 }
 
 #[cfg(feature = "bench")]
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct CommitOrderTraceState {
     next_event_sequence: u64,
     records: std::collections::BTreeMap<u64, CommitOrderTraceObservation>,
@@ -635,7 +635,7 @@ impl WriteProfile {
             return;
         }
 
-        let remaining = match self.commit_order_trace_remaining.fetch_update(
+        let remaining = match self.commit_order_trace_remaining.try_update(
             std::sync::atomic::Ordering::AcqRel,
             std::sync::atomic::Ordering::Acquire,
             |remaining| remaining.checked_sub(1),

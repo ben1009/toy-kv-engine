@@ -272,6 +272,7 @@ mkfs.ext4() { printf 'formatted:%s\n' "${@: -1}"; }
                         "WORK": temp, "SAFE_DEADLINE_EPOCH": "2000000000",
                         "MACHINE_TYPE": f"c4-standard-{vcpus}-lssd", "SSD_COUNT": str(disks),
                         "SSD_TOTAL_GIB": str(disks * 375), "WRITERS_CSV": "1,4,8", "SUITE": suite,
+                        "SOURCE_PATCH_SHA256": "-",
                         "BOOT_LOG": f"{temp}/bootstrap.log", "WAL_DEVICE": "/dev/test-ssd",
                     }
                     assignments = "\n".join(f"{key}={shlex.quote(value)}" for key, value in outer.items())
