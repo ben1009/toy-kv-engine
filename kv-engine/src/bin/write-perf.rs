@@ -297,6 +297,19 @@ struct Args {
     /// stages. Requires a bench build with PITR V8 Parallel I/O.
     #[arg(long, requires = "pitr")]
     wal_completion_timeline: bool,
+    /// Sample every Nth completed V8 Parallel durability advance and follower wait.
+    /// Captures phase wall/thread CPU time; requires a bench build with PITR V8 Parallel I/O.
+    #[arg(long, requires = "pitr")]
+    wal_v8_durability_sample_every: Option<u64>,
+    /// Sample every Nth commit timestamp through synchronous MVCC publication.
+    /// Captures publication order, frontier distance, lock wait, spin, and condition-variable
+    /// data.
+    #[arg(long)]
+    mvcc_publication_sample_every: Option<u64>,
+    /// Capture all commit-order stages for the first bounded number of Point puts.
+    /// Requires a bench build, PITR, and a Linux target.
+    #[arg(long, requires = "pitr")]
+    commit_order_trace_limit: Option<u64>,
     #[arg(long)]
     vlog: bool,
     #[arg(long)]
@@ -380,6 +393,9 @@ struct HarnessConfig {
     wal_sync_diagnostics: bool,
     wal_hol_diagnostics: bool,
     wal_completion_timeline: bool,
+    wal_v8_durability_sample_every: Option<u64>,
+    mvcc_publication_sample_every: Option<u64>,
+    commit_order_trace_limit: Option<u64>,
     vlog_override: bool,
     profile: bool,
     pitr: bool,
@@ -497,6 +513,9 @@ impl HarnessConfig {
             wal_sync_diagnostics: args.wal_sync_diagnostics,
             wal_hol_diagnostics: args.wal_hol_diagnostics,
             wal_completion_timeline: args.wal_completion_timeline,
+            wal_v8_durability_sample_every: args.wal_v8_durability_sample_every,
+            mvcc_publication_sample_every: args.mvcc_publication_sample_every,
+            commit_order_trace_limit: args.commit_order_trace_limit,
             vlog_override: args.vlog,
             profile: args.profile,
             pitr: args.pitr,
@@ -1111,6 +1130,12 @@ struct WalPipelineRecord {
     v8_hol_diagnostics_enabled: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     v8_completion_timeline: Option<WalV8CompletionTimelineRunRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    v8_durability_diagnostics: Option<WalV8DurabilityDiagnosticsRunRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mvcc_publication_diagnostics: Option<MvccPublicationDiagnosticsRunRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    commit_order_trace: Option<CommitOrderTraceRunRecord>,
     v8_data_submit_hol_episodes: u64,
     v8_data_submit_hol_wait_ns: u64,
     v8_data_submit_hol_successor_ticket_wait_ns: u64,
@@ -1179,6 +1204,222 @@ struct WalV8CompletionTimelineRecord {
     prefix_ready_to_durable_ns: u64,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+struct WalV8DurabilityDiagnosticsRunRecord {
+    sample_every: u64,
+    driver_attempts: u64,
+    empty_driver_attempts: u64,
+    advance_attempts: u64,
+    completed_advances: u64,
+    sampled_advances: u64,
+    dropped_samples: u64,
+    phases: Vec<WalV8DurabilityPhaseRecord>,
+    follower_wait_dropped_samples: u64,
+    follower_waits: Vec<WalV8FollowerWaitRecord>,
+    ack_dropped_samples: u64,
+    ack_samples: Vec<WalV8AckRecord>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
+struct WalV8AckRecord {
+    ticket: u64,
+    durable_publish_to_wal_return_ns: u64,
+    wal_return_to_memtable_start_ns: u64,
+    memtable_publish_wall_ns: u64,
+    mvcc_publish_commit_ts_ns: u64,
+    wal_return_to_put_return_ns: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+struct MvccPublicationDiagnosticsRunRecord {
+    sample_every: u64,
+    selected_samples: u64,
+    dropped_samples: u64,
+    thread_cpu_time_supported: bool,
+    samples: Vec<MvccPublicationRecord>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
+struct MvccPublicationRecord {
+    sample_sequence: u64,
+    commit_ts: u64,
+    next_to_publish_at_entry: u64,
+    distance_at_entry: i64,
+    next_to_publish_at_decision: u64,
+    distance_at_decision: i64,
+    path: &'static str,
+    frontier_timestamps_advanced: u64,
+    waited_for_predecessor: bool,
+    publication_lock_acquisitions: u64,
+    publication_lock_wait_wall_ns: u64,
+    publication_lock_wait_cpu_ns: u64,
+    spin_limit: u32,
+    spin_iterations: u32,
+    spin_exit: &'static str,
+    condvar_wait_calls: u64,
+    condvar_returns: u64,
+    condvar_frontier_advanced_returns: u64,
+    condvar_timeout_returns: u64,
+    condvar_wait_wall_ns: u64,
+    condvar_wait_cpu_ns: u64,
+    total_wall_ns: u64,
+    total_thread_cpu_ns: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+struct CommitOrderTraceRunRecord {
+    limit: u64,
+    selected_records: u64,
+    dropped_records: u64,
+    dropped_frontier_events: u64,
+    incomplete_records: u64,
+    records: Vec<CommitOrderTraceRecord>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
+struct CommitOrderTraceRecord {
+    commit_ts: u64,
+    wal_ticket: Option<u64>,
+    frontier_ticket_end: Option<u64>,
+    timestamp_reserved: Option<CommitOrderTraceEventRecord>,
+    wal_ticket_admitted: Option<CommitOrderTraceEventRecord>,
+    durable_frontier_published: Option<CommitOrderTraceEventRecord>,
+    wal_return: Option<CommitOrderTraceEventRecord>,
+    memtable_publish_complete: Option<CommitOrderTraceEventRecord>,
+    mvcc_publication_entry: Option<CommitOrderTraceEventRecord>,
+    mvcc_publication_complete: Option<CommitOrderTraceEventRecord>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
+struct CommitOrderTraceEventRecord {
+    sequence: u64,
+    monotonic_ns: u64,
+    thread_id: u64,
+}
+
+#[cfg(feature = "bench")]
+impl From<kv_engine_wrapper::mvcc::MvccPublicationObservation> for MvccPublicationRecord {
+    fn from(observation: kv_engine_wrapper::mvcc::MvccPublicationObservation) -> Self {
+        let path = match observation.path {
+            kv_engine_wrapper::mvcc::MvccPublicationPath::Unclassified => "unclassified",
+            kv_engine_wrapper::mvcc::MvccPublicationPath::Poisoned => "poisoned",
+            kv_engine_wrapper::mvcc::MvccPublicationPath::AlreadyPublished => "already_published",
+            kv_engine_wrapper::mvcc::MvccPublicationPath::InOrder => "in_order",
+            kv_engine_wrapper::mvcc::MvccPublicationPath::OutOfOrder => "out_of_order",
+        };
+
+        Self {
+            sample_sequence: observation.sample_sequence,
+            commit_ts: observation.commit_ts,
+            next_to_publish_at_entry: observation.next_to_publish_at_entry,
+            distance_at_entry: observation.distance_at_entry,
+            next_to_publish_at_decision: observation.next_to_publish_at_decision,
+            distance_at_decision: observation.distance_at_decision,
+            path,
+            frontier_timestamps_advanced: observation.frontier_timestamps_advanced,
+            waited_for_predecessor: observation.waited_for_predecessor,
+            publication_lock_acquisitions: observation.publication_lock_acquisitions,
+            publication_lock_wait_wall_ns: observation.publication_lock_wait_wall_ns,
+            publication_lock_wait_cpu_ns: observation.publication_lock_wait_cpu_ns,
+            spin_limit: observation.spin_limit,
+            spin_iterations: observation.spin_iterations,
+            spin_exit: match observation.spin_exit {
+                kv_engine_wrapper::mvcc::MvccPublicationSpinExit::NotRequired => "not_required",
+                kv_engine_wrapper::mvcc::MvccPublicationSpinExit::FrontierAdvanced => {
+                    "frontier_advanced"
+                }
+                kv_engine_wrapper::mvcc::MvccPublicationSpinExit::BudgetExhausted => {
+                    "budget_exhausted"
+                }
+            },
+            condvar_wait_calls: observation.condvar_wait_calls,
+            condvar_returns: observation.condvar_returns,
+            condvar_frontier_advanced_returns: observation.condvar_frontier_advanced_returns,
+            condvar_timeout_returns: observation.condvar_timeout_returns,
+            condvar_wait_wall_ns: observation.condvar_wait_wall_ns,
+            condvar_wait_cpu_ns: observation.condvar_wait_cpu_ns,
+            total_wall_ns: observation.total_wall_ns,
+            total_thread_cpu_ns: observation.total_thread_cpu_ns,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
+struct WalV8DurabilityPhaseRecord {
+    sample_id: u64,
+    driver_attempt_sequence: u64,
+    advance_sequence: u64,
+    ticket_start: u64,
+    ticket_end: u64,
+    tickets_covered: u64,
+    driver_wall_ns: u64,
+    driver_cpu_ns: u64,
+    frontier_lock_wait_ns: u64,
+    coalescing_wall_ns: u64,
+    coalescing_cpu_ns: u64,
+    coalescing_active_wall_ns: u64,
+    coalescing_active_cpu_ns: u64,
+    coalescing_state_lock_wait_wall_ns: u64,
+    coalescing_state_lock_wait_cpu_ns: u64,
+    coalescing_condvar_wait_wall_ns: u64,
+    coalescing_condvar_wait_cpu_ns: u64,
+    coalescing_condvar_wait_count: u64,
+    coalescing_condvar_reacquire_count: u64,
+    coalescing_condvar_non_timeout_returns: u64,
+    coalescing_condvar_prefix_growth_returns: u64,
+    coalescing_condvar_generation_changed_returns: u64,
+    coalescing_condvar_timeout_returns: u64,
+    coalescing_loop_check_count: u64,
+    preparation_wall_ns: u64,
+    preparation_cpu_ns: u64,
+    frontier_write_wall_ns: u64,
+    frontier_write_cpu_ns: u64,
+    fdatasync_wall_ns: u64,
+    fdatasync_cpu_ns: u64,
+    resource_retire_before_publish_wall_ns: u64,
+    resource_retire_before_publish_cpu_ns: u64,
+    resource_retire_before_publish_lock_wait_wall_ns: u64,
+    resource_retire_before_publish_lock_wait_cpu_ns: u64,
+    resource_retire_before_publish_lock_hold_wall_ns: u64,
+    resource_retire_before_publish_lock_hold_cpu_ns: u64,
+    resource_retire_before_publish_tickets: u64,
+    resource_retire_before_publish_collect_cpu_ns: u64,
+    resource_retire_before_publish_remove_cpu_ns: u64,
+    resource_retire_before_publish_release_cpu_ns: u64,
+    resource_retire_before_publish_finish_cpu_ns: u64,
+    resource_retire_after_publish_wall_ns: u64,
+    resource_retire_after_publish_cpu_ns: u64,
+    resource_retire_after_publish_lock_wait_wall_ns: u64,
+    resource_retire_after_publish_lock_wait_cpu_ns: u64,
+    resource_retire_after_publish_lock_hold_wall_ns: u64,
+    resource_retire_after_publish_lock_hold_cpu_ns: u64,
+    resource_retire_after_publish_tickets: u64,
+    resource_retire_after_publish_collect_cpu_ns: u64,
+    resource_retire_after_publish_remove_cpu_ns: u64,
+    resource_retire_after_publish_finish_cpu_ns: u64,
+    coordinator_publish_lock_wait_ns: u64,
+    coordinator_publish_lock_wait_cpu_ns: u64,
+    coordinator_publish_wall_ns: u64,
+    coordinator_publish_cpu_ns: u64,
+    notify_all_wall_ns: u64,
+    followers_waiting_at_publish: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
+struct WalV8FollowerWaitRecord {
+    sample_id: u64,
+    requested_ticket_end: u64,
+    durable_ticket_end_on_resume: u64,
+    coordinator_lock_wait_ns: u64,
+    coordinator_lock_wait_cpu_ns: u64,
+    total_wait_wall_ns: u64,
+    total_wait_cpu_ns: u64,
+    condvar_wait_count: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    notify_to_resume_ns: Option<u64>,
+    followers_woken_by_last_notify: u64,
+}
+
 #[cfg(feature = "bench")]
 impl From<kv_engine_wrapper::mem_table::WalV8CompletionTimelineObservation>
     for WalV8CompletionTimelineRecord
@@ -1201,6 +1442,157 @@ impl From<kv_engine_wrapper::mem_table::WalV8CompletionTimelineObservation>
             result_send_start_to_reaper_recv_ns: observation.result_send_start_to_reaper_recv_ns,
             reaper_recv_to_prefix_ready_ns: observation.reaper_recv_to_prefix_ready_ns,
             prefix_ready_to_durable_ns: observation.prefix_ready_to_durable_ns,
+        }
+    }
+}
+
+#[cfg(feature = "bench")]
+impl From<kv_engine_wrapper::mem_table::WalV8DurabilityPhaseObservation>
+    for WalV8DurabilityPhaseRecord
+{
+    fn from(observation: kv_engine_wrapper::mem_table::WalV8DurabilityPhaseObservation) -> Self {
+        Self {
+            sample_id: observation.sample_id,
+            driver_attempt_sequence: observation.driver_attempt_sequence,
+            advance_sequence: observation.advance_sequence,
+            ticket_start: observation.ticket_start,
+            ticket_end: observation.ticket_end,
+            tickets_covered: observation.tickets_covered,
+            driver_wall_ns: observation.driver_wall_ns,
+            driver_cpu_ns: observation.driver_cpu_ns,
+            frontier_lock_wait_ns: observation.frontier_lock_wait_ns,
+            coalescing_wall_ns: observation.coalescing_wall_ns,
+            coalescing_cpu_ns: observation.coalescing_cpu_ns,
+            coalescing_active_wall_ns: observation.coalescing_active_wall_ns,
+            coalescing_active_cpu_ns: observation.coalescing_active_cpu_ns,
+            coalescing_state_lock_wait_wall_ns: observation.coalescing_state_lock_wait_wall_ns,
+            coalescing_state_lock_wait_cpu_ns: observation.coalescing_state_lock_wait_cpu_ns,
+            coalescing_condvar_wait_wall_ns: observation.coalescing_condvar_wait_wall_ns,
+            coalescing_condvar_wait_cpu_ns: observation.coalescing_condvar_wait_cpu_ns,
+            coalescing_condvar_wait_count: observation.coalescing_condvar_wait_count,
+            coalescing_condvar_reacquire_count: observation.coalescing_condvar_reacquire_count,
+            coalescing_condvar_non_timeout_returns: observation
+                .coalescing_condvar_non_timeout_returns,
+            coalescing_condvar_prefix_growth_returns: observation
+                .coalescing_condvar_prefix_growth_returns,
+            coalescing_condvar_generation_changed_returns: observation
+                .coalescing_condvar_generation_changed_returns,
+            coalescing_condvar_timeout_returns: observation.coalescing_condvar_timeout_returns,
+            coalescing_loop_check_count: observation.coalescing_loop_check_count,
+            preparation_wall_ns: observation.preparation_wall_ns,
+            preparation_cpu_ns: observation.preparation_cpu_ns,
+            frontier_write_wall_ns: observation.frontier_write_wall_ns,
+            frontier_write_cpu_ns: observation.frontier_write_cpu_ns,
+            fdatasync_wall_ns: observation.fdatasync_wall_ns,
+            fdatasync_cpu_ns: observation.fdatasync_cpu_ns,
+            resource_retire_before_publish_wall_ns: observation
+                .resource_retire_before_publish_wall_ns,
+            resource_retire_before_publish_cpu_ns: observation
+                .resource_retire_before_publish_cpu_ns,
+            resource_retire_before_publish_lock_wait_wall_ns: observation
+                .resource_retire_before_publish_lock_wait_wall_ns,
+            resource_retire_before_publish_lock_wait_cpu_ns: observation
+                .resource_retire_before_publish_lock_wait_cpu_ns,
+            resource_retire_before_publish_lock_hold_wall_ns: observation
+                .resource_retire_before_publish_lock_hold_wall_ns,
+            resource_retire_before_publish_lock_hold_cpu_ns: observation
+                .resource_retire_before_publish_lock_hold_cpu_ns,
+            resource_retire_before_publish_tickets: observation
+                .resource_retire_before_publish_tickets,
+            resource_retire_before_publish_collect_cpu_ns: observation
+                .resource_retire_before_publish_collect_cpu_ns,
+            resource_retire_before_publish_remove_cpu_ns: observation
+                .resource_retire_before_publish_remove_cpu_ns,
+            resource_retire_before_publish_release_cpu_ns: observation
+                .resource_retire_before_publish_release_cpu_ns,
+            resource_retire_before_publish_finish_cpu_ns: observation
+                .resource_retire_before_publish_finish_cpu_ns,
+            resource_retire_after_publish_wall_ns: observation
+                .resource_retire_after_publish_wall_ns,
+            resource_retire_after_publish_cpu_ns: observation.resource_retire_after_publish_cpu_ns,
+            resource_retire_after_publish_lock_wait_wall_ns: observation
+                .resource_retire_after_publish_lock_wait_wall_ns,
+            resource_retire_after_publish_lock_wait_cpu_ns: observation
+                .resource_retire_after_publish_lock_wait_cpu_ns,
+            resource_retire_after_publish_lock_hold_wall_ns: observation
+                .resource_retire_after_publish_lock_hold_wall_ns,
+            resource_retire_after_publish_lock_hold_cpu_ns: observation
+                .resource_retire_after_publish_lock_hold_cpu_ns,
+            resource_retire_after_publish_tickets: observation
+                .resource_retire_after_publish_tickets,
+            resource_retire_after_publish_collect_cpu_ns: observation
+                .resource_retire_after_publish_collect_cpu_ns,
+            resource_retire_after_publish_remove_cpu_ns: observation
+                .resource_retire_after_publish_remove_cpu_ns,
+            resource_retire_after_publish_finish_cpu_ns: observation
+                .resource_retire_after_publish_finish_cpu_ns,
+            coordinator_publish_lock_wait_ns: observation.coordinator_publish_lock_wait_ns,
+            coordinator_publish_lock_wait_cpu_ns: observation.coordinator_publish_lock_wait_cpu_ns,
+            coordinator_publish_wall_ns: observation.coordinator_publish_wall_ns,
+            coordinator_publish_cpu_ns: observation.coordinator_publish_cpu_ns,
+            notify_all_wall_ns: observation.notify_all_wall_ns,
+            followers_waiting_at_publish: observation.followers_waiting_at_publish,
+        }
+    }
+}
+
+#[cfg(feature = "bench")]
+impl From<kv_engine_wrapper::mem_table::WalV8FollowerWaitObservation> for WalV8FollowerWaitRecord {
+    fn from(observation: kv_engine_wrapper::mem_table::WalV8FollowerWaitObservation) -> Self {
+        Self {
+            sample_id: observation.sample_id,
+            requested_ticket_end: observation.requested_ticket_end,
+            durable_ticket_end_on_resume: observation.durable_ticket_end_on_resume,
+            coordinator_lock_wait_ns: observation.coordinator_lock_wait_ns,
+            coordinator_lock_wait_cpu_ns: observation.coordinator_lock_wait_cpu_ns,
+            total_wait_wall_ns: observation.total_wait_wall_ns,
+            total_wait_cpu_ns: observation.total_wait_cpu_ns,
+            condvar_wait_count: observation.condvar_wait_count,
+            notify_to_resume_ns: observation.notify_to_resume_ns,
+            followers_woken_by_last_notify: observation.followers_woken_by_last_notify,
+        }
+    }
+}
+
+#[cfg(feature = "bench")]
+impl From<kv_engine_wrapper::mem_table::WalV8AckObservation> for WalV8AckRecord {
+    fn from(observation: kv_engine_wrapper::mem_table::WalV8AckObservation) -> Self {
+        Self {
+            ticket: observation.ticket,
+            durable_publish_to_wal_return_ns: observation.durable_publish_to_wal_return_ns,
+            wal_return_to_memtable_start_ns: observation.wal_return_to_memtable_start_ns,
+            memtable_publish_wall_ns: observation.memtable_publish_wall_ns,
+            mvcc_publish_commit_ts_ns: observation.mvcc_publish_commit_ts_ns,
+            wal_return_to_put_return_ns: observation.wal_return_to_put_return_ns,
+        }
+    }
+}
+
+#[cfg(feature = "bench")]
+impl From<kv_engine_wrapper::mem_table::CommitOrderTraceEvent> for CommitOrderTraceEventRecord {
+    fn from(event: kv_engine_wrapper::mem_table::CommitOrderTraceEvent) -> Self {
+        Self {
+            sequence: event.sequence,
+            monotonic_ns: event.monotonic_ns,
+            thread_id: event.thread_id,
+        }
+    }
+}
+
+#[cfg(feature = "bench")]
+impl From<kv_engine_wrapper::mem_table::CommitOrderTraceObservation> for CommitOrderTraceRecord {
+    fn from(observation: kv_engine_wrapper::mem_table::CommitOrderTraceObservation) -> Self {
+        Self {
+            commit_ts: observation.commit_ts,
+            wal_ticket: observation.wal_ticket,
+            frontier_ticket_end: observation.frontier_ticket_end,
+            timestamp_reserved: observation.timestamp_reserved.map(Into::into),
+            wal_ticket_admitted: observation.wal_ticket_admitted.map(Into::into),
+            durable_frontier_published: observation.durable_frontier_published.map(Into::into),
+            wal_return: observation.wal_return.map(Into::into),
+            memtable_publish_complete: observation.memtable_publish_complete.map(Into::into),
+            mvcc_publication_entry: observation.mvcc_publication_entry.map(Into::into),
+            mvcc_publication_complete: observation.mvcc_publication_complete.map(Into::into),
         }
     }
 }
@@ -1479,6 +1871,59 @@ fn wal_pipeline_record(
                 .map(WalV8CompletionTimelineRecord::from)
                 .collect(),
         });
+    let v8_durability_diagnostics = profile.wal_v8_durability_sample_every.map(|sample_every| {
+        let counts = engine.wal_v8_durability_diagnostic_counts();
+        WalV8DurabilityDiagnosticsRunRecord {
+            sample_every,
+            driver_attempts: counts.driver_attempts,
+            empty_driver_attempts: counts.empty_driver_attempts,
+            advance_attempts: counts.advance_attempts,
+            completed_advances: counts.completed_advances,
+            sampled_advances: counts.sampled_advances,
+            dropped_samples: counts.dropped_samples,
+            phases: engine
+                .wal_v8_durability_phase_observations()
+                .into_iter()
+                .map(WalV8DurabilityPhaseRecord::from)
+                .collect(),
+            follower_wait_dropped_samples: engine.wal_v8_follower_wait_dropped_samples(),
+            follower_waits: engine
+                .wal_v8_follower_wait_observations()
+                .into_iter()
+                .map(WalV8FollowerWaitRecord::from)
+                .collect(),
+            ack_dropped_samples: engine.wal_v8_ack_dropped_samples(),
+            ack_samples: engine
+                .wal_v8_ack_observations()
+                .into_iter()
+                .map(WalV8AckRecord::from)
+                .collect(),
+        }
+    });
+    let mvcc_publication_diagnostics = engine
+        .mvcc_publication_diagnostics()
+        .filter(|diagnostics| diagnostics.sample_every > 0)
+        .map(|diagnostics| MvccPublicationDiagnosticsRunRecord {
+            sample_every: diagnostics.sample_every,
+            selected_samples: diagnostics.selected_samples,
+            dropped_samples: diagnostics.dropped_samples,
+            thread_cpu_time_supported: cfg!(target_os = "linux"),
+            samples: diagnostics.samples.into_iter().map(Into::into).collect(),
+        });
+    let commit_order_trace_snapshot = engine.commit_order_trace_snapshot();
+    let commit_order_trace =
+        (commit_order_trace_snapshot.limit > 0).then(|| CommitOrderTraceRunRecord {
+            limit: commit_order_trace_snapshot.limit,
+            selected_records: commit_order_trace_snapshot.selected_records,
+            dropped_records: commit_order_trace_snapshot.dropped_records,
+            dropped_frontier_events: commit_order_trace_snapshot.dropped_frontier_events,
+            incomplete_records: commit_order_trace_snapshot.incomplete_records,
+            records: commit_order_trace_snapshot
+                .records
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+        });
 
     Ok(Some(WalPipelineRecord {
         commit_groups: profile.wal_commit_groups,
@@ -1497,6 +1942,9 @@ fn wal_pipeline_record(
             && wal_run_info.io_mode == "parallel")
             .then_some(hol_diagnostics_enabled),
         v8_completion_timeline,
+        v8_durability_diagnostics,
+        mvcc_publication_diagnostics,
+        commit_order_trace,
         v8_data_submit_hol_episodes: profile.wal_v8_data_submit_hol_episodes,
         v8_data_submit_hol_wait_ns: profile.wal_v8_data_submit_hol_wait_ns,
         v8_data_submit_hol_successor_ticket_wait_ns: profile
@@ -4436,6 +4884,8 @@ fn run_wal_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
     #[cfg(feature = "bench")]
     {
         engine.reset_write_profile();
+        engine.set_mvcc_publication_sample_every(cfg.mvcc_publication_sample_every)?;
+        engine.set_commit_order_trace_limit(cfg.commit_order_trace_limit)?;
         engine.set_wal_sync_diagnostics_enabled(
             (cfg.profile || cfg.wal_sync_diagnostics) && wal_run_info.runtime_counters_available(),
         )?;
@@ -4443,6 +4893,7 @@ fn run_wal_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
         engine.set_wal_v8_completion_timeline_sample_every(
             cfg.wal_completion_timeline.then_some(128),
         )?;
+        engine.set_wal_v8_durability_sample_every(cfg.wal_v8_durability_sample_every)?;
     }
     let value = vec![b'x'; cfg.value_size];
     let num_keys = cfg.num;
@@ -4659,6 +5110,8 @@ fn run_wal_batch_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>
     #[cfg(feature = "bench")]
     {
         engine.reset_write_profile();
+        engine.set_mvcc_publication_sample_every(cfg.mvcc_publication_sample_every)?;
+        engine.set_commit_order_trace_limit(cfg.commit_order_trace_limit)?;
         engine.set_wal_sync_diagnostics_enabled(
             (cfg.profile || cfg.wal_sync_diagnostics) && wal_run_info.runtime_counters_available(),
         )?;
@@ -4666,6 +5119,7 @@ fn run_wal_batch_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>
         engine.set_wal_v8_completion_timeline_sample_every(
             cfg.wal_completion_timeline.then_some(128),
         )?;
+        engine.set_wal_v8_durability_sample_every(cfg.wal_v8_durability_sample_every)?;
     }
     #[cfg(feature = "bench")]
     let wal_io_start = engine
@@ -9558,6 +10012,59 @@ fn validate_config(cfg: &HarnessConfig) -> Result<()> {
             "--wal-completion-timeline requires PITR V8 Parallel I/O"
         );
     }
+    if let Some(sample_every) = cfg.wal_v8_durability_sample_every {
+        anyhow::ensure!(
+            sample_every > 0,
+            "--wal-v8-durability-sample-every must be greater than zero"
+        );
+        anyhow::ensure!(
+            cfg!(feature = "bench"),
+            "--wal-v8-durability-sample-every requires a bench build"
+        );
+        anyhow::ensure!(
+            cfg.pitr_format.unwrap_or(PitrFormatArg::V8) == PitrFormatArg::V8
+                && cfg.wal_io_mode == WalIoModeArg::Parallel,
+            "--wal-v8-durability-sample-every requires PITR V8 Parallel I/O"
+        );
+    }
+    if let Some(sample_every) = cfg.mvcc_publication_sample_every {
+        anyhow::ensure!(
+            sample_every > 0,
+            "--mvcc-publication-sample-every must be greater than zero"
+        );
+        anyhow::ensure!(
+            cfg!(feature = "bench"),
+            "--mvcc-publication-sample-every requires a bench build"
+        );
+    }
+    if let Some(limit) = cfg.commit_order_trace_limit {
+        anyhow::ensure!(
+            limit > 0
+                && limit
+                    <= kv_engine_wrapper::mem_table::WriteProfile::MAX_COMMIT_ORDER_TRACE_RECORDS,
+            "--commit-order-trace-limit must be between 1 and the bounded record cap"
+        );
+        anyhow::ensure!(
+            cfg!(feature = "bench"),
+            "--commit-order-trace-limit requires a bench build"
+        );
+        anyhow::ensure!(
+            cfg!(target_os = "linux"),
+            "--commit-order-trace-limit requires Linux"
+        );
+        anyhow::ensure!(cfg.pitr, "--commit-order-trace-limit requires PITR");
+        anyhow::ensure!(
+            matches!(
+                cfg.pitr_format.unwrap_or(PitrFormatArg::V8),
+                PitrFormatArg::V7 | PitrFormatArg::V8
+            ),
+            "--commit-order-trace-limit requires PITR V7 or V8"
+        );
+        anyhow::ensure!(
+            cfg.wal_io_mode == WalIoModeArg::Parallel,
+            "--commit-order-trace-limit requires parallel WAL I/O"
+        );
+    }
     if cfg.prepare_golden || cfg.golden_path.is_some() || cfg.clone_golden {
         anyhow::ensure!(
             cfg.suite == Suite::SteadyState,
@@ -10110,11 +10617,15 @@ mod tests {
             ])
             .expect("parse incompatible Leader diagnostics option"),
         );
+        let leader_error = validate_config(&leader).unwrap_err().to_string();
+        let expected_leader_error = if cfg!(feature = "bench") {
+            "requires PITR V8 Parallel I/O"
+        } else {
+            "requires a bench build"
+        };
         assert!(
-            validate_config(&leader)
-                .unwrap_err()
-                .to_string()
-                .contains("requires PITR V8 Parallel I/O")
+            leader_error.contains(expected_leader_error),
+            "{leader_error}"
         );
         assert!(Args::try_parse_from(["write-perf", "--wal-hol-diagnostics"]).is_err());
     }
@@ -10153,13 +10664,156 @@ mod tests {
             ])
             .expect("parse incompatible Leader timeline option"),
         );
+        let leader_error = validate_config(&leader).unwrap_err().to_string();
+        let expected_leader_error = if cfg!(feature = "bench") {
+            "requires PITR V8 Parallel I/O"
+        } else {
+            "requires a bench build"
+        };
         assert!(
-            validate_config(&leader)
-                .unwrap_err()
-                .to_string()
-                .contains("requires PITR V8 Parallel I/O")
+            leader_error.contains(expected_leader_error),
+            "{leader_error}"
         );
         assert!(Args::try_parse_from(["write-perf", "--wal-completion-timeline"]).is_err());
+    }
+
+    #[test]
+    fn wal_v8_durability_sampling_requires_bench_build_and_v8_parallel() {
+        let parallel = HarnessConfig::from_args(
+            Args::try_parse_from([
+                "write-perf",
+                "--pitr",
+                "--wal-io-mode",
+                "parallel",
+                "--wal-v8-durability-sample-every",
+                "64",
+            ])
+            .expect("parse V8 durability sampling option"),
+        );
+        let result = validate_config(&parallel);
+        if cfg!(feature = "bench") {
+            result.expect("bench build can capture V8 durability phases");
+        } else {
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("requires a bench build")
+            );
+        }
+
+        let zero_interval = HarnessConfig::from_args(
+            Args::try_parse_from([
+                "write-perf",
+                "--pitr",
+                "--wal-v8-durability-sample-every",
+                "0",
+            ])
+            .expect("parse zero sampling interval for validation"),
+        );
+        assert!(
+            validate_config(&zero_interval)
+                .unwrap_err()
+                .to_string()
+                .contains("greater than zero")
+        );
+
+        let leader = HarnessConfig::from_args(
+            Args::try_parse_from([
+                "write-perf",
+                "--pitr",
+                "--wal-io-mode",
+                "leader",
+                "--wal-v8-durability-sample-every",
+                "64",
+            ])
+            .expect("parse incompatible Leader sampling option"),
+        );
+        let leader_error = validate_config(&leader).unwrap_err().to_string();
+        let expected_leader_error = if cfg!(feature = "bench") {
+            "requires PITR V8 Parallel I/O"
+        } else {
+            "requires a bench build"
+        };
+        assert!(
+            leader_error.contains(expected_leader_error),
+            "{leader_error}"
+        );
+        assert!(
+            Args::try_parse_from(["write-perf", "--wal-v8-durability-sample-every", "64"]).is_err()
+        );
+    }
+
+    #[test]
+    fn commit_order_trace_requires_bench_linux_and_parallel_pitr() {
+        let parallel = HarnessConfig::from_args(
+            Args::try_parse_from([
+                "write-perf",
+                "--pitr",
+                "--pitr-format",
+                "v8",
+                "--wal-io-mode",
+                "parallel",
+                "--commit-order-trace-limit",
+                "128",
+            ])
+            .expect("parse commit-order trace option"),
+        );
+        let parallel_result = validate_config(&parallel);
+        if cfg!(all(feature = "bench", target_os = "linux")) {
+            parallel_result.expect("Linux bench build can trace parallel PITR writes");
+        } else {
+            let error = parallel_result.unwrap_err().to_string();
+            let expected = if cfg!(feature = "bench") {
+                "requires Linux"
+            } else {
+                "requires a bench build"
+            };
+            assert!(error.contains(expected), "{error}");
+        }
+
+        let leader = HarnessConfig::from_args(
+            Args::try_parse_from([
+                "write-perf",
+                "--pitr",
+                "--pitr-format",
+                "v8",
+                "--wal-io-mode",
+                "leader",
+                "--commit-order-trace-limit",
+                "128",
+            ])
+            .expect("parse incompatible Leader trace option"),
+        );
+        let error = validate_config(&leader).unwrap_err().to_string();
+        let expected = if !cfg!(feature = "bench") {
+            "requires a bench build"
+        } else if !cfg!(target_os = "linux") {
+            "requires Linux"
+        } else {
+            "requires parallel WAL I/O"
+        };
+        assert!(error.contains(expected), "{error}");
+
+        let zero_limit = HarnessConfig::from_args(
+            Args::try_parse_from([
+                "write-perf",
+                "--pitr",
+                "--pitr-format",
+                "v7",
+                "--wal-io-mode",
+                "parallel",
+                "--commit-order-trace-limit",
+                "0",
+            ])
+            .expect("parse zero trace limit for validation"),
+        );
+        assert!(
+            validate_config(&zero_limit)
+                .unwrap_err()
+                .to_string()
+                .contains("between 1 and the bounded record cap")
+        );
     }
 
     #[derive(Debug, Deserialize)]
@@ -11361,6 +12015,9 @@ mod tests {
             wal_sync_diagnostics: false,
             wal_hol_diagnostics: false,
             wal_completion_timeline: false,
+            wal_v8_durability_sample_every: None,
+            mvcc_publication_sample_every: None,
+            commit_order_trace_limit: None,
             vlog_override: false,
             profile: true,
             clients: 1,
@@ -13900,6 +14557,9 @@ mod tests {
             wal_sync_diagnostics: false,
             wal_hol_diagnostics: false,
             wal_completion_timeline: false,
+            wal_v8_durability_sample_every: None,
+            mvcc_publication_sample_every: None,
+            commit_order_trace_limit: None,
             vlog_override: false,
             profile: false,
             clients: 1,

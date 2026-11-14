@@ -1816,6 +1816,14 @@ struct CompactionFilterRegistry {
     next_compaction_filter_id: u64,
 }
 
+#[derive(Default)]
+struct PutAckTiming {
+    #[cfg(feature = "bench")]
+    observation: Option<crate::mem_table::WalV8AckObservation>,
+    #[cfg(feature = "bench")]
+    wal_return_at: Option<std::time::Instant>,
+}
+
 impl CompactionFilterRegistry {
     fn snapshot_filters(&self) -> Vec<InstalledCompactionFilter> {
         self.active_filters.values().cloned().collect()
@@ -10067,6 +10075,66 @@ impl KvEngine {
     }
 
     #[cfg(feature = "bench")]
+    /// Sample synchronous MVCC publication internals for benchmark runs.
+    /// Passing `None` disables sampling and clears previously retained samples.
+    pub fn set_mvcc_publication_sample_every(&self, sample_every: Option<u64>) -> Result<()> {
+        anyhow::ensure!(
+            sample_every.is_none_or(|every| every > 0),
+            "MVCC publication sample interval must be greater than zero"
+        );
+        if let Some(mvcc) = self.inner.mvcc.as_deref() {
+            mvcc.set_benchmark_publication_sample_every(sample_every.unwrap_or_default());
+        } else {
+            anyhow::ensure!(
+                sample_every.is_none(),
+                "MVCC publication sampling requires MVCC to be enabled"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[cfg(feature = "bench")]
+    /// Capture a bounded, per-Put event trace from commit timestamp reservation through MVCC
+    /// publication. The trace records the first `limit` reservations after it is enabled.
+    /// Passing `None` disables tracing and clears retained records.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the record limit exceeds the hard cap or tracing is requested on a
+    /// non-Linux target.
+    pub fn set_commit_order_trace_limit(&self, limit: Option<u64>) -> Result<()> {
+        let limit = limit.unwrap_or_default();
+        anyhow::ensure!(
+            limit <= crate::mem_table::WriteProfile::MAX_COMMIT_ORDER_TRACE_RECORDS,
+            "commit-order trace limit exceeds the bounded record cap"
+        );
+        #[cfg(not(target_os = "linux"))]
+        anyhow::ensure!(limit == 0, "commit-order tracing requires Linux");
+
+        self.inner.write_profile.configure_commit_order_trace(limit);
+
+        Ok(())
+    }
+
+    #[cfg(feature = "bench")]
+    /// Snapshot the bounded cross-stage commit-order trace.
+    pub fn commit_order_trace_snapshot(&self) -> crate::mem_table::CommitOrderTraceSnapshot {
+        self.inner.write_profile.commit_order_trace_snapshot()
+    }
+
+    #[cfg(feature = "bench")]
+    /// Snapshot bounded samples from synchronous MVCC publication.
+    pub fn mvcc_publication_diagnostics(
+        &self,
+    ) -> Option<crate::mvcc::MvccPublicationDiagnosticsSnapshot> {
+        self.inner
+            .mvcc
+            .as_deref()
+            .map(crate::mvcc::LsmMvccInner::benchmark_publication_diagnostics)
+    }
+
+    #[cfg(feature = "bench")]
     /// Enable detailed WAL sync observations for the active WAL.
     ///
     /// Diagnostics must be enabled before its first ticket is admitted. They
@@ -10134,6 +10202,79 @@ impl KvEngine {
         self.inner
             .write_profile
             .wal_v8_completion_timeline_dropped_samples()
+    }
+
+    #[cfg(feature = "bench")]
+    /// Sample every Nth completed V8 Parallel durability advance and follower
+    /// wait. Driver attempt counters are also collected while enabled.
+    /// Passing `None` disables phase timing and counters.
+    pub fn set_wal_v8_durability_sample_every(&self, sample_every: Option<u64>) -> Result<()> {
+        anyhow::ensure!(
+            sample_every.is_none_or(|every| every > 0),
+            "durability phase sample interval must be greater than zero"
+        );
+        let _active_memtable = self.inner.active_memtable_lock.read();
+        self.inner
+            .write_profile
+            .set_wal_v8_durability_sample_every(sample_every.unwrap_or_default());
+
+        Ok(())
+    }
+
+    #[cfg(feature = "bench")]
+    /// Samples captured by the opt-in V8 Parallel durability phase diagnostics.
+    pub fn wal_v8_durability_phase_observations(
+        &self,
+    ) -> Vec<crate::mem_table::WalV8DurabilityPhaseObservation> {
+        self.inner
+            .write_profile
+            .wal_v8_durability_phase_observations()
+    }
+
+    #[cfg(feature = "bench")]
+    /// Driver-attempt, advance, and retained-sample counts for V8 diagnostics.
+    pub fn wal_v8_durability_diagnostic_counts(
+        &self,
+    ) -> crate::mem_table::WalV8DurabilityDiagnosticCounts {
+        self.inner
+            .write_profile
+            .wal_v8_durability_diagnostic_counts()
+    }
+
+    #[cfg(feature = "bench")]
+    /// Number of selected phase samples omitted after an advance failure or the sample cap.
+    pub fn wal_v8_durability_phase_dropped_samples(&self) -> u64 {
+        self.inner
+            .write_profile
+            .wal_v8_durability_phase_dropped_samples()
+    }
+
+    #[cfg(feature = "bench")]
+    /// Sampled V8 durable-publish through Put-return stage measurements.
+    pub fn wal_v8_ack_observations(&self) -> Vec<crate::mem_table::WalV8AckObservation> {
+        self.inner.write_profile.wal_v8_ack_observations()
+    }
+
+    #[cfg(feature = "bench")]
+    /// Number of caller-side V8 ACK samples omitted by bounded storage or missing stamps.
+    pub fn wal_v8_ack_dropped_samples(&self) -> u64 {
+        self.inner.write_profile.wal_v8_ack_dropped_samples()
+    }
+
+    #[cfg(feature = "bench")]
+    /// Sampled callers that waited for the active V8 Parallel durability driver.
+    pub fn wal_v8_follower_wait_observations(
+        &self,
+    ) -> Vec<crate::mem_table::WalV8FollowerWaitObservation> {
+        self.inner.write_profile.wal_v8_follower_wait_observations()
+    }
+
+    #[cfg(feature = "bench")]
+    /// Number of sampled follower waits dropped after reaching the bounded limit.
+    pub fn wal_v8_follower_wait_dropped_samples(&self) -> u64 {
+        self.inner
+            .write_profile
+            .wal_v8_follower_wait_dropped_samples()
     }
 
     /// I/O flags and inode identity for the active V8 WAL handles.
@@ -16887,6 +17028,27 @@ impl LsmStorageInner {
         Ok(())
     }
 
+    #[cfg(feature = "bench")]
+    fn commit_wal_ticket_or_poison_with_publish_timestamp(
+        memtable: &MemTable,
+        ticket: Option<u64>,
+        mvcc: Option<&crate::mvcc::LsmMvccInner>,
+        commit_ts: u64,
+    ) -> Result<Option<std::time::Instant>> {
+        match memtable.commit_wal_ticket_with_publish_timestamp(ticket) {
+            Ok(published_at) => Ok(published_at),
+            Err(error) => {
+                if commit_ts > 0
+                    && let Some(mvcc) = mvcc
+                {
+                    mvcc.poison_commit_ts(commit_ts);
+                }
+
+                Err(error)
+            }
+        }
+    }
+
     /// Write a batch through MVCC (used by transaction commit).
     pub(crate) fn mvcc_write_batch(
         &self,
@@ -19134,11 +19296,24 @@ impl LsmStorageInner {
         allow_lifecycle_closing: bool,
     ) -> Result<()> {
         let mut retries = 0;
+        let mut ack_timing = PutAckTiming::default();
 
         loop {
             let expected_memtable = self.state.load().memtable.clone();
-            match self.put_once(key, value) {
-                Ok(()) => return Ok(()),
+            match self.put_once(key, value, &mut ack_timing) {
+                Ok(()) => {
+                    #[cfg(feature = "bench")]
+                    if let (Some(mut observation), Some(wal_return_at)) =
+                        (ack_timing.observation.take(), ack_timing.wal_return_at)
+                    {
+                        observation.wal_return_to_put_return_ns =
+                            wal_return_at.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+                        self.write_profile
+                            .record_wal_v8_ack_observation(observation);
+                    }
+
+                    return Ok(());
+                }
                 Err(error) => {
                     self.retry_after_capacity_error_with_admission(
                         error,
@@ -19151,7 +19326,8 @@ impl LsmStorageInner {
         }
     }
 
-    fn put_once(&self, key: &[u8], value: &[u8]) -> Result<()> {
+    fn put_once(&self, key: &[u8], value: &[u8], ack_timing: &mut PutAckTiming) -> Result<()> {
+        *ack_timing = PutAckTiming::default();
         anyhow::ensure!(
             !(value.len() == 1 && value[0] == crate::vlog::KvKind::Tombstone as u8),
             "value must not be the tombstone marker byte (0x02)"
@@ -19195,6 +19371,16 @@ impl LsmStorageInner {
                     ticket,
                 )
             };
+            #[cfg(feature = "bench")]
+            let durable_published_at = Self::commit_wal_ticket_or_poison_with_publish_timestamp(
+                &memtable,
+                ticket,
+                self.mvcc.as_deref(),
+                publish_data
+                    .as_ref()
+                    .map_or(0, |(commit_ts, _, _)| *commit_ts),
+            )?;
+            #[cfg(not(feature = "bench"))]
             Self::commit_wal_ticket_or_poison(
                 &memtable,
                 ticket,
@@ -19203,6 +19389,25 @@ impl LsmStorageInner {
                     .as_ref()
                     .map_or(0, |(commit_ts, _, _)| *commit_ts),
             )?;
+            #[cfg(feature = "bench")]
+            if let (Some(ticket), Some((commit_ts, _, _))) = (ticket, publish_data.as_ref()) {
+                memtable
+                    .write_profile()
+                    .record_commit_order_wal_return(*commit_ts, ticket);
+            }
+            #[cfg(feature = "bench")]
+            if let (Some(ticket), Some(durable_published_at)) = (ticket, durable_published_at) {
+                ack_timing.wal_return_at = Some(std::time::Instant::now());
+                ack_timing.observation = Some(crate::mem_table::WalV8AckObservation {
+                    ticket,
+                    durable_publish_to_wal_return_ns: durable_published_at
+                        .elapsed()
+                        .as_nanos()
+                        .min(u64::MAX as u128)
+                        as u64,
+                    ..crate::mem_table::WalV8AckObservation::default()
+                });
+            }
             #[cfg(test)]
             if let Some((commit_ts, _, _)) = publish_data.as_ref() {
                 self.pause_native_write_blocking(
@@ -19212,6 +19417,11 @@ impl LsmStorageInner {
             }
             // Publish to skiplist + bloom AFTER WAL sync succeeds.
             if let Some((commit_ts, encoded_key, prefixed_val)) = publish_data {
+                #[cfg(feature = "bench")]
+                let publish_started = ack_timing
+                    .observation
+                    .is_some()
+                    .then(std::time::Instant::now);
                 if let Some(ref mvcc) = self.mvcc {
                     Self::publish_raw_batch_or_poison(
                         &memtable,
@@ -19228,12 +19438,50 @@ impl LsmStorageInner {
                         prefixed_val.as_slice(),
                     )])?;
                 }
+                #[cfg(feature = "bench")]
+                memtable
+                    .write_profile()
+                    .record_commit_order_memtable_publish_complete(commit_ts);
+                #[cfg(feature = "bench")]
+                if let (Some(started), Some(observation)) =
+                    (publish_started, ack_timing.observation.as_mut())
+                {
+                    if let Some(wal_return_at) = ack_timing.wal_return_at {
+                        observation.wal_return_to_memtable_start_ns = started
+                            .saturating_duration_since(wal_return_at)
+                            .as_nanos()
+                            .min(u64::MAX as u128)
+                            as u64;
+                    }
+                    observation.memtable_publish_wall_ns =
+                        started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+                }
                 // Advance current_ts AFTER publish — readers must not see the
                 // timestamp before data is visible in the skiplist.
                 if commit_ts > 0
                     && let Some(ref mvcc) = self.mvcc
                 {
+                    #[cfg(feature = "bench")]
+                    memtable
+                        .write_profile()
+                        .record_commit_order_mvcc_publication_entry(commit_ts);
+                    #[cfg(feature = "bench")]
+                    let publish_commit_started = ack_timing
+                        .observation
+                        .is_some()
+                        .then(std::time::Instant::now);
                     mvcc.publish_commit_ts(commit_ts)?;
+                    #[cfg(feature = "bench")]
+                    memtable
+                        .write_profile()
+                        .record_commit_order_mvcc_publication_complete(commit_ts);
+                    #[cfg(feature = "bench")]
+                    if let (Some(started), Some(observation)) =
+                        (publish_commit_started, ack_timing.observation.as_mut())
+                    {
+                        observation.mvcc_publish_commit_ts_ns =
+                            started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+                    }
                 }
                 if self.options.serializable
                     && let Some(ref mvcc) = self.mvcc

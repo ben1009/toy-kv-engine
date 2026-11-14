@@ -356,12 +356,14 @@ On flush and compaction, newly produced SST blocks are inserted into the block c
 
 ## GCP Benchmark Workflow
 
-For GCP WAL benchmarks, read `docs/wal/benchmarks/gcp-free-trial-wal-bench.md` and
-`infra/gcp/test-environment/README.md` first. Reuse the project, zone, SSH source
-CIDR, and spend limits already supplied in the active session instead of asking
-for them again. Pass the project explicitly to every cloud command. Do not put
-project identifiers, public IPs, credentials, access tokens, or private keys in
-tracked files.
+For any GCP work, first fetch and read the current
+[`infra/gcp/test-environment/README.md`](https://github.com/ben1009/toy-kv-engine/blob/main/infra/gcp/test-environment/README.md)
+from `main`, before running `gcloud`, Terraform, SSH, or other cloud commands.
+Then read `docs/wal/benchmarks/gcp-free-trial-wal-bench.md` for WAL-specific
+work. Reuse the project, zone, SSH source CIDR, and spend limits already supplied
+in the active session instead of asking for them again. Pass the project
+explicitly to every cloud command. Do not put project identifiers, public IPs,
+credentials, access tokens, or private keys in tracked files.
 
 Before creating the benchmark VM:
 
@@ -389,11 +391,24 @@ experimental source patches and runner changes isolated from PR branches; record
 the source commit and patch checksum with the results. Profiling or Hotpath runs
 are diagnostic and must not be reported as unprofiled throughput scores.
 
-After collection, verify the VM, boot disk, temporary SSH rule, route, subnet,
-and isolated VPC are deleted. Copy the result artifacts locally before teardown
-and report the result directory, observed I/O metadata, cleanup verification,
-and any failed or incomplete steps. PR #549 is explicitly not authorized to
-merge unless the user changes that instruction.
+If a benchmark was attempted or remote execution is uncertain and the local
+result set is missing or unverified, retain the VM, boot disk, temporary SSH
+rule, isolated VPC, subnet, route, and Terraform state. Do not run
+`terraform destroy` or delete cloud resources while they may be the only copy
+of completed results. Use the saved reconnect instructions to recover them.
+Treat a result set as verified only after the transferred archive checksum
+passes and both the archive and checksum metadata are retained locally.
+Require `summary.json` to report `complete: true` with matching
+planned/completed run counts, and `remote-exit.json` to report `failed: false`
+with `runs_started` matching the planned count. Validate the benchmark plan for
+normal matrices, or `profile-schedule.tsv` and the profile summary for
+`v8-small-ticket-profile`. In either suite, require every planned run ID to have
+a successful `result.json` and matching `run-metadata.json` in the same local
+run directory. Only then tear down the VM and temporary firewall,
+destroy the isolated Terraform network, verify all resources are absent, and
+report the result directory, observed I/O metadata, cleanup verification, and
+any failed or incomplete steps. PR #549 is explicitly not authorized to merge
+unless the user changes that instruction.
 
 ## Useful Binaries
 

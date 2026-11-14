@@ -32,6 +32,11 @@ LEGACY_ORDERS = (
     ("v4", "v7", "v8", "v8", "v7", "v4"),
     ("v8", "v7", "v4", "v4", "v7", "v8"),
 )
+COMMIT_ORDER_TRACE_LIMIT = 1_024
+COMMIT_ORDER_TRACE_REPETITIONS = 5
+COMMIT_ORDER_TRACE_WRITERS = 16
+COMMIT_ORDER_TRACE_NUM = 100_000
+COMMIT_ORDER_TRACE_ORDERS = (("v7_parallel", "v8_parallel"), ("v8_parallel", "v7_parallel"))
 
 
 def validate_writer_counts(values: Iterable[int]) -> tuple[int, ...]:
@@ -80,6 +85,87 @@ def build_batch64_schedule(writers: Iterable[int]) -> list[dict[str, int | str]]
                     "arm": arm,
                 })
     return schedule
+
+
+def build_commit_order_trace_schedule() -> list[dict[str, int | str]]:
+    """Return two trace captures and five counterbalanced, untraced Point pairs."""
+    schedule: list[dict[str, int | str]] = []
+    for arm in ("v7_parallel", "v8_parallel"):
+        schedule.append({
+            "run_index": len(schedule) + 1,
+            "writer": COMMIT_ORDER_TRACE_WRITERS,
+            "workload": "point",
+            "phase": "trace",
+            "repetition": 0,
+            "arm": arm,
+            "trace_limit": COMMIT_ORDER_TRACE_LIMIT,
+            "bench": "wal_concurrent",
+            "batch_entries": 1,
+            "num": COMMIT_ORDER_TRACE_NUM,
+            "sample_every": 100,
+        })
+
+    for repetition in range(1, COMMIT_ORDER_TRACE_REPETITIONS + 1):
+        order = COMMIT_ORDER_TRACE_ORDERS[(repetition - 1) % len(COMMIT_ORDER_TRACE_ORDERS)]
+        for arm in order:
+            schedule.append({
+                "run_index": len(schedule) + 1,
+                "writer": COMMIT_ORDER_TRACE_WRITERS,
+                "workload": "point",
+                "phase": "score",
+                "repetition": repetition,
+                "arm": arm,
+                "trace_limit": 0,
+                "bench": "wal_concurrent",
+                "batch_entries": 1,
+                "num": COMMIT_ORDER_TRACE_NUM,
+                "sample_every": 100,
+            })
+    return schedule
+
+
+def build_commit_order_trace_plan(
+    *, machine_type: str, machine_spec: Mapping[str, int], commit: str | None = None,
+    binary_sha256: str | None = None, source_patch_sha256: str | None = None,
+) -> dict[str, object]:
+    schedule = build_commit_order_trace_schedule()
+    plan: dict[str, object] = {
+        "suite": "commit-order-trace",
+        "writers": [COMMIT_ORDER_TRACE_WRITERS],
+        "formats": ["v7_parallel", "v8_parallel"],
+        "workloads": [{
+            "name": "point", "bench": "wal_concurrent", "batch_entries": 1,
+            "num": COMMIT_ORDER_TRACE_NUM, "sample_every": 100,
+        }],
+        "trace_records_per_diagnostic_run": COMMIT_ORDER_TRACE_LIMIT,
+        "untraced_pairs_planned": COMMIT_ORDER_TRACE_REPETITIONS,
+        "runs_planned": len(schedule),
+        "score_runs_planned": COMMIT_ORDER_TRACE_REPETITIONS * 2,
+        "counterbalanced": True,
+        "qualification_note": (
+            "Trace runs are diagnostic only; throughput comparisons use separate runs without the "
+            "commit-order trace."
+        ),
+    }
+    if commit is not None:
+        plan["commit"] = commit
+    if binary_sha256 is not None:
+        plan["binary_sha256"] = binary_sha256
+    if source_patch_sha256 is not None:
+        plan["source_patch_sha256"] = source_patch_sha256
+    vcpus = int(machine_spec["vcpus"])
+    ssd_count = int(machine_spec["ssd_count"])
+    layout = "single Local SSD" if ssd_count == 1 else f"RAID0 over {ssd_count} Local SSDs"
+    plan.update({
+        "machine_type": machine_type,
+        "vcpus": vcpus,
+        "local_ssd_count": ssd_count,
+        "local_ssd_total_gib": int(machine_spec["ssd_gib"]),
+        "runtime_protocol": f"single {vcpus}-vCPU host; {layout}",
+        "value_bytes": 1024,
+        "compaction": "none",
+    })
+    return plan
 
 
 def build_benchmark_plan(
@@ -210,3 +296,13 @@ def validate_batch64_rows(rows: Iterable[Mapping[str, object]], writers: Iterabl
         for item in schedule
     }
     return _validate_rows(rows, expected, ("writer", "block", "position", "format"))
+
+
+def validate_commit_order_trace_rows(rows: Iterable[Mapping[str, object]]) -> dict[str, object]:
+    schedule = build_commit_order_trace_schedule()
+    expected = {
+        (int(item["writer"]), str(item["phase"]), int(item["repetition"]), str(item["arm"])):
+        int(item["num"])
+        for item in schedule
+    }
+    return _validate_rows(rows, expected, ("writer", "phase", "repetition", "arm"))

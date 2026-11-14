@@ -8,22 +8,35 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shutil
+import stat
 import struct
 import subprocess
-import stat
 import tempfile
+import tarfile
 import time
 import unittest
 from unittest.mock import patch
 
 from gcp_wal_matrix import (
+    COMMIT_ORDER_TRACE_NUM,
+    COMMIT_ORDER_TRACE_WRITERS,
     FULL_DEFAULT_WRITERS,
     LEGACY_DEFAULT_WRITERS,
     build_benchmark_plan,
     build_batch64_schedule,
+    build_commit_order_trace_plan,
+    build_commit_order_trace_schedule,
     build_rfc026_schedule,
+    validate_commit_order_trace_rows,
     validate_batch64_rows,
     validate_rfc026_rows,
+)
+from gcp_commit_order_trace_runner import (
+    TRACE_STAGES,
+    _inversion_count,
+    analyze_trace,
+    summarize_score_pairs,
 )
 from gcp_wal_profile_runner import (
     _expected_frontier_mode_for_arm,
@@ -130,6 +143,64 @@ def fake_keygen(command, **_kwargs):
 
 
 class GcpFreeTrialWalBenchTests(unittest.TestCase):
+    def _make_result_bundle(
+        self, root: Path, *, complete: bool, include_run_metadata: bool = True,
+    ) -> Path:
+        # Match the VM layout so archive paths are rooted at "results/".
+        results = root / "results"
+        results.mkdir(parents=True)
+        plan = build_benchmark_plan(
+            full_matrix=False, writers=(16,), machine_type=BENCH.MACHINE_TYPE,
+            machine_spec=BENCH.MACHINE_SPECS[BENCH.MACHINE_TYPE], num=64,
+        )
+        (results / "benchmark-plan.json").write_text(json.dumps(plan), encoding="utf-8")
+        (results / "rfc026-schedule.tsv").write_text("run_index\n", encoding="utf-8")
+        (results / "summary.tsv").write_text("writer\tblock\tposition\tformat\texit_code\n", encoding="utf-8")
+        schedule = build_batch64_schedule((16,))
+        rows = []
+        for run in schedule:
+            run_id = BENCH._run_identifier(run, "batch64")
+            run_dir = results / run_id
+            run_dir.mkdir()
+            exit_code = 0 if complete or run != schedule[-1] else 1
+            row = {
+                "writer": run["writer"], "block": run["block"], "position": run["position"],
+                "format": run["arm"], "exit_code": exit_code,
+            }
+            rows.append(row)
+            (run_dir / "result.json").write_text(json.dumps({"result": {"ops_per_sec": 123}}), encoding="utf-8")
+            if include_run_metadata:
+                (run_dir / "run-metadata.json").write_text(json.dumps(row), encoding="utf-8")
+            (run_dir / "stderr.log").write_text("", encoding="utf-8")
+            (run_dir / "timeline.json").write_text("{}\n", encoding="utf-8")
+        (results / "summary.json").write_text(json.dumps({
+            "complete": complete, "runs_planned": len(schedule), "runs_completed": len(schedule),
+            "matrix_validation": {
+                "complete": complete, "planned": len(schedule), "observed": len(schedule),
+            },
+            "results": [{key: str(value) for key, value in row.items()} for row in rows],
+        }), encoding="utf-8")
+        (results / "remote-exit.json").write_text(json.dumps({
+            "failed": not complete, "runs_started": len(schedule),
+        }), encoding="utf-8")
+        (results / "profile-schedule.tsv").write_text("writer\tworkload\n", encoding="utf-8")
+        (results / "rust-toolchain.txt").write_text("nightly\n", encoding="utf-8")
+        return results
+
+    def _run_remote_bundle(self, command: str, results_root: Path, temp_root: Path) -> subprocess.CompletedProcess[str]:
+        remote_root = "GCP_WAL_RESULTS_ROOT=/mnt/gcp-wal-bench/results"
+        command = command.replace(remote_root, f"GCP_WAL_RESULTS_ROOT={BENCH.shlex.quote(str(results_root))}")
+        bundle_tmp = temp_root / "remote-tmp"
+        bundle_tmp.mkdir(exist_ok=True)
+        environment = {**os.environ, "TMPDIR": str(bundle_tmp)}
+        return subprocess.run(
+            ["bash", "-euc", command], capture_output=True, text=True, check=False, env=environment,
+        )
+
+    @staticmethod
+    def _archive_metadata(output: str) -> dict[str, str]:
+        return dict(line.split("=", 1) for line in output.splitlines() if "=" in line)
+
     def test_benchmark_record_loader_requires_exactly_one_valid_json_record(self) -> None:
         valid = json.dumps({"result": {}, "params": {}, "latency": {}})
         with tempfile.TemporaryDirectory() as temp:
@@ -153,6 +224,24 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
         }
         pipeline = {"wal_io_start": handles, "wal_io_end": handles, "wal_io_stable": True}
         self.assertEqual(_validate_wal_io_metadata(pipeline, 8), {
+            "wal_data_o_direct": True,
+            "wal_frontier_o_direct": False,
+            "wal_sync_o_direct": False,
+            "wal_io_device": 7,
+            "wal_io_inode": 11,
+        })
+        evolving_extent_metadata = {
+            "wal_io_start": {
+                **handles,
+                "sliding_extent_preparation": {"fallocate_calls": 0, "allocated_bytes": 0},
+            },
+            "wal_io_end": {
+                **handles,
+                "sliding_extent_preparation": {"fallocate_calls": 104, "allocated_bytes": 436207616},
+            },
+            "wal_io_stable": True,
+        }
+        self.assertEqual(_validate_wal_io_metadata(evolving_extent_metadata, 8), {
             "wal_data_o_direct": True,
             "wal_frontier_o_direct": False,
             "wal_sync_o_direct": False,
@@ -237,19 +326,50 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
         self.assertTrue(retained_profile.keep_vm_after_run)
         profile_subset = BENCH.parse_args([*common, "--v8-small-ticket-profile", "--writers", "8"])
         self.assertEqual(profile_subset.writers, (8,))
+        trace_args = [
+            *common, "--commit-order-trace", "--num", "100000", "--source-patch-sha256", "a" * 64,
+        ]
+        trace = BENCH.parse_args(trace_args)
+        self.assertEqual(trace.writers, (16,))
+        self.assertEqual(trace.machine_type, "c4-standard-16-lssd")
+        with self.assertRaises(SystemExit):
+            BENCH.parse_args([*trace_args, "--writers", "8"])
+        with self.assertRaises(SystemExit):
+            BENCH.parse_args([*common, "--commit-order-trace", "--num", "100000"])
         with self.assertRaises(SystemExit):
             BENCH.parse_args([*common, "--writers", "2", "2"])
         with self.assertRaises(SystemExit):
             BENCH.parse_args([*common, "--v8-small-ticket-profile", "--full-rfc026-matrix"])
 
-    def test_vm_retention_requires_successful_run_and_collected_artifacts(self) -> None:
+    def test_vm_retention_keeps_unverified_benchmark_for_artifact_recovery(self) -> None:
         args = BENCH.argparse.Namespace(keep_vm_after_run=True)
-        complete = {"created": True, "benchmark_started": True, "collected": True}
+        complete = {
+            "created": True,
+            "benchmark_attempted": True,
+            "benchmark_started": True,
+            "collected": True,
+            "results_verified": True,
+        }
         self.assertTrue(BENCH.should_retain_vm(args, 0, complete))
-        self.assertFalse(BENCH.should_retain_vm(args, 1, complete))
+        self.assertTrue(BENCH.should_retain_vm(args, 1, complete))
         self.assertFalse(BENCH.should_retain_vm(args, 0, {**complete, "collected": False}))
         self.assertFalse(BENCH.should_retain_vm(
             BENCH.argparse.Namespace(keep_vm_after_run=False), 0, complete,
+        ))
+        self.assertTrue(BENCH.should_retain_vm(
+            BENCH.argparse.Namespace(keep_vm_after_run=False),
+            1,
+            {"created": True, "benchmark_attempted": True, "results_verified": False},
+        ))
+        self.assertTrue(BENCH.should_retain_vm(
+            BENCH.argparse.Namespace(keep_vm_after_run=False),
+            1,
+            {"created": True, "remote_execution_uncertain": True, "results_verified": False},
+        ))
+        self.assertFalse(BENCH.should_retain_vm(
+            BENCH.argparse.Namespace(keep_vm_after_run=False),
+            1,
+            {"created": True, "benchmark_attempted": False, "results_verified": False},
         ))
 
     def test_retained_vm_reconnect_instructions_include_quoted_firewall_cleanup(self) -> None:
@@ -291,6 +411,242 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
         self.assertEqual(profile["runs_planned"], 28)
         self.assertEqual(profile["perf_captures_planned"], 7)
         self.assertTrue(profile["diagnostic_only"])
+
+    def test_commit_order_trace_schedule_is_bounded_and_counterbalanced(self) -> None:
+        schedule = build_commit_order_trace_schedule()
+        self.assertEqual(len(schedule), 12)
+        self.assertEqual(sum(row["phase"] == "trace" for row in schedule), 2)
+        score_rows = [row for row in schedule if row["phase"] == "score"]
+        self.assertEqual(len(score_rows), 10)
+        self.assertTrue(all(row["writer"] == COMMIT_ORDER_TRACE_WRITERS for row in schedule))
+        self.assertTrue(all(row["num"] == COMMIT_ORDER_TRACE_NUM for row in schedule))
+        self.assertEqual(
+            [tuple(row["arm"] for row in score_rows[index:index + 2]) for index in range(0, 10, 2)],
+            [
+                ("v7_parallel", "v8_parallel"),
+                ("v8_parallel", "v7_parallel"),
+                ("v7_parallel", "v8_parallel"),
+                ("v8_parallel", "v7_parallel"),
+                ("v7_parallel", "v8_parallel"),
+            ],
+        )
+        validation = validate_commit_order_trace_rows([{
+            "writer": row["writer"], "workload": row["workload"], "phase": row["phase"],
+            "repetition": row["repetition"], "arm": row["arm"], "ops": row["num"], "exit_code": 0,
+        } for row in schedule])
+        self.assertTrue(validation["complete"])
+        plan = build_commit_order_trace_plan(
+            machine_type="c4-standard-16-lssd",
+            machine_spec={"vcpus": 16, "ssd_count": 2, "ssd_gib": 750},
+        )
+        self.assertEqual(plan["runs_planned"], 12)
+        self.assertEqual(plan["trace_records_per_diagnostic_run"], 1024)
+
+    def test_commit_order_trace_analyzer_counts_stage_inversions_and_pairs(self) -> None:
+        self.assertEqual(_inversion_count([1, 3, 2]), 1)
+        records = []
+        for commit_ts in (1, 2, 3):
+            record = {
+                "commit_ts": commit_ts, "wal_ticket": commit_ts - 1,
+                "frontier_ticket_end": commit_ts,
+            }
+            for stage_index, stage in enumerate(TRACE_STAGES):
+                order = (3 - commit_ts) if stage_index >= 3 else commit_ts
+                record[stage] = {
+                    "monotonic_ns": stage_index * 100_000 + order * 1_000 + commit_ts,
+                    "sequence": commit_ts * 10 + stage_index,
+                    "thread_id": 1,
+                }
+            records.append(record)
+        analysis = analyze_trace({"records": records})
+        self.assertEqual(analysis["complete_records"], 3)
+        self.assertEqual(analysis["pairwise_timestamp_inversions"]["wal_return"]["timestamp_inversion_pairs"], 3)
+        self.assertEqual(analysis["pairwise_timestamp_inversions"]["timestamp_reserved"]["timestamp_inversion_pairs"], 0)
+        self.assertEqual(analysis["pairwise_timestamp_inversions"]["wal_return"]["timestamp_tie_pairs_excluded"], 0)
+
+        tied_records = []
+        for commit_ts in (1, 2, 3):
+            record = {
+                "commit_ts": commit_ts, "wal_ticket": commit_ts - 1,
+                "frontier_ticket_end": commit_ts,
+            }
+            for stage_index, stage in enumerate(TRACE_STAGES):
+                monotonic_ns = 1 if stage == "durable_frontier_published" else stage_index + 1
+                record[stage] = {
+                    "monotonic_ns": monotonic_ns, "sequence": commit_ts * 10 + stage_index, "thread_id": 1,
+                }
+            tied_records.append(record)
+        tied_analysis = analyze_trace({"records": tied_records})
+        frontier_order = tied_analysis["pairwise_timestamp_inversions"]["durable_frontier_published"]
+        self.assertEqual(frontier_order["timestamp_pair_count"], 0)
+        self.assertEqual(frontier_order["timestamp_tie_pairs_excluded"], 3)
+        self.assertIsNone(frontier_order["timestamp_inversion_rate"])
+
+        with self.assertRaisesRegex(ValueError, "incomplete"):
+            analyze_trace({"records": [{"commit_ts": 1}]})
+
+        score_rows = [
+            {"phase": "score", "repetition": 1, "arm": "v7_parallel", "exit_code": 0,
+             "puts_per_second": 100.0, "p99_ms": 1.0, "cpu_seconds": 1.2},
+            {"phase": "score", "repetition": 1, "arm": "v8_parallel", "exit_code": 0,
+             "puts_per_second": 110.0, "p99_ms": 0.9, "cpu_seconds": 1.1},
+        ]
+        paired = summarize_score_pairs(score_rows)
+        self.assertEqual(paired["paired_runs"], 1)
+        self.assertEqual(paired["v8_throughput_wins"], 1)
+        self.assertAlmostEqual(paired["median_paired_change_pct_v8_vs_v7"]["throughput_pct"], 10.0)
+
+    def test_commit_order_trace_analyzer_splits_wal_returns_by_group_and_size(self) -> None:
+        records = []
+        for commit_ts, ticket, frontier_end, return_order in (
+            (1, 0, 3, 40),
+            (2, 1, 3, 10),
+            (3, 2, 3, 10),
+            (4, 3, 5, 20),
+            (5, 4, 5, 30),
+            (6, 5, 7, 50),
+        ):
+            record = {
+                "commit_ts": commit_ts,
+                "wal_ticket": ticket,
+                "frontier_ticket_end": frontier_end,
+            }
+            for stage_index, stage in enumerate(TRACE_STAGES):
+                monotonic_ns = stage_index * 100_000 + commit_ts * 10
+                if stage == "wal_return":
+                    monotonic_ns = 300_000 + return_order * 1_000
+                record[stage] = {
+                    "monotonic_ns": monotonic_ns,
+                    "sequence": commit_ts * 10 + stage_index,
+                    "thread_id": 1,
+                }
+            records.append(record)
+
+        analysis = analyze_trace({"records": records})
+        grouped = analysis["wal_return_inversions_by_frontier_group"]
+        self.assertEqual(grouped["frontier_groups"], 3)
+        self.assertEqual(grouped["intra_group"]["timestamp_inversion_pairs"], 2)
+        self.assertEqual(grouped["intra_group"]["timestamp_pair_count"], 3)
+        self.assertEqual(grouped["intra_group"]["timestamp_tie_pairs_excluded"], 1)
+        self.assertEqual(grouped["inter_group"]["timestamp_inversion_pairs"], 2)
+        self.assertEqual(grouped["inter_group"]["timestamp_pair_count"], 11)
+
+        by_size = analysis["wal_return_inversions_by_complete_group_size"]
+        self.assertEqual(by_size["complete_groups"], 2)
+        self.assertEqual(by_size["incomplete_groups"], 1)
+        self.assertEqual(by_size["incomplete_group_details"], [{
+            "frontier_ticket_end": 7,
+            "expected_group_size": 2,
+            "observed_record_count": 1,
+        }])
+        size_two = by_size["by_group_size"]["2"]
+        self.assertEqual(size_two["groups"], 1)
+        self.assertEqual(size_two["records"], 2)
+        self.assertEqual(size_two["timestamp_inversion_pairs"], 0)
+        self.assertEqual(size_two["timestamp_pair_count"], 1)
+        size_three = by_size["by_group_size"]["3"]
+        self.assertEqual(size_three["timestamp_inversion_pairs"], 2)
+        self.assertEqual(size_three["timestamp_pair_count"], 2)
+        self.assertEqual(size_three["timestamp_tie_pairs_excluded"], 1)
+        self.assertEqual(size_three["timestamp_inversion_rate"], 1.0)
+        self.assertEqual(size_three["median_group_inversion_rate"], 1.0)
+
+    def test_commit_order_trace_analyzer_rejects_invalid_frontier_group(self) -> None:
+        record = {"commit_ts": 1, "wal_ticket": 0, "frontier_ticket_end": 0}
+        for stage_index, stage in enumerate(TRACE_STAGES):
+            record[stage] = {
+                "monotonic_ns": stage_index + 1,
+                "sequence": stage_index + 1,
+                "thread_id": 1,
+            }
+
+        with self.assertRaisesRegex(ValueError, "frontier ticket end"):
+            analyze_trace({"records": [record]})
+
+    def test_commit_order_trace_result_verifier_checks_trace_and_score_pairs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            results = Path(temp) / "results"
+            results.mkdir()
+            schedule = build_commit_order_trace_schedule()
+            plan = build_commit_order_trace_plan(
+                machine_type="c4-standard-16-lssd",
+                machine_spec={"vcpus": 16, "ssd_count": 2, "ssd_gib": 750},
+                commit="a" * 40,
+                binary_sha256="b" * 64,
+                source_patch_sha256="c" * 64,
+            )
+            (results / "benchmark-plan.json").write_text(json.dumps(plan), encoding="utf-8")
+            (results / "source-patch.sha256").write_text("c" * 64 + "\n", encoding="utf-8")
+            (results / "write-perf.sha256").write_text("b" * 64 + "\n", encoding="utf-8")
+            summary_rows = []
+            for item in schedule:
+                run_id = BENCH._run_identifier(item, "commit-order-trace")
+                run_dir = results / run_id
+                run_dir.mkdir()
+                version = 7 if item["arm"] == "v7_parallel" else 8
+                trace = None
+                if item["trace_limit"]:
+                    trace = {
+                        "limit": item["trace_limit"], "selected_records": item["trace_limit"],
+                        "dropped_records": 0, "dropped_frontier_events": 0, "incomplete_records": 0,
+                        "records": [{
+                            "commit_ts": value, "wal_ticket": value, "frontier_ticket_end": value + 1,
+                            **{
+                                stage: {"sequence": value + index, "monotonic_ns": value + index, "thread_id": 1}
+                                for index, stage in enumerate(TRACE_STAGES)
+                            },
+                        } for value in range(1, item["trace_limit"] + 1)],
+                    }
+                record = {
+                    "params": {
+                        "num": COMMIT_ORDER_TRACE_NUM, "threads": COMMIT_ORDER_TRACE_WRITERS,
+                        "value_size": 1024, "wal_format_version": version, "wal_io_mode": "parallel",
+                    },
+                    "result": {
+                        "ops": COMMIT_ORDER_TRACE_NUM,
+                        "wal_pipeline": {"commit_order_trace": trace},
+                    },
+                }
+                row = {
+                    **{key: item[key] for key in (
+                        "writer", "workload", "phase", "repetition", "arm", "trace_limit",
+                    )},
+                    "exit_code": 0, "ops": COMMIT_ORDER_TRACE_NUM,
+                }
+                summary_rows.append(row)
+                (run_dir / "result.json").write_text(json.dumps(record), encoding="utf-8")
+                (run_dir / "run-metadata.json").write_text(json.dumps(row), encoding="utf-8")
+
+            validation = validate_commit_order_trace_rows(summary_rows)
+            score_comparison = summarize_score_pairs([
+                {**row, "puts_per_second": 1.0, "p99_ms": 1.0, "cpu_seconds": 1.0}
+                for row in summary_rows if row["phase"] == "score"
+            ])
+            (results / "summary.json").write_text(json.dumps({
+                "suite": "commit-order-trace", "complete": True,
+                "runs_planned": len(schedule), "runs_completed": len(schedule),
+                "source_commit": "a" * 40, "source_patch_sha256": "c" * 64,
+                "binary_sha256": "b" * 64, "trace_analysis": {}, "score_comparison": score_comparison,
+                "matrix_validation": validation, "results": summary_rows,
+            }), encoding="utf-8")
+            (results / "commit-order-trace-analysis.json").write_text(json.dumps({
+                "commit": "a" * 40, "source_patch_sha256": "c" * 64,
+                "binary_sha256": "b" * 64, "traced_runs": {}, "score_comparison": score_comparison,
+            }), encoding="utf-8")
+            (results / "remote-exit.json").write_text(json.dumps({
+                "failed": False, "runs_started": len(schedule),
+            }), encoding="utf-8")
+            self.assertTrue(BENCH._verify_result_set(results)["verified"])
+
+            trace_run = next(item for item in schedule if item["trace_limit"])
+            run_id = BENCH._run_identifier(trace_run, "commit-order-trace")
+            result_path = results / run_id / "result.json"
+            record = json.loads(result_path.read_text(encoding="utf-8"))
+            record["result"]["wal_pipeline"]["commit_order_trace"]["dropped_frontier_events"] = 1
+            result_path.write_text(json.dumps(record), encoding="utf-8")
+            rejected = BENCH._verify_result_set(results)
+            self.assertFalse(rejected["verified"])
+            self.assertTrue(any("dropped or incomplete" in error for error in rejected["errors"]))
 
     def test_small_ticket_profile_schedule_and_completeness_validation(self) -> None:
         schedule = build_profile_schedule((1, 8, 16))
@@ -1075,17 +1431,24 @@ print('[hotpath] diagnostic report follows')
             def collect(*_args, **_kwargs):
                 nonlocal disk_full
                 disk_full = True
-                return {"results": True, "bootstrap_log": True, "summary_complete": True}
+                return {
+                    "results": True, "results_verified": True,
+                    "bootstrap_log": True, "summary_complete": True,
+                }
 
             def fsync(_fd):
                 if disk_full:
                     raise OSError("No space left on device")
 
             success = subprocess.CompletedProcess([], 0, "", "")
+
+            def make_known_hosts(*args, **_kwargs):
+                Path(args[5]).write_text("host-key\n", encoding="utf-8")
+
             with (
                 patch.object(BENCH.shutil, "which", return_value="/usr/bin/tool"),
                 patch.object(BENCH, "audit_ssh_firewall_rules"),
-                patch.object(BENCH, "wait_for_verified_host_keys"),
+                patch.object(BENCH, "wait_for_verified_host_keys", side_effect=make_known_hosts),
                 patch.object(BENCH.subprocess, "run", side_effect=fake_keygen),
                 patch.object(BENCH, "ssh_command", return_value=success),
                 patch.object(BENCH, "scp_to_vm", return_value=success),
@@ -1133,6 +1496,102 @@ print('[hotpath] diagnostic report follows')
                 cleanup.assert_called_once()
                 self.assertTrue(cleanup.call_args.kwargs["vm_created"])
                 self.assertFalse(cleanup.call_args.kwargs["firewall_created"])
+
+    def test_incomplete_result_collection_retains_vm_for_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            results = Path(temp) / "results"
+            args = BENCH.argparse.Namespace(
+                project="test-project", zone="us-central1-a", network="walbench-net", subnet="walbench-subnet",
+                ssh_source_range="203.0.113.10/32", max_runtime_minutes=60, commit="a" * 40, num=64,
+                machine_type=BENCH.MACHINE_TYPE, writers=(16,), full_rfc026_matrix=True,
+                v8_small_ticket_profile=False, commit_order_trace=False, source_patch_sha256=None,
+                keep_vm_after_run=False,
+            )
+            gcloud = ProvisionGcloud()
+            successful_ssh = subprocess.CompletedProcess([], 0, "", "")
+
+            def ssh(_key, _known_hosts, _ip, command, *, timeout):
+                if command == "true":
+                    return successful_ssh
+                return subprocess.CompletedProcess([], 1, "", "summary generation failed")
+
+            def wait_for_host_keys(_gcloud, _instance, _project, _zone, _ip, known_hosts, _deadline):
+                known_hosts.write_text("verified host key\n", encoding="utf-8")
+
+            def fail_collection(_ip, key, known_hosts, _results_dir, *, before_connect):
+                self.assertTrue(key.is_file())
+                self.assertTrue(known_hosts.is_file())
+                raise BENCH.BenchError("firewall audit failed before artifact transfer")
+
+            with (
+                patch.object(BENCH.shutil, "which", return_value="/usr/bin/tool"),
+                patch.object(BENCH, "audit_ssh_firewall_rules"),
+                patch.object(BENCH, "wait_for_verified_host_keys", side_effect=wait_for_host_keys),
+                patch.object(BENCH.subprocess, "run", side_effect=fake_keygen),
+                patch.object(BENCH, "ssh_command", side_effect=ssh),
+                patch.object(BENCH, "scp_to_vm", return_value=successful_ssh),
+                patch.object(BENCH, "collect_artifacts", side_effect=fail_collection),
+                patch.object(BENCH, "cleanup_gcp_resources", return_value=([], {}, False)) as cleanup,
+            ):
+                result = BENCH.provision_and_run(
+                    args, gcloud, results, {"boot_image": {"name": "pinned-image"}}
+                )
+
+            self.assertEqual(result, 1)
+            cleanup.assert_not_called()
+            lifecycle = json.loads((results / "lifecycle.json").read_text(encoding="utf-8"))
+            self.assertTrue(lifecycle["benchmark_attempted"])
+            self.assertTrue(lifecycle["retained"])
+            self.assertTrue((results / "retained-ssh-key").is_file())
+            self.assertTrue((results / "retained-known-hosts").is_file())
+            reconnect = (results / "reconnect.txt").read_text(encoding="utf-8")
+            self.assertIn("Do not destroy the VM, firewall, VPC, subnet, route, or Terraform state", reconnect)
+
+    def test_reconnect_instruction_failure_keeps_vm_for_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            results = Path(temp) / "results"
+            args = BENCH.argparse.Namespace(
+                project="test-project", zone="us-central1-a", network="walbench-net", subnet="walbench-subnet",
+                ssh_source_range="203.0.113.10/32", max_runtime_minutes=60, commit="a" * 40, num=64,
+                machine_type=BENCH.MACHINE_TYPE, writers=(16,), full_rfc026_matrix=True,
+                v8_small_ticket_profile=False, commit_order_trace=False, source_patch_sha256=None,
+                keep_vm_after_run=False,
+            )
+            gcloud = ProvisionGcloud()
+            successful_ssh = subprocess.CompletedProcess([], 0, "", "")
+
+            def ssh(_key, _known_hosts, _ip, command, *, timeout):
+                if command == "true":
+                    return successful_ssh
+                return subprocess.CompletedProcess([], 1, "", "benchmark did not complete")
+
+            def wait_for_host_keys(_gcloud, _instance, _project, _zone, _ip, known_hosts, _deadline):
+                known_hosts.write_text("verified host key\n", encoding="utf-8")
+
+            def fail_collection(*_args, **_kwargs):
+                raise BENCH.BenchError("firewall audit failed before artifact transfer")
+
+            with (
+                patch.object(BENCH.shutil, "which", return_value="/usr/bin/tool"),
+                patch.object(BENCH, "audit_ssh_firewall_rules"),
+                patch.object(BENCH, "wait_for_verified_host_keys", side_effect=wait_for_host_keys),
+                patch.object(BENCH.subprocess, "run", side_effect=fake_keygen),
+                patch.object(BENCH, "ssh_command", side_effect=ssh),
+                patch.object(BENCH, "scp_to_vm", return_value=successful_ssh),
+                patch.object(BENCH, "collect_artifacts", side_effect=fail_collection),
+                patch.object(BENCH, "retained_vm_reconnect_instructions", side_effect=OSError("disk full")),
+                patch.object(BENCH, "cleanup_gcp_resources", return_value=([], {}, False)) as cleanup,
+            ):
+                result = BENCH.provision_and_run(
+                    args, gcloud, results, {"boot_image": {"name": "pinned-image"}}
+                )
+
+            self.assertEqual(result, 1)
+            cleanup.assert_not_called()
+            lifecycle = json.loads((results / "lifecycle.json").read_text(encoding="utf-8"))
+            self.assertTrue(lifecycle["retained"])
+            self.assertTrue((results / "retained-ssh-key").is_file())
+            self.assertFalse((results / "reconnect.txt").exists())
 
     def test_firewall_audit_rejects_broad_ssh_allow(self) -> None:
         rule = {
@@ -1274,40 +1733,348 @@ print('[hotpath] diagnostic report follows')
             self.assertNotIn("secret", path.read_text(encoding="utf-8"))
             self.assertEqual(logged["stdout_bytes"], len(completed.stdout.encode("utf-8")))
 
-    def test_collection_retries_and_keeps_a_transferred_partial_matrix(self) -> None:
+    def test_gcloud_json_retries_transient_read_failures(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            gcloud = BENCH.Gcloud("project", Path(temp) / "gcloud.jsonl")
+            responses = [
+                subprocess.CompletedProcess([], 1, "", "ConnectionError: RemoteDisconnected"),
+                subprocess.CompletedProcess([], 0, '{"status":"UP"}', ""),
+            ]
+            with (
+                patch.object(BENCH.subprocess, "run", side_effect=responses) as mock_run,
+                patch.object(BENCH.time, "sleep") as sleep,
+            ):
+                self.assertEqual(gcloud.json(["compute", "zones", "describe", "zone-a"]), {"status": "UP"})
+
+            self.assertEqual(mock_run.call_count, 2)
+            sleep.assert_called_once_with(1)
+
+    def test_gcloud_json_does_not_retry_nontransient_failures(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            gcloud = BENCH.Gcloud("project", Path(temp) / "gcloud.jsonl")
+            failure = subprocess.CompletedProcess([], 403, "", "Permission denied")
+            with (
+                patch.object(BENCH.subprocess, "run", return_value=failure) as mock_run,
+                patch.object(BENCH.time, "sleep") as sleep,
+            ):
+                with self.assertRaisesRegex(BENCH.BenchError, "Permission denied"):
+                    gcloud.json(["compute", "zones", "describe", "zone-a"])
+
+            mock_run.assert_called_once()
+            sleep.assert_not_called()
+
+    def test_remote_archive_script_runs_and_keeps_diagnostics_and_provenance(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
+            results = root / "remote" / "results"
+            run_dir = results / "w16-point-v8_parallel"
+            run_dir.mkdir(parents=True)
+            for name in (
+                "profile-schedule.tsv", "rust-toolchain.txt", "write-perf.sha256", "perf-version.txt",
+            ):
+                (results / name).write_text("fixture\n", encoding="utf-8")
+            for name in ("stderr.log", "timeline.json", "perf.data", "perf-report.txt"):
+                (run_dir / name).write_bytes(b"capture")
+            (run_dir / "ignored.db").write_bytes(b"should not be bundled")
+
+            command = BENCH._build_remote_archive_command(root=str(results), max_bytes=1024 * 1024)
+            result = self._run_remote_bundle(command, results, root)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            metadata = self._archive_metadata(result.stdout)
+            self.assertEqual(metadata["ARCHIVE_FILES"], "8")
+            archive = Path(metadata["ARCHIVE_PATH"])
+            self.assertEqual(archive.parent, root / "remote-tmp")
+            with tarfile.open(archive, "r:gz") as bundle:
+                names = set(bundle.getnames())
+            for name in (
+                "results/profile-schedule.tsv", "results/rust-toolchain.txt",
+                "results/write-perf.sha256", "results/perf-version.txt",
+                "results/w16-point-v8_parallel/stderr.log", "results/w16-point-v8_parallel/timeline.json",
+                "results/w16-point-v8_parallel/perf.data", "results/w16-point-v8_parallel/perf-report.txt",
+            ):
+                self.assertIn(name, names)
+            self.assertFalse(any(name.endswith("ignored.db") for name in names))
+
+            too_small = BENCH._build_remote_archive_command(root=str(results), max_bytes=1)
+            rejected = self._run_remote_bundle(too_small, results, root)
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("exceeds 1 byte limit", rejected.stderr)
+
+    def test_collection_retries_and_preserves_partial_bundle_for_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            remote_results = self._make_result_bundle(root, complete=False)
             key = root / "key"
             known_hosts = root / "known_hosts"
             key.write_text("private", encoding="utf-8")
             known_hosts.write_text("host-key", encoding="utf-8")
             calls = 0
-            events = []
+            events: list[str] = []
+            archives: dict[str, Path] = {}
 
-            def scp(_ip, _remote, destination, _key, _known_hosts, *, recursive=False, timeout):
+            def pack(_key, _known_hosts, _ip, command, *, timeout):
+                self.assertEqual(events[-1], "audit")
+                events.append("ssh")
+                packed = self._run_remote_bundle(command, remote_results, root)
+                self.assertEqual(packed.returncode, 0, packed.stderr)
+                metadata = self._archive_metadata(packed.stdout)
+                archives[metadata["ARCHIVE_PATH"]] = Path(metadata["ARCHIVE_PATH"])
+                return packed
+
+            def scp(_ip, remote, destination, _key, _known_hosts, *, recursive=False, timeout):
                 nonlocal calls
+                self.assertFalse(recursive)
                 self.assertEqual(events[-1], "audit")
                 events.append("scp")
-                if recursive:
+                if remote.endswith(".tar.gz"):
                     calls += 1
                     if calls == 1:
                         return subprocess.CompletedProcess([], 1, "", "temporary transfer failure")
-                    result_dir = destination / "results"
-                    result_dir.mkdir(parents=True)
-                    (result_dir / "summary.json").write_text('{"complete": false}\n', encoding="utf-8")
+                    shutil.copyfile(archives[remote], destination)
                     return subprocess.CompletedProcess([], 0, "", "")
-                destination.write_text("boot log", encoding="utf-8")
+                destination.write_text("bootstrap details", encoding="utf-8")
                 return subprocess.CompletedProcess([], 0, "", "")
 
-            with patch.object(BENCH, "scp_from_vm", side_effect=scp), patch.object(BENCH.time, "sleep"):
+            with (
+                patch.object(BENCH, "ssh_command", side_effect=pack),
+                patch.object(BENCH, "scp_from_vm", side_effect=scp),
+                patch.object(BENCH.time, "sleep"),
+            ):
                 result = BENCH.collect_artifacts(
                     "192.0.2.1", key, known_hosts, root, before_connect=lambda: events.append("audit")
                 )
             self.assertTrue(result["results"])
             self.assertFalse(result["summary_complete"])
+            self.assertFalse(result["results_verified"])
             self.assertTrue((root / "collected" / "results" / "summary.json").is_file())
+            self.assertTrue((root / "collection-attempt-02" / "results.tar.gz").is_file())
+            self.assertTrue((root / "collection-attempt-02" / "bundle-metadata.json").is_file())
             self.assertEqual(calls, 2)
-            self.assertEqual(events, ["audit", "scp"] * 3)
+            self.assertEqual(
+                events,
+                ["audit", "ssh", "audit", "scp", "audit", "ssh", "audit", "scp", "audit", "scp"],
+            )
+
+    def test_collection_rejects_complete_summary_with_missing_run_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            remote_results = self._make_result_bundle(root, complete=True, include_run_metadata=False)
+            archives: dict[str, Path] = {}
+
+            def pack(_key, _known_hosts, _ip, command, *, timeout):
+                packed = self._run_remote_bundle(command, remote_results, root)
+                metadata = self._archive_metadata(packed.stdout)
+                archives[metadata["ARCHIVE_PATH"]] = Path(metadata["ARCHIVE_PATH"])
+                return packed
+
+            def scp(_ip, remote, destination, _key, _known_hosts, *, recursive=False, timeout):
+                self.assertFalse(recursive)
+                if remote in archives:
+                    shutil.copyfile(archives[remote], destination)
+                else:
+                    destination.write_text("bootstrap details", encoding="utf-8")
+                return subprocess.CompletedProcess([], 0, "", "")
+
+            with (
+                patch.object(BENCH, "ssh_command", side_effect=pack),
+                patch.object(BENCH, "scp_from_vm", side_effect=scp),
+                patch.object(BENCH.time, "sleep"),
+            ):
+                result = BENCH.collect_artifacts(
+                    "192.0.2.1", root / "key", root / "known_hosts", root, before_connect=lambda: None
+                )
+
+            self.assertTrue(result["results"])
+            self.assertFalse(result["results_verified"])
+            attempts = json.loads((root / "artifact-collection.json").read_text(encoding="utf-8"))["attempts"]
+            self.assertEqual(len(attempts), 2)
+            self.assertIn(
+                "missing result.json or run-metadata.json",
+                " ".join(attempts[0]["validation"]["errors"]),
+            )
+            self.assertTrue((root / "collection-attempt-01" / "results.tar.gz").is_file())
+
+    def test_collection_retries_after_copying_an_unverified_result_set(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            remote_results = self._make_result_bundle(root, complete=False)
+            archives: dict[str, Path] = {}
+            pack_count = 0
+
+            def pack(_key, _known_hosts, _ip, command, *, timeout):
+                nonlocal pack_count
+                pack_count += 1
+                if pack_count == 2:
+                    summary_path = remote_results / "summary.json"
+                    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+                    summary["complete"] = True
+                    summary["matrix_validation"]["complete"] = True
+                    for row in summary["results"]:
+                        row["exit_code"] = 0
+                        run_id = BENCH._summary_row_identifier(row, "batch64")
+                        metadata_path = remote_results / run_id / "run-metadata.json"
+                        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                        metadata["exit_code"] = 0
+                        metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+                    summary_path.write_text(json.dumps(summary), encoding="utf-8")
+                    (remote_results / "remote-exit.json").write_text(
+                        json.dumps({"failed": False, "runs_started": summary["runs_planned"]}),
+                        encoding="utf-8",
+                    )
+                packed = self._run_remote_bundle(command, remote_results, root)
+                self.assertEqual(packed.returncode, 0, packed.stderr)
+                metadata = self._archive_metadata(packed.stdout)
+                archives[metadata["ARCHIVE_PATH"]] = Path(metadata["ARCHIVE_PATH"])
+                return packed
+
+            def scp(_ip, remote, destination, _key, _known_hosts, *, recursive=False, timeout):
+                self.assertFalse(recursive)
+                if remote in archives:
+                    shutil.copyfile(archives[remote], destination)
+                else:
+                    destination.write_text("bootstrap details", encoding="utf-8")
+                return subprocess.CompletedProcess([], 0, "", "")
+
+            with (
+                patch.object(BENCH, "ssh_command", side_effect=pack),
+                patch.object(BENCH, "scp_from_vm", side_effect=scp),
+                patch.object(BENCH.time, "sleep"),
+            ):
+                result = BENCH.collect_artifacts(
+                    "192.0.2.1", root / "key", root / "known_hosts", root, before_connect=lambda: None
+                )
+
+            self.assertTrue(result["results_verified"])
+            self.assertEqual(pack_count, 2)
+            collection = json.loads((root / "artifact-collection.json").read_text(encoding="utf-8"))
+            self.assertEqual([attempt["results_verified"] for attempt in collection["attempts"]], [False, True])
+            for attempt in (1, 2):
+                staging = root / f"collection-attempt-{attempt:02d}"
+                self.assertTrue((staging / "results.tar.gz").is_file())
+                bundle_metadata = json.loads((staging / "bundle-metadata.json").read_text(encoding="utf-8"))
+                self.assertTrue(bundle_metadata["bundle_checksum_verified"])
+
+    def test_result_verifier_checks_per_run_pairing_and_remote_exit(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            results = self._make_result_bundle(Path(temp), complete=True)
+            schedule = build_batch64_schedule((16,))
+            first_id = BENCH._run_identifier(schedule[0], "batch64")
+            extra_dir = results / "w99-extra"
+            extra_dir.mkdir()
+            shutil.move(results / first_id / "run-metadata.json", extra_dir / "run-metadata.json")
+            invalid_pairing = BENCH._verify_result_set(results)
+            self.assertFalse(invalid_pairing["verified"])
+            self.assertTrue(any("run directories do not match schedule" in error for error in invalid_pairing["errors"]))
+
+            shutil.move(extra_dir / "run-metadata.json", results / first_id / "run-metadata.json")
+            extra_dir.rmdir()
+            (results / "remote-exit.json").write_text(json.dumps({"failed": True, "runs_started": 12}), encoding="utf-8")
+            invalid_exit = BENCH._verify_result_set(results)
+            self.assertFalse(invalid_exit["verified"])
+            self.assertTrue(any("remote exit record reports failure" in error for error in invalid_exit["errors"]))
+
+            (results / "remote-exit.json").write_text(
+                json.dumps({"failed": False, "runs_started": len(schedule) - 1}), encoding="utf-8"
+            )
+            mismatched_exit = BENCH._verify_result_set(results)
+            self.assertFalse(mismatched_exit["verified"])
+            self.assertTrue(any("remote exit run count does not match the plan" in error
+                                for error in mismatched_exit["errors"]))
+
+    def test_result_verifier_accepts_csv_string_exit_code_in_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            results = self._make_result_bundle(Path(temp), complete=True)
+            summary = json.loads((results / "summary.json").read_text(encoding="utf-8"))
+            self.assertTrue(all(row["exit_code"] == "0" for row in summary["results"]))
+
+            schedule = build_batch64_schedule((16,))
+            run_id = BENCH._run_identifier(schedule[0], "batch64")
+            metadata = json.loads((results / run_id / "run-metadata.json").read_text(encoding="utf-8"))
+            self.assertIs(type(metadata["exit_code"]), int)
+            self.assertTrue(BENCH._verify_result_set(results)["verified"])
+
+    def test_profile_result_verification_uses_schedule_and_requires_perf_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            results = Path(temp) / "results"
+            results.mkdir()
+            schedule = build_profile_schedule((1,))
+            with (results / "profile-schedule.tsv").open("w", encoding="utf-8", newline="") as stream:
+                writer = csv.DictWriter(stream, fieldnames=schedule[0].keys(), delimiter="\t")
+                writer.writeheader()
+                writer.writerows(schedule)
+            rows = []
+            captures = 0
+            for item in schedule:
+                run_id = BENCH._run_identifier(item, "v8-small-ticket-profile")
+                run_dir = results / run_id
+                run_dir.mkdir()
+                status = "captured" if item["perf_capture"] else "not_requested"
+                if item["perf_capture"]:
+                    captures += 1
+                    (run_dir / "perf.data").write_bytes(b"perf")
+                    (run_dir / "perf-report.txt").write_text("report", encoding="utf-8")
+                (run_dir / "result.json").write_text(
+                    json.dumps({"result": {}, "params": {}, "latency": {}}) + "\n[hotpath] sample\n",
+                    encoding="utf-8",
+                )
+                row = {
+                    "writer": item["writer"], "workload": item["workload"], "arm": item["arm"],
+                    "exit_code": 0, "ops": item["num"], "perf_status": status,
+                }
+                rows.append(row)
+                (run_dir / "run-metadata.json").write_text(json.dumps(row), encoding="utf-8")
+            (results / "summary.json").write_text(json.dumps({
+                "complete": True, "suite": "v8-small-ticket-profile", "runs_planned": len(schedule),
+                "runs_completed": len(schedule), "results": rows,
+                "matrix_validation": {"complete": True, "planned": len(schedule), "observed": len(schedule)},
+                "perf_captures_planned": captures, "perf_captures_completed": captures,
+                "perf_capture_complete": True,
+            }), encoding="utf-8")
+            (results / "remote-exit.json").write_text(
+                json.dumps({"failed": False, "runs_started": len(schedule)}), encoding="utf-8"
+            )
+            self.assertTrue(BENCH._verify_result_set(results)["verified"])
+            capture_row = next(row for row in schedule if row["perf_capture"])
+            capture_id = BENCH._run_identifier(capture_row, "v8-small-ticket-profile")
+            (results / capture_id / "perf.data").unlink()
+            rejected = BENCH._verify_result_set(results)
+            self.assertFalse(rejected["verified"])
+            self.assertTrue(any("profile capture artifacts are incomplete" in error for error in rejected["errors"]))
+
+    def test_collection_rejects_corrupt_archive_transfer(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            remote_results = self._make_result_bundle(root, complete=True)
+            archives: dict[str, Path] = {}
+
+            def pack(_key, _known_hosts, _ip, command, *, timeout):
+                packed = self._run_remote_bundle(command, remote_results, root)
+                metadata = self._archive_metadata(packed.stdout)
+                archives[metadata["ARCHIVE_PATH"]] = Path(metadata["ARCHIVE_PATH"])
+                return packed
+
+            def scp(_ip, remote, destination, _key, _known_hosts, *, recursive=False, timeout):
+                if remote in archives:
+                    shutil.copyfile(archives[remote], destination)
+                    with destination.open("ab") as stream:
+                        stream.write(b"corrupted transfer")
+                else:
+                    destination.write_text("bootstrap details", encoding="utf-8")
+                return subprocess.CompletedProcess([], 0, "", "")
+
+            with (
+                patch.object(BENCH, "ssh_command", side_effect=pack),
+                patch.object(BENCH, "scp_from_vm", side_effect=scp),
+                patch.object(BENCH.time, "sleep"),
+            ):
+                result = BENCH.collect_artifacts(
+                    "192.0.2.1", root / "key", root / "known_hosts", root, before_connect=lambda: None
+                )
+            self.assertFalse(result["results_verified"])
+            attempts = json.loads((root / "artifact-collection.json").read_text(encoding="utf-8"))["attempts"]
+            self.assertEqual(len(attempts), 2)
+            self.assertFalse(attempts[0]["bundle_checksum_verified"])
+            self.assertTrue((root / "collection-attempt-01" / "results.tar.gz").is_file())
 
     def test_collection_keeps_bootstrap_log_when_results_are_unavailable(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -1318,15 +2085,22 @@ print('[hotpath] diagnostic report follows')
             known_hosts.write_text("host-key", encoding="utf-8")
 
             def scp(_ip, remote, destination, _key, _known_hosts, *, recursive=False, timeout):
-                if recursive:
-                    return subprocess.CompletedProcess([], 1, "", "Local SSD setup failed")
+                self.assertFalse(recursive)
                 self.assertEqual(remote, "/var/log/gcp-free-trial-wal-bench.log")
                 destination.write_text(
                     "bootstrap details\nWAL_BENCHMARK_STARTED 2026-11-04T10:00:00Z\n", encoding="utf-8"
                 )
                 return subprocess.CompletedProcess([], 0, "", "")
 
-            with patch.object(BENCH, "scp_from_vm", side_effect=scp), patch.object(BENCH.time, "sleep"):
+            with (
+                patch.object(
+                    BENCH,
+                    "ssh_command",
+                    return_value=subprocess.CompletedProcess([], 1, "", "Local SSD setup failed"),
+                ),
+                patch.object(BENCH, "scp_from_vm", side_effect=scp),
+                patch.object(BENCH.time, "sleep"),
+            ):
                 result = BENCH.collect_artifacts("192.0.2.1", key, known_hosts, root, before_connect=lambda: None)
 
             self.assertFalse(result["results"])
@@ -1339,28 +2113,44 @@ print('[hotpath] diagnostic report follows')
             with self.subTest(rejected_audit=rejected_audit), tempfile.TemporaryDirectory() as temp:
                 root = Path(temp)
                 events = []
+                results = self._make_result_bundle(root, complete=True)
+                archives: dict[str, Path] = {}
 
                 def audit():
                     events.append("audit")
                     if events.count("audit") == rejected_audit:
                         raise BENCH.BenchError("SSH firewall policy changed")
 
-                def scp(_ip, _remote, destination, _key, _known_hosts, *, recursive=False, timeout):
+                def pack(_key, _known_hosts, _ip, command, *, timeout):
+                    events.append("ssh")
+                    result = self._run_remote_bundle(command, results, root)
+                    metadata = self._archive_metadata(result.stdout)
+                    archives[metadata["ARCHIVE_PATH"]] = Path(metadata["ARCHIVE_PATH"])
+                    return result
+
+                def scp(_ip, remote, destination, _key, _known_hosts, *, recursive=False, timeout):
                     events.append("scp")
-                    self.assertTrue(recursive)
-                    result_dir = destination / "results"
-                    result_dir.mkdir()
-                    (result_dir / "summary.json").write_text('{"complete": true}\n', encoding="utf-8")
+                    self.assertFalse(recursive)
+                    if remote in archives:
+                        shutil.copyfile(archives[remote], destination)
+                    else:
+                        destination.write_text("boot log", encoding="utf-8")
                     return subprocess.CompletedProcess([], 0, "", "")
 
-                with patch.object(BENCH, "scp_from_vm", side_effect=scp):
+                with (
+                    patch.object(BENCH, "ssh_command", side_effect=pack),
+                    patch.object(BENCH, "scp_from_vm", side_effect=scp),
+                ):
                     with self.assertRaisesRegex(BENCH.BenchError, "SSH firewall policy changed"):
                         BENCH.collect_artifacts(
                             "192.0.2.1", root / "key", root / "known_hosts", root, before_connect=audit
                         )
-                self.assertEqual(events, ["audit"] if rejected_audit == 1 else ["audit", "scp", "audit"])
+                self.assertEqual(
+                    events,
+                    ["audit"] if rejected_audit == 1 else ["audit", "ssh", "audit"],
+                )
                 if rejected_audit == 2:
-                    self.assertTrue((root / "collected" / "results" / "summary.json").is_file())
+                    self.assertFalse((root / "collected" / "results" / "summary.json").exists())
 
     def test_results_directory_is_private_under_permissive_umask(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

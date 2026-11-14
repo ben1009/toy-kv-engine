@@ -1632,6 +1632,10 @@ impl ParallelWalRuntime {
                 aligned_len: frame_bytes,
                 commit_ts,
             });
+            #[cfg(feature = "bench")]
+            if let Some(profile) = self.inner.sync_progress.profile() {
+                profile.record_commit_order_ticket_admitted(commit_ts, ticket);
+            }
             // Under the admission lock the packer sees either a preparing
             // producer or its admitted ticket, never a gap between them.
             drop(preparation);
@@ -3397,6 +3401,8 @@ fn synchronize_written_prefix(sync_file: &File, inner: &RuntimeInner) -> Result<
         }
 
         let mut state = inner.durability.state.lock();
+        #[cfg(feature = "bench")]
+        let durable_frontier_start = state.durable_frontier;
         let acknowledged = state
             .poison_ticket
             .map_or(target, |poison| target.min(poison));
@@ -3406,6 +3412,10 @@ fn synchronize_written_prefix(sync_file: &File, inner: &RuntimeInner) -> Result<
             debug_assert!(state.durable_frontier <= poison);
         }
         debug_assert!(state.written_frontier <= inner.admission.lock().next_ticket);
+        #[cfg(feature = "bench")]
+        if let Some(profile) = inner.sync_progress.profile() {
+            profile.record_commit_order_frontier_published(durable_frontier_start, acknowledged);
+        }
         inner.durability.notify_change();
         drop(state);
         inner.sync_progress.mark_durable(acknowledged);

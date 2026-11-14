@@ -281,6 +281,46 @@ pub struct WriteProfile {
     wal_v8_completion_timeline: Mutex<Vec<WalV8CompletionTimelineObservation>>,
     #[cfg(feature = "bench")]
     wal_v8_completion_timeline_dropped_samples: AtomicU64,
+    /// Interval for sampled durability phase diagnostics. Zero disables all
+    /// phase and follower timestamps.
+    #[cfg(feature = "bench")]
+    wal_v8_durability_sample_every: AtomicU64,
+    #[cfg(feature = "bench")]
+    wal_v8_durability_driver_attempt_count: AtomicU64,
+    #[cfg(feature = "bench")]
+    wal_v8_durability_empty_driver_attempt_count: AtomicU64,
+    #[cfg(feature = "bench")]
+    wal_v8_durability_advance_attempt_count: AtomicU64,
+    #[cfg(feature = "bench")]
+    wal_v8_durability_completed_advance_sequence: AtomicU64,
+    #[cfg(feature = "bench")]
+    wal_v8_durability_follower_sample_sequence: AtomicU64,
+    #[cfg(feature = "bench")]
+    wal_v8_durability_phases: Mutex<Vec<WalV8DurabilityPhaseObservation>>,
+    #[cfg(feature = "bench")]
+    wal_v8_durability_phase_dropped_samples: AtomicU64,
+    /// Sampled caller-side ACK stages correlated by V8 ticket.
+    #[cfg(feature = "bench")]
+    wal_v8_ack_observations: Mutex<Vec<WalV8AckObservation>>,
+    #[cfg(feature = "bench")]
+    wal_v8_ack_dropped_samples: AtomicU64,
+    #[cfg(feature = "bench")]
+    wal_v8_follower_waits: Mutex<Vec<WalV8FollowerWaitObservation>>,
+    #[cfg(feature = "bench")]
+    wal_v8_follower_wait_dropped_samples: AtomicU64,
+    /// Remaining reservations in the bounded Point-write ordering trace.
+    #[cfg(feature = "bench")]
+    commit_order_trace_remaining: AtomicU64,
+    #[cfg(feature = "bench")]
+    commit_order_trace_accepting: AtomicBool,
+    #[cfg(feature = "bench")]
+    commit_order_trace_cutoff_commit_ts: AtomicU64,
+    #[cfg(feature = "bench")]
+    commit_order_trace_limit: AtomicU64,
+    #[cfg(feature = "bench")]
+    commit_order_trace_dropped_records: AtomicU64,
+    #[cfg(feature = "bench")]
+    commit_order_trace: Mutex<CommitOrderTraceState>,
 }
 
 /// One logical `fdatasync` call and the WAL progress observed while it ran.
@@ -358,7 +398,462 @@ pub struct WalV8CompletionTimelineObservation {
     pub prefix_ready_to_durable_ns: u64,
 }
 
+/// One sampled, actual V8 durability advance. Wall and thread CPU durations
+/// are both captured so blocked I/O can be distinguished from CPU work.
+#[cfg(feature = "bench")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WalV8DurabilityPhaseObservation {
+    pub sample_id: u64,
+    pub driver_attempt_sequence: u64,
+    pub advance_sequence: u64,
+    pub ticket_start: u64,
+    pub ticket_end: u64,
+    pub tickets_covered: u64,
+    pub driver_wall_ns: u64,
+    pub driver_cpu_ns: u64,
+    pub frontier_lock_wait_ns: u64,
+    pub coalescing_wall_ns: u64,
+    pub coalescing_cpu_ns: u64,
+    pub coalescing_active_wall_ns: u64,
+    pub coalescing_active_cpu_ns: u64,
+    pub coalescing_state_lock_wait_wall_ns: u64,
+    pub coalescing_state_lock_wait_cpu_ns: u64,
+    pub coalescing_condvar_wait_wall_ns: u64,
+    pub coalescing_condvar_wait_cpu_ns: u64,
+    pub coalescing_condvar_wait_count: u64,
+    pub coalescing_condvar_reacquire_count: u64,
+    pub coalescing_condvar_non_timeout_returns: u64,
+    pub coalescing_condvar_prefix_growth_returns: u64,
+    pub coalescing_condvar_generation_changed_returns: u64,
+    pub coalescing_condvar_timeout_returns: u64,
+    pub coalescing_loop_check_count: u64,
+    pub preparation_wall_ns: u64,
+    pub preparation_cpu_ns: u64,
+    pub frontier_write_wall_ns: u64,
+    pub frontier_write_cpu_ns: u64,
+    pub fdatasync_wall_ns: u64,
+    pub fdatasync_cpu_ns: u64,
+    pub resource_retire_before_publish_wall_ns: u64,
+    pub resource_retire_before_publish_cpu_ns: u64,
+    pub resource_retire_before_publish_lock_wait_wall_ns: u64,
+    pub resource_retire_before_publish_lock_wait_cpu_ns: u64,
+    pub resource_retire_before_publish_lock_hold_wall_ns: u64,
+    pub resource_retire_before_publish_lock_hold_cpu_ns: u64,
+    pub resource_retire_before_publish_tickets: u64,
+    pub resource_retire_before_publish_collect_cpu_ns: u64,
+    pub resource_retire_before_publish_remove_cpu_ns: u64,
+    pub resource_retire_before_publish_release_cpu_ns: u64,
+    pub resource_retire_before_publish_finish_cpu_ns: u64,
+    pub resource_retire_after_publish_wall_ns: u64,
+    pub resource_retire_after_publish_cpu_ns: u64,
+    pub resource_retire_after_publish_lock_wait_wall_ns: u64,
+    pub resource_retire_after_publish_lock_wait_cpu_ns: u64,
+    pub resource_retire_after_publish_lock_hold_wall_ns: u64,
+    pub resource_retire_after_publish_lock_hold_cpu_ns: u64,
+    pub resource_retire_after_publish_tickets: u64,
+    pub resource_retire_after_publish_collect_cpu_ns: u64,
+    pub resource_retire_after_publish_remove_cpu_ns: u64,
+    pub resource_retire_after_publish_finish_cpu_ns: u64,
+    pub coordinator_publish_lock_wait_ns: u64,
+    pub coordinator_publish_lock_wait_cpu_ns: u64,
+    pub coordinator_publish_wall_ns: u64,
+    pub coordinator_publish_cpu_ns: u64,
+    pub notify_all_wall_ns: u64,
+    pub followers_waiting_at_publish: u64,
+}
+
+/// Sampled V8 Point-write stages after the durable FRONTIER was published.
+#[cfg(feature = "bench")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WalV8AckObservation {
+    pub ticket: u64,
+    pub durable_publish_to_wal_return_ns: u64,
+    pub wal_return_to_memtable_start_ns: u64,
+    pub memtable_publish_wall_ns: u64,
+    pub mvcc_publish_commit_ts_ns: u64,
+    pub wal_return_to_put_return_ns: u64,
+}
+
+/// One event in a bounded Point-write ordering trace.
+#[cfg(feature = "bench")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CommitOrderTraceEvent {
+    /// Recorder order, used only to break equal-timestamp ties.
+    pub sequence: u64,
+    pub monotonic_ns: u64,
+    pub thread_id: u64,
+}
+
+/// Cross-stage events associated with one commit timestamp and WAL ticket.
+#[cfg(feature = "bench")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CommitOrderTraceObservation {
+    pub commit_ts: u64,
+    pub wal_ticket: Option<u64>,
+    pub frontier_ticket_end: Option<u64>,
+    pub timestamp_reserved: Option<CommitOrderTraceEvent>,
+    pub wal_ticket_admitted: Option<CommitOrderTraceEvent>,
+    pub durable_frontier_published: Option<CommitOrderTraceEvent>,
+    pub wal_return: Option<CommitOrderTraceEvent>,
+    pub memtable_publish_complete: Option<CommitOrderTraceEvent>,
+    pub mvcc_publication_entry: Option<CommitOrderTraceEvent>,
+    pub mvcc_publication_complete: Option<CommitOrderTraceEvent>,
+}
+
+/// Bounded snapshot of cross-stage Point-write ordering events.
+#[cfg(feature = "bench")]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CommitOrderTraceSnapshot {
+    pub limit: u64,
+    pub selected_records: u64,
+    pub dropped_records: u64,
+    pub dropped_frontier_events: u64,
+    pub incomplete_records: u64,
+    pub records: Vec<CommitOrderTraceObservation>,
+}
+
+#[cfg(feature = "bench")]
+#[derive(Debug, Default)]
+struct CommitOrderTraceState {
+    next_event_sequence: u64,
+    records: std::collections::BTreeMap<u64, CommitOrderTraceObservation>,
+    ticket_to_commit_ts: std::collections::BTreeMap<u64, u64>,
+    durable_frontier_events: Vec<(u64, u64, CommitOrderTraceEvent)>,
+    dropped_frontier_events: u64,
+}
+
+#[cfg(feature = "bench")]
+impl CommitOrderTraceState {
+    fn next_event(&mut self, monotonic_ns: u64, thread_id: u64) -> CommitOrderTraceEvent {
+        self.next_event_sequence = self.next_event_sequence.saturating_add(1);
+
+        CommitOrderTraceEvent {
+            sequence: self.next_event_sequence,
+            monotonic_ns,
+            thread_id,
+        }
+    }
+}
+
+#[cfg(all(feature = "bench", target_os = "linux"))]
+fn benchmark_monotonic_ns() -> u64 {
+    let mut timestamp = std::mem::MaybeUninit::<libc::timespec>::uninit();
+    // SAFETY: `timestamp` points to writable storage for `clock_gettime`.
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, timestamp.as_mut_ptr()) } != 0 {
+        return 0;
+    }
+
+    // SAFETY: `clock_gettime` initialized the timestamp after returning zero.
+    let timestamp = unsafe { timestamp.assume_init() };
+    (timestamp.tv_sec as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(timestamp.tv_nsec as u64)
+}
+
+#[cfg(all(feature = "bench", target_os = "linux"))]
+fn benchmark_thread_id() -> u64 {
+    // SAFETY: `gettid` takes no pointer arguments and returns the calling thread ID.
+    unsafe { libc::syscall(libc::SYS_gettid) as u64 }
+}
+
+#[cfg(all(feature = "bench", not(target_os = "linux")))]
+fn benchmark_monotonic_ns() -> u64 {
+    0
+}
+
+#[cfg(all(feature = "bench", not(target_os = "linux")))]
+fn benchmark_thread_id() -> u64 {
+    0
+}
+
+/// Aggregate counters for one opt-in V8 durability sampling run.
+#[cfg(feature = "bench")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WalV8DurabilityDiagnosticCounts {
+    /// Driver loop iterations entered while sampling was enabled.
+    pub driver_attempts: u64,
+    /// Driver attempts that found no ready ticket prefix.
+    pub empty_driver_attempts: u64,
+    /// Non-empty advance cycles started, including cycles that later failed.
+    pub advance_attempts: u64,
+    /// Advances successfully published as durable.
+    pub completed_advances: u64,
+    /// Successfully retained phase observations.
+    pub sampled_advances: u64,
+    /// Selected phase observations not retained due to a failed cycle or sample cap.
+    pub dropped_samples: u64,
+}
+
+/// One sampled caller that waited for the current V8 durability driver.
+#[cfg(feature = "bench")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WalV8FollowerWaitObservation {
+    pub sample_id: u64,
+    pub requested_ticket_end: u64,
+    pub durable_ticket_end_on_resume: u64,
+    pub coordinator_lock_wait_ns: u64,
+    pub coordinator_lock_wait_cpu_ns: u64,
+    pub total_wait_wall_ns: u64,
+    pub total_wait_cpu_ns: u64,
+    pub condvar_wait_count: u64,
+    pub notify_to_resume_ns: Option<u64>,
+    pub followers_woken_by_last_notify: u64,
+}
+
 impl WriteProfile {
+    /// Hard limit for opt-in commit-order trace records retained by a benchmark run.
+    pub const MAX_COMMIT_ORDER_TRACE_RECORDS: u64 = 16_384;
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn configure_commit_order_trace(&self, limit: u64) {
+        self.commit_order_trace_accepting
+            .store(false, std::sync::atomic::Ordering::Release);
+        let mut trace = self.commit_order_trace.lock();
+        trace.next_event_sequence = 0;
+        trace.records.clear();
+        trace.ticket_to_commit_ts.clear();
+        trace.durable_frontier_events.clear();
+        trace.dropped_frontier_events = 0;
+        self.commit_order_trace_dropped_records
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.commit_order_trace_cutoff_commit_ts
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.commit_order_trace_limit
+            .store(limit, std::sync::atomic::Ordering::Relaxed);
+        self.commit_order_trace_remaining
+            .store(limit, std::sync::atomic::Ordering::Relaxed);
+        self.commit_order_trace_accepting
+            .store(limit > 0, std::sync::atomic::Ordering::Release);
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn record_commit_order_timestamp_reserved(&self, commit_ts: u64) {
+        if !self
+            .commit_order_trace_accepting
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return;
+        }
+
+        let remaining = match self.commit_order_trace_remaining.try_update(
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+            |remaining| remaining.checked_sub(1),
+        ) {
+            std::result::Result::Ok(remaining) => remaining,
+            std::result::Result::Err(_) => {
+                self.commit_order_trace_accepting
+                    .store(false, std::sync::atomic::Ordering::Release);
+                return;
+            }
+        };
+
+        let monotonic_ns = benchmark_monotonic_ns();
+        let thread_id = benchmark_thread_id();
+        let mut trace = self.commit_order_trace.lock();
+        let event = trace.next_event(monotonic_ns, thread_id);
+        let observation = CommitOrderTraceObservation {
+            commit_ts,
+            timestamp_reserved: Some(event),
+            ..CommitOrderTraceObservation::default()
+        };
+        if trace.records.insert(commit_ts, observation).is_some() {
+            self.commit_order_trace_dropped_records
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.commit_order_trace_cutoff_commit_ts
+            .fetch_max(commit_ts, std::sync::atomic::Ordering::Release);
+        if remaining == 1 {
+            self.commit_order_trace_accepting
+                .store(false, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn record_commit_order_ticket_admitted(&self, commit_ts: u64, ticket: u64) {
+        if !self.commit_order_trace_contains(commit_ts) {
+            return;
+        }
+
+        let monotonic_ns = benchmark_monotonic_ns();
+        let thread_id = benchmark_thread_id();
+        let mut trace = self.commit_order_trace.lock();
+        let event = trace.next_event(monotonic_ns, thread_id);
+        let durable_event = trace
+            .durable_frontier_events
+            .iter()
+            .find(|(ticket_start, ticket_end, _)| *ticket_start <= ticket && ticket < *ticket_end)
+            .map(|(_, ticket_end, durable_event)| (*ticket_end, *durable_event));
+        if let Some(observation) = trace.records.get_mut(&commit_ts) {
+            observation.wal_ticket = Some(ticket);
+            observation.wal_ticket_admitted = Some(event);
+            if let Some((ticket_end, durable_event)) = durable_event {
+                observation.frontier_ticket_end = Some(ticket_end);
+                observation.durable_frontier_published = Some(durable_event);
+            }
+            trace.ticket_to_commit_ts.insert(ticket, commit_ts);
+        }
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn record_commit_order_wal_return(&self, commit_ts: u64, ticket: u64) {
+        if !self.commit_order_trace_contains(commit_ts) {
+            return;
+        }
+
+        let monotonic_ns = benchmark_monotonic_ns();
+        let thread_id = benchmark_thread_id();
+        let mut trace = self.commit_order_trace.lock();
+        let event = trace.next_event(monotonic_ns, thread_id);
+        if let Some(observation) = trace.records.get_mut(&commit_ts)
+            && observation.wal_ticket == Some(ticket)
+        {
+            observation.wal_return = Some(event);
+        }
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn record_commit_order_memtable_publish_complete(&self, commit_ts: u64) {
+        self.record_commit_order_stage(commit_ts, |observation, event| {
+            observation.memtable_publish_complete = Some(event);
+        });
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn record_commit_order_mvcc_publication_entry(&self, commit_ts: u64) {
+        self.record_commit_order_stage(commit_ts, |observation, event| {
+            observation.mvcc_publication_entry = Some(event);
+        });
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn record_commit_order_mvcc_publication_complete(&self, commit_ts: u64) {
+        self.record_commit_order_stage(commit_ts, |observation, event| {
+            observation.mvcc_publication_complete = Some(event);
+        });
+    }
+
+    #[cfg(feature = "bench")]
+    fn record_commit_order_stage(
+        &self,
+        commit_ts: u64,
+        update: impl FnOnce(&mut CommitOrderTraceObservation, CommitOrderTraceEvent),
+    ) {
+        if !self.commit_order_trace_contains(commit_ts) {
+            return;
+        }
+
+        let monotonic_ns = benchmark_monotonic_ns();
+        let thread_id = benchmark_thread_id();
+        let mut trace = self.commit_order_trace.lock();
+        let event = trace.next_event(monotonic_ns, thread_id);
+        if let Some(observation) = trace.records.get_mut(&commit_ts) {
+            update(observation, event);
+        }
+    }
+
+    #[cfg(feature = "bench")]
+    fn commit_order_trace_contains(&self, commit_ts: u64) -> bool {
+        let cutoff = self
+            .commit_order_trace_cutoff_commit_ts
+            .load(std::sync::atomic::Ordering::Acquire);
+
+        commit_ts > 0
+            && commit_ts <= cutoff
+            && self
+                .commit_order_trace_limit
+                .load(std::sync::atomic::Ordering::Relaxed)
+                > 0
+    }
+
+    /// Record the durable frontier transition before waking WAL waiters.
+    #[cfg(feature = "bench")]
+    pub(crate) fn record_commit_order_frontier_published(
+        &self,
+        ticket_start: u64,
+        ticket_end: u64,
+    ) {
+        if ticket_start >= ticket_end
+            || self
+                .commit_order_trace_limit
+                .load(std::sync::atomic::Ordering::Relaxed)
+                == 0
+        {
+            return;
+        }
+
+        let monotonic_ns = benchmark_monotonic_ns();
+        let thread_id = benchmark_thread_id();
+        let mut trace = self.commit_order_trace.lock();
+        let has_mapped_ticket = trace
+            .ticket_to_commit_ts
+            .range(ticket_start..ticket_end)
+            .next()
+            .is_some();
+        let has_unadmitted_record = trace
+            .records
+            .values()
+            .any(|record| record.wal_ticket.is_none());
+        if !has_mapped_ticket && !has_unadmitted_record {
+            return;
+        }
+
+        let event = trace.next_event(monotonic_ns, thread_id);
+        if has_unadmitted_record {
+            if trace.durable_frontier_events.len() < Self::MAX_COMMIT_ORDER_TRACE_RECORDS as usize {
+                trace
+                    .durable_frontier_events
+                    .push((ticket_start, ticket_end, event));
+            } else {
+                trace.dropped_frontier_events = trace.dropped_frontier_events.saturating_add(1);
+            }
+        }
+        let CommitOrderTraceState {
+            records,
+            ticket_to_commit_ts,
+            ..
+        } = &mut *trace;
+        for (_, commit_ts) in ticket_to_commit_ts.range(ticket_start..ticket_end) {
+            if let Some(observation) = records.get_mut(commit_ts)
+                && observation.durable_frontier_published.is_none()
+            {
+                observation.frontier_ticket_end = Some(ticket_end);
+                observation.durable_frontier_published = Some(event);
+            }
+        }
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn commit_order_trace_snapshot(&self) -> CommitOrderTraceSnapshot {
+        let trace = self.commit_order_trace.lock();
+        let records = trace.records.values().copied().collect::<Vec<_>>();
+        let incomplete_records = records
+            .iter()
+            .filter(|observation| {
+                observation.timestamp_reserved.is_none()
+                    || observation.wal_ticket_admitted.is_none()
+                    || observation.durable_frontier_published.is_none()
+                    || observation.wal_return.is_none()
+                    || observation.memtable_publish_complete.is_none()
+                    || observation.mvcc_publication_entry.is_none()
+                    || observation.mvcc_publication_complete.is_none()
+            })
+            .count() as u64;
+
+        CommitOrderTraceSnapshot {
+            limit: self
+                .commit_order_trace_limit
+                .load(std::sync::atomic::Ordering::Relaxed),
+            selected_records: records.len() as u64,
+            dropped_records: self
+                .commit_order_trace_dropped_records
+                .load(std::sync::atomic::Ordering::Relaxed),
+            dropped_frontier_events: trace.dropped_frontier_events,
+            incomplete_records,
+            records,
+        }
+    }
+
     #[cfg(feature = "bench")]
     pub(crate) fn reset(&self) {
         let o = std::sync::atomic::Ordering::Relaxed;
@@ -393,6 +888,25 @@ impl WriteProfile {
         self.wal_v8_completion_timeline.lock().clear();
         #[cfg(feature = "bench")]
         self.wal_v8_completion_timeline_dropped_samples.store(0, o);
+        #[cfg(feature = "bench")]
+        {
+            self.wal_v8_completion_timeline_sample_every.store(0, o);
+            self.wal_v8_durability_sample_every.store(0, o);
+            self.wal_v8_durability_driver_attempt_count.store(0, o);
+            self.wal_v8_durability_empty_driver_attempt_count
+                .store(0, o);
+            self.wal_v8_durability_advance_attempt_count.store(0, o);
+            self.wal_v8_durability_completed_advance_sequence
+                .store(0, o);
+            self.wal_v8_durability_follower_sample_sequence.store(0, o);
+            self.wal_v8_durability_phases.lock().clear();
+            self.wal_v8_durability_phase_dropped_samples.store(0, o);
+            self.wal_v8_ack_observations.lock().clear();
+            self.wal_v8_ack_dropped_samples.store(0, o);
+            self.wal_v8_follower_waits.lock().clear();
+            self.wal_v8_follower_wait_dropped_samples.store(0, o);
+            self.configure_commit_order_trace(0);
+        }
         self.wal_worker_eventfd_notifications.store(0, o);
         self.wal_worker_eventfd_writes.store(0, o);
         self.wal_preallocation_ns.store(0, o);
@@ -541,6 +1055,19 @@ impl WriteProfile {
                     None
                 }
             },
+            wal_v8_durability_sample_every: {
+                #[cfg(feature = "bench")]
+                {
+                    match self.wal_v8_durability_sample_every.load(o) {
+                        0 => None,
+                        every => Some(every),
+                    }
+                }
+                #[cfg(not(feature = "bench"))]
+                {
+                    None
+                }
+            },
             op_count: self.op_count.load(o),
         }
     }
@@ -615,6 +1142,216 @@ impl WriteProfile {
     #[cfg(feature = "bench")]
     pub(crate) fn wal_v8_completion_timeline_dropped_samples(&self) -> u64 {
         self.wal_v8_completion_timeline_dropped_samples
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn set_wal_v8_durability_sample_every(&self, every: u64) {
+        self.wal_v8_durability_sample_every
+            .store(every, std::sync::atomic::Ordering::Release);
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn wal_v8_durability_sample_every(&self) -> u64 {
+        self.wal_v8_durability_sample_every
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn record_wal_v8_durability_driver_attempt(&self) -> Option<u64> {
+        if self.wal_v8_durability_sample_every() == 0 {
+            return None;
+        }
+
+        Some(
+            self.wal_v8_durability_driver_attempt_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                .saturating_add(1),
+        )
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn next_wal_v8_durability_advance_sample_candidate(&self) -> Option<u64> {
+        let every = self.wal_v8_durability_sample_every();
+        if every == 0 {
+            return None;
+        }
+
+        let next_advance_sequence = self
+            .wal_v8_durability_completed_advance_sequence
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .saturating_add(1);
+        next_advance_sequence
+            .is_multiple_of(every)
+            .then_some(next_advance_sequence)
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn record_wal_v8_durability_empty_driver_attempt(&self) {
+        self.wal_v8_durability_empty_driver_attempt_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn record_wal_v8_durability_advance_attempt(&self) {
+        self.wal_v8_durability_advance_attempt_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn complete_wal_v8_durability_advance(&self) -> u64 {
+        self.wal_v8_durability_completed_advance_sequence
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .saturating_add(1)
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn wal_v8_durability_driver_attempt_count(&self) -> u64 {
+        self.wal_v8_durability_driver_attempt_count
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn wal_v8_durability_empty_driver_attempt_count(&self) -> u64 {
+        self.wal_v8_durability_empty_driver_attempt_count
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn wal_v8_durability_advance_attempt_count(&self) -> u64 {
+        self.wal_v8_durability_advance_attempt_count
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn wal_v8_durability_completed_advance_sequence(&self) -> u64 {
+        self.wal_v8_durability_completed_advance_sequence
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn wal_v8_durability_phase_sample_count(&self) -> u64 {
+        self.wal_v8_durability_phases.lock().len() as u64
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn drop_wal_v8_durability_phase_sample(&self) {
+        self.wal_v8_durability_phase_dropped_samples
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn next_wal_v8_follower_sample(&self) -> Option<u64> {
+        let every = self.wal_v8_durability_sample_every();
+        if every == 0 {
+            return None;
+        }
+        let sample_id = self
+            .wal_v8_durability_follower_sample_sequence
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .saturating_add(1);
+        sample_id.is_multiple_of(every).then_some(sample_id)
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn record_wal_v8_durability_phase(
+        &self,
+        observation: WalV8DurabilityPhaseObservation,
+    ) {
+        const MAX_SAMPLES: usize = 4096;
+        let mut samples = self.wal_v8_durability_phases.lock();
+        if samples.len() < MAX_SAMPLES {
+            samples.push(observation);
+        } else {
+            self.wal_v8_durability_phase_dropped_samples
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn wal_v8_ack_ticket_is_sampled(&self, ticket: u64) -> bool {
+        let every = self.wal_v8_durability_sample_every();
+
+        every > 0
+            && ticket
+                .checked_add(1)
+                .is_some_and(|ticket_end| ticket_end.is_multiple_of(every))
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn record_wal_v8_ack_observation(&self, observation: WalV8AckObservation) {
+        const MAX_SAMPLES: usize = 4096;
+        let mut samples = self.wal_v8_ack_observations.lock();
+        if samples.len() < MAX_SAMPLES {
+            samples.push(observation);
+        } else {
+            self.wal_v8_ack_dropped_samples
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn wal_v8_ack_observations(&self) -> Vec<WalV8AckObservation> {
+        self.wal_v8_ack_observations.lock().clone()
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn wal_v8_ack_dropped_samples(&self) -> u64 {
+        self.wal_v8_ack_dropped_samples
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn drop_wal_v8_ack_publish_timestamp(&self) {
+        self.wal_v8_ack_dropped_samples
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn wal_v8_durability_phase_observations(
+        &self,
+    ) -> Vec<WalV8DurabilityPhaseObservation> {
+        self.wal_v8_durability_phases.lock().clone()
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn wal_v8_durability_phase_dropped_samples(&self) -> u64 {
+        self.wal_v8_durability_phase_dropped_samples
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn wal_v8_durability_diagnostic_counts(&self) -> WalV8DurabilityDiagnosticCounts {
+        WalV8DurabilityDiagnosticCounts {
+            driver_attempts: self.wal_v8_durability_driver_attempt_count(),
+            empty_driver_attempts: self.wal_v8_durability_empty_driver_attempt_count(),
+            advance_attempts: self.wal_v8_durability_advance_attempt_count(),
+            completed_advances: self.wal_v8_durability_completed_advance_sequence(),
+            sampled_advances: self.wal_v8_durability_phase_sample_count(),
+            dropped_samples: self.wal_v8_durability_phase_dropped_samples(),
+        }
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn record_wal_v8_follower_wait(&self, observation: WalV8FollowerWaitObservation) {
+        const MAX_SAMPLES: usize = 4096;
+        let mut samples = self.wal_v8_follower_waits.lock();
+        if samples.len() < MAX_SAMPLES {
+            samples.push(observation);
+        } else {
+            self.wal_v8_follower_wait_dropped_samples
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn wal_v8_follower_wait_observations(&self) -> Vec<WalV8FollowerWaitObservation> {
+        self.wal_v8_follower_waits.lock().clone()
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn wal_v8_follower_wait_dropped_samples(&self) -> u64 {
+        self.wal_v8_follower_wait_dropped_samples
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
@@ -971,6 +1708,7 @@ pub struct WriteProfileSnapshot {
     pub wal_sync_coalesce_wait_ns: u64,
     pub wal_hol_diagnostics_enabled: bool,
     pub wal_v8_completion_timeline_sample_every: Option<u64>,
+    pub wal_v8_durability_sample_every: Option<u64>,
     pub op_count: u64,
 }
 
@@ -1144,6 +1882,7 @@ impl WriteProfileSnapshot {
                 .saturating_sub(before.wal_sync_coalesce_wait_ns),
             wal_hol_diagnostics_enabled: self.wal_hol_diagnostics_enabled,
             wal_v8_completion_timeline_sample_every: self.wal_v8_completion_timeline_sample_every,
+            wal_v8_durability_sample_every: self.wal_v8_durability_sample_every,
             op_count: self.op_count.saturating_sub(before.op_count),
         }
     }
@@ -3823,6 +4562,30 @@ impl MemTable {
         Ok(())
     }
 
+    #[cfg(feature = "bench")]
+    pub(crate) fn commit_wal_ticket_with_publish_timestamp(
+        &self,
+        ticket: Option<u64>,
+    ) -> Result<Option<Instant>> {
+        let Some(ticket) = ticket else {
+            return Ok(None);
+        };
+        let Some(wal) = &self.wal else {
+            return Ok(None);
+        };
+
+        let started = Instant::now();
+        let profile = self.write_profile.load();
+        let published_at =
+            wal.submit_and_commit_profiled_with_publish_timestamp(ticket, &profile)?;
+        profile.wal_sync_ns.fetch_add(
+            started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+
+        Ok(published_at)
+    }
+
     /// Implement this in MVCC.
     pub fn put_batch(&self, data: &[(KeySlice, &[u8])]) -> Result<()> {
         let prefixed: Vec<(KeySlice, Vec<u8>)> = data
@@ -4449,6 +5212,117 @@ mod tests {
 
     const TEST_V7_MAX_FILE_SIZE: u64 = 1 << 30;
     const TEST_V8_MAX_IMAGE_LEN: u64 = 1 << 30;
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn v8_durability_sampling_tracks_completed_advances() {
+        let profile = super::WriteProfile::default();
+        profile.set_wal_v8_durability_sample_every(2);
+
+        assert_eq!(profile.record_wal_v8_durability_driver_attempt(), Some(1));
+        profile.record_wal_v8_durability_empty_driver_attempt();
+        assert_eq!(profile.record_wal_v8_durability_driver_attempt(), Some(2));
+        profile.record_wal_v8_durability_empty_driver_attempt();
+
+        // Empty driver attempts do not consume the next completed-advance sample.
+        assert_eq!(
+            profile.next_wal_v8_durability_advance_sample_candidate(),
+            None
+        );
+        assert_eq!(profile.complete_wal_v8_durability_advance(), 1);
+        assert_eq!(
+            profile.next_wal_v8_durability_advance_sample_candidate(),
+            Some(2)
+        );
+
+        profile.record_wal_v8_durability_advance_attempt();
+        assert_eq!(profile.complete_wal_v8_durability_advance(), 2);
+        assert_eq!(
+            profile.next_wal_v8_durability_advance_sample_candidate(),
+            None
+        );
+
+        let counts = profile.wal_v8_durability_diagnostic_counts();
+        assert_eq!(counts.driver_attempts, 2);
+        assert_eq!(counts.empty_driver_attempts, 2);
+        assert_eq!(counts.advance_attempts, 1);
+        assert_eq!(counts.completed_advances, 2);
+        assert_eq!(counts.sampled_advances, 0);
+        assert_eq!(counts.dropped_samples, 0);
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn commit_order_trace_is_bounded_and_associates_durable_tickets() {
+        let profile = super::WriteProfile::default();
+        profile.configure_commit_order_trace(2);
+
+        profile.record_commit_order_timestamp_reserved(10);
+        profile.record_commit_order_timestamp_reserved(11);
+        profile.record_commit_order_timestamp_reserved(12);
+
+        profile.record_commit_order_ticket_admitted(10, 4);
+        profile.record_commit_order_ticket_admitted(11, 5);
+        profile.record_commit_order_frontier_published(4, 5);
+        profile.record_commit_order_wal_return(10, 4);
+        profile.record_commit_order_memtable_publish_complete(10);
+        profile.record_commit_order_mvcc_publication_entry(10);
+        profile.record_commit_order_mvcc_publication_complete(10);
+
+        let snapshot = profile.commit_order_trace_snapshot();
+        assert_eq!(snapshot.limit, 2);
+        assert_eq!(snapshot.selected_records, 2);
+        assert_eq!(snapshot.dropped_records, 0);
+        assert_eq!(snapshot.dropped_frontier_events, 0);
+        assert_eq!(snapshot.incomplete_records, 1);
+        assert_eq!(snapshot.records.len(), 2);
+
+        let complete = &snapshot.records[0];
+        assert_eq!(complete.commit_ts, 10);
+        assert_eq!(complete.wal_ticket, Some(4));
+        assert_eq!(complete.frontier_ticket_end, Some(5));
+        let reserved = complete.timestamp_reserved.unwrap();
+        let admitted = complete.wal_ticket_admitted.unwrap();
+        let durable = complete.durable_frontier_published.unwrap();
+        let wal_return = complete.wal_return.unwrap();
+        let memtable = complete.memtable_publish_complete.unwrap();
+        let mvcc_entry = complete.mvcc_publication_entry.unwrap();
+        let mvcc_complete = complete.mvcc_publication_complete.unwrap();
+        assert!(reserved.sequence < admitted.sequence);
+        assert!(admitted.sequence < durable.sequence);
+        assert!(durable.sequence < wal_return.sequence);
+        assert!(wal_return.sequence < memtable.sequence);
+        assert!(memtable.sequence < mvcc_entry.sequence);
+        assert!(mvcc_entry.sequence < mvcc_complete.sequence);
+        assert_eq!(snapshot.records[1].commit_ts, 11);
+        assert!(snapshot.records[1].wal_ticket_admitted.is_some());
+        assert!(snapshot.records[1].durable_frontier_published.is_none());
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn commit_order_trace_links_frontier_published_before_admission_is_recorded() {
+        let profile = super::WriteProfile::default();
+        profile.configure_commit_order_trace(1);
+
+        profile.record_commit_order_timestamp_reserved(10);
+        profile.record_commit_order_frontier_published(4, 5);
+        profile.record_commit_order_ticket_admitted(10, 4);
+        profile.record_commit_order_wal_return(10, 4);
+        profile.record_commit_order_memtable_publish_complete(10);
+        profile.record_commit_order_mvcc_publication_entry(10);
+        profile.record_commit_order_mvcc_publication_complete(10);
+
+        let snapshot = profile.commit_order_trace_snapshot();
+        assert_eq!(snapshot.dropped_frontier_events, 0);
+        assert_eq!(snapshot.incomplete_records, 0);
+        let record = &snapshot.records[0];
+        assert_eq!(record.frontier_ticket_end, Some(5));
+        assert!(
+            record.durable_frontier_published.unwrap().sequence
+                < record.wal_ticket_admitted.unwrap().sequence
+        );
+    }
 
     #[cfg(target_os = "linux")]
     fn install_empty_v8(path: &Path) -> Result<(WalV8Header, ActiveBoundary)> {

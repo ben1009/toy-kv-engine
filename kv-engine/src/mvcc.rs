@@ -158,6 +158,11 @@ pub(crate) struct LsmMvccInner {
     /// counted until the publisher completes. Barriers conservatively wait
     /// for every earlier attempt to finish publication or retire.
     in_flight: AtomicU64,
+    /// Opt-in, bounded diagnostics for synchronous MVCC publication. These
+    /// are kept on the sequencer so the benchmark samples the real lock and
+    /// wait paths without changing the production API.
+    #[cfg(feature = "bench")]
+    publication_diagnostics: PublicationDiagnostics,
     pub(crate) watermark: Watermark,
     pub(crate) committed_txns: Arc<Mutex<BTreeMap<u64, CommittedTxnData>>>,
 }
@@ -177,6 +182,181 @@ struct PublicationState {
     /// It is a count rather than a flag because one waiter leaving must not
     /// silence a signal another waiter still needs.
     waiters: usize,
+}
+
+#[cfg(feature = "bench")]
+const MAX_PUBLICATION_DIAGNOSTIC_SAMPLES: usize = 16_384;
+
+#[cfg(feature = "bench")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// Publication path taken by a sampled commit timestamp.
+pub enum MvccPublicationPath {
+    #[default]
+    Unclassified,
+    Poisoned,
+    AlreadyPublished,
+    InOrder,
+    OutOfOrder,
+}
+
+#[cfg(feature = "bench")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// Reason a sampled publication stopped spinning for its predecessor.
+pub enum MvccPublicationSpinExit {
+    #[default]
+    NotRequired,
+    FrontierAdvanced,
+    BudgetExhausted,
+}
+
+#[cfg(feature = "bench")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// Per-call synchronous MVCC publication measurements for benchmark diagnosis.
+pub struct MvccPublicationObservation {
+    pub sample_sequence: u64,
+    pub commit_ts: u64,
+    pub next_to_publish_at_entry: u64,
+    pub distance_at_entry: i64,
+    pub next_to_publish_at_decision: u64,
+    pub distance_at_decision: i64,
+    pub path: MvccPublicationPath,
+    pub frontier_timestamps_advanced: u64,
+    pub waited_for_predecessor: bool,
+    pub publication_lock_acquisitions: u64,
+    pub publication_lock_wait_wall_ns: u64,
+    pub publication_lock_wait_cpu_ns: u64,
+    pub spin_limit: u32,
+    pub spin_iterations: u32,
+    pub spin_exit: MvccPublicationSpinExit,
+    pub condvar_wait_calls: u64,
+    pub condvar_returns: u64,
+    pub condvar_frontier_advanced_returns: u64,
+    pub condvar_timeout_returns: u64,
+    pub condvar_wait_wall_ns: u64,
+    pub condvar_wait_cpu_ns: u64,
+    pub total_wall_ns: u64,
+    pub total_thread_cpu_ns: u64,
+}
+
+#[cfg(feature = "bench")]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// Bounded sample set and accounting for MVCC publication diagnostics.
+pub struct MvccPublicationDiagnosticsSnapshot {
+    pub sample_every: u64,
+    pub selected_samples: u64,
+    pub dropped_samples: u64,
+    pub samples: Vec<MvccPublicationObservation>,
+}
+
+#[cfg(feature = "bench")]
+#[derive(Default)]
+struct PublicationDiagnostics {
+    sample_every: AtomicU64,
+    selected_samples: AtomicU64,
+    dropped_samples: AtomicU64,
+    samples: Mutex<Vec<MvccPublicationObservation>>,
+}
+
+#[cfg(feature = "bench")]
+#[derive(Default)]
+struct MvccPublicationSampleBuilder {
+    observation: MvccPublicationObservation,
+    started_at: Option<std::time::Instant>,
+    thread_cpu_started_ns: u64,
+}
+
+#[cfg(feature = "bench")]
+impl MvccPublicationSampleBuilder {
+    fn new(sample_sequence: u64, commit_ts: u64, next_to_publish_at_entry: u64) -> Self {
+        Self {
+            observation: MvccPublicationObservation {
+                sample_sequence,
+                commit_ts,
+                next_to_publish_at_entry,
+                distance_at_entry: timestamp_distance(commit_ts, next_to_publish_at_entry),
+                ..MvccPublicationObservation::default()
+            },
+            started_at: Some(std::time::Instant::now()),
+            thread_cpu_started_ns: crate::wal::v8::digest::thread_cpu_time_ns(),
+        }
+    }
+
+    fn finish(mut self) -> MvccPublicationObservation {
+        if let Some(started_at) = self.started_at.take() {
+            self.observation.total_wall_ns = duration_ns(started_at.elapsed());
+        }
+        self.observation.total_thread_cpu_ns =
+            crate::wal::v8::digest::thread_cpu_time_ns().saturating_sub(self.thread_cpu_started_ns);
+
+        self.observation
+    }
+}
+
+#[cfg(feature = "bench")]
+impl PublicationDiagnostics {
+    fn configure(&self, sample_every: u64) {
+        self.sample_every.store(0, Ordering::Release);
+        self.selected_samples.store(0, Ordering::Relaxed);
+        self.dropped_samples.store(0, Ordering::Relaxed);
+        self.samples.lock().clear();
+        self.sample_every.store(sample_every, Ordering::Release);
+    }
+
+    fn start_sample(
+        &self,
+        commit_ts: u64,
+        read_frontier: impl FnOnce() -> u64,
+    ) -> Option<MvccPublicationSampleBuilder> {
+        let sample_every = self.sample_every.load(Ordering::Relaxed);
+        if sample_every == 0 || !commit_ts.is_multiple_of(sample_every) {
+            return None;
+        }
+
+        let sample_sequence = self.selected_samples.fetch_add(1, Ordering::Relaxed);
+        let next_to_publish_at_entry = read_frontier();
+
+        Some(MvccPublicationSampleBuilder::new(
+            sample_sequence,
+            commit_ts,
+            next_to_publish_at_entry,
+        ))
+    }
+
+    fn record(&self, observation: MvccPublicationObservation) {
+        let mut samples = self.samples.lock();
+        if samples.len() < MAX_PUBLICATION_DIAGNOSTIC_SAMPLES {
+            samples.push(observation);
+        } else {
+            self.dropped_samples.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn snapshot(&self) -> MvccPublicationDiagnosticsSnapshot {
+        MvccPublicationDiagnosticsSnapshot {
+            sample_every: self.sample_every.load(Ordering::Relaxed),
+            selected_samples: self.selected_samples.load(Ordering::Relaxed),
+            dropped_samples: self.dropped_samples.load(Ordering::Relaxed),
+            samples: self.samples.lock().clone(),
+        }
+    }
+}
+
+#[cfg(feature = "bench")]
+fn timestamp_distance(commit_ts: u64, next_to_publish: u64) -> i64 {
+    if commit_ts >= next_to_publish {
+        commit_ts
+            .saturating_sub(next_to_publish)
+            .min(i64::MAX as u64) as i64
+    } else {
+        -(next_to_publish
+            .saturating_sub(commit_ts)
+            .min(i64::MAX as u64) as i64)
+    }
+}
+
+#[cfg(feature = "bench")]
+fn duration_ns(duration: std::time::Duration) -> u64 {
+    duration.as_nanos().min(u64::MAX as u128) as u64
 }
 
 /// Explicit entry kind for [`LsmMvccInner::write_batch_wal_only`].
@@ -351,9 +531,21 @@ impl LsmMvccInner {
             in_flight: AtomicU64::new(0),
             publication_condvar: Condvar::new(),
             async_publication_changed: tokio::sync::Notify::new(),
+            #[cfg(feature = "bench")]
+            publication_diagnostics: PublicationDiagnostics::default(),
             watermark: Watermark::new(),
             committed_txns: Arc::new(Mutex::new(BTreeMap::new())),
         }
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn set_benchmark_publication_sample_every(&self, sample_every: u64) {
+        self.publication_diagnostics.configure(sample_every);
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn benchmark_publication_diagnostics(&self) -> MvccPublicationDiagnosticsSnapshot {
+        self.publication_diagnostics.snapshot()
     }
 
     #[allow(dead_code)]
@@ -437,7 +629,11 @@ impl LsmMvccInner {
     /// without another handoff to this thread. A missing predecessor cannot
     /// cause unbounded spinning; prefix advancement or poison wakes parked
     /// callers, which always recheck the predicate under the publication lock.
-    fn await_publication(&self, commit_ts: u64) -> anyhow::Result<()> {
+    fn await_publication(
+        &self,
+        commit_ts: u64,
+        #[cfg(feature = "bench")] mut sample: Option<&mut MvccPublicationSampleBuilder>,
+    ) -> anyhow::Result<()> {
         // Ready work can advance while this caller is parked. Under contention
         // or far behind a missing predecessor, leave CPU time for publishers
         // and WAL workers. Counts and distance are only scheduling hints; the
@@ -452,13 +648,52 @@ impl LsmMvccInner {
         } else {
             PUBLICATION_SPIN_LIMIT
         };
-        for _ in 0..spin_limit {
+        #[cfg(feature = "bench")]
+        if let Some(sample) = sample.as_deref_mut() {
+            sample.observation.spin_limit = spin_limit;
+        }
+        for _spin_iteration in 0..spin_limit {
             if self.frontier.load(Ordering::Acquire) > commit_ts {
+                #[cfg(feature = "bench")]
+                if let Some(sample) = sample.as_deref_mut() {
+                    sample.observation.spin_iterations = _spin_iteration + 1;
+                    sample.observation.spin_exit = MvccPublicationSpinExit::FrontierAdvanced;
+                }
+
                 return Ok(());
             }
             std::hint::spin_loop();
         }
+        #[cfg(feature = "bench")]
+        if let Some(sample) = sample.as_deref_mut() {
+            sample.observation.spin_iterations = spin_limit;
+            sample.observation.spin_exit = MvccPublicationSpinExit::BudgetExhausted;
+        }
+        #[cfg(feature = "bench")]
+        let lock_wait_started = sample.as_ref().map(|_| std::time::Instant::now());
+        #[cfg(feature = "bench")]
+        let lock_wait_cpu_started = sample
+            .as_ref()
+            .map(|_| crate::wal::v8::digest::thread_cpu_time_ns());
         let mut publication = self.publication.lock();
+        #[cfg(feature = "bench")]
+        if let Some(sample) = sample.as_deref_mut() {
+            sample.observation.publication_lock_acquisitions += 1;
+            if let Some(started) = lock_wait_started {
+                sample.observation.publication_lock_wait_wall_ns = sample
+                    .observation
+                    .publication_lock_wait_wall_ns
+                    .saturating_add(duration_ns(started.elapsed()));
+            }
+            if let Some(started) = lock_wait_cpu_started {
+                sample.observation.publication_lock_wait_cpu_ns = sample
+                    .observation
+                    .publication_lock_wait_cpu_ns
+                    .saturating_add(
+                        crate::wal::v8::digest::thread_cpu_time_ns().saturating_sub(started),
+                    );
+            }
+        }
         publication.waiters += 1;
         while publication.next_to_publish <= commit_ts {
             if publication
@@ -468,8 +703,47 @@ impl LsmMvccInner {
                 publication.waiters -= 1;
                 anyhow::bail!("commit sequencer requires recovery after unknown WAL durability");
             }
+            #[cfg(feature = "bench")]
+            let frontier_before_wait = publication.next_to_publish;
+            #[cfg(feature = "bench")]
+            let condvar_wait_started = sample.as_ref().map(|_| std::time::Instant::now());
+            #[cfg(feature = "bench")]
+            let condvar_wait_cpu_started = sample
+                .as_ref()
+                .map(|_| crate::wal::v8::digest::thread_cpu_time_ns());
+            #[cfg(feature = "bench")]
+            if let Some(sample) = sample.as_deref_mut() {
+                sample.observation.condvar_wait_calls += 1;
+            }
+            #[cfg(feature = "bench")]
+            let timeout = self
+                .publication_condvar
+                .wait_for(&mut publication, DRAIN_RECHECK);
+            #[cfg(not(feature = "bench"))]
             self.publication_condvar
                 .wait_for(&mut publication, DRAIN_RECHECK);
+            #[cfg(feature = "bench")]
+            if let Some(sample) = sample.as_deref_mut() {
+                sample.observation.condvar_returns += 1;
+                if publication.next_to_publish > frontier_before_wait {
+                    sample.observation.condvar_frontier_advanced_returns += 1;
+                }
+                if timeout.timed_out() {
+                    sample.observation.condvar_timeout_returns += 1;
+                }
+                if let Some(started) = condvar_wait_started {
+                    sample.observation.condvar_wait_wall_ns = sample
+                        .observation
+                        .condvar_wait_wall_ns
+                        .saturating_add(duration_ns(started.elapsed()));
+                }
+                if let Some(started) = condvar_wait_cpu_started {
+                    sample.observation.condvar_wait_cpu_ns =
+                        sample.observation.condvar_wait_cpu_ns.saturating_add(
+                            crate::wal::v8::digest::thread_cpu_time_ns().saturating_sub(started),
+                        );
+                }
+            }
         }
         publication.waiters -= 1;
 
@@ -725,18 +999,88 @@ impl LsmMvccInner {
     }
 
     pub(crate) fn publish_commit_ts(&self, commit_ts: u64) -> anyhow::Result<()> {
+        #[cfg(feature = "bench")]
+        if let Some(mut sample) = self
+            .publication_diagnostics
+            .start_sample(commit_ts, || self.frontier.load(Ordering::Acquire))
+        {
+            let result = self.publish_commit_ts_impl(commit_ts, Some(&mut sample));
+            self.publication_diagnostics.record(sample.finish());
+
+            return result;
+        }
+
+        #[cfg(feature = "bench")]
+        return self.publish_commit_ts_impl(commit_ts, None);
+
+        #[cfg(not(feature = "bench"))]
+        self.publish_commit_ts_impl(commit_ts)
+    }
+
+    fn publish_commit_ts_impl(
+        &self,
+        commit_ts: u64,
+        #[cfg(feature = "bench")] mut sample: Option<&mut MvccPublicationSampleBuilder>,
+    ) -> anyhow::Result<()> {
+        #[cfg(feature = "bench")]
+        let lock_wait_started = sample.as_ref().map(|_| std::time::Instant::now());
+        #[cfg(feature = "bench")]
+        let lock_wait_cpu_started = sample
+            .as_ref()
+            .map(|_| crate::wal::v8::digest::thread_cpu_time_ns());
         let mut publication = self.publication.lock();
+        #[cfg(feature = "bench")]
+        if let Some(sample) = sample.as_deref_mut() {
+            sample.observation.publication_lock_acquisitions += 1;
+            if let Some(started) = lock_wait_started {
+                sample.observation.publication_lock_wait_wall_ns = sample
+                    .observation
+                    .publication_lock_wait_wall_ns
+                    .saturating_add(duration_ns(started.elapsed()));
+            }
+            if let Some(started) = lock_wait_cpu_started {
+                sample.observation.publication_lock_wait_cpu_ns = sample
+                    .observation
+                    .publication_lock_wait_cpu_ns
+                    .saturating_add(
+                        crate::wal::v8::digest::thread_cpu_time_ns().saturating_sub(started),
+                    );
+            }
+            sample.observation.next_to_publish_at_decision = publication.next_to_publish;
+            sample.observation.distance_at_decision =
+                timestamp_distance(commit_ts, publication.next_to_publish);
+        }
         if publication
             .poisoned_at
             .is_some_and(|poisoned| commit_ts >= poisoned)
         {
+            #[cfg(feature = "bench")]
+            if let Some(sample) = sample.as_deref_mut() {
+                sample.observation.path = MvccPublicationPath::Poisoned;
+            }
+
             // Failed reservations remain in flight until recovery.
             anyhow::bail!("commit sequencer requires recovery after unknown WAL durability");
         }
         if commit_ts < publication.next_to_publish {
+            #[cfg(feature = "bench")]
+            if let Some(sample) = sample.as_deref_mut() {
+                sample.observation.path = MvccPublicationPath::AlreadyPublished;
+            }
             self.in_flight.fetch_sub(1, Ordering::SeqCst);
+
             return Ok(());
         }
+        #[cfg(feature = "bench")]
+        if let Some(sample) = sample.as_deref_mut() {
+            sample.observation.path = if commit_ts == publication.next_to_publish {
+                MvccPublicationPath::InOrder
+            } else {
+                MvccPublicationPath::OutOfOrder
+            };
+        }
+        #[cfg(feature = "bench")]
+        let frontier_before_advance = publication.next_to_publish;
         if commit_ts == publication.next_to_publish {
             // Preserve the allocation-free in-order path.
             self.current_ts.store(commit_ts, Ordering::Release);
@@ -748,10 +1092,47 @@ impl LsmMvccInner {
             debug_assert!(inserted, "commit publication is registered once");
         }
         self.advance_ready_publications(&mut publication);
+        #[cfg(feature = "bench")]
+        if let Some(sample) = sample.as_deref_mut() {
+            sample.observation.frontier_timestamps_advanced = publication
+                .next_to_publish
+                .saturating_sub(frontier_before_advance);
+        }
         if publication.next_to_publish <= commit_ts {
+            #[cfg(feature = "bench")]
+            if let Some(sample) = sample.as_deref_mut() {
+                sample.observation.waited_for_predecessor = true;
+            }
             drop(publication);
+            #[cfg(feature = "bench")]
+            self.await_publication(commit_ts, sample.as_deref_mut())?;
+            #[cfg(not(feature = "bench"))]
             self.await_publication(commit_ts)?;
+            #[cfg(feature = "bench")]
+            let lock_wait_started = sample.as_ref().map(|_| std::time::Instant::now());
+            #[cfg(feature = "bench")]
+            let lock_wait_cpu_started = sample
+                .as_ref()
+                .map(|_| crate::wal::v8::digest::thread_cpu_time_ns());
             publication = self.publication.lock();
+            #[cfg(feature = "bench")]
+            if let Some(sample) = sample {
+                sample.observation.publication_lock_acquisitions += 1;
+                if let Some(started) = lock_wait_started {
+                    sample.observation.publication_lock_wait_wall_ns = sample
+                        .observation
+                        .publication_lock_wait_wall_ns
+                        .saturating_add(duration_ns(started.elapsed()));
+                }
+                if let Some(started) = lock_wait_cpu_started {
+                    sample.observation.publication_lock_wait_cpu_ns = sample
+                        .observation
+                        .publication_lock_wait_cpu_ns
+                        .saturating_add(
+                            crate::wal::v8::digest::thread_cpu_time_ns().saturating_sub(started),
+                        );
+                }
+            }
         }
         self.in_flight.fetch_sub(1, Ordering::SeqCst);
         // The barrier still drains callers whose ready timestamps were made
@@ -832,6 +1213,10 @@ impl LsmMvccInner {
         }
         let _write_guard = self.write_lock.lock();
         let commit_ts = self.reserve_commit_ts()?;
+        #[cfg(feature = "bench")]
+        memtable
+            .write_profile()
+            .record_commit_order_timestamp_reserved(commit_ts);
         let _unwind_guard = self.guard_versioned_commit_unwind(memtable, commit_ts);
         let encoded_key = encode_internal_key(user_key, commit_ts);
         let mut prefixed = Vec::with_capacity(1 + value.len());
@@ -862,6 +1247,12 @@ impl LsmMvccInner {
                 return Err(error);
             }
         };
+        #[cfg(feature = "bench")]
+        if let Some(ticket) = ticket {
+            memtable
+                .write_profile()
+                .record_commit_order_ticket_admitted(commit_ts, ticket);
+        }
         // Do NOT advance current_ts here — readers would see the timestamp
         // before the data is published to the skiplist. The caller must
         // advance current_ts after commit_wal_ticket + publish_raw_batch succeed.
@@ -894,6 +1285,10 @@ impl LsmMvccInner {
 
         let write_guard = self.write_lock.lock();
         let commit_ts = self.reserve_commit_ts()?;
+        #[cfg(feature = "bench")]
+        memtable
+            .write_profile()
+            .record_commit_order_timestamp_reserved(commit_ts);
         let _unwind_guard = self.guard_versioned_commit_unwind(memtable, commit_ts);
         let encoded_key = encode_internal_key(user_key, commit_ts);
         let recorded_at = self.pitr_recorded_at_for_commit(commit_ts)?;
@@ -942,6 +1337,10 @@ impl LsmMvccInner {
 
         let _write_guard = self.write_lock.lock();
         let commit_ts = self.reserve_commit_ts()?;
+        #[cfg(feature = "bench")]
+        memtable
+            .write_profile()
+            .record_commit_order_timestamp_reserved(commit_ts);
         let _unwind_guard = self.guard_versioned_commit_unwind(memtable, commit_ts);
         let encoded_key = encode_internal_key(user_key, commit_ts);
         let (ticket, frame_job) = match memtable.admit_prepared_v7_pitr_wal_batch_only(

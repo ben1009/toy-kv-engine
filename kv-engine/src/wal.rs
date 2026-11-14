@@ -822,6 +822,26 @@ impl RecoveryHandler for SkiplistRangeRecovery<'_> {
 
 // WAL files are garbage-collected by LsmStorageInner::force_flush_next_imm_memtable
 // once the corresponding immutable memtable has been durably flushed to SST.
+fn wait_for_v8_parallel_if_needed(
+    durable_ticket: &AtomicU64,
+    poisoned: &AtomicBool,
+    ticket: Option<u64>,
+    wait: impl FnOnce() -> Result<()>,
+) -> Result<bool> {
+    if let Some(ticket) = ticket
+        && durable_ticket.load(Ordering::Acquire) > ticket
+    {
+        return Ok(false);
+    }
+    ensure!(
+        !poisoned.load(Ordering::Acquire),
+        "WAL is poisoned due to a previous I/O error"
+    );
+    wait()?;
+
+    Ok(true)
+}
+
 impl Wal {
     // ── io_uring + O_DIRECT helpers ────────────────────────────────────────
 
@@ -2743,24 +2763,24 @@ impl Wal {
         writer: &v8::leader::WalV8ParallelWriter,
         ticket: Option<u64>,
     ) -> Result<()> {
-        if let Some(ticket) = ticket
-            && self.completion_state.durable_ticket.load(Ordering::Acquire) > ticket
-        {
-            return Ok(());
-        }
-        ensure!(
-            !self.poisoned.load(Ordering::Acquire),
-            "WAL is poisoned due to a previous I/O error"
-        );
-        let result = match ticket {
-            Some(ticket) => writer.wait_durable(ticket),
-            None => writer.sync(),
+        let waited = match wait_for_v8_parallel_if_needed(
+            &self.completion_state.durable_ticket,
+            &self.poisoned,
+            ticket,
+            || match ticket {
+                Some(ticket) => writer.wait_durable(ticket),
+                None => writer.sync(),
+            },
+        ) {
+            Ok(waited) => waited,
+            Err(error) => {
+                self.record_v8_parallel_error(writer, &error);
+                return Err(error);
+            }
         };
-        if let Err(error) = result {
-            self.record_v8_parallel_error(writer, &error);
-            return Err(error);
+        if waited {
+            self.refresh_v8_parallel_cursor(writer);
         }
-        self.refresh_v8_parallel_cursor(writer);
 
         Ok(())
     }
@@ -3927,6 +3947,31 @@ impl Wal {
         self.submit_and_commit_inner(ticket, Some(profile))
     }
 
+    #[cfg(feature = "bench")]
+    pub(crate) fn submit_and_commit_profiled_with_publish_timestamp(
+        &self,
+        ticket: u64,
+        profile: &crate::mem_table::WriteProfile,
+    ) -> Result<Option<std::time::Instant>> {
+        let Some(writer) = &self.v8_parallel else {
+            self.submit_and_commit_profiled(ticket, profile)?;
+
+            return Ok(None);
+        };
+        if !profile.wal_v8_ack_ticket_is_sampled(ticket) {
+            self.submit_and_commit_profiled(ticket, profile)?;
+
+            return Ok(None);
+        }
+        self.wait_for_v8_parallel(writer, Some(ticket))?;
+        let published_at = writer.take_durable_publish_sample_timestamp(ticket);
+        if published_at.is_none() {
+            profile.drop_wal_v8_ack_publish_timestamp();
+        }
+
+        Ok(published_at)
+    }
+
     fn submit_and_commit_inner(
         &self,
         ticket: u64,
@@ -4563,5 +4608,85 @@ impl Wal {
         // the seal from them after it releases `submitting`. into_inner is safe
         // here because we only reach this path on success (no SQEs in flight).
         Ok(std::mem::ManuallyDrop::into_inner(bufs))
+    }
+}
+
+#[cfg(test)]
+mod v8_wait_tests {
+    use super::*;
+
+    #[test]
+    fn already_durable_ticket_succeeds_after_wal_poison() {
+        // Arrange
+        let durable_ticket = AtomicU64::new(12);
+        let poisoned = AtomicBool::new(true);
+        let wait_called = AtomicBool::new(false);
+
+        // Act
+        let waited = wait_for_v8_parallel_if_needed(&durable_ticket, &poisoned, Some(11), || {
+            wait_called.store(true, Ordering::Relaxed);
+            anyhow::bail!("the wait closure must not run for a durable ticket")
+        })
+        .expect("a later poison cannot retract the durable ticket");
+
+        // Assert
+        assert!(!waited);
+        assert!(!wait_called.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn non_durable_ticket_fails_after_wal_poison_without_waiting() {
+        // Arrange
+        let durable_ticket = AtomicU64::new(11);
+        let poisoned = AtomicBool::new(true);
+        let wait_called = AtomicBool::new(false);
+
+        // Act
+        let result = wait_for_v8_parallel_if_needed(&durable_ticket, &poisoned, Some(11), || {
+            wait_called.store(true, Ordering::Relaxed);
+            Ok(())
+        });
+
+        // Assert
+        assert!(result.is_err());
+        assert!(!wait_called.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn non_durable_ticket_waits_when_wal_is_healthy() {
+        // Arrange
+        let durable_ticket = AtomicU64::new(11);
+        let poisoned = AtomicBool::new(false);
+        let wait_called = AtomicBool::new(false);
+
+        // Act
+        let waited = wait_for_v8_parallel_if_needed(&durable_ticket, &poisoned, Some(11), || {
+            wait_called.store(true, Ordering::Relaxed);
+            Ok(())
+        })
+        .expect("a healthy WAL should wait for a non-durable ticket");
+
+        // Assert
+        assert!(waited);
+        assert!(wait_called.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn missing_ticket_runs_sync_when_wal_is_healthy() {
+        // Arrange
+        let durable_ticket = AtomicU64::new(0);
+        let poisoned = AtomicBool::new(false);
+        let sync_called = AtomicBool::new(false);
+
+        // Act
+        let waited = wait_for_v8_parallel_if_needed(&durable_ticket, &poisoned, None, || {
+            sync_called.store(true, Ordering::Relaxed);
+            Ok(())
+        })
+        .expect("a healthy WAL should run a whole-WAL sync");
+
+        // Assert
+        assert!(waited);
+        assert!(sync_called.load(Ordering::Relaxed));
     }
 }

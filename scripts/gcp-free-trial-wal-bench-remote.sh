@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-if [[ $# -ne 9 ]]; then
-    echo "usage: $0 <commit> <num> <project> <zone> <instance> <safe-deadline-epoch> <machine-type> <writers-csv> <suite>" >&2
+if [[ $# -ne 10 ]]; then
+    echo "usage: $0 <commit> <num> <project> <zone> <instance> <safe-deadline-epoch> <machine-type> <writers-csv> <suite> <source-patch-sha256>" >&2
     exit 64
 fi
 
@@ -15,6 +15,7 @@ SAFE_DEADLINE_EPOCH="$6"
 MACHINE_TYPE="$7"
 WRITERS_CSV="$8"
 SUITE="$9"
+SOURCE_PATCH_SHA256="${10}"
 
 case "$MACHINE_TYPE" in
     c4-standard-8-lssd) SSD_COUNT=1; SSD_TOTAL_GIB=375 ;;
@@ -39,7 +40,7 @@ for writer in "${WRITERS[@]}"; do
     SEEN_WRITERS[$writer]=1
 done
 if [[ "$SUITE" != "batch64" && "$SUITE" != "rfc026-full" \
-    && "$SUITE" != "v8-small-ticket-profile" ]]; then
+    && "$SUITE" != "v8-small-ticket-profile" && "$SUITE" != "commit-order-trace" ]]; then
     echo "unsupported benchmark suite: $SUITE" >&2
     exit 64
 fi
@@ -52,8 +53,22 @@ if [[ ! "$NUM" =~ ^[0-9]+$ ]] || (( NUM < 64 )); then
     echo "num must be >=64" >&2
     exit 64
 fi
+if [[ "$SUITE" == "commit-order-trace" ]] \
+    && { [[ "$NUM" != "100000" ]] || [[ "$MACHINE_TYPE" != "c4-standard-16-lssd" ]] \
+        || [[ "$WRITERS_CSV" != "16" ]]; }; then
+    echo "commit-order-trace requires c4-standard-16-lssd, 16 writers, and 100000 puts" >&2
+    exit 64
+fi
 if [[ ! "$SAFE_DEADLINE_EPOCH" =~ ^[0-9]+$ ]] || (( SAFE_DEADLINE_EPOCH < 1 )); then
     echo "safe VM deadline must be a positive Unix epoch" >&2
+    exit 64
+fi
+if [[ "$SUITE" == "commit-order-trace" ]] && [[ ! "$SOURCE_PATCH_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+    echo "commit-order-trace requires a lowercase source patch SHA-256" >&2
+    exit 64
+fi
+if [[ "$SUITE" != "commit-order-trace" ]] && [[ "$SOURCE_PATCH_SHA256" != "-" ]]; then
+    echo "source patch SHA-256 is only valid for commit-order-trace" >&2
     exit 64
 fi
 
@@ -175,6 +190,7 @@ runuser -u bench -- env \
     BENCH_DEVICE="$WAL_DEVICE" \
     BENCH_WRITERS="$WRITERS_CSV" \
     BENCH_SUITE="$SUITE" \
+    BENCH_SOURCE_PATCH_SHA256="$SOURCE_PATCH_SHA256" \
     BENCH_BOOT_LOG="$BOOT_LOG" \
     bash -s <<'BENCH_USER_SCRIPT'
 set -Eeuo pipefail
@@ -247,6 +263,23 @@ if [[ "$BENCH_SUITE" == "v8-small-ticket-profile" ]]; then
         --db-root "$BENCH_WORK/databases" \
         --writers "$BENCH_WRITERS" \
         --safe-deadline-epoch "$BENCH_SAFE_DEADLINE_EPOCH"
+elif [[ "$BENCH_SUITE" == "commit-order-trace" ]]; then
+    if [[ ! -r /tmp/gcp-commit-order-trace-runner.py ]]; then
+        echo "commit-order trace runner was not uploaded" >&2
+        exit 1
+    fi
+    printf '%s\n' "$BENCH_SOURCE_PATCH_SHA256" >"$BENCH_RESULTS/source-patch.sha256"
+    cp /tmp/gcp-commit-order-trace-runner.py "$REPO/scripts/gcp_commit_order_trace_runner.py"
+    echo "WAL_BENCHMARK_STARTED $(date --iso-8601=seconds)" | tee -a "$BENCH_BOOT_LOG"
+    PYTHONPATH="$REPO/scripts${PYTHONPATH:+:$PYTHONPATH}" \
+        python3 "$REPO/scripts/gcp_commit_order_trace_runner.py" \
+        --binary "$BINARY" \
+        --results-dir "$BENCH_RESULTS" \
+        --db-root "$BENCH_WORK/databases" \
+        --safe-deadline-epoch "$BENCH_SAFE_DEADLINE_EPOCH" \
+        --commit "$ACTUAL_COMMIT" \
+        --binary-sha256 "$BINARY_SHA256" \
+        --source-patch-sha256 "$BENCH_SOURCE_PATCH_SHA256"
 elif [[ "$BENCH_SUITE" == "rfc026-full" ]]; then
     python3 - "$BENCH_RESULTS/benchmark-plan.json" "$ACTUAL_COMMIT" "$BINARY_SHA256" \
         "$BENCH_WRITERS" "$BENCH_MACHINE_TYPE" "$BENCH_SSD_COUNT" "$BENCH_SSD_TOTAL_GIB" <<'PY'
