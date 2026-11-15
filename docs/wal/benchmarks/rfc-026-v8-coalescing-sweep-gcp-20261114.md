@@ -89,7 +89,7 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_gcp_f
 
 The sweep does not show that coalescing-induced WAL-return order is the cause of the Point throughput gap. A 0 μs budget is a promising throughput candidate for confirmation, while 400 μs remains more CPU- and Sync-efficient. The five repetitions are too few to justify a default change, especially given the latency variation.
 
-The next experiment should repeat a counterbalanced 0-versus-400 score comparison with more repetitions and retain the same Direct FRONTIER and Sliding Fallocate settings. Repeat the trace diagnostics separately if the ordering question remains important; the current single trace per arm is insufficient for a causal conclusion. Do not change the MVCC sequencer or WAL notification protocol based on this sweep alone.
+The follow-up 0-versus-400 score comparison with a same-host V7 control is complete; see the [10-round confirmation report](rfc-026-v7-v8-coalescing-confirmation-gcp-20261115.md). Repeat trace diagnostics separately if the ordering question remains important; the single trace per budget here is insufficient for a causal conclusion. Do not change the MVCC sequencer or WAL notification protocol based on this sweep alone.
 
 ## Result verification and retention
 

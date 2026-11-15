@@ -97,6 +97,7 @@ the retained and rejected experiments.
 - [RFC 026 V7/V8 Point MVCC publication path diagnostics on GCP, 2026-11-14](benchmarks/rfc-026-v7-v8-mvcc-publication-paths-gcp-20261114.md)
 - [RFC 026 V7/V8 Point commit-order trace on GCP, 2026-11-14](benchmarks/rfc-026-v7-v8-commit-order-trace-gcp-20261114.md)
 - [RFC 026 V8 coalescing budget sweep on GCP, 2026-11-14](benchmarks/rfc-026-v8-coalescing-sweep-gcp-20261114.md)
+- [RFC 026 V8 0 vs 400 μs coalescing confirmation with V7 control on GCP, 2026-11-15](benchmarks/rfc-026-v7-v8-coalescing-confirmation-gcp-20261115.md)
 - [RFC 026 V8 DATA submission-order probe on GCP, 2026-11-11](benchmarks/rfc-026-v8-data-submit-order-gcp-20261111.md)
 - [RFC 026 V8 coalescing budget A/B on GCP, 2026-11-11](benchmarks/rfc-026-v8-coalescing-budget-gcp-20261111.md)
 - [RFC 026 V8 low-overhead coalescing confirmation on GCP, 2026-11-11](benchmarks/rfc-026-v8-low-overhead-budget-gcp-20261111.md)
