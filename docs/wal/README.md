@@ -93,6 +93,7 @@ the retained and rejected experiments.
 - [RFC 026 V7/V8 FRONTIER and coalescing comparison on GCP, 2026-11-13](benchmarks/rfc-026-v7-v8-frontier-gcp-20261113.md)
 - [RFC 026 V7/V8 Point CPU and scheduler diagnosis on GCP, 2026-11-13](benchmarks/rfc-026-v7-v8-point-perf-sched-gcp-20261113.md)
 - [RFC 026 V7/V8 Point durability phase comparison on GCP, 2026-11-15](benchmarks/rfc-026-v7-v8-durability-phases-gcp-20261115.md)
+- [RFC 026 V8 batched durable-guard check GCP A/B, 2026-11-15](benchmarks/rfc-026-v8-durable-guard-check-gcp-20261115.md)
 - [RFC 026 V8 durability phase sampling on GCP, 2026-11-13](benchmarks/rfc-026-v8-durability-sampling-gcp-20261113.md)
 - [RFC 026 V7/V8 Point MVCC publication and sampler overhead on GCP, 2026-11-14](benchmarks/rfc-026-v7-v8-mvcc-publication-gcp-20261114.md)
 - [RFC 026 V7/V8 Point MVCC publication path diagnostics on GCP, 2026-11-14](benchmarks/rfc-026-v7-v8-mvcc-publication-paths-gcp-20261114.md)
