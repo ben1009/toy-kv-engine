@@ -47,10 +47,25 @@ Each difference is the median of the five within-pair V8-minus-V7 differences. �
 
 These intervals have different start/end anchors and must not be treated as a matched V7/V8 critical-path comparison. No paired percentage is calculated for them.
 
+## V8 retirement substeps
+
+I reanalyzed the five retained V8 score-run JSON files. Each run had 98–99 sampled advances. For each run, the p50 and p95 of each substep's accumulated thread CPU were calculated first; this table reports the median of those five run-level percentiles. Values are microseconds per sampled advance.
+
+| Retirement substep | Before publish CPU p50/p95 | After publish CPU p50/p95 |
+| --- | ---: | ---: |
+| Collect covered tickets | 1.129/1.733 | 1.015/1.449 |
+| Remove ticket entries | 4.179/4.745 | 6.157/10.170 |
+| Release unused FRONTIER credit | 12.730/14.615 | — |
+| Finish reservation / disarm guard | 7.065/8.426 | 13.579/21.023 |
+| Complete retirement interval | 35.117/42.130 | 32.770/47.840 |
+
+The largest pre-publish substep is releasing unused FRONTIER credit. After publish, guard disarming is the largest measured substep. Each sampled advance covers about 16 tickets. These per-advance CPU percentiles must not be added or treated as per-put costs. The post-publish `finish` measurement includes the current per-guard durable-state check and the per-substep timing overhead; it is a candidate for a batched prefix check, not proof that lock acquisition alone accounts for the entire cost.
+
 ## Findings and limits
 
 - The clearest matched differences are V8 coalescing (+59.7 μs wall and +13.0 μs thread CPU at p50) and pre-publish retirement (+22.2 μs wall and CPU at p50); both were higher in all five pairs.
 - V8 `fdatasync` p50 was about 100 μs higher, while thread CPU was about 8 μs higher. V7's p50 was only 1.3 μs but its p95 was 112.5 μs, so its sampled latency distribution was highly variable; the median alone does not represent every sync.
+- Both V7 and V8 `fdatasync_once()` wrappers call `libc::fdatasync()` and retry `EINTR`. In this comparison V7's sync descriptor is cloned from its `O_DIRECT` file handle, while V8's sync descriptor is buffered; the recorded handles refer to the same respective WAL inode. The descriptor flag alone does not establish a different `fdatasync` durability guarantee. The p50 gap therefore needs syscall/writeback evidence before it is attributed to device service time or a runtime bug.
 - Durable-publish lock wait and publication time were similar. These measurements do not support coordinator lock contention as a major difference in this experiment.
 - V7 and V8 coalescing policies are not identical. FRONTIER preparation also represents different internal work: V7 prepares state/marker data, while V8 reserves and encodes a frontier. These are phase-boundary comparisons, not identical operations.
 - V7 retirement combines the pre-publish work measured here; V8 also has a separate post-publish retirement interval, for which there is no direct V7 counterpart.

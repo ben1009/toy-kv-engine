@@ -277,6 +277,18 @@ pub(crate) struct WalV8CoordinatorWake {
     pub(crate) poisoned: bool,
 }
 
+/// Opaque proof that the coordinator checked a durable ticket prefix.
+pub(crate) struct WalV8DurablePrefixCheck {
+    coordinator: Arc<CoordinatorInner>,
+    ticket_end: u64,
+}
+
+impl WalV8DurablePrefixCheck {
+    fn covers(&self, coordinator: &WalV8ParallelCoordinator, ticket: u64) -> bool {
+        Arc::ptr_eq(&self.coordinator, &coordinator.inner) && ticket < self.ticket_end
+    }
+}
+
 impl WalV8ParallelCoordinator {
     /// Create a bounded ticket coordinator positioned at a recovered Active
     /// image. Source-spool capacity is managed by the caller; preparation
@@ -1916,6 +1928,14 @@ impl WalV8AdmissionGuard for WalV8ParallelAdmissionGuard {
             self.armed = false;
         }
     }
+
+    fn disarm_after_durable_prefix_check(&mut self, prefix_check: &WalV8DurablePrefixCheck) {
+        if self.armed && !prefix_check.covers(&self.coordinator, self.ticket) {
+            self.coordinator.poison_ticket_if_pending(self.ticket);
+        }
+
+        self.armed = false;
+    }
 }
 
 impl Drop for WalV8ParallelAdmissionGuard {
@@ -1930,6 +1950,24 @@ impl WalV8ParallelCoordinator {
 
         if ticket >= state.durable_ticket_end {
             poison_locked(&self.inner, &mut state);
+        }
+    }
+
+    /// Preserve the admission guards' poison fallback with one coordinator
+    /// lock when the caller is retiring a contiguous, already-collected range.
+    pub(crate) fn poison_ticket_prefix_if_pending(
+        &self,
+        ticket_end: u64,
+    ) -> WalV8DurablePrefixCheck {
+        let mut state = self.inner.state.lock();
+
+        if ticket_end > state.durable_ticket_end {
+            poison_locked(&self.inner, &mut state);
+        }
+
+        WalV8DurablePrefixCheck {
+            coordinator: Arc::clone(&self.inner),
+            ticket_end,
         }
     }
 }
@@ -2210,6 +2248,71 @@ mod tests {
 
     fn coordinator(max_inflight_tickets: usize) -> Result<WalV8ParallelCoordinator> {
         coordinator_with_byte_limit(max_inflight_tickets, 64 * 1024 * 1024)
+    }
+
+    #[test]
+    fn poison_ticket_prefix_if_pending_checks_the_prefix_once() -> Result<()> {
+        let coordinator = coordinator(4)?;
+        coordinator.inner.state.lock().durable_ticket_end = 3;
+
+        let covered = coordinator.poison_ticket_prefix_if_pending(3);
+        assert!(covered.covers(&coordinator, 2));
+        assert!(!covered.covers(&coordinator, 3));
+        assert!(!coordinator.is_poisoned());
+
+        coordinator.poison_ticket_prefix_if_pending(4);
+        assert!(coordinator.is_poisoned());
+
+        Ok(())
+    }
+
+    #[test]
+    fn disarm_after_durable_prefix_check_keeps_covered_guard_unarmed() -> Result<()> {
+        let coordinator = coordinator(4)?;
+        let batch = batch(1);
+        let mut encoded = admit(&batch, &coordinator)?.encode()?;
+        coordinator.inner.state.lock().durable_ticket_end = 1;
+
+        let prefix_check = coordinator.poison_ticket_prefix_if_pending(1);
+        encoded.disarm_after_durable_prefix_check(&prefix_check);
+        drop(encoded);
+
+        assert!(!coordinator.is_poisoned());
+
+        Ok(())
+    }
+
+    #[test]
+    fn disarm_after_durable_prefix_check_keeps_uncovered_guard_fail_safe() -> Result<()> {
+        let coordinator = coordinator(4)?;
+        let batch = batch(1);
+        let mut encoded = admit(&batch, &coordinator)?.encode()?;
+        let prefix_check = coordinator.poison_ticket_prefix_if_pending(0);
+
+        encoded.disarm_after_durable_prefix_check(&prefix_check);
+        drop(encoded);
+
+        assert!(coordinator.is_poisoned());
+
+        Ok(())
+    }
+
+    #[test]
+    fn durable_prefix_check_cannot_disarm_another_coordinators_guard() -> Result<()> {
+        let writer_coordinator = coordinator(4)?;
+        let other_coordinator = coordinator(4)?;
+        let batch = batch(1);
+        let mut encoded = admit(&batch, &writer_coordinator)?.encode()?;
+        other_coordinator.inner.state.lock().durable_ticket_end = 1;
+        let foreign_check = other_coordinator.poison_ticket_prefix_if_pending(1);
+
+        encoded.disarm_after_durable_prefix_check(&foreign_check);
+        drop(encoded);
+
+        assert!(writer_coordinator.is_poisoned());
+        assert!(!other_coordinator.is_poisoned());
+
+        Ok(())
     }
 
     fn batch(commit_ts: u64) -> WalBatch {

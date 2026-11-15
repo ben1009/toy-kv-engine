@@ -8,7 +8,7 @@ use anyhow::{Context, Result, ensure};
 
 use crate::pitr::{CanonicalWalEntryStream, RecordedAt, WalBatch, WalV5Limits};
 
-use super::{WAL_V8_HEADER_LEN, codec, digest};
+use super::{WAL_V8_HEADER_LEN, codec, digest, parallel::WalV8DurablePrefixCheck};
 
 const WAL_V8_DATA_START: u64 = (WAL_V8_HEADER_LEN + codec::WAL_V8_FRAME_LEN) as u64;
 
@@ -43,6 +43,12 @@ pub(crate) trait WalV8AdmissionGuard {
     fn segment_ticket(&self) -> u64;
     fn poison(&mut self);
     fn disarm_after_durable(&mut self);
+
+    /// Disarm after the caller has checked the whole durable prefix once.
+    /// Implementations with cheap per-ticket checks can keep the default.
+    fn disarm_after_durable_prefix_check(&mut self, _prefix_check: &WalV8DurablePrefixCheck) {
+        self.disarm_after_durable();
+    }
 }
 
 /// Parallel admission boundary used by v8 producers.
@@ -387,6 +393,15 @@ impl<G: WalV8AdmissionGuard> EncodedWalV8Batch<G> {
     /// Disarm the ticket's poison guard only after durable publication.
     pub(crate) fn disarm_after_durable(&mut self) {
         self.admission_guard.disarm_after_durable();
+    }
+
+    /// Disarm after the caller validates that the complete covered prefix is durable.
+    pub(crate) fn disarm_after_durable_prefix_check(
+        &mut self,
+        prefix_check: &WalV8DurablePrefixCheck,
+    ) {
+        self.admission_guard
+            .disarm_after_durable_prefix_check(prefix_check);
     }
 
     /// Materialize the assigned logical bytes into the v8 physical DATA frames.

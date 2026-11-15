@@ -3995,6 +3995,10 @@ impl WalV8ParallelWriter {
         let started = sample.then(Instant::now);
         #[cfg(feature = "bench")]
         let cpu_started = sample.then(digest::thread_cpu_time_ns);
+        // The prefix was just published by this durability driver. Preserve
+        // the guards' fail-safe behavior with one coordinator lock instead of
+        // reacquiring it once for every covered ticket.
+        let prefix_check = self.coordinator.poison_ticket_prefix_if_pending(ticket_end);
         #[cfg(feature = "bench")]
         let lock_wait_started = sample.then(Instant::now);
         #[cfg(feature = "bench")]
@@ -4035,6 +4039,11 @@ impl WalV8ParallelWriter {
             let mut encoded = guards
                 .remove(&ticket)
                 .context("v8 Parallel producer guard disappeared")?;
+            ensure!(
+                encoded.assignment().segment_ticket == ticket
+                    && (first_ticket..ticket_end).contains(&ticket),
+                "v8 Parallel producer guard ticket does not match its durable prefix"
+            );
             #[cfg(feature = "bench")]
             {
                 remove_cpu_ns = remove_cpu_ns.saturating_add(
@@ -4045,7 +4054,7 @@ impl WalV8ParallelWriter {
             }
             #[cfg(feature = "bench")]
             let step_started = sample.then(digest::thread_cpu_time_ns);
-            encoded.disarm_after_durable();
+            encoded.disarm_after_durable_prefix_check(&prefix_check);
             #[cfg(feature = "bench")]
             {
                 finish_cpu_ns = finish_cpu_ns.saturating_add(
