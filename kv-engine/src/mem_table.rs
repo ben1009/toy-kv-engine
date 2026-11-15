@@ -498,6 +498,7 @@ pub struct CommitOrderTraceObservation {
     pub memtable_publish_complete: Option<CommitOrderTraceEvent>,
     pub mvcc_publication_entry: Option<CommitOrderTraceEvent>,
     pub mvcc_publication_complete: Option<CommitOrderTraceEvent>,
+    pub put_return: Option<CommitOrderTraceEvent>,
 }
 
 /// Bounded snapshot of cross-stage Point-write ordering events.
@@ -734,6 +735,13 @@ impl WriteProfile {
     }
 
     #[cfg(feature = "bench")]
+    pub(crate) fn record_commit_order_put_return(&self, commit_ts: u64) {
+        self.record_commit_order_stage(commit_ts, |observation, event| {
+            observation.put_return = Some(event);
+        });
+    }
+
+    #[cfg(feature = "bench")]
     fn record_commit_order_stage(
         &self,
         commit_ts: u64,
@@ -837,6 +845,7 @@ impl WriteProfile {
                     || observation.memtable_publish_complete.is_none()
                     || observation.mvcc_publication_entry.is_none()
                     || observation.mvcc_publication_complete.is_none()
+                    || observation.put_return.is_none()
             })
             .count() as u64;
 
@@ -5268,6 +5277,7 @@ mod tests {
         profile.record_commit_order_memtable_publish_complete(10);
         profile.record_commit_order_mvcc_publication_entry(10);
         profile.record_commit_order_mvcc_publication_complete(10);
+        profile.record_commit_order_put_return(10);
 
         let snapshot = profile.commit_order_trace_snapshot();
         assert_eq!(snapshot.limit, 2);
@@ -5294,6 +5304,7 @@ mod tests {
         assert!(wal_return.sequence < memtable.sequence);
         assert!(memtable.sequence < mvcc_entry.sequence);
         assert!(mvcc_entry.sequence < mvcc_complete.sequence);
+        assert!(mvcc_complete.sequence < complete.put_return.unwrap().sequence);
         assert_eq!(snapshot.records[1].commit_ts, 11);
         assert!(snapshot.records[1].wal_ticket_admitted.is_some());
         assert!(snapshot.records[1].durable_frontier_published.is_none());
@@ -5312,6 +5323,7 @@ mod tests {
         profile.record_commit_order_memtable_publish_complete(10);
         profile.record_commit_order_mvcc_publication_entry(10);
         profile.record_commit_order_mvcc_publication_complete(10);
+        profile.record_commit_order_put_return(10);
 
         let snapshot = profile.commit_order_trace_snapshot();
         assert_eq!(snapshot.dropped_frontier_events, 0);

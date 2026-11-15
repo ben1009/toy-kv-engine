@@ -442,6 +442,7 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
         )
         self.assertEqual(plan["runs_planned"], 12)
         self.assertEqual(plan["trace_records_per_diagnostic_run"], 1024)
+        self.assertEqual(plan["diagnostic_sampling"]["mvcc_publication_sample_every"], 64)
 
     def test_commit_order_trace_analyzer_counts_stage_inversions_and_pairs(self) -> None:
         self.assertEqual(_inversion_count([1, 3, 2]), 1)
@@ -462,8 +463,10 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
         analysis = analyze_trace({"records": records})
         self.assertEqual(analysis["complete_records"], 3)
         self.assertEqual(analysis["pairwise_timestamp_inversions"]["wal_return"]["timestamp_inversion_pairs"], 3)
+        self.assertEqual(analysis["pairwise_timestamp_inversions"]["put_return"]["timestamp_inversion_pairs"], 3)
         self.assertEqual(analysis["pairwise_timestamp_inversions"]["timestamp_reserved"]["timestamp_inversion_pairs"], 0)
         self.assertEqual(analysis["pairwise_timestamp_inversions"]["wal_return"]["timestamp_tie_pairs_excluded"], 0)
+        self.assertIn("mvcc_publication_complete_to_put_return", analysis["stage_intervals"])
 
         tied_records = []
         for commit_ts in (1, 2, 3):

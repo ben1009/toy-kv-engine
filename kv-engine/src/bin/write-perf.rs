@@ -1288,6 +1288,7 @@ struct CommitOrderTraceRecord {
     memtable_publish_complete: Option<CommitOrderTraceEventRecord>,
     mvcc_publication_entry: Option<CommitOrderTraceEventRecord>,
     mvcc_publication_complete: Option<CommitOrderTraceEventRecord>,
+    put_return: Option<CommitOrderTraceEventRecord>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
@@ -1593,6 +1594,7 @@ impl From<kv_engine_wrapper::mem_table::CommitOrderTraceObservation> for CommitO
             memtable_publish_complete: observation.memtable_publish_complete.map(Into::into),
             mvcc_publication_entry: observation.mvcc_publication_entry.map(Into::into),
             mvcc_publication_complete: observation.mvcc_publication_complete.map(Into::into),
+            put_return: observation.put_return.map(Into::into),
         }
     }
 }

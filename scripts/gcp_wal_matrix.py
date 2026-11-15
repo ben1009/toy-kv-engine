@@ -138,6 +138,10 @@ def build_commit_order_trace_plan(
             "num": COMMIT_ORDER_TRACE_NUM, "sample_every": 100,
         }],
         "trace_records_per_diagnostic_run": COMMIT_ORDER_TRACE_LIMIT,
+        "diagnostic_sampling": {
+            "mvcc_publication_sample_every": 64,
+            "v8_durability_sample_every": 64,
+        },
         "untraced_pairs_planned": COMMIT_ORDER_TRACE_REPETITIONS,
         "runs_planned": len(schedule),
         "score_runs_planned": COMMIT_ORDER_TRACE_REPETITIONS * 2,

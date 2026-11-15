@@ -1822,6 +1822,8 @@ struct PutAckTiming {
     observation: Option<crate::mem_table::WalV8AckObservation>,
     #[cfg(feature = "bench")]
     wal_return_at: Option<std::time::Instant>,
+    #[cfg(feature = "bench")]
+    commit_ts: Option<u64>,
 }
 
 impl CompactionFilterRegistry {
@@ -19303,6 +19305,11 @@ impl LsmStorageInner {
             match self.put_once(key, value, &mut ack_timing) {
                 Ok(()) => {
                     #[cfg(feature = "bench")]
+                    if let Some(commit_ts) = ack_timing.commit_ts {
+                        self.write_profile.record_commit_order_put_return(commit_ts);
+                    }
+
+                    #[cfg(feature = "bench")]
                     if let (Some(mut observation), Some(wal_return_at)) =
                         (ack_timing.observation.take(), ack_timing.wal_return_at)
                     {
@@ -19371,6 +19378,12 @@ impl LsmStorageInner {
                     ticket,
                 )
             };
+            #[cfg(feature = "bench")]
+            if let Some((commit_ts, _, _)) = publish_data.as_ref()
+                && *commit_ts > 0
+            {
+                ack_timing.commit_ts = Some(*commit_ts);
+            }
             #[cfg(feature = "bench")]
             let durable_published_at = Self::commit_wal_ticket_or_poison_with_publish_timestamp(
                 &memtable,

@@ -27,6 +27,8 @@ from gcp_wal_matrix import (
 )
 
 RUN_TIMEOUT_SECONDS = 300
+MVCC_SAMPLE_EVERY = 64
+V8_DURABILITY_SAMPLE_EVERY = 64
 V8_ENV = {
     "TOYKV_WAL_V8_FRONTIER_MODE": "direct",
     "TOYKV_WAL_V8_COALESCE_BUDGET_US": "400",
@@ -41,6 +43,7 @@ TRACE_STAGES = (
     "memtable_publish_complete",
     "mvcc_publication_entry",
     "mvcc_publication_complete",
+    "put_return",
 )
 
 
@@ -81,6 +84,25 @@ def _validate_trace_result(
         ):
             raise ValueError("commit-order trace is incomplete")
         analyze_trace(trace)
+        mvcc_diagnostics = pipeline.get("mvcc_publication_diagnostics")
+        if (
+            not isinstance(mvcc_diagnostics, dict)
+            or mvcc_diagnostics.get("sample_every") != MVCC_SAMPLE_EVERY
+            or mvcc_diagnostics.get("selected_samples", 0) <= 0
+            or not isinstance(mvcc_diagnostics.get("samples"), list)
+            or not mvcc_diagnostics["samples"]
+        ):
+            raise ValueError("MVCC publication diagnostic samples are missing")
+        if expected_arm == "v8_parallel":
+            durability_diagnostics = pipeline.get("v8_durability_diagnostics")
+            if (
+                not isinstance(durability_diagnostics, dict)
+                or durability_diagnostics.get("sample_every") != V8_DURABILITY_SAMPLE_EVERY
+                or durability_diagnostics.get("sampled_advances", 0) <= 0
+                or durability_diagnostics.get("dropped_samples") != 0
+                or not durability_diagnostics.get("phases")
+            ):
+                raise ValueError("V8 durability diagnostic samples are missing or incomplete")
     elif trace is not None:
         raise ValueError("commit-order tracing was enabled for a score run")
 
@@ -471,6 +493,12 @@ def run(args: argparse.Namespace) -> int:
         ]
         if row["trace_limit"]:
             command.extend(("--commit-order-trace-limit", str(row["trace_limit"])))
+            command.extend(("--mvcc-publication-sample-every", str(MVCC_SAMPLE_EVERY)))
+            if row["arm"] == "v8_parallel":
+                command.extend((
+                    "--wal-v8-durability-sample-every",
+                    str(V8_DURABILITY_SAMPLE_EVERY),
+                ))
 
         environment: dict[str, str] = {}
         if row["arm"] == "v8_parallel":
