@@ -32,6 +32,7 @@ from gcp_wal_matrix import (
     validate_batch64_rows,
     validate_rfc026_rows,
 )
+from analyze_gcp_commit_order_trace import extract_trace
 from gcp_commit_order_trace_runner import (
     TRACE_STAGES,
     _inversion_count,
@@ -550,6 +551,43 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
         self.assertEqual(size_three["timestamp_tie_pairs_excluded"], 1)
         self.assertEqual(size_three["timestamp_inversion_rate"], 1.0)
         self.assertEqual(size_three["median_group_inversion_rate"], 1.0)
+
+    def test_commit_order_trace_analyzer_excludes_ties_in_complete_16_ticket_group(self) -> None:
+        records = []
+        for ticket in range(16):
+            record = {
+                "commit_ts": ticket + 1,
+                "wal_ticket": ticket,
+                "frontier_ticket_end": 16,
+            }
+            for stage_index, stage in enumerate(TRACE_STAGES):
+                return_order = 0 if ticket < 2 else ticket
+                monotonic_ns = stage_index * 100_000 + ticket + 1
+                if stage == "wal_return":
+                    monotonic_ns = 300_000 + return_order * 1_000
+                record[stage] = {
+                    "monotonic_ns": monotonic_ns,
+                    "sequence": (ticket + 1) * 10 + stage_index,
+                    "thread_id": ticket + 1,
+                }
+            records.append(record)
+
+        analysis = analyze_trace({"records": records})
+        size_sixteen = analysis["wal_return_inversions_by_complete_group_size"]["by_group_size"]["16"]
+        self.assertEqual(size_sixteen["groups"], 1)
+        self.assertEqual(size_sixteen["timestamp_pair_count"], 119)
+        self.assertEqual(size_sixteen["timestamp_tie_pairs_excluded"], 1)
+        self.assertEqual(size_sixteen["timestamp_inversion_pairs"], 0)
+
+    def test_offline_commit_order_trace_extractor_accepts_write_perf_json(self) -> None:
+        trace = {"records": []}
+        self.assertIs(extract_trace(trace), trace)
+        self.assertIs(
+            extract_trace({"result": {"wal_pipeline": {"commit_order_trace": trace}}}),
+            trace,
+        )
+        with self.assertRaisesRegex(ValueError, "does not contain"):
+            extract_trace({"result": {"wal_pipeline": {}}})
 
     def test_commit_order_trace_analyzer_rejects_invalid_frontier_group(self) -> None:
         record = {"commit_ts": 1, "wal_ticket": 0, "frontier_ticket_end": 0}
