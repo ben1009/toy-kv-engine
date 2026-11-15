@@ -59,12 +59,13 @@ archive and checksum file remain local and were not added to GitHub, as
 requested. The verified archive SHA-256 is
 `d7b377c4bd9a27965f4873a5588951df3bdf70219e56d08c69ce8ba5a641ce8e`.
 
-A separate built-in 64-run RFC 026 matrix attempt stopped on its first run
+The original built-in 64-run RFC 026 matrix attempt stopped on its first run
 because the generated TSV used CRLF line endings, leaving a carriage return in
 the latency-sampling argument. The runner was fixed in `bb5dbf50` to emit LF
-line endings, but that 64-run matrix was not rerun as part of this paired
-comparison. Its incomplete result is not included in the table above. The GCP
-environment was retained; no cloud cleanup was performed.
+line endings. A later 64/64 rerun completed and is reported in the [full matrix
+report](rfc-026-v8-durable-guard-full-matrix-gcp-20261115.md). Those matrix
+results are separate from the five-pair A/B table above. The GCP environment
+was retained; no cloud cleanup was performed.
 
 This result supports the change as a possible CPU-efficiency improvement, not
 as a demonstrated Point-throughput optimization. More paired runs would be
