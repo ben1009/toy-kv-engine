@@ -2324,6 +2324,33 @@ print('[hotpath] diagnostic report follows')
                     {"failed": failed, "runs_started": len(selected)},
                 )
 
+    def test_rfc026_run_plan_uses_lf_for_shell_reader(self) -> None:
+        source = Path(__file__).with_name("gcp-free-trial-wal-bench-remote.sh").read_text(encoding="utf-8")
+        start = source.index('python3 - "$RUN_PLAN" "$BENCH_WRITERS" <<\'PY\'')
+        finish = source.index("\nPY\n", start) + len("\nPY")
+        script = source[start:finish]
+
+        with tempfile.TemporaryDirectory() as temp:
+            plan_path = Path(temp) / "rfc026-schedule.tsv"
+            result = subprocess.run(
+                ["bash", "-euc", script],
+                env={
+                    "PATH": os.environ["PATH"],
+                    "PYTHONPATH": str(Path(__file__).parent),
+                    "RUN_PLAN": str(plan_path),
+                    "BENCH_WRITERS": "16",
+                },
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            content = plan_path.read_text(encoding="utf-8")
+            self.assertNotIn("\r", content)
+            rows = list(csv.DictReader(content.splitlines(), delimiter="\t"))
+            self.assertEqual(len(rows), len(build_rfc026_schedule((16,))))
+            self.assertEqual(rows[0]["sample_every"], "100")
+
     def test_full_rfc026_summary_accepts_all_320_runs(self) -> None:
         source = Path(__file__).with_name("gcp-free-trial-wal-bench-remote.sh").read_text(encoding="utf-8")
         self.assertIn('IFS=\',\' read -r -a WRITER_COUNTS <<<"$BENCH_WRITERS"', source)

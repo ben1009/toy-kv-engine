@@ -317,7 +317,7 @@ from gcp_wal_matrix import build_rfc026_schedule
 path, writers_csv = sys.argv[1:]
 schedule = build_rfc026_schedule(int(value) for value in writers_csv.split(","))
 with open(path, "w", encoding="utf-8", newline="") as stream:
-    writer = csv.DictWriter(stream, fieldnames=schedule[0].keys(), delimiter="\t")
+    writer = csv.DictWriter(stream, fieldnames=schedule[0].keys(), delimiter="\t", lineterminator="\n")
     writer.writeheader()
     writer.writerows({**item, "batch_size": item["batch_size"] or "none"} for item in schedule)
 PY
