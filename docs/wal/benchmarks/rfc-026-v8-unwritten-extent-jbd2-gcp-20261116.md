@@ -44,6 +44,10 @@ This particular per-call trace captured no V7 calls below 2 μs; do not generali
 - Initialization reduced JBD2 waits during measured WAL syncs but cost about 2.3 seconds up front and changed sync grouping. Its end-to-end one-shot throughput was lower than fallocate-only, so this is mechanism evidence, not a proposed optimization.
 - These are single diagnostic runs; BPF can perturb timing. Do not interpret the diagnostic throughput as a benchmark score.
 
+## Reproducing the kernel trace
+
+The inode/JBD2 aggregate probe is retained at [`scripts/gcp_v8_unwritten_jbd2.bt`](../../../scripts/gcp_v8_unwritten_jbd2.bt). From the repository root, run it with the benchmark process ID, for example `sudo bpftrace scripts/gcp_v8_unwritten_jbd2.bt 12345 | tee trace.txt`. It emits aggregate maps at exit. Join `@wait_tx_by_inode` transaction IDs against `@commit_end_ns` using the device and transaction keys; do not interpret equal wait and sync totals as a one-to-one pairing. Kernel tracepoint fields and function probes vary by kernel, so verify availability before running.
+
 ## Validation and artifacts
 
 All 6 planned runs have successful `result.json` and matching `run-metadata.json` in their own directories. `summary.json` reports complete 6/6; `remote-exit.json` reports no failures and 6 starts/completions. Three transferred result archives and their retained checksum sidecars passed SHA-256 verification. The source commit and workspace/vendor archive hashes remain in the local summary.
