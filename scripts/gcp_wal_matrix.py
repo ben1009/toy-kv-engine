@@ -159,7 +159,9 @@ def build_point_lookahead_schedule(writers: Iterable[int]) -> list[dict[str, obj
                         "arm": arm,
                         **{key: value for key, value in workload.items() if key != "name"},
                         "extent_mode": (
-                            "sliding-point-lookahead" if arm == "v8_point_lookahead" else "sliding-fallocate"
+                            "sliding-point-lookahead"
+                            if arm == "v8_point_lookahead" and workload["name"] == "point"
+                            else "sliding-fallocate"
                         ),
                         "extent_window_bytes": POINT_LOOKAHEAD_WINDOW_BYTES,
                     })

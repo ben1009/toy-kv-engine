@@ -361,11 +361,18 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
         )
         self.assertEqual(
             {row["extent_mode"] for row in schedule if row["arm"] == "v8_point_lookahead"},
-            {"sliding-point-lookahead"},
+            {"sliding-fallocate", "sliding-point-lookahead"},
         )
         for workload in ("point", "batch8", "batch16", "batch64"):
             selected = [row for row in schedule if row["workload"] == workload]
             self.assertEqual(len(selected), 10)
+            expected_extent_mode = (
+                "sliding-point-lookahead" if workload == "point" else "sliding-fallocate"
+            )
+            self.assertEqual(
+                {row["extent_mode"] for row in selected if row["arm"] == "v8_point_lookahead"},
+                {expected_extent_mode},
+            )
             for repetition in range(1, 6):
                 pair = [row["arm"] for row in selected if row["repetition"] == repetition]
                 expected = (
