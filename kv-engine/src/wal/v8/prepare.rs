@@ -31,6 +31,8 @@ pub(crate) struct WalV8AdmissionPlan {
     pub(crate) commit_ts: u64,
     pub(crate) recorded_at: RecordedAt,
     pub(crate) logical_batch_bytes: usize,
+    #[cfg(feature = "bench")]
+    pub(crate) operation_count: u32,
     pub(crate) fragment_count: u32,
     pub(crate) frame_buffer_bytes: usize,
 }
@@ -68,6 +70,22 @@ pub(crate) trait WalV8AdmissionPublisher {
         &self,
         plan: WalV8AdmissionPlan,
     ) -> Result<(WalV8BatchAssignment, Self::Guard)>;
+
+    /// Run a range-registration callback after the assignment is known and
+    /// before it becomes visible to other producers. Implementations that can
+    /// do this atomically should override the default post-admission callback.
+    fn admit_and_publish_with<F>(
+        &self,
+        plan: WalV8AdmissionPlan,
+        register: F,
+    ) -> Result<(WalV8BatchAssignment, Self::Guard)>
+    where
+        F: FnOnce(WalV8BatchAssignment) -> Result<()>,
+    {
+        let (assignment, guard) = self.admit_and_publish(plan)?;
+        register(assignment)?;
+        Ok((assignment, guard))
+    }
 }
 
 /// Canonical operations and checked encoded sizes, with no serialized payload.
@@ -78,6 +96,8 @@ pub(crate) struct PreparedWalV8Batch<'a, R> {
     recorded_at: RecordedAt,
     logical_batch_bytes: usize,
     preparation_buffer_bytes: u64,
+    #[cfg(feature = "bench")]
+    operation_count: u32,
     fragment_count: u32,
     frame_buffer_bytes: usize,
     preparation_reservation: R,
@@ -101,6 +121,9 @@ impl<'a, R> PreparedWalV8Batch<'a, R> {
     where
         F: FnOnce(u64) -> Result<R>,
     {
+        #[cfg(feature = "bench")]
+        let operation_count = u32::try_from(batch.entries.len())
+            .context("v8 operation count exceeds the admission limit")?;
         let preparation_bytes = Self::preparation_buffer_bytes(batch, limits)?;
         let preparation_reservation = reserve_preparation(preparation_bytes)?;
         let canonical = CanonicalWalEntryStream::new(batch, limits)?;
@@ -122,6 +145,8 @@ impl<'a, R> PreparedWalV8Batch<'a, R> {
             recorded_at: batch.recorded_at,
             logical_batch_bytes,
             preparation_buffer_bytes: preparation_bytes,
+            #[cfg(feature = "bench")]
+            operation_count,
             fragment_count,
             frame_buffer_bytes,
             preparation_reservation,
@@ -179,6 +204,8 @@ impl<'a, R> PreparedWalV8Batch<'a, R> {
             commit_ts,
             recorded_at,
             logical_batch_bytes: self.logical_batch_bytes,
+            #[cfg(feature = "bench")]
+            operation_count: self.operation_count,
             fragment_count: self.fragment_count,
             frame_buffer_bytes: self.frame_buffer_bytes,
         };
@@ -636,6 +663,8 @@ mod tests {
             secs: 123,
             nanos: 456,
         };
+        #[cfg(feature = "bench")]
+        let operation_count = prepared.operation_count;
         publisher.assignment.commit_ts = commit_ts;
         publisher.assignment.recorded_at = recorded_at;
 
@@ -649,6 +678,8 @@ mod tests {
                 commit_ts,
                 recorded_at,
                 logical_batch_bytes: encoded.as_bytes().len(),
+                #[cfg(feature = "bench")]
+                operation_count,
                 fragment_count: encoded.fragment_count,
                 frame_buffer_bytes: encoded.frame_buffer_bytes,
             }]
@@ -721,6 +752,8 @@ mod tests {
             commit_ts: batch.commit_ts,
             recorded_at: batch.recorded_at,
             logical_batch_bytes: prepared.logical_batch_bytes(),
+            #[cfg(feature = "bench")]
+            operation_count: prepared.operation_count,
             fragment_count: prepared.fragment_count(),
             frame_buffer_bytes: prepared.frame_buffer_bytes(),
         };

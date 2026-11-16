@@ -36,12 +36,16 @@ from gcp_wal_matrix import (
     COMMIT_ORDER_TRACE_WRITERS,
     FULL_DEFAULT_WRITERS,
     LEGACY_DEFAULT_WRITERS,
+    POINT_LOOKAHEAD_WRITERS,
     build_commit_order_trace_plan,
     build_commit_order_trace_schedule,
     build_batch64_schedule,
     build_benchmark_plan,
+    build_point_lookahead_plan,
+    build_point_lookahead_schedule,
     build_rfc026_schedule,
     validate_commit_order_trace_rows,
+    validate_point_lookahead_rows,
     validate_writer_counts,
 )
 from gcp_commit_order_trace_runner import analyze_trace
@@ -55,6 +59,7 @@ RUNNERS = Path(__file__).with_name("gcp-free-trial-wal-bench-remote.sh")
 MATRIX_MODULE = Path(__file__).with_name("gcp_wal_matrix.py")
 PROFILE_RUNNER = Path(__file__).with_name("gcp_wal_profile_runner.py")
 COMMIT_ORDER_TRACE_RUNNER = Path(__file__).with_name("gcp_commit_order_trace_runner.py")
+POINT_LOOKAHEAD_RUNNER = Path(__file__).with_name("gcp_v8_point_lookahead_runner.py")
 REPO_URL = "https://github.com/ben1009/toy-kv-engine.git"
 MAX_RUNTIME_MINUTES = 180
 MIN_RUNTIME_MINUTES = 60
@@ -74,6 +79,7 @@ if not root.is_dir():
 root_names = {
     "summary.json", "summary.tsv", "comparison.tsv", "benchmark-plan.json",
     "rfc026-schedule.tsv", "profile-schedule.tsv", "commit-order-trace-schedule.tsv",
+    "point-lookahead-schedule.tsv",
     "commit-order-trace-analysis.json", "commit.txt", "remote-exit.json",
     "finished_utc.txt", "remote-finished-utc.txt", "remote-status.txt", "host.txt",
     "os-release.txt", "uname.txt", "lscpu.txt", "lsblk.txt", "findmnt.txt", "df.txt",
@@ -1045,6 +1051,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                              help="Collect Hotpath/perf diagnostics for V7/V8 point and batch workloads")
     suite_group.add_argument("--commit-order-trace", action="store_true",
                              help="Trace commit order and run five untraced 16-writer V7/V8 Point pairs")
+    suite_group.add_argument("--v8-point-lookahead-ab", action="store_true",
+                             help="Compare V8 1 MiB fallocate vs Point-only lookahead, with batch guardrails")
     parser.add_argument("--source-patch-sha256",
                         help="SHA-256 of the exact source patch used for a commit-order trace run")
     parser.add_argument("--network", help="Existing VPC to use (default: default)")
@@ -1067,11 +1075,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                         help="Attest that Billing Overview says Free Trial and you will not upgrade to Paid")
     args = parser.parse_args(argv)
     if args.machine_type is None:
-        args.machine_type = "c4-standard-16-lssd" if args.commit_order_trace else MACHINE_TYPE
+        args.machine_type = "c4-standard-16-lssd" if (args.commit_order_trace or args.v8_point_lookahead_ab) else MACHINE_TYPE
     args.network = args.network or "default"
     if args.writers is None:
         if args.commit_order_trace:
             args.writers = (COMMIT_ORDER_TRACE_WRITERS,)
+        elif args.v8_point_lookahead_ab:
+            args.writers = (POINT_LOOKAHEAD_WRITERS,)
         elif args.v8_small_ticket_profile:
             args.writers = (1, 8, 16)
         else:
@@ -1082,11 +1092,15 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error(str(error))
     if args.commit_order_trace and args.writers != (COMMIT_ORDER_TRACE_WRITERS,):
         parser.error("--commit-order-trace requires exactly 16 writers")
+    if args.v8_point_lookahead_ab and args.writers != (POINT_LOOKAHEAD_WRITERS,):
+        parser.error("--v8-point-lookahead-ab requires exactly 16 writers")
+    if args.v8_point_lookahead_ab and args.machine_type != "c4-standard-16-lssd":
+        parser.error("--v8-point-lookahead-ab requires c4-standard-16-lssd")
     if not re.fullmatch(r"[0-9a-fA-F]{40}", args.commit):
         parser.error("--commit must be a full 40-character SHA")
     if args.num < 64:
         parser.error("--num must be at least 64")
-    if (args.full_rfc026_matrix or args.v8_small_ticket_profile) and args.num != 750_000:
+    if (args.full_rfc026_matrix or args.v8_small_ticket_profile or args.v8_point_lookahead_ab) and args.num != 750_000:
         parser.error("the selected multi-workload suite uses fixed operation counts; omit --num overrides")
     if args.commit_order_trace and args.num != COMMIT_ORDER_TRACE_NUM:
         parser.error(f"--commit-order-trace uses a fixed {COMMIT_ORDER_TRACE_NUM}-put workload")
@@ -1208,6 +1222,8 @@ def _run_identifier(row: dict[str, Any], suite: str) -> str:
         return f"w{row['writer']}-b{row['block']}-p{row['position']}-{row['arm']}"
     if suite == "commit-order-trace":
         return f"w{row['writer']}-{row['workload']}-{row['phase']}-r{row['repetition']}-{row['arm']}"
+    if suite == "v8-point-lookahead":
+        return f"w{row['writer']}-{row['workload']}-r{row['repetition']}-{row['arm']}"
     raise ValueError(f"unsupported benchmark suite: {suite!r}")
 
 
@@ -1223,6 +1239,8 @@ def _summary_row_identifier(row: dict[str, Any], suite: str) -> str:
             f"w{int(row['writer'])}-{row['workload']}-{row['phase']}-r{int(row['repetition'])}-"
             f"{row['arm']}"
         )
+    if suite == "v8-point-lookahead":
+        return f"w{int(row['writer'])}-{row['workload']}-r{int(row['repetition'])}-{row['arm']}"
     raise ValueError(f"unsupported benchmark suite: {suite!r}")
 
 
@@ -1238,6 +1256,13 @@ def _expected_run_metadata(row: dict[str, Any], suite: str) -> dict[str, Any]:
     if suite == "commit-order-trace":
         return {
             key: row[key] for key in ("writer", "workload", "phase", "repetition", "arm", "trace_limit")
+        }
+    if suite == "v8-point-lookahead":
+        return {
+            key: row[key] for key in (
+                "writer", "workload", "repetition", "arm", "bench", "batch_entries", "batch_size",
+                "num", "sample_every", "extent_mode", "extent_window_bytes",
+            )
         }
     raise ValueError(f"unsupported benchmark suite: {suite!r}")
 
@@ -1280,6 +1305,8 @@ def _verify_result_set(results: Path) -> dict[str, Any]:
             suite = plan.get("suite")
             if suite == "rfc026-full":
                 schedule = build_rfc026_schedule(plan["writers"])
+            elif suite == "v8-point-lookahead":
+                schedule = build_point_lookahead_schedule(plan["writers"])
             elif suite == "batch64":
                 schedule = build_batch64_schedule(plan["writers"])
             elif suite == "commit-order-trace":
@@ -1504,6 +1531,48 @@ def _verify_result_set(results: Path) -> dict[str, Any]:
                             raise ValueError("benchmark result parameters do not match the planned run")
                     except (KeyError, AttributeError, TypeError, ValueError) as error:
                         errors.append(f"run {run_id} result parameters are invalid: {error}")
+                elif suite == "v8-point-lookahead" and isinstance(record, dict):
+                    try:
+                        params = record["params"]
+                        result = record["result"]
+                        expected_params = {
+                            "num": identity["num"],
+                            "threads": identity["writer"],
+                            "value_size": 1024,
+                            "batch_size": identity["batch_size"],
+                            "wal_format_version": 8,
+                            "wal_io_mode": "parallel",
+                        }
+                        if result.get("ops") != identity["num"] or any(
+                            params.get(key) != value for key, value in expected_params.items()
+                        ):
+                            raise ValueError("benchmark parameters do not match the planned Point/Batch run")
+                        pipeline = result["wal_pipeline"]
+                        if pipeline.get("wal_io_stable") is not True:
+                            raise ValueError("WAL I/O metadata changed during the run")
+                        expected_mode = identity["extent_mode"]
+                        expected_window = identity["extent_window_bytes"]
+                        for boundary in ("wal_io_start", "wal_io_end"):
+                            preparation = pipeline[boundary]["sliding_extent_preparation"]
+                            if preparation.get("mode") != expected_mode or (
+                                preparation.get("window_bytes") != expected_window
+                            ):
+                                raise ValueError(f"{boundary} does not report the planned extent mode/window")
+                        final_preparation = pipeline["wal_io_end"]["sliding_extent_preparation"]
+                        initialized_bytes = final_preparation.get("initialized_bytes")
+                        if type(initialized_bytes) is not int or initialized_bytes < 0:
+                            raise ValueError("extent initialization byte count is invalid")
+                        should_initialize = (
+                            identity["workload"] == "point" and identity["arm"] == "v8_point_lookahead"
+                        )
+                        if (initialized_bytes > 0) != should_initialize:
+                            raise ValueError(
+                                "extent initialization does not match the Point-only policy "
+                                f"(workload={identity['workload']}, arm={identity['arm']}, "
+                                f"bytes={initialized_bytes})"
+                            )
+                    except (KeyError, AttributeError, TypeError, ValueError) as error:
+                        errors.append(f"run {run_id} result parameters are invalid: {error}")
             except (OSError, json.JSONDecodeError, ValueError) as error:
                 errors.append(f"run {run_id} metadata is invalid: {error}")
 
@@ -1515,6 +1584,10 @@ def _verify_result_set(results: Path) -> dict[str, Any]:
                 errors.append("profile perf captures are incomplete")
             if profile_capture_count != captures_planned:
                 errors.append("profile capture artifacts do not match planned captures")
+        elif suite == "v8-point-lookahead":
+            validation = validate_point_lookahead_rows(summary.get("results", []), plan["writers"])
+            if validation != summary.get("matrix_validation"):
+                errors.append("Point lookahead matrix validation does not match its per-run results")
     except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError, csv.Error) as error:
         errors.append(f"result metadata is invalid: {error}")
         planned = 0
@@ -1855,6 +1928,7 @@ def provision_and_run(
 ) -> int:
     profile_suite = getattr(args, "v8_small_ticket_profile", False)
     trace_suite = getattr(args, "commit_order_trace", False)
+    point_lookahead_suite = getattr(args, "v8_point_lookahead_ab", False)
     missing_tools = [tool for tool in ("ssh", "scp", "ssh-keygen") if not shutil.which(tool)]
     if missing_tools:
         raise BenchError("Required local tools are missing: " + ", ".join(missing_tools))
@@ -2099,6 +2173,16 @@ def provision_and_run(
                 append_local_log(key_log, trace_copy.stdout + trace_copy.stderr)
                 if trace_copy.returncode:
                     raise BenchError(f"Could not copy commit-order trace runner: {trace_copy.stderr.strip()}")
+            if point_lookahead_suite:
+                if not POINT_LOOKAHEAD_RUNNER.is_file():
+                    raise BenchError(f"Point lookahead runner is not present in this checkout: {POINT_LOOKAHEAD_RUNNER}")
+                point_copy = scp_to_vm(
+                    ip, POINT_LOOKAHEAD_RUNNER, "/tmp/gcp-v8-point-lookahead-runner.py", key, known_hosts,
+                    timeout=120,
+                )
+                append_local_log(key_log, point_copy.stdout + point_copy.stderr)
+                if point_copy.returncode:
+                    raise BenchError(f"Could not copy Point lookahead runner: {point_copy.stderr.strip()}")
 
             safe_deadline_epoch = int(deadline_epoch - 600)
             remote_command = "sudo -n bash /tmp/run-wal-bench.sh " + shlex.join([
@@ -2106,7 +2190,9 @@ def provision_and_run(
                 args.machine_type, ",".join(str(writer) for writer in args.writers),
                 "v8-small-ticket-profile" if profile_suite else (
                     "commit-order-trace" if trace_suite else (
-                        "rfc026-full" if args.full_rfc026_matrix else "batch64"
+                        "v8-point-lookahead" if point_lookahead_suite else (
+                            "rfc026-full" if args.full_rfc026_matrix else "batch64"
+                        )
                     )
                 ),
                 args.source_patch_sha256 or "-",
@@ -2277,6 +2363,14 @@ def main(argv: list[str] | None = None) -> int:
                 machine_spec=MACHINE_SPECS[args.machine_type],
                 commit=args.commit.lower(),
                 source_patch_sha256=args.source_patch_sha256,
+            )
+        elif args.v8_point_lookahead_ab:
+            report["benchmark_suite"] = "v8-point-lookahead"
+            report["benchmark_plan"] = build_point_lookahead_plan(
+                writers=args.writers,
+                machine_type=args.machine_type,
+                machine_spec=MACHINE_SPECS[args.machine_type],
+                commit=args.commit.lower(),
             )
         else:
             report["benchmark_suite"] = "rfc026-full" if args.full_rfc026_matrix else "batch64"

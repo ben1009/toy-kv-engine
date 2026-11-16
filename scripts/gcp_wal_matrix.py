@@ -38,6 +38,24 @@ COMMIT_ORDER_TRACE_WRITERS = 16
 COMMIT_ORDER_TRACE_NUM = 100_000
 COMMIT_ORDER_TRACE_ORDERS = (("v7_parallel", "v8_parallel"), ("v8_parallel", "v7_parallel"))
 
+POINT_LOOKAHEAD_WORKLOADS = (
+    {"name": "point", "bench": "wal_concurrent", "batch_entries": 1, "batch_size": None,
+     "num": 100_000, "sample_every": 100},
+    {"name": "batch8", "bench": "wal_batch_concurrent", "batch_entries": 8, "batch_size": 8,
+     "num": 300_000, "sample_every": 10},
+    {"name": "batch16", "bench": "wal_batch_concurrent", "batch_entries": 16, "batch_size": 16,
+     "num": 500_000, "sample_every": 10},
+    {"name": "batch64", "bench": "wal_batch_concurrent", "batch_entries": 64, "batch_size": 64,
+     "num": 750_000, "sample_every": 10},
+)
+POINT_LOOKAHEAD_ORDERS = (
+    ("v8_fallocate", "v8_point_lookahead"),
+    ("v8_point_lookahead", "v8_fallocate"),
+)
+POINT_LOOKAHEAD_REPETITIONS = 5
+POINT_LOOKAHEAD_WRITERS = 16
+POINT_LOOKAHEAD_WINDOW_BYTES = 1 << 20
+
 
 def validate_writer_counts(values: Iterable[int]) -> tuple[int, ...]:
     writers = tuple(int(value) for value in values)
@@ -122,6 +140,69 @@ def build_commit_order_trace_schedule() -> list[dict[str, int | str]]:
                 "sample_every": 100,
             })
     return schedule
+
+
+def build_point_lookahead_schedule(writers: Iterable[int]) -> list[dict[str, object]]:
+    """Compare V8 fallocate with Point-only lookahead, including batch guardrails."""
+    writer_counts = validate_writer_counts(writers)
+    schedule: list[dict[str, object]] = []
+    for writer in writer_counts:
+        for workload in POINT_LOOKAHEAD_WORKLOADS:
+            for repetition in range(1, POINT_LOOKAHEAD_REPETITIONS + 1):
+                order = POINT_LOOKAHEAD_ORDERS[(repetition - 1) % len(POINT_LOOKAHEAD_ORDERS)]
+                for arm in order:
+                    schedule.append({
+                        "run_index": len(schedule) + 1,
+                        "writer": writer,
+                        "workload": workload["name"],
+                        "repetition": repetition,
+                        "arm": arm,
+                        **{key: value for key, value in workload.items() if key != "name"},
+                        "extent_mode": (
+                            "sliding-point-lookahead" if arm == "v8_point_lookahead" else "sliding-fallocate"
+                        ),
+                        "extent_window_bytes": POINT_LOOKAHEAD_WINDOW_BYTES,
+                    })
+    return schedule
+
+
+def build_point_lookahead_plan(
+    *, writers: Iterable[int], machine_type: str, machine_spec: Mapping[str, int],
+    commit: str | None = None, binary_sha256: str | None = None,
+) -> dict[str, object]:
+    writer_counts = validate_writer_counts(writers)
+    schedule = build_point_lookahead_schedule(writer_counts)
+    vcpus = int(machine_spec["vcpus"])
+    ssd_count = int(machine_spec["ssd_count"])
+    layout = "single Local SSD" if ssd_count == 1 else f"RAID0 over {ssd_count} Local SSDs"
+    plan: dict[str, object] = {
+        "suite": "v8-point-lookahead",
+        "writers": list(writer_counts),
+        "workloads": [dict(workload) for workload in POINT_LOOKAHEAD_WORKLOADS],
+        "arms": ["v8_fallocate", "v8_point_lookahead"],
+        "repetitions_per_cell": POINT_LOOKAHEAD_REPETITIONS,
+        "arm_orders": [list(order) for order in POINT_LOOKAHEAD_ORDERS],
+        "extent_window_bytes": POINT_LOOKAHEAD_WINDOW_BYTES,
+        "runs_planned": len(schedule),
+        "score_runs_planned": len(schedule),
+        "counterbalanced": True,
+        "machine_type": machine_type,
+        "vcpus": vcpus,
+        "local_ssd_count": ssd_count,
+        "local_ssd_total_gib": int(machine_spec["ssd_gib"]),
+        "runtime_protocol": f"single {vcpus}-vCPU host; {layout}",
+        "value_bytes": 1024,
+        "compaction": "none",
+        "qualification_note": (
+            "Same-VM V8 comparison. Point uses one-entry DATA writes; batch cells verify that the "
+            "point-only lookahead mode leaves multi-entry batches on fallocate-only preparation."
+        ),
+    }
+    if commit is not None:
+        plan["commit"] = commit
+    if binary_sha256 is not None:
+        plan["binary_sha256"] = binary_sha256
+    return plan
 
 
 def build_commit_order_trace_plan(
@@ -310,3 +391,15 @@ def validate_commit_order_trace_rows(rows: Iterable[Mapping[str, object]]) -> di
         for item in schedule
     }
     return _validate_rows(rows, expected, ("writer", "phase", "repetition", "arm"))
+
+
+def validate_point_lookahead_rows(
+    rows: Iterable[Mapping[str, object]], writers: Iterable[int],
+) -> dict[str, object]:
+    schedule = build_point_lookahead_schedule(writers)
+    expected = {
+        (int(item["writer"]), str(item["workload"]), int(item["repetition"]), str(item["arm"])):
+        int(item["num"])
+        for item in schedule
+    }
+    return _validate_rows(rows, expected, ("writer", "workload", "repetition", "arm"))

@@ -23,13 +23,17 @@ from gcp_wal_matrix import (
     COMMIT_ORDER_TRACE_WRITERS,
     FULL_DEFAULT_WRITERS,
     LEGACY_DEFAULT_WRITERS,
+    POINT_LOOKAHEAD_WRITERS,
     build_benchmark_plan,
     build_batch64_schedule,
     build_commit_order_trace_plan,
     build_commit_order_trace_schedule,
+    build_point_lookahead_plan,
+    build_point_lookahead_schedule,
     build_rfc026_schedule,
     validate_commit_order_trace_rows,
     validate_batch64_rows,
+    validate_point_lookahead_rows,
     validate_rfc026_rows,
 )
 from analyze_gcp_commit_order_trace import extract_trace
@@ -341,6 +345,118 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
             BENCH.parse_args([*common, "--writers", "2", "2"])
         with self.assertRaises(SystemExit):
             BENCH.parse_args([*common, "--v8-small-ticket-profile", "--full-rfc026-matrix"])
+
+        point_lookahead = BENCH.parse_args([*common, "--v8-point-lookahead-ab"])
+        self.assertEqual(point_lookahead.writers, (POINT_LOOKAHEAD_WRITERS,))
+        self.assertEqual(point_lookahead.machine_type, "c4-standard-16-lssd")
+        with self.assertRaises(SystemExit):
+            BENCH.parse_args([*common, "--v8-point-lookahead-ab", "--writers", "8"])
+
+    def test_point_lookahead_schedule_has_counterbalanced_point_and_batch_guardrails(self) -> None:
+        schedule = build_point_lookahead_schedule((16,))
+        self.assertEqual(len(schedule), 40)
+        self.assertEqual(
+            {row["extent_mode"] for row in schedule if row["arm"] == "v8_fallocate"},
+            {"sliding-fallocate"},
+        )
+        self.assertEqual(
+            {row["extent_mode"] for row in schedule if row["arm"] == "v8_point_lookahead"},
+            {"sliding-point-lookahead"},
+        )
+        for workload in ("point", "batch8", "batch16", "batch64"):
+            selected = [row for row in schedule if row["workload"] == workload]
+            self.assertEqual(len(selected), 10)
+            for repetition in range(1, 6):
+                pair = [row["arm"] for row in selected if row["repetition"] == repetition]
+                expected = (
+                    ["v8_fallocate", "v8_point_lookahead"] if repetition % 2 else
+                    ["v8_point_lookahead", "v8_fallocate"]
+                )
+                self.assertEqual(pair, expected)
+        rows = [{
+            "writer": row["writer"], "workload": row["workload"], "repetition": row["repetition"],
+            "arm": row["arm"], "ops": row["num"], "exit_code": 0,
+        } for row in schedule]
+        self.assertTrue(validate_point_lookahead_rows(rows, (16,))["complete"])
+        self.assertFalse(validate_point_lookahead_rows(rows[:-1], (16,))["complete"])
+        plan = build_point_lookahead_plan(
+            writers=(16,), machine_type="c4-standard-16-lssd",
+            machine_spec=BENCH.MACHINE_SPECS["c4-standard-16-lssd"],
+        )
+        self.assertEqual(plan["runs_planned"], 40)
+        self.assertEqual(plan["suite"], "v8-point-lookahead")
+
+    def test_point_lookahead_result_verifier_checks_workload_specific_initialization(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            results = Path(temp) / "results"
+            results.mkdir()
+            schedule = build_point_lookahead_schedule((16,))
+            plan = build_point_lookahead_plan(
+                writers=(16,), machine_type="c4-standard-16-lssd",
+                machine_spec=BENCH.MACHINE_SPECS["c4-standard-16-lssd"],
+            )
+            (results / "benchmark-plan.json").write_text(json.dumps(plan), encoding="utf-8")
+            rows = []
+            for row in schedule:
+                run_id = BENCH._run_identifier(row, "v8-point-lookahead")
+                run_dir = results / run_id
+                run_dir.mkdir()
+                should_initialize = row["workload"] == "point" and row["arm"] == "v8_point_lookahead"
+                initialized_bytes = 1_048_576 if should_initialize else 0
+                extent_start = {
+                    "mode": row["extent_mode"], "window_bytes": row["extent_window_bytes"],
+                    "initialized_bytes": 0,
+                }
+                extent_end = {
+                    "mode": row["extent_mode"], "window_bytes": row["extent_window_bytes"],
+                    "initialized_bytes": initialized_bytes,
+                }
+                record = {
+                    "params": {
+                        "num": row["num"], "threads": row["writer"], "value_size": 1024,
+                        "batch_size": row["batch_size"], "wal_format_version": 8,
+                        "wal_io_mode": "parallel",
+                    },
+                    "result": {
+                        "ops": row["num"], "ops_per_sec": 10_000.0,
+                        "process_cpu_user_ms": 1.0, "process_cpu_system_ms": 1.0,
+                        "wal_pipeline": {
+                            "sync_count": 10, "wal_io_stable": True,
+                            "wal_io_start": {"sliding_extent_preparation": extent_start},
+                            "wal_io_end": {"sliding_extent_preparation": extent_end},
+                        },
+                    },
+                    "latency": {"p50_ms": 0.1, "p95_ms": 0.2, "p99_ms": 0.3},
+                }
+                (run_dir / "result.json").write_text(json.dumps(record), encoding="utf-8")
+                metadata = {**BENCH._expected_run_metadata(row, "v8-point-lookahead"), "exit_code": 0}
+                (run_dir / "run-metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
+                rows.append({
+                    **metadata, "ops": row["num"], "puts_per_second": 10_000.0,
+                    "p50_ms": 0.1, "p95_ms": 0.2, "p99_ms": 0.3, "cpu_seconds": 0.002,
+                    "cpu_us_per_put": 0.02, "sync_count": 10, "puts_per_sync": row["num"] / 10,
+                })
+            validation = validate_point_lookahead_rows(rows, (16,))
+            (results / "summary.json").write_text(json.dumps({
+                "complete": True, "runs_planned": len(schedule), "runs_completed": len(schedule),
+                "results": rows, "matrix_validation": validation,
+            }), encoding="utf-8")
+            (results / "remote-exit.json").write_text(json.dumps({
+                "failed": False, "runs_started": len(schedule),
+            }), encoding="utf-8")
+            self.assertTrue(BENCH._verify_result_set(results)["verified"])
+
+            batch_row = next(row for row in schedule if row["workload"] == "batch8"
+                             and row["arm"] == "v8_point_lookahead")
+            batch_record_path = results / BENCH._run_identifier(batch_row, "v8-point-lookahead") / "result.json"
+            batch_record = json.loads(batch_record_path.read_text(encoding="utf-8"))
+            batch_record["result"]["wal_pipeline"]["wal_io_end"]["sliding_extent_preparation"][
+                "initialized_bytes"
+            ] = 4096
+            batch_record_path.write_text(json.dumps(batch_record), encoding="utf-8")
+            rejected = BENCH._verify_result_set(results)
+            self.assertFalse(rejected["verified"])
+            self.assertTrue(any("Point-only policy" in error for error in rejected["errors"]))
 
     def test_vm_retention_keeps_unverified_benchmark_for_artifact_recovery(self) -> None:
         args = BENCH.argparse.Namespace(keep_vm_after_run=True)

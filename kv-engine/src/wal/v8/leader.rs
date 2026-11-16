@@ -343,8 +343,9 @@ impl WalExtentPreparationMode {
             Some("sliding-fallocate") => Self::SlidingFallocate,
             Some("sliding-initialize") => Self::SlidingInitialize,
             Some("sliding-lookahead") => Self::SlidingLookahead,
+            Some("sliding-point-lookahead") => Self::SlidingPointLookahead,
             Some(value) => anyhow::bail!(
-                "invalid {WAL_V8_EXTENT_PREPARATION_ENV} {value:?}; expected `fallocate`, `initialize`, `sliding-fallocate`, `sliding-initialize`, or `sliding-lookahead`"
+                "invalid {WAL_V8_EXTENT_PREPARATION_ENV} {value:?}; expected `fallocate`, `initialize`, `sliding-fallocate`, `sliding-initialize`, `sliding-lookahead`, or `sliding-point-lookahead`"
             ),
             None => anyhow::bail!("{WAL_V8_EXTENT_PREPARATION_ENV} is not valid UTF-8"),
         };
@@ -366,7 +367,10 @@ impl WalExtentPreparationMode {
     const fn is_sliding(self) -> bool {
         matches!(
             self,
-            Self::SlidingFallocate | Self::SlidingInitialize | Self::SlidingLookahead
+            Self::SlidingFallocate
+                | Self::SlidingInitialize
+                | Self::SlidingLookahead
+                | Self::SlidingPointLookahead
         )
     }
 }
@@ -759,6 +763,15 @@ fn sliding_extent_target_end(
         .min(max_file_size))
 }
 
+fn extent_window_start(start_offset: u64, window_bytes: u64, offset: u64) -> Result<u64> {
+    let relative = offset
+        .checked_sub(start_offset)
+        .context("V8 extent offset precedes its initial cursor")?;
+    start_offset
+        .checked_add((relative / window_bytes) * window_bytes)
+        .context("V8 extent window start overflows")
+}
+
 struct WalV8ExtentSlack {
     start: u64,
     end: u64,
@@ -771,6 +784,7 @@ struct WalV8ExtentPreallocationState {
     allocated_end: u64,
     requested_end: u64,
     background_request_pending: bool,
+    extent_policies: BTreeMap<u64, WalV8ExtentPolicy>,
     slack: Vec<WalV8ExtentSlack>,
     window_preallocation_disabled: bool,
     failure: Option<String>,
@@ -794,6 +808,37 @@ struct WalV8ExtentPreallocationState {
     wait_ns: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WalV8ExtentPolicy {
+    Lookahead,
+    FallocateOnly,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WalV8ExtentPreparationStrategy {
+    FallocateOnly,
+    Lookahead,
+    #[cfg(feature = "bench")]
+    PointOnlyLookahead,
+}
+
+impl WalV8ExtentPreparationStrategy {
+    const fn uses_lookahead(self) -> bool {
+        !matches!(self, Self::FallocateOnly)
+    }
+
+    const fn is_point_only(self) -> bool {
+        #[cfg(feature = "bench")]
+        {
+            matches!(self, Self::PointOnlyLookahead)
+        }
+        #[cfg(not(feature = "bench"))]
+        {
+            false
+        }
+    }
+}
+
 /// Sliding ext4 extent allocation for V8. Each window's unused suffix is
 /// charged to the image owner, then its charge transfers to the normal DATA or
 /// FRONTIER reservation as that range is assigned.
@@ -804,7 +849,7 @@ struct WalV8ExtentPreallocator {
     window_bytes: u64,
     source_allocation_unit: u64,
     reservation_owner: Option<Arc<WalV8ReservationOwner>>,
-    lookahead: bool,
+    strategy: WalV8ExtentPreparationStrategy,
     state: Arc<Mutex<WalV8ExtentPreallocationState>>,
     prepared: Arc<Condvar>,
     preparation_lock: Arc<Mutex<()>>,
@@ -821,14 +866,14 @@ impl WalV8ExtentPreallocator {
         window_bytes: u64,
         reservation_owner: Option<Arc<WalV8ReservationOwner>>,
     ) -> Result<Self> {
-        Self::new_with_lookahead(
+        Self::new_with_strategy(
             data_file,
             sync_file,
             start_offset,
             max_file_size,
             window_bytes,
             reservation_owner,
-            false,
+            WalV8ExtentPreparationStrategy::FallocateOnly,
         )
     }
 
@@ -841,6 +886,53 @@ impl WalV8ExtentPreallocator {
         reservation_owner: Option<Arc<WalV8ReservationOwner>>,
         lookahead: bool,
     ) -> Result<Self> {
+        Self::new_with_strategy(
+            data_file,
+            sync_file,
+            start_offset,
+            max_file_size,
+            window_bytes,
+            reservation_owner,
+            if lookahead {
+                WalV8ExtentPreparationStrategy::Lookahead
+            } else {
+                WalV8ExtentPreparationStrategy::FallocateOnly
+            },
+        )
+    }
+
+    #[cfg(feature = "bench")]
+    fn new_with_point_only_lookahead(
+        data_file: File,
+        sync_file: &File,
+        start_offset: u64,
+        max_file_size: u64,
+        window_bytes: u64,
+        reservation_owner: Arc<WalV8ReservationOwner>,
+    ) -> Result<Self> {
+        Self::new_with_strategy(
+            data_file,
+            sync_file,
+            start_offset,
+            max_file_size,
+            window_bytes,
+            Some(reservation_owner),
+            #[cfg(feature = "bench")]
+            WalV8ExtentPreparationStrategy::PointOnlyLookahead,
+        )
+    }
+
+    fn new_with_strategy(
+        data_file: File,
+        sync_file: &File,
+        start_offset: u64,
+        max_file_size: u64,
+        window_bytes: u64,
+        reservation_owner: Option<Arc<WalV8ReservationOwner>>,
+        strategy: WalV8ExtentPreparationStrategy,
+    ) -> Result<Self> {
+        let lookahead = strategy.uses_lookahead();
+        let point_only_lookahead = strategy.is_point_only();
         ensure!(
             is_o_direct_file(&data_file)?,
             "V8 sliding extent preparation requires an O_DIRECT DATA worker"
@@ -888,6 +980,7 @@ impl WalV8ExtentPreallocator {
             allocated_end: start_offset,
             requested_end: start_offset,
             background_request_pending: false,
+            extent_policies: BTreeMap::new(),
             slack: Vec::new(),
             window_preallocation_disabled: false,
             failure: None,
@@ -939,6 +1032,7 @@ impl WalV8ExtentPreallocator {
                             start_offset,
                             max_file_size,
                             window_bytes,
+                            point_only_lookahead,
                         }
                         .run()
                     }));
@@ -967,7 +1061,7 @@ impl WalV8ExtentPreallocator {
                 .as_ref()
                 .map_or(FRAME_LEN_U64, |owner| owner.source_allocation_unit()),
             reservation_owner,
-            lookahead,
+            strategy,
             state,
             prepared,
             preparation_lock,
@@ -976,8 +1070,114 @@ impl WalV8ExtentPreallocator {
         })
     }
 
+    fn register_data_range(
+        &self,
+        start: u64,
+        end: u64,
+        operation_count: u32,
+        frame_bytes: u64,
+    ) -> Result<()> {
+        if !self.strategy.is_point_only() {
+            return Ok(());
+        }
+        ensure!(
+            start < end
+                && start >= self.start_offset
+                && end <= self.max_file_size
+                && start.is_multiple_of(FRAME_LEN_U64)
+                && end.is_multiple_of(FRAME_LEN_U64),
+            "invalid V8 DATA range for extent policy registration"
+        );
+
+        let policy = if operation_count == 1 && frame_bytes == FRAME_LEN_U64 {
+            WalV8ExtentPolicy::Lookahead
+        } else {
+            WalV8ExtentPolicy::FallocateOnly
+        };
+        let mut state = self.state.lock();
+        if let Some(failure) = &state.failure {
+            anyhow::bail!("V8 extent lookahead failed: {failure}");
+        }
+        let prepared_end = state.prepared_end;
+        let mut extent_start = self.extent_window_start(start)?;
+        while extent_start < end {
+            // The first admitted DATA range chooses the policy for this
+            // physical extent. Single-entry, one-frame writes can use
+            // lookahead; multi-entry or multi-frame writes keep the existing
+            // fallocate-only path. Later ranges inherit the first owner's policy.
+            // If preparation already passed it, keep the conservative
+            // fallocate-only policy instead of claiming bytes were initialized.
+            state
+                .extent_policies
+                .entry(extent_start)
+                .or_insert_with(|| {
+                    if extent_start < prepared_end {
+                        WalV8ExtentPolicy::FallocateOnly
+                    } else {
+                        policy
+                    }
+                });
+            extent_start = extent_start
+                .checked_add(self.window_bytes)
+                .context("V8 extent policy cursor overflows")?;
+        }
+
+        Ok(())
+    }
+
+    fn extent_window_start(&self, offset: u64) -> Result<u64> {
+        let relative = offset
+            .checked_sub(self.start_offset)
+            .context("V8 extent offset precedes its initial cursor")?;
+        self.start_offset
+            .checked_add((relative / self.window_bytes) * self.window_bytes)
+            .context("V8 extent window start overflows")
+    }
+
+    fn has_unprepared_lookahead_extent(
+        &self,
+        state: &WalV8ExtentPreallocationState,
+        end: u64,
+    ) -> bool {
+        state
+            .extent_policies
+            .iter()
+            .any(|(&extent_start, &policy)| {
+                policy == WalV8ExtentPolicy::Lookahead
+                    && extent_start < end
+                    && extent_start.saturating_add(self.window_bytes) > state.prepared_end
+            })
+    }
+
+    fn claim_fallocate_only_windows(
+        &self,
+        state: &mut WalV8ExtentPreallocationState,
+        start: u64,
+        end: u64,
+    ) -> Result<()> {
+        if !self.strategy.is_point_only() || start >= end {
+            return Ok(());
+        }
+
+        let mut extent_start = self.extent_window_start(start)?;
+        while extent_start < end {
+            state
+                .extent_policies
+                .entry(extent_start)
+                .or_insert(WalV8ExtentPolicy::FallocateOnly);
+            extent_start = extent_start
+                .checked_add(self.window_bytes)
+                .context("V8 extent policy cursor overflows")?;
+        }
+
+        Ok(())
+    }
+
     fn ensure_prepared_through(&self, required_end: u64) -> Result<()> {
-        if self.lookahead {
+        if self.strategy.uses_lookahead()
+            && (!self.strategy.is_point_only()
+                || self.has_unprepared_lookahead_extent(&self.state.lock(), required_end))
+        {
             return self.wait_for_prepared_through(required_end);
         }
 
@@ -995,7 +1195,10 @@ impl WalV8ExtentPreallocator {
             required_end <= self.max_file_size,
             "V8 sliding extent preparation exceeds the WAL segment limit"
         );
-        let _preparation = self.lookahead.then(|| self.preparation_lock.lock());
+        let _preparation = self
+            .strategy
+            .uses_lookahead()
+            .then(|| self.preparation_lock.lock());
         let mut state = self.state.lock();
         if let Some(failure) = &state.failure {
             anyhow::bail!("V8 extent preparation failed: {failure}");
@@ -1018,6 +1221,12 @@ impl WalV8ExtentPreallocator {
             // The window suffix has no quota owner in test-only writers, so
             // keep those paths exact rather than allocating uncharged space.
             target_end = required_end;
+        }
+        if self.strategy.is_point_only() && self.has_unprepared_lookahead_extent(&state, target_end)
+        {
+            drop(state);
+            drop(_preparation);
+            return self.wait_for_prepared_through(target_end);
         }
         let mut slack_reservation = None;
         if target_end > required_end
@@ -1074,6 +1283,8 @@ impl WalV8ExtentPreallocator {
         }
         let prepared_end = prepared_end?;
         target_end = prepared_end;
+        let prepared_start = state.prepared_end;
+        self.claim_fallocate_only_windows(&mut state, prepared_start, target_end)?;
         #[cfg(feature = "bench")]
         let allocated_bytes = target_end - prepared_start;
 
@@ -1094,7 +1305,7 @@ impl WalV8ExtentPreallocator {
 
     fn queue_background_preparation(&self, required_end: u64) -> Result<()> {
         ensure!(
-            self.lookahead,
+            self.strategy.uses_lookahead(),
             "V8 background extent preparation is not enabled"
         );
         ensure!(
@@ -1104,6 +1315,11 @@ impl WalV8ExtentPreallocator {
         let mut state = self.state.lock();
         if let Some(failure) = &state.failure {
             anyhow::bail!("V8 extent lookahead failed: {failure}");
+        }
+        if self.strategy.is_point_only()
+            && !self.has_unprepared_lookahead_extent(&state, required_end)
+        {
+            return Ok(());
         }
         if required_end <= state.prepared_end || required_end <= state.requested_end {
             return Ok(());
@@ -1198,7 +1414,10 @@ impl WalV8ExtentPreallocator {
         let Some(owner) = &self.reservation_owner else {
             return Ok(());
         };
-        let _preparation = self.lookahead.then(|| self.preparation_lock.lock());
+        let _preparation = self
+            .strategy
+            .uses_lookahead()
+            .then(|| self.preparation_lock.lock());
         let mut state = self.state.lock();
         state.window_preallocation_disabled = true;
         if state.slack.iter().all(|window| window.charged_bytes == 0) {
@@ -1212,6 +1431,9 @@ impl WalV8ExtentPreallocator {
         state.prepared_end = state.prepared_end.min(allocated_tail);
         state.allocated_end = state.allocated_end.min(allocated_tail);
         state.requested_end = state.requested_end.min(allocated_tail);
+        state
+            .extent_policies
+            .retain(|extent_start, _| *extent_start < allocated_tail);
         self.data_file
             .set_len(allocated_tail)
             .context("truncate speculative v8 WAL extent tail")?;
@@ -1232,7 +1454,9 @@ impl WalV8ExtentPreallocator {
         let state = self.state.lock();
 
         WalV8SlidingExtentPreparationDiagnostics {
-            mode: if self.lookahead {
+            mode: if self.strategy.is_point_only() {
+                WalExtentPreparationMode::SlidingPointLookahead
+            } else if self.strategy.uses_lookahead() {
                 WalExtentPreparationMode::SlidingLookahead
             } else {
                 WalExtentPreparationMode::SlidingFallocate
@@ -1277,6 +1501,7 @@ struct WalV8ExtentLookaheadWorker {
     start_offset: u64,
     max_file_size: u64,
     window_bytes: u64,
+    point_only_lookahead: bool,
 }
 
 impl WalV8ExtentLookaheadWorker {
@@ -1291,6 +1516,7 @@ impl WalV8ExtentLookaheadWorker {
             start_offset,
             max_file_size,
             window_bytes,
+            point_only_lookahead,
         } = self;
         let chunk_bytes = WAL_V8_EXTENT_PREPARATION_CHUNK_BYTES as u64;
         let mut zeros = DirectBuf::new(chunk_bytes as usize);
@@ -1400,10 +1626,29 @@ impl WalV8ExtentLookaheadWorker {
                     if initialized_start >= allocated_end {
                         break;
                     }
+                    let extent_start =
+                        extent_window_start(start_offset, window_bytes, initialized_start)?;
+                    let extent_end = extent_start
+                        .checked_add(window_bytes)
+                        .context("V8 extent lookahead window end overflows")?
+                        .min(allocated_end);
+                    let extent_policy = if point_only_lookahead {
+                        *state_guard
+                            .extent_policies
+                            .entry(extent_start)
+                            .or_insert(WalV8ExtentPolicy::FallocateOnly)
+                    } else {
+                        WalV8ExtentPolicy::Lookahead
+                    };
+                    if extent_policy == WalV8ExtentPolicy::FallocateOnly {
+                        state_guard.prepared_end = extent_end;
+                        prepared.notify_all();
+                        continue;
+                    }
                     let initialized_end = initialized_start
                         .checked_add(chunk_bytes)
                         .context("V8 extent lookahead chunk end overflows")?
-                        .min(allocated_end);
+                        .min(extent_end);
                     let chunk_len = usize::try_from(initialized_end - initialized_start)?;
                     ensure!(
                         initialized_start.is_multiple_of(FRAME_LEN_U64)
@@ -1991,7 +2236,7 @@ impl WalV8ParallelIo {
 
     fn request_extent_preparation_through(&self, required_end: u64) -> Result<()> {
         if let Some(preallocator) = &self.extent_preallocator
-            && preallocator.lookahead
+            && preallocator.strategy.uses_lookahead()
         {
             return preallocator.queue_background_preparation(required_end);
         }
@@ -2598,6 +2843,7 @@ impl WalV8FrameJob<'_> {
 struct WalV8LeaderAdmissionPublisher<'a> {
     coordinator: &'a WalV8ParallelCoordinator,
     reservation: RefCell<&'a mut Option<WalV7OwnedBatchReservation>>,
+    extent_preallocator: Option<&'a WalV8ExtentPreallocator>,
 }
 
 impl WalV8AdmissionPublisher for WalV8LeaderAdmissionPublisher<'_> {
@@ -2607,6 +2853,29 @@ impl WalV8AdmissionPublisher for WalV8LeaderAdmissionPublisher<'_> {
         &self,
         plan: WalV8AdmissionPlan,
     ) -> Result<(WalV8BatchAssignment, Self::Guard)> {
+        #[cfg(feature = "bench")]
+        let admitted = self
+            .coordinator
+            .admit_and_publish_with(plan, |assignment| {
+                if let Some(preallocator) = self
+                    .extent_preallocator
+                    .filter(|preallocator| preallocator.strategy.is_point_only())
+                {
+                    let data_end = assignment
+                        .first_data_offset
+                        .checked_add(u64::try_from(plan.frame_buffer_bytes)?)
+                        .context("V8 admitted DATA range end overflows")?;
+                    preallocator.register_data_range(
+                        assignment.first_data_offset,
+                        data_end,
+                        plan.operation_count,
+                        u64::try_from(plan.frame_buffer_bytes)?,
+                    )?;
+                }
+
+                Ok(())
+            })?;
+        #[cfg(not(feature = "bench"))]
         let admitted = self.coordinator.admit_and_publish(plan)?;
         if let Some(reservation) = self.reservation.borrow_mut().as_mut() {
             reservation.mark_admitted();
@@ -2863,6 +3132,23 @@ impl WalV8LeaderWriter {
                                 Some(Arc::clone(owner)),
                                 true,
                             )?))
+                        }
+                        WalExtentPreparationMode::SlidingPointLookahead => {
+                            let owner = self.reservation_owner.as_ref().context(
+                                "point-only sliding lookahead benchmark requires PITR quota accounting",
+                            )?;
+                            Some(Arc::new(
+                                WalV8ExtentPreallocator::new_with_point_only_lookahead(
+                                    worker_file.try_clone().context(
+                                        "clone v8 WAL handle for point-only extent lookahead",
+                                    )?,
+                                    &self.sync_file,
+                                    start_offset,
+                                    self.max_file_size,
+                                    window_bytes,
+                                    Arc::clone(owner),
+                                )?,
+                            ))
                         }
                         WalExtentPreparationMode::SlidingFallocate => {
                             if let Some(owner) = &self.reservation_owner {
@@ -3280,6 +3566,7 @@ impl WalV8LeaderWriter {
             let publisher = WalV8LeaderAdmissionPublisher {
                 coordinator: &self.coordinator,
                 reservation: RefCell::new(reservation),
+                extent_preallocator: None,
             };
             admitted_batches.push(prepared.admit_with_metadata(
                 commit_ts,
@@ -3767,6 +4054,7 @@ impl WalV8ParallelWriter {
         let publisher = WalV8LeaderAdmissionPublisher {
             coordinator: &self.coordinator,
             reservation: RefCell::new(&mut reservation),
+            extent_preallocator: self.io.extent_preallocator.as_deref(),
         };
         let admitted = prepared.admit_with_metadata(commit_ts, recorded_at, &publisher)?;
         let assignment = admitted.assignment();
@@ -5062,6 +5350,98 @@ mod tests {
 
     #[cfg(feature = "bench")]
     #[test]
+    fn point_only_lookahead_keeps_batches_on_fallocate_path() -> Result<()> {
+        const SEGMENT_LIMIT: u64 = 1024 * 1024;
+        const WINDOW_BYTES: u64 = WAL_V8_EXTENT_PREPARATION_CHUNK_BYTES as u64;
+
+        let point_directory = tempfile::tempdir()?;
+        let point_path = point_directory.path().join("point-only-lookahead-v8.wal");
+        let point_fixture =
+            point_only_extent_preallocator_fixture(&point_path, SEGMENT_LIMIT, WINDOW_BYTES)?;
+        point_fixture.preallocator.register_data_range(
+            point_fixture.start_offset,
+            point_fixture.required_end,
+            1,
+            FRAME_LEN_U64,
+        )?;
+        point_fixture.preallocator.register_data_range(
+            point_fixture.required_end,
+            point_fixture.required_end + FRAME_LEN_U64 * 3,
+            8,
+            FRAME_LEN_U64 * 3,
+        )?;
+        point_fixture
+            .preallocator
+            .ensure_prepared_through(point_fixture.required_end)?;
+
+        let point_state = point_fixture.preallocator.state.lock();
+        assert_eq!(point_state.prepared_end, point_fixture.window_end);
+        assert_eq!(point_state.initialized_bytes, WINDOW_BYTES);
+        assert_eq!(
+            point_state.extent_policies.get(&point_fixture.start_offset),
+            Some(&WalV8ExtentPolicy::Lookahead)
+        );
+        drop(point_state);
+
+        let batch_directory = tempfile::tempdir()?;
+        let batch_path = batch_directory.path().join("batch-fallocate-only-v8.wal");
+        let batch_fixture =
+            point_only_extent_preallocator_fixture(&batch_path, SEGMENT_LIMIT, WINDOW_BYTES)?;
+        // A multi-entry batch can still occupy one fixed-size DATA frame.
+        // Entry count must keep it on the existing fallocate-only path.
+        let batch_frame_bytes = FRAME_LEN_U64;
+        let batch_end = batch_fixture.start_offset + batch_frame_bytes;
+        batch_fixture.preallocator.register_data_range(
+            batch_fixture.start_offset,
+            batch_end,
+            8,
+            batch_frame_bytes,
+        )?;
+        batch_fixture.preallocator.register_data_range(
+            batch_end,
+            batch_end + FRAME_LEN_U64,
+            1,
+            FRAME_LEN_U64,
+        )?;
+        batch_fixture
+            .preallocator
+            .ensure_prepared_through(batch_end)?;
+
+        let batch_state = batch_fixture.preallocator.state.lock();
+        assert_eq!(batch_state.prepared_end, batch_fixture.window_end);
+        assert_eq!(batch_state.initialized_bytes, 0);
+        assert_eq!(
+            batch_state.extent_policies.get(&batch_fixture.start_offset),
+            Some(&WalV8ExtentPolicy::FallocateOnly)
+        );
+
+        let large_directory = tempfile::tempdir()?;
+        let large_path = large_directory
+            .path()
+            .join("large-point-fallocate-only-v8.wal");
+        let large_fixture =
+            point_only_extent_preallocator_fixture(&large_path, SEGMENT_LIMIT, WINDOW_BYTES)?;
+        large_fixture.preallocator.register_data_range(
+            large_fixture.start_offset,
+            large_fixture.start_offset + FRAME_LEN_U64 * 3,
+            1,
+            FRAME_LEN_U64 * 3,
+        )?;
+        assert_eq!(
+            large_fixture
+                .preallocator
+                .state
+                .lock()
+                .extent_policies
+                .get(&large_fixture.start_offset),
+            Some(&WalV8ExtentPolicy::FallocateOnly)
+        );
+
+        Ok(())
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
     fn extent_lookahead_records_condvar_waits() -> Result<()> {
         const SEGMENT_LIMIT: u64 = 64 * 1024;
         const WINDOW_BYTES: u64 = FRAME_LEN_U64 * 4;
@@ -5277,6 +5657,14 @@ mod tests {
             )
             .unwrap(),
             Some((WalExtentPreparationMode::SlidingLookahead, 1024 * 1024,))
+        );
+        assert_eq!(
+            WalExtentPreparationMode::from_values(
+                Some(OsStr::new("sliding-point-lookahead")),
+                Some(OsStr::new("1048576")),
+            )
+            .unwrap(),
+            Some((WalExtentPreparationMode::SlidingPointLookahead, 1024 * 1024,))
         );
         assert!(WalExtentPreparationMode::from_values(None, Some(OsStr::new("131072"))).is_err());
         assert!(WalExtentPreparationMode::from_values(Some(OsStr::new("none")), None).is_err());
@@ -5558,8 +5946,12 @@ mod tests {
                     .write(true)
                     .custom_flags(libc::O_DIRECT)
                     .open(wal_path)?;
-                if std::env::var_os(EXTENT_PREPARATION_ENV).as_deref()
-                    == Some(OsStr::new("sliding-lookahead"))
+                if std::env::var_os(EXTENT_PREPARATION_ENV)
+                    .as_deref()
+                    .is_some_and(|mode| {
+                        mode == OsStr::new("sliding-lookahead")
+                            || mode == OsStr::new("sliding-point-lookahead")
+                    })
                 {
                     let sync_file = OpenOptions::new().read(true).write(true).open(wal_path)?;
                     let (leader, _owner) = open_accounted_writer(
@@ -5586,9 +5978,12 @@ mod tests {
                         installed.image_len + WAL_V8_EXTENT_PREPARATION_CHUNK_BYTES as u64
                     }
                     None
-                    | Some("sliding-fallocate" | "sliding-initialize" | "sliding-lookahead") => {
-                        installed.image_len
-                    }
+                    | Some(
+                        "sliding-fallocate"
+                        | "sliding-initialize"
+                        | "sliding-lookahead"
+                        | "sliding-point-lookahead",
+                    ) => installed.image_len,
                     Some(other) => anyhow::bail!("unexpected V8 extent preparation mode {other:?}"),
                 };
                 ensure!(
@@ -5636,6 +6031,7 @@ mod tests {
             "sliding-fallocate",
             "sliding-initialize",
             "sliding-lookahead",
+            "sliding-point-lookahead",
         ];
         #[cfg(not(feature = "bench"))]
         let extent_preparation_modes = ["none"];
@@ -5738,7 +6134,10 @@ mod tests {
                         );
                     }
                     #[cfg(feature = "bench")]
-                    if extent_preparation_mode == "sliding-lookahead" {
+                    if matches!(
+                        extent_preparation_mode,
+                        "sliding-lookahead" | "sliding-point-lookahead"
+                    ) {
                         ensure!(
                             std::fs::metadata(&wal_path)?.len()
                                 == HEADER_LEN_U64
@@ -6060,6 +6459,47 @@ mod tests {
             window_bytes,
             Some(Arc::clone(&owner)),
             lookahead,
+        )?;
+
+        Ok(AccountedExtentPreallocatorFixture {
+            owner,
+            preallocator,
+            start_offset,
+            required_end,
+            window_end,
+        })
+    }
+
+    #[cfg(feature = "bench")]
+    fn point_only_extent_preallocator_fixture(
+        path: &Path,
+        max_file_size: u64,
+        window_bytes: u64,
+    ) -> Result<AccountedExtentPreallocatorFixture> {
+        let fixture =
+            accounted_extent_preallocator_fixture(path, max_file_size, window_bytes, false)?;
+        let AccountedExtentPreallocatorFixture {
+            owner,
+            preallocator,
+            start_offset,
+            required_end,
+            window_end,
+        } = fixture;
+        drop(preallocator);
+
+        let data_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_DIRECT)
+            .open(path)?;
+        let sync_file = OpenOptions::new().read(true).write(true).open(path)?;
+        let preallocator = WalV8ExtentPreallocator::new_with_point_only_lookahead(
+            data_file,
+            &sync_file,
+            start_offset,
+            max_file_size,
+            window_bytes,
+            Arc::clone(&owner),
         )?;
 
         Ok(AccountedExtentPreallocatorFixture {
@@ -6612,6 +7052,7 @@ mod tests {
         let publisher = WalV8LeaderAdmissionPublisher {
             coordinator: &writer.coordinator,
             reservation: RefCell::new(&mut reservation),
+            extent_preallocator: writer.io.extent_preallocator.as_deref(),
         };
         let admitted = prepared.admit_with_metadata(10, first_batch.recorded_at, &publisher)?;
         let mut encoded = admitted.encode()?;

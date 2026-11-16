@@ -1748,6 +1748,17 @@ impl WalV8AdmissionPublisher for WalV8ParallelCoordinator {
         &self,
         plan: WalV8AdmissionPlan,
     ) -> Result<(WalV8BatchAssignment, Self::Guard)> {
+        self.admit_and_publish_with(plan, |_| Ok(()))
+    }
+
+    fn admit_and_publish_with<F>(
+        &self,
+        plan: WalV8AdmissionPlan,
+        register: F,
+    ) -> Result<(WalV8BatchAssignment, Self::Guard)>
+    where
+        F: FnOnce(WalV8BatchAssignment) -> Result<()>,
+    {
         validate_plan(plan)?;
         let data_bytes = u64::try_from(plan.frame_buffer_bytes)?;
         let reserved_bytes = u64::try_from(plan.logical_batch_bytes)?
@@ -1837,6 +1848,11 @@ impl WalV8AdmissionPublisher for WalV8ParallelCoordinator {
             physical_header_digest: self.inner.physical_header_digest,
             initial_prefix_digest: self.inner.initial_prefix_digest,
         };
+
+        // Register physical-range ownership before publishing the assigned
+        // ticket. Extent preparation can otherwise race ahead and initialize
+        // a range whose DATA strategy has not yet been made visible.
+        register(assignment)?;
 
         state.tickets.push_back(TicketState {
             assignment,

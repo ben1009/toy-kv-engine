@@ -40,7 +40,8 @@ for writer in "${WRITERS[@]}"; do
     SEEN_WRITERS[$writer]=1
 done
 if [[ "$SUITE" != "batch64" && "$SUITE" != "rfc026-full" \
-    && "$SUITE" != "v8-small-ticket-profile" && "$SUITE" != "commit-order-trace" ]]; then
+    && "$SUITE" != "v8-small-ticket-profile" && "$SUITE" != "commit-order-trace" \
+    && "$SUITE" != "v8-point-lookahead" ]]; then
     echo "unsupported benchmark suite: $SUITE" >&2
     exit 64
 fi
@@ -280,6 +281,25 @@ elif [[ "$BENCH_SUITE" == "commit-order-trace" ]]; then
         --commit "$ACTUAL_COMMIT" \
         --binary-sha256 "$BINARY_SHA256" \
         --source-patch-sha256 "$BENCH_SOURCE_PATCH_SHA256"
+elif [[ "$BENCH_SUITE" == "v8-point-lookahead" ]]; then
+    if [[ ! -r /tmp/gcp-v8-point-lookahead-runner.py ]]; then
+        echo "Point lookahead runner was not uploaded" >&2
+        exit 1
+    fi
+    cp /tmp/gcp-v8-point-lookahead-runner.py "$REPO/scripts/gcp_v8_point_lookahead_runner.py"
+    echo "WAL_BENCHMARK_STARTED $(date --iso-8601=seconds)" | tee -a "$BENCH_BOOT_LOG"
+    PYTHONPATH="$REPO/scripts${PYTHONPATH:+:$PYTHONPATH}" \
+        python3 "$REPO/scripts/gcp_v8_point_lookahead_runner.py" \
+        --binary "$BINARY" \
+        --results-dir "$BENCH_RESULTS" \
+        --db-root "$BENCH_WORK/databases" \
+        --writers "$BENCH_WRITERS" \
+        --safe-deadline-epoch "$BENCH_SAFE_DEADLINE_EPOCH" \
+        --commit "$ACTUAL_COMMIT" \
+        --binary-sha256 "$BINARY_SHA256" \
+        --machine-type "$BENCH_MACHINE_TYPE" \
+        --ssd-count "$BENCH_SSD_COUNT" \
+        --ssd-gib "$BENCH_SSD_TOTAL_GIB"
 elif [[ "$BENCH_SUITE" == "rfc026-full" ]]; then
     python3 - "$BENCH_RESULTS/benchmark-plan.json" "$ACTUAL_COMMIT" "$BINARY_SHA256" \
         "$BENCH_WRITERS" "$BENCH_MACHINE_TYPE" "$BENCH_SSD_COUNT" "$BENCH_SSD_TOTAL_GIB" <<'PY'

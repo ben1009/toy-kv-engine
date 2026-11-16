@@ -1677,6 +1677,7 @@ impl From<WalExtentPreparationDiagnostics> for WalExtentPreparationRecord {
                 WalExtentPreparationMode::SlidingFallocate => "sliding-fallocate",
                 WalExtentPreparationMode::SlidingInitialize => "sliding-initialize",
                 WalExtentPreparationMode::SlidingLookahead => "sliding-lookahead",
+                WalExtentPreparationMode::SlidingPointLookahead => "sliding-point-lookahead",
             },
             start_offset: diagnostics.start_offset,
             end_offset: diagnostics.end_offset,
@@ -1697,6 +1698,7 @@ impl From<WalV8SlidingExtentPreparationDiagnostics> for WalV8SlidingExtentPrepar
                 WalExtentPreparationMode::SlidingFallocate => "sliding-fallocate",
                 WalExtentPreparationMode::SlidingInitialize => "sliding-initialize",
                 WalExtentPreparationMode::SlidingLookahead => "sliding-lookahead",
+                WalExtentPreparationMode::SlidingPointLookahead => "sliding-point-lookahead",
             },
             start_offset: diagnostics.start_offset,
             max_file_size: diagnostics.max_file_size,
@@ -10130,7 +10132,7 @@ fn validate_v8_extent_preparation(
             "V8 extent preparation requires PITR V8 Parallel I/O"
         );
         let extent_mode = extent_mode.context(
-            "TOYKV_BENCH_V8_EXTENT_PREP requires `fallocate`, `initialize`, `sliding-fallocate`, `sliding-initialize`, or `sliding-lookahead`",
+            "TOYKV_BENCH_V8_EXTENT_PREP requires `fallocate`, `initialize`, `sliding-fallocate`, `sliding-initialize`, `sliding-lookahead`, or `sliding-point-lookahead`",
         )?;
         anyhow::ensure!(
             matches!(
@@ -10141,9 +10143,10 @@ fn validate_v8_extent_preparation(
                         | "sliding-fallocate"
                         | "sliding-initialize"
                         | "sliding-lookahead"
+                        | "sliding-point-lookahead"
                 )
             ),
-            "TOYKV_BENCH_V8_EXTENT_PREP must be `fallocate`, `initialize`, `sliding-fallocate`, `sliding-initialize`, or `sliding-lookahead`"
+            "TOYKV_BENCH_V8_EXTENT_PREP must be `fallocate`, `initialize`, `sliding-fallocate`, `sliding-initialize`, `sliding-lookahead`, or `sliding-point-lookahead`"
         );
         let extent_bytes = extent_bytes
             .context("TOYKV_BENCH_V8_EXTENT_PREP_BYTES is required with extent preparation")?;
@@ -10176,6 +10179,7 @@ mod tests {
             "sliding-fallocate",
             "sliding-initialize",
             "sliding-lookahead",
+            "sliding-point-lookahead",
         ] {
             for window_bytes in [1 << 20, 4 << 20] {
                 let window_bytes = window_bytes.to_string();
