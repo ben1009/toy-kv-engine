@@ -81,47 +81,6 @@ const MAX_PARALLEL_INFLIGHT_TICKETS: usize = 32;
 const DATA_GROUP_JOIN_BUDGET: Duration = Duration::from_micros(10);
 const WAL_V8_PRODUCTION_EXTENT_WINDOW_BYTES: u64 = 1 << 20;
 const WAL_V8_EXTENT_LOOKAHEAD_ENV: &str = "TOYKV_WAL_V8_EXTENT_LOOKAHEAD";
-#[cfg(feature = "bench")]
-const WAL_V8_POINT_GROUP_JOIN_ENV: &str = "TOYKV_BENCH_V8_POINT_GROUP_JOIN_US";
-
-#[cfg(any(test, feature = "bench"))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum PointGroupPolicy {
-    Immediate,
-    JoinAdmitted { budget: Duration },
-}
-
-#[cfg(any(test, feature = "bench"))]
-impl PointGroupPolicy {
-    fn from_budget_us(budget_us: u64) -> Self {
-        if budget_us == 0 {
-            Self::Immediate
-        } else {
-            Self::JoinAdmitted {
-                budget: Duration::from_micros(budget_us),
-            }
-        }
-    }
-}
-
-#[cfg(feature = "bench")]
-fn point_group_join_budget_from_environment() -> Result<u64> {
-    let Some(value) = std::env::var_os(WAL_V8_POINT_GROUP_JOIN_ENV) else {
-        return Ok(0);
-    };
-    let value = value
-        .to_str()
-        .context("TOYKV_BENCH_V8_POINT_GROUP_JOIN_US is not valid UTF-8")?;
-    let budget_us = value.parse::<u64>().with_context(|| {
-        format!("invalid {WAL_V8_POINT_GROUP_JOIN_ENV} {value:?}; expected 0, 5, 10, or 20")
-    })?;
-    ensure!(
-        matches!(budget_us, 0 | 5 | 10 | 20),
-        "invalid {WAL_V8_POINT_GROUP_JOIN_ENV} {value:?}; expected 0, 5, 10, or 20"
-    );
-
-    Ok(budget_us)
-}
 
 #[cfg(feature = "bench")]
 fn data_completion_to_frontier_start_ns(
@@ -2063,7 +2022,6 @@ struct WalV8ParallelFrontier {
 
 struct PendingV8DataWrite {
     file_offset: u64,
-    write_class: WalV8WriteClass,
     buffer: WalV8DataBuffer,
 }
 
@@ -2156,8 +2114,6 @@ struct WalV8ParallelIo {
     frames_ready: Condvar,
     #[cfg(test)]
     group_join_micros: std::sync::atomic::AtomicU64,
-    #[cfg(any(test, feature = "bench"))]
-    point_group_join_micros: std::sync::atomic::AtomicU64,
     coordinator: WalV8ParallelCoordinator,
     progress: Arc<crate::wal::parallel_worker::WalSyncProgress>,
     #[cfg(feature = "bench")]
@@ -2179,10 +2135,6 @@ impl WalV8ParallelIo {
         #[cfg(feature = "bench")] extent_preparation: Option<Arc<WalV8SlidingExtentPreparation>>,
     ) -> Result<Arc<Self>> {
         let submit_any_ready_ticket = benchmark_submits_any_ready_ticket()?;
-        #[cfg(feature = "bench")]
-        let point_group_join_micros = point_group_join_budget_from_environment()?;
-        #[cfg(all(test, not(feature = "bench")))]
-        let point_group_join_micros = 0;
         let worker_file = Arc::new(worker_file);
         let buffer_pool = Arc::new(ArrayQueue::<WalV8DataBuffer>::new(1));
         let mut worker = if submit_any_ready_ticket {
@@ -2248,8 +2200,6 @@ impl WalV8ParallelIo {
             group_join_micros: std::sync::atomic::AtomicU64::new(
                 DATA_GROUP_JOIN_BUDGET.as_micros() as u64,
             ),
-            #[cfg(any(test, feature = "bench"))]
-            point_group_join_micros: std::sync::atomic::AtomicU64::new(point_group_join_micros),
             coordinator,
             progress,
             #[cfg(feature = "bench")]
@@ -2368,18 +2318,6 @@ impl WalV8ParallelIo {
         Ok(())
     }
 
-    #[cfg(any(test, feature = "bench"))]
-    fn point_group_policy(&self) -> PointGroupPolicy {
-        #[cfg(any(test, feature = "bench"))]
-        let budget_us = self
-            .point_group_join_micros
-            .load(std::sync::atomic::Ordering::Relaxed);
-        #[cfg(not(any(test, feature = "bench")))]
-        let budget_us = 0;
-
-        PointGroupPolicy::from_budget_us(budget_us)
-    }
-
     fn default_group_join_budget(&self) -> Duration {
         #[cfg(test)]
         {
@@ -2394,13 +2332,7 @@ impl WalV8ParallelIo {
         }
     }
 
-    fn publish_data(
-        &self,
-        ticket: u64,
-        write_class: WalV8WriteClass,
-        file_offset: u64,
-        buffer: WalV8DataBuffer,
-    ) -> Result<()> {
+    fn publish_data(&self, ticket: u64, file_offset: u64, buffer: WalV8DataBuffer) -> Result<()> {
         let allocation_end = file_offset
             .checked_add(u64::try_from(buffer.len())?)
             .context("v8 worker DATA allocation end overflows")?;
@@ -2418,7 +2350,6 @@ impl WalV8ParallelIo {
                     ticket,
                     PendingV8DataWrite {
                         file_offset,
-                        write_class,
                         buffer
                     }
                 )
@@ -2437,46 +2368,21 @@ impl WalV8ParallelIo {
             return Ok(());
         }
         // Admission publishes this atomic before any producer can encode.
-        // With no admitted successor there is no join opportunity. Single-
-        // frame Batch writes keep immediate submission; Point writes can opt
-        // into a benchmark-only bounded join window.
+        // Single-frame writes submit immediately; larger writes may be
+        // coalesced with already-admitted successors.
         let head = &submission.pending[&submission.next_ticket];
         let small_head = head.buffer.len() == WAL_V8_FRAME_LEN;
-        #[cfg(any(test, feature = "bench"))]
-        let (join_budget, class_limit) = {
-            let point_group_policy = if small_head && head.write_class == WalV8WriteClass::Point {
-                self.point_group_policy()
-            } else {
-                PointGroupPolicy::Immediate
-            };
-            let point_joins_admitted =
-                matches!(point_group_policy, PointGroupPolicy::JoinAdmitted { .. });
-            if (small_head && !point_joins_admitted)
-                || self.coordinator.admitted_ticket_end()
-                    == submission.next_ticket.saturating_add(1)
-            {
-                return self.drain_ready_locked(&mut submission);
-            }
-            match point_group_policy {
-                PointGroupPolicy::Immediate => (self.default_group_join_budget(), None),
-                PointGroupPolicy::JoinAdmitted { budget } => (budget, Some(WalV8WriteClass::Point)),
-            }
-        };
-        #[cfg(not(any(test, feature = "bench")))]
-        let (join_budget, class_limit) = {
-            if small_head
-                || self.coordinator.admitted_ticket_end()
-                    == submission.next_ticket.saturating_add(1)
-            {
-                return self.drain_ready_locked(&mut submission);
-            }
-            (self.default_group_join_budget(), None)
-        };
+        if small_head
+            || self.coordinator.admitted_ticket_end() == submission.next_ticket.saturating_add(1)
+        {
+            return self.drain_ready_locked(&mut submission);
+        }
+        let join_budget = self.default_group_join_budget();
         let first_ticket = submission.next_ticket;
         submission.packing = true;
         drop(submission);
 
-        self.pack_admitted_group(first_ticket, join_budget, class_limit)
+        self.pack_admitted_group(first_ticket, join_budget)
     }
 
     #[cfg(feature = "bench")]
@@ -2580,12 +2486,7 @@ impl WalV8ParallelIo {
         Ok(())
     }
 
-    fn pack_admitted_group(
-        &self,
-        first_ticket: u64,
-        budget: Duration,
-        class_limit: Option<WalV8WriteClass>,
-    ) -> Result<()> {
+    fn pack_admitted_group(&self, first_ticket: u64, budget: Duration) -> Result<()> {
         let mut guard = WalV8DataPackingGuard {
             io: self,
             armed: true,
@@ -2595,9 +2496,9 @@ impl WalV8ParallelIo {
         loop {
             // Never hold submission while entering the coordinator: FRONTIER
             // registration uses coordinator -> submission lock order.
-            let window =
-                self.coordinator
-                    .data_group_window(first_ticket, MAX_GROUP_TICKETS, class_limit)?;
+            let window = self
+                .coordinator
+                .data_group_window(first_ticket, MAX_GROUP_TICKETS)?;
             ensure!(
                 window.ticket_end > first_ticket,
                 "v8 DATA packer has no admitted head"
@@ -2739,11 +2640,6 @@ impl WalV8ParallelIo {
                 .submit_group(group)
                 .context("submit v8 DATA worker group")?;
 
-            #[cfg(feature = "bench")]
-            if let Some(profile) = self.profile.load_full() {
-                profile.record_wal_v8_data_submit_group(u64::try_from(selected.len())?);
-            }
-
             for offset in frontier_offsets {
                 let removed = state.frontier_offsets.remove(&offset);
                 ensure!(removed, "v8 worker FRONTIER offset disappeared");
@@ -2882,7 +2778,6 @@ impl WalV8FrameJob<'_> {
             .admitted
             .take()
             .context("v8 producer job lost its admitted batch")?;
-        let write_class = admitted.write_class();
         let mut encoded = match admitted.encode() {
             Ok(encoded) => encoded,
             Err(error) => {
@@ -2931,12 +2826,9 @@ impl WalV8FrameJob<'_> {
             self.coordinator.poison();
             anyhow::bail!("v8 Parallel ticket already owns a producer guard");
         }
-        let write_result = self.io.publish_data(
-            ticket,
-            write_class,
-            self.assignment.first_data_offset,
-            data_buffer,
-        );
+        let write_result =
+            self.io
+                .publish_data(ticket, self.assignment.first_data_offset, data_buffer);
         if let Err(error) = write_result {
             self.coordinator.poison();
             return Err(error).context("submit v8 Parallel DATA frames");
@@ -7308,7 +7200,7 @@ mod tests {
     }
 
     #[test]
-    fn single_frame_batch_head_skips_the_point_only_join() -> Result<()> {
+    fn single_frame_head_skips_the_optional_join_for_unfinished_successors() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("small-data-group.wal");
         let installed = install_empty(&path, header())?;
@@ -7316,10 +7208,6 @@ mod tests {
         writer
             .io
             .group_join_micros
-            .store(2_000_000, std::sync::atomic::Ordering::Relaxed);
-        writer
-            .io
-            .point_group_join_micros
             .store(2_000_000, std::sync::atomic::Ordering::Relaxed);
         let first = batch(10);
         let second = batch(20);
@@ -7349,187 +7237,6 @@ mod tests {
         assert!(!writer.io.submission.lock().packing);
         writer.wait_durable(0)?;
         second_job.finish()?;
-        writer.wait_durable(1)?;
-
-        Ok(())
-    }
-
-    #[test]
-    fn single_frame_point_keeps_immediate_submission_by_default() -> Result<()> {
-        let directory = tempfile::tempdir()?;
-        let path = directory.path().join("point-immediate-data-group.wal");
-        let installed = install_empty(&path, header())?;
-        let writer = open_writer(&path, &installed)?.into_parallel()?;
-        assert_eq!(
-            writer
-                .io
-                .point_group_join_micros
-                .load(std::sync::atomic::Ordering::Relaxed),
-            0
-        );
-        let first = batch(10);
-        let second = batch(20);
-        let first_job = writer.admit_prepared_batch(
-            writer.preflight_batch_with_write_class(
-                &first,
-                LIVE_WAL_V5_LIMITS,
-                WalV8WriteClass::Point,
-            )?,
-            10,
-            first.recorded_at,
-        )?;
-        let second_job = writer.admit_prepared_batch(
-            writer.preflight_batch_with_write_class(
-                &second,
-                LIVE_WAL_V5_LIMITS,
-                WalV8WriteClass::Point,
-            )?,
-            20,
-            second.recorded_at,
-        )?;
-
-        thread::scope(|scope| -> Result<()> {
-            let (tx, rx) = mpsc::channel();
-            let first_handle = scope.spawn(move || {
-                let _ = tx.send(first_job.finish());
-            });
-            rx.recv_timeout(Duration::from_secs(1))??;
-            first_handle
-                .join()
-                .expect("default Point DATA producer panicked");
-            assert_eq!(writer.io.submission.lock().next_ticket, 1);
-            assert!(!writer.io.submission.lock().packing);
-
-            Ok(())
-        })?;
-        writer.wait_durable(0)?;
-        second_job.finish()?;
-        writer.wait_durable(1)?;
-
-        Ok(())
-    }
-
-    #[test]
-    fn single_frame_point_joins_an_admitted_successor_when_opted_in() -> Result<()> {
-        let directory = tempfile::tempdir()?;
-        let path = directory.path().join("point-data-group.wal");
-        let installed = install_empty(&path, header())?;
-        let writer = open_writer(&path, &installed)?.into_parallel()?;
-        writer
-            .io
-            .point_group_join_micros
-            .store(500_000, std::sync::atomic::Ordering::Relaxed);
-        let first = batch(10);
-        let second = batch(20);
-        let first_job = writer.admit_prepared_batch(
-            writer.preflight_batch_with_write_class(
-                &first,
-                LIVE_WAL_V5_LIMITS,
-                WalV8WriteClass::Point,
-            )?,
-            10,
-            first.recorded_at,
-        )?;
-        let second_job = writer.admit_prepared_batch(
-            writer.preflight_batch_with_write_class(
-                &second,
-                LIVE_WAL_V5_LIMITS,
-                WalV8WriteClass::Point,
-            )?,
-            20,
-            second.recorded_at,
-        )?;
-
-        thread::scope(|scope| -> Result<()> {
-            let first_handle = scope.spawn(move || first_job.finish());
-            wait_for_data_group_cutoff(&writer, 2)?;
-            assert_eq!(writer.io.submission.lock().next_ticket, 0);
-
-            second_job.finish()?;
-            first_handle.join().expect("Point DATA packer panicked")?;
-            assert_eq!(writer.io.submission.lock().next_ticket, 2);
-
-            Ok(())
-        })?;
-        writer.wait_durable(1)?;
-        drop(writer);
-
-        let recovered = super::super::install::recover_and_install_active(
-            &path,
-            &[installed.active_boundary],
-            header().predecessor,
-            LIVE_WAL_V5_LIMITS,
-            MAX_WAL_FILE_SIZE,
-        )?;
-        assert_eq!(replayed_batches(&path, &recovered)?, [first, second]);
-
-        Ok(())
-    }
-
-    #[test]
-    fn single_frame_point_does_not_wait_for_an_admitted_batch_successor() -> Result<()> {
-        let directory = tempfile::tempdir()?;
-        let path = directory.path().join("point-does-not-delay-batch.wal");
-        let installed = install_empty(&path, header())?;
-        let writer = open_writer(&path, &installed)?.into_parallel()?;
-        writer
-            .io
-            .point_group_join_micros
-            .store(30_000_000, std::sync::atomic::Ordering::Relaxed);
-
-        let point = batch(10);
-        let batch_write = batch(20);
-        let point_job = writer.admit_prepared_batch(
-            writer.preflight_batch_with_write_class(
-                &point,
-                LIVE_WAL_V5_LIMITS,
-                WalV8WriteClass::Point,
-            )?,
-            10,
-            point.recorded_at,
-        )?;
-        let batch_job = writer.admit_prepared_batch(
-            writer.preflight_batch(&batch_write, LIVE_WAL_V5_LIMITS)?,
-            20,
-            batch_write.recorded_at,
-        )?;
-        let mut batch_job = Some(batch_job);
-
-        thread::scope(|scope| -> Result<()> {
-            let (tx, rx) = mpsc::channel();
-            let point_handle = scope.spawn(move || {
-                let _ = tx.send(point_job.finish());
-            });
-            let point_result = rx.recv_timeout(Duration::from_secs(1));
-            let point_finished_before_batch = match point_result {
-                Ok(result) => {
-                    result?;
-                    true
-                }
-                Err(mpsc::RecvTimeoutError::Timeout) => false,
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    anyhow::bail!("Point DATA producer exited without returning its result")
-                }
-            };
-            if !point_finished_before_batch {
-                batch_job
-                    .take()
-                    .context("Batch successor was already completed")?
-                    .finish()?;
-            }
-            point_handle.join().expect("Point DATA producer panicked");
-            ensure!(
-                point_finished_before_batch,
-                "Point group policy waited for a Batch successor"
-            );
-            assert_eq!(writer.io.submission.lock().next_ticket, 1);
-
-            if let Some(batch_job) = batch_job {
-                batch_job.finish()?;
-            }
-
-            Ok(())
-        })?;
         writer.wait_durable(1)?;
 
         Ok(())

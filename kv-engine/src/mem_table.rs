@@ -239,12 +239,6 @@ pub struct WriteProfile {
     pub wal_v8_data_completion_hol_tickets: AtomicU64,
     /// Time DATA-complete tickets waited behind an earlier ticket without DATA completion.
     pub wal_v8_data_completion_hol_wait_ns: AtomicU64,
-    /// Number of DATA submission groups sent by the V8 parallel worker.
-    pub wal_v8_data_submit_groups: AtomicU64,
-    /// Total ticket count submitted across V8 DATA submission groups.
-    pub wal_v8_data_submit_tickets: AtomicU64,
-    /// Maximum tickets included in one V8 DATA submission group.
-    pub wal_v8_data_submit_max_tickets: AtomicU64,
     /// Number of WAL commit groups that reached fdatasync.
     pub wal_commit_groups: AtomicU64,
     /// Number of WAL commit groups that only contained one pending buffer.
@@ -958,9 +952,6 @@ impl WriteProfile {
         self.wal_v8_digest_order_hol_wait_ns.store(0, o);
         self.wal_v8_data_completion_hol_tickets.store(0, o);
         self.wal_v8_data_completion_hol_wait_ns.store(0, o);
-        self.wal_v8_data_submit_groups.store(0, o);
-        self.wal_v8_data_submit_tickets.store(0, o);
-        self.wal_v8_data_submit_max_tickets.store(0, o);
         self.wal_commit_groups.store(0, o);
         self.wal_commit_solo_groups.store(0, o);
         self.wal_commit_buffers.store(0, o);
@@ -1039,9 +1030,6 @@ impl WriteProfile {
             wal_v8_digest_order_hol_wait_ns: self.wal_v8_digest_order_hol_wait_ns.load(o),
             wal_v8_data_completion_hol_tickets: self.wal_v8_data_completion_hol_tickets.load(o),
             wal_v8_data_completion_hol_wait_ns: self.wal_v8_data_completion_hol_wait_ns.load(o),
-            wal_v8_data_submit_groups: self.wal_v8_data_submit_groups.load(o),
-            wal_v8_data_submit_tickets: self.wal_v8_data_submit_tickets.load(o),
-            wal_v8_data_submit_max_tickets: self.wal_v8_data_submit_max_tickets.load(o),
             wal_commit_groups: self.wal_commit_groups.load(o),
             wal_commit_solo_groups: self.wal_commit_solo_groups.load(o),
             wal_commit_buffers: self.wal_commit_buffers.load(o),
@@ -1516,14 +1504,6 @@ impl WriteProfile {
     }
 
     #[cfg(feature = "bench")]
-    pub(crate) fn record_wal_v8_data_submit_group(&self, tickets: u64) {
-        let o = std::sync::atomic::Ordering::Relaxed;
-        self.wal_v8_data_submit_groups.fetch_add(1, o);
-        self.wal_v8_data_submit_tickets.fetch_add(tickets, o);
-        self.wal_v8_data_submit_max_tickets.fetch_max(tickets, o);
-    }
-
-    #[cfg(feature = "bench")]
     pub fn wal_sync_observations(&self) -> Vec<WalSyncObservation> {
         self.wal_sync_observations.lock().clone()
     }
@@ -1724,9 +1704,6 @@ pub struct WriteProfileSnapshot {
     pub wal_v8_digest_order_hol_wait_ns: u64,
     pub wal_v8_data_completion_hol_tickets: u64,
     pub wal_v8_data_completion_hol_wait_ns: u64,
-    pub wal_v8_data_submit_groups: u64,
-    pub wal_v8_data_submit_tickets: u64,
-    pub wal_v8_data_submit_max_tickets: u64,
     pub wal_commit_groups: u64,
     pub wal_commit_solo_groups: u64,
     pub wal_commit_buffers: u64,
@@ -1883,13 +1860,6 @@ impl WriteProfileSnapshot {
             wal_v8_data_completion_hol_wait_ns: self
                 .wal_v8_data_completion_hol_wait_ns
                 .saturating_sub(before.wal_v8_data_completion_hol_wait_ns),
-            wal_v8_data_submit_groups: self
-                .wal_v8_data_submit_groups
-                .saturating_sub(before.wal_v8_data_submit_groups),
-            wal_v8_data_submit_tickets: self
-                .wal_v8_data_submit_tickets
-                .saturating_sub(before.wal_v8_data_submit_tickets),
-            wal_v8_data_submit_max_tickets: self.wal_v8_data_submit_max_tickets,
             wal_commit_groups: self
                 .wal_commit_groups
                 .saturating_sub(before.wal_commit_groups),

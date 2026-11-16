@@ -37,19 +37,15 @@ from gcp_wal_matrix import (
     FULL_DEFAULT_WRITERS,
     LEGACY_DEFAULT_WRITERS,
     POINT_LOOKAHEAD_WRITERS,
-    POINT_GROUP_POLICY_WRITERS,
     build_commit_order_trace_plan,
     build_commit_order_trace_schedule,
     build_batch64_schedule,
     build_benchmark_plan,
     build_point_lookahead_plan,
     build_point_lookahead_schedule,
-    build_point_group_policy_plan,
-    build_point_group_policy_schedule,
     build_rfc026_schedule,
     validate_commit_order_trace_rows,
     validate_point_lookahead_rows,
-    validate_point_group_policy_rows,
     validate_writer_counts,
 )
 from gcp_commit_order_trace_runner import analyze_trace
@@ -64,7 +60,6 @@ MATRIX_MODULE = Path(__file__).with_name("gcp_wal_matrix.py")
 PROFILE_RUNNER = Path(__file__).with_name("gcp_wal_profile_runner.py")
 COMMIT_ORDER_TRACE_RUNNER = Path(__file__).with_name("gcp_commit_order_trace_runner.py")
 POINT_LOOKAHEAD_RUNNER = Path(__file__).with_name("gcp_v8_point_lookahead_runner.py")
-POINT_GROUP_POLICY_RUNNER = Path(__file__).with_name("gcp_v8_point_group_policy_runner.py")
 REPO_URL = "https://github.com/ben1009/toy-kv-engine.git"
 MAX_RUNTIME_MINUTES = 180
 MIN_RUNTIME_MINUTES = 60
@@ -84,7 +79,7 @@ if not root.is_dir():
 root_names = {
     "summary.json", "summary.tsv", "comparison.tsv", "benchmark-plan.json",
     "rfc026-schedule.tsv", "profile-schedule.tsv", "commit-order-trace-schedule.tsv",
-    "point-lookahead-schedule.tsv", "point-group-policy-schedule.tsv",
+    "point-lookahead-schedule.tsv",
     "commit-order-trace-analysis.json", "commit.txt", "remote-exit.json",
     "finished_utc.txt", "remote-finished-utc.txt", "remote-status.txt", "host.txt",
     "os-release.txt", "uname.txt", "lscpu.txt", "lsblk.txt", "findmnt.txt", "df.txt",
@@ -1058,15 +1053,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                              help="Trace commit order and run five untraced 16-writer V7/V8 Point pairs")
     suite_group.add_argument("--v8-point-lookahead-ab", action="store_true",
                              help="Compare V8 1 MiB fallocate vs Point-only lookahead, with batch guardrails")
-    suite_group.add_argument("--v8-point-data-group", action="store_true",
-                             help="Compare V8 Point DATA group-join budgets and run Batch16/64 guardrails")
     parser.add_argument("--source-patch-sha256",
                         help="SHA-256 of the exact source patch used for a commit-order trace run")
     parser.add_argument("--network", help="Existing VPC to use (default: default)")
     parser.add_argument("--subnet", help="Subnetwork name for custom-mode VPCs (must be in the requested region)")
     parser.add_argument("--ssh-source-range", help="Restricted IPv4 CIDR allowed to SSH to this ephemeral VM")
     parser.add_argument("--results-dir", type=Path, help="Local directory for preflight and collected artifacts")
-    parser.add_argument("--num", type=int, help="Writes per run (default depends on selected suite)")
+    parser.add_argument("--num", type=int, default=750_000, help="Writes per run (default: 750000)")
     parser.add_argument("--max-runtime-minutes", type=int, default=180,
                         help=f"Server-enforced delete deadline, {MIN_RUNTIME_MINUTES}..{MAX_RUNTIME_MINUTES} minutes (default: 180)")
     parser.add_argument("--estimated-hourly-cost-usd", type=float,
@@ -1081,20 +1074,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--confirm-free-trial", action="store_true",
                         help="Attest that Billing Overview says Free Trial and you will not upgrade to Paid")
     args = parser.parse_args(argv)
-    if args.num is None:
-        args.num = 100_000 if (args.commit_order_trace or args.v8_point_data_group) else 750_000
     if args.machine_type is None:
-        args.machine_type = "c4-standard-16-lssd" if (
-            args.commit_order_trace or args.v8_point_lookahead_ab or args.v8_point_data_group
-        ) else MACHINE_TYPE
+        args.machine_type = "c4-standard-16-lssd" if (args.commit_order_trace or args.v8_point_lookahead_ab) else MACHINE_TYPE
     args.network = args.network or "default"
     if args.writers is None:
         if args.commit_order_trace:
             args.writers = (COMMIT_ORDER_TRACE_WRITERS,)
         elif args.v8_point_lookahead_ab:
             args.writers = (POINT_LOOKAHEAD_WRITERS,)
-        elif args.v8_point_data_group:
-            args.writers = POINT_GROUP_POLICY_WRITERS
         elif args.v8_small_ticket_profile:
             args.writers = (1, 8, 16)
         else:
@@ -1107,10 +1094,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error("--commit-order-trace requires exactly 16 writers")
     if args.v8_point_lookahead_ab and args.writers != (POINT_LOOKAHEAD_WRITERS,):
         parser.error("--v8-point-lookahead-ab requires exactly 16 writers")
-    if args.v8_point_data_group and not set(args.writers).issubset(POINT_GROUP_POLICY_WRITERS):
-        parser.error("--v8-point-data-group supports only 1, 4, 8, and 16 writers")
-    if args.v8_point_data_group and args.machine_type != "c4-standard-16-lssd":
-        parser.error("--v8-point-data-group requires c4-standard-16-lssd")
     if args.v8_point_lookahead_ab and args.machine_type != "c4-standard-16-lssd":
         parser.error("--v8-point-lookahead-ab requires c4-standard-16-lssd")
     if not re.fullmatch(r"[0-9a-fA-F]{40}", args.commit):
@@ -1121,8 +1104,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error("the selected multi-workload suite uses fixed operation counts; omit --num overrides")
     if args.commit_order_trace and args.num != COMMIT_ORDER_TRACE_NUM:
         parser.error(f"--commit-order-trace uses a fixed {COMMIT_ORDER_TRACE_NUM}-put workload")
-    if args.v8_point_data_group and args.num != 100_000:
-        parser.error("--v8-point-data-group uses a fixed 100000-put Point workload; omit --num overrides")
     if args.commit_order_trace and (
         not args.source_patch_sha256 or not re.fullmatch(r"[0-9a-f]{64}", args.source_patch_sha256)
     ):
@@ -1243,8 +1224,6 @@ def _run_identifier(row: dict[str, Any], suite: str) -> str:
         return f"w{row['writer']}-{row['workload']}-{row['phase']}-r{row['repetition']}-{row['arm']}"
     if suite == "v8-point-lookahead":
         return f"w{row['writer']}-{row['workload']}-r{row['repetition']}-{row['arm']}"
-    if suite == "v8-point-data-group":
-        return f"w{row['writer']}-{row['workload']}-r{row['repetition']}-{row['arm']}"
     raise ValueError(f"unsupported benchmark suite: {suite!r}")
 
 
@@ -1261,8 +1240,6 @@ def _summary_row_identifier(row: dict[str, Any], suite: str) -> str:
             f"{row['arm']}"
         )
     if suite == "v8-point-lookahead":
-        return f"w{int(row['writer'])}-{row['workload']}-r{int(row['repetition'])}-{row['arm']}"
-    if suite == "v8-point-data-group":
         return f"w{int(row['writer'])}-{row['workload']}-r{int(row['repetition'])}-{row['arm']}"
     raise ValueError(f"unsupported benchmark suite: {suite!r}")
 
@@ -1285,13 +1262,6 @@ def _expected_run_metadata(row: dict[str, Any], suite: str) -> dict[str, Any]:
             key: row[key] for key in (
                 "writer", "workload", "repetition", "arm", "bench", "batch_entries", "batch_size",
                 "num", "sample_every", "extent_mode", "extent_window_bytes",
-            )
-        }
-    if suite == "v8-point-data-group":
-        return {
-            key: row[key] for key in (
-                "writer", "workload", "repetition", "arm", "bench", "batch_entries", "batch_size",
-                "num", "sample_every", "point_group_join_us", "extent_mode", "extent_window_bytes",
             )
         }
     raise ValueError(f"unsupported benchmark suite: {suite!r}")
@@ -1337,8 +1307,6 @@ def _verify_result_set(results: Path) -> dict[str, Any]:
                 schedule = build_rfc026_schedule(plan["writers"])
             elif suite == "v8-point-lookahead":
                 schedule = build_point_lookahead_schedule(plan["writers"])
-            elif suite == "v8-point-data-group":
-                schedule = build_point_group_policy_schedule(plan["writers"])
             elif suite == "batch64":
                 schedule = build_batch64_schedule(plan["writers"])
             elif suite == "commit-order-trace":
@@ -1605,67 +1573,6 @@ def _verify_result_set(results: Path) -> dict[str, Any]:
                             )
                     except (KeyError, AttributeError, TypeError, ValueError) as error:
                         errors.append(f"run {run_id} result parameters are invalid: {error}")
-                elif suite == "v8-point-data-group" and isinstance(record, dict):
-                    try:
-                        params = record["params"]
-                        result = record["result"]
-                        expected_params = {
-                            "num": identity["num"],
-                            "threads": identity["writer"],
-                            "value_size": 1024,
-                            "batch_size": identity["batch_size"],
-                            "wal_format_version": 8,
-                            "wal_io_mode": "parallel",
-                        }
-                        if result.get("ops") != identity["num"] or any(
-                            params.get(key) != value for key, value in expected_params.items()
-                        ):
-                            raise ValueError("benchmark parameters do not match the Point group policy plan")
-                        pipeline = result["wal_pipeline"]
-                        if pipeline.get("wal_io_stable") is not True:
-                            raise ValueError("WAL I/O metadata changed during the run")
-                        for boundary in ("wal_io_start", "wal_io_end"):
-                            preparation = pipeline[boundary]["sliding_extent_preparation"]
-                            if preparation.get("mode") != identity["extent_mode"] or (
-                                preparation.get("window_bytes") != identity["extent_window_bytes"]
-                            ):
-                                raise ValueError(f"{boundary} does not report the planned extent policy")
-                        start_preparation = pipeline["wal_io_start"]["sliding_extent_preparation"]
-                        end_preparation = pipeline["wal_io_end"]["sliding_extent_preparation"]
-                        initialized_start = start_preparation.get("initialized_bytes")
-                        initialized_end = end_preparation.get("initialized_bytes")
-                        if any(type(value) is not int or value < 0 for value in (
-                            initialized_start, initialized_end,
-                        )) or initialized_end < initialized_start:
-                            raise ValueError("extent initialization byte counters are invalid")
-                        initialized_delta = initialized_end - initialized_start
-                        should_initialize = identity["workload"] == "point"
-                        if (initialized_delta > 0) != should_initialize:
-                            raise ValueError("extent initialization does not match the planned Point/Batch policy")
-                        budget_env = (run_dir / "environment.txt").read_text(encoding="utf-8")
-                        expected_env = f"TOYKV_BENCH_V8_POINT_GROUP_JOIN_US={identity['point_group_join_us']}"
-                        if expected_env not in budget_env.splitlines():
-                            raise ValueError("run environment does not contain the planned Point join budget")
-                        if (
-                            pipeline.get("v8_data_submit_groups") != metadata.get("data_submit_groups")
-                            or pipeline.get("v8_data_submit_tickets") != metadata.get("data_submit_tickets")
-                            or pipeline.get("v8_data_submit_max_tickets") != metadata.get("data_submit_max_tickets")
-                        ):
-                            raise ValueError("DATA group counters differ from run metadata")
-                        group_counters = (
-                            pipeline.get("v8_data_submit_groups"),
-                            pipeline.get("v8_data_submit_tickets"),
-                            pipeline.get("v8_data_submit_max_tickets"),
-                        )
-                        if any(type(value) is not int or value < 0 for value in group_counters):
-                            raise ValueError("V8 DATA group counters are invalid")
-                        groups, tickets, max_tickets = group_counters
-                        if groups <= 0 or tickets <= 0 or groups > tickets:
-                            raise ValueError("V8 DATA group counters are missing")
-                        if max_tickets <= 0 or max_tickets > tickets or max_tickets > 32:
-                            raise ValueError("V8 DATA maximum group size is invalid")
-                    except (KeyError, AttributeError, OSError, TypeError, ValueError) as error:
-                        errors.append(f"run {run_id} result parameters are invalid: {error}")
             except (OSError, json.JSONDecodeError, ValueError) as error:
                 errors.append(f"run {run_id} metadata is invalid: {error}")
 
@@ -1681,10 +1588,6 @@ def _verify_result_set(results: Path) -> dict[str, Any]:
             validation = validate_point_lookahead_rows(summary.get("results", []), plan["writers"])
             if validation != summary.get("matrix_validation"):
                 errors.append("Point lookahead matrix validation does not match its per-run results")
-        elif suite == "v8-point-data-group":
-            validation = validate_point_group_policy_rows(summary.get("results", []), plan["writers"])
-            if validation != summary.get("matrix_validation"):
-                errors.append("Point DATA group matrix validation does not match its per-run results")
     except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError, csv.Error) as error:
         errors.append(f"result metadata is invalid: {error}")
         planned = 0
@@ -2026,7 +1929,6 @@ def provision_and_run(
     profile_suite = getattr(args, "v8_small_ticket_profile", False)
     trace_suite = getattr(args, "commit_order_trace", False)
     point_lookahead_suite = getattr(args, "v8_point_lookahead_ab", False)
-    point_group_suite = getattr(args, "v8_point_data_group", False)
     missing_tools = [tool for tool in ("ssh", "scp", "ssh-keygen") if not shutil.which(tool)]
     if missing_tools:
         raise BenchError("Required local tools are missing: " + ", ".join(missing_tools))
@@ -2281,18 +2183,6 @@ def provision_and_run(
                 append_local_log(key_log, point_copy.stdout + point_copy.stderr)
                 if point_copy.returncode:
                     raise BenchError(f"Could not copy Point lookahead runner: {point_copy.stderr.strip()}")
-            if point_group_suite:
-                if not POINT_GROUP_POLICY_RUNNER.is_file():
-                    raise BenchError(
-                        f"Point DATA group-policy runner is not present in this checkout: {POINT_GROUP_POLICY_RUNNER}"
-                    )
-                point_group_copy = scp_to_vm(
-                    ip, POINT_GROUP_POLICY_RUNNER, "/tmp/gcp-v8-point-group-policy-runner.py", key, known_hosts,
-                    timeout=120,
-                )
-                append_local_log(key_log, point_group_copy.stdout + point_group_copy.stderr)
-                if point_group_copy.returncode:
-                    raise BenchError(f"Could not copy Point DATA group-policy runner: {point_group_copy.stderr.strip()}")
 
             safe_deadline_epoch = int(deadline_epoch - 600)
             remote_command = "sudo -n bash /tmp/run-wal-bench.sh " + shlex.join([
@@ -2300,10 +2190,8 @@ def provision_and_run(
                 args.machine_type, ",".join(str(writer) for writer in args.writers),
                 "v8-small-ticket-profile" if profile_suite else (
                     "commit-order-trace" if trace_suite else (
-                        "v8-point-data-group" if point_group_suite else (
-                            "v8-point-lookahead" if point_lookahead_suite else (
-                                "rfc026-full" if args.full_rfc026_matrix else "batch64"
-                            )
+                        "v8-point-lookahead" if point_lookahead_suite else (
+                            "rfc026-full" if args.full_rfc026_matrix else "batch64"
                         )
                     )
                 ),
@@ -2479,14 +2367,6 @@ def main(argv: list[str] | None = None) -> int:
         elif args.v8_point_lookahead_ab:
             report["benchmark_suite"] = "v8-point-lookahead"
             report["benchmark_plan"] = build_point_lookahead_plan(
-                writers=args.writers,
-                machine_type=args.machine_type,
-                machine_spec=MACHINE_SPECS[args.machine_type],
-                commit=args.commit.lower(),
-            )
-        elif args.v8_point_data_group:
-            report["benchmark_suite"] = "v8-point-data-group"
-            report["benchmark_plan"] = build_point_group_policy_plan(
                 writers=args.writers,
                 machine_type=args.machine_type,
                 machine_spec=MACHINE_SPECS[args.machine_type],
