@@ -6981,6 +6981,9 @@ mod tests {
     fn parallel_frontier_gaps_keep_unused_extent_space_charged() -> Result<()> {
         const SEGMENT_LIMIT: u64 = 2 * 1024 * 1024;
         const WINDOW_BYTES: u64 = 256 * 1024;
+        const DATA_AND_FRONTIER_BYTES_PER_COMMIT: u64 = 2 * FRAME_LEN_U64;
+        const COMMITS_TO_CROSS_TWO_WINDOWS: u64 =
+            (2 * WINDOW_BYTES) / DATA_AND_FRONTIER_BYTES_PER_COMMIT + 1;
 
         let parent = Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/wal-v8-tests");
         std::fs::create_dir_all(&parent)?;
@@ -6996,7 +6999,8 @@ mod tests {
         )?;
 
         let mut previous_frontier_end = installed.image_len;
-        for commit_ts in 10..20 {
+        // Each single-entry commit advances one DATA frame and one FRONTIER frame.
+        for commit_ts in 10..(10 + COMMITS_TO_CROSS_TWO_WINDOWS) {
             let batch = batch(commit_ts);
             let (commit, _) = writer.append_prepared_batch(
                 writer.preflight_batch(&batch, LIVE_WAL_V5_LIMITS)?,
