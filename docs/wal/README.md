@@ -100,6 +100,7 @@ the retained and rejected experiments.
 - [RFC 026 full WAL matrix rerun on GCP, 2026-11-15](benchmarks/rfc-026-v8-durable-guard-full-matrix-gcp-20261115.md)
 - [RFC 026 V8 default configuration factorial on GCP, 2026-11-15](benchmarks/rfc-026-v8-default-config-factorial-gcp-20261115.md)
 - [RFC 026 V8 sliding fallocate window comparison on GCP, 2026-11-15](benchmarks/rfc-026-v8-extent-window-gcp-20261115.md)
+- [RFC 026 V8 Sliding Lookahead full-matrix comparison on GCP, 2026-11-16](benchmarks/rfc-026-v8-sliding-lookahead-full-matrix-gcp-20261116.md)
 - [RFC 026 V8 durability phase sampling on GCP, 2026-11-13](benchmarks/rfc-026-v8-durability-sampling-gcp-20261113.md)
 - [RFC 026 V7/V8 Point MVCC publication and sampler overhead on GCP, 2026-11-14](benchmarks/rfc-026-v7-v8-mvcc-publication-gcp-20261114.md)
 - [RFC 026 V7/V8 Point MVCC publication path diagnostics on GCP, 2026-11-14](benchmarks/rfc-026-v7-v8-mvcc-publication-paths-gcp-20261114.md)
