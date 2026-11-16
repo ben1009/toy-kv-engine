@@ -358,11 +358,7 @@ On flush and compaction, newly produced SST blocks are inserted into the block c
 
 For any GCP work, first read the checked-in
 [`infra/gcp/test-environment/README.md`](infra/gcp/test-environment/README.md)
-before running `gcloud`, Terraform, SSH, or other cloud commands. The project
-Codex hook in `.codex/hooks.json` injects that local README for GCP-related
-prompts and gates recognizable cloud-command forms until it has been read in
-the current session. This is a workflow reminder, not a shell sandbox.
-Review and trust the hook in Codex's `/hooks` view when prompted.
+before running `gcloud`, Terraform, SSH, or other cloud commands.
 Then read `docs/wal/benchmarks/gcp-free-trial-wal-bench.md` for WAL-specific
 work. Reuse the project, zone, SSH source CIDR, and spend limits already supplied
 in the active session instead of asking for them again. Pass the project
