@@ -1,0 +1,32 @@
+{
+  "description": "Load the current GCP test-environment instructions before cloud work.",
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$(git rev-parse --show-toplevel)/.codex/hooks/gcp_readme.py\"",
+            "statusMessage": "Loading current GCP test-environment instructions",
+            "timeout": 10,
+            "additionalContextLimit": 5000
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash|exec_command|functions.exec_command|functions.exec|mcp__.*(gcp|gcloud|google|cloud).*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$(git rev-parse --show-toplevel)/.codex/hooks/gcp_readme.py\"",
+            "statusMessage": "Checking that GCP instructions were read first",
+            "timeout": 10,
+            "additionalContextLimit": 5000
+          }
+        ]
+      }
+    ]
+  }
+}
