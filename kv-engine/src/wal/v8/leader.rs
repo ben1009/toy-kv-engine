@@ -788,6 +788,10 @@ struct WalV8ExtentPreallocationState {
     fallocate_elapsed_ns: u64,
     #[cfg(feature = "bench")]
     elapsed_ns: u64,
+    #[cfg(feature = "bench")]
+    wait_calls: u64,
+    #[cfg(feature = "bench")]
+    wait_ns: u64,
 }
 
 /// Sliding ext4 extent allocation for V8. Each window's unused suffix is
@@ -901,6 +905,10 @@ impl WalV8ExtentPreallocator {
             fallocate_elapsed_ns: 0,
             #[cfg(feature = "bench")]
             elapsed_ns: 0,
+            #[cfg(feature = "bench")]
+            wait_calls: 0,
+            #[cfg(feature = "bench")]
+            wait_ns: 0,
         }));
         let prepared = Arc::new(Condvar::new());
         let preparation_lock = Arc::new(Mutex::new(()));
@@ -1120,7 +1128,19 @@ impl WalV8ExtentPreallocator {
         self.queue_background_preparation(required_end)?;
         let mut state = self.state.lock();
         while required_end > state.prepared_end && state.failure.is_none() {
+            #[cfg(feature = "bench")]
+            {
+                state.wait_calls = state.wait_calls.saturating_add(1);
+            }
+            #[cfg(feature = "bench")]
+            let wait_started = Instant::now();
             self.prepared.wait(&mut state);
+            #[cfg(feature = "bench")]
+            {
+                state.wait_ns = state.wait_ns.saturating_add(
+                    u64::try_from(wait_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                );
+            }
         }
         if let Some(failure) = &state.failure {
             anyhow::bail!("V8 extent lookahead failed: {failure}");
@@ -1230,8 +1250,8 @@ impl WalV8ExtentPreallocator {
             elapsed_ns: state.elapsed_ns,
             fallocate_elapsed_ns: state.fallocate_elapsed_ns,
             initialization_elapsed_ns: state.initialization_elapsed_ns,
-            wait_calls: 0,
-            wait_ns: 0,
+            wait_calls: state.wait_calls,
+            wait_ns: state.wait_ns,
         }
     }
 }
@@ -5040,6 +5060,45 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "bench")]
+    #[test]
+    fn extent_lookahead_records_condvar_waits() -> Result<()> {
+        const SEGMENT_LIMIT: u64 = 64 * 1024;
+        const WINDOW_BYTES: u64 = FRAME_LEN_U64 * 4;
+
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("lookahead-wait-v8.wal");
+        let fixture =
+            accounted_extent_preallocator_fixture(&path, SEGMENT_LIMIT, WINDOW_BYTES, true)?;
+        let required_end = fixture.required_end;
+        let preallocator = Arc::new(fixture.preallocator);
+        let preparation = preallocator.preparation_lock.lock();
+        let waiting_preallocator = Arc::clone(&preallocator);
+        let waiter =
+            thread::spawn(move || waiting_preallocator.ensure_prepared_through(required_end));
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut observed_wait = false;
+        while Instant::now() < deadline {
+            if preallocator.state.lock().wait_calls > 0 {
+                observed_wait = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        drop(preparation);
+        waiter
+            .join()
+            .expect("lookahead preparation waiter panicked")?;
+
+        assert!(observed_wait, "lookahead wait counter was not recorded");
+        let diagnostics = preallocator.diagnostics();
+        assert_eq!(diagnostics.wait_calls, 1);
+        assert!(diagnostics.wait_ns > 0);
+
+        Ok(())
+    }
+
     #[test]
     fn extent_lookahead_falls_back_to_quota_covered_prefix() -> Result<()> {
         const SEGMENT_LIMIT: u64 = 64 * 1024;
@@ -6962,7 +7021,7 @@ mod tests {
 
     #[test]
     fn parallel_lookahead_replays_across_extent_windows() -> Result<()> {
-        const SEGMENT_LIMIT: u64 = 256 * 1024;
+        const SEGMENT_LIMIT: u64 = 1024 * 1024;
         const WINDOW_BYTES: u64 = FRAME_LEN_U64 * 8;
 
         let parent = Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/wal-v8-tests");
