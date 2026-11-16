@@ -41,7 +41,7 @@ for writer in "${WRITERS[@]}"; do
 done
 if [[ "$SUITE" != "batch64" && "$SUITE" != "rfc026-full" \
     && "$SUITE" != "v8-small-ticket-profile" && "$SUITE" != "commit-order-trace" \
-    && "$SUITE" != "v8-point-lookahead" ]]; then
+    && "$SUITE" != "v8-point-lookahead" && "$SUITE" != "v8-point-data-group" ]]; then
     echo "unsupported benchmark suite: $SUITE" >&2
     exit 64
 fi
@@ -290,6 +290,25 @@ elif [[ "$BENCH_SUITE" == "v8-point-lookahead" ]]; then
     echo "WAL_BENCHMARK_STARTED $(date --iso-8601=seconds)" | tee -a "$BENCH_BOOT_LOG"
     PYTHONPATH="$REPO/scripts${PYTHONPATH:+:$PYTHONPATH}" \
         python3 "$REPO/scripts/gcp_v8_point_lookahead_runner.py" \
+        --binary "$BINARY" \
+        --results-dir "$BENCH_RESULTS" \
+        --db-root "$BENCH_WORK/databases" \
+        --writers "$BENCH_WRITERS" \
+        --safe-deadline-epoch "$BENCH_SAFE_DEADLINE_EPOCH" \
+        --commit "$ACTUAL_COMMIT" \
+        --binary-sha256 "$BINARY_SHA256" \
+        --machine-type "$BENCH_MACHINE_TYPE" \
+        --ssd-count "$BENCH_SSD_COUNT" \
+        --ssd-gib "$BENCH_SSD_TOTAL_GIB"
+elif [[ "$BENCH_SUITE" == "v8-point-data-group" ]]; then
+    if [[ ! -r /tmp/gcp-v8-point-group-policy-runner.py ]]; then
+        echo "Point DATA group-policy runner was not uploaded" >&2
+        exit 1
+    fi
+    cp /tmp/gcp-v8-point-group-policy-runner.py "$REPO/scripts/gcp_v8_point_group_policy_runner.py"
+    echo "WAL_BENCHMARK_STARTED $(date --iso-8601=seconds)" | tee -a "$BENCH_BOOT_LOG"
+    PYTHONPATH="$REPO/scripts${PYTHONPATH:+:$PYTHONPATH}" \
+        python3 "$REPO/scripts/gcp_v8_point_group_policy_runner.py" \
         --binary "$BINARY" \
         --results-dir "$BENCH_RESULTS" \
         --db-root "$BENCH_WORK/databases" \

@@ -24,16 +24,22 @@ from gcp_wal_matrix import (
     FULL_DEFAULT_WRITERS,
     LEGACY_DEFAULT_WRITERS,
     POINT_LOOKAHEAD_WRITERS,
+    POINT_GROUP_POLICY_BUDGETS_US,
+    POINT_GROUP_POLICY_GUARDRAIL_BUDGETS_US,
+    POINT_GROUP_POLICY_WRITERS,
     build_benchmark_plan,
     build_batch64_schedule,
     build_commit_order_trace_plan,
     build_commit_order_trace_schedule,
     build_point_lookahead_plan,
     build_point_lookahead_schedule,
+    build_point_group_policy_plan,
+    build_point_group_policy_schedule,
     build_rfc026_schedule,
     validate_commit_order_trace_rows,
     validate_batch64_rows,
     validate_point_lookahead_rows,
+    validate_point_group_policy_rows,
     validate_rfc026_rows,
 )
 from analyze_gcp_commit_order_trace import extract_trace
@@ -351,6 +357,135 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
         self.assertEqual(point_lookahead.machine_type, "c4-standard-16-lssd")
         with self.assertRaises(SystemExit):
             BENCH.parse_args([*common, "--v8-point-lookahead-ab", "--writers", "8"])
+
+        point_group = BENCH.parse_args([*common, "--v8-point-data-group"])
+        self.assertEqual(point_group.writers, POINT_GROUP_POLICY_WRITERS)
+        self.assertEqual(point_group.machine_type, "c4-standard-16-lssd")
+        self.assertEqual(point_group.num, 100_000)
+        with self.assertRaises(SystemExit):
+            BENCH.parse_args([*common, "--v8-point-data-group", "--writers", "2"])
+        with self.assertRaises(SystemExit):
+            BENCH.parse_args([*common, "--v8-point-data-group", "--num", "750000"])
+
+    def test_point_group_policy_schedule_varies_point_only_and_guards_batch(self) -> None:
+        schedule = build_point_group_policy_schedule(POINT_GROUP_POLICY_WRITERS)
+        point_rows = [row for row in schedule if row["workload"] == "point"]
+        batch_rows = [row for row in schedule if row["workload"] != "point"]
+        self.assertEqual(len(schedule), 100)
+        self.assertEqual(len(point_rows), 80)
+        self.assertEqual(len(batch_rows), 20)
+        self.assertEqual({row["writer"] for row in point_rows}, set(POINT_GROUP_POLICY_WRITERS))
+        self.assertEqual(
+            {row["point_group_join_us"] for row in point_rows}, set(POINT_GROUP_POLICY_BUDGETS_US),
+        )
+        self.assertEqual({row["workload"] for row in batch_rows}, {"batch16", "batch64"})
+        self.assertEqual({row["writer"] for row in batch_rows}, {POINT_LOOKAHEAD_WRITERS})
+        self.assertEqual(
+            {row["point_group_join_us"] for row in batch_rows}, set(POINT_GROUP_POLICY_GUARDRAIL_BUDGETS_US),
+        )
+        self.assertTrue(all(row["extent_mode"] == "sliding-point-lookahead" for row in point_rows))
+        self.assertTrue(all(row["extent_mode"] == "sliding-fallocate" for row in batch_rows))
+        for writer in POINT_GROUP_POLICY_WRITERS:
+            for budget in POINT_GROUP_POLICY_BUDGETS_US:
+                selected = [row for row in point_rows if row["writer"] == writer
+                            and row["point_group_join_us"] == budget]
+                self.assertEqual(len(selected), 5)
+        rows = [{
+            "writer": row["writer"], "workload": row["workload"], "repetition": row["repetition"],
+            "arm": row["arm"], "ops": row["num"], "exit_code": 0,
+        } for row in schedule]
+        self.assertTrue(validate_point_group_policy_rows(rows, POINT_GROUP_POLICY_WRITERS)["complete"])
+        self.assertFalse(validate_point_group_policy_rows(rows[:-1], POINT_GROUP_POLICY_WRITERS)["complete"])
+        plan = build_point_group_policy_plan(
+            writers=POINT_GROUP_POLICY_WRITERS,
+            machine_type="c4-standard-16-lssd",
+            machine_spec=BENCH.MACHINE_SPECS["c4-standard-16-lssd"],
+        )
+        self.assertEqual(plan["runs_planned"], 100)
+        self.assertEqual(plan["score_runs_planned"], 80)
+        self.assertEqual(plan["suite"], "v8-point-data-group")
+
+    def test_point_group_policy_result_verifier_pairs_every_run_and_checks_counters(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            results = Path(temp) / "results"
+            results.mkdir()
+            schedule = build_point_group_policy_schedule((1,))
+            plan = build_point_group_policy_plan(
+                writers=(1,), machine_type="c4-standard-16-lssd",
+                machine_spec=BENCH.MACHINE_SPECS["c4-standard-16-lssd"],
+            )
+            (results / "benchmark-plan.json").write_text(json.dumps(plan), encoding="utf-8")
+            summary_rows = []
+            for row in schedule:
+                run_id = BENCH._run_identifier(row, "v8-point-data-group")
+                run_dir = results / run_id
+                run_dir.mkdir()
+                initialized_delta = 65_536 if row["workload"] == "point" else 0
+                extent_start = {
+                    "mode": row["extent_mode"], "window_bytes": row["extent_window_bytes"],
+                    "initialized_bytes": 0, "allocated_bytes": 0, "fallocate_calls": 0, "wait_ns": 0,
+                }
+                extent_end = {
+                    "mode": row["extent_mode"], "window_bytes": row["extent_window_bytes"],
+                    "initialized_bytes": initialized_delta, "allocated_bytes": 1_048_576,
+                    "fallocate_calls": 1, "wait_ns": 1000,
+                }
+                data_groups, data_tickets, max_tickets = 100, 1000, 10
+                record = {
+                    "params": {
+                        "num": row["num"], "threads": row["writer"], "value_size": 1024,
+                        "batch_size": row["batch_size"], "wal_format_version": 8,
+                        "wal_io_mode": "parallel",
+                    },
+                    "result": {
+                        "ops": row["num"], "ops_per_sec": 10_000.0,
+                        "process_cpu_user_ms": 1.0, "process_cpu_system_ms": 1.0,
+                        "wal_pipeline": {
+                            "sync_count": 10, "wal_io_stable": True,
+                            "v8_data_submit_groups": data_groups,
+                            "v8_data_submit_tickets": data_tickets,
+                            "v8_data_submit_max_tickets": max_tickets,
+                            "wal_io_start": {"sliding_extent_preparation": extent_start},
+                            "wal_io_end": {"sliding_extent_preparation": extent_end},
+                        },
+                    },
+                    "latency": {"p50_ms": 0.1, "p95_ms": 0.2, "p99_ms": 0.3},
+                }
+                (run_dir / "result.json").write_text(json.dumps(record), encoding="utf-8")
+                (run_dir / "environment.txt").write_text(
+                    "TOYKV_BENCH_V8_POINT_GROUP_JOIN_US=" + str(row["point_group_join_us"]) + "\n",
+                    encoding="utf-8",
+                )
+                metadata = {
+                    **BENCH._expected_run_metadata(row, "v8-point-data-group"),
+                    "exit_code": 0,
+                    "data_submit_groups": data_groups,
+                    "data_submit_tickets": data_tickets,
+                    "data_submit_max_tickets": max_tickets,
+                }
+                (run_dir / "run-metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
+                summary_rows.append({
+                    **metadata, "ops": row["num"], "puts_per_second": 10_000.0,
+                })
+            validation = validate_point_group_policy_rows(summary_rows, (1,))
+            (results / "summary.json").write_text(json.dumps({
+                "suite": "v8-point-data-group", "complete": True,
+                "runs_planned": len(schedule), "runs_completed": len(schedule),
+                "results": summary_rows, "matrix_validation": validation,
+            }), encoding="utf-8")
+            (results / "remote-exit.json").write_text(json.dumps({
+                "failed": False, "runs_started": len(schedule),
+            }), encoding="utf-8")
+            self.assertTrue(BENCH._verify_result_set(results)["verified"])
+
+            point_row = next(row for row in schedule if row["workload"] == "point")
+            point_dir = results / BENCH._run_identifier(point_row, "v8-point-data-group")
+            (point_dir / "environment.txt").write_text(
+                "TOYKV_BENCH_V8_POINT_GROUP_JOIN_US=999\n", encoding="utf-8",
+            )
+            rejected = BENCH._verify_result_set(results)
+            self.assertFalse(rejected["verified"])
+            self.assertTrue(any("planned Point join budget" in error for error in rejected["errors"]))
 
     def test_point_lookahead_schedule_has_counterbalanced_point_and_batch_guardrails(self) -> None:
         schedule = build_point_lookahead_schedule((16,))

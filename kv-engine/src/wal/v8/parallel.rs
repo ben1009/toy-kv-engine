@@ -30,7 +30,7 @@ use super::{
     leader::WalV8LeaderCapacityError,
     prepare::{
         WalV8AdmissionGuard, WalV8AdmissionPlan, WalV8AdmissionPublisher, WalV8BatchAssignment,
-        WalV8DigestReady,
+        WalV8DigestReady, WalV8WriteClass,
     },
 };
 
@@ -423,6 +423,7 @@ impl WalV8ParallelCoordinator {
         &self,
         first_ticket: u64,
         max_tickets: usize,
+        class_limit: Option<WalV8WriteClass>,
     ) -> Result<WalV8DataGroupWindow> {
         ensure!(max_tickets > 0, "v8 DATA group window must be nonempty");
         let state = self.inner.state.lock();
@@ -431,10 +432,25 @@ impl WalV8ParallelCoordinator {
             first_ticket >= state.durable_ticket_end && first_ticket <= state.next_ticket,
             "v8 DATA group starts outside the admitted window"
         );
-        let count = (state.next_ticket - first_ticket).min(u64::try_from(max_tickets)?);
+        let count =
+            usize::try_from((state.next_ticket - first_ticket).min(u64::try_from(max_tickets)?))?;
+        let offset = usize::try_from(first_ticket - state.durable_ticket_end)?;
+        let ticket_count = class_limit.map_or(count, |class| {
+            state
+                .tickets
+                .iter()
+                .skip(offset)
+                .take(count)
+                .take_while(|ticket| ticket.plan.write_class == class)
+                .count()
+        });
+        ensure!(
+            ticket_count > 0,
+            "v8 DATA group head does not match its class limit"
+        );
 
         Ok(WalV8DataGroupWindow {
-            ticket_end: first_ticket + count,
+            ticket_end: first_ticket + u64::try_from(ticket_count)?,
             closed: state.closed,
         })
     }

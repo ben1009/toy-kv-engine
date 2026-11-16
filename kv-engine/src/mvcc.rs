@@ -1280,8 +1280,11 @@ impl LsmMvccInner {
                 value: prefixed.clone(),
             }],
         };
-        let prepared =
-            memtable.prepare_v8_pitr_wal_batch(&batch, crate::pitr::LIVE_WAL_V5_LIMITS)?;
+        let prepared = memtable.prepare_v8_pitr_wal_batch_with_write_class(
+            &batch,
+            crate::pitr::LIVE_WAL_V5_LIMITS,
+            crate::wal::v8::prepare::WalV8WriteClass::Point,
+        )?;
 
         let write_guard = self.write_lock.lock();
         let commit_ts = self.reserve_commit_ts()?;
@@ -1380,7 +1383,13 @@ impl LsmMvccInner {
         let prepared_v8 = v8_batch
             .as_ref()
             .filter(|_| memtable.uses_parallel_wal())
-            .map(|batch| memtable.prepare_v8_pitr_wal_batch(batch, crate::pitr::LIVE_WAL_V5_LIMITS))
+            .map(|batch| {
+                memtable.prepare_v8_pitr_wal_batch_with_write_class(
+                    batch,
+                    crate::pitr::LIVE_WAL_V5_LIMITS,
+                    crate::wal::v8::prepare::WalV8WriteClass::Point,
+                )
+            })
             .transpose()?;
         let _write_guard = self.write_lock.lock();
         let commit_ts = self.reserve_commit_ts()?;
@@ -1468,7 +1477,13 @@ impl LsmMvccInner {
         let prepared_v8 = v8_batch
             .as_ref()
             .filter(|_| memtable.uses_parallel_wal())
-            .map(|batch| memtable.prepare_v8_pitr_wal_batch(batch, crate::pitr::LIVE_WAL_V5_LIMITS))
+            .map(|batch| {
+                memtable.prepare_v8_pitr_wal_batch_with_write_class(
+                    batch,
+                    crate::pitr::LIVE_WAL_V5_LIMITS,
+                    crate::wal::v8::prepare::WalV8WriteClass::Point,
+                )
+            })
             .transpose()?;
         let _write_guard = self.write_lock.lock();
         let commit_ts = self.reserve_commit_ts()?;

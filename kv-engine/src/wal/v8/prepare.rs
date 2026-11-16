@@ -12,6 +12,15 @@ use super::{WAL_V8_HEADER_LEN, codec, digest, parallel::WalV8DurablePrefixCheck}
 
 const WAL_V8_DATA_START: u64 = (WAL_V8_HEADER_LEN + codec::WAL_V8_FRAME_LEN) as u64;
 
+/// API-level class used only to select benchmark DATA scheduling policy.
+/// It is not serialized and never changes ticket or durability ordering.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum WalV8WriteClass {
+    Point,
+    #[default]
+    Batch,
+}
+
 /// Coordinates assigned by the writer after resource reservation and before
 /// payload encoding begins.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -30,6 +39,7 @@ pub(crate) struct WalV8BatchAssignment {
 pub(crate) struct WalV8AdmissionPlan {
     pub(crate) commit_ts: u64,
     pub(crate) recorded_at: RecordedAt,
+    pub(crate) write_class: WalV8WriteClass,
     pub(crate) logical_batch_bytes: usize,
     #[cfg(feature = "bench")]
     pub(crate) operation_count: u32,
@@ -94,6 +104,7 @@ pub(crate) struct PreparedWalV8Batch<'a, R> {
     limits: WalV5Limits,
     commit_ts: u64,
     recorded_at: RecordedAt,
+    write_class: WalV8WriteClass,
     logical_batch_bytes: usize,
     preparation_buffer_bytes: u64,
     #[cfg(feature = "bench")]
@@ -121,6 +132,21 @@ impl<'a, R> PreparedWalV8Batch<'a, R> {
     where
         F: FnOnce(u64) -> Result<R>,
     {
+        Self::preflight_with_write_class(batch, limits, WalV8WriteClass::Batch, reserve_preparation)
+    }
+
+    /// Preflight with the caller's API-level write class for benchmark-only
+    /// scheduling experiments. The class is carried with admission metadata,
+    /// but is not part of the WAL encoding.
+    pub(crate) fn preflight_with_write_class<F>(
+        batch: &'a WalBatch,
+        limits: WalV5Limits,
+        write_class: WalV8WriteClass,
+        reserve_preparation: F,
+    ) -> Result<PreparedWalV8Batch<'a, R>>
+    where
+        F: FnOnce(u64) -> Result<R>,
+    {
         #[cfg(feature = "bench")]
         let operation_count = u32::try_from(batch.entries.len())
             .context("v8 operation count exceeds the admission limit")?;
@@ -143,6 +169,7 @@ impl<'a, R> PreparedWalV8Batch<'a, R> {
             limits,
             commit_ts: batch.commit_ts,
             recorded_at: batch.recorded_at,
+            write_class,
             logical_batch_bytes,
             preparation_buffer_bytes: preparation_bytes,
             #[cfg(feature = "bench")]
@@ -203,6 +230,7 @@ impl<'a, R> PreparedWalV8Batch<'a, R> {
         let plan = WalV8AdmissionPlan {
             commit_ts,
             recorded_at,
+            write_class: self.write_class,
             logical_batch_bytes: self.logical_batch_bytes,
             #[cfg(feature = "bench")]
             operation_count: self.operation_count,
@@ -221,6 +249,7 @@ impl<'a, R> PreparedWalV8Batch<'a, R> {
             limits: self.limits,
             logical_batch_bytes: self.logical_batch_bytes,
             assignment,
+            write_class: self.write_class,
             fragment_count: self.fragment_count,
             frame_buffer_bytes: self.frame_buffer_bytes,
             admission_guard,
@@ -267,6 +296,7 @@ pub(crate) struct AdmittedWalV8Batch<'a, G, R> {
     limits: WalV5Limits,
     logical_batch_bytes: usize,
     assignment: WalV8BatchAssignment,
+    write_class: WalV8WriteClass,
     fragment_count: u32,
     frame_buffer_bytes: usize,
     admission_guard: G,
@@ -278,6 +308,10 @@ impl<G: WalV8AdmissionGuard, R> AdmittedWalV8Batch<'_, G, R> {
     /// encoding so persistent reservations can be attached to the ticket.
     pub(crate) fn assignment(&self) -> WalV8BatchAssignment {
         self.assignment
+    }
+
+    pub(crate) fn write_class(&self) -> WalV8WriteClass {
+        self.write_class
     }
 
     /// Encode canonical entries while updating CRC and BLAKE3 from the same
@@ -292,6 +326,7 @@ impl<G: WalV8AdmissionGuard, R> AdmittedWalV8Batch<'_, G, R> {
             fragment_count,
             frame_buffer_bytes,
             admission_guard,
+            write_class: _,
         } = self;
         let entry_stream_len = canonical.data_len();
         let entry_count = canonical.entry_count();
@@ -677,6 +712,7 @@ mod tests {
             &[WalV8AdmissionPlan {
                 commit_ts,
                 recorded_at,
+                write_class: WalV8WriteClass::Batch,
                 logical_batch_bytes: encoded.as_bytes().len(),
                 #[cfg(feature = "bench")]
                 operation_count,
@@ -697,6 +733,35 @@ mod tests {
         assert_eq!(header.recorded_at_secs, recorded_at.secs);
         assert_eq!(header.recorded_at_nanos, recorded_at.nanos);
         encoded.disarm_after_durable();
+
+        Ok(())
+    }
+
+    #[test]
+    fn admission_preserves_the_api_write_class_without_encoding_it() -> Result<()> {
+        let batch = batch(32);
+        let prepared =
+            PreparedWalV8Batch::<TestPreparationReservation>::preflight_with_write_class(
+                &batch,
+                crate::pitr::LIVE_WAL_V5_LIMITS,
+                WalV8WriteClass::Point,
+                |bytes| Ok(TestPreparationReservation { _bytes: bytes }),
+            )?;
+        let publisher = TestPublisher::new(WAL_V8_DATA_START);
+        let admitted = prepared.admit(&publisher)?;
+
+        assert_eq!(admitted.write_class(), WalV8WriteClass::Point);
+        assert_eq!(
+            publisher.plans.lock()[0].write_class,
+            WalV8WriteClass::Point
+        );
+
+        let mut point_encoded = admitted.encode()?;
+        let batch_publisher = TestPublisher::new(WAL_V8_DATA_START);
+        let mut batch_encoded = preflight(&batch)?.admit(&batch_publisher)?.encode()?;
+        assert_eq!(point_encoded.as_bytes(), batch_encoded.as_bytes());
+        point_encoded.disarm_after_durable();
+        batch_encoded.disarm_after_durable();
 
         Ok(())
     }
@@ -751,6 +816,7 @@ mod tests {
         let plan_expected = WalV8AdmissionPlan {
             commit_ts: batch.commit_ts,
             recorded_at: batch.recorded_at,
+            write_class: WalV8WriteClass::Batch,
             logical_batch_bytes: prepared.logical_batch_bytes(),
             #[cfg(feature = "bench")]
             operation_count: prepared.operation_count,

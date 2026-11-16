@@ -2516,10 +2516,11 @@ impl Wal {
         }
     }
 
-    pub(crate) fn preflight_v8_leader_batch<'a>(
+    pub(crate) fn preflight_v8_leader_batch_with_write_class<'a>(
         &self,
         batch: &'a crate::pitr::WalBatch,
         limits: crate::pitr::WalV5Limits,
+        write_class: v8::prepare::WalV8WriteClass,
     ) -> Result<v8::leader::WalV8PreparedBatch<'a>> {
         ensure!(
             self.format_version == WAL_FORMAT_VERSION_V8,
@@ -2527,14 +2528,14 @@ impl Wal {
             self.format_version
         );
         if let Some(writer) = &self.v8_parallel {
-            return writer.preflight_batch(batch, limits);
+            return writer.preflight_batch_with_write_class(batch, limits, write_class);
         }
 
         self.v8_leader
             .as_ref()
             .context("v8 WAL has no recovered Active writer")?
             .lock()
-            .preflight_batch(batch, limits)
+            .preflight_batch_with_write_class(batch, limits, write_class)
     }
 
     pub(crate) fn admit_v8_prepared_parallel_batch<'a>(
