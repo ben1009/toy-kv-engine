@@ -10,9 +10,9 @@ Workload: 100,000 Point puts, 16 writers, 1 KiB values, PITR Parallel WAL.
 
 ## Result
 
-The inode-correlated traces strongly support a connection between V8's fallocate-only path, ext4 unwritten-extent handling, and JBD2 waits inside the WAL `fdatasync` path. They do not establish that this mechanism explains the full V7/V8 throughput gap.
+The inode-associated traces support a connection between V8's fallocate-only path, ext4 unwritten-extent handling, and JBD2 waits during WAL `fdatasync`. They do not establish that this mechanism explains the full V7/V8 throughput gap.
 
-| Diagnostic arm | Diagnostic puts/s* | Runtime syncs | ext4 unwritten-handler events on WAL inode | JBD2 waits inside inode sync / ext4 sync entries | JBD2 wait wall total / average |
+| Diagnostic arm | Diagnostic puts/s* | Runtime syncs | ext4 unwritten-handler events on WAL inode | JBD2 waits / ext4 sync entries (original probe) | JBD2 wait wall total / average |
 |---|---:|---:|---:|---:|---:|
 | V7 native | 42.54k | 8,297 | 3,393 | 1,124 / 8,298 (13.55%) | 143.100 ms / 127.3 μs |
 | V8 fallocate-only | 29.08k | 6,336 | 112,673 | 6,338 / 6,338 (100.00%) | 683.403 ms / 107.8 μs |
@@ -20,7 +20,7 @@ The inode-correlated traces strongly support a connection between V8's fallocate
 
 *Single-run BPF diagnostics, not formal throughput scores. Initialization took 2.301 s for 512 MiB, before the measured workload (2.393 s). Including both phases yields about 21.30k puts/s, below fallocate-only. This is not a production recommendation.
 
-The ext4 sync-entry counts differ from runtime sync counters by one or two events; they are reported separately. Wait counts are aggregate counts within the inode-scoped sync context, so matching totals do not establish one wait per individual sync. All unique transaction IDs captured at inode-correlated JBD2 waits had matching `jbd2_end_commit` events: V7 1124/1124, V8 fallocate 4024/4024, and V8 initialize 2/2.
+The ext4 sync-entry counts differ from runtime sync counters by one or two events; they are reported separately. These historical JBD2 counts came from the original probe, which filtered to the benchmark PID and associated waits with the most recent ext4 inode context in the current `fdatasync` syscall, but did not require the wait to occur between `ext4_sync_file_enter` and `ext4_sync_file_exit`. The counts therefore are not the strict active-sync classification emitted by the revised probe. Matching aggregate totals do not establish one wait per individual sync. All unique transaction IDs captured by the original inode-associated JBD2 probe had matching `jbd2_end_commit` events: V7 1124/1124, V8 fallocate 4024/4024, and V8 initialize 2/2.
 
 V8 fallocate recorded 112,673 unwritten-handler events on its active WAL inode, split across raw flag values `1073742883` (6,336 events) and `1073742899` (106,337 events); flags are retained without semantic decoding. V8 initialization recorded 4,101 events over 2.302 s, matching its preparation interval. V7 recorded 3,393 events on the active WAL inode; the trace does not attribute those events to a userspace thread.
 
@@ -38,7 +38,7 @@ This particular per-call trace captured no V7 calls below 2 μs; do not generali
 
 ## Interpretation and limits
 
-- V8 fallocate-only had 6,338 JBD2 wait calls for 6,338 ext4 sync entries; V7 had 1,124/8,298 (13.5%); V8 initialization had 2/9,715. The aggregate counters do not prove a one-to-one wait-to-sync pairing. The inode-correlated wait totals were 683.4 ms, 143.1 ms, and 1.0 ms, respectively. These are diagnostic waits, not isolated device service time.
+- The original probe reported 6,338 V8 fallocate-only JBD2 waits for 6,338 ext4 sync entries; V7 had 1,124/8,298 (13.5%); V8 initialization had 2/9,715. These legacy counts were not gated on the active `ext4_sync_file` interval and cannot be split retrospectively into correlated and uncorrelated waits. Use the revised probe for that distinction. The original inode-associated wait totals were 683.4 ms, 143.1 ms, and 1.0 ms, respectively. These are diagnostic waits, not isolated device service time.
 - The ext4 unwritten-handler tracepoint includes device and inode. The JBD2 wait probe captures transaction IDs, all of which matched an end-commit event on the device. This is stronger than same-device temporal overlap, but it does not prove every V8 wait was caused solely by unwritten-extent conversion; other inode metadata, scheduling, and changed durability grouping may contribute.
 - The first probe, `ext4_ext_convert_to_initialized_enter`, produced no events on this kernel/path. The follow-up used `ext4_ext_handle_unwritten_extents`, which did capture inode-correlated events. The empty first probe is not evidence of zero conversions.
 - Initialization reduced JBD2 waits during measured WAL syncs but cost about 2.3 seconds up front and changed sync grouping. Its end-to-end one-shot throughput was lower than fallocate-only, so this is mechanism evidence, not a proposed optimization.
@@ -46,7 +46,7 @@ This particular per-call trace captured no V7 calls below 2 μs; do not generali
 
 ## Reproducing the kernel trace
 
-The inode/JBD2 aggregate probe is retained at [`scripts/gcp_v8_unwritten_jbd2.bt`](../../../scripts/gcp_v8_unwritten_jbd2.bt). From the repository root, run it with the benchmark process ID, for example `sudo bpftrace scripts/gcp_v8_unwritten_jbd2.bt 12345 | tee trace.txt`. It emits aggregate maps at exit. Join `@wait_tx_by_inode` transaction IDs against `@commit_end_ns` using the device and transaction keys; do not interpret equal wait and sync totals as a one-to-one pairing. Kernel tracepoint fields and function probes vary by kernel, so verify availability before running.
+The inode/JBD2 aggregate probe is retained at [`scripts/gcp_v8_unwritten_jbd2.bt`](../../../scripts/gcp_v8_unwritten_jbd2.bt). From the repository root, run it with the benchmark process ID, for example `sudo bpftrace scripts/gcp_v8_unwritten_jbd2.bt 12345 | tee trace.txt`. It emits aggregate maps at exit. `@syscall_unmatched_count` counts `fdatasync` calls without a matching ext4 sync entry. `@wait_count_by_inode` and `@wait_tx_by_inode` cover JBD2 waits that began while the target thread was inside the active ext4 sync interval for a `fdatasync`; `@wait_unmatched_count` and `@wait_unmatched_tx` separately capture target-process waits outside that interval. Join matched transaction IDs against `@commit_end_ns` using device and transaction keys; do not interpret equal aggregate wait and sync totals as a one-to-one pairing. The revised classification has not been rerun for the historical results above. Kernel tracepoint fields and function probes vary by kernel, so verify availability before running.
 
 ## Validation and artifacts
 

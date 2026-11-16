@@ -1,8 +1,10 @@
-// Capture ext4 unwritten-extent handling and inode-scoped fdatasync/JBD2 waits.
+// Capture ext4 unwritten-extent handling and fdatasync/JBD2 waits.
 // Usage from the repository root: sudo bpftrace scripts/gcp_v8_unwritten_jbd2.bt BENCHMARK_PID
 // The target PID is passed as bpftrace positional argument $1. JBD2 commit maps
 // are device-wide and should be joined offline to wait transaction IDs by
 // (device, transaction); aggregate counts do not prove one wait per sync.
+// Unwritten-extent events are attributed by WAL inode, not process PID: direct-I/O
+// completion handling may run in a different task context.
 // Tracepoint/function availability and field layouts depend on the Linux kernel.
 
 tracepoint:ext4:ext4_ext_handle_unwritten_extents
@@ -25,60 +27,92 @@ tracepoint:ext4:ext4_ext_convert_to_initialized_fastpath
 {
     @convert_fastpath_events[args.dev, args.ino] = count();
 }
-tracepoint:ext4:ext4_sync_file_enter /pid == $1/
+tracepoint:ext4:ext4_sync_file_enter /pid == $1 && @sys_start[tid]/
 {
     @sync_start[tid] = nsecs;
+    @sync_active[tid] = 1;
+    @sync_seen[tid] = 1;
     @sync_dev[tid] = args.dev;
     @sync_ino[tid] = args.ino;
     @sync_count[args.dev, args.ino] = count();
 }
-tracepoint:ext4:ext4_sync_file_exit /@sync_start[tid]/
+tracepoint:ext4:ext4_sync_file_exit /@sync_active[tid]/
 {
     $elapsed = nsecs - @sync_start[tid];
     $dev = @sync_dev[tid];
     $ino = @sync_ino[tid];
     @sync_us[$dev, $ino] = hist($elapsed / 1000);
     @sync_total_ns[$dev, $ino] = sum($elapsed);
+    delete(@sync_active[tid]);
 }
 tracepoint:syscalls:sys_enter_fdatasync /pid == $1/
 {
+    // Discard any stale ext4 context before starting a new syscall interval.
+    delete(@sync_start[tid]);
+    delete(@sync_active[tid]);
+    delete(@sync_seen[tid]);
+    delete(@sync_dev[tid]);
+    delete(@sync_ino[tid]);
     @sys_start[tid] = nsecs;
     @syscall_count = count();
 }
 tracepoint:syscalls:sys_exit_fdatasync /@sys_start[tid]/
 {
     $elapsed = nsecs - @sys_start[tid];
-    $dev = @sync_dev[tid];
-    $ino = @sync_ino[tid];
-    @syscall_us[$dev, $ino] = hist($elapsed / 1000);
-    @syscall_total_ns[$dev, $ino] = sum($elapsed);
-    @syscall_count_by_inode[$dev, $ino] = count();
+    if (@sync_seen[tid]) {
+        $dev = @sync_dev[tid];
+        $ino = @sync_ino[tid];
+        @syscall_us[$dev, $ino] = hist($elapsed / 1000);
+        @syscall_total_ns[$dev, $ino] = sum($elapsed);
+        @syscall_count_by_inode[$dev, $ino] = count();
+    } else {
+        @syscall_unmatched_count = count();
+        @syscall_unmatched_us = hist($elapsed / 1000);
+        @syscall_unmatched_total_ns = sum($elapsed);
+    }
     delete(@sys_start[tid]);
     delete(@sync_start[tid]);
+    delete(@sync_active[tid]);
+    delete(@sync_seen[tid]);
     delete(@sync_dev[tid]);
     delete(@sync_ino[tid]);
 }
-kprobe:jbd2_log_wait_commit /pid == $1/
+kprobe:jbd2_log_wait_commit /pid == $1 && @sys_start[tid] && @sync_active[tid]/
 {
     @wait_start[tid] = nsecs;
     @wait_tx[tid] = arg1;
+    @wait_correlated[tid] = 1;
     @wait_inode[tid] = @sync_ino[tid];
     @wait_dev[tid] = @sync_dev[tid];
+    @wait_correlated_count = count();
+}
+kprobe:jbd2_log_wait_commit /pid == $1 && !(@sys_start[tid] && @sync_active[tid])/
+{
+    @wait_start[tid] = nsecs;
+    @wait_tx[tid] = arg1;
+    @wait_correlated[tid] = 0;
+    @wait_unmatched_count = count();
+    @wait_unmatched_tx[arg1] = count();
 }
 kretprobe:jbd2_log_wait_commit /@wait_start[tid]/
 {
     $elapsed = nsecs - @wait_start[tid];
-    $tx = @wait_tx[tid];
-    $ino = @wait_inode[tid];
-    $dev = @wait_dev[tid];
-    @wait_count = count();
-    @wait_us = hist($elapsed / 1000);
-    @wait_count_by_inode[$dev, $ino] = count();
-    @wait_total_ns_by_inode[$dev, $ino] = sum($elapsed);
-    @wait_us_by_inode[$dev, $ino] = hist($elapsed / 1000);
-    @wait_tx_by_inode[$dev, $ino, $tx] = count();
+    if (@wait_correlated[tid]) {
+        $tx = @wait_tx[tid];
+        $ino = @wait_inode[tid];
+        $dev = @wait_dev[tid];
+        @wait_correlated_us = hist($elapsed / 1000);
+        @wait_count_by_inode[$dev, $ino] = count();
+        @wait_total_ns_by_inode[$dev, $ino] = sum($elapsed);
+        @wait_us_by_inode[$dev, $ino] = hist($elapsed / 1000);
+        @wait_tx_by_inode[$dev, $ino, $tx] = count();
+    } else {
+        @wait_unmatched_us = hist($elapsed / 1000);
+        @wait_unmatched_total_ns = sum($elapsed);
+    }
     delete(@wait_start[tid]);
     delete(@wait_tx[tid]);
+    delete(@wait_correlated[tid]);
     delete(@wait_inode[tid]);
     delete(@wait_dev[tid]);
 }
@@ -103,6 +137,8 @@ END
     print(@convert_events); print(@convert_unwritten_len); print(@convert_per_second); print(@convert_fastpath_events);
     print(@sync_count); print(@sync_us); print(@sync_total_ns);
     print(@syscall_count); print(@syscall_count_by_inode); print(@syscall_us); print(@syscall_total_ns);
-    print(@wait_count); print(@wait_us); print(@wait_count_by_inode); print(@wait_total_ns_by_inode); print(@wait_us_by_inode); print(@wait_tx_by_inode);
+    print(@syscall_unmatched_count); print(@syscall_unmatched_us); print(@syscall_unmatched_total_ns);
+    print(@wait_correlated_count); print(@wait_correlated_us); print(@wait_count_by_inode); print(@wait_total_ns_by_inode); print(@wait_us_by_inode); print(@wait_tx_by_inode);
+    print(@wait_unmatched_count); print(@wait_unmatched_tx); print(@wait_unmatched_us); print(@wait_unmatched_total_ns);
     print(@commit_start_count); print(@commit_count); print(@commit_us); print(@commit_end_ns); print(@commit_duration_ns_by_tx);
 }
