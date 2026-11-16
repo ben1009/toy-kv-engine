@@ -204,6 +204,7 @@ pub enum WalExtentPreparationMode {
     Initialize,
     SlidingFallocate,
     SlidingInitialize,
+    SlidingLookahead,
 }
 
 /// Size of a batch header (v2/v3): commit_ts (8) + entry_count (4) + data_crc32 (4) = 16 bytes.
