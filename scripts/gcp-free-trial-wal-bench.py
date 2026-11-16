@@ -1059,7 +1059,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--subnet", help="Subnetwork name for custom-mode VPCs (must be in the requested region)")
     parser.add_argument("--ssh-source-range", help="Restricted IPv4 CIDR allowed to SSH to this ephemeral VM")
     parser.add_argument("--results-dir", type=Path, help="Local directory for preflight and collected artifacts")
-    parser.add_argument("--num", type=int, default=750_000, help="Writes per run (default: 750000)")
+    parser.add_argument("--num", type=int, help="Writes per run (default depends on the selected suite)")
     parser.add_argument("--max-runtime-minutes", type=int, default=180,
                         help=f"Server-enforced delete deadline, {MIN_RUNTIME_MINUTES}..{MAX_RUNTIME_MINUTES} minutes (default: 180)")
     parser.add_argument("--estimated-hourly-cost-usd", type=float,
@@ -1074,6 +1074,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--confirm-free-trial", action="store_true",
                         help="Attest that Billing Overview says Free Trial and you will not upgrade to Paid")
     args = parser.parse_args(argv)
+    if args.num is None:
+        args.num = COMMIT_ORDER_TRACE_NUM if args.commit_order_trace else 750_000
     if args.machine_type is None:
         args.machine_type = "c4-standard-16-lssd" if (args.commit_order_trace or args.v8_point_lookahead_ab) else MACHINE_TYPE
     args.network = args.network or "default"

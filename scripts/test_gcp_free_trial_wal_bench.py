@@ -318,6 +318,7 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
     def test_writer_defaults_are_suite_specific_and_duplicates_are_rejected(self) -> None:
         common = ["--project", "project", "--zone", "us-central1-a", "--commit", "a" * 40, "--preflight-only"]
         legacy = BENCH.parse_args(common)
+        self.assertEqual(legacy.num, 750_000)
         full = BENCH.parse_args([*common, "--full-rfc026-matrix"])
         self.assertEqual(legacy.writers, LEGACY_DEFAULT_WRITERS)
         self.assertEqual(full.writers, FULL_DEFAULT_WRITERS)
@@ -335,8 +336,13 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
             *common, "--commit-order-trace", "--num", "100000", "--source-patch-sha256", "a" * 64,
         ]
         trace = BENCH.parse_args(trace_args)
+        self.assertEqual(trace.num, COMMIT_ORDER_TRACE_NUM)
         self.assertEqual(trace.writers, (16,))
         self.assertEqual(trace.machine_type, "c4-standard-16-lssd")
+        trace_default = BENCH.parse_args([
+            *common, "--commit-order-trace", "--source-patch-sha256", "a" * 64,
+        ])
+        self.assertEqual(trace_default.num, COMMIT_ORDER_TRACE_NUM)
         with self.assertRaises(SystemExit):
             BENCH.parse_args([*trace_args, "--writers", "8"])
         with self.assertRaises(SystemExit):
