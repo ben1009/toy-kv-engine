@@ -53,3 +53,47 @@ The inode/JBD2 aggregate probe is retained at [`scripts/gcp_v8_unwritten_jbd2.bt
 All 6 planned runs have successful `result.json` and matching `run-metadata.json` in their own directories. `summary.json` reports complete 6/6; `remote-exit.json` reports no failures and 6 starts/completions. Three transferred result archives and their retained checksum sidecars passed SHA-256 verification. The source commit and workspace/vendor archive hashes remain in the local summary.
 
 The report is committed here; run-level JSON, traces, and checksum-verified archives remain in the local benchmark result directory and are not uploaded to GitHub. No manual cloud cleanup or `terraform destroy` was run. The VM is now absent because its configured 60-minute server-side lifetime expired; the isolated VPC, subnet, three narrowly scoped SSH rules, and local Terraform state remain. The VM Local SSD disappeared with the instance, while the complete verified result set is retained locally.
+
+## Follow-up: revised probe and sliding-initialization A/B (2026-11-16)
+
+The probe fixes in source commit `f9b14572b8c378b83b6af65981071357c6698c61` were checked on the same C4/ext4 setup. The checked-in probe SHA-256 was `0e369ca0cdfa1d8535b4a4eadedf094550a0aa659655a5cdd938039bd57eadcf`. The installed bpftrace 0.20.2 did not accept `--dry-run`; syntax and attach checks used `-d` and a short `-c /bin/true`. Actual short benchmarks were launched with `-c` and a temporary `cpid`-substituted probe to avoid a PID-attach race.
+
+The first V8 Fallocate trace hit the default 4,096-key map cap and is excluded. The retry used `BPFTRACE_MAX_MAP_KEYS=16384`. The following are three qualified, one-run diagnostics; diagnostic throughput is not a clean score.
+
+| Arm | Runtime WAL syncs | fdatasync syscalls | WAL-inode calls | Unmatched syscalls | Correlated JBD2 wait starts | Unmatched wait starts | Completed WAL-inode waits | WAL-inode wait transactions joined to commit-end | WAL-inode unwritten-handler events |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| V7 Parallel | 8,599 | 8,600 | 8,599 | 0 | 918 | 51 | 917 | 917/917 (all inodes 918/918) | 3,401 |
+| V8 Buffered + Sliding Fallocate 1 MiB | 6,318 | 6,318 | 6,318 | 0 | 6,318 | 75 | 6,318 | 6,318/6,318 | 112,637 |
+| V8 Sliding Initialize 1 MiB | 9,596 | 9,596 | 9,596 | 0 | 3,439 | 75 | 3,439 | 3,439/3,439 | 3,426 |
+
+The syscall counts reconcile: V8 totals match runtime sync counts; V7 has one additional ext4-associated syscall on a second inode, while its WAL inode has exactly 8,599. `@syscall_unmatched_count` is zero for every qualified arm. Correlated and unmatched JBD2 waits remain separate; waits are not assumed to be one-per-sync. All completed correlated `(device, transaction)` keys joined to `@commit_end_ns`. In this sample, Sliding Initialize sharply reduced unwritten-handler activity and correlated JBD2 waits versus Fallocate. This supports the extent/JBD2 mechanism but does not prove exclusive causality or explain the full throughput gap.
+
+### Untraced throughput follow-up
+
+Both score matrices used five counterbalanced blocks of V7, V8 Sliding Fallocate 1 MiB, and an initialization configuration. Each suite completed 15/15 runs; all measured initialization costs were included. The benchmark source remained at `f9b14572` except for the isolated temporary candidate patch described below.
+
+| First matrix | Median puts/s | CPU μs/put | Syncs | Puts/sync | Average fdatasync |
+|---|---:|---:|---:|---:|---:|
+| V7 Parallel | 48.45k | 59.23 | 8,209 | 12.18 | 15.88 μs |
+| V8 Sliding Fallocate 1 MiB | 31.56k | 70.23 | 6,345 | 15.76 | 162.35 μs |
+| V8 existing Sliding Initialize 1 MiB | 33.64k | 79.57 | 9,577 | 10.44 | 75.68 μs |
+
+Existing Sliding Initialize beat Fallocate in all five matched blocks, with a median paired gain of 6.72%, but remained 30.85% behind V7. Median preparation initialized 448.9 MB over 429 `fallocate` calls; initializer time was 274.2 ms and cumulative producer wait was 390.4 ms across threads.
+
+The second matrix tested a temporary benchmark-only full-window lookahead patch. It requests preparation through the full 1 MiB window while a DATA writer waits only for its own required prefix, allowing initialization to run ahead without delaying that writer for the remaining suffix. Patch SHA-256: `74beffad8e90a295d5a3464e4b5db66d8942d696211ce2c780ea65a3a2adb9f5`; candidate binary SHA-256: `fa0163fa77bfc69943bbfeb45475720251e77b995a4822fc0fc21958e49702ce`.
+
+| Full-window candidate matrix | Median puts/s | CPU μs/put | Syncs | Puts/sync | Average fdatasync |
+|---|---:|---:|---:|---:|---:|
+| V7 Parallel | 46.85k | 61.45 | 8,286 | 12.07 | 16.45 μs |
+| V8 Sliding Fallocate 1 MiB | 30.54k | 70.37 | 6,327 | 15.81 | 170.52 μs |
+| V8 full-window Initialize prototype | 38.21k | 79.69 | 9,823 | 10.18 | 52.98 μs |
+
+The prototype beat Fallocate in all five matched blocks (+25.35% median paired), but remained 17.16% behind V7. Relative to Fallocate, CPU per put rose 13.2%, sync count rose 55.3%, and average `fdatasync` fell 68.9%. Median initialization was 449.8 MB, with 301.7 ms initializer time and 67.1 ms cumulative producer wait across threads. Since sync count and grouping also changed, the throughput gain cannot be attributed to `fdatasync` alone.
+
+Separate one-run latency diagnostics sampled 1,008 operations per arm. V7 was 0.307/0.609/1.223 ms p50/p95/p99; Fallocate 0.493/0.672/2.489 ms; existing Initialize 0.455/0.804/3.955 ms; the prototype 0.350/0.978/2.488 ms. These samples are too few for stable tail-latency claims; the prototype p95 was higher than Fallocate in this run. Clean score runs did not sample operation latency. Their output includes average `fdatasync` time, while the separate BPF histograms provide only coarse syscall percentile buckets.
+
+### Follow-up limits and retained results
+
+The full-window prototype is a promising benchmark candidate, not a production-ready change. Quota/accounting, concurrent-write, crash-recovery, and failpoint qualification were not run. No Rust runtime change was made on this branch. Raw per-run archives, traces, and the temporary patch were retained locally and deliberately not added to GitHub; their archive SHA-256 values are `fe9ffc3bcb33a55fb41c6a3d049c4c2e751560a62db32c966d645b17c66d229d` (existing-initialization matrix) and `acbc6fbc73ac9f244df200ac1ab07dd69240de133bed7e9000d7421cd8b53808` (lookahead candidate matrix). The revised-probe archive SHA-256 is `fb56556d6b19ed5c0d5fb52fe2018b937bc8726ea1eff01f25d4116f7294a6f1`.
+
+For these follow-up runs, the local `remote-exit.json` was not retained before the VM's configured lifetime elapsed. The archives and per-run results were checksum-checked, but that missing runner record leaves the strict cleanup verification incomplete. No manual cloud cleanup or `terraform destroy` was performed; local Terraform state and network configuration were retained. No archive was uploaded and no PR was merged.
