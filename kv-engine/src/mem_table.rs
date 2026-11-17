@@ -444,6 +444,7 @@ pub struct WalV8DurabilityPhaseObservation {
     pub resource_retire_before_publish_remove_cpu_ns: u64,
     pub resource_retire_before_publish_release_cpu_ns: u64,
     pub resource_retire_before_publish_finish_cpu_ns: u64,
+    pub resource_retire_before_publish_batched_point_credits: bool,
     pub resource_retire_after_publish_wall_ns: u64,
     pub resource_retire_after_publish_cpu_ns: u64,
     pub resource_retire_after_publish_lock_wait_wall_ns: u64,

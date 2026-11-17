@@ -1388,6 +1388,7 @@ struct WalV8DurabilityPhaseRecord {
     resource_retire_before_publish_remove_cpu_ns: u64,
     resource_retire_before_publish_release_cpu_ns: u64,
     resource_retire_before_publish_finish_cpu_ns: u64,
+    resource_retire_before_publish_batched_point_credits: bool,
     resource_retire_after_publish_wall_ns: u64,
     resource_retire_after_publish_cpu_ns: u64,
     resource_retire_after_publish_lock_wait_wall_ns: u64,
@@ -1508,6 +1509,8 @@ impl From<kv_engine_wrapper::mem_table::WalV8DurabilityPhaseObservation>
                 .resource_retire_before_publish_release_cpu_ns,
             resource_retire_before_publish_finish_cpu_ns: observation
                 .resource_retire_before_publish_finish_cpu_ns,
+            resource_retire_before_publish_batched_point_credits: observation
+                .resource_retire_before_publish_batched_point_credits,
             resource_retire_after_publish_wall_ns: observation
                 .resource_retire_after_publish_wall_ns,
             resource_retire_after_publish_cpu_ns: observation.resource_retire_after_publish_cpu_ns,

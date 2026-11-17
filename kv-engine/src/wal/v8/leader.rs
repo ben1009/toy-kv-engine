@@ -188,7 +188,7 @@ pub(crate) struct WalV8ParallelWriter {
     io: Arc<WalV8ParallelIo>,
     reservation_owner: Option<Arc<WalV8ReservationOwner>>,
     frontier: Mutex<WalV8ParallelFrontier>,
-    frontier_resources: Mutex<BTreeMap<u64, WalV7OwnedBatchReservation>>,
+    frontier_resources: Mutex<BTreeMap<u64, WalV8FrontierResource>>,
     producer_guards: Arc<Mutex<BTreeMap<u64, EncodedWalV8Batch<WalV8ParallelAdmissionGuard>>>>,
     max_file_size: u64,
     installed_dev: u64,
@@ -201,8 +201,18 @@ pub(crate) struct WalV8ParallelWriter {
     /// detailed sync-observation capture.
     #[cfg(feature = "bench")]
     coalesce_budget_override_us: Option<u64>,
+    /// Benchmark-only experiment that batches credit release for Point-only
+    /// durable prefixes. Batch and mixed prefixes retain the existing path.
+    #[cfg(feature = "bench")]
+    batch_point_frontier_credits: bool,
     #[cfg(feature = "bench")]
     profile: arc_swap::ArcSwapOption<crate::mem_table::WriteProfile>,
+}
+
+struct WalV8FrontierResource {
+    reservation: WalV7OwnedBatchReservation,
+    #[cfg(feature = "bench")]
+    write_class: WalV8WriteClass,
 }
 
 #[cfg(feature = "bench")]
@@ -259,6 +269,8 @@ struct WalV8RetirementObservation {
     release_cpu_ns: u64,
     #[cfg(feature = "bench")]
     finish_cpu_ns: u64,
+    #[cfg(feature = "bench")]
+    batch_point_frontier_credits: bool,
 }
 
 #[cfg(feature = "bench")]
@@ -319,6 +331,8 @@ impl WalV8FrontierWriteMode {
 const WAL_V8_EXTENT_PREPARATION_ENV: &str = "TOYKV_BENCH_V8_EXTENT_PREP";
 #[cfg(feature = "bench")]
 const WAL_V8_EXTENT_PREPARATION_BYTES_ENV: &str = "TOYKV_BENCH_V8_EXTENT_PREP_BYTES";
+#[cfg(feature = "bench")]
+const WAL_V8_POINT_FRONTIER_CREDIT_BATCH_ENV: &str = "TOYKV_BENCH_V8_POINT_FRONTIER_CREDIT_BATCH";
 const WAL_V8_EXTENT_PREPARATION_CHUNK_BYTES: usize = 128 * 1024;
 
 #[cfg(feature = "bench")]
@@ -2013,6 +2027,23 @@ fn coalesce_budget_override_from_environment() -> Result<Option<u64>> {
     Ok(Some(budget_us))
 }
 
+#[cfg(feature = "bench")]
+fn point_frontier_credit_batch_from_environment() -> Result<bool> {
+    let Some(value) = std::env::var_os(WAL_V8_POINT_FRONTIER_CREDIT_BATCH_ENV) else {
+        return Ok(false);
+    };
+    let value = value
+        .to_str()
+        .with_context(|| format!("{WAL_V8_POINT_FRONTIER_CREDIT_BATCH_ENV} is not valid UTF-8"))?;
+    match value {
+        "0" => Ok(false),
+        "1" => Ok(true),
+        _ => anyhow::bail!(
+            "invalid {WAL_V8_POINT_FRONTIER_CREDIT_BATCH_ENV} {value:?}; expected `0` or `1`"
+        ),
+    }
+}
+
 struct WalV8ParallelFrontier {
     frontier: WalV8Frontier,
     offset: u64,
@@ -3114,6 +3145,8 @@ impl WalV8LeaderWriter {
         #[cfg(feature = "bench")]
         let coalesce_budget_override_us = coalesce_budget_override_from_environment()?;
         #[cfg(feature = "bench")]
+        let batch_point_frontier_credits = point_frontier_credit_batch_from_environment()?;
+        #[cfg(feature = "bench")]
         {
             io_diagnostics.data = WalIoHandleMetadata::from_file(&worker_file)?;
         }
@@ -3309,6 +3342,8 @@ impl WalV8LeaderWriter {
             io_diagnostics,
             #[cfg(feature = "bench")]
             coalesce_budget_override_us,
+            #[cfg(feature = "bench")]
+            batch_point_frontier_credits,
             #[cfg(feature = "bench")]
             profile: self.profile,
         })
@@ -4082,11 +4117,17 @@ impl WalV8ParallelWriter {
         };
         let admitted = prepared.admit_with_metadata(commit_ts, recorded_at, &publisher)?;
         let assignment = admitted.assignment();
+        #[cfg(feature = "bench")]
+        let write_class = admitted.write_class();
         if let Some(reservation) = reservation.take() {
-            let previous = self
-                .frontier_resources
-                .lock()
-                .insert(assignment.segment_ticket, reservation);
+            let previous = self.frontier_resources.lock().insert(
+                assignment.segment_ticket,
+                WalV8FrontierResource {
+                    reservation,
+                    #[cfg(feature = "bench")]
+                    write_class,
+                },
+            );
             if previous.is_some() {
                 self.coordinator.poison();
                 anyhow::bail!("v8 Parallel ticket already owns a resource reservation");
@@ -4616,6 +4657,8 @@ impl WalV8ParallelWriter {
                             resource_retire_before_publish.release_cpu_ns,
                         resource_retire_before_publish_finish_cpu_ns:
                             resource_retire_before_publish.finish_cpu_ns,
+                        resource_retire_before_publish_batched_point_credits:
+                            resource_retire_before_publish.batch_point_frontier_credits,
                         resource_retire_after_publish_wall_ns: resource_retire_after_publish
                             .wall_ns,
                         resource_retire_after_publish_cpu_ns: resource_retire_after_publish.cpu_ns,
@@ -4663,9 +4706,6 @@ impl WalV8ParallelWriter {
             return Ok(WalV8RetirementObservation::default());
         }
         let expected = usize::try_from(ticket_end - first_ticket)?;
-        // Allocate before locking the map. The durable prefix is bounded by
-        // the coordinator's in-flight window, so this buffer remains small.
-        let mut retired = Vec::with_capacity(expected);
         #[cfg(feature = "bench")]
         let lock_wait_started = sample.then(Instant::now);
         #[cfg(feature = "bench")]
@@ -4685,7 +4725,16 @@ impl WalV8ParallelWriter {
         let lock_hold_cpu_started = sample.then(digest::thread_cpu_time_ns);
         #[cfg(feature = "bench")]
         let collect_started = sample.then(digest::thread_cpu_time_ns);
-        let found = resources.range(first_ticket..ticket_end).count();
+        #[cfg(feature = "bench")]
+        let mut point_only_prefix = true;
+        let mut tickets = Vec::with_capacity(expected);
+        for (&ticket, _resource) in resources.range(first_ticket..ticket_end) {
+            #[cfg(feature = "bench")]
+            {
+                point_only_prefix &= _resource.write_class == WalV8WriteClass::Point;
+            }
+            tickets.push(ticket);
+        }
         #[cfg(feature = "bench")]
         let collect_cpu_ns = collect_started
             .map(|t| digest::thread_cpu_time_ns().saturating_sub(t))
@@ -4693,26 +4742,74 @@ impl WalV8ParallelWriter {
         #[cfg(feature = "bench")]
         let (mut remove_cpu_ns, mut release_cpu_ns, mut finish_cpu_ns) = (0u64, 0u64, 0u64);
         ensure!(
-            found == expected,
+            tickets.len() == expected,
             "v8 Parallel durable prefix is missing resource reservations"
         );
-        for ticket in first_ticket..ticket_end {
+
+        #[cfg(feature = "bench")]
+        let batch_point_frontier_credits =
+            self.batch_point_frontier_credits && point_only_prefix && expected > 1;
+        #[cfg(not(feature = "bench"))]
+        let batch_point_frontier_credits = false;
+
+        if batch_point_frontier_credits {
             #[cfg(feature = "bench")]
             let step_started = sample.then(digest::thread_cpu_time_ns);
-            let Some(reservation) = resources.remove(&ticket) else {
-                // `found == expected` under the same lock guarantees this
-                // cannot happen. Restore defensively if the map invariant is
-                // ever changed so the failure path retains all prior entries.
-                for (retired_ticket, reservation) in retired.drain(..) {
-                    let previous = resources.insert(retired_ticket, reservation);
-                    debug_assert!(previous.is_none());
-                }
-                anyhow::bail!("v8 Parallel resource reservation disappeared");
-            };
-            retired.push((ticket, reservation));
+            let mut reservations: Vec<&mut WalV7OwnedBatchReservation> = resources
+                .range_mut(first_ticket..ticket_end)
+                .skip(1)
+                .map(|(_, resource)| &mut resource.reservation)
+                .collect();
+            WalV7OwnedBatchReservation::release_unused_frontier_credits_batch(&mut reservations)
+                .context("release batched Point v8 FRONTIER credits")?;
+            #[cfg(feature = "bench")]
+            {
+                release_cpu_ns = release_cpu_ns.saturating_add(
+                    step_started
+                        .map(|t| digest::thread_cpu_time_ns().saturating_sub(t))
+                        .unwrap_or_default(),
+                );
+            }
+        }
+
+        for (index, ticket) in tickets.into_iter().enumerate() {
+            #[cfg(feature = "bench")]
+            let step_started = sample.then(digest::thread_cpu_time_ns);
+            let resource = resources
+                .remove(&ticket)
+                .context("v8 Parallel resource reservation disappeared")?;
             #[cfg(feature = "bench")]
             {
                 remove_cpu_ns = remove_cpu_ns.saturating_add(
+                    step_started
+                        .map(|t| digest::thread_cpu_time_ns().saturating_sub(t))
+                        .unwrap_or_default(),
+                );
+            }
+            let mut reservation = resource.reservation;
+            if index > 0 && !batch_point_frontier_credits {
+                #[cfg(feature = "bench")]
+                let step_started = sample.then(digest::thread_cpu_time_ns);
+                if let Err(error) = reservation.release_unused_frontier_credit() {
+                    return Err(error).context("release coalesced v8 FRONTIER reservation");
+                }
+                #[cfg(feature = "bench")]
+                {
+                    release_cpu_ns = release_cpu_ns.saturating_add(
+                        step_started
+                            .map(|t| digest::thread_cpu_time_ns().saturating_sub(t))
+                            .unwrap_or_default(),
+                    );
+                }
+            }
+            #[cfg(feature = "bench")]
+            let step_started = sample.then(digest::thread_cpu_time_ns);
+            if let Err(error) = reservation.finish_after_io() {
+                return Err(error).context("retire durable v8 batch resources");
+            }
+            #[cfg(feature = "bench")]
+            {
+                finish_cpu_ns = finish_cpu_ns.saturating_add(
                     step_started
                         .map(|t| digest::thread_cpu_time_ns().saturating_sub(t))
                         .unwrap_or_default(),
@@ -4730,49 +4827,6 @@ impl WalV8ParallelWriter {
             .unwrap_or_default();
         drop(resources);
 
-        // Quota-ledger updates and operation retirement do not need the map
-        // lock. Complete them before publishing the durable prefix, preserving
-        // the existing durability and resource-accounting order.
-        let mut pending = retired.into_iter();
-        for index in 0..expected {
-            let next = pending.next();
-            let Some((_, mut reservation)) = next else {
-                self.restore_frontier_resources(pending)?;
-                anyhow::bail!("v8 Parallel extracted resource reservation disappeared");
-            };
-            if index > 0 {
-                #[cfg(feature = "bench")]
-                let step_started = sample.then(digest::thread_cpu_time_ns);
-                if let Err(error) = reservation.release_unused_frontier_credit() {
-                    drop(reservation);
-                    self.restore_frontier_resources(pending)?;
-                    return Err(error).context("release coalesced v8 FRONTIER reservation");
-                }
-                #[cfg(feature = "bench")]
-                {
-                    release_cpu_ns = release_cpu_ns.saturating_add(
-                        step_started
-                            .map(|t| digest::thread_cpu_time_ns().saturating_sub(t))
-                            .unwrap_or_default(),
-                    );
-                }
-            }
-            #[cfg(feature = "bench")]
-            let step_started = sample.then(digest::thread_cpu_time_ns);
-            if let Err(error) = reservation.finish_after_io() {
-                self.restore_frontier_resources(pending)?;
-                return Err(error).context("retire durable v8 batch resources");
-            }
-            #[cfg(feature = "bench")]
-            {
-                finish_cpu_ns = finish_cpu_ns.saturating_add(
-                    step_started
-                        .map(|t| digest::thread_cpu_time_ns().saturating_sub(t))
-                        .unwrap_or_default(),
-                );
-            }
-        }
-
         #[allow(unused_mut)]
         let mut observation = WalV8RetirementObservation::default();
         #[cfg(feature = "bench")]
@@ -4781,6 +4835,7 @@ impl WalV8ParallelWriter {
             observation.remove_cpu_ns = remove_cpu_ns;
             observation.release_cpu_ns = release_cpu_ns;
             observation.finish_cpu_ns = finish_cpu_ns;
+            observation.batch_point_frontier_credits = batch_point_frontier_credits;
             observation.tickets = u64::try_from(expected).unwrap_or(u64::MAX);
             observation.wall_ns = started
                 .map(|started| started.elapsed().as_nanos().min(u64::MAX as u128) as u64)
@@ -4795,26 +4850,6 @@ impl WalV8ParallelWriter {
         }
 
         Ok(observation)
-    }
-
-    fn restore_frontier_resources(
-        &self,
-        reservations: impl Iterator<Item = (u64, WalV7OwnedBatchReservation)>,
-    ) -> Result<()> {
-        let mut resources = self.frontier_resources.lock();
-        for (ticket, reservation) in reservations {
-            match resources.entry(ticket) {
-                std::collections::btree_map::Entry::Vacant(entry) => {
-                    entry.insert(reservation);
-                }
-                std::collections::btree_map::Entry::Occupied(_) => {
-                    anyhow::bail!(
-                        "v8 Parallel resource reservation was replaced while restoring retirement"
-                    );
-                }
-            }
-        }
-        Ok(())
     }
 
     fn retire_frontier_guards(
