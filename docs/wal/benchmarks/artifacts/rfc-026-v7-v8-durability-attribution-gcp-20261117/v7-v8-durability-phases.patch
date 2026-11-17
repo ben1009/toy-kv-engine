@@ -1,0 +1,837 @@
+diff --git a/kv-engine/src/bin/write-perf.rs b/kv-engine/src/bin/write-perf.rs
+index cc1e74a3..40627c4a 100644
+--- a/kv-engine/src/bin/write-perf.rs
++++ b/kv-engine/src/bin/write-perf.rs
+@@ -301,6 +301,11 @@ struct Args {
+     /// Captures phase wall/thread CPU time; requires a bench build with PITR V8 Parallel I/O.
+     #[arg(long, requires = "pitr")]
+     wal_v8_durability_sample_every: Option<u64>,
++    /// Sample every Nth completed V7 Parallel durability advance.
++    /// Captures matched phase wall/thread CPU time; requires a bench build with PITR V7 Parallel
++    /// I/O.
++    #[arg(long, requires = "pitr")]
++    wal_v7_durability_sample_every: Option<u64>,
+     /// Sample every Nth commit timestamp through synchronous MVCC publication.
+     /// Captures publication order, frontier distance, lock wait, spin, and condition-variable
+     /// data.
+@@ -394,6 +399,7 @@ struct HarnessConfig {
+     wal_hol_diagnostics: bool,
+     wal_completion_timeline: bool,
+     wal_v8_durability_sample_every: Option<u64>,
++    wal_v7_durability_sample_every: Option<u64>,
+     mvcc_publication_sample_every: Option<u64>,
+     commit_order_trace_limit: Option<u64>,
+     vlog_override: bool,
+@@ -514,6 +520,7 @@ impl HarnessConfig {
+             wal_hol_diagnostics: args.wal_hol_diagnostics,
+             wal_completion_timeline: args.wal_completion_timeline,
+             wal_v8_durability_sample_every: args.wal_v8_durability_sample_every,
++            wal_v7_durability_sample_every: args.wal_v7_durability_sample_every,
+             mvcc_publication_sample_every: args.mvcc_publication_sample_every,
+             commit_order_trace_limit: args.commit_order_trace_limit,
+             vlog_override: args.vlog,
+@@ -1133,6 +1140,8 @@ struct WalPipelineRecord {
+     #[serde(skip_serializing_if = "Option::is_none")]
+     v8_durability_diagnostics: Option<WalV8DurabilityDiagnosticsRunRecord>,
+     #[serde(skip_serializing_if = "Option::is_none")]
++    v7_durability_diagnostics: Option<WalV7DurabilityDiagnosticsRunRecord>,
++    #[serde(skip_serializing_if = "Option::is_none")]
+     mvcc_publication_diagnostics: Option<MvccPublicationDiagnosticsRunRecord>,
+     #[serde(skip_serializing_if = "Option::is_none")]
+     commit_order_trace: Option<CommitOrderTraceRunRecord>,
+@@ -1220,6 +1229,39 @@ struct WalV8DurabilityDiagnosticsRunRecord {
+     ack_samples: Vec<WalV8AckRecord>,
+ }
+ 
++#[derive(Clone, Debug, Default, PartialEq, Serialize)]
++struct WalV7DurabilityDiagnosticsRunRecord {
++    sample_every: u64,
++    completed_advances: u64,
++    sampled_advances: u64,
++    dropped_samples: u64,
++    phases: Vec<WalV7DurabilityPhaseRecord>,
++}
++
++#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
++struct WalV7DurabilityPhaseRecord {
++    sample_sequence: u64,
++    ticket_start: u64,
++    ticket_end: u64,
++    tickets_covered: u64,
++    written_prefix_to_durable_wall_ns: u64,
++    written_prefix_to_durable_cpu_ns: u64,
++    coalescing_wall_ns: u64,
++    coalescing_cpu_ns: u64,
++    frontier_prepare_wall_ns: u64,
++    frontier_prepare_cpu_ns: u64,
++    frontier_write_wall_ns: u64,
++    frontier_write_cpu_ns: u64,
++    fdatasync_wall_ns: u64,
++    fdatasync_cpu_ns: u64,
++    retirement_wall_ns: u64,
++    retirement_cpu_ns: u64,
++    durable_publish_lock_wait_wall_ns: u64,
++    durable_publish_lock_wait_cpu_ns: u64,
++    durable_publish_wall_ns: u64,
++    durable_publish_cpu_ns: u64,
++}
++
+ #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
+ struct WalV8AckRecord {
+     ticket: u64,
+@@ -1537,6 +1579,36 @@ impl From<kv_engine_wrapper::mem_table::WalV8DurabilityPhaseObservation>
+     }
+ }
+ 
++#[cfg(feature = "bench")]
++impl From<kv_engine_wrapper::mem_table::WalV7DurabilityPhaseObservation>
++    for WalV7DurabilityPhaseRecord
++{
++    fn from(observation: kv_engine_wrapper::mem_table::WalV7DurabilityPhaseObservation) -> Self {
++        Self {
++            sample_sequence: observation.sample_sequence,
++            ticket_start: observation.ticket_start,
++            ticket_end: observation.ticket_end,
++            tickets_covered: observation.tickets_covered,
++            written_prefix_to_durable_wall_ns: observation.written_prefix_to_durable_wall_ns,
++            written_prefix_to_durable_cpu_ns: observation.written_prefix_to_durable_cpu_ns,
++            coalescing_wall_ns: observation.coalescing_wall_ns,
++            coalescing_cpu_ns: observation.coalescing_cpu_ns,
++            frontier_prepare_wall_ns: observation.frontier_prepare_wall_ns,
++            frontier_prepare_cpu_ns: observation.frontier_prepare_cpu_ns,
++            frontier_write_wall_ns: observation.frontier_write_wall_ns,
++            frontier_write_cpu_ns: observation.frontier_write_cpu_ns,
++            fdatasync_wall_ns: observation.fdatasync_wall_ns,
++            fdatasync_cpu_ns: observation.fdatasync_cpu_ns,
++            retirement_wall_ns: observation.retirement_wall_ns,
++            retirement_cpu_ns: observation.retirement_cpu_ns,
++            durable_publish_lock_wait_wall_ns: observation.durable_publish_lock_wait_wall_ns,
++            durable_publish_lock_wait_cpu_ns: observation.durable_publish_lock_wait_cpu_ns,
++            durable_publish_wall_ns: observation.durable_publish_wall_ns,
++            durable_publish_cpu_ns: observation.durable_publish_cpu_ns,
++        }
++    }
++}
++
+ #[cfg(feature = "bench")]
+ impl From<kv_engine_wrapper::mem_table::WalV8FollowerWaitObservation> for WalV8FollowerWaitRecord {
+     fn from(observation: kv_engine_wrapper::mem_table::WalV8FollowerWaitObservation) -> Self {
+@@ -1902,6 +1974,19 @@ fn wal_pipeline_record(
+                 .collect(),
+         }
+     });
++    let v7_durability_diagnostics = profile.wal_v7_durability_sample_every.map(|sample_every| {
++        let phases = engine.wal_v7_durability_phase_observations();
++        WalV7DurabilityDiagnosticsRunRecord {
++            sample_every,
++            completed_advances: engine.wal_v7_durability_completed_advance_sequence(),
++            sampled_advances: phases.len() as u64,
++            dropped_samples: engine.wal_v7_durability_phase_dropped_samples(),
++            phases: phases
++                .into_iter()
++                .map(WalV7DurabilityPhaseRecord::from)
++                .collect(),
++        }
++    });
+     let mvcc_publication_diagnostics = engine
+         .mvcc_publication_diagnostics()
+         .filter(|diagnostics| diagnostics.sample_every > 0)
+@@ -1945,6 +2030,7 @@ fn wal_pipeline_record(
+             .then_some(hol_diagnostics_enabled),
+         v8_completion_timeline,
+         v8_durability_diagnostics,
++        v7_durability_diagnostics,
+         mvcc_publication_diagnostics,
+         commit_order_trace,
+         v8_data_submit_hol_episodes: profile.wal_v8_data_submit_hol_episodes,
+@@ -4896,6 +4982,7 @@ fn run_wal_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
+             cfg.wal_completion_timeline.then_some(128),
+         )?;
+         engine.set_wal_v8_durability_sample_every(cfg.wal_v8_durability_sample_every)?;
++        engine.set_wal_v7_durability_sample_every(cfg.wal_v7_durability_sample_every)?;
+     }
+     let value = vec![b'x'; cfg.value_size];
+     let num_keys = cfg.num;
+@@ -5122,6 +5209,7 @@ fn run_wal_batch_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>
+             cfg.wal_completion_timeline.then_some(128),
+         )?;
+         engine.set_wal_v8_durability_sample_every(cfg.wal_v8_durability_sample_every)?;
++        engine.set_wal_v7_durability_sample_every(cfg.wal_v7_durability_sample_every)?;
+     }
+     #[cfg(feature = "bench")]
+     let wal_io_start = engine
+@@ -10029,6 +10117,21 @@ fn validate_config(cfg: &HarnessConfig) -> Result<()> {
+             "--wal-v8-durability-sample-every requires PITR V8 Parallel I/O"
+         );
+     }
++    if let Some(sample_every) = cfg.wal_v7_durability_sample_every {
++        anyhow::ensure!(
++            sample_every > 0,
++            "--wal-v7-durability-sample-every must be greater than zero"
++        );
++        anyhow::ensure!(
++            cfg!(feature = "bench"),
++            "--wal-v7-durability-sample-every requires a bench build"
++        );
++        anyhow::ensure!(
++            cfg.pitr_format.unwrap_or(PitrFormatArg::V8) == PitrFormatArg::V7
++                && cfg.wal_io_mode == WalIoModeArg::Parallel,
++            "--wal-v7-durability-sample-every requires PITR V7 Parallel I/O"
++        );
++    }
+     if let Some(sample_every) = cfg.mvcc_publication_sample_every {
+         anyhow::ensure!(
+             sample_every > 0,
+@@ -12018,6 +12121,7 @@ mod tests {
+             wal_hol_diagnostics: false,
+             wal_completion_timeline: false,
+             wal_v8_durability_sample_every: None,
++            wal_v7_durability_sample_every: None,
+             mvcc_publication_sample_every: None,
+             commit_order_trace_limit: None,
+             vlog_override: false,
+@@ -14560,6 +14664,7 @@ mod tests {
+             wal_hol_diagnostics: false,
+             wal_completion_timeline: false,
+             wal_v8_durability_sample_every: None,
++            wal_v7_durability_sample_every: None,
+             mvcc_publication_sample_every: None,
+             commit_order_trace_limit: None,
+             vlog_override: false,
+diff --git a/kv-engine/src/lsm_storage.rs b/kv-engine/src/lsm_storage.rs
+index 7d698894..2d405fa9 100644
+--- a/kv-engine/src/lsm_storage.rs
++++ b/kv-engine/src/lsm_storage.rs
+@@ -10251,6 +10251,48 @@ impl KvEngine {
+             .wal_v8_durability_phase_dropped_samples()
+     }
+ 
++    #[cfg(feature = "bench")]
++    /// Sample every Nth completed V7 Parallel durability advance.
++    /// Passing `None` disables phase timing.
++    pub fn set_wal_v7_durability_sample_every(&self, sample_every: Option<u64>) -> Result<()> {
++        anyhow::ensure!(
++            sample_every.is_none_or(|every| every > 0),
++            "V7 durability phase sample interval must be greater than zero"
++        );
++        let _active_memtable = self.inner.active_memtable_lock.read();
++        self.inner
++            .write_profile
++            .set_wal_v7_durability_sample_every(sample_every.unwrap_or_default());
++
++        Ok(())
++    }
++
++    #[cfg(feature = "bench")]
++    /// Samples captured by the opt-in V7 Parallel durability phase diagnostics.
++    pub fn wal_v7_durability_phase_observations(
++        &self,
++    ) -> Vec<crate::mem_table::WalV7DurabilityPhaseObservation> {
++        self.inner
++            .write_profile
++            .wal_v7_durability_phase_observations()
++    }
++
++    #[cfg(feature = "bench")]
++    /// Number of V7 durability advances completed during the current benchmark.
++    pub fn wal_v7_durability_completed_advance_sequence(&self) -> u64 {
++        self.inner
++            .write_profile
++            .wal_v7_durability_completed_advance_sequence()
++    }
++
++    #[cfg(feature = "bench")]
++    /// Number of selected V7 phase samples omitted by errors or the bounded sample limit.
++    pub fn wal_v7_durability_phase_dropped_samples(&self) -> u64 {
++        self.inner
++            .write_profile
++            .wal_v7_durability_phase_dropped_samples()
++    }
++
+     #[cfg(feature = "bench")]
+     /// Sampled V8 durable-publish through Put-return stage measurements.
+     pub fn wal_v8_ack_observations(&self) -> Vec<crate::mem_table::WalV8AckObservation> {
+diff --git a/kv-engine/src/mem_table.rs b/kv-engine/src/mem_table.rs
+index f16ff2df..ce1c6fd8 100644
+--- a/kv-engine/src/mem_table.rs
++++ b/kv-engine/src/mem_table.rs
+@@ -299,6 +299,14 @@ pub struct WriteProfile {
+     wal_v8_durability_phases: Mutex<Vec<WalV8DurabilityPhaseObservation>>,
+     #[cfg(feature = "bench")]
+     wal_v8_durability_phase_dropped_samples: AtomicU64,
++    #[cfg(feature = "bench")]
++    wal_v7_durability_sample_every: AtomicU64,
++    #[cfg(feature = "bench")]
++    wal_v7_durability_completed_advance_sequence: AtomicU64,
++    #[cfg(feature = "bench")]
++    wal_v7_durability_phases: Mutex<Vec<WalV7DurabilityPhaseObservation>>,
++    #[cfg(feature = "bench")]
++    wal_v7_durability_phase_dropped_samples: AtomicU64,
+     /// Sampled caller-side ACK stages correlated by V8 ticket.
+     #[cfg(feature = "bench")]
+     wal_v8_ack_observations: Mutex<Vec<WalV8AckObservation>>,
+@@ -462,6 +470,35 @@ pub struct WalV8DurabilityPhaseObservation {
+     pub followers_waiting_at_publish: u64,
+ }
+ 
++/// One sampled V7 Parallel durability advance. Some stages differ internally
++/// from V8, so the benchmark report keeps the phase names explicit.
++#[cfg(feature = "bench")]
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub struct WalV7DurabilityPhaseObservation {
++    pub sample_sequence: u64,
++    pub ticket_start: u64,
++    pub ticket_end: u64,
++    pub tickets_covered: u64,
++    pub written_prefix_to_durable_wall_ns: u64,
++    pub written_prefix_to_durable_cpu_ns: u64,
++    pub coalescing_wall_ns: u64,
++    pub coalescing_cpu_ns: u64,
++    /// V7 frontier reservation, encoding, digest, and extent preparation.
++    pub frontier_prepare_wall_ns: u64,
++    pub frontier_prepare_cpu_ns: u64,
++    pub frontier_write_wall_ns: u64,
++    pub frontier_write_cpu_ns: u64,
++    pub fdatasync_wall_ns: u64,
++    pub fdatasync_cpu_ns: u64,
++    /// V7 allocator completion and covered reservation retirement before publish.
++    pub retirement_wall_ns: u64,
++    pub retirement_cpu_ns: u64,
++    pub durable_publish_lock_wait_wall_ns: u64,
++    pub durable_publish_lock_wait_cpu_ns: u64,
++    pub durable_publish_wall_ns: u64,
++    pub durable_publish_cpu_ns: u64,
++}
++
+ /// Sampled V8 Point-write stages after the durable FRONTIER was published.
+ #[cfg(feature = "bench")]
+ #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+@@ -910,6 +947,11 @@ impl WriteProfile {
+             self.wal_v8_durability_follower_sample_sequence.store(0, o);
+             self.wal_v8_durability_phases.lock().clear();
+             self.wal_v8_durability_phase_dropped_samples.store(0, o);
++            self.wal_v7_durability_sample_every.store(0, o);
++            self.wal_v7_durability_completed_advance_sequence
++                .store(0, o);
++            self.wal_v7_durability_phases.lock().clear();
++            self.wal_v7_durability_phase_dropped_samples.store(0, o);
+             self.wal_v8_ack_observations.lock().clear();
+             self.wal_v8_ack_dropped_samples.store(0, o);
+             self.wal_v8_follower_waits.lock().clear();
+@@ -1077,6 +1119,19 @@ impl WriteProfile {
+                     None
+                 }
+             },
++            wal_v7_durability_sample_every: {
++                #[cfg(feature = "bench")]
++                {
++                    match self.wal_v7_durability_sample_every.load(o) {
++                        0 => None,
++                        every => Some(every),
++                    }
++                }
++                #[cfg(not(feature = "bench"))]
++                {
++                    None
++                }
++            },
+             op_count: self.op_count.load(o),
+         }
+     }
+@@ -1166,6 +1221,84 @@ impl WriteProfile {
+             .load(std::sync::atomic::Ordering::Acquire)
+     }
+ 
++    #[cfg(feature = "bench")]
++    pub(crate) fn set_wal_v7_durability_sample_every(&self, every: u64) {
++        self.wal_v7_durability_sample_every
++            .store(every, std::sync::atomic::Ordering::Release);
++    }
++
++    #[cfg(feature = "bench")]
++    pub(crate) fn wal_v7_durability_sample_every(&self) -> u64 {
++        self.wal_v7_durability_sample_every
++            .load(std::sync::atomic::Ordering::Acquire)
++    }
++
++    #[cfg(feature = "bench")]
++    pub(crate) fn next_wal_v7_durability_advance_sample_candidate(&self) -> Option<u64> {
++        let every = self
++            .wal_v7_durability_sample_every
++            .load(std::sync::atomic::Ordering::Acquire);
++        if every == 0 {
++            return None;
++        }
++
++        let next_advance_sequence = self
++            .wal_v7_durability_completed_advance_sequence
++            .load(std::sync::atomic::Ordering::Relaxed)
++            .saturating_add(1);
++
++        next_advance_sequence
++            .is_multiple_of(every)
++            .then_some(next_advance_sequence)
++    }
++
++    #[cfg(feature = "bench")]
++    pub(crate) fn complete_wal_v7_durability_advance(&self) -> u64 {
++        self.wal_v7_durability_completed_advance_sequence
++            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
++            .saturating_add(1)
++    }
++
++    #[cfg(feature = "bench")]
++    pub(crate) fn wal_v7_durability_completed_advance_sequence(&self) -> u64 {
++        self.wal_v7_durability_completed_advance_sequence
++            .load(std::sync::atomic::Ordering::Relaxed)
++    }
++
++    #[cfg(feature = "bench")]
++    pub(crate) fn record_wal_v7_durability_phase(
++        &self,
++        observation: WalV7DurabilityPhaseObservation,
++    ) {
++        const MAX_SAMPLES: usize = 4096;
++        let mut samples = self.wal_v7_durability_phases.lock();
++        if samples.len() < MAX_SAMPLES {
++            samples.push(observation);
++        } else {
++            self.wal_v7_durability_phase_dropped_samples
++                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++        }
++    }
++
++    #[cfg(feature = "bench")]
++    pub(crate) fn drop_wal_v7_durability_phase_sample(&self) {
++        self.wal_v7_durability_phase_dropped_samples
++            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++    }
++
++    #[cfg(feature = "bench")]
++    pub(crate) fn wal_v7_durability_phase_observations(
++        &self,
++    ) -> Vec<WalV7DurabilityPhaseObservation> {
++        self.wal_v7_durability_phases.lock().clone()
++    }
++
++    #[cfg(feature = "bench")]
++    pub(crate) fn wal_v7_durability_phase_dropped_samples(&self) -> u64 {
++        self.wal_v7_durability_phase_dropped_samples
++            .load(std::sync::atomic::Ordering::Relaxed)
++    }
++
+     #[cfg(feature = "bench")]
+     pub(crate) fn record_wal_v8_durability_driver_attempt(&self) -> Option<u64> {
+         if self.wal_v8_durability_sample_every() == 0 {
+@@ -1718,6 +1851,7 @@ pub struct WriteProfileSnapshot {
+     pub wal_hol_diagnostics_enabled: bool,
+     pub wal_v8_completion_timeline_sample_every: Option<u64>,
+     pub wal_v8_durability_sample_every: Option<u64>,
++    pub wal_v7_durability_sample_every: Option<u64>,
+     pub op_count: u64,
+ }
+ 
+@@ -1892,6 +2026,7 @@ impl WriteProfileSnapshot {
+             wal_hol_diagnostics_enabled: self.wal_hol_diagnostics_enabled,
+             wal_v8_completion_timeline_sample_every: self.wal_v8_completion_timeline_sample_every,
+             wal_v8_durability_sample_every: self.wal_v8_durability_sample_every,
++            wal_v7_durability_sample_every: self.wal_v7_durability_sample_every,
+             op_count: self.op_count.saturating_sub(before.op_count),
+         }
+     }
+diff --git a/kv-engine/src/wal/parallel/runtime.rs b/kv-engine/src/wal/parallel/runtime.rs
+index 395eec67..ff87e878 100644
+--- a/kv-engine/src/wal/parallel/runtime.rs
++++ b/kv-engine/src/wal/parallel/runtime.rs
+@@ -779,6 +779,60 @@ impl ParallelWalV7Metadata {
+ struct WalV7FrontierCycle {
+     reservation: WalV7FrontierReservation,
+     cursor: WalV7FrontierCursor,
++    #[cfg(feature = "bench")]
++    frontier_write_wall_ns: u64,
++    #[cfg(feature = "bench")]
++    frontier_write_cpu_ns: u64,
++}
++
++#[cfg(feature = "bench")]
++struct WalV7DurabilitySampleContext {
++    profile: Arc<crate::mem_table::WriteProfile>,
++    sample_sequence: u64,
++    cycle_started_at: Instant,
++    cycle_thread_cpu_started_ns: u64,
++    coalescing_wall_ns: u64,
++    coalescing_cpu_ns: u64,
++}
++
++#[cfg(feature = "bench")]
++struct WalV7DurabilityPhaseSampleGuard {
++    context: WalV7DurabilitySampleContext,
++    record_on_drop: bool,
++}
++
++#[cfg(feature = "bench")]
++impl WalV7DurabilityPhaseSampleGuard {
++    fn new(context: WalV7DurabilitySampleContext) -> Self {
++        Self {
++            context,
++            record_on_drop: true,
++        }
++    }
++
++    fn context(&self) -> &WalV7DurabilitySampleContext {
++        &self.context
++    }
++
++    fn disarm(mut self) {
++        self.record_on_drop = false;
++    }
++
++    fn record(mut self, observation: crate::mem_table::WalV7DurabilityPhaseObservation) {
++        self.record_on_drop = false;
++        self.context
++            .profile
++            .record_wal_v7_durability_phase(observation);
++    }
++}
++
++#[cfg(feature = "bench")]
++impl Drop for WalV7DurabilityPhaseSampleGuard {
++    fn drop(&mut self) {
++        if self.record_on_drop {
++            self.context.profile.drop_wal_v7_durability_phase_sample();
++        }
++    }
+ }
+ 
+ #[derive(Default)]
+@@ -2737,14 +2791,55 @@ fn run_sync_coordinator(
+         #[cfg(all(test, feature = "chaos-testing"))]
+         crate::chaos::failpoint::before_parallel_wal_result_drain();
+         drain_ready_results(&inner, &completions);
++        #[cfg(feature = "bench")]
++        let mut v7_phase_sample = if v7_layout {
++            inner.sync_progress.profile().and_then(|profile| {
++                let sample_sequence = profile.next_wal_v7_durability_advance_sample_candidate()?;
++                let has_written_prefix = {
++                    let state = inner.durability.state.lock();
++                    state.poison_ticket.is_none() && state.written_frontier > state.durable_frontier
++                };
++                has_written_prefix.then(|| WalV7DurabilitySampleContext {
++                    profile,
++                    sample_sequence,
++                    cycle_started_at: Instant::now(),
++                    cycle_thread_cpu_started_ns: crate::wal::v8::digest::thread_cpu_time_ns(),
++                    coalescing_wall_ns: 0,
++                    coalescing_cpu_ns: 0,
++                })
++            })
++        } else {
++            None
++        };
+         let large_batch_wave = v7_layout
+             && last_sync_latency.is_some_and(|latency| latency >= SYNC_COALESCE_MIN_SYNC)
+             && inner.durability.state.lock().large_batch_wave;
+         let coalesce_wait = sync_coalesce_wait(last_sync_latency, v7_layout, large_batch_wave);
+         if let Some(wait) = coalesce_wait {
++            #[cfg(feature = "bench")]
++            let coalesce_wall_started = v7_phase_sample.as_ref().map(|_| Instant::now());
++            #[cfg(feature = "bench")]
++            let coalesce_cpu_started = v7_phase_sample
++                .as_ref()
++                .map(|_| crate::wal::v8::digest::thread_cpu_time_ns());
+             coalesce_before_capture(&inner, &completions, wait, v7_layout);
++            #[cfg(feature = "bench")]
++            if let Some(sample) = v7_phase_sample.as_mut() {
++                sample.coalescing_wall_ns = coalesce_wall_started
++                    .map(|started| started.elapsed().as_nanos().min(u64::MAX as u128) as u64)
++                    .unwrap_or_default();
++                sample.coalescing_cpu_ns = coalesce_cpu_started
++                    .map(|started| {
++                        crate::wal::v8::digest::thread_cpu_time_ns().saturating_sub(started)
++                    })
++                    .unwrap_or_default();
++            }
+         }
+-        if let Some(latency) = synchronize_written_prefix(&sync_file, &inner)? {
++        #[cfg(feature = "bench")]
++        let sync_latency = synchronize_written_prefix(&sync_file, &inner, v7_phase_sample)?;
++        #[cfg(not(feature = "bench"))]
++        let sync_latency = synchronize_written_prefix(&sync_file, &inner)?;
++        if let Some(latency) = sync_latency {
+             last_sync_latency = Some(latency);
+         }
+     }
+@@ -2752,6 +2847,9 @@ fn run_sync_coordinator(
+     // Both producers have terminated. Freeze the final written prefix and
+     // perform the shutdown sync before allowing the file handles to drop.
+     terminalize_unresolved_prefix(&inner);
++    #[cfg(feature = "bench")]
++    synchronize_written_prefix(&sync_file, &inner, None)?;
++    #[cfg(not(feature = "bench"))]
+     synchronize_written_prefix(&sync_file, &inner)?;
+ 
+     Ok(())
+@@ -3039,7 +3137,11 @@ fn append_v7_frontier(
+     target: u64,
+     durable_ticket: u64,
+     poison_ticket: Option<u64>,
++    sample_frontier_write: bool,
+ ) -> Result<Option<WalV7FrontierCycle>> {
++    #[cfg(not(feature = "bench"))]
++    let _ = sample_frontier_write;
++
+     let mut frontier_reservation = None;
+     let result = (|| -> Result<Option<WalV7FrontierCycle>> {
+         let mut admission = inner.admission.lock();
+@@ -3161,9 +3263,22 @@ fn append_v7_frontier(
+         let profile = inner.sync_progress.profile();
+         #[cfg(feature = "bench")]
+         let frontier_write_started = profile.as_ref().map(|_| Instant::now());
++        #[cfg(feature = "bench")]
++        let phase_frontier_write_started = sample_frontier_write.then(Instant::now);
++        #[cfg(feature = "bench")]
++        let phase_frontier_write_cpu_started =
++            sample_frontier_write.then(crate::wal::v8::digest::thread_cpu_time_ns);
+         write_v7_frontier_once(sync_file, frontier_bytes, reservation.frame_offset())
+             .context("write v7 Parallel FRONTIER")?;
+         #[cfg(feature = "bench")]
++        let phase_frontier_write_wall_ns = phase_frontier_write_started
++            .map(|started| started.elapsed().as_nanos().min(u64::MAX as u128) as u64)
++            .unwrap_or_default();
++        #[cfg(feature = "bench")]
++        let phase_frontier_write_cpu_ns = phase_frontier_write_cpu_started
++            .map(|started| crate::wal::v8::digest::thread_cpu_time_ns().saturating_sub(started))
++            .unwrap_or_default();
++        #[cfg(feature = "bench")]
+         if let (Some(profile), Some(started)) = (profile, frontier_write_started) {
+             profile.record_wal_frontier_write(
+                 WAL_V7_FRAME_LEN as u64,
+@@ -3181,6 +3296,10 @@ fn append_v7_frontier(
+                     .frame_offset(),
+                 frame_digest: frontier_digest,
+             },
++            #[cfg(feature = "bench")]
++            frontier_write_wall_ns: phase_frontier_write_wall_ns,
++            #[cfg(feature = "bench")]
++            frontier_write_cpu_ns: phase_frontier_write_cpu_ns,
+         }))
+     })();
+ 
+@@ -3291,7 +3410,11 @@ fn validate_sync_diagnostics_transition(
+     Ok(())
+ }
+ 
+-fn synchronize_written_prefix(sync_file: &File, inner: &RuntimeInner) -> Result<Option<Duration>> {
++fn synchronize_written_prefix(
++    sync_file: &File,
++    inner: &RuntimeInner,
++    #[cfg(feature = "bench")] sample_context: Option<WalV7DurabilitySampleContext>,
++) -> Result<Option<Duration>> {
+     let (target, durable, poison_ticket) = {
+         let state = inner.durability.state.lock();
+         let target = state
+@@ -3309,12 +3432,37 @@ fn synchronize_written_prefix(sync_file: &File, inner: &RuntimeInner) -> Result<
+         return Ok(None);
+     }
+ 
++    #[cfg(feature = "bench")]
++    let mut phase_sample = sample_context.map(WalV7DurabilityPhaseSampleGuard::new);
++
++    #[cfg(feature = "bench")]
++    let frontier_prepare_started = phase_sample.as_ref().map(|_| Instant::now());
++    #[cfg(feature = "bench")]
++    let frontier_prepare_cpu_started = phase_sample
++        .as_ref()
++        .map(|_| crate::wal::v8::digest::thread_cpu_time_ns());
++
+     let frontier_cycle = if inner.admission.lock().v7_allocator.is_some() {
+-        let cycle = append_v7_frontier(sync_file, inner, target, durable, poison_ticket)?;
++        let cycle = append_v7_frontier(
++            sync_file,
++            inner,
++            target,
++            durable,
++            poison_ticket,
++            #[cfg(feature = "bench")]
++            phase_sample.is_some(),
++            #[cfg(not(feature = "bench"))]
++            false,
++        )?;
+         if cycle.is_none() {
+             // Retaining the preceding marker includes later DATA. Completion
+             // of those already admitted tickets will make a larger target
+             // eligible; no marker slot or sync is consumed while waiting.
++            #[cfg(feature = "bench")]
++            if let Some(sample) = phase_sample.take() {
++                sample.disarm();
++            }
++
+             return Ok(None);
+         }
+         cycle
+@@ -3322,6 +3470,28 @@ fn synchronize_written_prefix(sync_file: &File, inner: &RuntimeInner) -> Result<
+         None
+     };
+ 
++    #[cfg(feature = "bench")]
++    let frontier_cycle_ticket_end = frontier_cycle
++        .as_ref()
++        .map(|cycle| cycle.reservation.ticket_end());
++
++    #[cfg(feature = "bench")]
++    let frontier_prepare_wall_ns = frontier_prepare_started
++        .map(|started| started.elapsed().as_nanos().min(u64::MAX as u128) as u64)
++        .unwrap_or_default();
++    #[cfg(feature = "bench")]
++    let frontier_prepare_cpu_ns = frontier_prepare_cpu_started
++        .map(|started| crate::wal::v8::digest::thread_cpu_time_ns().saturating_sub(started))
++        .unwrap_or_default();
++    #[cfg(feature = "bench")]
++    let frontier_write_wall_ns = frontier_cycle
++        .as_ref()
++        .map_or(0, |cycle| cycle.frontier_write_wall_ns);
++    #[cfg(feature = "bench")]
++    let frontier_write_cpu_ns = frontier_cycle
++        .as_ref()
++        .map_or(0, |cycle| cycle.frontier_write_cpu_ns);
++
+     #[cfg(feature = "chaos-testing")]
+     crate::chaos::failpoint::wal_crash_point("parallel_wal.before_fdatasync");
+     #[cfg(all(test, feature = "chaos-testing"))]
+@@ -3330,6 +3500,10 @@ fn synchronize_written_prefix(sync_file: &File, inner: &RuntimeInner) -> Result<
+     inner.sync_progress.start_sync_activity();
+     let started_at = Instant::now();
+     #[cfg(feature = "bench")]
++    let phase_sync_cpu_started = phase_sample
++        .as_ref()
++        .map(|_| crate::wal::v8::digest::thread_cpu_time_ns());
++    #[cfg(feature = "bench")]
+     let syscall_started_at = Some(started_at);
+     #[cfg(not(feature = "bench"))]
+     let syscall_started_at = None;
+@@ -3345,6 +3519,12 @@ fn synchronize_written_prefix(sync_file: &File, inner: &RuntimeInner) -> Result<
+         break (None, call_finished_at);
+     };
+     let sync_latency = started_at.elapsed();
++    #[cfg(feature = "bench")]
++    let phase_fdatasync_wall_ns = started_at.elapsed().as_nanos().min(u64::MAX as u128) as u64;
++    #[cfg(feature = "bench")]
++    let phase_fdatasync_cpu_ns = phase_sync_cpu_started
++        .map(|started| crate::wal::v8::digest::thread_cpu_time_ns().saturating_sub(started))
++        .unwrap_or_default();
+     let (_sync_end, finished_at) = inner
+         .sync_progress
+         .finish_sync(syscall_started_at, syscall_finished_at);
+@@ -3388,6 +3568,12 @@ fn synchronize_written_prefix(sync_file: &File, inner: &RuntimeInner) -> Result<
+         #[cfg(feature = "chaos-testing")]
+         crate::chaos::failpoint::wal_crash_point("parallel_wal.after_fdatasync");
+ 
++        #[cfg(feature = "bench")]
++        let retirement_started = phase_sample.as_ref().map(|_| Instant::now());
++        #[cfg(feature = "bench")]
++        let retirement_cpu_started = phase_sample
++            .as_ref()
++            .map(|_| crate::wal::v8::digest::thread_cpu_time_ns());
+         if let Some(cycle) = frontier_cycle
+             && let Err(error) = complete_v7_frontier_cycle(inner, cycle)
+         {
+@@ -3399,9 +3585,37 @@ fn synchronize_written_prefix(sync_file: &File, inner: &RuntimeInner) -> Result<
+             );
+             return Err(error).context("complete v7 Parallel FRONTIER sync cycle");
+         }
++        #[cfg(feature = "bench")]
++        let retirement_wall_ns = retirement_started
++            .map(|started| started.elapsed().as_nanos().min(u64::MAX as u128) as u64)
++            .unwrap_or_default();
++        #[cfg(feature = "bench")]
++        let retirement_cpu_ns = retirement_cpu_started
++            .map(|started| crate::wal::v8::digest::thread_cpu_time_ns().saturating_sub(started))
++            .unwrap_or_default();
+ 
++        #[cfg(feature = "bench")]
++        let publish_started = phase_sample.as_ref().map(|_| Instant::now());
++        #[cfg(feature = "bench")]
++        let publish_cpu_started = phase_sample
++            .as_ref()
++            .map(|_| crate::wal::v8::digest::thread_cpu_time_ns());
++        #[cfg(feature = "bench")]
++        let publish_lock_wait_started = phase_sample.as_ref().map(|_| Instant::now());
++        #[cfg(feature = "bench")]
++        let publish_lock_wait_cpu_started = phase_sample
++            .as_ref()
++            .map(|_| crate::wal::v8::digest::thread_cpu_time_ns());
+         let mut state = inner.durability.state.lock();
+         #[cfg(feature = "bench")]
++        let publish_lock_wait_wall_ns = publish_lock_wait_started
++            .map(|started| started.elapsed().as_nanos().min(u64::MAX as u128) as u64)
++            .unwrap_or_default();
++        #[cfg(feature = "bench")]
++        let publish_lock_wait_cpu_ns = publish_lock_wait_cpu_started
++            .map(|started| crate::wal::v8::digest::thread_cpu_time_ns().saturating_sub(started))
++            .unwrap_or_default();
++        #[cfg(feature = "bench")]
+         let durable_frontier_start = state.durable_frontier;
+         let acknowledged = state
+             .poison_ticket
+@@ -3420,6 +3634,61 @@ fn synchronize_written_prefix(sync_file: &File, inner: &RuntimeInner) -> Result<
+         drop(state);
+         inner.sync_progress.mark_durable(acknowledged);
+ 
++        #[cfg(feature = "bench")]
++        let v7_completed_sequence = inner
++            .sync_progress
++            .profile()
++            .filter(|profile| profile.wal_v7_durability_sample_every() > 0)
++            .filter(|_| frontier_cycle_ticket_end.is_some())
++            .map(|profile| profile.complete_wal_v7_durability_advance());
++
++        #[cfg(feature = "bench")]
++        if let Some(sample) = phase_sample {
++            let sample_sequence = sample.context().sample_sequence;
++            debug_assert_eq!(v7_completed_sequence, Some(sample_sequence));
++            let frontier_ticket_end = frontier_cycle_ticket_end.unwrap_or(target);
++            let frontier_prepare_wall_ns =
++                frontier_prepare_wall_ns.saturating_sub(frontier_write_wall_ns);
++            let frontier_prepare_cpu_ns =
++                frontier_prepare_cpu_ns.saturating_sub(frontier_write_cpu_ns);
++            let observation = crate::mem_table::WalV7DurabilityPhaseObservation {
++                sample_sequence,
++                ticket_start: durable,
++                ticket_end: frontier_ticket_end,
++                tickets_covered: frontier_ticket_end.saturating_sub(durable),
++                written_prefix_to_durable_wall_ns: sample
++                    .context()
++                    .cycle_started_at
++                    .elapsed()
++                    .as_nanos()
++                    .min(u64::MAX as u128)
++                    as u64,
++                written_prefix_to_durable_cpu_ns: crate::wal::v8::digest::thread_cpu_time_ns()
++                    .saturating_sub(sample.context().cycle_thread_cpu_started_ns),
++                coalescing_wall_ns: sample.context().coalescing_wall_ns,
++                coalescing_cpu_ns: sample.context().coalescing_cpu_ns,
++                frontier_prepare_wall_ns,
++                frontier_prepare_cpu_ns,
++                frontier_write_wall_ns,
++                frontier_write_cpu_ns,
++                fdatasync_wall_ns: phase_fdatasync_wall_ns,
++                fdatasync_cpu_ns: phase_fdatasync_cpu_ns,
++                retirement_wall_ns,
++                retirement_cpu_ns,
++                durable_publish_lock_wait_wall_ns: publish_lock_wait_wall_ns,
++                durable_publish_lock_wait_cpu_ns: publish_lock_wait_cpu_ns,
++                durable_publish_wall_ns: publish_started
++                    .map(|started| started.elapsed().as_nanos().min(u64::MAX as u128) as u64)
++                    .unwrap_or_default(),
++                durable_publish_cpu_ns: publish_cpu_started
++                    .map(|started| {
++                        crate::wal::v8::digest::thread_cpu_time_ns().saturating_sub(started)
++                    })
++                    .unwrap_or_default(),
++            };
++            sample.record(observation);
++        }
++
+         return Ok(Some(sync_latency));
+     };
+ 
