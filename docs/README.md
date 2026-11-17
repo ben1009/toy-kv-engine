@@ -48,6 +48,7 @@ and do not define the current writer selection.
 - [GCP V8 unwritten-extent and JBD2 diagnostic, 2026-11-16](wal/benchmarks/rfc-026-v8-unwritten-extent-jbd2-gcp-20261116.md)
 - [GCP V7/V8 cross-host Point FRONTIER qualification, 2026-11-17](wal/benchmarks/rfc-026-v7-v8-cross-host-point-frontier-gcp-20261117.md)
 - [GCP V7/V8 Point durability attribution, 2026-11-17](wal/benchmarks/rfc-026-v7-v8-point-durability-attribution-gcp-20261117.md)
+- [GCP V8 pre-publish retirement lock-scope A/B, 2026-11-17](wal/benchmarks/rfc-026-v8-retirement-lock-scope-gcp-20261117.md)
 - [GCP V8 durability phase sampling, 2026-11-13](wal/benchmarks/rfc-026-v8-durability-sampling-gcp-20261113.md)
 - [GCP V7/V8 Point MVCC publication and sampler overhead, 2026-11-14](wal/benchmarks/rfc-026-v7-v8-mvcc-publication-gcp-20261114.md)
 - [GCP V7/V8 Point MVCC publication path diagnostics, 2026-11-14](wal/benchmarks/rfc-026-v7-v8-mvcc-publication-paths-gcp-20261114.md)
