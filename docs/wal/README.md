@@ -102,6 +102,7 @@ the retained and rejected experiments.
 - [RFC 026 V7/V8 Point FRONTIER qualification rerun on GCP, 2026-11-17](benchmarks/rfc-026-v7-v8-point-frontier-qualification-gcp-20261117.md)
 - [RFC 026 V7/V8 cross-host Point FRONTIER qualification on GCP, 2026-11-17](benchmarks/rfc-026-v7-v8-cross-host-point-frontier-gcp-20261117.md)
 - [RFC 026 V7/V8 Point durability attribution on GCP, 2026-11-17](benchmarks/rfc-026-v7-v8-point-durability-attribution-gcp-20261117.md)
+- [RFC 026 V7/V8 Point thread-sample reanalysis on GCP, 2026-11-17](benchmarks/rfc-026-v7-v8-point-thread-sample-reanalysis-gcp-20261117.md)
 - [RFC 026 V8 pre-publish retirement lock-scope A/B on GCP, 2026-11-17](benchmarks/rfc-026-v8-retirement-lock-scope-gcp-20261117.md)
 - [RFC 026 V8 Point retirement credit batching A/B on GCP, 2026-11-17](benchmarks/rfc-026-v8-point-retirement-credit-batching-gcp-20261117.md)
 - [RFC 026 V8 Point DATA group join experiment on GCP, 2026-11-17](benchmarks/rfc-026-v8-point-data-group-gcp-20261117.md)
