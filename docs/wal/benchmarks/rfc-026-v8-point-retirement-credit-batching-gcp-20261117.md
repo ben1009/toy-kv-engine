@@ -58,11 +58,9 @@ The Batch16 and Batch64 runs used `wal_batch_concurrent`. All four diagnostics r
 
 These guardrails show that the Batch path did not activate the Point-specific release operation; they are not a full mixed-load or production qualification.
 
-## Result verification and artifacts
+## Result verification
 
-The corrected suite reports `complete: true`, with 16 planned and 16 completed runs. `remote-exit.json` reports `failed: false` and 16 started runs. Every planned run has a successful `result.json` and matching `run-metadata.json` in its run directory. The earlier Batch attempt used the Point workload selector by mistake; it was excluded from the result summary and retained in the archive for audit. The corrected Batch guardrails use `wal_batch_concurrent`.
-
-The sanitized compact result archive and checksum are included at [the benchmark artifact](artifacts/rfc-026-v8-point-retirement-credit-batching-gcp-20261117.tar.gz) and [its SHA-256 sidecar](artifacts/rfc-026-v8-point-retirement-credit-batching-gcp-20261117.tar.gz.sha256). Archive SHA-256: `f46790905208ac4f0600f958950b700ad99c7616dccdc24bdab2a400fb5288f3`. The archive contains both the excluded initial attempt and corrected run set; the corrected suite is under `results/retirement-batch-20261117-corrected/`.
+The corrected suite reports `complete: true`, with 16 planned and 16 completed runs. `remote-exit.json` reports `failed: false` and 16 started runs. Every planned run has a successful `result.json` and matching `run-metadata.json` in its run directory. The earlier Batch attempt used the Point workload selector by mistake and was excluded from the reported results. The corrected Batch guardrails use `wal_batch_concurrent`.
 
 ## Conclusion
 
