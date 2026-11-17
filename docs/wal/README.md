@@ -99,6 +99,7 @@ the retained and rejected experiments.
 - [RFC 026 V8 Point-only Lookahead comparison on GCP, 2026-11-17](benchmarks/rfc-026-v8-point-only-lookahead-gcp-20261117.md)
 - [RFC 026 V8 Point FRONTIER coalescing comparison on GCP, 2026-11-17](benchmarks/rfc-026-v8-frontier-coalescing-gcp-20261117.md)
 - [RFC 026 V8 Point Lookahead Buffered vs Direct FRONTIER on GCP, 2026-11-17](benchmarks/rfc-026-v8-lookahead-frontier-mode-gcp-20261117.md)
+- [RFC 026 V7/V8 Point FRONTIER qualification rerun on GCP, 2026-11-17](benchmarks/rfc-026-v7-v8-point-frontier-qualification-gcp-20261117.md)
 - [RFC 026 V8 Point DATA group join experiment on GCP, 2026-11-17](benchmarks/rfc-026-v8-point-data-group-gcp-20261117.md)
 - [RFC 026 V8 batched durable-guard check GCP A/B, 2026-11-15](benchmarks/rfc-026-v8-durable-guard-check-gcp-20261115.md)
 - [RFC 026 full WAL matrix rerun on GCP, 2026-11-15](benchmarks/rfc-026-v8-durable-guard-full-matrix-gcp-20261115.md)
