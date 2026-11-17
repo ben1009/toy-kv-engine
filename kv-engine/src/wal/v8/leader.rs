@@ -4662,6 +4662,10 @@ impl WalV8ParallelWriter {
         if self.reservation_owner.is_none() {
             return Ok(WalV8RetirementObservation::default());
         }
+        let expected = usize::try_from(ticket_end - first_ticket)?;
+        // Allocate before locking the map. The durable prefix is bounded by
+        // the coordinator's in-flight window, so this buffer remains small.
+        let mut retired = Vec::with_capacity(expected);
         #[cfg(feature = "bench")]
         let lock_wait_started = sample.then(Instant::now);
         #[cfg(feature = "bench")]
@@ -4681,58 +4685,34 @@ impl WalV8ParallelWriter {
         let lock_hold_cpu_started = sample.then(digest::thread_cpu_time_ns);
         #[cfg(feature = "bench")]
         let collect_started = sample.then(digest::thread_cpu_time_ns);
-        let tickets: Vec<u64> = resources
-            .range(first_ticket..ticket_end)
-            .map(|(&t, _)| t)
-            .collect();
+        let found = resources.range(first_ticket..ticket_end).count();
         #[cfg(feature = "bench")]
         let collect_cpu_ns = collect_started
             .map(|t| digest::thread_cpu_time_ns().saturating_sub(t))
             .unwrap_or_default();
         #[cfg(feature = "bench")]
         let (mut remove_cpu_ns, mut release_cpu_ns, mut finish_cpu_ns) = (0u64, 0u64, 0u64);
-        let expected = usize::try_from(ticket_end - first_ticket)?;
         ensure!(
-            tickets.len() == expected,
+            found == expected,
             "v8 Parallel durable prefix is missing resource reservations"
         );
-        for (index, ticket) in tickets.into_iter().enumerate() {
+        for ticket in first_ticket..ticket_end {
             #[cfg(feature = "bench")]
             let step_started = sample.then(digest::thread_cpu_time_ns);
-            let mut reservation = resources
-                .remove(&ticket)
-                .context("v8 Parallel resource reservation disappeared")?;
+            let Some(reservation) = resources.remove(&ticket) else {
+                // `found == expected` under the same lock guarantees this
+                // cannot happen. Restore defensively if the map invariant is
+                // ever changed so the failure path retains all prior entries.
+                for (retired_ticket, reservation) in retired.drain(..) {
+                    let previous = resources.insert(retired_ticket, reservation);
+                    debug_assert!(previous.is_none());
+                }
+                anyhow::bail!("v8 Parallel resource reservation disappeared");
+            };
+            retired.push((ticket, reservation));
             #[cfg(feature = "bench")]
             {
                 remove_cpu_ns = remove_cpu_ns.saturating_add(
-                    step_started
-                        .map(|t| digest::thread_cpu_time_ns().saturating_sub(t))
-                        .unwrap_or_default(),
-                );
-            }
-            if index > 0 {
-                #[cfg(feature = "bench")]
-                let step_started = sample.then(digest::thread_cpu_time_ns);
-                reservation
-                    .release_unused_frontier_credit()
-                    .context("release coalesced v8 FRONTIER reservation")?;
-                #[cfg(feature = "bench")]
-                {
-                    release_cpu_ns = release_cpu_ns.saturating_add(
-                        step_started
-                            .map(|t| digest::thread_cpu_time_ns().saturating_sub(t))
-                            .unwrap_or_default(),
-                    );
-                }
-            }
-            #[cfg(feature = "bench")]
-            let step_started = sample.then(digest::thread_cpu_time_ns);
-            reservation
-                .finish_after_io()
-                .context("retire durable v8 batch resources")?;
-            #[cfg(feature = "bench")]
-            {
-                finish_cpu_ns = finish_cpu_ns.saturating_add(
                     step_started
                         .map(|t| digest::thread_cpu_time_ns().saturating_sub(t))
                         .unwrap_or_default(),
@@ -4749,6 +4729,49 @@ impl WalV8ParallelWriter {
             .map(|started| digest::thread_cpu_time_ns().saturating_sub(started))
             .unwrap_or_default();
         drop(resources);
+
+        // Quota-ledger updates and operation retirement do not need the map
+        // lock. Complete them before publishing the durable prefix, preserving
+        // the existing durability and resource-accounting order.
+        let mut pending = retired.into_iter();
+        for index in 0..expected {
+            let next = pending.next();
+            let Some((_, mut reservation)) = next else {
+                self.restore_frontier_resources(pending)?;
+                anyhow::bail!("v8 Parallel extracted resource reservation disappeared");
+            };
+            if index > 0 {
+                #[cfg(feature = "bench")]
+                let step_started = sample.then(digest::thread_cpu_time_ns);
+                if let Err(error) = reservation.release_unused_frontier_credit() {
+                    drop(reservation);
+                    self.restore_frontier_resources(pending)?;
+                    return Err(error).context("release coalesced v8 FRONTIER reservation");
+                }
+                #[cfg(feature = "bench")]
+                {
+                    release_cpu_ns = release_cpu_ns.saturating_add(
+                        step_started
+                            .map(|t| digest::thread_cpu_time_ns().saturating_sub(t))
+                            .unwrap_or_default(),
+                    );
+                }
+            }
+            #[cfg(feature = "bench")]
+            let step_started = sample.then(digest::thread_cpu_time_ns);
+            if let Err(error) = reservation.finish_after_io() {
+                self.restore_frontier_resources(pending)?;
+                return Err(error).context("retire durable v8 batch resources");
+            }
+            #[cfg(feature = "bench")]
+            {
+                finish_cpu_ns = finish_cpu_ns.saturating_add(
+                    step_started
+                        .map(|t| digest::thread_cpu_time_ns().saturating_sub(t))
+                        .unwrap_or_default(),
+                );
+            }
+        }
 
         #[allow(unused_mut)]
         let mut observation = WalV8RetirementObservation::default();
@@ -4772,6 +4795,26 @@ impl WalV8ParallelWriter {
         }
 
         Ok(observation)
+    }
+
+    fn restore_frontier_resources(
+        &self,
+        reservations: impl Iterator<Item = (u64, WalV7OwnedBatchReservation)>,
+    ) -> Result<()> {
+        let mut resources = self.frontier_resources.lock();
+        for (ticket, reservation) in reservations {
+            match resources.entry(ticket) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(reservation);
+                }
+                std::collections::btree_map::Entry::Occupied(_) => {
+                    anyhow::bail!(
+                        "v8 Parallel resource reservation was replaced while restoring retirement"
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     fn retire_frontier_guards(
