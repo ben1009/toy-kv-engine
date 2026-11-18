@@ -67,11 +67,12 @@ its elected writer, rather than described as a dedicated thread.
 ## GCP status at initial reanalysis, 2026-11-17
 
 The profile archive is locally verified and complete. A read-only inventory
-check found the retained VM still running at 2026-11-17 16:49 UTC, about 66
-minutes after its recorded creation and beyond the configured 60-minute
-maximum runtime. No additional benchmark was started, and no cloud resource
-had been deleted at the time of that check. The later inventory is recorded
-below.
+check found the VM for the earlier point-lifecycle profile
+(`walbench-261117-154251-67c54379`) still running at 2026-11-17 16:49 UTC,
+about 66 minutes after its recorded creation and beyond the configured
+60-minute maximum runtime. No additional benchmark was started, and no cloud
+resource had been deleted at the time of that check. The later inventory is
+recorded below.
 
 ## Follow-up symbol-recovery check, 2026-11-18
 
@@ -85,11 +86,12 @@ shows the generic `RawMutex::lock_slow` symbol and futex-side frames, but not
 which Rust call sites acquired the mutex.
 
 The matching build ID was absent from the local perf build-ID/debug caches and
-from 149 `write-perf*` executables in the repository's target tree. The original
-profile VM is now absent; a read-only Compute inventory found no matching
-standalone disk or snapshot from which to recover its binary. The
-profile-specific SSH firewall rule was removed after confirming that no VM
-used its unique target tag. The shared network and subnet were left intact.
+from 149 `write-perf*` executables in the repository's target tree. The earlier
+profile VM, `walbench-261117-154251-67c54379`, is now absent; a read-only
+Compute inventory found no matching standalone disk or snapshot from which to
+recover its binary. The profile-specific SSH firewall rule was removed after
+confirming that no VM used its unique target tag. The shared network and
+subnet were left intact.
 
 Consequently, caller-level attribution cannot be recovered from the retained
 local artifacts. The lock percentages remain unattributed and must not be
@@ -100,8 +102,11 @@ made for this follow-up.
 
 ## GCP symbol-recovery retest, 2026-11-18
 
-The retained GCP VM was reused; no VM was created. The first runner attempt
-exited during SSH startup, so I resumed the runner on that same VM. The main
+This retest used a different, already-retained VM,
+`walbench-261117-235109-96d21834`; it did not reuse the earlier
+`walbench-261117-154251-67c54379` profile VM, and no new VM was provisioned
+for the retest. The first runner attempt exited during SSH startup, so I
+resumed the runner on the same retest VM. The main
 `v8-small-ticket-profile` suite then completed and was verified: 8/8 planned
 runs, 8/8 matching result/metadata pairs, 2/2 requested perf captures, and
 `remote-exit.json` reported `failed: false` with eight runs started. The
@@ -172,3 +177,27 @@ DWARF-enabled captures still did not unwind the application caller above
 generic lock slow-path samples, but mutex ownership remains unresolved. A future
 capture needs a callchain method that successfully preserves caller frames or
 targeted per-lock wait/hold counters before selecting an optimization.
+
+## Existing coordinator-lock wait samples
+
+The earlier 1/4/8/16-writer durability-sampling run already records
+`coordinator_lock_wait_ns` and `coordinator_lock_wait_cpu_ns` around the state
+mutex acquisition in `acquire_durability_driver()`. Reanalysis of its verified
+rerun (`rerun-counter-fix-v2`) gives the following follower-observation
+samples; the single-writer run had no follower samples:
+
+| Writers | Samples | Coordinator lock wait wall p50 / p95 / max | Thread CPU p50 / p95 / max |
+| ---: | ---: | ---: | ---: |
+| 4 | 1,171 | 0.477 / 1.207 / 9.046 μs | 0.334 / 0.915 / 5.631 μs |
+| 8 | 1,368 | 0.471 / 1.593 / 34.012 μs | 0.338 / 1.338 / 7.703 μs |
+| 16 | 1,465 | 0.477 / 1.234 / 32.888 μs | 0.346 / 1.040 / 12.536 μs |
+
+Typical coordinator-state mutex acquisition remained short from 8 to 16
+writers in that diagnostic configuration. This lowers the priority of that
+specific mutex as the main scaling bottleneck, but does not explain the generic
+`RawMutex::lock_slow` profile samples: those can come from other mutexes, and
+the recorded maximums are isolated tail observations. These counters are from
+the earlier Direct FRONTIER / fixed 400 μs / 4 MiB Sliding Fallocate run, not
+the newer Point Lookahead / Direct FRONTIER / dynamic-coalescing profile. They
+also have no matched V7 lock-wait measurement. They should therefore guide the
+next diagnostic, not be treated as a V7/V8 lock-contention comparison.
