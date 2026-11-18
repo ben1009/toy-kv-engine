@@ -6911,7 +6911,7 @@ mod tests {
         let path = directory.path().join("active-direct-point-v8.wal");
         let header = header();
         let installed = install_empty(&path, header)?;
-        let mut writer = open_writer(&path, &installed)?.into_parallel()?;
+        let writer = open_writer(&path, &installed)?.into_parallel()?;
         let input = batch(10);
         let prepared = writer.preflight_batch_with_write_class(
             &input,
@@ -6942,7 +6942,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_point_frame_completes_out_of_order_ticket_before_frontier_sync() -> Result<()> {
+    fn direct_point_frame_digest_is_ready_before_head_data_submission() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("active-direct-point-ooo-v8.wal");
         let header = header();
@@ -6986,24 +6986,40 @@ mod tests {
                 second_writer.wait_durable(second_ticket)
             });
 
-            let deadline = Instant::now() + Duration::from_secs(2);
-            loop {
-                let admitted = writer.coordinator.admitted_window();
-                if admitted.len() == 2
-                    && admitted[1].frames_ready
-                    && admitted[1].digest_ready.is_some()
-                    && admitted[1].data_complete
-                {
-                    assert!(!admitted[0].data_complete);
-                    assert_eq!(writer.coordinator.durable_ticket_end(), 0);
-                    break;
+            // Ticket 1 can publish its digest and frame while ticket 0's
+            // producer is paused, but the submission worker cannot complete
+            // ticket 1's DATA write until the missing head frame is submitted.
+            // Keep this wait result separate so the head producer is always
+            // released before propagating a timeout or assertion failure.
+            let readiness_result = (|| -> Result<()> {
+                let deadline = Instant::now() + Duration::from_secs(2);
+                loop {
+                    let admitted = writer.coordinator.admitted_window();
+                    if admitted.len() == 2
+                        && admitted[1].frames_ready
+                        && admitted[1].digest_ready.is_some()
+                    {
+                        ensure!(
+                            !admitted[0].frames_ready && !admitted[0].data_complete,
+                            "head DATA producer unexpectedly advanced while paused"
+                        );
+                        ensure!(
+                            !admitted[1].data_complete,
+                            "later DATA completed before the missing head was submitted"
+                        );
+                        ensure!(
+                            writer.coordinator.durable_ticket_end() == 0,
+                            "durable frontier advanced across an incomplete head ticket"
+                        );
+                        return Ok(());
+                    }
+                    ensure!(
+                        Instant::now() < deadline,
+                        "later direct-frame ticket did not publish its digest and frame"
+                    );
+                    thread::yield_now();
                 }
-                ensure!(
-                    Instant::now() < deadline,
-                    "later direct-frame ticket did not complete while the head was blocked"
-                );
-                thread::yield_now();
-            }
+            })();
 
             release_tx
                 .send(())
@@ -7014,6 +7030,7 @@ mod tests {
             let second_result = second_handle
                 .join()
                 .map_err(|_| anyhow::anyhow!("direct-frame producer panicked"))?;
+            readiness_result?;
             first_result?;
             second_result?;
 

@@ -320,8 +320,15 @@ def validate_point_borrowed_input_rows(rows: list[Mapping[str, object]], writers
     """Check every paired run identity, count and successful operation total."""
     schedule = build_point_borrowed_input_schedule(writers)
     expected = {
-        (row["writer"], row["workload"], row["repetition"], row["arm"]): row for row in schedule
+        (
+            int(row["writer"]),
+            str(row["workload"]),
+            int(row["repetition"]),
+            str(row["arm"]),
+        ): int(row["num"])
+        for row in schedule
     }
+    return _validate_rows(rows, expected, ("writer", "workload", "repetition", "arm"))
 
 
 def build_point_direct_frame_schedule(writers: Iterable[int]) -> list[dict[str, object]]:

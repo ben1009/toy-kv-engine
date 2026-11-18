@@ -1062,10 +1062,12 @@ mod tests {
                 WalV8WriteClass::Point,
                 |bytes| Ok(TestPreparationReservation { _bytes: bytes }),
             )?;
-        let publisher = TestPublisher::new(WAL_V8_DATA_START);
+        let mut publisher = TestPublisher::new(WAL_V8_DATA_START);
+        publisher.assignment.commit_ts = batch.commit_ts;
+        publisher.assignment.recorded_at = batch.recorded_at;
         let mut direct_frame = [0_u8; codec::WAL_V8_FRAME_LEN];
         let mut encoded = prepared
-            .admit(&publisher)?
+            .admit_with_metadata(batch.commit_ts, batch.recorded_at, &publisher)?
             .encode_point_single_frame_logical_into(&mut direct_frame)?;
         let mut undersized_frame = vec![0_u8; codec::WAL_V8_FRAME_LEN - 1];
 
@@ -1132,10 +1134,12 @@ mod tests {
             )?;
         assert_eq!(exact_prepared.logical_batch_bytes(), capacity);
         assert_eq!(exact_prepared.fragment_count(), 1);
-        let publisher = TestPublisher::new(WAL_V8_DATA_START);
+        let mut publisher = TestPublisher::new(WAL_V8_DATA_START);
+        publisher.assignment.commit_ts = exact.commit_ts;
+        publisher.assignment.recorded_at = exact.recorded_at;
         assert!(
             exact_prepared
-                .admit(&publisher)?
+                .admit_with_metadata(exact.commit_ts, exact.recorded_at, &publisher)?
                 .can_encode_point_single_frame()
         );
 
@@ -1149,10 +1153,12 @@ mod tests {
             )?;
         assert_eq!(over_prepared.logical_batch_bytes(), capacity + 1);
         assert_eq!(over_prepared.fragment_count(), 2);
-        let publisher = TestPublisher::new(WAL_V8_DATA_START);
+        let mut publisher = TestPublisher::new(WAL_V8_DATA_START);
+        publisher.assignment.commit_ts = over.commit_ts;
+        publisher.assignment.recorded_at = over.recorded_at;
         assert!(
             !over_prepared
-                .admit(&publisher)?
+                .admit_with_metadata(over.commit_ts, over.recorded_at, &publisher)?
                 .can_encode_point_single_frame()
         );
 
