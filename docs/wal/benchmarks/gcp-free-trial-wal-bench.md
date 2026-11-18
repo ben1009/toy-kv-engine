@@ -178,8 +178,11 @@ python3 scripts/gcp-free-trial-wal-bench.py \
 After confirming the Free Trial status in Billing Overview and choosing your
 current public IPv4 CIDR, run the benchmark. `--ssh-source-range auto` resolves
 the current public IPv4 as a `/32` through `https://api.ipify.org`; this sends
-the caller's public IP to that lookup service. Use an explicit CIDR instead if
-that lookup is not permitted or available:
+the caller's public IP to that lookup service. The HTTPS lookup and SSH
+connection must use the same public IPv4 egress address. If they use different
+routes (for example, HTTPS goes through a proxy while SSH connects directly),
+pass the SSH client's egress CIDR explicitly instead of using `auto`. Use an
+explicit CIDR if the lookup is not permitted or available:
 
 ```bash
 python3 scripts/gcp-free-trial-wal-bench.py \

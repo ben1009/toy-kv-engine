@@ -42,23 +42,29 @@ enum VersionedWalFrameJob<'a> {
 
 #[cfg(feature = "bench")]
 struct WalCpuPhaseTimer {
-    wall_started: std::time::Instant,
-    cpu_started: u64,
+    started: Option<(std::time::Instant, u64)>,
 }
 
 #[cfg(feature = "bench")]
 impl WalCpuPhaseTimer {
-    fn start() -> Self {
+    fn start(enabled: bool) -> Self {
         Self {
-            wall_started: std::time::Instant::now(),
-            cpu_started: crate::wal::v8::digest::thread_cpu_time_ns(),
+            started: enabled.then(|| {
+                (
+                    std::time::Instant::now(),
+                    crate::wal::v8::digest::thread_cpu_time_ns(),
+                )
+            }),
         }
     }
 
     fn finish(self) -> (u64, u64) {
+        let Some((wall_started, cpu_started)) = self.started else {
+            return (0, 0);
+        };
         (
-            self.wall_started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
-            crate::wal::v8::digest::thread_cpu_time_ns().saturating_sub(self.cpu_started),
+            wall_started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+            crate::wal::v8::digest::thread_cpu_time_ns().saturating_sub(cpu_started),
         )
     }
 }
@@ -1319,7 +1325,7 @@ impl LsmMvccInner {
         #[cfg(feature = "bench")]
         let mut cpu_attribution = profile.begin_wal_cpu_attribution_sample(8, 1);
         #[cfg(feature = "bench")]
-        let phase_timer = WalCpuPhaseTimer::start();
+        let phase_timer = WalCpuPhaseTimer::start(cpu_attribution.is_some());
         let mut prefixed = Vec::with_capacity(1 + value.len());
         prefixed.push(crate::vlog::KvKind::Inline as u8);
         prefixed.extend_from_slice(value);
@@ -1339,7 +1345,7 @@ impl LsmMvccInner {
         }
 
         #[cfg(feature = "bench")]
-        let phase_timer = WalCpuPhaseTimer::start();
+        let phase_timer = WalCpuPhaseTimer::start(cpu_attribution.is_some());
         let prepared_result = memtable.prepare_v8_pitr_wal_batch_with_write_class(
             &batch,
             crate::pitr::LIVE_WAL_V5_LIMITS,
@@ -1354,7 +1360,7 @@ impl LsmMvccInner {
         let prepared = prepared_result?;
 
         #[cfg(feature = "bench")]
-        let phase_timer = WalCpuPhaseTimer::start();
+        let phase_timer = WalCpuPhaseTimer::start(cpu_attribution.is_some());
         let write_guard = self.write_lock.lock();
         #[cfg(feature = "bench")]
         if let Some(sample) = cpu_attribution.as_mut() {
@@ -1364,7 +1370,7 @@ impl LsmMvccInner {
         }
 
         #[cfg(feature = "bench")]
-        let phase_timer = WalCpuPhaseTimer::start();
+        let phase_timer = WalCpuPhaseTimer::start(cpu_attribution.is_some());
         let commit_ts = self.reserve_commit_ts()?;
         #[cfg(feature = "bench")]
         if let Some(sample) = cpu_attribution.as_mut() {
@@ -1385,7 +1391,7 @@ impl LsmMvccInner {
         }
 
         #[cfg(feature = "bench")]
-        let phase_timer = WalCpuPhaseTimer::start();
+        let phase_timer = WalCpuPhaseTimer::start(cpu_attribution.is_some());
         let admission_result =
             memtable.admit_prepared_v8_pitr_wal_batch_only(prepared, commit_ts, recorded_at);
         #[cfg(feature = "bench")]
@@ -1408,7 +1414,7 @@ impl LsmMvccInner {
         drop(write_guard);
         if let Some(frame_job) = frame_job {
             #[cfg(feature = "bench")]
-            let phase_timer = WalCpuPhaseTimer::start();
+            let phase_timer = WalCpuPhaseTimer::start(cpu_attribution.is_some());
             #[cfg(feature = "bench")]
             let finish_result =
                 self.finish_v8_frame_job(memtable, commit_ts, frame_job, cpu_attribution.is_some());
@@ -1460,7 +1466,7 @@ impl LsmMvccInner {
         #[cfg(feature = "bench")]
         let mut cpu_attribution = profile.begin_wal_cpu_attribution_sample(7, 1);
         #[cfg(feature = "bench")]
-        let phase_timer = WalCpuPhaseTimer::start();
+        let phase_timer = WalCpuPhaseTimer::start(cpu_attribution.is_some());
         let recorded_at = self.next_pitr_recorded_at(std::time::SystemTime::now())?;
         let mut prefixed = Vec::with_capacity(1 + value.len());
         prefixed.push(crate::vlog::KvKind::Inline as u8);
@@ -1481,7 +1487,7 @@ impl LsmMvccInner {
         }
 
         #[cfg(feature = "bench")]
-        let phase_timer = WalCpuPhaseTimer::start();
+        let phase_timer = WalCpuPhaseTimer::start(cpu_attribution.is_some());
         let prepared_result =
             memtable.prepare_v7_pitr_wal_batch(&batch, crate::pitr::LIVE_WAL_V5_LIMITS);
         #[cfg(feature = "bench")]
@@ -1494,7 +1500,7 @@ impl LsmMvccInner {
         drop(batch);
 
         #[cfg(feature = "bench")]
-        let phase_timer = WalCpuPhaseTimer::start();
+        let phase_timer = WalCpuPhaseTimer::start(cpu_attribution.is_some());
         let _write_guard = self.write_lock.lock();
         #[cfg(feature = "bench")]
         if let Some(sample) = cpu_attribution.as_mut() {
@@ -1504,7 +1510,7 @@ impl LsmMvccInner {
         }
 
         #[cfg(feature = "bench")]
-        let phase_timer = WalCpuPhaseTimer::start();
+        let phase_timer = WalCpuPhaseTimer::start(cpu_attribution.is_some());
         let commit_ts = self.reserve_commit_ts()?;
         #[cfg(feature = "bench")]
         if let Some(sample) = cpu_attribution.as_mut() {
@@ -1524,7 +1530,7 @@ impl LsmMvccInner {
         }
 
         #[cfg(feature = "bench")]
-        let phase_timer = WalCpuPhaseTimer::start();
+        let phase_timer = WalCpuPhaseTimer::start(cpu_attribution.is_some());
         let admission_result =
             memtable.admit_prepared_v7_pitr_wal_batch_only(prepared, commit_ts, recorded_at);
         #[cfg(feature = "bench")]
@@ -1547,7 +1553,7 @@ impl LsmMvccInner {
         if let Some(frame_job) = frame_job {
             drop(_write_guard);
             #[cfg(feature = "bench")]
-            let phase_timer = WalCpuPhaseTimer::start();
+            let phase_timer = WalCpuPhaseTimer::start(cpu_attribution.is_some());
             let finish_result = self.finish_v7_frame_job(memtable, commit_ts, frame_job);
             #[cfg(feature = "bench")]
             if let Some(sample) = cpu_attribution.as_mut() {

@@ -13,7 +13,7 @@ from pathlib import Path
 import shlex
 import subprocess
 import time
-from typing import Any
+from typing import Any, Callable
 
 from gcp_wal_matrix import (
     V8_POINT_CPU_ATTRIBUTION_NUM,
@@ -78,6 +78,11 @@ def _valid_nonnegative_int(value: Any) -> bool:
     return type(value) is int and value >= 0
 
 
+def _extract_v8_digest(result: dict[str, Any]) -> dict[str, Any] | None:
+    digest = result.get("wal_v8_digest")
+    return digest if isinstance(digest, dict) else None
+
+
 def _validate_v8_durability_phase_samples(durability: dict[str, Any]) -> None:
     phases = durability.get("phases")
     if (
@@ -95,6 +100,12 @@ def _validate_v8_durability_phase_samples(durability: dict[str, Any]) -> None:
     # provides it, reject only an explicit failure.
     if any(sample.get("succeeded") is False for sample in phases):
         raise ValueError("V8 durability-driver sample reports a failed advance")
+    if any(
+        not isinstance(sample, dict)
+        or any(not _valid_nonnegative_int(sample.get(field)) for field in V8_DURABILITY_FIELDS)
+        for sample in phases
+    ):
+        raise ValueError("V8 durability-driver phase has a missing or invalid summary field")
 
 
 def _validate_record(record: dict[str, Any], row: dict[str, Any]) -> dict[str, Any]:
@@ -117,10 +128,16 @@ def _validate_record(record: dict[str, Any], row: dict[str, Any]) -> dict[str, A
     attribution = pipeline.get("wal_cpu_attribution")
     if not isinstance(attribution, dict):
         raise ValueError("WAL CPU attribution payload is missing")
-    expected_samples = V8_POINT_CPU_ATTRIBUTION_NUM // V8_POINT_CPU_ATTRIBUTION_SAMPLE_EVERY
+    operations_seen = attribution.get("operations_seen")
+    retry_attempts = (
+        operations_seen - V8_POINT_CPU_ATTRIBUTION_NUM
+        if _valid_nonnegative_int(operations_seen)
+        else -1
+    )
+    expected_samples = operations_seen // V8_POINT_CPU_ATTRIBUTION_SAMPLE_EVERY if retry_attempts >= 0 else -1
     if (
         attribution.get("sample_every") != V8_POINT_CPU_ATTRIBUTION_SAMPLE_EVERY
-        or attribution.get("operations_seen") != V8_POINT_CPU_ATTRIBUTION_NUM
+        or retry_attempts < 0
         or attribution.get("selected_producer_samples") != expected_samples
         or attribution.get("dropped_producer_samples") != 0
         or attribution.get("dropped_thread_samples") != 0
@@ -133,17 +150,28 @@ def _validate_record(record: dict[str, Any], row: dict[str, Any]) -> dict[str, A
         raise ValueError("producer sample count differs from the planned cadence")
     if not isinstance(thread_samples, list) or not thread_samples:
         raise ValueError("thread-role CPU samples are missing")
+    completed_sample_count = 0
     for sample in producer_samples:
+        if not isinstance(sample, dict) or sample.get("wal_version") != version or sample.get("entry_count") != 1:
+            raise ValueError("producer attribution sample is malformed or incomplete")
         if (
-            not isinstance(sample, dict)
-            or sample.get("wal_version") != version
-            or sample.get("entry_count") != 1
-            or sample.get("completed") is not True
-            or not _valid_nonnegative_int(sample.get("ticket"))
-            or not _valid_nonnegative_int(sample.get("commit_ts"))
+            not _valid_nonnegative_int(sample.get("sample_sequence"))
+            or sample["sample_sequence"] % V8_POINT_CPU_ATTRIBUTION_SAMPLE_EVERY != 0
             or any(not _valid_nonnegative_int(sample.get(field)) for field in PRODUCER_PHASE_FIELDS)
         ):
             raise ValueError("producer attribution sample is malformed or incomplete")
+        if sample.get("completed") is True:
+            completed_sample_count += 1
+            if not _valid_nonnegative_int(sample.get("ticket")) or not _valid_nonnegative_int(sample.get("commit_ts")):
+                raise ValueError("completed producer attribution sample is missing its ticket identity")
+        elif sample.get("completed") is False and sample.get("ticket") is None and sample.get("commit_ts") is None:
+            # Admission-barrier retries are rejected before timestamp or ticket assignment.
+            # The successful benchmark run proves the logical operation was retried.
+            continue
+        else:
+            raise ValueError("producer attribution sample is malformed or incomplete")
+    if completed_sample_count < max(0, expected_samples - retry_attempts):
+        raise ValueError("too few completed producer attribution samples after admission retries")
     roles = set()
     for sample in thread_samples:
         if (
@@ -192,9 +220,10 @@ def _validate_record(record: dict[str, Any], row: dict[str, Any]) -> dict[str, A
         "p95_ms": float(record["latency"]["p95_ms"]),
         "p99_ms": float(record["latency"]["p99_ms"]),
         "wal_cpu_attribution_valid": True,
+        "wal_cpu_attribution_retry_attempts": retry_attempts,
         "wal_cpu_attribution": attribution,
         "v8_durability_diagnostics": durability,
-        "v8_digest": record.get("wal_v8_digest"),
+        "v8_digest": _extract_v8_digest(result),
     }
 
 
@@ -219,7 +248,7 @@ def _producer_phase_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
         attribution = row.get("wal_cpu_attribution")
         if not isinstance(attribution, dict):
             continue
-        samples = attribution["producer_samples"]
+        samples = [sample for sample in attribution["producer_samples"] if sample.get("completed") is True]
         summaries[row["arm"]] = {
             field: _distribution([float(sample[field]) for sample in samples])
             for field in PRODUCER_CPU_FIELDS
@@ -296,6 +325,7 @@ def _digest_summary(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
 
 def _run_one(
     *, binary: Path, row: dict[str, Any], results_dir: Path, db_root: Path, safe_deadline_epoch: int,
+    on_launch: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     run_id = _run_id(row)
     run_dir = results_dir / run_id
@@ -315,12 +345,16 @@ def _run_one(
     if int(time.time()) + RUN_TIMEOUT_SECONDS + 330 >= safe_deadline_epoch:
         raise TimeoutError("stopping before the VM safety deadline")
 
+    command = [
+        "timeout", "--signal=INT", "--kill-after=30s", str(RUN_TIMEOUT_SECONDS), "env",
+        *(f"{key}={value}" for key, value in env.items()), *command,
+    ]
     started = time.monotonic()
-    completed = subprocess.run(
-        ["timeout", "--signal=INT", "--kill-after=30s", str(RUN_TIMEOUT_SECONDS), "env",
-         *(f"{key}={value}" for key, value in env.items()), *command],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
-    )
+    with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as process:
+        if on_launch is not None:
+            on_launch()
+        stdout, stderr = process.communicate()
+    completed = subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
     duration = time.monotonic() - started
     (run_dir / "end_utc.txt").write_text(datetime.now(timezone.utc).isoformat() + "\n", encoding="utf-8")
     (run_dir / "result.json").write_text(completed.stdout, encoding="utf-8")
@@ -357,7 +391,7 @@ def _summarize(rows: list[dict[str, Any]], planned: int) -> dict[str, Any]:
                 **{key: run.get(key) for key in (
                     "puts_per_second", "process_cpu_us_per_put", "sync_count", "p50_ms", "p95_ms", "p99_ms",
                 )},
-                "producer_cpu_ns": _producer_phase_summary([run])[arm],
+                "producer_cpu_ns": _producer_phase_summary([run]).get(arm),
                 "thread_roles": _thread_role_summary([run]),
                 "durability_advance_cpu_ns": _durability_summary([run]),
                 "digest_cpu": _digest_summary([run]),
@@ -416,11 +450,14 @@ def run_suite(args: Any) -> int:
     failed = False
     runs_started = 0
     for index, item in enumerate(schedule, start=1):
-        runs_started += 1
+        def record_launch() -> None:
+            nonlocal runs_started
+            runs_started += 1
+
         try:
             row = _run_one(
                 binary=args.binary, row=item, results_dir=args.results_dir, db_root=args.db_root,
-                safe_deadline_epoch=args.safe_deadline_epoch,
+                safe_deadline_epoch=args.safe_deadline_epoch, on_launch=record_launch,
             )
         except (OSError, TimeoutError, subprocess.SubprocessError) as error:
             failed = True

@@ -14,6 +14,7 @@ import binascii
 import csv
 from collections.abc import Callable
 from datetime import datetime, timezone
+import http.client
 import ipaddress
 import json
 import math
@@ -186,12 +187,12 @@ def resolve_ssh_source_range(source_range: str | None) -> str | None:
         with urllib.request.urlopen(request, timeout=10) as response:
             address_text = response.read(128).decode("ascii").strip()
         address = ipaddress.ip_address(address_text)
-    except (OSError, UnicodeError, ValueError) as error:
+    except (OSError, http.client.HTTPException, UnicodeError, ValueError) as error:
         raise BenchError(
             "could not resolve the current public IPv4 address; no cloud resources were created"
         ) from error
 
-    if address.version != 4 or not address.is_global:
+    if address.version != 4 or not address.is_global or address.is_multicast:
         raise BenchError(
             "the public IP lookup did not return a globally routable IPv4 address; no cloud resources were created"
         )

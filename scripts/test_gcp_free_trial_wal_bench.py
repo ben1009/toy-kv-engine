@@ -204,11 +204,21 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
         self.assertEqual(lookup.call_args.kwargs["timeout"], 10)
 
     def test_auto_ssh_source_range_rejects_non_global_or_non_ipv4_response(self) -> None:
-        for response in (b"2001:4860:4860::8888", b"192.168.1.2", b"not-an-ip"):
+        for response in (b"2001:4860:4860::8888", b"192.168.1.2", b"224.0.0.1", b"not-an-ip"):
             with self.subTest(response=response), patch.object(
                 BENCH.urllib.request, "urlopen", return_value=BytesIO(response),
             ), self.assertRaises(BENCH.BenchError):
                 BENCH.resolve_ssh_source_range("auto")
+
+    def test_auto_ssh_source_range_wraps_incomplete_lookup_response(self) -> None:
+        class IncompleteReadResponse(BytesIO):
+            def read(self, _size: int = -1) -> bytes:
+                raise BENCH.http.client.IncompleteRead(b"8.8.")
+
+        with patch.object(
+            BENCH.urllib.request, "urlopen", return_value=IncompleteReadResponse(),
+        ), self.assertRaisesRegex(BENCH.BenchError, "no cloud resources were created"):
+            BENCH.resolve_ssh_source_range("auto")
 
     def test_auto_ssh_source_range_lookup_failure_fails_closed(self) -> None:
         with patch.object(BENCH.urllib.request, "urlopen", side_effect=TimeoutError("lookup timed out")):
@@ -508,23 +518,68 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
         self.assertFalse(validate_v8_point_cpu_attribution_rows(rows[:-1])["complete"])
 
     def test_v8_durability_phase_validation_matches_serialized_schema(self) -> None:
-        # Rust phase records are emitted only for completed advances and do not
-        # serialize a per-record `succeeded` field.
+        # Rust phase records are emitted only after completed advances and use integer timing/count fields.
+        phase = {field: 10 for field in cpu_attribution_runner.V8_DURABILITY_FIELDS}
         diagnostics = {
             "sample_every": V8_POINT_CPU_ATTRIBUTION_SAMPLE_EVERY,
             "sampled_advances": 1,
             "dropped_samples": 0,
-            "phases": [{"sample_id": 64, "advance_sequence": 64}],
+            "phases": [phase],
         }
         _validate_v8_durability_phase_samples(diagnostics)
 
-        diagnostics["phases"][0]["succeeded"] = False
+        diagnostics["phases"] = ["not a phase record"]
+        with self.assertRaisesRegex(ValueError, "missing or incomplete"):
+            _validate_v8_durability_phase_samples(diagnostics)
+
+        diagnostics["phases"] = [{key: value for key, value in phase.items() if key != "driver_cpu_ns"}]
+        with self.assertRaisesRegex(ValueError, "missing or invalid summary field"):
+            _validate_v8_durability_phase_samples(diagnostics)
+
+        diagnostics["phases"] = [{**phase, "driver_cpu_ns": True}]
+        with self.assertRaisesRegex(ValueError, "missing or invalid summary field"):
+            _validate_v8_durability_phase_samples(diagnostics)
+
+        diagnostics["phases"] = [{**phase, "succeeded": False}]
         with self.assertRaisesRegex(ValueError, "reports a failed advance"):
             _validate_v8_durability_phase_samples(diagnostics)
 
-    def test_v8_cpu_attribution_writes_standard_remote_exit_metadata(self) -> None:
-        for failed, expected_started in ((False, 8), (True, 1)):
-            with self.subTest(failed=failed), tempfile.TemporaryDirectory() as temporary:
+    def test_v8_cpu_attribution_failed_launch_writes_partial_summary_and_zero_started(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            results_dir = Path(temporary) / "results"
+            binary = Path(temporary) / "write-perf"
+            binary.write_bytes(b"fake benchmark executable")
+            binary_sha256 = hashlib.sha256(binary.read_bytes()).hexdigest()
+            args = SimpleNamespace(
+                binary=binary,
+                results_dir=results_dir,
+                db_root=Path(temporary) / "databases",
+                safe_deadline_epoch=9_999_999_999,
+                commit="a" * 40,
+                binary_sha256=binary_sha256,
+                machine_type="c4-standard-16-lssd",
+                ssd_count=2,
+                ssd_gib=750,
+            )
+            with patch.object(
+                cpu_attribution_runner,
+                "_run_one",
+                side_effect=TimeoutError("stopping before launch"),
+            ):
+                exit_code = run_cpu_attribution_suite(args)
+
+            summary = json.loads((results_dir / "summary.json").read_text(encoding="utf-8"))
+            remote_exit = json.loads((results_dir / "remote-exit.json").read_text(encoding="utf-8"))
+            self.assertEqual(exit_code, 1)
+            self.assertFalse(summary["complete"])
+            self.assertFalse(summary["results_complete"])
+            self.assertEqual(summary["runs_completed"], 0)
+            self.assertEqual(remote_exit, {"failed": True, "runs_started": 0})
+            self.assertTrue((results_dir / "summary.tsv").is_file())
+
+    def test_v8_cpu_attribution_failed_run_uses_real_summarizer_and_counts_launch(self) -> None:
+        for failed_exit_code in (75, 65):
+            with self.subTest(exit_code=failed_exit_code), tempfile.TemporaryDirectory() as temporary:
                 results_dir = Path(temporary) / "results"
                 binary = Path(temporary) / "write-perf"
                 binary.write_bytes(b"fake benchmark executable")
@@ -540,22 +595,145 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
                     ssd_count=2,
                     ssd_gib=750,
                 )
-                row = {"exit_code": 65 if failed else 0}
-                summary = {"complete": not failed}
-                with (
-                    patch.object(cpu_attribution_runner, "_run_one", return_value=row),
-                    patch.object(cpu_attribution_runner, "_summarize", return_value=summary),
-                ):
+                scheduled = build_v8_point_cpu_attribution_schedule()[0]
+
+                def failed_run(**kwargs):
+                    kwargs["on_launch"]()
+                    return {**kwargs["row"], "exit_code": failed_exit_code}
+
+                with patch.object(cpu_attribution_runner, "_run_one", side_effect=failed_run):
                     exit_code = run_cpu_attribution_suite(args)
 
+                summary = json.loads((results_dir / "summary.json").read_text(encoding="utf-8"))
                 remote_exit = json.loads((results_dir / "remote-exit.json").read_text(encoding="utf-8"))
-                self.assertEqual(exit_code, int(failed))
-                self.assertEqual(remote_exit, {"failed": failed, "runs_started": expected_started})
-                self.assertEqual((results_dir / "commit.txt").read_text(encoding="utf-8"), "a" * 40 + "\n")
-                self.assertEqual(
-                    (results_dir / "write-perf.sha256").read_text(encoding="utf-8"),
-                    binary_sha256 + "\n",
-                )
+                self.assertEqual(exit_code, 1)
+                self.assertFalse(summary["complete"])
+                self.assertFalse(summary["results_complete"])
+                self.assertEqual(summary["runs_completed"], 1)
+                self.assertEqual(summary["results"][0]["arm"], scheduled["arm"])
+                self.assertEqual(summary["results"][0]["exit_code"], failed_exit_code)
+                self.assertEqual(remote_exit, {"failed": True, "runs_started": 1})
+
+    def test_v8_cpu_attribution_success_writes_complete_remote_exit_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            results_dir = Path(temporary) / "results"
+            binary = Path(temporary) / "write-perf"
+            binary.write_bytes(b"fake benchmark executable")
+            binary_sha256 = hashlib.sha256(binary.read_bytes()).hexdigest()
+            args = SimpleNamespace(
+                binary=binary,
+                results_dir=results_dir,
+                db_root=Path(temporary) / "databases",
+                safe_deadline_epoch=9_999_999_999,
+                commit="a" * 40,
+                binary_sha256=binary_sha256,
+                machine_type="c4-standard-16-lssd",
+                ssd_count=2,
+                ssd_gib=750,
+            )
+
+            def successful_run(**kwargs):
+                kwargs["on_launch"]()
+                row = kwargs["row"]
+                return {
+                    **row,
+                    "ops": row["num"],
+                    "exit_code": 0,
+                    "wal_cpu_attribution_valid": True,
+                }
+
+            with patch.object(cpu_attribution_runner, "_run_one", side_effect=successful_run):
+                exit_code = run_cpu_attribution_suite(args)
+
+            summary = json.loads((results_dir / "summary.json").read_text(encoding="utf-8"))
+            remote_exit = json.loads((results_dir / "remote-exit.json").read_text(encoding="utf-8"))
+            planned = len(build_v8_point_cpu_attribution_schedule())
+            self.assertEqual(exit_code, 0)
+            self.assertTrue(summary["complete"])
+            self.assertTrue(summary["results_complete"])
+            self.assertEqual(summary["runs_completed"], planned)
+            self.assertEqual(remote_exit, {"failed": False, "runs_started": planned})
+
+    def test_v8_cpu_attribution_accepts_retried_admission_barrier_sample(self) -> None:
+        sequence = list(range(
+            V8_POINT_CPU_ATTRIBUTION_SAMPLE_EVERY,
+            V8_POINT_CPU_ATTRIBUTION_NUM + 1,
+            V8_POINT_CPU_ATTRIBUTION_SAMPLE_EVERY,
+        ))
+        producer_samples = []
+        for sample_sequence in sequence:
+            sample = {
+                "sample_sequence": sample_sequence,
+                "wal_version": 7,
+                "entry_count": 1,
+                "completed": sample_sequence != sequence[0],
+                **{field: 10 for field in cpu_attribution_runner.PRODUCER_PHASE_FIELDS},
+            }
+            if sample["completed"]:
+                sample.update({"ticket": sample_sequence, "commit_ts": sample_sequence})
+            producer_samples.append(sample)
+
+        record = {
+            "params": {
+                "num": V8_POINT_CPU_ATTRIBUTION_NUM,
+                "threads": 16,
+                "value_size": 1024,
+                "wal_format_version": 7,
+                "wal_io_mode": "parallel",
+            },
+            "result": {
+                "ops": V8_POINT_CPU_ATTRIBUTION_NUM,
+                "ops_per_sec": 20_000,
+                "process_cpu_user_ms": 1_000,
+                "process_cpu_system_ms": 100,
+                "wal_pipeline": {
+                    "sync_count": 1,
+                    "wal_cpu_attribution": {
+                        "sample_every": V8_POINT_CPU_ATTRIBUTION_SAMPLE_EVERY,
+                        "operations_seen": V8_POINT_CPU_ATTRIBUTION_NUM + 1,
+                        "selected_producer_samples": len(producer_samples),
+                        "dropped_producer_samples": 0,
+                        "dropped_thread_samples": 0,
+                        "thread_cpu_time_supported": True,
+                        "producer_samples": producer_samples,
+                        "thread_samples": [
+                            {
+                                "role": role,
+                                "sample_sequence": 64,
+                                "work_items": 1,
+                                "thread_cpu_ns": 10,
+                                "wall_ns": 10,
+                                "completed": True,
+                            }
+                            for role in (
+                                "io_worker_completion_processing",
+                                "v7_durability_coordinator",
+                            )
+                        ],
+                    },
+                },
+            },
+            "latency": {"p50_ms": 1, "p95_ms": 2, "p99_ms": 3},
+        }
+        row = {"writer": 16, "arm": "v7_parallel"}
+
+        validated = cpu_attribution_runner._validate_record(record, row)
+
+        self.assertEqual(validated["wal_cpu_attribution_retry_attempts"], 1)
+        producer_summary = cpu_attribution_runner._producer_phase_summary([{
+            **validated, "arm": "v7_parallel",
+        }])
+        self.assertEqual(
+            producer_summary["v7_parallel"]["producer_total_cpu_ns"]["count"],
+            len(sequence) - 1,
+        )
+
+    def test_v8_cpu_attribution_reads_digest_from_result_object(self) -> None:
+        # The digest is serialized beside wal_pipeline inside result, not at the JSON record root.
+        self.assertEqual(
+            cpu_attribution_runner._extract_v8_digest({"wal_v8_digest": {"payload_hash_cpu_ns": 7}}),
+            {"payload_hash_cpu_ns": 7},
+        )
 
     def test_v8_mutex_diagnostic_schedule_and_validation_are_counterbalanced(self) -> None:
         schedule = build_v8_mutex_diagnostic_schedule()

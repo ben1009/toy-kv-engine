@@ -1896,6 +1896,7 @@ fn wal_pipeline_record(
     completion_timeline_enabled: bool,
     wal_run_info: WalRunInfo,
     wal_io_start: Option<WalIoDiagnosticsRecord>,
+    wal_cpu_attribution_sample_every: Option<u64>,
 ) -> Result<Option<WalPipelineRecord>> {
     if !wal_run_info.runtime_counters_available() {
         return Ok(None);
@@ -1958,22 +1959,20 @@ fn wal_pipeline_record(
                 .collect(),
         }
     });
-    let wal_cpu_attribution = profile
-        .wal_cpu_attribution_sample_every
-        .map(|sample_every| {
-            let (operations_seen, selected_producer_samples, dropped_producer_samples) =
-                engine.wal_cpu_attribution_counts();
-            WalCpuAttributionRunRecord {
-                sample_every,
-                operations_seen,
-                selected_producer_samples,
-                dropped_producer_samples,
-                dropped_thread_samples: engine.wal_cpu_thread_dropped_samples(),
-                thread_cpu_time_supported: cfg!(target_os = "linux"),
-                producer_samples: engine.wal_cpu_attribution_observations(),
-                thread_samples: engine.wal_cpu_thread_observations(),
-            }
-        });
+    let wal_cpu_attribution = wal_cpu_attribution_sample_every.map(|sample_every| {
+        let (operations_seen, selected_producer_samples, dropped_producer_samples) =
+            engine.wal_cpu_attribution_counts();
+        WalCpuAttributionRunRecord {
+            sample_every,
+            operations_seen,
+            selected_producer_samples,
+            dropped_producer_samples,
+            dropped_thread_samples: engine.wal_cpu_thread_dropped_samples(),
+            thread_cpu_time_supported: cfg!(target_os = "linux"),
+            producer_samples: engine.wal_cpu_attribution_observations(),
+            thread_samples: engine.wal_cpu_thread_observations(),
+        }
+    });
     let mvcc_publication_diagnostics = engine
         .mvcc_publication_diagnostics()
         .filter(|diagnostics| diagnostics.sample_every > 0)
@@ -4978,14 +4977,6 @@ fn run_wal_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
         engine.set_wal_v8_completion_timeline_sample_every(
             cfg.wal_completion_timeline.then_some(128),
         )?;
-        engine.set_wal_cpu_attribution_sample_every(cfg.wal_cpu_attribution_sample_every)?;
-        engine.set_wal_v8_durability_sample_every(cfg.wal_v8_durability_sample_every.or_else(
-            || {
-                (wal_run_info.format_version == 8 && wal_run_info.io_mode == "parallel")
-                    .then_some(cfg.wal_cpu_attribution_sample_every)
-                    .flatten()
-            },
-        ))?;
     }
     let value = vec![b'x'; cfg.value_size];
     let num_keys = cfg.num;
@@ -5000,6 +4991,17 @@ fn run_wal_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
         writer_threads,
         num_keys,
     )?;
+    #[cfg(feature = "bench")]
+    {
+        engine.set_wal_cpu_attribution_sample_every(cfg.wal_cpu_attribution_sample_every)?;
+        engine.set_wal_v8_durability_sample_every(cfg.wal_v8_durability_sample_every.or_else(
+            || {
+                (wal_run_info.format_version == 8 && wal_run_info.io_mode == "parallel")
+                    .then_some(cfg.wal_cpu_attribution_sample_every)
+                    .flatten()
+            },
+        ))?;
+    }
     #[cfg(all(feature = "bench", target_os = "linux"))]
     let affinity_enabled = affinity_capture.is_some();
     #[cfg(feature = "bench")]
@@ -5120,6 +5122,7 @@ fn run_wal_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
         cfg.wal_completion_timeline,
         wal_run_info,
         wal_io_start,
+        cfg.wal_cpu_attribution_sample_every,
     )?;
     #[cfg(not(feature = "bench"))]
     let wal_pipeline = None;
@@ -5346,6 +5349,7 @@ fn run_wal_batch_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>
         cfg.wal_completion_timeline,
         wal_run_info,
         wal_io_start,
+        cfg.wal_cpu_attribution_sample_every,
     )?;
     #[cfg(not(feature = "bench"))]
     let wal_pipeline = None;

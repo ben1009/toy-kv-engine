@@ -1239,19 +1239,6 @@ impl WriteProfile {
                     None
                 }
             },
-            wal_cpu_attribution_sample_every: {
-                #[cfg(feature = "bench")]
-                {
-                    match self.wal_cpu_attribution_sample_every.load(o) {
-                        0 => None,
-                        every => Some(every),
-                    }
-                }
-                #[cfg(not(feature = "bench"))]
-                {
-                    None
-                }
-            },
             op_count: self.op_count.load(o),
         }
     }
@@ -2029,7 +2016,6 @@ pub struct WriteProfileSnapshot {
     pub wal_hol_diagnostics_enabled: bool,
     pub wal_v8_completion_timeline_sample_every: Option<u64>,
     pub wal_v8_durability_sample_every: Option<u64>,
-    pub wal_cpu_attribution_sample_every: Option<u64>,
     pub op_count: u64,
 }
 
@@ -2207,7 +2193,6 @@ impl WriteProfileSnapshot {
             wal_hol_diagnostics_enabled: self.wal_hol_diagnostics_enabled,
             wal_v8_completion_timeline_sample_every: self.wal_v8_completion_timeline_sample_every,
             wal_v8_durability_sample_every: self.wal_v8_durability_sample_every,
-            wal_cpu_attribution_sample_every: self.wal_cpu_attribution_sample_every,
             op_count: self.op_count.saturating_sub(before.op_count),
         }
     }
