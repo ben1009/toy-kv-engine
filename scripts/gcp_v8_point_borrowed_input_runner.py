@@ -31,6 +31,16 @@ def _run_id(row: dict[str, Any]) -> str:
     return f"w{row['writer']}-{row['workload']}-r{row['repetition']}-{row['arm']}"
 
 
+def _summary_fields(schedule_row: dict[str, Any]) -> tuple[str, ...]:
+    """Return all planned-run and measured-result columns in stable order."""
+    return (
+        *schedule_row.keys(),
+        "source_commit", "binary_sha256", "exit_code", "ops", "puts_per_second", "cpu_seconds",
+        "cpu_us_per_put", "p50_ms", "p95_ms", "p99_ms", "sync_count", "puts_per_sync",
+        "initialized_bytes", "preparation_wait_ms", "duration_seconds",
+    )
+
+
 def _run_one(
     *, binary: Path, binary_sha256: str, row: dict[str, Any], results_dir: Path,
     db_root: Path, safe_deadline_epoch: int,
@@ -233,10 +243,7 @@ def run_suite(args: argparse.Namespace) -> int:
         writer = csv.DictWriter(stream, fieldnames=schedule[0].keys(), delimiter="\t", lineterminator="\n")
         writer.writeheader()
         writer.writerows({**row, "batch_size": row["batch_size"] or "none"} for row in schedule)
-    fields = (
-        "writer workload repetition arm source_commit binary_sha256 exit_code ops puts_per_second cpu_us_per_put "
-        "p50_ms p95_ms p99_ms sync_count puts_per_sync initialized_bytes preparation_wait_ms duration_seconds"
-    ).split()
+    fields = _summary_fields(schedule[0])
     with (results_dir / "summary.tsv").open("w", encoding="utf-8", newline="") as stream:
         csv.DictWriter(stream, fieldnames=fields, delimiter="\t", lineterminator="\n").writeheader()
 

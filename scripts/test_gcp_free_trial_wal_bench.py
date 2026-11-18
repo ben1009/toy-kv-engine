@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import csv
 import importlib.util
+from io import StringIO
 import json
 import os
 from pathlib import Path
@@ -69,6 +70,7 @@ from gcp_v8_mutex_diagnostic_runner import (
     _build_command as build_mutex_command,
     _validate_record as validate_mutex_record,
 )
+from gcp_v8_point_borrowed_input_runner import _summary_fields
 
 
 SCRIPT = Path(__file__).with_name("gcp-free-trial-wal-bench.py")
@@ -164,6 +166,31 @@ def fake_keygen(command, **_kwargs):
 
 
 class GcpFreeTrialWalBenchTests(unittest.TestCase):
+    def test_point_borrowed_summary_columns_cover_run_metadata(self) -> None:
+        schedule_row = build_point_borrowed_input_schedule((1, 8, 16))[0]
+        metadata = {
+            **schedule_row,
+            "source_commit": "candidate",
+            "binary_sha256": "binary",
+            "exit_code": 0,
+            "ops": 100_000,
+            "puts_per_second": 1.0,
+            "cpu_seconds": 1.0,
+            "cpu_us_per_put": 10.0,
+            "p50_ms": 1.0,
+            "p95_ms": 2.0,
+            "p99_ms": 3.0,
+            "sync_count": 1,
+            "puts_per_sync": 100_000,
+            "initialized_bytes": 0,
+            "preparation_wait_ms": 0.0,
+            "duration_seconds": 1.0,
+        }
+        fields = _summary_fields(schedule_row)
+        self.assertFalse(metadata.keys() - set(fields))
+        writer = csv.DictWriter(StringIO(), fieldnames=fields, delimiter="\t")
+        writer.writerow(metadata)
+
     def _make_result_bundle(
         self, root: Path, *, complete: bool, include_run_metadata: bool = True,
     ) -> Path:
