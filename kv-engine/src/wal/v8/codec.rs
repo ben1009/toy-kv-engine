@@ -610,7 +610,6 @@ pub(crate) fn encode_frontier_successor(
     )
 }
 
-
 /// Finalize a single DATA frame whose logical payload was already encoded
 /// in-place at offset 64+24.  Unlike encode_frame_into this never clears or
 /// copies that payload. The existing structural validation and frame CRC are
@@ -628,7 +627,10 @@ pub(crate) fn finish_preencoded_data_fragment_frame_in_place(
         fragment.fragment_count == 1 && fragment.fragment_index == 0,
         "in-place DATA framing requires a single fragment"
     );
-    ensure!(output.len() == WAL_V8_FRAME_LEN, "invalid in-place DATA frame buffer");
+    ensure!(
+        output.len() == WAL_V8_FRAME_LEN,
+        "invalid in-place DATA frame buffer"
+    );
     validate_frame_offset(frame_offset)?;
     let body_len = WAL_V8_DATA_FRAGMENT_HEADER_LEN
         .checked_add(payload_len)
@@ -637,7 +639,10 @@ pub(crate) fn finish_preencoded_data_fragment_frame_in_place(
     let body_end = WAL_V8_FRAME_HEADER_LEN
         .checked_add(body_len)
         .context("in-place DATA frame body end overflows")?;
-    ensure!(body_end <= output.len(), "in-place DATA payload exceeds frame");
+    ensure!(
+        body_end <= output.len(),
+        "in-place DATA payload exceeds frame"
+    );
 
     // Preserve bytes [88..body_end] written by the logical encoder.
     output[..WAL_V8_FRAME_HEADER_LEN + WAL_V8_DATA_FRAGMENT_HEADER_LEN].fill(0);

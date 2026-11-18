@@ -347,8 +347,7 @@ impl<G: WalV8AdmissionGuard, R> AdmittedWalV8Batch<'_, G, R> {
             frame_buffer_bytes == codec::WAL_V8_FRAME_LEN && output.len() == frame_buffer_bytes,
             "v8 direct Point frame buffer size mismatch"
         );
-        let payload_start =
-            codec::WAL_V8_FRAME_HEADER_LEN + codec::WAL_V8_DATA_FRAGMENT_HEADER_LEN;
+        let payload_start = codec::WAL_V8_FRAME_HEADER_LEN + codec::WAL_V8_DATA_FRAGMENT_HEADER_LEN;
         let payload_end = payload_start
             .checked_add(logical_batch_bytes)
             .context("v8 direct Point payload end overflows")?;
@@ -543,7 +542,10 @@ impl<G: WalV8AdmissionGuard> EncodedWalV8Batch<G> {
     }
 
     pub(crate) fn as_bytes(&self) -> &[u8] {
-        assert!(!self.directly_framed, "direct DATA frame has no separate logical bytes");
+        assert!(
+            !self.directly_framed,
+            "direct DATA frame has no separate logical bytes"
+        );
         &self.logical_batch
     }
 
@@ -601,7 +603,10 @@ impl<G: WalV8AdmissionGuard> EncodedWalV8Batch<G> {
     }
 
     fn encode_data_frames(&self, output: &mut [u8]) -> Result<usize> {
-        ensure!(!self.directly_framed, "direct DATA frame is already materialized");
+        ensure!(
+            !self.directly_framed,
+            "direct DATA frame is already materialized"
+        );
         ensure!(
             output.len() >= self.frame_buffer_bytes,
             "v8 DATA frame output buffer is too small"
@@ -896,37 +901,50 @@ mod tests {
             value[0] = crate::vlog::KvKind::Inline as u8;
             let batch = WalBatch {
                 commit_ts: 17,
-                recorded_at: RecordedAt { secs: 123, nanos: 456 },
+                recorded_at: RecordedAt {
+                    secs: 123,
+                    nanos: 456,
+                },
                 entries: vec![crate::pitr::WalEntry::Put {
                     key: b"point".to_vec(),
                     value,
                 }],
             };
             let limits = crate::pitr::LIVE_WAL_V5_LIMITS;
-            let prepared = PreparedWalV8Batch::<TestPreparationReservation>::preflight_with_write_class(
-                &batch,
-                limits,
-                WalV8WriteClass::Point,
-                |bytes| Ok(TestPreparationReservation { _bytes: bytes }),
-            )?;
-            let publisher = TestPublisher::new(WAL_V8_DATA_START);
+            let prepared =
+                PreparedWalV8Batch::<TestPreparationReservation>::preflight_with_write_class(
+                    &batch,
+                    limits,
+                    WalV8WriteClass::Point,
+                    |bytes| Ok(TestPreparationReservation { _bytes: bytes }),
+                )?;
+            let mut publisher = TestPublisher::new(WAL_V8_DATA_START);
+            publisher.assignment.commit_ts = batch.commit_ts;
+            publisher.assignment.recorded_at = batch.recorded_at;
             let admitted =
                 prepared.admit_with_metadata(batch.commit_ts, batch.recorded_at, &publisher)?;
             assert!(admitted.can_encode_point_single_frame());
             let mut direct_frame = [0xa5_u8; codec::WAL_V8_FRAME_LEN];
             let mut direct = admitted.encode_point_single_frame_into(&mut direct_frame)?;
 
-            let reference = PreparedWalV8Batch::<TestPreparationReservation>::preflight_with_write_class(
-                &batch,
-                limits,
-                WalV8WriteClass::Point,
-                |bytes| Ok(TestPreparationReservation { _bytes: bytes }),
-            )?;
-            let publisher = TestPublisher::new(WAL_V8_DATA_START);
-            let mut normal =
-                reference.admit_with_metadata(batch.commit_ts, batch.recorded_at, &publisher)?.encode()?;
+            let reference =
+                PreparedWalV8Batch::<TestPreparationReservation>::preflight_with_write_class(
+                    &batch,
+                    limits,
+                    WalV8WriteClass::Point,
+                    |bytes| Ok(TestPreparationReservation { _bytes: bytes }),
+                )?;
+            let mut publisher = TestPublisher::new(WAL_V8_DATA_START);
+            publisher.assignment.commit_ts = batch.commit_ts;
+            publisher.assignment.recorded_at = batch.recorded_at;
+            let mut normal = reference
+                .admit_with_metadata(batch.commit_ts, batch.recorded_at, &publisher)?
+                .encode()?;
             let mut expected = vec![0; codec::WAL_V8_FRAME_LEN];
-            assert_eq!(normal.encode_data_frames_into(&mut expected)?, expected.len());
+            assert_eq!(
+                normal.encode_data_frames_into(&mut expected)?,
+                expected.len()
+            );
             assert_eq!(direct_frame.as_slice(), expected.as_slice());
             assert_eq!(direct.digest_ready()?, normal.digest_ready()?);
             assert_eq!(direct.entry_digest(), normal.entry_digest());
@@ -947,14 +965,18 @@ mod tests {
                 value: vec![0x42; 5000],
             }],
         };
-        let prepared = PreparedWalV8Batch::<TestPreparationReservation>::preflight_with_write_class(
-            &batch,
-            crate::pitr::LIVE_WAL_V5_LIMITS,
-            WalV8WriteClass::Point,
-            |bytes| Ok(TestPreparationReservation { _bytes: bytes }),
-        )?;
-        let publisher = TestPublisher::new(WAL_V8_DATA_START);
-        let admitted = prepared.admit_with_metadata(batch.commit_ts, batch.recorded_at, &publisher)?;
+        let prepared =
+            PreparedWalV8Batch::<TestPreparationReservation>::preflight_with_write_class(
+                &batch,
+                crate::pitr::LIVE_WAL_V5_LIMITS,
+                WalV8WriteClass::Point,
+                |bytes| Ok(TestPreparationReservation { _bytes: bytes }),
+            )?;
+        let mut publisher = TestPublisher::new(WAL_V8_DATA_START);
+        publisher.assignment.commit_ts = batch.commit_ts;
+        publisher.assignment.recorded_at = batch.recorded_at;
+        let admitted =
+            prepared.admit_with_metadata(batch.commit_ts, batch.recorded_at, &publisher)?;
         assert!(!admitted.can_encode_point_single_frame());
         let mut encoded = admitted.encode()?;
         encoded.disarm_after_durable();
