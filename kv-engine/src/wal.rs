@@ -198,6 +198,8 @@ pub struct WalV8SlidingExtentPreparationDiagnostics {
     pub extent_policy_entries_scanned: u64,
     pub extent_policy_map_max_entries: u64,
     pub lookahead_worker_cpu_ns: u64,
+    pub extent_policy_storage: &'static str,
+    pub extent_policy_scan_diagnostics_enabled: bool,
 }
 
 /// How the benchmark prepared an Active V8 WAL suffix.

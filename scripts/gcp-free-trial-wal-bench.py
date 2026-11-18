@@ -42,6 +42,8 @@ from gcp_wal_matrix import (
     POINT_BORROWED_INPUT_WRITERS,
     POINT_DIRECT_FRAME_NUM,
     POINT_DIRECT_FRAME_WRITERS,
+    V8_EXTENT_POLICY_STORAGE_NUM,
+    V8_EXTENT_POLICY_STORAGE_WRITERS,
     V8_MUTEX_DIAGNOSTIC_NUM,
     V8_MUTEX_DIAGNOSTIC_SAMPLE_EVERY,
     V8_MUTEX_DIAGNOSTIC_WRITERS,
@@ -55,6 +57,8 @@ from gcp_wal_matrix import (
     build_point_borrowed_input_schedule,
     build_point_direct_frame_plan,
     build_point_direct_frame_schedule,
+    build_v8_extent_policy_storage_plan,
+    build_v8_extent_policy_storage_schedule,
     build_v8_mutex_diagnostic_plan,
     build_v8_mutex_diagnostic_schedule,
     build_rfc026_schedule,
@@ -62,6 +66,7 @@ from gcp_wal_matrix import (
     validate_point_lookahead_rows,
     validate_point_borrowed_input_rows,
     validate_point_direct_frame_rows,
+    validate_v8_extent_policy_storage_rows,
     validate_v8_mutex_diagnostic_rows,
     validate_writer_counts,
 )
@@ -80,6 +85,7 @@ POINT_LOOKAHEAD_RUNNER = Path(__file__).with_name("gcp_v8_point_lookahead_runner
 V8_MUTEX_DIAGNOSTIC_RUNNER = Path(__file__).with_name("gcp_v8_mutex_diagnostic_runner.py")
 POINT_BORROWED_INPUT_RUNNER = Path(__file__).with_name("gcp_v8_point_borrowed_input_runner.py")
 POINT_DIRECT_FRAME_RUNNER = Path(__file__).with_name("gcp_v8_point_direct_frame_runner.py")
+V8_EXTENT_POLICY_STORAGE_RUNNER = Path(__file__).with_name("gcp_v8_extent_policy_storage_runner.py")
 REPO_URL = "https://github.com/ben1009/toy-kv-engine.git"
 MAX_RUNTIME_MINUTES = 180
 MIN_RUNTIME_MINUTES = 60
@@ -102,6 +108,7 @@ root_names = {
     "point-lookahead-schedule.tsv", "v8-mutex-diagnostic-schedule.tsv",
     "point-borrowed-input-schedule.tsv",
     "point-direct-frame-schedule.tsv",
+    "extent-policy-storage-schedule.tsv",
     "commit-order-trace-analysis.json", "commit.txt", "remote-exit.json",
     "finished_utc.txt", "remote-finished-utc.txt", "remote-status.txt", "host.txt",
     "os-release.txt", "uname.txt", "lscpu.txt", "lsblk.txt", "findmnt.txt", "df.txt",
@@ -1081,6 +1088,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                              help="Compare V8 Point owned vs borrowed preparation with Batch16/64 guardrails")
     suite_group.add_argument("--v8-point-direct-frame-ab", action="store_true",
                              help="Compare V8 Point direct-frame encoding with the existing path and Batch guardrails")
+    suite_group.add_argument("--v8-extent-policy-storage-ab", action="store_true",
+                             help="Compare V8 BTreeMap and Vec extent-policy storage with Point/Batch guardrails")
     parser.add_argument("--baseline-commit", help="Full source commit used as the borrowed-input A/B baseline")
     parser.add_argument("--source-patch-sha256",
                         help="SHA-256 of the exact source patch used for a commit-order trace run")
@@ -1106,6 +1115,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     if args.num is None:
         args.num = (
             POINT_DIRECT_FRAME_NUM if args.v8_point_direct_frame_ab else
+            V8_EXTENT_POLICY_STORAGE_NUM if args.v8_extent_policy_storage_ab else
             POINT_BORROWED_INPUT_NUM if args.v8_point_borrowed_input_ab else
             V8_MUTEX_DIAGNOSTIC_NUM if args.v8_mutex_diagnostic else
             COMMIT_ORDER_TRACE_NUM if args.commit_order_trace else 750_000
@@ -1114,6 +1124,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         args.machine_type = "c4-standard-16-lssd" if (
             args.commit_order_trace or args.v8_point_lookahead_ab or args.v8_mutex_diagnostic
             or args.v8_point_borrowed_input_ab or args.v8_point_direct_frame_ab
+            or args.v8_extent_policy_storage_ab
         ) else MACHINE_TYPE
     args.network = args.network or "default"
     if args.writers is None:
@@ -1127,6 +1138,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             args.writers = POINT_BORROWED_INPUT_WRITERS
         elif args.v8_point_direct_frame_ab:
             args.writers = POINT_DIRECT_FRAME_WRITERS
+        elif args.v8_extent_policy_storage_ab:
+            args.writers = V8_EXTENT_POLICY_STORAGE_WRITERS
         elif args.v8_small_ticket_profile:
             args.writers = (1, 8, 16)
         else:
@@ -1153,6 +1166,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error(f"--v8-point-direct-frame-ab requires writers {POINT_DIRECT_FRAME_WRITERS}")
     if args.v8_point_direct_frame_ab and args.machine_type != "c4-standard-16-lssd":
         parser.error("--v8-point-direct-frame-ab requires c4-standard-16-lssd")
+    if args.v8_extent_policy_storage_ab and args.writers != V8_EXTENT_POLICY_STORAGE_WRITERS:
+        parser.error(f"--v8-extent-policy-storage-ab requires writers {V8_EXTENT_POLICY_STORAGE_WRITERS}")
+    if args.v8_extent_policy_storage_ab and args.machine_type != "c4-standard-16-lssd":
+        parser.error("--v8-extent-policy-storage-ab requires c4-standard-16-lssd")
     if not re.fullmatch(r"[0-9a-fA-F]{40}", args.commit):
         parser.error("--commit must be a full 40-character SHA")
     if args.num < 64:
@@ -1163,6 +1180,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error(f"--v8-point-borrowed-input-ab uses a fixed {POINT_BORROWED_INPUT_NUM}-put workload")
     if args.v8_point_direct_frame_ab and args.num != POINT_DIRECT_FRAME_NUM:
         parser.error(f"--v8-point-direct-frame-ab uses a fixed {POINT_DIRECT_FRAME_NUM}-put workload")
+    if args.v8_extent_policy_storage_ab and args.num != V8_EXTENT_POLICY_STORAGE_NUM:
+        parser.error(f"--v8-extent-policy-storage-ab uses a fixed {V8_EXTENT_POLICY_STORAGE_NUM}-put workload")
     if args.v8_mutex_diagnostic and args.num != V8_MUTEX_DIAGNOSTIC_NUM:
         parser.error(f"--v8-mutex-diagnostic uses a fixed {V8_MUTEX_DIAGNOSTIC_NUM}-put workload")
     if args.commit_order_trace and args.num != COMMIT_ORDER_TRACE_NUM:
@@ -1296,6 +1315,10 @@ def _run_identifier(row: dict[str, Any], suite: str) -> str:
         return f"w{row['writer']}-{row['workload']}-{row['phase']}-r{row['repetition']}-{row['arm']}"
     if suite in ("v8-point-lookahead", "v8-point-borrowed-input", "v8-point-direct-frame"):
         return f"w{row['writer']}-{row['workload']}-r{row['repetition']}-{row['arm']}"
+    if suite == "v8-extent-policy-storage":
+        return (
+            f"w{row['writer']}-{row['workload']}-{row['phase']}-r{row['repetition']}-{row['arm']}"
+        )
     if suite == "v8-mutex-diagnostic":
         return f"w{row['writer']}-{row['workload']}-r{row['repetition']}-{row['arm']}"
     raise ValueError(f"unsupported benchmark suite: {suite!r}")
@@ -1315,6 +1338,11 @@ def _summary_row_identifier(row: dict[str, Any], suite: str) -> str:
         )
     if suite in ("v8-point-lookahead", "v8-point-borrowed-input", "v8-point-direct-frame"):
         return f"w{int(row['writer'])}-{row['workload']}-r{int(row['repetition'])}-{row['arm']}"
+    if suite == "v8-extent-policy-storage":
+        return (
+            f"w{int(row['writer'])}-{row['workload']}-{row['phase']}-r{int(row['repetition'])}-"
+            f"{row['arm']}"
+        )
     if suite == "v8-mutex-diagnostic":
         return f"w{int(row['writer'])}-{row['workload']}-r{int(row['repetition'])}-{row['arm']}"
     raise ValueError(f"unsupported benchmark suite: {suite!r}")
@@ -1353,6 +1381,14 @@ def _expected_run_metadata(row: dict[str, Any], suite: str) -> dict[str, Any]:
                 "writer", "workload", "repetition", "arm", "bench", "batch_entries", "batch_size",
                 "num", "sample_every", "extent_mode", "extent_window_bytes", "frontier_mode",
                 "point_direct_frame_enabled",
+            )
+        }
+    if suite == "v8-extent-policy-storage":
+        return {
+            key: row[key] for key in (
+                "writer", "workload", "phase", "repetition", "arm", "bench", "batch_entries",
+                "batch_size", "num", "sample_every", "extent_mode", "extent_window_bytes",
+                "frontier_mode", "scan_diagnostics_enabled",
             )
         }
     if suite == "v8-mutex-diagnostic":
@@ -1490,6 +1526,36 @@ def _verify_result_set(results: Path) -> dict[str, Any]:
                     errors.append("direct-frame summary source metadata is invalid")
                 if summary.get("binary_sha256") != binary_sha:
                     errors.append("direct-frame summary binary checksum does not match the plan")
+            elif suite == "v8-extent-policy-storage":
+                schedule = build_v8_extent_policy_storage_schedule(plan["writers"])
+                try:
+                    recorded_commit = (results / "commit.txt").read_text(encoding="utf-8").strip()
+                    binary_sha = (results / "write-perf.sha256").read_text(encoding="utf-8").strip()
+                except OSError as error:
+                    recorded_commit = binary_sha = ""
+                    errors.append(f"extent-policy source/binary identity is missing: {error}")
+                if not re.fullmatch(r"[0-9a-f]{40}", recorded_commit) or plan.get("commit") != recorded_commit:
+                    errors.append("extent-policy plan source commit does not match commit.txt")
+                if not re.fullmatch(r"[0-9a-f]{64}", binary_sha) or plan.get("binary_sha256") != binary_sha:
+                    errors.append("extent-policy binary checksum does not match the plan")
+                expected_plan = build_v8_extent_policy_storage_plan(
+                    writers=plan.get("writers", ()),
+                    machine_type=plan.get("machine_type", ""),
+                    machine_spec={
+                        "vcpus": plan.get("vcpus", 0),
+                        "ssd_count": plan.get("local_ssd_count", 0),
+                        "ssd_gib": plan.get("local_ssd_total_gib", 0),
+                    },
+                    commit=recorded_commit,
+                    binary_sha256=binary_sha,
+                )
+                for key, value in expected_plan.items():
+                    if plan.get(key) != value:
+                        errors.append(f"extent-policy plan field {key} does not match the fixed suite")
+                if summary.get("suite") != suite or summary.get("source_commit") != recorded_commit:
+                    errors.append("extent-policy summary source metadata is invalid")
+                if summary.get("binary_sha256") != binary_sha:
+                    errors.append("extent-policy summary binary checksum does not match the plan")
             elif suite == "batch64":
                 schedule = build_batch64_schedule(plan["writers"])
             elif suite == "commit-order-trace":
@@ -1909,6 +1975,72 @@ def _verify_result_set(results: Path) -> dict[str, Any]:
                             raise ValueError("summary row differs from direct-frame run metadata")
                     except (KeyError, AttributeError, TypeError, ValueError) as error:
                         errors.append(f"run {run_id} direct-frame result is invalid: {error}")
+                elif suite == "v8-extent-policy-storage" and isinstance(record, dict):
+                    try:
+                        identity = expected[run_id]
+                        result = record["result"]
+                        params = record["params"]
+                        expected_params = {
+                            "num": V8_EXTENT_POLICY_STORAGE_NUM,
+                            "threads": identity["writer"],
+                            "value_size": 1024,
+                            "batch_size": identity["batch_size"],
+                            "wal_format_version": 8,
+                            "wal_io_mode": "parallel",
+                        }
+                        if int(result["ops"]) != V8_EXTENT_POLICY_STORAGE_NUM or any(
+                            params.get(key) != value for key, value in expected_params.items()
+                        ):
+                            raise ValueError("benchmark parameters do not match the extent-policy plan")
+                        if metadata.get("source_commit") != plan.get("commit") or (
+                            metadata.get("binary_sha256") != plan.get("binary_sha256")
+                        ):
+                            raise ValueError("run source/binary identity differs from the shared A/B identity")
+                        pipeline = result["wal_pipeline"]
+                        if pipeline.get("wal_io_stable") is not True:
+                            raise ValueError("WAL I/O metadata changed during the run")
+                        for boundary in ("wal_io_start", "wal_io_end"):
+                            preparation = pipeline[boundary]["sliding_extent_preparation"]
+                            if (
+                                preparation.get("mode") != identity["extent_mode"]
+                                or preparation.get("window_bytes") != identity["extent_window_bytes"]
+                                or preparation.get("extent_policy_storage") != identity["arm"]
+                                or preparation.get("extent_policy_scan_diagnostics_enabled")
+                                is not identity["scan_diagnostics_enabled"]
+                            ):
+                                raise ValueError(f"{boundary} extent-policy settings do not match the plan")
+                        start_prep = pipeline["wal_io_start"]["sliding_extent_preparation"]
+                        end_prep = pipeline["wal_io_end"]["sliding_extent_preparation"]
+                        check_calls = end_prep["lookahead_check_calls"] - start_prep["lookahead_check_calls"]
+                        entries_scanned = (
+                            end_prep["extent_policy_entries_scanned"]
+                            - start_prep["extent_policy_entries_scanned"]
+                        )
+                        if metadata.get("lookahead_check_calls") != check_calls or (
+                            metadata.get("extent_policy_entries_scanned") != entries_scanned
+                        ):
+                            raise ValueError("run metadata scan counters differ from runtime diagnostics")
+                        if not identity["scan_diagnostics_enabled"] and (check_calls or entries_scanned):
+                            raise ValueError("score run unexpectedly enabled scan diagnostics")
+                        initialized_bytes = end_prep["initialized_bytes"] - start_prep["initialized_bytes"]
+                        if (initialized_bytes > 0) != (identity["workload"] == "point"):
+                            raise ValueError("extent initialization differs from the planned Point/Batch cell")
+                        expected_environment = (
+                            "TOYKV_BENCH_V8_EXTENT_PREP=sliding-point-lookahead\n"
+                            "TOYKV_BENCH_V8_EXTENT_PREP_BYTES=1048576\n"
+                            "TOYKV_WAL_V8_FRONTIER_MODE=direct\n"
+                            "TOYKV_BENCH_V8_POINT_DIRECT_FRAME=0\n"
+                            f"TOYKV_BENCH_V8_EXTENT_POLICY_STORAGE={identity['arm']}\n"
+                            "TOYKV_BENCH_V8_EXTENT_POLICY_SCAN_DIAGNOSTICS="
+                            f"{int(identity['scan_diagnostics_enabled'])}\n"
+                        )
+                        if (run_dir / "environment.txt").read_text(encoding="utf-8") != expected_environment:
+                            raise ValueError("extent-policy run environment differs from the fixed plan")
+                        summary_row = summary_by_id.get(run_id)
+                        if summary_row is None or summary_row != metadata:
+                            raise ValueError("summary row differs from extent-policy run metadata")
+                    except (KeyError, AttributeError, TypeError, ValueError) as error:
+                        errors.append(f"run {run_id} extent-policy result is invalid: {error}")
                 elif suite == "v8-mutex-diagnostic" and isinstance(record, dict):
                     try:
                         identity = expected[run_id]
@@ -1981,6 +2113,10 @@ def _verify_result_set(results: Path) -> dict[str, Any]:
             validation = validate_point_direct_frame_rows(summary.get("results", []), plan["writers"])
             if validation != summary.get("matrix_validation"):
                 errors.append("direct-frame matrix validation does not match its per-run results")
+        elif suite == "v8-extent-policy-storage":
+            validation = validate_v8_extent_policy_storage_rows(summary.get("results", []), plan["writers"])
+            if validation != summary.get("matrix_validation"):
+                errors.append("extent-policy matrix validation does not match its per-run results")
         elif suite == "v8-mutex-diagnostic":
             validation = validate_v8_mutex_diagnostic_rows(summary.get("results", []))
             if validation != summary.get("matrix_validation"):
@@ -2329,6 +2465,7 @@ def provision_and_run(
     mutex_diagnostic_suite = getattr(args, "v8_mutex_diagnostic", False)
     point_borrowed_input_suite = getattr(args, "v8_point_borrowed_input_ab", False)
     point_direct_frame_suite = getattr(args, "v8_point_direct_frame_ab", False)
+    extent_policy_storage_suite = getattr(args, "v8_extent_policy_storage_ab", False)
     missing_tools = [tool for tool in ("ssh", "scp", "ssh-keygen") if not shutil.which(tool)]
     if missing_tools:
         raise BenchError("Required local tools are missing: " + ", ".join(missing_tools))
@@ -2613,6 +2750,16 @@ def provision_and_run(
                 append_local_log(key_log, direct_copy.stdout + direct_copy.stderr)
                 if direct_copy.returncode:
                     raise BenchError(f"Could not copy direct-frame helper: {direct_copy.stderr.strip()}")
+            if extent_policy_storage_suite:
+                if not V8_EXTENT_POLICY_STORAGE_RUNNER.is_file():
+                    raise BenchError(f"Extent-policy storage runner is missing: {V8_EXTENT_POLICY_STORAGE_RUNNER}")
+                storage_copy = scp_to_vm(
+                    ip, V8_EXTENT_POLICY_STORAGE_RUNNER, "/tmp/gcp-v8-extent-policy-storage-runner.py",
+                    key, known_hosts, timeout=120,
+                )
+                append_local_log(key_log, storage_copy.stdout + storage_copy.stderr)
+                if storage_copy.returncode:
+                    raise BenchError(f"Could not copy extent-policy storage helper: {storage_copy.stderr.strip()}")
 
             safe_deadline_epoch = int(deadline_epoch - 600)
             remote_command = "sudo -n bash /tmp/run-wal-bench.sh " + shlex.join([
@@ -2620,12 +2767,14 @@ def provision_and_run(
                 args.machine_type, ",".join(str(writer) for writer in args.writers),
                 "v8-small-ticket-profile" if profile_suite else (
                     "commit-order-trace" if trace_suite else (
+                        "v8-extent-policy-storage" if extent_policy_storage_suite else (
                         "v8-point-direct-frame" if point_direct_frame_suite else (
                             "v8-point-borrowed-input" if point_borrowed_input_suite else (
                             "v8-mutex-diagnostic" if mutex_diagnostic_suite else (
                                 "v8-point-lookahead" if point_lookahead_suite else (
                                     "rfc026-full" if args.full_rfc026_matrix else "batch64"
                                 )
+                            )
                             )
                             )
                         )
@@ -2829,6 +2978,14 @@ def main(argv: list[str] | None = None) -> int:
         elif args.v8_point_direct_frame_ab:
             report["benchmark_suite"] = "v8-point-direct-frame"
             report["benchmark_plan"] = build_point_direct_frame_plan(
+                writers=args.writers,
+                machine_type=args.machine_type,
+                machine_spec=MACHINE_SPECS[args.machine_type],
+                commit=args.commit.lower(),
+            )
+        elif args.v8_extent_policy_storage_ab:
+            report["benchmark_suite"] = "v8-extent-policy-storage"
+            report["benchmark_plan"] = build_v8_extent_policy_storage_plan(
                 writers=args.writers,
                 machine_type=args.machine_type,
                 machine_spec=MACHINE_SPECS[args.machine_type],

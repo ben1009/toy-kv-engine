@@ -79,6 +79,17 @@ POINT_DIRECT_FRAME_ORDERS = (
     ("direct_frame_on", "direct_frame_off"),
 )
 
+V8_EXTENT_POLICY_STORAGE_WRITERS = (8, 16)
+V8_EXTENT_POLICY_STORAGE_REPETITIONS = 5
+V8_EXTENT_POLICY_STORAGE_NUM = 100_000
+V8_EXTENT_POLICY_STORAGE_ARMS = ("btree", "vec")
+V8_EXTENT_POLICY_STORAGE_ORDERS = (("btree", "vec"), ("vec", "btree"))
+V8_EXTENT_POLICY_STORAGE_WORKLOADS = (
+    {"name": "point", "bench": "wal_concurrent", "batch_entries": 1, "batch_size": None},
+    {"name": "batch16", "bench": "wal_batch_concurrent", "batch_entries": 16, "batch_size": 16},
+    {"name": "batch64", "bench": "wal_batch_concurrent", "batch_entries": 64, "batch_size": 64},
+)
+
 V8_MUTEX_DIAGNOSTIC_WRITERS = (16,)
 V8_MUTEX_DIAGNOSTIC_REPETITIONS = 5
 V8_MUTEX_DIAGNOSTIC_NUM = 100_000
@@ -443,16 +454,147 @@ def validate_point_direct_frame_rows(
         "duplicate_cells": [list(cell) for cell, count in observed.items() if count != 1],
         "invalid_rows": [dict(row) for row in invalid],
     }
-    observed: dict[tuple[object, object, object, object], int] = {}
+
+
+def build_v8_extent_policy_storage_schedule(
+    writers: Iterable[int],
+) -> list[dict[str, object]]:
+    """Build uninstrumented BTreeMap/Vec score pairs and separate scan diagnostics."""
+    writer_counts = validate_writer_counts(writers)
+    if writer_counts != V8_EXTENT_POLICY_STORAGE_WRITERS:
+        raise ValueError(
+            f"extent-policy storage suite requires writers {V8_EXTENT_POLICY_STORAGE_WRITERS}"
+        )
+
+    cells = [(writer, V8_EXTENT_POLICY_STORAGE_WORKLOADS[0]) for writer in writer_counts]
+    cells.extend((16, workload) for workload in V8_EXTENT_POLICY_STORAGE_WORKLOADS[1:])
+    schedule: list[dict[str, object]] = []
+    for writer, workload in cells:
+        for repetition in range(1, V8_EXTENT_POLICY_STORAGE_REPETITIONS + 1):
+            order = V8_EXTENT_POLICY_STORAGE_ORDERS[(repetition - 1) % len(V8_EXTENT_POLICY_STORAGE_ORDERS)]
+            for arm in order:
+                schedule.append({
+                    "run_index": len(schedule) + 1,
+                    "writer": writer,
+                    "workload": workload["name"],
+                    "phase": "score",
+                    "repetition": repetition,
+                    "arm": arm,
+                    "bench": workload["bench"],
+                    "batch_entries": workload["batch_entries"],
+                    "batch_size": workload["batch_size"],
+                    "num": V8_EXTENT_POLICY_STORAGE_NUM,
+                    "sample_every": 100 if workload["name"] == "point" else 10,
+                    "extent_mode": "sliding-point-lookahead",
+                    "extent_window_bytes": POINT_LOOKAHEAD_WINDOW_BYTES,
+                    "frontier_mode": "direct",
+                    "scan_diagnostics_enabled": False,
+                })
+
+    for writer in writer_counts:
+        order = V8_EXTENT_POLICY_STORAGE_ORDERS[(writer // 8 - 1) % len(V8_EXTENT_POLICY_STORAGE_ORDERS)]
+        for arm in order:
+            schedule.append({
+                "run_index": len(schedule) + 1,
+                "writer": writer,
+                "workload": "point",
+                "phase": "diagnostic",
+                "repetition": 0,
+                "arm": arm,
+                "bench": "wal_concurrent",
+                "batch_entries": 1,
+                "batch_size": None,
+                "num": V8_EXTENT_POLICY_STORAGE_NUM,
+                "sample_every": 100,
+                "extent_mode": "sliding-point-lookahead",
+                "extent_window_bytes": POINT_LOOKAHEAD_WINDOW_BYTES,
+                "frontier_mode": "direct",
+                "scan_diagnostics_enabled": True,
+            })
+    return schedule
+
+
+def build_v8_extent_policy_storage_plan(
+    *, writers: Iterable[int], machine_type: str, machine_spec: Mapping[str, int],
+    commit: str, binary_sha256: str | None = None,
+) -> dict[str, object]:
+    writer_counts = validate_writer_counts(writers)
+    schedule = build_v8_extent_policy_storage_schedule(writer_counts)
+    vcpus = int(machine_spec["vcpus"])
+    ssd_count = int(machine_spec["ssd_count"])
+    layout = "single Local SSD" if ssd_count == 1 else f"RAID0 over {ssd_count} Local SSDs"
+    plan: dict[str, object] = {
+        "suite": "v8-extent-policy-storage",
+        "writers": list(writer_counts),
+        "workloads": [dict(workload, num=V8_EXTENT_POLICY_STORAGE_NUM)
+                      for workload in V8_EXTENT_POLICY_STORAGE_WORKLOADS],
+        "arms": list(V8_EXTENT_POLICY_STORAGE_ARMS),
+        "repetitions_per_cell": V8_EXTENT_POLICY_STORAGE_REPETITIONS,
+        "score_runs_planned": sum(row["phase"] == "score" for row in schedule),
+        "diagnostic_runs_planned": sum(row["phase"] == "diagnostic" for row in schedule),
+        "runs_planned": len(schedule),
+        "counterbalanced": True,
+        "machine_type": machine_type,
+        "vcpus": vcpus,
+        "local_ssd_count": ssd_count,
+        "local_ssd_total_gib": int(machine_spec["ssd_gib"]),
+        "runtime_protocol": f"single {vcpus}-vCPU host; {layout}; same binary and source for both arms",
+        "value_bytes": 1024,
+        "compaction": "none",
+        "commit": commit,
+        "binary_sha256": binary_sha256,
+        "extent_preparation": "sliding-point-lookahead, 1 MiB",
+        "frontier_mode": "direct",
+        "coalescing": "dynamic",
+        "storage_ab": {
+            "environment_variable": "TOYKV_BENCH_V8_EXTENT_POLICY_STORAGE",
+            "baseline": "btree",
+            "candidate": "vec",
+            "score_diagnostics": False,
+            "diagnostic_runs_per_storage": 1,
+        },
+        "qualification_note": (
+            "The BTreeMap and Vec score arms use one bench binary and differ only in extent-policy storage. "
+            "Scan counters are disabled for throughput runs; four separate Point runs enable them to verify "
+            "the work reduction. Batch16/64 remain independent regression guardrails."
+        ),
+    }
+    return plan
+
+
+def validate_v8_extent_policy_storage_rows(
+    rows: list[Mapping[str, object]], writers: Iterable[int],
+) -> dict[str, object]:
+    schedule = build_v8_extent_policy_storage_schedule(writers)
+    expected = {
+        (row["writer"], row["workload"], row["phase"], row["repetition"], row["arm"]): row
+        for row in schedule
+    }
+    observed: dict[tuple[object, ...], int] = {}
     invalid: list[Mapping[str, object]] = []
     for row in rows:
-        identity = tuple(row.get(key) for key in ("writer", "workload", "repetition", "arm"))
+        identity = tuple(row.get(key) for key in ("writer", "workload", "phase", "repetition", "arm"))
         observed[identity] = observed.get(identity, 0) + 1
+        planned = expected.get(identity)
         if (
-            identity not in expected
+            planned is None
             or row.get("exit_code") != 0
-            or row.get("ops") != POINT_BORROWED_INPUT_NUM
+            or row.get("ops") != V8_EXTENT_POLICY_STORAGE_NUM
+            or row.get("extent_policy_storage") != row.get("arm")
+            or row.get("scan_diagnostics_enabled") != bool(planned["scan_diagnostics_enabled"])
         ):
+            invalid.append(row)
+            continue
+        if planned["phase"] == "score":
+            if row.get("lookahead_check_calls") != 0 or row.get("extent_policy_entries_scanned") != 0:
+                invalid.append(row)
+        elif (
+            row.get("workload") != "point"
+            or row.get("lookahead_check_calls", 0) <= 0
+            or row.get("extent_policy_entries_scanned", 0) <= 0
+        ):
+            invalid.append(row)
+        if row.get("workload") != "point" and row.get("initialized_bytes") != 0:
             invalid.append(row)
 
     expected_cells = set(expected)
@@ -463,13 +605,11 @@ def validate_point_direct_frame_rows(
         ),
         "planned": len(schedule),
         "observed": len(rows),
-        "missing_cells": [list(cell) for cell in sorted(expected_cells - observed_cells)],
+        "missing_cells": [list(cell) for cell in sorted(expected_cells - observed_cells, key=str)],
         "unexpected_cells": [list(cell) for cell in sorted(observed_cells - expected_cells, key=str)],
         "duplicate_cells": [list(cell) for cell, count in observed.items() if count != 1],
         "invalid_rows": [dict(row) for row in invalid],
     }
-
-
 def build_v8_mutex_diagnostic_schedule() -> list[dict[str, object]]:
     """Build five counterbalanced V7/V8 Point mutex-diagnostic pairs."""
     schedule: list[dict[str, object]] = []

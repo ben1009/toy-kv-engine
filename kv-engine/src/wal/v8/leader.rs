@@ -754,6 +754,8 @@ impl WalV8SlidingExtentPreparation {
             extent_policy_entries_scanned: 0,
             extent_policy_map_max_entries: 0,
             lookahead_worker_cpu_ns: 0,
+            extent_policy_storage: "btree",
+            extent_policy_scan_diagnostics_enabled: false,
         }
     }
 }
@@ -803,7 +805,7 @@ struct WalV8ExtentPreallocationState {
     allocated_end: u64,
     requested_end: u64,
     background_request_pending: bool,
-    extent_policies: BTreeMap<u64, WalV8ExtentPolicy>,
+    extent_policies: WalV8ExtentPolicies,
     slack: Vec<WalV8ExtentSlack>,
     window_preallocation_disabled: bool,
     failure: Option<String>,
@@ -828,6 +830,8 @@ struct WalV8ExtentPreallocationState {
     #[cfg(feature = "bench")]
     lookahead_check_calls: u64,
     #[cfg(feature = "bench")]
+    extent_policy_scan_diagnostics_enabled: bool,
+    #[cfg(feature = "bench")]
     extent_policy_entries_scanned: u64,
     #[cfg(feature = "bench")]
     extent_policy_map_max_entries: u64,
@@ -835,8 +839,266 @@ struct WalV8ExtentPreallocationState {
     lookahead_worker_cpu_ns: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WalV8ExtentPolicyStorageKind {
+    BTreeMap,
+    Vec,
+}
+
+enum WalV8ExtentPolicyStorage {
+    BTreeMap(BTreeMap<u64, WalV8ExtentPolicy>),
+    Vec(Vec<Option<WalV8ExtentPolicy>>),
+}
+
+/// Tracks the first write class assigned to each fixed WAL extent window.
+///
+/// The Vec representation keeps an `Option` per window so an unregistered
+/// window remains distinct from a window owned by a FallocateOnly write.
+struct WalV8ExtentPolicies {
+    start_offset: u64,
+    window_bytes: u64,
+    storage: WalV8ExtentPolicyStorage,
+    entries: usize,
+}
+
+impl WalV8ExtentPolicies {
+    fn new(start_offset: u64, window_bytes: u64, kind: WalV8ExtentPolicyStorageKind) -> Self {
+        let storage = match kind {
+            WalV8ExtentPolicyStorageKind::BTreeMap => {
+                WalV8ExtentPolicyStorage::BTreeMap(BTreeMap::new())
+            }
+            WalV8ExtentPolicyStorageKind::Vec => WalV8ExtentPolicyStorage::Vec(Vec::new()),
+        };
+        Self {
+            start_offset,
+            window_bytes,
+            storage,
+            entries: 0,
+        }
+    }
+
+    fn index(&self, extent_start: u64) -> Result<usize> {
+        let relative = extent_start
+            .checked_sub(self.start_offset)
+            .context("V8 extent policy precedes its initial cursor")?;
+        ensure!(
+            relative.is_multiple_of(self.window_bytes),
+            "V8 extent policy offset is not window-aligned"
+        );
+        usize::try_from(relative / self.window_bytes)
+            .context("V8 extent policy index exceeds addressable memory")
+    }
+
+    fn insert_if_absent(
+        &mut self,
+        extent_start: u64,
+        policy: WalV8ExtentPolicy,
+    ) -> Result<WalV8ExtentPolicy> {
+        let index = self.index(extent_start)?;
+        match &mut self.storage {
+            WalV8ExtentPolicyStorage::BTreeMap(policies) => {
+                let selected = *policies.entry(extent_start).or_insert(policy);
+                self.entries = policies.len();
+                Ok(selected)
+            }
+            WalV8ExtentPolicyStorage::Vec(policies) => {
+                let required_len = index
+                    .checked_add(1)
+                    .context("V8 extent policy vector length overflows")?;
+                if policies.len() < required_len {
+                    policies.resize(required_len, None);
+                }
+                let slot = &mut policies[index];
+                if let Some(existing) = slot {
+                    Ok(*existing)
+                } else {
+                    *slot = Some(policy);
+                    self.entries = self.entries.saturating_add(1);
+                    Ok(policy)
+                }
+            }
+        }
+    }
+
+    fn get(&self, extent_start: u64) -> Option<WalV8ExtentPolicy> {
+        let index = self.index(extent_start).ok()?;
+        match &self.storage {
+            WalV8ExtentPolicyStorage::BTreeMap(policies) => policies.get(&extent_start).copied(),
+            WalV8ExtentPolicyStorage::Vec(policies) => policies.get(index).copied().flatten(),
+        }
+    }
+
+    fn truncate_before(&mut self, end: u64) {
+        if end < self.start_offset {
+            return;
+        }
+        match &mut self.storage {
+            WalV8ExtentPolicyStorage::BTreeMap(policies) => {
+                policies.retain(|extent_start, _| *extent_start < end);
+                self.entries = policies.len();
+            }
+            WalV8ExtentPolicyStorage::Vec(policies) => {
+                let relative_end = end.saturating_sub(self.start_offset);
+                let retained_windows = relative_end / self.window_bytes
+                    + u64::from(!relative_end.is_multiple_of(self.window_bytes));
+                let retained_windows = usize::try_from(retained_windows).unwrap_or(usize::MAX);
+                let removed = policies
+                    .get(retained_windows..)
+                    .unwrap_or_default()
+                    .iter()
+                    .filter(|policy| policy.is_some())
+                    .count();
+                policies.truncate(retained_windows);
+                self.entries = self.entries.saturating_sub(removed);
+            }
+        }
+    }
+
+    fn has_unprepared_lookahead(
+        &self,
+        end: u64,
+        prepared_end: u64,
+        count_scanned: bool,
+    ) -> (bool, u64) {
+        match &self.storage {
+            WalV8ExtentPolicyStorage::BTreeMap(policies) => {
+                if count_scanned {
+                    let mut scanned = 0_u64;
+                    for (&extent_start, &policy) in policies {
+                        scanned = scanned.saturating_add(1);
+                        if policy == WalV8ExtentPolicy::Lookahead
+                            && extent_start < end
+                            && extent_start.saturating_add(self.window_bytes) > prepared_end
+                        {
+                            return (true, scanned);
+                        }
+                    }
+                    (false, scanned)
+                } else {
+                    (
+                        policies.iter().any(|(&extent_start, &policy)| {
+                            policy == WalV8ExtentPolicy::Lookahead
+                                && extent_start < end
+                                && extent_start.saturating_add(self.window_bytes) > prepared_end
+                        }),
+                        0,
+                    )
+                }
+            }
+            WalV8ExtentPolicyStorage::Vec(policies) => {
+                let lower = prepared_end.saturating_sub(self.window_bytes.saturating_sub(1));
+                if lower >= end || end <= self.start_offset {
+                    return (false, 0);
+                }
+                let relative_lower = lower.saturating_sub(self.start_offset);
+                let first_index = relative_lower / self.window_bytes
+                    + u64::from(!relative_lower.is_multiple_of(self.window_bytes));
+                let relative_end = end.saturating_sub(self.start_offset);
+                let end_index = relative_end / self.window_bytes
+                    + u64::from(!relative_end.is_multiple_of(self.window_bytes));
+                let Ok(first_index) = usize::try_from(first_index) else {
+                    return (false, 0);
+                };
+                let Ok(end_index) = usize::try_from(end_index) else {
+                    return (false, 0);
+                };
+                let start_index = first_index.min(policies.len());
+                let end_index = end_index.min(policies.len());
+                if start_index >= end_index {
+                    return (false, 0);
+                }
+
+                let Some(candidates) = policies.get(start_index..end_index) else {
+                    return (false, 0);
+                };
+                let Some(first_extent_start) = u64::try_from(start_index)
+                    .ok()
+                    .and_then(|index| index.checked_mul(self.window_bytes))
+                    .and_then(|relative| self.start_offset.checked_add(relative))
+                else {
+                    return (false, 0);
+                };
+
+                let mut scanned = 0_u64;
+                for (relative_index, policy) in candidates.iter().enumerate() {
+                    if count_scanned {
+                        scanned = scanned.saturating_add(1);
+                    }
+                    let Some(policy) = policy else {
+                        continue;
+                    };
+                    let Some(extent_start) = u64::try_from(relative_index)
+                        .ok()
+                        .and_then(|index| index.checked_mul(self.window_bytes))
+                        .and_then(|relative| first_extent_start.checked_add(relative))
+                    else {
+                        continue;
+                    };
+                    if *policy == WalV8ExtentPolicy::Lookahead
+                        && extent_start < end
+                        && extent_start.saturating_add(self.window_bytes) > prepared_end
+                    {
+                        return (true, scanned);
+                    }
+                }
+                (false, scanned)
+            }
+        }
+    }
+
+    fn kind(&self) -> WalV8ExtentPolicyStorageKind {
+        match &self.storage {
+            WalV8ExtentPolicyStorage::BTreeMap(_) => WalV8ExtentPolicyStorageKind::BTreeMap,
+            WalV8ExtentPolicyStorage::Vec(_) => WalV8ExtentPolicyStorageKind::Vec,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.entries
+    }
+}
+
+#[cfg(feature = "bench")]
+fn extent_policy_storage_kind_from_env() -> Result<WalV8ExtentPolicyStorageKind> {
+    match std::env::var("TOYKV_BENCH_V8_EXTENT_POLICY_STORAGE") {
+        Ok(value) if value == "btree" => Ok(WalV8ExtentPolicyStorageKind::BTreeMap),
+        Ok(value) if value == "vec" => Ok(WalV8ExtentPolicyStorageKind::Vec),
+        Ok(value) => anyhow::bail!(
+            "TOYKV_BENCH_V8_EXTENT_POLICY_STORAGE must be `btree` or `vec`, got `{value}`"
+        ),
+        Err(std::env::VarError::NotPresent) => Ok(WalV8ExtentPolicyStorageKind::BTreeMap),
+        Err(error) => Err(error).context("read V8 extent policy storage setting"),
+    }
+}
+
+#[cfg(not(feature = "bench"))]
+fn extent_policy_storage_kind_from_env() -> Result<WalV8ExtentPolicyStorageKind> {
+    Ok(WalV8ExtentPolicyStorageKind::BTreeMap)
+}
+
+#[cfg(feature = "bench")]
+fn extent_policy_scan_diagnostics_enabled_from_env() -> Result<bool> {
+    match std::env::var("TOYKV_BENCH_V8_EXTENT_POLICY_SCAN_DIAGNOSTICS") {
+        Ok(value) if value == "1" => Ok(true),
+        Ok(value) if value == "0" => Ok(false),
+        Ok(value) => anyhow::bail!(
+            "TOYKV_BENCH_V8_EXTENT_POLICY_SCAN_DIAGNOSTICS must be `0` or `1`, got `{value}`"
+        ),
+        Err(std::env::VarError::NotPresent) => Ok(true),
+        Err(error) => Err(error).context("read V8 extent policy scan diagnostics setting"),
+    }
+}
+
+#[cfg(not(feature = "bench"))]
+fn extent_policy_scan_diagnostics_enabled_from_env() -> Result<bool> {
+    Ok(false)
+}
+
 #[cfg(feature = "bench")]
 fn record_extent_policy_map_len(state: &mut WalV8ExtentPreallocationState) {
+    if !state.extent_policy_scan_diagnostics_enabled {
+        return;
+    }
     let entries = u64::try_from(state.extent_policies.len()).unwrap_or(u64::MAX);
     state.extent_policy_map_max_entries = state.extent_policy_map_max_entries.max(entries);
 }
@@ -978,6 +1240,9 @@ impl WalV8ExtentPreallocator {
     ) -> Result<Self> {
         let lookahead = strategy.uses_lookahead();
         let point_only_lookahead = strategy.is_point_only();
+        let extent_policy_storage_kind = extent_policy_storage_kind_from_env()?;
+        let extent_policy_scan_diagnostics_enabled =
+            extent_policy_scan_diagnostics_enabled_from_env()?;
         ensure!(
             is_o_direct_file(&data_file)?,
             "V8 sliding extent preparation requires an O_DIRECT DATA worker"
@@ -1025,7 +1290,11 @@ impl WalV8ExtentPreallocator {
             allocated_end: start_offset,
             requested_end: start_offset,
             background_request_pending: false,
-            extent_policies: BTreeMap::new(),
+            extent_policies: WalV8ExtentPolicies::new(
+                start_offset,
+                window_bytes,
+                extent_policy_storage_kind,
+            ),
             slack: Vec::new(),
             window_preallocation_disabled: false,
             failure: None,
@@ -1049,6 +1318,8 @@ impl WalV8ExtentPreallocator {
             wait_ns: 0,
             #[cfg(feature = "bench")]
             lookahead_check_calls: 0,
+            #[cfg(feature = "bench")]
+            extent_policy_scan_diagnostics_enabled,
             #[cfg(feature = "bench")]
             extent_policy_entries_scanned: 0,
             #[cfg(feature = "bench")]
@@ -1163,16 +1434,14 @@ impl WalV8ExtentPreallocator {
             // fallocate-only path. Later ranges inherit the first owner's policy.
             // If preparation already passed it, keep the conservative
             // fallocate-only policy instead of claiming bytes were initialized.
-            state
-                .extent_policies
-                .entry(extent_start)
-                .or_insert_with(|| {
-                    if extent_start < prepared_end {
-                        WalV8ExtentPolicy::FallocateOnly
-                    } else {
-                        policy
-                    }
-                });
+            state.extent_policies.insert_if_absent(
+                extent_start,
+                if extent_start < prepared_end {
+                    WalV8ExtentPolicy::FallocateOnly
+                } else {
+                    policy
+                },
+            )?;
             extent_start = extent_start
                 .checked_add(self.window_bytes)
                 .context("V8 extent policy cursor overflows")?;
@@ -1198,45 +1467,24 @@ impl WalV8ExtentPreallocator {
         state: &mut WalV8ExtentPreallocationState,
         end: u64,
     ) -> bool {
-        #[cfg(feature = "bench")]
-        let map_entries = state.extent_policies.len();
-        #[cfg(feature = "bench")]
-        let mut entries_scanned = 0_u64;
         let prepared_end = state.prepared_end;
-        let has_unprepared = {
-            #[cfg(feature = "bench")]
-            {
-                state
-                    .extent_policies
-                    .iter()
-                    .any(|(&extent_start, &policy)| {
-                        entries_scanned = entries_scanned.saturating_add(1);
-                        policy == WalV8ExtentPolicy::Lookahead
-                            && extent_start < end
-                            && extent_start.saturating_add(self.window_bytes) > prepared_end
-                    })
-            }
-            #[cfg(not(feature = "bench"))]
-            {
-                state
-                    .extent_policies
-                    .iter()
-                    .any(|(&extent_start, &policy)| {
-                        policy == WalV8ExtentPolicy::Lookahead
-                            && extent_start < end
-                            && extent_start.saturating_add(self.window_bytes) > prepared_end
-                    })
-            }
-        };
         #[cfg(feature = "bench")]
-        {
+        let diagnostics_enabled = state.extent_policy_scan_diagnostics_enabled;
+        #[cfg(not(feature = "bench"))]
+        let diagnostics_enabled = false;
+        let (has_unprepared, entries_scanned) =
+            state
+                .extent_policies
+                .has_unprepared_lookahead(end, prepared_end, diagnostics_enabled);
+        #[cfg(feature = "bench")]
+        if diagnostics_enabled {
             state.lookahead_check_calls = state.lookahead_check_calls.saturating_add(1);
             state.extent_policy_entries_scanned = state
                 .extent_policy_entries_scanned
                 .saturating_add(entries_scanned);
             state.extent_policy_map_max_entries = state
                 .extent_policy_map_max_entries
-                .max(u64::try_from(map_entries).unwrap_or(u64::MAX));
+                .max(u64::try_from(state.extent_policies.len()).unwrap_or(u64::MAX));
         }
 
         has_unprepared
@@ -1256,8 +1504,7 @@ impl WalV8ExtentPreallocator {
         while extent_start < end {
             state
                 .extent_policies
-                .entry(extent_start)
-                .or_insert(WalV8ExtentPolicy::FallocateOnly);
+                .insert_if_absent(extent_start, WalV8ExtentPolicy::FallocateOnly)?;
             extent_start = extent_start
                 .checked_add(self.window_bytes)
                 .context("V8 extent policy cursor overflows")?;
@@ -1546,9 +1793,7 @@ impl WalV8ExtentPreallocator {
         state.prepared_end = state.prepared_end.min(allocated_tail);
         state.allocated_end = state.allocated_end.min(allocated_tail);
         state.requested_end = state.requested_end.min(allocated_tail);
-        state
-            .extent_policies
-            .retain(|extent_start, _| *extent_start < allocated_tail);
+        state.extent_policies.truncate_before(allocated_tail);
         self.data_file
             .set_len(allocated_tail)
             .context("truncate speculative v8 WAL extent tail")?;
@@ -1595,6 +1840,11 @@ impl WalV8ExtentPreallocator {
             extent_policy_entries_scanned: state.extent_policy_entries_scanned,
             extent_policy_map_max_entries: state.extent_policy_map_max_entries,
             lookahead_worker_cpu_ns: state.lookahead_worker_cpu_ns,
+            extent_policy_storage: match state.extent_policies.kind() {
+                WalV8ExtentPolicyStorageKind::BTreeMap => "btree",
+                WalV8ExtentPolicyStorageKind::Vec => "vec",
+            },
+            extent_policy_scan_diagnostics_enabled: state.extent_policy_scan_diagnostics_enabled,
         }
     }
 }
@@ -1761,10 +2011,9 @@ impl WalV8ExtentLookaheadWorker {
                         .context("V8 extent lookahead window end overflows")?
                         .min(allocated_end);
                     let extent_policy = if point_only_lookahead {
-                        let policy = *state_guard
+                        let policy = state_guard
                             .extent_policies
-                            .entry(extent_start)
-                            .or_insert(WalV8ExtentPolicy::FallocateOnly);
+                            .insert_if_absent(extent_start, WalV8ExtentPolicy::FallocateOnly)?;
                         #[cfg(feature = "bench")]
                         record_extent_policy_map_len(&mut state_guard);
                         policy
@@ -5390,6 +5639,124 @@ mod tests {
     };
 
     #[test]
+    fn extent_policy_vec_matches_btree_for_mixed_out_of_order_ranges() -> Result<()> {
+        const START: u64 = 4096;
+        const WINDOW: u64 = 16 * 1024;
+        const WINDOW_COUNT: u64 = 128;
+
+        let mut btree =
+            WalV8ExtentPolicies::new(START, WINDOW, WalV8ExtentPolicyStorageKind::BTreeMap);
+        let mut vector = WalV8ExtentPolicies::new(START, WINDOW, WalV8ExtentPolicyStorageKind::Vec);
+
+        // Admission order is deliberately different from physical order. Repeated
+        // registrations model Point/Batch writes sharing an extent; the first
+        // policy must remain authoritative in both representations.
+        let registration_order = [17, 3, 88, 0, 16, 42, 1, 127, 5, 42, 17, 64, 2, 90, 4];
+        for (position, window) in registration_order.into_iter().enumerate() {
+            let extent_start = START + window * WINDOW;
+            let policy = if (position + window as usize).is_multiple_of(2) {
+                WalV8ExtentPolicy::Lookahead
+            } else {
+                WalV8ExtentPolicy::FallocateOnly
+            };
+            let prepared_end = START + (u64::try_from(position % 6)? * WINDOW) + WINDOW / 2;
+            let first_owner_policy = if extent_start < prepared_end {
+                WalV8ExtentPolicy::FallocateOnly
+            } else {
+                policy
+            };
+            assert_eq!(
+                btree.insert_if_absent(extent_start, first_owner_policy)?,
+                vector.insert_if_absent(extent_start, first_owner_policy)?
+            );
+        }
+        assert_eq!(btree.len(), vector.len());
+
+        // Exercise exact window boundaries, partial windows, gaps between
+        // out-of-order admissions, and endpoints immediately around a window.
+        let mut endpoints = vec![START, START + 1, START + WINDOW_COUNT * WINDOW];
+        for index in 0..=WINDOW_COUNT {
+            let boundary = START + index * WINDOW;
+            endpoints.extend([
+                boundary.saturating_sub(1),
+                boundary,
+                boundary.saturating_add(1),
+            ]);
+        }
+        let prepared_ends = endpoints.clone();
+        for prepared_end in prepared_ends {
+            for end in &endpoints {
+                assert_eq!(
+                    btree.has_unprepared_lookahead(*end, prepared_end, false).0,
+                    vector.has_unprepared_lookahead(*end, prepared_end, false).0,
+                    "prepared_end={prepared_end}, end={end}"
+                );
+            }
+        }
+
+        // Deterministic randomized admission and query states add coverage for
+        // sparse Vec slots and first-owner-wins collisions without a new crate.
+        let mut random_btree =
+            WalV8ExtentPolicies::new(START, WINDOW, WalV8ExtentPolicyStorageKind::BTreeMap);
+        let mut random_vector =
+            WalV8ExtentPolicies::new(START, WINDOW, WalV8ExtentPolicyStorageKind::Vec);
+        let mut seed = 0x7d31_9a5b_u64;
+        let mut next = || {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            seed
+        };
+        for _ in 0..512 {
+            let window = next() % WINDOW_COUNT;
+            let extent_start = START + window * WINDOW;
+            let prepared_end = START + (next() % (WINDOW_COUNT + 1)) * WINDOW;
+            let policy = if next() & 1 == 0 {
+                WalV8ExtentPolicy::Lookahead
+            } else {
+                WalV8ExtentPolicy::FallocateOnly
+            };
+            let first_owner_policy = if extent_start < prepared_end {
+                WalV8ExtentPolicy::FallocateOnly
+            } else {
+                policy
+            };
+            assert_eq!(
+                random_btree.insert_if_absent(extent_start, first_owner_policy)?,
+                random_vector.insert_if_absent(extent_start, first_owner_policy)?
+            );
+        }
+        for _ in 0..10_000 {
+            let prepared_end = START + (next() % (WINDOW_COUNT + 2)) * WINDOW;
+            let end = START + (next() % (WINDOW_COUNT + 2)) * WINDOW;
+            assert_eq!(
+                random_btree
+                    .has_unprepared_lookahead(end, prepared_end, false)
+                    .0,
+                random_vector
+                    .has_unprepared_lookahead(end, prepared_end, false)
+                    .0,
+                "random prepared_end={prepared_end}, end={end}"
+            );
+        }
+
+        let truncate_end = START + 65 * WINDOW + 1;
+        let btree_len = btree.len();
+        let vector_len = vector.len();
+        btree.truncate_before(START - 1);
+        vector.truncate_before(START - 1);
+        assert_eq!(btree.len(), btree_len);
+        assert_eq!(vector.len(), vector_len);
+        btree.truncate_before(truncate_end);
+        vector.truncate_before(truncate_end);
+        assert_eq!(btree.len(), vector.len());
+        for index in 0..WINDOW_COUNT {
+            let extent_start = START + index * WINDOW;
+            assert_eq!(btree.get(extent_start), vector.get(extent_start));
+        }
+
+        Ok(())
+    }
+
+    #[test]
     fn sliding_extent_falls_back_to_exact_prefix_after_capacity_error() -> Result<()> {
         let mut preallocation_disabled = false;
         let mut calls = Vec::new();
@@ -5657,8 +6024,8 @@ mod tests {
         assert_eq!(point_state.prepared_end, point_fixture.window_end);
         assert_eq!(point_state.initialized_bytes, WINDOW_BYTES);
         assert_eq!(
-            point_state.extent_policies.get(&point_fixture.start_offset),
-            Some(&WalV8ExtentPolicy::Lookahead)
+            point_state.extent_policies.get(point_fixture.start_offset),
+            Some(WalV8ExtentPolicy::Lookahead)
         );
         drop(point_state);
 
@@ -5690,8 +6057,8 @@ mod tests {
         assert_eq!(batch_state.prepared_end, batch_fixture.window_end);
         assert_eq!(batch_state.initialized_bytes, 0);
         assert_eq!(
-            batch_state.extent_policies.get(&batch_fixture.start_offset),
-            Some(&WalV8ExtentPolicy::FallocateOnly)
+            batch_state.extent_policies.get(batch_fixture.start_offset),
+            Some(WalV8ExtentPolicy::FallocateOnly)
         );
 
         let large_directory = tempfile::tempdir()?;
@@ -5712,8 +6079,8 @@ mod tests {
                 .state
                 .lock()
                 .extent_policies
-                .get(&large_fixture.start_offset),
-            Some(&WalV8ExtentPolicy::FallocateOnly)
+                .get(large_fixture.start_offset),
+            Some(WalV8ExtentPolicy::FallocateOnly)
         );
 
         Ok(())

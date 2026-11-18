@@ -30,6 +30,8 @@ from gcp_wal_matrix import (
     POINT_BORROWED_INPUT_WRITERS,
     POINT_DIRECT_FRAME_NUM,
     POINT_DIRECT_FRAME_WRITERS,
+    V8_EXTENT_POLICY_STORAGE_NUM,
+    V8_EXTENT_POLICY_STORAGE_WRITERS,
     V8_MUTEX_DIAGNOSTIC_NUM,
     V8_MUTEX_DIAGNOSTIC_SAMPLE_EVERY,
     V8_MUTEX_DIAGNOSTIC_WRITERS,
@@ -43,6 +45,8 @@ from gcp_wal_matrix import (
     build_point_borrowed_input_schedule,
     build_point_direct_frame_plan,
     build_point_direct_frame_schedule,
+    build_v8_extent_policy_storage_plan,
+    build_v8_extent_policy_storage_schedule,
     build_v8_mutex_diagnostic_plan,
     build_v8_mutex_diagnostic_schedule,
     build_rfc026_schedule,
@@ -51,6 +55,7 @@ from gcp_wal_matrix import (
     validate_point_lookahead_rows,
     validate_point_borrowed_input_rows,
     validate_point_direct_frame_rows,
+    validate_v8_extent_policy_storage_rows,
     validate_v8_mutex_diagnostic_rows,
     validate_rfc026_rows,
 )
@@ -762,6 +767,75 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
             BENCH.parse_args([
                 "--project", "test-project", "--zone", "us-east1-b", "--commit", "c" * 40,
                 "--writers", "16", "--v8-point-direct-frame-ab", "--preflight-only",
+            ])
+
+    def test_extent_policy_storage_schedule_separates_scores_and_scan_diagnostics(self) -> None:
+        schedule = build_v8_extent_policy_storage_schedule(V8_EXTENT_POLICY_STORAGE_WRITERS)
+        self.assertEqual(len(schedule), 44)
+        score_rows = [row for row in schedule if row["phase"] == "score"]
+        diagnostic_rows = [row for row in schedule if row["phase"] == "diagnostic"]
+        self.assertEqual(len(score_rows), 40)
+        self.assertEqual(len(diagnostic_rows), 4)
+        self.assertTrue(all(not row["scan_diagnostics_enabled"] for row in score_rows))
+        self.assertTrue(all(row["scan_diagnostics_enabled"] for row in diagnostic_rows))
+
+        for writer in V8_EXTENT_POLICY_STORAGE_WRITERS:
+            point_rows = [
+                row for row in score_rows if row["writer"] == writer and row["workload"] == "point"
+            ]
+            self.assertEqual(len(point_rows), 10)
+            for repetition in range(1, 6):
+                arms = [row["arm"] for row in point_rows if row["repetition"] == repetition]
+                expected = ["btree", "vec"] if repetition % 2 else ["vec", "btree"]
+                self.assertEqual(arms, expected)
+
+        rows = []
+        for row in schedule:
+            diagnostic = row["phase"] == "diagnostic"
+            rows.append({
+                **row,
+                "exit_code": 0,
+                "ops": V8_EXTENT_POLICY_STORAGE_NUM,
+                "extent_policy_storage": row["arm"],
+                "scan_diagnostics_enabled": diagnostic,
+                "lookahead_check_calls": 100 if diagnostic else 0,
+                "extent_policy_entries_scanned": 1_000 if diagnostic else 0,
+                "initialized_bytes": 1_048_576 if row["workload"] == "point" else 0,
+            })
+        self.assertTrue(
+            validate_v8_extent_policy_storage_rows(rows, V8_EXTENT_POLICY_STORAGE_WRITERS)["complete"]
+        )
+
+        invalid_diagnostic = next(row for row in rows if row["phase"] == "diagnostic")
+        invalid_diagnostic["extent_policy_entries_scanned"] = 0
+        self.assertFalse(
+            validate_v8_extent_policy_storage_rows(rows, V8_EXTENT_POLICY_STORAGE_WRITERS)["complete"]
+        )
+
+        plan = build_v8_extent_policy_storage_plan(
+            writers=V8_EXTENT_POLICY_STORAGE_WRITERS,
+            machine_type="c4-standard-16-lssd",
+            machine_spec=BENCH.MACHINE_SPECS["c4-standard-16-lssd"],
+            commit="c" * 40,
+            binary_sha256="d" * 64,
+        )
+        self.assertEqual(plan["runs_planned"], 44)
+        self.assertEqual(plan["score_runs_planned"], 40)
+        self.assertEqual(plan["diagnostic_runs_planned"], 4)
+        self.assertEqual(plan["binary_sha256"], "d" * 64)
+
+    def test_extent_policy_storage_cli_uses_fixed_same_binary_matrix(self) -> None:
+        args = BENCH.parse_args([
+            "--project", "test-project", "--zone", "us-east1-b", "--commit", "c" * 40,
+            "--v8-extent-policy-storage-ab", "--preflight-only",
+        ])
+        self.assertEqual(args.num, V8_EXTENT_POLICY_STORAGE_NUM)
+        self.assertEqual(args.writers, V8_EXTENT_POLICY_STORAGE_WRITERS)
+        self.assertEqual(args.machine_type, "c4-standard-16-lssd")
+        with self.assertRaises(SystemExit):
+            BENCH.parse_args([
+                "--project", "test-project", "--zone", "us-east1-b", "--commit", "c" * 40,
+                "--writers", "16", "--v8-extent-policy-storage-ab", "--preflight-only",
             ])
 
     def test_point_direct_frame_result_verifier_requires_actual_point_hits_and_batch_misses(self) -> None:

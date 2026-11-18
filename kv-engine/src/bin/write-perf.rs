@@ -1674,6 +1674,8 @@ struct WalV8SlidingExtentPreparationRecord {
     extent_policy_entries_scanned: u64,
     extent_policy_map_max_entries: u64,
     lookahead_worker_cpu_ns: u64,
+    extent_policy_storage: &'static str,
+    extent_policy_scan_diagnostics_enabled: bool,
 }
 
 #[cfg(feature = "bench")]
@@ -1684,6 +1686,9 @@ impl WalV8SlidingExtentPreparationRecord {
             && self.max_file_size == other.max_file_size
             && self.window_bytes == other.window_bytes
             && self.initialization_chunk_bytes == other.initialization_chunk_bytes
+            && self.extent_policy_storage == other.extent_policy_storage
+            && self.extent_policy_scan_diagnostics_enabled
+                == other.extent_policy_scan_diagnostics_enabled
     }
 }
 
@@ -1739,6 +1744,9 @@ impl From<WalV8SlidingExtentPreparationDiagnostics> for WalV8SlidingExtentPrepar
             extent_policy_entries_scanned: diagnostics.extent_policy_entries_scanned,
             extent_policy_map_max_entries: diagnostics.extent_policy_map_max_entries,
             lookahead_worker_cpu_ns: diagnostics.lookahead_worker_cpu_ns,
+            extent_policy_storage: diagnostics.extent_policy_storage,
+            extent_policy_scan_diagnostics_enabled: diagnostics
+                .extent_policy_scan_diagnostics_enabled,
         }
     }
 }
@@ -10293,6 +10301,8 @@ mod tests {
                 extent_policy_entries_scanned: 0,
                 extent_policy_map_max_entries: 0,
                 lookahead_worker_cpu_ns: 0,
+                extent_policy_storage: "btree",
+                extent_policy_scan_diagnostics_enabled: false,
             }),
             ..WalIoDiagnosticsRecord::default()
         };
