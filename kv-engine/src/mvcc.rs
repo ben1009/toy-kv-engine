@@ -1289,18 +1289,12 @@ impl LsmMvccInner {
         let mut prefixed = Vec::with_capacity(1 + value.len());
         prefixed.push(crate::vlog::KvKind::Inline as u8);
         prefixed.extend_from_slice(value);
-        let batch = crate::pitr::WalBatch {
-            commit_ts: 1,
-            recorded_at: crate::pitr::RecordedAt { secs: 0, nanos: 0 },
-            entries: vec![crate::pitr::WalEntry::Put {
-                key: user_key.to_vec(),
-                value: prefixed.clone(),
-            }],
-        };
-        let prepared = memtable.prepare_v8_pitr_wal_batch_with_write_class(
-            &batch,
+        let prepared = memtable.prepare_v8_pitr_point(
+            crate::wal::v8::prepare::WalV8PointInput::Put {
+                key: user_key,
+                value: &prefixed,
+            },
             crate::pitr::LIVE_WAL_V5_LIMITS,
-            crate::wal::v8::prepare::WalV8WriteClass::Point,
         )?;
 
         let write_guard = self.write_lock.lock();
@@ -1390,24 +1384,14 @@ impl LsmMvccInner {
         user_key: &[u8],
         memtable: &MemTable,
     ) -> Result<WalPublish, anyhow::Error> {
-        let v8_batch = memtable.uses_v8_wal().then(|| crate::pitr::WalBatch {
-            commit_ts: 1,
-            recorded_at: crate::pitr::RecordedAt { secs: 0, nanos: 0 },
-            entries: vec![crate::pitr::WalEntry::PointDelete {
-                key: user_key.to_vec(),
-            }],
-        });
-        let prepared_v8 = v8_batch
-            .as_ref()
-            .filter(|_| memtable.uses_parallel_wal())
-            .map(|batch| {
-                memtable.prepare_v8_pitr_wal_batch_with_write_class(
-                    batch,
-                    crate::pitr::LIVE_WAL_V5_LIMITS,
-                    crate::wal::v8::prepare::WalV8WriteClass::Point,
-                )
-            })
-            .transpose()?;
+        let prepared_v8 = if memtable.uses_v8_wal() && memtable.uses_parallel_wal() {
+            Some(memtable.prepare_v8_pitr_point(
+                crate::wal::v8::prepare::WalV8PointInput::Delete { key: user_key },
+                crate::pitr::LIVE_WAL_V5_LIMITS,
+            )?)
+        } else {
+            None
+        };
         let _write_guard = self.write_lock.lock();
         let commit_ts = self.reserve_commit_ts()?;
         let _unwind_guard = self.guard_versioned_commit_unwind(memtable, commit_ts);
@@ -1483,25 +1467,17 @@ impl LsmMvccInner {
         let expire_at = crate::vlog::compute_expire_at(ttl);
         let prefixed =
             crate::vlog::encode_ttl_value(crate::vlog::KvKind::TtlInline, expire_at, value);
-        let v8_batch = memtable.uses_v8_wal().then(|| crate::pitr::WalBatch {
-            commit_ts: 1,
-            recorded_at: crate::pitr::RecordedAt { secs: 0, nanos: 0 },
-            entries: vec![crate::pitr::WalEntry::Put {
-                key: user_key.to_vec(),
-                value: prefixed.clone(),
-            }],
-        });
-        let prepared_v8 = v8_batch
-            .as_ref()
-            .filter(|_| memtable.uses_parallel_wal())
-            .map(|batch| {
-                memtable.prepare_v8_pitr_wal_batch_with_write_class(
-                    batch,
-                    crate::pitr::LIVE_WAL_V5_LIMITS,
-                    crate::wal::v8::prepare::WalV8WriteClass::Point,
-                )
-            })
-            .transpose()?;
+        let prepared_v8 = if memtable.uses_v8_wal() && memtable.uses_parallel_wal() {
+            Some(memtable.prepare_v8_pitr_point(
+                crate::wal::v8::prepare::WalV8PointInput::Put {
+                    key: user_key,
+                    value: &prefixed,
+                },
+                crate::pitr::LIVE_WAL_V5_LIMITS,
+            )?)
+        } else {
+            None
+        };
         let _write_guard = self.write_lock.lock();
         let commit_ts = self.reserve_commit_ts()?;
         let _unwind_guard = self.guard_versioned_commit_unwind(memtable, commit_ts);

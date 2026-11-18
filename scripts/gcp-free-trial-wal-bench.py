@@ -37,6 +37,8 @@ from gcp_wal_matrix import (
     FULL_DEFAULT_WRITERS,
     LEGACY_DEFAULT_WRITERS,
     POINT_LOOKAHEAD_WRITERS,
+    POINT_BORROWED_INPUT_NUM,
+    POINT_BORROWED_INPUT_WRITERS,
     V8_MUTEX_DIAGNOSTIC_NUM,
     V8_MUTEX_DIAGNOSTIC_SAMPLE_EVERY,
     V8_MUTEX_DIAGNOSTIC_WRITERS,
@@ -46,11 +48,14 @@ from gcp_wal_matrix import (
     build_benchmark_plan,
     build_point_lookahead_plan,
     build_point_lookahead_schedule,
+    build_point_borrowed_input_plan,
+    build_point_borrowed_input_schedule,
     build_v8_mutex_diagnostic_plan,
     build_v8_mutex_diagnostic_schedule,
     build_rfc026_schedule,
     validate_commit_order_trace_rows,
     validate_point_lookahead_rows,
+    validate_point_borrowed_input_rows,
     validate_v8_mutex_diagnostic_rows,
     validate_writer_counts,
 )
@@ -67,6 +72,7 @@ PROFILE_RUNNER = Path(__file__).with_name("gcp_wal_profile_runner.py")
 COMMIT_ORDER_TRACE_RUNNER = Path(__file__).with_name("gcp_commit_order_trace_runner.py")
 POINT_LOOKAHEAD_RUNNER = Path(__file__).with_name("gcp_v8_point_lookahead_runner.py")
 V8_MUTEX_DIAGNOSTIC_RUNNER = Path(__file__).with_name("gcp_v8_mutex_diagnostic_runner.py")
+POINT_BORROWED_INPUT_RUNNER = Path(__file__).with_name("gcp_v8_point_borrowed_input_runner.py")
 REPO_URL = "https://github.com/ben1009/toy-kv-engine.git"
 MAX_RUNTIME_MINUTES = 180
 MIN_RUNTIME_MINUTES = 60
@@ -87,11 +93,12 @@ root_names = {
     "summary.json", "summary.tsv", "comparison.tsv", "benchmark-plan.json",
     "rfc026-schedule.tsv", "profile-schedule.tsv", "commit-order-trace-schedule.tsv",
     "point-lookahead-schedule.tsv", "v8-mutex-diagnostic-schedule.tsv",
+    "point-borrowed-input-schedule.tsv",
     "commit-order-trace-analysis.json", "commit.txt", "remote-exit.json",
     "finished_utc.txt", "remote-finished-utc.txt", "remote-status.txt", "host.txt",
     "os-release.txt", "uname.txt", "lscpu.txt", "lsblk.txt", "findmnt.txt", "df.txt",
     "setup.log", "rust-toolchain.txt", "rust-toolchain.toml", "write-perf.sha256", "source-patch.sha256",
-    "perf-version.txt",
+    "perf-version.txt", "baseline-binary.sha256", "candidate-binary.sha256", "baseline-commit.txt",
 }
 run_names = {
     "result.json", "run-metadata.json", "environment.txt", "start_utc.txt", "end_utc.txt",
@@ -1062,6 +1069,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                              help="Compare V8 1 MiB fallocate vs Point-only lookahead, with batch guardrails")
     suite_group.add_argument("--v8-mutex-diagnostic", action="store_true",
                              help="Run five paired V7/V8 Point runs with sampled hot-mutex diagnostics")
+    suite_group.add_argument("--v8-point-borrowed-input-ab", action="store_true",
+                             help="Compare V8 Point owned vs borrowed preparation with Batch16/64 guardrails")
+    parser.add_argument("--baseline-commit", help="Full source commit used as the borrowed-input A/B baseline")
     parser.add_argument("--source-patch-sha256",
                         help="SHA-256 of the exact source patch used for a commit-order trace run")
     parser.add_argument("--network", help="Existing VPC to use (default: default)")
@@ -1085,12 +1095,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if args.num is None:
         args.num = (
+            POINT_BORROWED_INPUT_NUM if args.v8_point_borrowed_input_ab else
             V8_MUTEX_DIAGNOSTIC_NUM if args.v8_mutex_diagnostic else
             COMMIT_ORDER_TRACE_NUM if args.commit_order_trace else 750_000
         )
     if args.machine_type is None:
         args.machine_type = "c4-standard-16-lssd" if (
             args.commit_order_trace or args.v8_point_lookahead_ab or args.v8_mutex_diagnostic
+            or args.v8_point_borrowed_input_ab
         ) else MACHINE_TYPE
     args.network = args.network or "default"
     if args.writers is None:
@@ -1100,6 +1112,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             args.writers = V8_MUTEX_DIAGNOSTIC_WRITERS
         elif args.v8_point_lookahead_ab:
             args.writers = (POINT_LOOKAHEAD_WRITERS,)
+        elif args.v8_point_borrowed_input_ab:
+            args.writers = POINT_BORROWED_INPUT_WRITERS
         elif args.v8_small_ticket_profile:
             args.writers = (1, 8, 16)
         else:
@@ -1118,12 +1132,18 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error("--v8-point-lookahead-ab requires exactly 16 writers")
     if args.v8_point_lookahead_ab and args.machine_type != "c4-standard-16-lssd":
         parser.error("--v8-point-lookahead-ab requires c4-standard-16-lssd")
+    if args.v8_point_borrowed_input_ab and args.writers != POINT_BORROWED_INPUT_WRITERS:
+        parser.error(f"--v8-point-borrowed-input-ab requires writers {POINT_BORROWED_INPUT_WRITERS}")
+    if args.v8_point_borrowed_input_ab and args.machine_type != "c4-standard-16-lssd":
+        parser.error("--v8-point-borrowed-input-ab requires c4-standard-16-lssd")
     if not re.fullmatch(r"[0-9a-fA-F]{40}", args.commit):
         parser.error("--commit must be a full 40-character SHA")
     if args.num < 64:
         parser.error("--num must be at least 64")
     if (args.full_rfc026_matrix or args.v8_small_ticket_profile or args.v8_point_lookahead_ab) and args.num != 750_000:
         parser.error("the selected multi-workload suite uses fixed operation counts; omit --num overrides")
+    if args.v8_point_borrowed_input_ab and args.num != POINT_BORROWED_INPUT_NUM:
+        parser.error(f"--v8-point-borrowed-input-ab uses a fixed {POINT_BORROWED_INPUT_NUM}-put workload")
     if args.v8_mutex_diagnostic and args.num != V8_MUTEX_DIAGNOSTIC_NUM:
         parser.error(f"--v8-mutex-diagnostic uses a fixed {V8_MUTEX_DIAGNOSTIC_NUM}-put workload")
     if args.commit_order_trace and args.num != COMMIT_ORDER_TRACE_NUM:
@@ -1132,8 +1152,17 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         not args.source_patch_sha256 or not re.fullmatch(r"[0-9a-f]{64}", args.source_patch_sha256)
     ):
         parser.error("--commit-order-trace requires --source-patch-sha256 with 64 lowercase hex characters")
-    if not args.commit_order_trace and args.source_patch_sha256:
-        parser.error("--source-patch-sha256 is only valid with --commit-order-trace")
+    if args.v8_point_borrowed_input_ab and (
+        not args.source_patch_sha256 or not re.fullmatch(r"[0-9a-f]{64}", args.source_patch_sha256)
+    ):
+        parser.error("--v8-point-borrowed-input-ab requires --source-patch-sha256 with 64 lowercase hex characters")
+    if args.v8_point_borrowed_input_ab:
+        if not args.baseline_commit or not re.fullmatch(r"[0-9a-fA-F]{40}", args.baseline_commit):
+            parser.error("--v8-point-borrowed-input-ab requires --baseline-commit with a full 40-character SHA")
+    elif args.baseline_commit:
+        parser.error("--baseline-commit is only valid with --v8-point-borrowed-input-ab")
+    if not (args.commit_order_trace or args.v8_point_borrowed_input_ab) and args.source_patch_sha256:
+        parser.error("--source-patch-sha256 is only valid with trace or borrowed-input A/B suites")
     if not MIN_RUNTIME_MINUTES <= args.max_runtime_minutes <= MAX_RUNTIME_MINUTES:
         parser.error(f"--max-runtime-minutes must be between {MIN_RUNTIME_MINUTES} and {MAX_RUNTIME_MINUTES}")
     if (args.estimated_hourly_cost_usd is None) != (args.max_estimated_spend_usd is None):
@@ -1246,7 +1275,7 @@ def _run_identifier(row: dict[str, Any], suite: str) -> str:
         return f"w{row['writer']}-b{row['block']}-p{row['position']}-{row['arm']}"
     if suite == "commit-order-trace":
         return f"w{row['writer']}-{row['workload']}-{row['phase']}-r{row['repetition']}-{row['arm']}"
-    if suite == "v8-point-lookahead":
+    if suite in ("v8-point-lookahead", "v8-point-borrowed-input"):
         return f"w{row['writer']}-{row['workload']}-r{row['repetition']}-{row['arm']}"
     if suite == "v8-mutex-diagnostic":
         return f"w{row['writer']}-{row['workload']}-r{row['repetition']}-{row['arm']}"
@@ -1265,7 +1294,7 @@ def _summary_row_identifier(row: dict[str, Any], suite: str) -> str:
             f"w{int(row['writer'])}-{row['workload']}-{row['phase']}-r{int(row['repetition'])}-"
             f"{row['arm']}"
         )
-    if suite == "v8-point-lookahead":
+    if suite in ("v8-point-lookahead", "v8-point-borrowed-input"):
         return f"w{int(row['writer'])}-{row['workload']}-r{int(row['repetition'])}-{row['arm']}"
     if suite == "v8-mutex-diagnostic":
         return f"w{int(row['writer'])}-{row['workload']}-r{int(row['repetition'])}-{row['arm']}"
@@ -1290,6 +1319,13 @@ def _expected_run_metadata(row: dict[str, Any], suite: str) -> dict[str, Any]:
             key: row[key] for key in (
                 "writer", "workload", "repetition", "arm", "bench", "batch_entries", "batch_size",
                 "num", "sample_every", "extent_mode", "extent_window_bytes",
+            )
+        }
+    if suite == "v8-point-borrowed-input":
+        return {
+            key: row[key] for key in (
+                "writer", "workload", "repetition", "arm", "bench", "batch_entries", "batch_size",
+                "num", "sample_every", "extent_mode", "extent_window_bytes", "frontier_mode",
             )
         }
     if suite == "v8-mutex-diagnostic":
@@ -1337,6 +1373,60 @@ def _verify_result_set(results: Path) -> dict[str, Any]:
                 schedule = build_rfc026_schedule(plan["writers"])
             elif suite == "v8-point-lookahead":
                 schedule = build_point_lookahead_schedule(plan["writers"])
+            elif suite == "v8-point-borrowed-input":
+                schedule = build_point_borrowed_input_schedule(plan["writers"])
+                if not isinstance(plan.get("candidate_commit"), str) or not re.fullmatch(
+                    r"[0-9a-f]{40}", plan["candidate_commit"]
+                ):
+                    errors.append("borrowed-input plan has an invalid candidate commit")
+                if not isinstance(plan.get("baseline_commit"), str) or not re.fullmatch(
+                    r"[0-9a-f]{40}", plan["baseline_commit"]
+                ):
+                    errors.append("borrowed-input plan has an invalid baseline commit")
+                patch_sha_path = results / "source-patch.sha256"
+                try:
+                    patch_sha = patch_sha_path.read_text(encoding="utf-8").strip()
+                except OSError as error:
+                    patch_sha = ""
+                    errors.append(f"borrowed-input patch checksum is missing: {error}")
+                if not re.fullmatch(r"[0-9a-f]{64}", patch_sha) or plan.get("source_patch_sha256") != patch_sha:
+                    errors.append("borrowed-input patch checksum does not match its plan")
+                try:
+                    baseline_sha = (results / "baseline-binary.sha256").read_text(encoding="utf-8").strip()
+                    candidate_sha = (results / "candidate-binary.sha256").read_text(encoding="utf-8").strip()
+                except OSError as error:
+                    baseline_sha = candidate_sha = ""
+                    errors.append(f"borrowed-input binary checksum is missing: {error}")
+                if not re.fullmatch(r"[0-9a-f]{64}", baseline_sha):
+                    errors.append("borrowed-input baseline binary checksum is invalid")
+                if not re.fullmatch(r"[0-9a-f]{64}", candidate_sha):
+                    errors.append("borrowed-input candidate binary checksum is invalid")
+                expected_plan = build_point_borrowed_input_plan(
+                    writers=plan.get("writers", ()),
+                    machine_type=plan.get("machine_type", ""),
+                    machine_spec={
+                        "vcpus": plan.get("vcpus", 0), "ssd_count": plan.get("local_ssd_count", 0),
+                        "ssd_gib": plan.get("local_ssd_total_gib", 0),
+                    },
+                    baseline_commit=plan.get("baseline_commit", ""),
+                    candidate_commit=plan.get("candidate_commit", ""),
+                    source_patch_sha256=patch_sha,
+                    baseline_binary_sha256=baseline_sha,
+                    candidate_binary_sha256=candidate_sha,
+                )
+                for key, value in expected_plan.items():
+                    if plan.get(key) != value:
+                        errors.append(f"borrowed-input plan field {key} does not match the fixed suite")
+                if summary.get("suite") != suite or summary.get("source_commit") != plan.get("candidate_commit"):
+                    errors.append("borrowed-input summary source metadata is invalid")
+                if summary.get("baseline_commit") != plan.get("baseline_commit"):
+                    errors.append("borrowed-input summary baseline commit does not match the plan")
+                if summary.get("source_patch_sha256") != patch_sha:
+                    errors.append("borrowed-input summary patch checksum does not match the plan")
+                if summary.get("baseline_binary_sha256") != baseline_sha or (
+                    summary.get("candidate_binary_sha256") != candidate_sha
+                ):
+                    errors.append("borrowed-input summary binary checksums do not match the plan")
             elif suite == "batch64":
                 schedule = build_batch64_schedule(plan["writers"])
             elif suite == "commit-order-trace":
@@ -1636,6 +1726,57 @@ def _verify_result_set(results: Path) -> dict[str, Any]:
                             )
                     except (KeyError, AttributeError, TypeError, ValueError) as error:
                         errors.append(f"run {run_id} result parameters are invalid: {error}")
+                elif suite == "v8-point-borrowed-input" and isinstance(record, dict):
+                    try:
+                        identity = expected[run_id]
+                        result = record["result"]
+                        params = record["params"]
+                        expected_params = {
+                            "num": identity["num"], "threads": identity["writer"], "value_size": 1024,
+                            "batch_size": identity["batch_size"], "wal_format_version": 8,
+                            "wal_io_mode": "parallel",
+                        }
+                        if int(result["ops"]) != identity["num"] or any(
+                            params.get(key) != value for key, value in expected_params.items()
+                        ):
+                            raise ValueError("benchmark params do not match the borrowed-input plan")
+                        wanted_commit = plan[
+                            "baseline_commit" if identity["arm"] == "v8_owned_baseline" else "candidate_commit"
+                        ]
+                        wanted_binary = plan[
+                            "baseline_binary_sha256" if identity["arm"] == "v8_owned_baseline"
+                            else "candidate_binary_sha256"
+                        ]
+                        if metadata.get("source_commit") != wanted_commit or (
+                            metadata.get("binary_sha256") != wanted_binary
+                        ):
+                            raise ValueError("run source/binary identity does not match its planned arm")
+                        pipeline = result["wal_pipeline"]
+                        if pipeline.get("wal_io_stable") is not True:
+                            raise ValueError("WAL I/O metadata changed during the run")
+                        for boundary in ("wal_io_start", "wal_io_end"):
+                            preparation = pipeline[boundary]["sliding_extent_preparation"]
+                            if preparation.get("mode") != "sliding-point-lookahead" or (
+                                preparation.get("window_bytes") != POINT_LOOKAHEAD_WINDOW_BYTES
+                            ):
+                                raise ValueError(f"{boundary} does not report the planned Point lookahead")
+                        final_preparation = pipeline["wal_io_end"]["sliding_extent_preparation"]
+                        initialized_bytes = final_preparation.get("initialized_bytes")
+                        should_initialize = identity["workload"] == "point"
+                        if type(initialized_bytes) is not int or (initialized_bytes > 0) != should_initialize:
+                            raise ValueError("extent initialization does not match the planned Point/Batch cell")
+                        expected_env = (
+                            "TOYKV_BENCH_V8_EXTENT_PREP=sliding-point-lookahead\n"
+                            "TOYKV_BENCH_V8_EXTENT_PREP_BYTES=1048576\n"
+                            "TOYKV_WAL_V8_FRONTIER_MODE=direct\n"
+                        )
+                        if (run_dir / "environment.txt").read_text(encoding="utf-8") != expected_env:
+                            raise ValueError("Point borrowed-input run environment differs from the fixed suite")
+                        summary_row = summary_by_id.get(run_id)
+                        if summary_row is None or summary_row != metadata:
+                            raise ValueError("summary row differs from borrowed-input run metadata")
+                    except (KeyError, AttributeError, TypeError, ValueError) as error:
+                        errors.append(f"run {run_id} borrowed-input result is invalid: {error}")
                 elif suite == "v8-mutex-diagnostic" and isinstance(record, dict):
                     try:
                         identity = expected[run_id]
@@ -1700,6 +1841,10 @@ def _verify_result_set(results: Path) -> dict[str, Any]:
             validation = validate_point_lookahead_rows(summary.get("results", []), plan["writers"])
             if validation != summary.get("matrix_validation"):
                 errors.append("Point lookahead matrix validation does not match its per-run results")
+        elif suite == "v8-point-borrowed-input":
+            validation = validate_point_borrowed_input_rows(summary.get("results", []), plan["writers"])
+            if validation != summary.get("matrix_validation"):
+                errors.append("borrowed-input matrix validation does not match its per-run results")
         elif suite == "v8-mutex-diagnostic":
             validation = validate_v8_mutex_diagnostic_rows(summary.get("results", []))
             if validation != summary.get("matrix_validation"):
@@ -2046,6 +2191,7 @@ def provision_and_run(
     trace_suite = getattr(args, "commit_order_trace", False)
     point_lookahead_suite = getattr(args, "v8_point_lookahead_ab", False)
     mutex_diagnostic_suite = getattr(args, "v8_mutex_diagnostic", False)
+    point_borrowed_input_suite = getattr(args, "v8_point_borrowed_input_ab", False)
     missing_tools = [tool for tool in ("ssh", "scp", "ssh-keygen") if not shutil.which(tool)]
     if missing_tools:
         raise BenchError("Required local tools are missing: " + ", ".join(missing_tools))
@@ -2310,6 +2456,16 @@ def provision_and_run(
                 append_local_log(key_log, mutex_copy.stdout + mutex_copy.stderr)
                 if mutex_copy.returncode:
                     raise BenchError(f"Could not copy mutex diagnostic runner: {mutex_copy.stderr.strip()}")
+            if point_borrowed_input_suite:
+                if not POINT_BORROWED_INPUT_RUNNER.is_file():
+                    raise BenchError(f"Borrowed-input helper is missing: {POINT_BORROWED_INPUT_RUNNER}")
+                borrowed_copy = scp_to_vm(
+                    ip, POINT_BORROWED_INPUT_RUNNER, "/tmp/gcp-v8-point-borrowed-input-runner.py",
+                    key, known_hosts, timeout=120,
+                )
+                append_local_log(key_log, borrowed_copy.stdout + borrowed_copy.stderr)
+                if borrowed_copy.returncode:
+                    raise BenchError(f"Could not copy borrowed-input helper: {borrowed_copy.stderr.strip()}")
 
             safe_deadline_epoch = int(deadline_epoch - 600)
             remote_command = "sudo -n bash /tmp/run-wal-bench.sh " + shlex.join([
@@ -2317,14 +2473,17 @@ def provision_and_run(
                 args.machine_type, ",".join(str(writer) for writer in args.writers),
                 "v8-small-ticket-profile" if profile_suite else (
                     "commit-order-trace" if trace_suite else (
-                        "v8-mutex-diagnostic" if mutex_diagnostic_suite else (
-                            "v8-point-lookahead" if point_lookahead_suite else (
-                                "rfc026-full" if args.full_rfc026_matrix else "batch64"
+                        "v8-point-borrowed-input" if point_borrowed_input_suite else (
+                            "v8-mutex-diagnostic" if mutex_diagnostic_suite else (
+                                "v8-point-lookahead" if point_lookahead_suite else (
+                                    "rfc026-full" if args.full_rfc026_matrix else "batch64"
+                                )
                             )
                         )
                     )
                 ),
                 args.source_patch_sha256 or "-",
+                getattr(args, "baseline_commit", "").lower() if getattr(args, "baseline_commit", None) else "-",
             ])
             remaining = max(30, int(deadline - time.monotonic()))
             try:
@@ -2507,6 +2666,16 @@ def main(argv: list[str] | None = None) -> int:
                 machine_type=args.machine_type,
                 machine_spec=MACHINE_SPECS[args.machine_type],
                 commit=args.commit.lower(),
+            )
+        elif args.v8_point_borrowed_input_ab:
+            report["benchmark_suite"] = "v8-point-borrowed-input"
+            report["benchmark_plan"] = build_point_borrowed_input_plan(
+                writers=args.writers,
+                machine_type=args.machine_type,
+                machine_spec=MACHINE_SPECS[args.machine_type],
+                baseline_commit=args.baseline_commit.lower(),
+                candidate_commit=args.commit.lower(),
+                source_patch_sha256=args.source_patch_sha256,
             )
         else:
             report["benchmark_suite"] = "rfc026-full" if args.full_rfc026_matrix else "batch64"

@@ -56,6 +56,20 @@ POINT_LOOKAHEAD_REPETITIONS = 5
 POINT_LOOKAHEAD_WRITERS = 16
 POINT_LOOKAHEAD_WINDOW_BYTES = 1 << 20
 
+POINT_BORROWED_INPUT_WRITERS = (1, 8, 16)
+POINT_BORROWED_INPUT_REPETITIONS = 5
+POINT_BORROWED_INPUT_NUM = 100_000
+POINT_BORROWED_INPUT_WORKLOADS = (
+    {"name": "point", "bench": "wal_concurrent", "batch_entries": 1, "batch_size": None},
+    {"name": "batch16", "bench": "wal_batch_concurrent", "batch_entries": 16, "batch_size": 16},
+    {"name": "batch64", "bench": "wal_batch_concurrent", "batch_entries": 64, "batch_size": 64},
+)
+POINT_BORROWED_INPUT_ARMS = ("v8_owned_baseline", "v8_borrowed_candidate")
+POINT_BORROWED_INPUT_ORDERS = (
+    ("v8_owned_baseline", "v8_borrowed_candidate"),
+    ("v8_borrowed_candidate", "v8_owned_baseline"),
+)
+
 V8_MUTEX_DIAGNOSTIC_WRITERS = (16,)
 V8_MUTEX_DIAGNOSTIC_REPETITIONS = 5
 V8_MUTEX_DIAGNOSTIC_NUM = 100_000
@@ -214,6 +228,115 @@ def build_point_lookahead_plan(
     if binary_sha256 is not None:
         plan["binary_sha256"] = binary_sha256
     return plan
+
+
+def build_point_borrowed_input_schedule(writers: Iterable[int]) -> list[dict[str, object]]:
+    """Build paired Point and Batch guardrail runs for the borrowed-input change."""
+    writer_counts = validate_writer_counts(writers)
+    if writer_counts != POINT_BORROWED_INPUT_WRITERS:
+        raise ValueError(f"borrowed-input suite requires writers {POINT_BORROWED_INPUT_WRITERS}")
+    schedule: list[dict[str, object]] = []
+    cells = [(writer, POINT_BORROWED_INPUT_WORKLOADS[0]) for writer in writer_counts]
+    cells.extend((16, workload) for workload in POINT_BORROWED_INPUT_WORKLOADS[1:])
+    for writer, workload in cells:
+        for repetition in range(1, POINT_BORROWED_INPUT_REPETITIONS + 1):
+            order = POINT_BORROWED_INPUT_ORDERS[(repetition - 1) % len(POINT_BORROWED_INPUT_ORDERS)]
+            for arm in order:
+                schedule.append({
+                    "run_index": len(schedule) + 1,
+                    "writer": writer,
+                    "workload": workload["name"],
+                    "repetition": repetition,
+                    "arm": arm,
+                    "bench": workload["bench"],
+                    "batch_entries": workload["batch_entries"],
+                    "batch_size": workload["batch_size"],
+                    "num": POINT_BORROWED_INPUT_NUM,
+                    "sample_every": 100 if workload["name"] == "point" else 10,
+                    "extent_mode": "sliding-point-lookahead",
+                    "extent_window_bytes": POINT_LOOKAHEAD_WINDOW_BYTES,
+                    "frontier_mode": "direct",
+                })
+    return schedule
+
+
+def build_point_borrowed_input_plan(
+    *, writers: Iterable[int], machine_type: str, machine_spec: Mapping[str, int],
+    baseline_commit: str, candidate_commit: str, source_patch_sha256: str,
+    baseline_binary_sha256: str | None = None, candidate_binary_sha256: str | None = None,
+) -> dict[str, object]:
+    writer_counts = validate_writer_counts(writers)
+    schedule = build_point_borrowed_input_schedule(writer_counts)
+    vcpus = int(machine_spec["vcpus"])
+    ssd_count = int(machine_spec["ssd_count"])
+    layout = "single Local SSD" if ssd_count == 1 else f"RAID0 over {ssd_count} Local SSDs"
+    plan: dict[str, object] = {
+        "suite": "v8-point-borrowed-input",
+        "writers": list(writer_counts),
+        "workloads": [dict(workload, num=POINT_BORROWED_INPUT_NUM) for workload in POINT_BORROWED_INPUT_WORKLOADS],
+        "arms": list(POINT_BORROWED_INPUT_ARMS),
+        "repetitions_per_cell": POINT_BORROWED_INPUT_REPETITIONS,
+        "arm_orders": [list(order) for order in POINT_BORROWED_INPUT_ORDERS],
+        "runs_planned": len(schedule),
+        "score_runs_planned": len(schedule),
+        "counterbalanced": True,
+        "machine_type": machine_type,
+        "vcpus": vcpus,
+        "local_ssd_count": ssd_count,
+        "local_ssd_total_gib": int(machine_spec["ssd_gib"]),
+        "runtime_protocol": f"single {vcpus}-vCPU host; {layout}; both revisions built with the pinned toolchain",
+        "value_bytes": 1024,
+        "compaction": "none",
+        "baseline_commit": baseline_commit,
+        "candidate_commit": candidate_commit,
+        "source_patch_sha256": source_patch_sha256,
+        "extent_preparation": "sliding-point-lookahead, 1 MiB",
+        "frontier_mode": "direct",
+        "coalescing": "dynamic",
+        "qualification_note": (
+            "Only V8 Point preparation source differs. The candidate borrows the Point key/value during WAL "
+            "preparation; Point/Batch admission, frame jobs, durability, extent policy and frontier settings "
+            "are held fixed. Batch16/64 are paired regression guardrails."
+        ),
+    }
+    if baseline_binary_sha256 is not None:
+        plan["baseline_binary_sha256"] = baseline_binary_sha256
+    if candidate_binary_sha256 is not None:
+        plan["candidate_binary_sha256"] = candidate_binary_sha256
+    return plan
+
+
+def validate_point_borrowed_input_rows(rows: list[Mapping[str, object]], writers: Iterable[int]) -> dict[str, object]:
+    """Check every paired run identity, count and successful operation total."""
+    schedule = build_point_borrowed_input_schedule(writers)
+    expected = {
+        (row["writer"], row["workload"], row["repetition"], row["arm"]): row for row in schedule
+    }
+    observed: dict[tuple[object, object, object, object], int] = {}
+    invalid: list[Mapping[str, object]] = []
+    for row in rows:
+        identity = tuple(row.get(key) for key in ("writer", "workload", "repetition", "arm"))
+        observed[identity] = observed.get(identity, 0) + 1
+        if (
+            identity not in expected
+            or row.get("exit_code") != 0
+            or row.get("ops") != POINT_BORROWED_INPUT_NUM
+        ):
+            invalid.append(row)
+
+    expected_cells = set(expected)
+    observed_cells = set(observed)
+    return {
+        "complete": not (
+            expected_cells != observed_cells or any(count != 1 for count in observed.values()) or invalid
+        ),
+        "planned": len(schedule),
+        "observed": len(rows),
+        "missing_cells": [list(cell) for cell in sorted(expected_cells - observed_cells)],
+        "unexpected_cells": [list(cell) for cell in sorted(observed_cells - expected_cells, key=str)],
+        "duplicate_cells": [list(cell) for cell, count in observed.items() if count != 1],
+        "invalid_rows": [dict(row) for row in invalid],
+    }
 
 
 def build_v8_mutex_diagnostic_schedule() -> list[dict[str, object]]:

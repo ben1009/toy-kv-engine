@@ -24,6 +24,8 @@ from gcp_wal_matrix import (
     FULL_DEFAULT_WRITERS,
     LEGACY_DEFAULT_WRITERS,
     POINT_LOOKAHEAD_WRITERS,
+    POINT_BORROWED_INPUT_NUM,
+    POINT_BORROWED_INPUT_WRITERS,
     V8_MUTEX_DIAGNOSTIC_NUM,
     V8_MUTEX_DIAGNOSTIC_SAMPLE_EVERY,
     V8_MUTEX_DIAGNOSTIC_WRITERS,
@@ -33,12 +35,15 @@ from gcp_wal_matrix import (
     build_commit_order_trace_schedule,
     build_point_lookahead_plan,
     build_point_lookahead_schedule,
+    build_point_borrowed_input_plan,
+    build_point_borrowed_input_schedule,
     build_v8_mutex_diagnostic_plan,
     build_v8_mutex_diagnostic_schedule,
     build_rfc026_schedule,
     validate_commit_order_trace_rows,
     validate_batch64_rows,
     validate_point_lookahead_rows,
+    validate_point_borrowed_input_rows,
     validate_v8_mutex_diagnostic_rows,
     validate_rfc026_rows,
 )
@@ -520,6 +525,56 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
         )
         self.assertEqual(plan["runs_planned"], 40)
         self.assertEqual(plan["suite"], "v8-point-lookahead")
+
+    def test_point_borrowed_input_schedule_is_counterbalanced_and_limited_to_point_and_batch_guardrails(self) -> None:
+        schedule = build_point_borrowed_input_schedule(POINT_BORROWED_INPUT_WRITERS)
+        self.assertEqual(len(schedule), 50)
+        for writer in POINT_BORROWED_INPUT_WRITERS:
+            point_rows = [row for row in schedule if row["writer"] == writer and row["workload"] == "point"]
+            self.assertEqual(len(point_rows), 10)
+            for repetition in range(1, 6):
+                pair = [row["arm"] for row in point_rows if row["repetition"] == repetition]
+                expected = (
+                    ["v8_owned_baseline", "v8_borrowed_candidate"] if repetition % 2 else
+                    ["v8_borrowed_candidate", "v8_owned_baseline"]
+                )
+                self.assertEqual(pair, expected)
+        self.assertEqual(
+            {(row["writer"], row["workload"]) for row in schedule if row["workload"] != "point"},
+            {(16, "batch16"), (16, "batch64")},
+        )
+        rows = [{
+            "writer": row["writer"], "workload": row["workload"], "repetition": row["repetition"],
+            "arm": row["arm"], "ops": POINT_BORROWED_INPUT_NUM, "exit_code": 0,
+        } for row in schedule]
+        self.assertTrue(validate_point_borrowed_input_rows(rows, POINT_BORROWED_INPUT_WRITERS)["complete"])
+        self.assertFalse(
+            validate_point_borrowed_input_rows(rows[:-1], POINT_BORROWED_INPUT_WRITERS)["complete"]
+        )
+        with self.assertRaisesRegex(ValueError, "requires writers"):
+            build_point_borrowed_input_schedule((16,))
+        plan = build_point_borrowed_input_plan(
+            writers=POINT_BORROWED_INPUT_WRITERS, machine_type="c4-standard-16-lssd",
+            machine_spec=BENCH.MACHINE_SPECS["c4-standard-16-lssd"],
+            baseline_commit="1" * 40, candidate_commit="2" * 40, source_patch_sha256="a" * 64,
+        )
+        self.assertEqual(plan["runs_planned"], 50)
+        self.assertEqual(plan["suite"], "v8-point-borrowed-input")
+
+    def test_point_borrowed_input_cli_requires_fixed_pair_and_source_identity(self) -> None:
+        args = BENCH.parse_args([
+            "--project", "test-project", "--zone", "us-east1-b", "--commit", "2" * 40,
+            "--baseline-commit", "1" * 40, "--source-patch-sha256", "a" * 64,
+            "--v8-point-borrowed-input-ab", "--preflight-only",
+        ])
+        self.assertEqual(args.num, POINT_BORROWED_INPUT_NUM)
+        self.assertEqual(args.writers, POINT_BORROWED_INPUT_WRITERS)
+        self.assertEqual(args.machine_type, "c4-standard-16-lssd")
+        with self.assertRaises(SystemExit):
+            BENCH.parse_args([
+                "--project", "test-project", "--zone", "us-east1-b", "--commit", "2" * 40,
+                "--v8-point-borrowed-input-ab", "--preflight-only",
+            ])
 
     def test_point_lookahead_result_verifier_checks_workload_specific_initialization(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

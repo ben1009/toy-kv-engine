@@ -68,7 +68,8 @@ use super::{
     },
     prepare::{
         AdmittedWalV8Batch, EncodedWalV8Batch, PreparedWalV8Batch, WalV8AdmissionPlan,
-        WalV8AdmissionPublisher, WalV8BatchAssignment, WalV8DigestReady, WalV8WriteClass,
+        WalV8AdmissionPublisher, WalV8BatchAssignment, WalV8DigestReady, WalV8PointInput,
+        WalV8WriteClass,
     },
     resource::WalV8ReservationOwner,
 };
@@ -4021,22 +4022,38 @@ impl WalV8ParallelWriter {
         let limits = bounded_limits(limits);
 
         WalV8PreparedBatch::preflight_with_write_class(batch, limits, write_class, |bytes| {
-            ensure!(
-                bytes <= self.max_file_size,
-                WalV8LeaderCapacityError::GroupExceedsAdmissionWindow
-            );
-            let source = self
-                .reservation_owner
-                .as_ref()
-                .map(|owner| owner.reserve_preparation_buffer(bytes))
-                .transpose()?
-                .flatten();
-            let coordinator = self.coordinator.reserve_preparation(bytes)?;
+            self.reserve_preparation_buffer(bytes)
+        })
+    }
 
-            Ok(WalV8PreflightReservation {
-                _coordinator: coordinator,
-                _source: source,
-            })
+    pub(crate) fn preflight_point<'a>(
+        &self,
+        input: WalV8PointInput<'a>,
+        limits: WalV5Limits,
+    ) -> Result<WalV8PreparedBatch<'a>> {
+        ensure!(!self.is_poisoned(), "v8 Parallel WAL is poisoned");
+        let limits = bounded_limits(limits);
+        WalV8PreparedBatch::preflight_point(input, limits, |bytes| {
+            self.reserve_preparation_buffer(bytes)
+        })
+    }
+
+    fn reserve_preparation_buffer(&self, bytes: u64) -> Result<WalV8PreflightReservation> {
+        ensure!(
+            bytes <= self.max_file_size,
+            WalV8LeaderCapacityError::GroupExceedsAdmissionWindow
+        );
+        let source = self
+            .reservation_owner
+            .as_ref()
+            .map(|owner| owner.reserve_preparation_buffer(bytes))
+            .transpose()?
+            .flatten();
+        let coordinator = self.coordinator.reserve_preparation(bytes)?;
+
+        Ok(WalV8PreflightReservation {
+            _coordinator: coordinator,
+            _source: source,
         })
     }
 
