@@ -610,6 +610,56 @@ pub(crate) fn encode_frontier_successor(
     )
 }
 
+
+/// Finalize a single DATA frame whose logical payload was already encoded
+/// in-place at offset 64+24.  Unlike encode_frame_into this never clears or
+/// copies that payload. The existing structural validation and frame CRC are
+/// applied unchanged.
+pub(crate) fn finish_preencoded_data_fragment_frame_in_place(
+    physical_header_digest: [u8; 32],
+    initial_prefix_digest: digest::WalV8Digest,
+    frame_offset: u64,
+    fragment: WalV8DataFragmentHeader,
+    payload_len: usize,
+    output: &mut [u8],
+) -> Result<()> {
+    fragment.validate_payload_len(payload_len)?;
+    ensure!(
+        fragment.fragment_count == 1 && fragment.fragment_index == 0,
+        "in-place DATA framing requires a single fragment"
+    );
+    ensure!(output.len() == WAL_V8_FRAME_LEN, "invalid in-place DATA frame buffer");
+    validate_frame_offset(frame_offset)?;
+    let body_len = WAL_V8_DATA_FRAGMENT_HEADER_LEN
+        .checked_add(payload_len)
+        .context("in-place DATA frame body length overflows")?;
+    WalV8FrameKind::Data.validate_body_len(body_len)?;
+    let body_end = WAL_V8_FRAME_HEADER_LEN
+        .checked_add(body_len)
+        .context("in-place DATA frame body end overflows")?;
+    ensure!(body_end <= output.len(), "in-place DATA payload exceeds frame");
+
+    // Preserve bytes [88..body_end] written by the logical encoder.
+    output[..WAL_V8_FRAME_HEADER_LEN + WAL_V8_DATA_FRAGMENT_HEADER_LEN].fill(0);
+    output[body_end..].fill(0);
+    output[..8].copy_from_slice(&WAL_V8_FRAME_MAGIC);
+    output[8..10].copy_from_slice(&WAL_V8_FRAME_VERSION.to_be_bytes());
+    output[10..12].copy_from_slice(&WAL_V8_FRAME_KIND_DATA.to_be_bytes());
+    output[12..14].copy_from_slice(&(WAL_V8_FRAME_HEADER_LEN as u16).to_be_bytes());
+    output[16..48].copy_from_slice(&physical_header_digest);
+    output[48..56].copy_from_slice(&frame_offset.to_be_bytes());
+    output[56..60].copy_from_slice(&u32::try_from(body_len)?.to_be_bytes());
+    let body = &mut output[WAL_V8_FRAME_HEADER_LEN..body_end];
+    body[0..8].copy_from_slice(&fragment.segment_ticket.to_be_bytes());
+    body[8..12].copy_from_slice(&fragment.fragment_index.to_be_bytes());
+    body[12..16].copy_from_slice(&fragment.fragment_count.to_be_bytes());
+    body[16..24].copy_from_slice(&fragment.batch_bytes.to_be_bytes());
+    WalV8FrameKind::Data.validate_position(body, &initial_prefix_digest, frame_offset)?;
+    let crc = frame_crc(output);
+    output[60..64].copy_from_slice(&crc.to_be_bytes());
+    Ok(())
+}
+
 /// Decode and validate a frame envelope. This does not prove DATA fragment
 /// sequence completeness or a nonzero FRONTIER's predecessor chain.
 pub(crate) fn decode_frame_structural(
