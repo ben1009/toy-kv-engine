@@ -24,7 +24,7 @@ from gcp_wal_matrix import (
     validate_point_borrowed_input_rows,
 )
 
-RUN_TIMEOUT_SECONDS = 900
+RUN_TIMEOUT_SECONDS = 300
 
 
 def _run_id(row: dict[str, Any]) -> str:
