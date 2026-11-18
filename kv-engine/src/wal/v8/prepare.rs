@@ -896,20 +896,55 @@ mod tests {
 
     #[test]
     fn direct_point_frame_is_byte_identical_to_existing_encoder() -> Result<()> {
-        for value_len in [0_usize, 1024, 3900] {
-            let mut value = vec![0x5a; value_len + 1];
-            value[0] = crate::vlog::KvKind::Inline as u8;
-            let batch = WalBatch {
+        let recorded_at = RecordedAt {
+            secs: 123,
+            nanos: 456,
+        };
+        let mut cases = [0_usize, 1024, 3900]
+            .into_iter()
+            .map(|value_len| {
+                let mut value = vec![0x5a; value_len + 1];
+                value[0] = crate::vlog::KvKind::Inline as u8;
+                (
+                    "inline Put",
+                    WalBatch {
+                        commit_ts: 17,
+                        recorded_at,
+                        entries: vec![crate::pitr::WalEntry::Put {
+                            key: b"point".to_vec(),
+                            value,
+                        }],
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        cases.push((
+            "PointDelete",
+            WalBatch {
                 commit_ts: 17,
-                recorded_at: RecordedAt {
-                    secs: 123,
-                    nanos: 456,
-                },
+                recorded_at,
+                entries: vec![crate::pitr::WalEntry::PointDelete {
+                    key: b"point".to_vec(),
+                }],
+            },
+        ));
+        cases.push((
+            "TTL inline Put",
+            WalBatch {
+                commit_ts: 17,
+                recorded_at,
                 entries: vec![crate::pitr::WalEntry::Put {
                     key: b"point".to_vec(),
-                    value,
+                    value: crate::vlog::encode_ttl_value(
+                        crate::vlog::KvKind::TtlInline,
+                        1_800_000_000,
+                        b"ttl-value",
+                    ),
                 }],
-            };
+            },
+        ));
+
+        for (case_name, batch) in cases {
             let limits = crate::pitr::LIVE_WAL_V5_LIMITS;
             let prepared =
                 PreparedWalV8Batch::<TestPreparationReservation>::preflight_with_write_class(
@@ -943,12 +978,17 @@ mod tests {
             let mut expected = vec![0; codec::WAL_V8_FRAME_LEN];
             assert_eq!(
                 normal.encode_data_frames_into(&mut expected)?,
-                expected.len()
+                expected.len(),
+                "unexpected encoded length for {case_name}"
             );
-            assert_eq!(direct_frame.as_slice(), expected.as_slice());
-            assert_eq!(direct.digest_ready()?, normal.digest_ready()?);
-            assert_eq!(direct.entry_digest(), normal.entry_digest());
-            assert_eq!(direct.batch_digest(), normal.batch_digest());
+            assert_eq!(direct_frame.as_slice(), expected.as_slice(), "{case_name}");
+            assert_eq!(
+                direct.digest_ready()?,
+                normal.digest_ready()?,
+                "{case_name}"
+            );
+            assert_eq!(direct.entry_digest(), normal.entry_digest(), "{case_name}");
+            assert_eq!(direct.batch_digest(), normal.batch_digest(), "{case_name}");
             direct.disarm_after_durable();
             normal.disarm_after_durable();
         }
