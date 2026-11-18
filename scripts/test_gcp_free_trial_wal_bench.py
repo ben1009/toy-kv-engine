@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import csv
+import hashlib
 import importlib.util
 from io import BytesIO, StringIO
 import json
@@ -525,16 +526,19 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
         for failed, expected_started in ((False, 8), (True, 1)):
             with self.subTest(failed=failed), tempfile.TemporaryDirectory() as temporary:
                 results_dir = Path(temporary) / "results"
+                binary = Path(temporary) / "write-perf"
+                binary.write_bytes(b"fake benchmark executable")
+                binary_sha256 = hashlib.sha256(binary.read_bytes()).hexdigest()
                 args = SimpleNamespace(
-                    binary=Path("write-perf"),
+                    binary=binary,
                     results_dir=results_dir,
                     db_root=Path(temporary) / "databases",
                     safe_deadline_epoch=9_999_999_999,
                     commit="a" * 40,
-                    binary_sha256="b" * 64,
+                    binary_sha256=binary_sha256,
                     machine_type="c4-standard-16-lssd",
-                    ssd_count=1,
-                    ssd_gib=375,
+                    ssd_count=2,
+                    ssd_gib=750,
                 )
                 row = {"exit_code": 65 if failed else 0}
                 summary = {"complete": not failed}
@@ -547,6 +551,11 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
                 remote_exit = json.loads((results_dir / "remote-exit.json").read_text(encoding="utf-8"))
                 self.assertEqual(exit_code, int(failed))
                 self.assertEqual(remote_exit, {"failed": failed, "runs_started": expected_started})
+                self.assertEqual((results_dir / "commit.txt").read_text(encoding="utf-8"), "a" * 40 + "\n")
+                self.assertEqual(
+                    (results_dir / "write-perf.sha256").read_text(encoding="utf-8"),
+                    binary_sha256 + "\n",
+                )
 
     def test_v8_mutex_diagnostic_schedule_and_validation_are_counterbalanced(self) -> None:
         schedule = build_v8_mutex_diagnostic_schedule()

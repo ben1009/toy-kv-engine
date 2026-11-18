@@ -6,6 +6,7 @@ from __future__ import annotations
 import csv
 import argparse
 from datetime import datetime, timezone
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -385,6 +386,18 @@ def _summarize(rows: list[dict[str, Any]], planned: int) -> dict[str, Any]:
 def run_suite(args: Any) -> int:
     args.results_dir.mkdir(parents=True, exist_ok=True)
     args.db_root.mkdir(parents=True, exist_ok=True)
+    if not isinstance(args.commit, str) or len(args.commit) != 40 or any(
+        character not in "0123456789abcdef" for character in args.commit
+    ):
+        raise ValueError("source commit must be a full lowercase Git SHA")
+    binary_digest = hashlib.sha256()
+    with args.binary.open("rb") as binary:
+        for chunk in iter(lambda: binary.read(1024 * 1024), b""):
+            binary_digest.update(chunk)
+    if binary_digest.hexdigest() != args.binary_sha256:
+        raise ValueError("write-perf binary SHA-256 does not match the benchmark plan")
+    (args.results_dir / "commit.txt").write_text(args.commit + "\n", encoding="utf-8")
+    (args.results_dir / "write-perf.sha256").write_text(args.binary_sha256 + "\n", encoding="utf-8")
     schedule = build_v8_point_cpu_attribution_schedule()
     machine_spec = {
         "vcpus": int(args.machine_type.split("-")[2]), "ssd_count": args.ssd_count, "ssd_gib": args.ssd_gib,
