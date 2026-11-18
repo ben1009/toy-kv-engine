@@ -1137,6 +1137,9 @@ struct WalPipelineRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     v8_data_submit_order: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    v8_point_direct_frame_enabled: Option<bool>,
+    v8_point_direct_frame_encoded_count: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
     v8_hol_diagnostics_enabled: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     v8_completion_timeline: Option<WalV8CompletionTimelineRunRecord>,
@@ -1957,6 +1960,13 @@ fn wal_pipeline_record(
                     _ => "ticket_prefix",
                 },
             ),
+        v8_point_direct_frame_enabled: (wal_run_info.format_version == 8
+            && wal_run_info.io_mode == "parallel")
+            .then_some(
+                cfg!(feature = "bench")
+                    && std::env::var("TOYKV_BENCH_V8_POINT_DIRECT_FRAME").as_deref() == Ok("1"),
+            ),
+        v8_point_direct_frame_encoded_count: profile.wal_v8_point_direct_frame_encoded,
         v8_hol_diagnostics_enabled: (wal_run_info.format_version == 8
             && wal_run_info.io_mode == "parallel")
             .then_some(hol_diagnostics_enabled),

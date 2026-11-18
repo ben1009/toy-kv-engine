@@ -70,6 +70,15 @@ POINT_BORROWED_INPUT_ORDERS = (
     ("v8_borrowed_candidate", "v8_owned_baseline"),
 )
 
+POINT_DIRECT_FRAME_WRITERS = (1, 8, 16)
+POINT_DIRECT_FRAME_REPETITIONS = 5
+POINT_DIRECT_FRAME_NUM = 100_000
+POINT_DIRECT_FRAME_ARMS = ("direct_frame_off", "direct_frame_on")
+POINT_DIRECT_FRAME_ORDERS = (
+    ("direct_frame_off", "direct_frame_on"),
+    ("direct_frame_on", "direct_frame_off"),
+)
+
 V8_MUTEX_DIAGNOSTIC_WRITERS = (16,)
 V8_MUTEX_DIAGNOSTIC_REPETITIONS = 5
 V8_MUTEX_DIAGNOSTIC_NUM = 100_000
@@ -256,6 +265,7 @@ def build_point_borrowed_input_schedule(writers: Iterable[int]) -> list[dict[str
                     "extent_mode": "sliding-point-lookahead",
                     "extent_window_bytes": POINT_LOOKAHEAD_WINDOW_BYTES,
                     "frontier_mode": "direct",
+                    "point_direct_frame_enabled": False,
                 })
     return schedule
 
@@ -311,6 +321,121 @@ def validate_point_borrowed_input_rows(rows: list[Mapping[str, object]], writers
     schedule = build_point_borrowed_input_schedule(writers)
     expected = {
         (row["writer"], row["workload"], row["repetition"], row["arm"]): row for row in schedule
+    }
+
+
+def build_point_direct_frame_schedule(writers: Iterable[int]) -> list[dict[str, object]]:
+    """Build same-binary direct-frame A/B runs and Point/Batch guardrails."""
+    writer_counts = validate_writer_counts(writers)
+    if writer_counts != POINT_DIRECT_FRAME_WRITERS:
+        raise ValueError(f"direct-frame suite requires writers {POINT_DIRECT_FRAME_WRITERS}")
+    schedule: list[dict[str, object]] = []
+    cells = [(writer, POINT_BORROWED_INPUT_WORKLOADS[0]) for writer in writer_counts]
+    cells.extend((16, workload) for workload in POINT_BORROWED_INPUT_WORKLOADS[1:])
+    for writer, workload in cells:
+        for repetition in range(1, POINT_DIRECT_FRAME_REPETITIONS + 1):
+            order = POINT_DIRECT_FRAME_ORDERS[(repetition - 1) % len(POINT_DIRECT_FRAME_ORDERS)]
+            for arm in order:
+                schedule.append({
+                    "run_index": len(schedule) + 1,
+                    "writer": writer,
+                    "workload": workload["name"],
+                    "repetition": repetition,
+                    "arm": arm,
+                    "bench": workload["bench"],
+                    "batch_entries": workload["batch_entries"],
+                    "batch_size": workload["batch_size"],
+                    "num": POINT_DIRECT_FRAME_NUM,
+                    "sample_every": 100 if workload["name"] == "point" else 10,
+                    "extent_mode": "sliding-point-lookahead",
+                    "extent_window_bytes": POINT_LOOKAHEAD_WINDOW_BYTES,
+                    "frontier_mode": "direct",
+                    "point_direct_frame_enabled": arm == "direct_frame_on",
+                })
+    return schedule
+
+
+def build_point_direct_frame_plan(
+    *, writers: Iterable[int], machine_type: str, machine_spec: Mapping[str, int],
+    commit: str, binary_sha256: str | None = None,
+) -> dict[str, object]:
+    writer_counts = validate_writer_counts(writers)
+    schedule = build_point_direct_frame_schedule(writer_counts)
+    vcpus = int(machine_spec["vcpus"])
+    ssd_count = int(machine_spec["ssd_count"])
+    layout = "single Local SSD" if ssd_count == 1 else f"RAID0 over {ssd_count} Local SSDs"
+    plan: dict[str, object] = {
+        "suite": "v8-point-direct-frame",
+        "writers": list(writer_counts),
+        "workloads": [dict(workload, num=POINT_DIRECT_FRAME_NUM) for workload in POINT_BORROWED_INPUT_WORKLOADS],
+        "arms": list(POINT_DIRECT_FRAME_ARMS),
+        "repetitions_per_cell": POINT_DIRECT_FRAME_REPETITIONS,
+        "arm_orders": [list(order) for order in POINT_DIRECT_FRAME_ORDERS],
+        "runs_planned": len(schedule),
+        "score_runs_planned": len(schedule),
+        "counterbalanced": True,
+        "machine_type": machine_type,
+        "vcpus": vcpus,
+        "local_ssd_count": ssd_count,
+        "local_ssd_total_gib": int(machine_spec["ssd_gib"]),
+        "runtime_protocol": f"single {vcpus}-vCPU host; {layout}; same binary and source for both arms",
+        "value_bytes": 1024,
+        "compaction": "none",
+        "commit": commit,
+        "binary_sha256": binary_sha256,
+        "extent_preparation": "sliding-point-lookahead, 1 MiB",
+        "frontier_mode": "direct",
+        "coalescing": "dynamic",
+        "point_direct_frame_ab": {
+            "environment_variable": "TOYKV_BENCH_V8_POINT_DIRECT_FRAME",
+            "baseline_value": "0",
+            "candidate_value": "1",
+        },
+        "qualification_note": (
+            "The direct-frame flag is the only A/B difference; both arms use the same bench binary. "
+            "Every Point put must report one completed direct-frame encode. Batch16 and Batch64 must report zero."
+        ),
+    }
+    return plan
+
+
+def validate_point_direct_frame_rows(
+    rows: list[Mapping[str, object]], writers: Iterable[int]
+) -> dict[str, object]:
+    """Check planned run identities, success counts, and actual encoder hits."""
+    schedule = build_point_direct_frame_schedule(writers)
+    expected = {
+        (row["writer"], row["workload"], row["repetition"], row["arm"]): row for row in schedule
+    }
+    observed: dict[tuple[object, object, object, object], int] = {}
+    invalid: list[Mapping[str, object]] = []
+    for row in rows:
+        identity = tuple(row.get(key) for key in ("writer", "workload", "repetition", "arm"))
+        observed[identity] = observed.get(identity, 0) + 1
+        expected_row = expected.get(identity)
+        should_encode = bool(expected_row and expected_row["point_direct_frame_enabled"])
+        expected_hits = POINT_DIRECT_FRAME_NUM if should_encode and row.get("workload") == "point" else 0
+        if (
+            expected_row is None
+            or row.get("exit_code") != 0
+            or row.get("ops") != POINT_DIRECT_FRAME_NUM
+            or row.get("point_direct_frame_enabled") != should_encode
+            or row.get("direct_frame_encoded_count") != expected_hits
+        ):
+            invalid.append(row)
+
+    expected_cells = set(expected)
+    observed_cells = set(observed)
+    return {
+        "complete": not (
+            expected_cells != observed_cells or any(count != 1 for count in observed.values()) or invalid
+        ),
+        "planned": len(schedule),
+        "observed": len(rows),
+        "missing_cells": [list(cell) for cell in sorted(expected_cells - observed_cells)],
+        "unexpected_cells": [list(cell) for cell in sorted(observed_cells - expected_cells, key=str)],
+        "duplicate_cells": [list(cell) for cell, count in observed.items() if count != 1],
+        "invalid_rows": [dict(row) for row in invalid],
     }
     observed: dict[tuple[object, object, object, object], int] = {}
     invalid: list[Mapping[str, object]] = []

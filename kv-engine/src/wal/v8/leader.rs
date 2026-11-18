@@ -2837,21 +2837,31 @@ impl WalV8FrameJob<'_> {
         self.data_buffer.as_ref().map_or(0, |buffer| buffer.cap())
     }
 
-    pub(crate) fn finish(mut self) -> Result<digest::WalV8DigestMetrics> {
-        let admitted = self
-            .admitted
-            .take()
-            .context("v8 producer job lost its admitted batch")?;
-        // Benchmark-only opt-in; the default path remains exactly the same.
+    pub(crate) fn finish(self) -> Result<digest::WalV8DigestMetrics> {
         #[cfg(feature = "bench")]
-        let direct_point = admitted.can_encode_point_single_frame() && {
+        let direct_point_enabled = {
             static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
             *ENABLED.get_or_init(|| {
                 std::env::var("TOYKV_BENCH_V8_POINT_DIRECT_FRAME").as_deref() == Ok("1")
             })
         };
         #[cfg(not(feature = "bench"))]
-        let direct_point = false;
+        let direct_point_enabled = false;
+
+        self.finish_with_point_direct_frame(direct_point_enabled)
+    }
+
+    fn finish_with_point_direct_frame(
+        mut self,
+        direct_point_enabled: bool,
+    ) -> Result<digest::WalV8DigestMetrics> {
+        let admitted = self
+            .admitted
+            .take()
+            .context("v8 producer job lost its admitted batch")?;
+        // The selector is injectable in unit tests. Production only enables it
+        // through the bench-only OnceLock above.
+        let direct_point = direct_point_enabled && admitted.can_encode_point_single_frame();
         let mut early_buffer = if direct_point {
             Some(WalV8DataBuffer(
                 self.data_buffer
@@ -2863,7 +2873,7 @@ impl WalV8FrameJob<'_> {
             None
         };
         let encode_result = if let Some(buffer) = early_buffer.as_mut() {
-            admitted.encode_point_single_frame_into(buffer.as_mut_slice())
+            admitted.encode_point_single_frame_logical_into(buffer.as_mut_slice())
         } else {
             admitted.encode()
         };
@@ -2896,6 +2906,16 @@ impl WalV8FrameJob<'_> {
                     .initialize(),
             )
         };
+        if direct_point {
+            if let Err(error) = encoded.finish_point_frame_in_place(data_buffer.as_mut_slice()) {
+                self.coordinator.poison();
+                return Err(error).context("finish v8 direct Point DATA frame");
+            }
+            #[cfg(feature = "bench")]
+            if let Some(profile) = &self.profile {
+                profile.record_v8_point_direct_frame_encoded();
+            }
+        }
         let data_len = if direct_point {
             encoded.frame_buffer_bytes()
         } else {
@@ -6881,6 +6901,137 @@ mod tests {
         assert!(recovered.selection.batches.is_empty());
         assert_eq!(recovered.replay_tickets.len(), 1);
         assert_eq!(replayed_batches(&path, &recovered)?, [batch(10)]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn direct_point_frame_syncs_and_recovers_through_parallel_runtime() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("active-direct-point-v8.wal");
+        let header = header();
+        let installed = install_empty(&path, header)?;
+        let mut writer = open_writer(&path, &installed)?.into_parallel()?;
+        let input = batch(10);
+        let prepared = writer.preflight_batch_with_write_class(
+            &input,
+            LIVE_WAL_V5_LIMITS,
+            WalV8WriteClass::Point,
+        )?;
+        let job = writer.admit_prepared_batch(prepared, input.commit_ts, input.recorded_at)?;
+        let ticket = job.assignment().segment_ticket;
+
+        job.finish_with_point_direct_frame(true)?;
+        writer.wait_durable(ticket)?;
+        let durable_frontier = writer.active_boundaries()?.1;
+        assert_eq!(durable_frontier.ticket_end, 1);
+        assert!(!writer.is_poisoned());
+
+        drop(writer);
+        let recovered = super::super::install::recover_and_install_active(
+            &path,
+            &[installed.active_boundary],
+            header.predecessor,
+            LIVE_WAL_V5_LIMITS,
+            MAX_WAL_FILE_SIZE,
+        )?;
+        assert_eq!(recovered.active_boundary.ticket_end, 1);
+        assert_eq!(replayed_batches(&path, &recovered)?, [input]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn direct_point_frame_completes_out_of_order_ticket_before_frontier_sync() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("active-direct-point-ooo-v8.wal");
+        let header = header();
+        let installed = install_empty(&path, header)?;
+        let writer = Arc::new(open_writer(&path, &installed)?.into_parallel()?);
+        let first_batch = batch(10);
+        let first_prepared = writer.preflight_batch(&first_batch, LIVE_WAL_V5_LIMITS)?;
+        let second_batch = batch(20);
+        let second_prepared = writer.preflight_batch_with_write_class(
+            &second_batch,
+            LIVE_WAL_V5_LIMITS,
+            WalV8WriteClass::Point,
+        )?;
+        let (admitted_tx, admitted_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+
+        thread::scope(|scope| -> Result<()> {
+            let first_writer = Arc::clone(&writer);
+            let first_handle = scope.spawn(move || {
+                first_writer.append_prepared_batch_inner(
+                    first_prepared,
+                    10,
+                    first_batch.recorded_at,
+                    || {
+                        admitted_tx
+                            .send(())
+                            .expect("admission receiver remains open");
+                        release_rx.recv().expect("test releases the first producer");
+                    },
+                )
+            });
+            admitted_rx.recv_timeout(Duration::from_secs(2))?;
+
+            let second_job =
+                writer.admit_prepared_batch(second_prepared, 20, second_batch.recorded_at)?;
+            let second_ticket = second_job.assignment().segment_ticket;
+            assert_eq!(second_ticket, 1);
+            let second_writer = Arc::clone(&writer);
+            let second_handle = scope.spawn(move || -> Result<()> {
+                second_job.finish_with_point_direct_frame(true)?;
+                second_writer.wait_durable(second_ticket)
+            });
+
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                let admitted = writer.coordinator.admitted_window();
+                if admitted.len() == 2
+                    && admitted[1].frames_ready
+                    && admitted[1].digest_ready.is_some()
+                    && admitted[1].data_complete
+                {
+                    assert!(!admitted[0].data_complete);
+                    assert_eq!(writer.coordinator.durable_ticket_end(), 0);
+                    break;
+                }
+                ensure!(
+                    Instant::now() < deadline,
+                    "later direct-frame ticket did not complete while the head was blocked"
+                );
+                thread::yield_now();
+            }
+
+            release_tx
+                .send(())
+                .expect("first producer is still waiting");
+            let first_result = first_handle
+                .join()
+                .map_err(|_| anyhow::anyhow!("first v8 producer panicked"))?;
+            let second_result = second_handle
+                .join()
+                .map_err(|_| anyhow::anyhow!("direct-frame producer panicked"))?;
+            first_result?;
+            second_result?;
+
+            Ok(())
+        })?;
+
+        assert_eq!(writer.active_boundaries()?.1.ticket_end, 2);
+        assert!(!writer.is_poisoned());
+        drop(writer);
+        let recovered = super::super::install::recover_and_install_active(
+            &path,
+            &[installed.active_boundary],
+            header.predecessor,
+            LIVE_WAL_V5_LIMITS,
+            MAX_WAL_FILE_SIZE,
+        )?;
+        assert_eq!(recovered.active_boundary.ticket_end, 2);
+        assert_eq!(replayed_batches(&path, &recovered)?, [batch(10), batch(20)]);
 
         Ok(())
     }

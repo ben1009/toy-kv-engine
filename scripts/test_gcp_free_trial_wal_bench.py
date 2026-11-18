@@ -27,6 +27,8 @@ from gcp_wal_matrix import (
     POINT_LOOKAHEAD_WRITERS,
     POINT_BORROWED_INPUT_NUM,
     POINT_BORROWED_INPUT_WRITERS,
+    POINT_DIRECT_FRAME_NUM,
+    POINT_DIRECT_FRAME_WRITERS,
     V8_MUTEX_DIAGNOSTIC_NUM,
     V8_MUTEX_DIAGNOSTIC_SAMPLE_EVERY,
     V8_MUTEX_DIAGNOSTIC_WRITERS,
@@ -38,6 +40,8 @@ from gcp_wal_matrix import (
     build_point_lookahead_schedule,
     build_point_borrowed_input_plan,
     build_point_borrowed_input_schedule,
+    build_point_direct_frame_plan,
+    build_point_direct_frame_schedule,
     build_v8_mutex_diagnostic_plan,
     build_v8_mutex_diagnostic_schedule,
     build_rfc026_schedule,
@@ -45,6 +49,7 @@ from gcp_wal_matrix import (
     validate_batch64_rows,
     validate_point_lookahead_rows,
     validate_point_borrowed_input_rows,
+    validate_point_direct_frame_rows,
     validate_v8_mutex_diagnostic_rows,
     validate_rfc026_rows,
 )
@@ -602,6 +607,173 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
                 "--project", "test-project", "--zone", "us-east1-b", "--commit", "2" * 40,
                 "--v8-point-borrowed-input-ab", "--preflight-only",
             ])
+
+    def test_point_direct_frame_schedule_is_counterbalanced_and_checks_fast_path_hits(self) -> None:
+        schedule = build_point_direct_frame_schedule(POINT_DIRECT_FRAME_WRITERS)
+        self.assertEqual(len(schedule), 50)
+        for writer in POINT_DIRECT_FRAME_WRITERS:
+            point_rows = [row for row in schedule if row["writer"] == writer and row["workload"] == "point"]
+            self.assertEqual(len(point_rows), 10)
+            for repetition in range(1, 6):
+                pair = [row["arm"] for row in point_rows if row["repetition"] == repetition]
+                expected = (
+                    ["direct_frame_off", "direct_frame_on"] if repetition % 2 else
+                    ["direct_frame_on", "direct_frame_off"]
+                )
+                self.assertEqual(pair, expected)
+        rows = [{
+            **row,
+            "ops": POINT_DIRECT_FRAME_NUM,
+            "exit_code": 0,
+            "direct_frame_encoded_count": (
+                POINT_DIRECT_FRAME_NUM
+                if row["point_direct_frame_enabled"] and row["workload"] == "point"
+                else 0
+            ),
+        } for row in schedule]
+        self.assertTrue(validate_point_direct_frame_rows(rows, POINT_DIRECT_FRAME_WRITERS)["complete"])
+        bad_row = next(row for row in rows if row["point_direct_frame_enabled"] and row["workload"] == "point")
+        bad_row["direct_frame_encoded_count"] = 0
+        self.assertFalse(validate_point_direct_frame_rows(rows, POINT_DIRECT_FRAME_WRITERS)["complete"])
+        with self.assertRaisesRegex(ValueError, "requires writers"):
+            build_point_direct_frame_schedule((16,))
+
+        plan = build_point_direct_frame_plan(
+            writers=POINT_DIRECT_FRAME_WRITERS,
+            machine_type="c4-standard-16-lssd",
+            machine_spec=BENCH.MACHINE_SPECS["c4-standard-16-lssd"],
+            commit="c" * 40,
+            binary_sha256="d" * 64,
+        )
+        self.assertEqual(plan["runs_planned"], 50)
+        self.assertEqual(plan["suite"], "v8-point-direct-frame")
+        self.assertEqual(plan["binary_sha256"], "d" * 64)
+
+    def test_point_direct_frame_cli_uses_fixed_same_binary_matrix(self) -> None:
+        args = BENCH.parse_args([
+            "--project", "test-project", "--zone", "us-east1-b", "--commit", "c" * 40,
+            "--v8-point-direct-frame-ab", "--preflight-only",
+        ])
+        self.assertEqual(args.num, POINT_DIRECT_FRAME_NUM)
+        self.assertEqual(args.writers, POINT_DIRECT_FRAME_WRITERS)
+        self.assertEqual(args.machine_type, "c4-standard-16-lssd")
+        with self.assertRaises(SystemExit):
+            BENCH.parse_args([
+                "--project", "test-project", "--zone", "us-east1-b", "--commit", "c" * 40,
+                "--writers", "16", "--v8-point-direct-frame-ab", "--preflight-only",
+            ])
+
+    def test_point_direct_frame_result_verifier_requires_actual_point_hits_and_batch_misses(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            results = Path(temp) / "results"
+            results.mkdir()
+            commit = "c" * 40
+            binary_sha = "d" * 64
+            writers = POINT_DIRECT_FRAME_WRITERS
+            schedule = build_point_direct_frame_schedule(writers)
+            plan = build_point_direct_frame_plan(
+                writers=writers,
+                machine_type="c4-standard-16-lssd",
+                machine_spec=BENCH.MACHINE_SPECS["c4-standard-16-lssd"],
+                commit=commit,
+                binary_sha256=binary_sha,
+            )
+            (results / "benchmark-plan.json").write_text(json.dumps(plan), encoding="utf-8")
+            (results / "commit.txt").write_text(commit + "\n", encoding="utf-8")
+            (results / "write-perf.sha256").write_text(binary_sha + "\n", encoding="utf-8")
+            rows = []
+            for row in schedule:
+                run_id = BENCH._run_identifier(row, "v8-point-direct-frame")
+                run_dir = results / run_id
+                run_dir.mkdir()
+                initialized_bytes = 1_048_576 if row["workload"] == "point" else 0
+                encoded_count = (
+                    POINT_DIRECT_FRAME_NUM
+                    if row["point_direct_frame_enabled"] and row["workload"] == "point"
+                    else 0
+                )
+                metadata = {
+                    **BENCH._expected_run_metadata(row, "v8-point-direct-frame"),
+                    "source_commit": commit,
+                    "binary_sha256": binary_sha,
+                    "exit_code": 0,
+                    "ops": POINT_DIRECT_FRAME_NUM,
+                    "puts_per_second": 10_000.0,
+                    "cpu_seconds": 1.0,
+                    "cpu_us_per_put": 10.0,
+                    "p50_ms": 0.1,
+                    "p95_ms": 0.2,
+                    "p99_ms": 0.3,
+                    "sync_count": 10,
+                    "puts_per_sync": POINT_DIRECT_FRAME_NUM / 10,
+                    "initialized_bytes": initialized_bytes,
+                    "preparation_wait_ms": 0.0,
+                    "direct_frame_encoded_count": encoded_count,
+                    "duration_seconds": 10.0,
+                }
+                (run_dir / "run-metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
+                (run_dir / "environment.txt").write_text(
+                    "TOYKV_BENCH_V8_EXTENT_PREP=sliding-point-lookahead\n"
+                    "TOYKV_BENCH_V8_EXTENT_PREP_BYTES=1048576\n"
+                    "TOYKV_WAL_V8_FRONTIER_MODE=direct\n"
+                    f"TOYKV_BENCH_V8_POINT_DIRECT_FRAME={int(row['point_direct_frame_enabled'])}\n",
+                    encoding="utf-8",
+                )
+                preparation = {
+                    "mode": row["extent_mode"],
+                    "window_bytes": row["extent_window_bytes"],
+                    "initialized_bytes": initialized_bytes,
+                }
+                record = {
+                    "params": {
+                        "num": POINT_DIRECT_FRAME_NUM,
+                        "threads": row["writer"],
+                        "value_size": 1024,
+                        "batch_size": row["batch_size"],
+                        "wal_format_version": 8,
+                        "wal_io_mode": "parallel",
+                    },
+                    "result": {
+                        "ops": POINT_DIRECT_FRAME_NUM,
+                        "wal_pipeline": {
+                            "wal_io_stable": True,
+                            "v8_point_direct_frame_enabled": row["point_direct_frame_enabled"],
+                            "v8_point_direct_frame_encoded_count": encoded_count,
+                            "wal_io_start": {"sliding_extent_preparation": {**preparation, "initialized_bytes": 0}},
+                            "wal_io_end": {"sliding_extent_preparation": preparation},
+                        },
+                    },
+                }
+                (run_dir / "result.json").write_text(json.dumps(record), encoding="utf-8")
+                rows.append(metadata)
+
+            validation = validate_point_direct_frame_rows(rows, writers)
+            (results / "summary.json").write_text(json.dumps({
+                "suite": "v8-point-direct-frame",
+                "source_commit": commit,
+                "binary_sha256": binary_sha,
+                "complete": True,
+                "runs_planned": len(schedule),
+                "runs_completed": len(schedule),
+                "results": rows,
+                "matrix_validation": validation,
+            }), encoding="utf-8")
+            (results / "remote-exit.json").write_text(json.dumps({
+                "failed": False, "runs_started": len(schedule),
+            }), encoding="utf-8")
+            self.assertTrue(BENCH._verify_result_set(results)["verified"])
+
+            batch_on = next(
+                row for row in rows
+                if row["workload"] == "batch16" and row["point_direct_frame_enabled"]
+            )
+            batch_on["direct_frame_encoded_count"] = 1
+            (results / BENCH._run_identifier(batch_on, "v8-point-direct-frame") / "run-metadata.json").write_text(
+                json.dumps(batch_on), encoding="utf-8",
+            )
+            rejected = BENCH._verify_result_set(results)
+            self.assertFalse(rejected["verified"])
+            self.assertTrue(any("direct-frame hit count" in error for error in rejected["errors"]))
 
     def test_point_lookahead_result_verifier_checks_workload_specific_initialization(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

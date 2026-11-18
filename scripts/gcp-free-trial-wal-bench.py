@@ -40,6 +40,8 @@ from gcp_wal_matrix import (
     POINT_LOOKAHEAD_WRITERS,
     POINT_BORROWED_INPUT_NUM,
     POINT_BORROWED_INPUT_WRITERS,
+    POINT_DIRECT_FRAME_NUM,
+    POINT_DIRECT_FRAME_WRITERS,
     V8_MUTEX_DIAGNOSTIC_NUM,
     V8_MUTEX_DIAGNOSTIC_SAMPLE_EVERY,
     V8_MUTEX_DIAGNOSTIC_WRITERS,
@@ -51,12 +53,15 @@ from gcp_wal_matrix import (
     build_point_lookahead_schedule,
     build_point_borrowed_input_plan,
     build_point_borrowed_input_schedule,
+    build_point_direct_frame_plan,
+    build_point_direct_frame_schedule,
     build_v8_mutex_diagnostic_plan,
     build_v8_mutex_diagnostic_schedule,
     build_rfc026_schedule,
     validate_commit_order_trace_rows,
     validate_point_lookahead_rows,
     validate_point_borrowed_input_rows,
+    validate_point_direct_frame_rows,
     validate_v8_mutex_diagnostic_rows,
     validate_writer_counts,
 )
@@ -74,6 +79,7 @@ COMMIT_ORDER_TRACE_RUNNER = Path(__file__).with_name("gcp_commit_order_trace_run
 POINT_LOOKAHEAD_RUNNER = Path(__file__).with_name("gcp_v8_point_lookahead_runner.py")
 V8_MUTEX_DIAGNOSTIC_RUNNER = Path(__file__).with_name("gcp_v8_mutex_diagnostic_runner.py")
 POINT_BORROWED_INPUT_RUNNER = Path(__file__).with_name("gcp_v8_point_borrowed_input_runner.py")
+POINT_DIRECT_FRAME_RUNNER = Path(__file__).with_name("gcp_v8_point_direct_frame_runner.py")
 REPO_URL = "https://github.com/ben1009/toy-kv-engine.git"
 MAX_RUNTIME_MINUTES = 180
 MIN_RUNTIME_MINUTES = 60
@@ -95,6 +101,7 @@ root_names = {
     "rfc026-schedule.tsv", "profile-schedule.tsv", "commit-order-trace-schedule.tsv",
     "point-lookahead-schedule.tsv", "v8-mutex-diagnostic-schedule.tsv",
     "point-borrowed-input-schedule.tsv",
+    "point-direct-frame-schedule.tsv",
     "commit-order-trace-analysis.json", "commit.txt", "remote-exit.json",
     "finished_utc.txt", "remote-finished-utc.txt", "remote-status.txt", "host.txt",
     "os-release.txt", "uname.txt", "lscpu.txt", "lsblk.txt", "findmnt.txt", "df.txt",
@@ -1072,6 +1079,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                              help="Run five paired V7/V8 Point runs with sampled hot-mutex diagnostics")
     suite_group.add_argument("--v8-point-borrowed-input-ab", action="store_true",
                              help="Compare V8 Point owned vs borrowed preparation with Batch16/64 guardrails")
+    suite_group.add_argument("--v8-point-direct-frame-ab", action="store_true",
+                             help="Compare V8 Point direct-frame encoding with the existing path and Batch guardrails")
     parser.add_argument("--baseline-commit", help="Full source commit used as the borrowed-input A/B baseline")
     parser.add_argument("--source-patch-sha256",
                         help="SHA-256 of the exact source patch used for a commit-order trace run")
@@ -1096,6 +1105,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if args.num is None:
         args.num = (
+            POINT_DIRECT_FRAME_NUM if args.v8_point_direct_frame_ab else
             POINT_BORROWED_INPUT_NUM if args.v8_point_borrowed_input_ab else
             V8_MUTEX_DIAGNOSTIC_NUM if args.v8_mutex_diagnostic else
             COMMIT_ORDER_TRACE_NUM if args.commit_order_trace else 750_000
@@ -1103,7 +1113,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     if args.machine_type is None:
         args.machine_type = "c4-standard-16-lssd" if (
             args.commit_order_trace or args.v8_point_lookahead_ab or args.v8_mutex_diagnostic
-            or args.v8_point_borrowed_input_ab
+            or args.v8_point_borrowed_input_ab or args.v8_point_direct_frame_ab
         ) else MACHINE_TYPE
     args.network = args.network or "default"
     if args.writers is None:
@@ -1115,6 +1125,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             args.writers = (POINT_LOOKAHEAD_WRITERS,)
         elif args.v8_point_borrowed_input_ab:
             args.writers = POINT_BORROWED_INPUT_WRITERS
+        elif args.v8_point_direct_frame_ab:
+            args.writers = POINT_DIRECT_FRAME_WRITERS
         elif args.v8_small_ticket_profile:
             args.writers = (1, 8, 16)
         else:
@@ -1137,6 +1149,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error(f"--v8-point-borrowed-input-ab requires writers {POINT_BORROWED_INPUT_WRITERS}")
     if args.v8_point_borrowed_input_ab and args.machine_type != "c4-standard-16-lssd":
         parser.error("--v8-point-borrowed-input-ab requires c4-standard-16-lssd")
+    if args.v8_point_direct_frame_ab and args.writers != POINT_DIRECT_FRAME_WRITERS:
+        parser.error(f"--v8-point-direct-frame-ab requires writers {POINT_DIRECT_FRAME_WRITERS}")
+    if args.v8_point_direct_frame_ab and args.machine_type != "c4-standard-16-lssd":
+        parser.error("--v8-point-direct-frame-ab requires c4-standard-16-lssd")
     if not re.fullmatch(r"[0-9a-fA-F]{40}", args.commit):
         parser.error("--commit must be a full 40-character SHA")
     if args.num < 64:
@@ -1145,6 +1161,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error("the selected multi-workload suite uses fixed operation counts; omit --num overrides")
     if args.v8_point_borrowed_input_ab and args.num != POINT_BORROWED_INPUT_NUM:
         parser.error(f"--v8-point-borrowed-input-ab uses a fixed {POINT_BORROWED_INPUT_NUM}-put workload")
+    if args.v8_point_direct_frame_ab and args.num != POINT_DIRECT_FRAME_NUM:
+        parser.error(f"--v8-point-direct-frame-ab uses a fixed {POINT_DIRECT_FRAME_NUM}-put workload")
     if args.v8_mutex_diagnostic and args.num != V8_MUTEX_DIAGNOSTIC_NUM:
         parser.error(f"--v8-mutex-diagnostic uses a fixed {V8_MUTEX_DIAGNOSTIC_NUM}-put workload")
     if args.commit_order_trace and args.num != COMMIT_ORDER_TRACE_NUM:
@@ -1276,7 +1294,7 @@ def _run_identifier(row: dict[str, Any], suite: str) -> str:
         return f"w{row['writer']}-b{row['block']}-p{row['position']}-{row['arm']}"
     if suite == "commit-order-trace":
         return f"w{row['writer']}-{row['workload']}-{row['phase']}-r{row['repetition']}-{row['arm']}"
-    if suite in ("v8-point-lookahead", "v8-point-borrowed-input"):
+    if suite in ("v8-point-lookahead", "v8-point-borrowed-input", "v8-point-direct-frame"):
         return f"w{row['writer']}-{row['workload']}-r{row['repetition']}-{row['arm']}"
     if suite == "v8-mutex-diagnostic":
         return f"w{row['writer']}-{row['workload']}-r{row['repetition']}-{row['arm']}"
@@ -1295,7 +1313,7 @@ def _summary_row_identifier(row: dict[str, Any], suite: str) -> str:
             f"w{int(row['writer'])}-{row['workload']}-{row['phase']}-r{int(row['repetition'])}-"
             f"{row['arm']}"
         )
-    if suite in ("v8-point-lookahead", "v8-point-borrowed-input"):
+    if suite in ("v8-point-lookahead", "v8-point-borrowed-input", "v8-point-direct-frame"):
         return f"w{int(row['writer'])}-{row['workload']}-r{int(row['repetition'])}-{row['arm']}"
     if suite == "v8-mutex-diagnostic":
         return f"w{int(row['writer'])}-{row['workload']}-r{int(row['repetition'])}-{row['arm']}"
@@ -1327,6 +1345,15 @@ def _expected_run_metadata(row: dict[str, Any], suite: str) -> dict[str, Any]:
             key: row[key] for key in (
                 "writer", "workload", "repetition", "arm", "bench", "batch_entries", "batch_size",
                 "num", "sample_every", "extent_mode", "extent_window_bytes", "frontier_mode",
+                "point_direct_frame_enabled",
+            )
+        }
+    if suite == "v8-point-direct-frame":
+        return {
+            key: row[key] for key in (
+                "writer", "workload", "repetition", "arm", "bench", "batch_entries", "batch_size",
+                "num", "sample_every", "extent_mode", "extent_window_bytes", "frontier_mode",
+                "point_direct_frame_enabled",
             )
         }
     if suite == "v8-mutex-diagnostic":
@@ -1428,6 +1455,42 @@ def _verify_result_set(results: Path) -> dict[str, Any]:
                     summary.get("candidate_binary_sha256") != candidate_sha
                 ):
                     errors.append("borrowed-input summary binary checksums do not match the plan")
+            elif suite == "v8-point-direct-frame":
+                schedule = build_point_direct_frame_schedule(plan["writers"])
+                commit_path = results / "commit.txt"
+                binary_sha_path = results / "write-perf.sha256"
+                try:
+                    recorded_commit = commit_path.read_text(encoding="utf-8").strip()
+                except OSError as error:
+                    recorded_commit = ""
+                    errors.append(f"direct-frame source commit is missing: {error}")
+                try:
+                    binary_sha = binary_sha_path.read_text(encoding="utf-8").strip()
+                except OSError as error:
+                    binary_sha = ""
+                    errors.append(f"direct-frame binary checksum is missing: {error}")
+                if not re.fullmatch(r"[0-9a-f]{40}", recorded_commit) or plan.get("commit") != recorded_commit:
+                    errors.append("direct-frame plan source commit does not match commit.txt")
+                if not re.fullmatch(r"[0-9a-f]{64}", binary_sha) or plan.get("binary_sha256") != binary_sha:
+                    errors.append("direct-frame binary checksum does not match the plan")
+                expected_plan = build_point_direct_frame_plan(
+                    writers=plan.get("writers", ()),
+                    machine_type=plan.get("machine_type", ""),
+                    machine_spec={
+                        "vcpus": plan.get("vcpus", 0),
+                        "ssd_count": plan.get("local_ssd_count", 0),
+                        "ssd_gib": plan.get("local_ssd_total_gib", 0),
+                    },
+                    commit=recorded_commit,
+                    binary_sha256=binary_sha,
+                )
+                for key, value in expected_plan.items():
+                    if plan.get(key) != value:
+                        errors.append(f"direct-frame plan field {key} does not match the fixed suite")
+                if summary.get("suite") != suite or summary.get("source_commit") != recorded_commit:
+                    errors.append("direct-frame summary source metadata is invalid")
+                if summary.get("binary_sha256") != binary_sha:
+                    errors.append("direct-frame summary binary checksum does not match the plan")
             elif suite == "batch64":
                 schedule = build_batch64_schedule(plan["writers"])
             elif suite == "commit-order-trace":
@@ -1770,6 +1833,7 @@ def _verify_result_set(results: Path) -> dict[str, Any]:
                             "TOYKV_BENCH_V8_EXTENT_PREP=sliding-point-lookahead\n"
                             "TOYKV_BENCH_V8_EXTENT_PREP_BYTES=1048576\n"
                             "TOYKV_WAL_V8_FRONTIER_MODE=direct\n"
+                            "TOYKV_BENCH_V8_POINT_DIRECT_FRAME=0\n"
                         )
                         if (run_dir / "environment.txt").read_text(encoding="utf-8") != expected_env:
                             raise ValueError("Point borrowed-input run environment differs from the fixed suite")
@@ -1778,6 +1842,69 @@ def _verify_result_set(results: Path) -> dict[str, Any]:
                             raise ValueError("summary row differs from borrowed-input run metadata")
                     except (KeyError, AttributeError, TypeError, ValueError) as error:
                         errors.append(f"run {run_id} borrowed-input result is invalid: {error}")
+                elif suite == "v8-point-direct-frame" and isinstance(record, dict):
+                    try:
+                        identity = expected[run_id]
+                        result = record["result"]
+                        params = record["params"]
+                        expected_params = {
+                            "num": POINT_DIRECT_FRAME_NUM, "threads": identity["writer"], "value_size": 1024,
+                            "batch_size": identity["batch_size"], "wal_format_version": 8,
+                            "wal_io_mode": "parallel",
+                        }
+                        if int(result["ops"]) != POINT_DIRECT_FRAME_NUM or any(
+                            params.get(key) != value for key, value in expected_params.items()
+                        ):
+                            raise ValueError("benchmark parameters do not match the direct-frame plan")
+                        if metadata.get("source_commit") != plan.get("commit") or (
+                            metadata.get("binary_sha256") != plan.get("binary_sha256")
+                        ):
+                            raise ValueError("run source/binary identity differs from the shared A/B identity")
+                        pipeline = result["wal_pipeline"]
+                        if pipeline.get("wal_io_stable") is not True:
+                            raise ValueError("WAL I/O metadata changed during the run")
+                        if pipeline.get("v8_point_direct_frame_enabled") is not identity["point_direct_frame_enabled"]:
+                            raise ValueError("runtime direct-frame selector differs from the planned arm")
+                        expected_direct_count = (
+                            POINT_DIRECT_FRAME_NUM
+                            if identity["point_direct_frame_enabled"] and identity["workload"] == "point"
+                            else 0
+                        )
+                        direct_count = pipeline.get("v8_point_direct_frame_encoded_count")
+                        if type(direct_count) is not int or direct_count != expected_direct_count or (
+                            metadata.get("direct_frame_encoded_count") != expected_direct_count
+                        ):
+                            raise ValueError(
+                                "runtime direct-frame hit count differs from the Point/Batch expectation "
+                                f"(expected={expected_direct_count}, actual={direct_count})"
+                            )
+                        for boundary in ("wal_io_start", "wal_io_end"):
+                            preparation = pipeline[boundary]["sliding_extent_preparation"]
+                            if preparation.get("mode") != identity["extent_mode"] or (
+                                preparation.get("window_bytes") != identity["extent_window_bytes"]
+                            ):
+                                raise ValueError(f"{boundary} does not report the planned extent policy")
+                        initialized_bytes = pipeline["wal_io_end"]["sliding_extent_preparation"].get(
+                            "initialized_bytes"
+                        )
+                        if type(initialized_bytes) is not int or (initialized_bytes > 0) != (
+                            identity["workload"] == "point"
+                        ):
+                            raise ValueError("extent initialization differs from the planned Point/Batch cell")
+                        expected_env = (
+                            f"TOYKV_BENCH_V8_EXTENT_PREP={identity['extent_mode']}\n"
+                            f"TOYKV_BENCH_V8_EXTENT_PREP_BYTES={POINT_LOOKAHEAD_WINDOW_BYTES}\n"
+                            "TOYKV_WAL_V8_FRONTIER_MODE=direct\n"
+                            "TOYKV_BENCH_V8_POINT_DIRECT_FRAME="
+                            f"{1 if identity['point_direct_frame_enabled'] else 0}\n"
+                        )
+                        if (run_dir / "environment.txt").read_text(encoding="utf-8") != expected_env:
+                            raise ValueError("direct-frame run environment differs from its planned arm")
+                        summary_row = summary_by_id.get(run_id)
+                        if summary_row is None or summary_row != metadata:
+                            raise ValueError("summary row differs from direct-frame run metadata")
+                    except (KeyError, AttributeError, TypeError, ValueError) as error:
+                        errors.append(f"run {run_id} direct-frame result is invalid: {error}")
                 elif suite == "v8-mutex-diagnostic" and isinstance(record, dict):
                     try:
                         identity = expected[run_id]
@@ -1846,6 +1973,10 @@ def _verify_result_set(results: Path) -> dict[str, Any]:
             validation = validate_point_borrowed_input_rows(summary.get("results", []), plan["writers"])
             if validation != summary.get("matrix_validation"):
                 errors.append("borrowed-input matrix validation does not match its per-run results")
+        elif suite == "v8-point-direct-frame":
+            validation = validate_point_direct_frame_rows(summary.get("results", []), plan["writers"])
+            if validation != summary.get("matrix_validation"):
+                errors.append("direct-frame matrix validation does not match its per-run results")
         elif suite == "v8-mutex-diagnostic":
             validation = validate_v8_mutex_diagnostic_rows(summary.get("results", []))
             if validation != summary.get("matrix_validation"):
@@ -2193,6 +2324,7 @@ def provision_and_run(
     point_lookahead_suite = getattr(args, "v8_point_lookahead_ab", False)
     mutex_diagnostic_suite = getattr(args, "v8_mutex_diagnostic", False)
     point_borrowed_input_suite = getattr(args, "v8_point_borrowed_input_ab", False)
+    point_direct_frame_suite = getattr(args, "v8_point_direct_frame_ab", False)
     missing_tools = [tool for tool in ("ssh", "scp", "ssh-keygen") if not shutil.which(tool)]
     if missing_tools:
         raise BenchError("Required local tools are missing: " + ", ".join(missing_tools))
@@ -2467,6 +2599,16 @@ def provision_and_run(
                 append_local_log(key_log, borrowed_copy.stdout + borrowed_copy.stderr)
                 if borrowed_copy.returncode:
                     raise BenchError(f"Could not copy borrowed-input helper: {borrowed_copy.stderr.strip()}")
+            if point_direct_frame_suite:
+                if not POINT_DIRECT_FRAME_RUNNER.is_file():
+                    raise BenchError(f"Direct-frame helper is missing: {POINT_DIRECT_FRAME_RUNNER}")
+                direct_copy = scp_to_vm(
+                    ip, POINT_DIRECT_FRAME_RUNNER, "/tmp/gcp-v8-point-direct-frame-runner.py",
+                    key, known_hosts, timeout=120,
+                )
+                append_local_log(key_log, direct_copy.stdout + direct_copy.stderr)
+                if direct_copy.returncode:
+                    raise BenchError(f"Could not copy direct-frame helper: {direct_copy.stderr.strip()}")
 
             safe_deadline_epoch = int(deadline_epoch - 600)
             remote_command = "sudo -n bash /tmp/run-wal-bench.sh " + shlex.join([
@@ -2474,11 +2616,13 @@ def provision_and_run(
                 args.machine_type, ",".join(str(writer) for writer in args.writers),
                 "v8-small-ticket-profile" if profile_suite else (
                     "commit-order-trace" if trace_suite else (
-                        "v8-point-borrowed-input" if point_borrowed_input_suite else (
+                        "v8-point-direct-frame" if point_direct_frame_suite else (
+                            "v8-point-borrowed-input" if point_borrowed_input_suite else (
                             "v8-mutex-diagnostic" if mutex_diagnostic_suite else (
                                 "v8-point-lookahead" if point_lookahead_suite else (
                                     "rfc026-full" if args.full_rfc026_matrix else "batch64"
                                 )
+                            )
                             )
                         )
                     )
@@ -2677,6 +2821,14 @@ def main(argv: list[str] | None = None) -> int:
                 baseline_commit=args.baseline_commit.lower(),
                 candidate_commit=args.commit.lower(),
                 source_patch_sha256=args.source_patch_sha256,
+            )
+        elif args.v8_point_direct_frame_ab:
+            report["benchmark_suite"] = "v8-point-direct-frame"
+            report["benchmark_plan"] = build_point_direct_frame_plan(
+                writers=args.writers,
+                machine_type=args.machine_type,
+                machine_spec=MACHINE_SPECS[args.machine_type],
+                commit=args.commit.lower(),
             )
         else:
             report["benchmark_suite"] = "rfc026-full" if args.full_rfc026_matrix else "batch64"

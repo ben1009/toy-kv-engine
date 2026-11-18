@@ -220,6 +220,8 @@ pub struct WriteProfile {
     pub wal_v8_post_encode_hash_reread_bytes: AtomicU64,
     /// Tickets included in the sampled v8 digest CPU timings.
     pub wal_v8_cpu_timing_sampled_tickets: AtomicU64,
+    /// Point requests encoded directly into their final DATA frame.
+    pub wal_v8_point_direct_frame_encoded: AtomicU64,
     /// Aggregate time in v8 Leader's synchronous positional DATA write calls.
     /// Parallel mode uses the shared worker's submission/CQE counters instead.
     pub wal_v8_data_write_call_ns: AtomicU64,
@@ -943,6 +945,7 @@ impl WriteProfile {
         self.wal_v8_ordered_link_hash_cpu_ns.store(0, o);
         self.wal_v8_post_encode_hash_reread_bytes.store(0, o);
         self.wal_v8_cpu_timing_sampled_tickets.store(0, o);
+        self.wal_v8_point_direct_frame_encoded.store(0, o);
         self.wal_v8_data_write_call_ns.store(0, o);
         self.wal_v8_data_submit_hol_episodes.store(0, o);
         self.wal_v8_data_submit_hol_wait_ns.store(0, o);
@@ -1018,6 +1021,7 @@ impl WriteProfile {
             wal_v8_ordered_link_hash_cpu_ns: self.wal_v8_ordered_link_hash_cpu_ns.load(o),
             wal_v8_post_encode_hash_reread_bytes: self.wal_v8_post_encode_hash_reread_bytes.load(o),
             wal_v8_cpu_timing_sampled_tickets: self.wal_v8_cpu_timing_sampled_tickets.load(o),
+            wal_v8_point_direct_frame_encoded: self.wal_v8_point_direct_frame_encoded.load(o),
             wal_v8_data_write_call_ns: self.wal_v8_data_write_call_ns.load(o),
             wal_v8_data_submit_hol_episodes: self.wal_v8_data_submit_hol_episodes.load(o),
             wal_v8_data_submit_hol_wait_ns: self.wal_v8_data_submit_hol_wait_ns.load(o),
@@ -1560,6 +1564,12 @@ impl WriteProfile {
     }
 
     #[cfg(feature = "bench")]
+    pub(crate) fn record_v8_point_direct_frame_encoded(&self) {
+        self.wal_v8_point_direct_frame_encoded
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "bench")]
     pub(crate) fn record_wal_validate_ns(&self, nanos: u64) {
         self.wal_validate_ns
             .fetch_add(nanos, std::sync::atomic::Ordering::Relaxed);
@@ -1696,6 +1706,7 @@ pub struct WriteProfileSnapshot {
     pub wal_v8_ordered_link_hash_cpu_ns: u64,
     pub wal_v8_post_encode_hash_reread_bytes: u64,
     pub wal_v8_cpu_timing_sampled_tickets: u64,
+    pub wal_v8_point_direct_frame_encoded: u64,
     pub wal_v8_data_write_call_ns: u64,
     pub wal_v8_data_submit_hol_episodes: u64,
     pub wal_v8_data_submit_hol_wait_ns: u64,
@@ -1836,6 +1847,9 @@ impl WriteProfileSnapshot {
             wal_v8_cpu_timing_sampled_tickets: self
                 .wal_v8_cpu_timing_sampled_tickets
                 .saturating_sub(before.wal_v8_cpu_timing_sampled_tickets),
+            wal_v8_point_direct_frame_encoded: self
+                .wal_v8_point_direct_frame_encoded
+                .saturating_sub(before.wal_v8_point_direct_frame_encoded),
             wal_v8_data_write_call_ns: self
                 .wal_v8_data_write_call_ns
                 .saturating_sub(before.wal_v8_data_write_call_ns),

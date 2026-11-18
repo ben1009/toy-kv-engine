@@ -37,13 +37,13 @@ def _summary_fields(schedule_row: dict[str, Any]) -> tuple[str, ...]:
         *schedule_row.keys(),
         "source_commit", "binary_sha256", "exit_code", "ops", "puts_per_second", "cpu_seconds",
         "cpu_us_per_put", "p50_ms", "p95_ms", "p99_ms", "sync_count", "puts_per_sync",
-        "initialized_bytes", "preparation_wait_ms", "duration_seconds",
+        "initialized_bytes", "preparation_wait_ms", "direct_frame_encoded_count", "duration_seconds",
     )
 
 
 def _run_one(
     *, binary: Path, binary_sha256: str, row: dict[str, Any], results_dir: Path,
-    db_root: Path, safe_deadline_epoch: int,
+    db_root: Path, safe_deadline_epoch: int, verify_direct_frame: bool = False,
 ) -> dict[str, Any]:
     name = _run_id(row)
     run_dir = results_dir / name
@@ -61,6 +61,7 @@ def _run_one(
         "TOYKV_BENCH_V8_EXTENT_PREP": str(row["extent_mode"]),
         "TOYKV_BENCH_V8_EXTENT_PREP_BYTES": str(row["extent_window_bytes"]),
         "TOYKV_WAL_V8_FRONTIER_MODE": str(row["frontier_mode"]),
+        "TOYKV_BENCH_V8_POINT_DIRECT_FRAME": "1" if row.get("point_direct_frame_enabled", False) else "0",
     }
     (run_dir / "command.sh").write_text(shlex.join(command) + "\n", encoding="utf-8")
     (run_dir / "environment.txt").write_text(
@@ -88,7 +89,7 @@ def _run_one(
     metrics: dict[str, Any] = {
         "ops": "", "puts_per_second": "", "p50_ms": "", "p95_ms": "", "p99_ms": "",
         "cpu_seconds": "", "cpu_us_per_put": "", "sync_count": "", "puts_per_sync": "",
-        "initialized_bytes": "", "preparation_wait_ms": "",
+        "initialized_bytes": "", "preparation_wait_ms": "", "direct_frame_encoded_count": "",
     }
     if exit_code == 0:
         try:
@@ -123,6 +124,20 @@ def _run_one(
                 "initialized_bytes": initialized_bytes,
                 "preparation_wait_ms": counter_delta("wait_ns") / 1_000_000,
             }
+            if verify_direct_frame:
+                direct_frame_enabled = bool(row["point_direct_frame_enabled"])
+                direct_frame_encoded_count = int(pipeline["v8_point_direct_frame_encoded_count"])
+                metrics["direct_frame_encoded_count"] = direct_frame_encoded_count
+                if pipeline.get("v8_point_direct_frame_enabled") is not direct_frame_enabled:
+                    raise ValueError("benchmark direct-frame flag does not match the planned run")
+                expected_direct_frame_count = (
+                    metrics["ops"] if direct_frame_enabled and row["workload"] == "point" else 0
+                )
+                if direct_frame_encoded_count != expected_direct_frame_count:
+                    raise ValueError(
+                        "direct-frame encode count does not match the planned Point/Batch workload "
+                        f"(expected={expected_direct_frame_count}, actual={direct_frame_encoded_count})"
+                    )
             expected_params = {
                 "num": row["num"], "threads": row["writer"], "value_size": 1024,
                 "batch_size": row["batch_size"], "wal_format_version": 8, "wal_io_mode": "parallel",
@@ -163,6 +178,8 @@ def _run_one(
         "source_commit": row["source_commit"], "binary_sha256": binary_sha256,
         "exit_code": int(exit_code), **metrics, "duration_seconds": duration,
     })
+    if "point_direct_frame_enabled" in row:
+        metadata["point_direct_frame_enabled"] = bool(row["point_direct_frame_enabled"])
     (run_dir / "run-metadata.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
     print(f"run={name} source={row['source_commit'][:12]} exit={exit_code} duration={duration:.3f}s", flush=True)
     return metadata
