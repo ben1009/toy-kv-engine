@@ -24,16 +24,22 @@ from gcp_wal_matrix import (
     FULL_DEFAULT_WRITERS,
     LEGACY_DEFAULT_WRITERS,
     POINT_LOOKAHEAD_WRITERS,
+    V8_MUTEX_DIAGNOSTIC_NUM,
+    V8_MUTEX_DIAGNOSTIC_SAMPLE_EVERY,
+    V8_MUTEX_DIAGNOSTIC_WRITERS,
     build_benchmark_plan,
     build_batch64_schedule,
     build_commit_order_trace_plan,
     build_commit_order_trace_schedule,
     build_point_lookahead_plan,
     build_point_lookahead_schedule,
+    build_v8_mutex_diagnostic_plan,
+    build_v8_mutex_diagnostic_schedule,
     build_rfc026_schedule,
     validate_commit_order_trace_rows,
     validate_batch64_rows,
     validate_point_lookahead_rows,
+    validate_v8_mutex_diagnostic_rows,
     validate_rfc026_rows,
 )
 from analyze_gcp_commit_order_trace import extract_trace
@@ -52,6 +58,11 @@ from gcp_wal_profile_runner import (
     build_profile_schedule,
     run_suite as run_profile_suite,
     validate_profile_rows,
+)
+from gcp_v8_mutex_diagnostic_runner import (
+    LOCK_NAMES,
+    _build_command as build_mutex_command,
+    _validate_record as validate_mutex_record,
 )
 
 
@@ -357,6 +368,117 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
         self.assertEqual(point_lookahead.machine_type, "c4-standard-16-lssd")
         with self.assertRaises(SystemExit):
             BENCH.parse_args([*common, "--v8-point-lookahead-ab", "--writers", "8"])
+
+        mutex_diagnostic = BENCH.parse_args([*common, "--v8-mutex-diagnostic"])
+        self.assertEqual(mutex_diagnostic.num, V8_MUTEX_DIAGNOSTIC_NUM)
+        self.assertEqual(mutex_diagnostic.writers, V8_MUTEX_DIAGNOSTIC_WRITERS)
+        self.assertEqual(mutex_diagnostic.machine_type, "c4-standard-16-lssd")
+        with self.assertRaises(SystemExit):
+            BENCH.parse_args([*common, "--v8-mutex-diagnostic", "--writers", "8"])
+        with self.assertRaises(SystemExit):
+            BENCH.parse_args([*common, "--v8-mutex-diagnostic", "--num", "750000"])
+
+    def test_v8_mutex_diagnostic_schedule_and_validation_are_counterbalanced(self) -> None:
+        schedule = build_v8_mutex_diagnostic_schedule()
+        self.assertEqual(len(schedule), 10)
+        self.assertEqual({row["writer"] for row in schedule}, {16})
+        self.assertEqual({row["num"] for row in schedule}, {100_000})
+        self.assertEqual({row["sample_every"] for row in schedule}, {64})
+        for repetition in range(1, 6):
+            pair = [row["arm"] for row in schedule if row["repetition"] == repetition]
+            expected = (
+                ["v7_parallel", "v8_point_lookahead_direct"] if repetition % 2 else
+                ["v8_point_lookahead_direct", "v7_parallel"]
+            )
+            self.assertEqual(pair, expected)
+
+        diagnostics = {
+            "sample_every": V8_MUTEX_DIAGNOSTIC_SAMPLE_EVERY,
+            "locks": [{"name": name} for name in LOCK_NAMES],
+        }
+        rows = [{
+            "writer": row["writer"], "workload": row["workload"], "repetition": row["repetition"],
+            "arm": row["arm"], "ops": row["num"], "exit_code": 0,
+            "mutex_lock_diagnostics": diagnostics,
+        } for row in schedule]
+        self.assertTrue(validate_v8_mutex_diagnostic_rows(rows)["complete"])
+        self.assertFalse(validate_v8_mutex_diagnostic_rows(rows[:-1])["complete"])
+        broken = [{**row, "mutex_lock_diagnostics": {**diagnostics, "sample_every": 32}} for row in rows]
+        self.assertFalse(validate_v8_mutex_diagnostic_rows(broken)["complete"])
+
+        plan = build_v8_mutex_diagnostic_plan(
+            machine_type="c4-standard-16-lssd",
+            machine_spec=BENCH.MACHINE_SPECS["c4-standard-16-lssd"],
+            commit="a" * 40,
+        )
+        self.assertEqual(plan["runs_planned"], 10)
+        self.assertTrue(plan["diagnostic_only"])
+        self.assertEqual(plan["mutex_sample_every"], 64)
+
+    def test_mutex_diagnostic_command_pins_latest_v8_point_candidate(self) -> None:
+        row = next(row for row in build_v8_mutex_diagnostic_schedule()
+                   if row["arm"] == "v8_point_lookahead_direct")
+        command = build_mutex_command(Path("write-perf"), row, Path("dbs"))
+        self.assertIn("--mutex-lock-sample-every", command)
+        self.assertIn("64", command)
+        self.assertIn("v8", command)
+        v7_row = next(row for row in build_v8_mutex_diagnostic_schedule() if row["arm"] == "v7_parallel")
+        self.assertIn("v7", build_mutex_command(Path("write-perf"), v7_row, Path("dbs")))
+
+    def test_mutex_diagnostic_record_validation_checks_v7_and_v8_paths(self) -> None:
+        diagnostics = {
+            "sample_every": 64,
+            "histogram": "log2_upper_bound_nanoseconds",
+            "acquisition_scope": "instrumented synchronous WAL resource/extent and MVCC publication call sites",
+            "locks": [{
+                "name": name,
+                "acquisition_count": 640,
+                "sampled_acquisition_count": 10,
+                "sampled_contended_count": 1,
+                "estimated_contended_count": 64,
+                "sampled_wait_ns_total": 100,
+                "estimated_wait_ns_total": 6400,
+                "sampled_hold_ns_total": 200,
+                "estimated_hold_ns_total": 12800,
+            } for name in LOCK_NAMES],
+        }
+        handles = {
+            "data": {"o_direct": True, "device": 1, "inode": 7},
+            "frontier": {"o_direct": True, "device": 1, "inode": 7},
+            "sync": {"o_direct": False, "device": 1, "inode": 7},
+        }
+        preparation = {"mode": "sliding-point-lookahead", "window_bytes": 1 << 20}
+        for version, arm in ((7, "v7_parallel"), (8, "v8_point_lookahead_direct")):
+            row = {
+                "writer": 16, "workload": "point", "repetition": 1, "arm": arm,
+            }
+            pipeline = {"sync_count": 10}
+            if version == 8:
+                pipeline.update({
+                    "wal_io_stable": True,
+                    "wal_io_start": {**handles, "sliding_extent_preparation": preparation},
+                    "wal_io_end": {**handles, "sliding_extent_preparation": preparation},
+                })
+            record = {
+                "params": {
+                    "num": 100_000, "threads": 16, "value_size": 1024,
+                    "wal_format_version": version, "wal_io_mode": "parallel",
+                },
+                "result": {
+                    "ops": 100_000, "ops_per_sec": 20_000.0,
+                    "process_cpu_user_ms": 1000.0, "process_cpu_system_ms": 1000.0,
+                    "wal_pipeline": pipeline, "mutex_lock_diagnostics": diagnostics,
+                },
+                "latency": {"p50_ms": 0.1, "p95_ms": 0.2, "p99_ms": 0.3},
+            }
+            self.assertEqual(validate_mutex_record(record, row)["ops"], 100_000)
+
+            if version == 8:
+                bad = json.loads(json.dumps(record))
+                bad["result"]["wal_pipeline"]["wal_io_start"]["frontier"]["o_direct"] = False
+                bad["result"]["wal_pipeline"]["wal_io_end"]["frontier"]["o_direct"] = False
+                with self.assertRaisesRegex(ValueError, "FRONTIER O_DIRECT"):
+                    validate_mutex_record(bad, row)
 
     def test_point_lookahead_schedule_has_counterbalanced_point_and_batch_guardrails(self) -> None:
         schedule = build_point_lookahead_schedule((16,))

@@ -56,6 +56,15 @@ POINT_LOOKAHEAD_REPETITIONS = 5
 POINT_LOOKAHEAD_WRITERS = 16
 POINT_LOOKAHEAD_WINDOW_BYTES = 1 << 20
 
+V8_MUTEX_DIAGNOSTIC_WRITERS = (16,)
+V8_MUTEX_DIAGNOSTIC_REPETITIONS = 5
+V8_MUTEX_DIAGNOSTIC_NUM = 100_000
+V8_MUTEX_DIAGNOSTIC_SAMPLE_EVERY = 64
+V8_MUTEX_DIAGNOSTIC_ORDERS = (
+    ("v7_parallel", "v8_point_lookahead_direct"),
+    ("v8_point_lookahead_direct", "v7_parallel"),
+)
+
 
 def validate_writer_counts(values: Iterable[int]) -> tuple[int, ...]:
     writers = tuple(int(value) for value in values)
@@ -205,6 +214,125 @@ def build_point_lookahead_plan(
     if binary_sha256 is not None:
         plan["binary_sha256"] = binary_sha256
     return plan
+
+
+def build_v8_mutex_diagnostic_schedule() -> list[dict[str, object]]:
+    """Build five counterbalanced V7/V8 Point mutex-diagnostic pairs."""
+    schedule: list[dict[str, object]] = []
+    for repetition in range(1, V8_MUTEX_DIAGNOSTIC_REPETITIONS + 1):
+        order = V8_MUTEX_DIAGNOSTIC_ORDERS[(repetition - 1) % len(V8_MUTEX_DIAGNOSTIC_ORDERS)]
+        for arm in order:
+            is_v8 = arm == "v8_point_lookahead_direct"
+            schedule.append({
+                "run_index": len(schedule) + 1,
+                "writer": V8_MUTEX_DIAGNOSTIC_WRITERS[0],
+                "workload": "point",
+                "repetition": repetition,
+                "arm": arm,
+                "bench": "wal_concurrent",
+                "batch_entries": 1,
+                "batch_size": None,
+                "num": V8_MUTEX_DIAGNOSTIC_NUM,
+                "sample_every": V8_MUTEX_DIAGNOSTIC_SAMPLE_EVERY,
+                "extent_mode": "sliding-point-lookahead" if is_v8 else "none",
+                "extent_window_bytes": POINT_LOOKAHEAD_WINDOW_BYTES if is_v8 else 0,
+                "frontier_mode": "direct" if is_v8 else "n/a",
+            })
+    return schedule
+
+
+def build_v8_mutex_diagnostic_plan(
+    *, machine_type: str, machine_spec: Mapping[str, int], commit: str | None = None,
+    binary_sha256: str | None = None,
+) -> dict[str, object]:
+    schedule = build_v8_mutex_diagnostic_schedule()
+    vcpus = int(machine_spec["vcpus"])
+    ssd_count = int(machine_spec["ssd_count"])
+    layout = "single Local SSD" if ssd_count == 1 else f"RAID0 over {ssd_count} Local SSDs"
+    plan: dict[str, object] = {
+        "suite": "v8-mutex-diagnostic",
+        "diagnostic_only": True,
+        "writers": list(V8_MUTEX_DIAGNOSTIC_WRITERS),
+        "workloads": [{"name": "point", "bench": "wal_concurrent", "num": V8_MUTEX_DIAGNOSTIC_NUM}],
+        "arms": list(V8_MUTEX_DIAGNOSTIC_ORDERS[0]),
+        "repetitions_per_pair": V8_MUTEX_DIAGNOSTIC_REPETITIONS,
+        "arm_orders": [list(order) for order in V8_MUTEX_DIAGNOSTIC_ORDERS],
+        "mutex_sample_every": V8_MUTEX_DIAGNOSTIC_SAMPLE_EVERY,
+        "runs_planned": len(schedule),
+        "counterbalanced": True,
+        "machine_type": machine_type,
+        "vcpus": vcpus,
+        "local_ssd_count": ssd_count,
+        "local_ssd_total_gib": int(machine_spec["ssd_gib"]),
+        "runtime_protocol": f"single {vcpus}-vCPU host; {layout}",
+        "value_bytes": 1024,
+        "compaction": "none",
+        "v8_configuration": {
+            "extent_preparation": "sliding-point-lookahead",
+            "extent_window_bytes": POINT_LOOKAHEAD_WINDOW_BYTES,
+            "frontier_mode": "direct",
+            "coalescing": "dynamic",
+        },
+        "qualification_note": (
+            "Diagnostic-only paired runs; sampled mutex timings and estimates are not uninstrumented "
+            "throughput scores. V7 and V8 use the same binary and host."
+        ),
+    }
+    if commit is not None:
+        plan["commit"] = commit
+    if binary_sha256 is not None:
+        plan["binary_sha256"] = binary_sha256
+    return plan
+
+
+def validate_v8_mutex_diagnostic_rows(rows: list[Mapping[str, object]]) -> dict[str, object]:
+    """Validate each planned diagnostic run and its sampled mutex payload."""
+    schedule = build_v8_mutex_diagnostic_schedule()
+    expected = {
+        (row["writer"], row["workload"], row["repetition"], row["arm"]): row for row in schedule
+    }
+    observed: dict[tuple[object, object, object, object], int] = {}
+    invalid: list[Mapping[str, object]] = []
+    lock_names = {
+        "resource_ledger", "reservation_owner", "v8_extent_state", "v8_extent_preparation",
+        "mvcc_publication",
+    }
+    for row in rows:
+        identity = tuple(row.get(key) for key in ("writer", "workload", "repetition", "arm"))
+        observed[identity] = observed.get(identity, 0) + 1
+        try:
+            if identity not in expected or row.get("exit_code") != 0 or row.get("ops") != V8_MUTEX_DIAGNOSTIC_NUM:
+                invalid.append(row)
+                continue
+            diagnostics = row["mutex_lock_diagnostics"]
+            if not isinstance(diagnostics, Mapping):
+                invalid.append(row)
+                continue
+            if diagnostics.get("sample_every") != V8_MUTEX_DIAGNOSTIC_SAMPLE_EVERY:
+                invalid.append(row)
+                continue
+            locks = diagnostics.get("locks")
+            if not isinstance(locks, list) or {entry.get("name") for entry in locks if isinstance(entry, Mapping)} != lock_names:
+                invalid.append(row)
+                continue
+        except (KeyError, TypeError):
+            invalid.append(row)
+
+    expected_cells = set(expected)
+    observed_cells = set(observed)
+    return {
+        "complete": not (
+            expected_cells != observed_cells
+            or any(count != 1 for count in observed.values())
+            or invalid
+        ),
+        "planned": len(schedule),
+        "observed": len(rows),
+        "missing_cells": [list(cell) for cell in sorted(expected_cells - observed_cells)],
+        "unexpected_cells": [list(cell) for cell in sorted(observed_cells - expected_cells, key=str)],
+        "duplicate_cells": [list(cell) for cell, count in observed.items() if count != 1],
+        "invalid_rows": [dict(row) for row in invalid],
+    }
 
 
 def build_commit_order_trace_plan(

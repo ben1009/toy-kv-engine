@@ -675,7 +675,10 @@ impl LsmMvccInner {
         let lock_wait_cpu_started = sample
             .as_ref()
             .map(|_| crate::wal::v8::digest::thread_cpu_time_ns());
-        let mut publication = self.publication.lock();
+        let (mut publication_lock_timer, mut publication) = crate::wal::mutex_diagnostics::lock(
+            &self.publication,
+            crate::wal::mutex_diagnostics::MutexLockKind::MvccPublication,
+        );
         #[cfg(feature = "bench")]
         if let Some(sample) = sample.as_deref_mut() {
             sample.observation.publication_lock_acquisitions += 1;
@@ -715,6 +718,7 @@ impl LsmMvccInner {
             if let Some(sample) = sample.as_deref_mut() {
                 sample.observation.condvar_wait_calls += 1;
             }
+            let lock_wait_started = publication_lock_timer.pause_for_condvar();
             #[cfg(feature = "bench")]
             let timeout = self
                 .publication_condvar
@@ -722,6 +726,7 @@ impl LsmMvccInner {
             #[cfg(not(feature = "bench"))]
             self.publication_condvar
                 .wait_for(&mut publication, DRAIN_RECHECK);
+            publication_lock_timer.resume_after_condvar(lock_wait_started);
             #[cfg(feature = "bench")]
             if let Some(sample) = sample.as_deref_mut() {
                 sample.observation.condvar_returns += 1;
@@ -1022,13 +1027,17 @@ impl LsmMvccInner {
         commit_ts: u64,
         #[cfg(feature = "bench")] mut sample: Option<&mut MvccPublicationSampleBuilder>,
     ) -> anyhow::Result<()> {
+        let mut reacquired_publication_lock_timer = None;
         #[cfg(feature = "bench")]
         let lock_wait_started = sample.as_ref().map(|_| std::time::Instant::now());
         #[cfg(feature = "bench")]
         let lock_wait_cpu_started = sample
             .as_ref()
             .map(|_| crate::wal::v8::digest::thread_cpu_time_ns());
-        let mut publication = self.publication.lock();
+        let (publication_lock_timer, mut publication) = crate::wal::mutex_diagnostics::lock(
+            &self.publication,
+            crate::wal::mutex_diagnostics::MutexLockKind::MvccPublication,
+        );
         #[cfg(feature = "bench")]
         if let Some(sample) = sample.as_deref_mut() {
             sample.observation.publication_lock_acquisitions += 1;
@@ -1104,6 +1113,7 @@ impl LsmMvccInner {
                 sample.observation.waited_for_predecessor = true;
             }
             drop(publication);
+            drop(publication_lock_timer);
             #[cfg(feature = "bench")]
             self.await_publication(commit_ts, sample.as_deref_mut())?;
             #[cfg(not(feature = "bench"))]
@@ -1114,7 +1124,12 @@ impl LsmMvccInner {
             let lock_wait_cpu_started = sample
                 .as_ref()
                 .map(|_| crate::wal::v8::digest::thread_cpu_time_ns());
-            publication = self.publication.lock();
+            let (timer, guard) = crate::wal::mutex_diagnostics::lock(
+                &self.publication,
+                crate::wal::mutex_diagnostics::MutexLockKind::MvccPublication,
+            );
+            reacquired_publication_lock_timer = Some(timer);
+            publication = guard;
             #[cfg(feature = "bench")]
             if let Some(sample) = sample {
                 sample.observation.publication_lock_acquisitions += 1;
@@ -1141,6 +1156,8 @@ impl LsmMvccInner {
             self.publication_condvar.notify_all();
             self.async_publication_changed.notify_waiters();
         }
+        drop(publication);
+        drop(reacquired_publication_lock_timer);
 
         Ok(())
     }

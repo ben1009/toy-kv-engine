@@ -41,7 +41,7 @@ for writer in "${WRITERS[@]}"; do
 done
 if [[ "$SUITE" != "batch64" && "$SUITE" != "rfc026-full" \
     && "$SUITE" != "v8-small-ticket-profile" && "$SUITE" != "commit-order-trace" \
-    && "$SUITE" != "v8-point-lookahead" ]]; then
+    && "$SUITE" != "v8-point-lookahead" && "$SUITE" != "v8-mutex-diagnostic" ]]; then
     echo "unsupported benchmark suite: $SUITE" >&2
     exit 64
 fi
@@ -58,6 +58,12 @@ if [[ "$SUITE" == "commit-order-trace" ]] \
     && { [[ "$NUM" != "100000" ]] || [[ "$MACHINE_TYPE" != "c4-standard-16-lssd" ]] \
         || [[ "$WRITERS_CSV" != "16" ]]; }; then
     echo "commit-order-trace requires c4-standard-16-lssd, 16 writers, and 100000 puts" >&2
+    exit 64
+fi
+if [[ "$SUITE" == "v8-mutex-diagnostic" ]] \
+    && { [[ "$NUM" != "100000" ]] || [[ "$MACHINE_TYPE" != "c4-standard-16-lssd" ]] \
+        || [[ "$WRITERS_CSV" != "16" ]]; }; then
+    echo "v8-mutex-diagnostic requires c4-standard-16-lssd, 16 writers, and 100000 puts" >&2
     exit 64
 fi
 if [[ ! "$SAFE_DEADLINE_EPOCH" =~ ^[0-9]+$ ]] || (( SAFE_DEADLINE_EPOCH < 1 )); then
@@ -294,6 +300,24 @@ elif [[ "$BENCH_SUITE" == "v8-point-lookahead" ]]; then
         --results-dir "$BENCH_RESULTS" \
         --db-root "$BENCH_WORK/databases" \
         --writers "$BENCH_WRITERS" \
+        --safe-deadline-epoch "$BENCH_SAFE_DEADLINE_EPOCH" \
+        --commit "$ACTUAL_COMMIT" \
+        --binary-sha256 "$BINARY_SHA256" \
+        --machine-type "$BENCH_MACHINE_TYPE" \
+        --ssd-count "$BENCH_SSD_COUNT" \
+        --ssd-gib "$BENCH_SSD_TOTAL_GIB"
+elif [[ "$BENCH_SUITE" == "v8-mutex-diagnostic" ]]; then
+    if [[ ! -r /tmp/gcp-v8-mutex-diagnostic-runner.py ]]; then
+        echo "V8 mutex diagnostic runner was not uploaded" >&2
+        exit 1
+    fi
+    cp /tmp/gcp-v8-mutex-diagnostic-runner.py "$REPO/scripts/gcp_v8_mutex_diagnostic_runner.py"
+    echo "WAL_BENCHMARK_STARTED $(date --iso-8601=seconds)" | tee -a "$BENCH_BOOT_LOG"
+    PYTHONPATH="$REPO/scripts${PYTHONPATH:+:$PYTHONPATH}" \
+        python3 "$REPO/scripts/gcp_v8_mutex_diagnostic_runner.py" \
+        --binary "$BINARY" \
+        --results-dir "$BENCH_RESULTS" \
+        --db-root "$BENCH_WORK/databases" \
         --safe-deadline-epoch "$BENCH_SAFE_DEADLINE_EPOCH" \
         --commit "$ACTUAL_COMMIT" \
         --binary-sha256 "$BINARY_SHA256" \

@@ -81,6 +81,7 @@ mod io_metadata_tests {
 }
 
 pub(crate) mod format;
+pub mod mutex_diagnostics;
 pub(crate) mod v7;
 pub(crate) mod v8;
 

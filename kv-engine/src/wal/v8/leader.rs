@@ -26,6 +26,7 @@ use std::{
 #[cfg(test)]
 use std::os::unix::fs::OpenOptionsExt;
 
+use crate::wal::mutex_diagnostics::{self, MutexLockKind};
 use anyhow::{Context, Result, ensure};
 use crossbeam_queue::ArrayQueue;
 use parking_lot::{Condvar, Mutex};
@@ -1056,7 +1057,9 @@ impl WalV8ExtentPreallocator {
                         Err(_) => Some("background V8 extent lookahead panicked".to_owned()),
                     };
                     if let Some(failure) = failure {
-                        worker_state.lock().failure = Some(failure);
+                        let (_extent_state_timer, mut state) =
+                            mutex_diagnostics::lock(&worker_state, MutexLockKind::ExtentState);
+                        state.failure = Some(failure);
                         worker_prepared.notify_all();
                     }
                 })
@@ -1108,7 +1111,8 @@ impl WalV8ExtentPreallocator {
         } else {
             WalV8ExtentPolicy::FallocateOnly
         };
-        let mut state = self.state.lock();
+        let (_extent_state_timer, mut state) =
+            mutex_diagnostics::lock(&self.state, MutexLockKind::ExtentState);
         if let Some(failure) = &state.failure {
             anyhow::bail!("V8 extent lookahead failed: {failure}");
         }
@@ -1189,8 +1193,11 @@ impl WalV8ExtentPreallocator {
 
     fn ensure_prepared_through(&self, required_end: u64) -> Result<()> {
         if self.strategy.uses_lookahead()
-            && (!self.strategy.is_point_only()
-                || self.has_unprepared_lookahead_extent(&self.state.lock(), required_end))
+            && (!self.strategy.is_point_only() || {
+                let (_extent_state_timer, state) =
+                    mutex_diagnostics::lock(&self.state, MutexLockKind::ExtentState);
+                self.has_unprepared_lookahead_extent(&state, required_end)
+            })
         {
             return self.wait_for_prepared_through(required_end);
         }
@@ -1209,11 +1216,15 @@ impl WalV8ExtentPreallocator {
             required_end <= self.max_file_size,
             "V8 sliding extent preparation exceeds the WAL segment limit"
         );
-        let _preparation = self
+        let (_preparation_timer, _preparation) = self
             .strategy
             .uses_lookahead()
-            .then(|| self.preparation_lock.lock());
-        let mut state = self.state.lock();
+            .then(|| {
+                mutex_diagnostics::lock(&self.preparation_lock, MutexLockKind::ExtentPreparation)
+            })
+            .unzip();
+        let (_extent_state_timer, mut state) =
+            mutex_diagnostics::lock(&self.state, MutexLockKind::ExtentState);
         if let Some(failure) = &state.failure {
             anyhow::bail!("V8 extent preparation failed: {failure}");
         }
@@ -1239,7 +1250,9 @@ impl WalV8ExtentPreallocator {
         if self.strategy.is_point_only() && self.has_unprepared_lookahead_extent(&state, target_end)
         {
             drop(state);
+            drop(_extent_state_timer);
             drop(_preparation);
+            drop(_preparation_timer);
             return self.wait_for_prepared_through(target_end);
         }
         let mut slack_reservation = None;
@@ -1326,7 +1339,8 @@ impl WalV8ExtentPreallocator {
             required_end <= self.max_file_size,
             "V8 sliding extent preparation exceeds the WAL segment limit"
         );
-        let mut state = self.state.lock();
+        let (_extent_state_timer, mut state) =
+            mutex_diagnostics::lock(&self.state, MutexLockKind::ExtentState);
         if let Some(failure) = &state.failure {
             anyhow::bail!("V8 extent lookahead failed: {failure}");
         }
@@ -1356,7 +1370,8 @@ impl WalV8ExtentPreallocator {
 
     fn wait_for_prepared_through(&self, required_end: u64) -> Result<()> {
         self.queue_background_preparation(required_end)?;
-        let mut state = self.state.lock();
+        let (mut extent_state_timer, mut state) =
+            mutex_diagnostics::lock(&self.state, MutexLockKind::ExtentState);
         while required_end > state.prepared_end && state.failure.is_none() {
             #[cfg(feature = "bench")]
             {
@@ -1364,7 +1379,9 @@ impl WalV8ExtentPreallocator {
             }
             #[cfg(feature = "bench")]
             let wait_started = Instant::now();
+            let paused_at = extent_state_timer.pause_for_condvar();
             self.prepared.wait(&mut state);
+            extent_state_timer.resume_after_condvar(paused_at);
             #[cfg(feature = "bench")]
             {
                 state.wait_ns = state.wait_ns.saturating_add(
@@ -1394,7 +1411,8 @@ impl WalV8ExtentPreallocator {
         let Some(owner) = &self.reservation_owner else {
             return Ok(());
         };
-        let mut state = self.state.lock();
+        let (_extent_state_timer, mut state) =
+            mutex_diagnostics::lock(&self.state, MutexLockKind::ExtentState);
         let first = state.slack.partition_point(|window| window.end <= start);
         for window in &mut state.slack[first..] {
             if window.start >= end {
@@ -1428,11 +1446,15 @@ impl WalV8ExtentPreallocator {
         let Some(owner) = &self.reservation_owner else {
             return Ok(());
         };
-        let _preparation = self
+        let (_preparation_timer, _preparation) = self
             .strategy
             .uses_lookahead()
-            .then(|| self.preparation_lock.lock());
-        let mut state = self.state.lock();
+            .then(|| {
+                mutex_diagnostics::lock(&self.preparation_lock, MutexLockKind::ExtentPreparation)
+            })
+            .unzip();
+        let (_extent_state_timer, mut state) =
+            mutex_diagnostics::lock(&self.state, MutexLockKind::ExtentState);
         state.window_preallocation_disabled = true;
         if state.slack.iter().all(|window| window.charged_bytes == 0) {
             return Ok(());
@@ -1535,9 +1557,11 @@ impl WalV8ExtentLookaheadWorker {
         let chunk_bytes = WAL_V8_EXTENT_PREPARATION_CHUNK_BYTES as u64;
         let mut zeros = DirectBuf::new(chunk_bytes as usize);
         while requests.recv().is_ok() {
-            let _preparation = preparation_lock.lock();
+            let (_preparation_timer, _preparation) =
+                mutex_diagnostics::lock(&preparation_lock, MutexLockKind::ExtentPreparation);
             loop {
-                let mut state_guard = state.lock();
+                let (_extent_state_timer, mut state_guard) =
+                    mutex_diagnostics::lock(&state, MutexLockKind::ExtentState);
                 let required_end = state_guard.requested_end;
                 if required_end <= state_guard.prepared_end {
                     state_guard.background_request_pending = false;
@@ -1586,6 +1610,7 @@ impl WalV8ExtentLookaheadWorker {
                 let allocated_start = state_guard.allocated_end;
                 let mut preallocation_disabled = state_guard.window_preallocation_disabled;
                 drop(state_guard);
+                drop(_extent_state_timer);
 
                 let mut fallocate_calls = 0_u64;
                 let allocation_started = Instant::now();
@@ -1610,7 +1635,8 @@ impl WalV8ExtentLookaheadWorker {
                 let allocation_elapsed_ns =
                     u64::try_from(allocation_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
 
-                let mut state_guard = state.lock();
+                let (_extent_state_timer, mut state_guard) =
+                    mutex_diagnostics::lock(&state, MutexLockKind::ExtentState);
                 ensure!(
                     state_guard.allocated_end == allocated_start,
                     "V8 extent lookahead lost its serialized allocation prefix"
@@ -1635,7 +1661,8 @@ impl WalV8ExtentLookaheadWorker {
                 drop(state_guard);
 
                 loop {
-                    let mut state_guard = state.lock();
+                    let (_extent_state_timer, mut state_guard) =
+                        mutex_diagnostics::lock(&state, MutexLockKind::ExtentState);
                     let initialized_start = state_guard.prepared_end;
                     if initialized_start >= allocated_end {
                         break;
@@ -1670,6 +1697,7 @@ impl WalV8ExtentLookaheadWorker {
                         "V8 extent lookahead lost direct-I/O alignment"
                     );
                     drop(state_guard);
+                    drop(_extent_state_timer);
 
                     let initialization_started = Instant::now();
                     initialize_v8_extent_chunk(&state, initialized_start, initialized_end, || {
@@ -1681,7 +1709,9 @@ impl WalV8ExtentLookaheadWorker {
                             })
                     })?;
 
-                    state_guard = state.lock();
+                    #[allow(unused_mut)]
+                    let (extent_state_timer, mut state_guard) =
+                        mutex_diagnostics::lock(&state, MutexLockKind::ExtentState);
                     ensure!(
                         state_guard.prepared_end == initialized_end,
                         "V8 extent lookahead failed to publish its initialized prefix"
@@ -1709,6 +1739,8 @@ impl WalV8ExtentLookaheadWorker {
                     }
                     #[cfg(not(feature = "bench"))]
                     let _ = initialization_started;
+                    drop(state_guard);
+                    drop(extent_state_timer);
                     prepared.notify_all();
                 }
             }
@@ -1730,7 +1762,8 @@ fn initialize_v8_extent_chunk(
     );
     write_chunk()?;
 
-    let mut state = state.lock();
+    let (_extent_state_timer, mut state) =
+        mutex_diagnostics::lock(state, MutexLockKind::ExtentState);
     ensure!(
         state.prepared_end == initialized_start,
         "V8 extent lookahead lost its serialized initialization prefix"

@@ -252,6 +252,38 @@ until the server-side VM deadline; the private reconnect key is saved in the
 results directory with mode `0600`. Any retained VM is still automatically
 deleted at that deadline.
 
+For targeted V7/V8 hot-mutex attribution, use the 10-run `--v8-mutex-diagnostic`
+suite. It runs five counterbalanced pairs at 16 writers, 100,000 one-kilobyte
+Point puts, on one host and one release binary. The V8 arm uses the current
+Point-only 1 MiB extent lookahead and Direct FRONTIER candidate; V7 is the
+parallel-I/O reference. Both arms enable the same per-thread sampling interval
+for the instrumented call sites:
+
+```bash
+python3 scripts/gcp-free-trial-wal-bench.py \
+  --project YOUR_PROJECT_ID \
+  --zone us-east1-b \
+  --machine-type c4-standard-16-lssd \
+  --v8-mutex-diagnostic \
+  --commit 0123456789abcdef0123456789abcdef01234567 \
+  --network YOUR_ISOLATED_VPC \
+  --subnet YOUR_SUBNET \
+  --ssh-source-range YOUR_PUBLIC_IPV4/32 \
+  --estimated-hourly-cost-usd YOUR_CURRENT_ESTIMATE \
+  --max-estimated-spend-usd 2.00 \
+  --max-runtime-minutes 60 \
+  --confirm-free-trial
+```
+
+The report includes exact acquisition counts for instrumented call sites.
+Wait/hold timings and contention are sampled every 64th acquisition by default;
+scaled totals and contention counts are estimates. Percentiles are upper bounds
+from log2 nanosecond buckets, not exact quantiles. Compare Resource Ledger and
+MVCC publication between versions, and treat V8 extent-state/preparation locks
+as V8-only measurements. This suite is diagnostic: its instrumented throughput
+and latency are not unprofiled performance scores. It leaves WAL protocol and
+Coordinator Mutex behavior unchanged.
+
 Replace the example commit, CIDR, and cost values. Use a full 40-character
 commit SHA. The two cost arguments are mandatory for a full run: look up
 current pricing for the selected region and estimate the VM, Local SSD, boot

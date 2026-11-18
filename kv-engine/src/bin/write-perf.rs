@@ -301,6 +301,11 @@ struct Args {
     /// Captures phase wall/thread CPU time; requires a bench build with PITR V8 Parallel I/O.
     #[arg(long, requires = "pitr")]
     wal_v8_durability_sample_every: Option<u64>,
+    /// Sample every Nth acquisition of the selected hot WAL/MVCC mutexes.
+    /// Emits lock acquisition/contended estimates, wall wait and hold histograms. Requires a
+    /// bench build and PITR V7/V8 Parallel I/O.
+    #[arg(long, requires = "pitr")]
+    mutex_lock_sample_every: Option<u64>,
     /// Sample every Nth commit timestamp through synchronous MVCC publication.
     /// Captures publication order, frontier distance, lock wait, spin, and condition-variable
     /// data.
@@ -394,6 +399,7 @@ struct HarnessConfig {
     wal_hol_diagnostics: bool,
     wal_completion_timeline: bool,
     wal_v8_durability_sample_every: Option<u64>,
+    mutex_lock_sample_every: Option<u64>,
     mvcc_publication_sample_every: Option<u64>,
     commit_order_trace_limit: Option<u64>,
     vlog_override: bool,
@@ -514,6 +520,7 @@ impl HarnessConfig {
             wal_hol_diagnostics: args.wal_hol_diagnostics,
             wal_completion_timeline: args.wal_completion_timeline,
             wal_v8_durability_sample_every: args.wal_v8_durability_sample_every,
+            mutex_lock_sample_every: args.mutex_lock_sample_every,
             mvcc_publication_sample_every: args.mvcc_publication_sample_every,
             commit_order_trace_limit: args.commit_order_trace_limit,
             vlog_override: args.vlog,
@@ -1073,6 +1080,9 @@ struct MeasurementResult {
     wal_pipeline: Option<WalPipelineRecord>,
     #[serde(skip_serializing_if = "Option::is_none")]
     wal_v8_digest: Option<WalV8DigestRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mutex_lock_diagnostics:
+        Option<kv_engine_wrapper::wal::mutex_diagnostics::MutexLockDiagnosticsSnapshot>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -4893,6 +4903,9 @@ fn run_wal_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
     #[cfg(feature = "bench")]
     {
         engine.reset_write_profile();
+        kv_engine_wrapper::wal::mutex_diagnostics::configure(
+            cfg.mutex_lock_sample_every.unwrap_or_default(),
+        );
         engine.set_mvcc_publication_sample_every(cfg.mvcc_publication_sample_every)?;
         engine.set_commit_order_trace_limit(cfg.commit_order_trace_limit)?;
         engine.set_wal_sync_diagnostics_enabled(
@@ -5021,6 +5034,10 @@ fn run_wal_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
     let elapsed = start.elapsed();
     let (process_cpu_user_ms, process_cpu_system_ms) =
         process_cpu_delta(cpu_start, process_cpu_times());
+    #[cfg(feature = "bench")]
+    let mutex_lock_diagnostics = kv_engine_wrapper::wal::mutex_diagnostics::snapshot();
+    #[cfg(not(feature = "bench"))]
+    let mutex_lock_diagnostics = None;
     #[cfg(all(feature = "bench", target_os = "linux"))]
     if let Some(capture) = affinity_capture {
         capture.finish(std::mem::take(&mut *affinity_writer_placements.lock()))?;
@@ -5085,6 +5102,7 @@ fn run_wal_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
             process_cpu_system_ms,
             wal_pipeline,
             wal_v8_digest,
+            mutex_lock_diagnostics,
             ..MeasurementResult::default()
         },
         counters,
@@ -5119,6 +5137,9 @@ fn run_wal_batch_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>
     #[cfg(feature = "bench")]
     {
         engine.reset_write_profile();
+        kv_engine_wrapper::wal::mutex_diagnostics::configure(
+            cfg.mutex_lock_sample_every.unwrap_or_default(),
+        );
         engine.set_mvcc_publication_sample_every(cfg.mvcc_publication_sample_every)?;
         engine.set_commit_order_trace_limit(cfg.commit_order_trace_limit)?;
         engine.set_wal_sync_diagnostics_enabled(
@@ -5233,6 +5254,10 @@ fn run_wal_batch_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>
     let (process_cpu_user_ms, process_cpu_system_ms) =
         process_cpu_delta(cpu_start, process_cpu_times());
     #[cfg(feature = "bench")]
+    let mutex_lock_diagnostics = kv_engine_wrapper::wal::mutex_diagnostics::snapshot();
+    #[cfg(not(feature = "bench"))]
+    let mutex_lock_diagnostics = None;
+    #[cfg(feature = "bench")]
     let timeline_output = timeline
         .map(|capture| capture.finish(timeline_spans))
         .transpose()?;
@@ -5296,6 +5321,7 @@ fn run_wal_batch_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>
             process_cpu_system_ms,
             wal_pipeline,
             wal_v8_digest,
+            mutex_lock_diagnostics,
             ..MeasurementResult::default()
         },
         counters,
@@ -10036,6 +10062,25 @@ fn validate_config(cfg: &HarnessConfig) -> Result<()> {
             "--wal-v8-durability-sample-every requires PITR V8 Parallel I/O"
         );
     }
+    if let Some(sample_every) = cfg.mutex_lock_sample_every {
+        anyhow::ensure!(
+            sample_every > 0,
+            "--mutex-lock-sample-every must be greater than zero"
+        );
+        anyhow::ensure!(
+            cfg!(feature = "bench"),
+            "--mutex-lock-sample-every requires a bench build"
+        );
+        anyhow::ensure!(
+            cfg.pitr
+                && matches!(
+                    cfg.pitr_format.unwrap_or(PitrFormatArg::V8),
+                    PitrFormatArg::V7 | PitrFormatArg::V8
+                )
+                && cfg.wal_io_mode == WalIoModeArg::Parallel,
+            "--mutex-lock-sample-every requires PITR V7/V8 Parallel I/O"
+        );
+    }
     if let Some(sample_every) = cfg.mvcc_publication_sample_every {
         anyhow::ensure!(
             sample_every > 0,
@@ -10763,6 +10808,91 @@ mod tests {
         assert!(
             Args::try_parse_from(["write-perf", "--wal-v8-durability-sample-every", "64"]).is_err()
         );
+    }
+
+    #[test]
+    fn mutex_lock_sampling_requires_bench_build_and_versioned_parallel_wal() {
+        let v8 = HarnessConfig::from_args(
+            Args::try_parse_from([
+                "write-perf",
+                "--pitr",
+                "--wal-io-mode",
+                "parallel",
+                "--mutex-lock-sample-every",
+                "64",
+            ])
+            .expect("parse V8 mutex sampling option"),
+        );
+        let v8_result = validate_config(&v8);
+        if cfg!(feature = "bench") {
+            v8_result.expect("bench build can capture V8 mutex diagnostics");
+        } else {
+            assert!(
+                v8_result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("requires a bench build")
+            );
+        }
+
+        let v7 = HarnessConfig::from_args(
+            Args::try_parse_from([
+                "write-perf",
+                "--pitr",
+                "--pitr-format",
+                "v7",
+                "--wal-io-mode",
+                "parallel",
+                "--mutex-lock-sample-every",
+                "64",
+            ])
+            .expect("parse V7 mutex sampling option"),
+        );
+        let v7_result = validate_config(&v7);
+        if cfg!(feature = "bench") {
+            v7_result.expect("bench build can capture V7 mutex diagnostics");
+        } else {
+            assert!(
+                v7_result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("requires a bench build")
+            );
+        }
+
+        let zero_interval = HarnessConfig::from_args(
+            Args::try_parse_from(["write-perf", "--pitr", "--mutex-lock-sample-every", "0"])
+                .expect("parse zero mutex sampling interval"),
+        );
+        assert!(
+            validate_config(&zero_interval)
+                .unwrap_err()
+                .to_string()
+                .contains("greater than zero")
+        );
+
+        let leader = HarnessConfig::from_args(
+            Args::try_parse_from([
+                "write-perf",
+                "--pitr",
+                "--wal-io-mode",
+                "leader",
+                "--mutex-lock-sample-every",
+                "64",
+            ])
+            .expect("parse incompatible Leader mutex sampling option"),
+        );
+        let leader_error = validate_config(&leader).unwrap_err().to_string();
+        let expected_leader_error = if cfg!(feature = "bench") {
+            "requires PITR V7/V8 Parallel I/O"
+        } else {
+            "requires a bench build"
+        };
+        assert!(
+            leader_error.contains(expected_leader_error),
+            "{leader_error}"
+        );
+        assert!(Args::try_parse_from(["write-perf", "--mutex-lock-sample-every", "64"]).is_err());
     }
 
     #[test]
@@ -12037,6 +12167,7 @@ mod tests {
             wal_hol_diagnostics: false,
             wal_completion_timeline: false,
             wal_v8_durability_sample_every: None,
+            mutex_lock_sample_every: None,
             mvcc_publication_sample_every: None,
             commit_order_trace_limit: None,
             vlog_override: false,
@@ -14579,6 +14710,7 @@ mod tests {
             wal_hol_diagnostics: false,
             wal_completion_timeline: false,
             wal_v8_durability_sample_every: None,
+            mutex_lock_sample_every: None,
             mvcc_publication_sample_every: None,
             commit_order_trace_limit: None,
             vlog_override: false,

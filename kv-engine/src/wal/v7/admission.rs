@@ -28,6 +28,8 @@ use std::sync::atomic::AtomicU64;
 
 use parking_lot::{Condvar, Mutex};
 
+use crate::wal::mutex_diagnostics::{self, MutexLockKind};
+
 use super::codec::{WAL_V7_FRAME_LEN, data_fragment_count};
 
 /// Resource amounts charged atomically by one reservation.
@@ -432,7 +434,8 @@ impl WalV7ReservationOwner {
     /// pressure recovery can reassess the Active boundary. Independent scratch
     /// buffers do not prevent that recovery.
     pub(crate) fn has_in_flight_source_spool_work(&self) -> bool {
-        let state = self.state.lock();
+        let (_owner_lock_timer, state) =
+            mutex_diagnostics::lock(&self.state, MutexLockKind::ReservationOwner);
 
         state.active_source_spool_preparations != 0 || state.active_batch_operations != 0
     }
@@ -440,7 +443,9 @@ impl WalV7ReservationOwner {
     /// A conservative hint for bounded coalescing, never a durability bound.
     /// Excess operations may be preparing batches or lingering DATA pins.
     pub(crate) fn has_batch_operations_beyond(&self, admitted_in_flight: u64) -> bool {
-        self.state.lock().active_batch_operations > admitted_in_flight
+        let (_owner_lock_timer, state) =
+            mutex_diagnostics::lock(&self.state, MutexLockKind::ReservationOwner);
+        state.active_batch_operations > admitted_in_flight
     }
 
     pub(crate) fn source_spool_generation_changed(&self, generation: u64) -> bool {
@@ -450,7 +455,9 @@ impl WalV7ReservationOwner {
     /// Capture after the rejected attempt unwinds, before checking progress,
     /// so only later work completions prompt another pressure retry.
     pub(crate) fn source_spool_work_generation(&self) -> u64 {
-        self.ledger.inner.state.lock().source_spool_work_generation
+        let (_ledger_lock_timer, state) =
+            mutex_diagnostics::lock(&self.ledger.inner.state, MutexLockKind::ResourceLedger);
+        state.source_spool_work_generation
     }
 
     pub(crate) fn release_startup_staging_resources(&self) {
@@ -494,7 +501,8 @@ impl WalV7ReservationOwner {
         {
             return Err(WalV7ReservationError::InvalidBatchLength);
         }
-        let mut state = self.state.lock();
+        let (_owner_lock_timer, mut state) =
+            mutex_diagnostics::lock(&self.state, MutexLockKind::ReservationOwner);
         if state.retired {
             return Err(WalV7ReservationError::ReservationOwnerRetired);
         }
@@ -531,7 +539,8 @@ impl WalV7ReservationOwner {
             return Err(WalV7ReservationError::EmptyReservation);
         }
 
-        let mut state = self.state.lock();
+        let (_owner_lock_timer, mut state) =
+            mutex_diagnostics::lock(&self.state, MutexLockKind::ReservationOwner);
         if state.retired {
             return Err(WalV7ReservationError::ReservationOwnerRetired);
         }
@@ -556,7 +565,8 @@ impl WalV7ReservationOwner {
             return Ok(());
         }
 
-        let mut state = self.state.lock();
+        let (_owner_lock_timer, mut state) =
+            mutex_diagnostics::lock(&self.state, MutexLockKind::ReservationOwner);
         let inactive = {
             let reservation = state
                 .reservations
@@ -611,7 +621,8 @@ impl WalV7ReservationOwner {
         if charge.is_empty() {
             return Ok(None);
         }
-        let mut state = self.state.lock();
+        let (_owner_lock_timer, mut state) =
+            mutex_diagnostics::lock(&self.state, MutexLockKind::ReservationOwner);
         if state.retired {
             return Err(WalV7ReservationError::ReservationOwnerRetired);
         }
@@ -640,7 +651,8 @@ impl WalV7ReservationOwner {
     /// and seal have been durably removed. Existing operation guards retain
     /// their charges until their work and buffer use finish.
     pub(crate) fn retire_after_durable_cleanup(&self) -> Result<(), WalV7ReservationError> {
-        let mut state = self.state.lock();
+        let (_owner_lock_timer, mut state) =
+            mutex_diagnostics::lock(&self.state, MutexLockKind::ReservationOwner);
         state.retired = true;
         release_retired_reservations(&mut state);
 
@@ -655,7 +667,8 @@ impl WalV7ReservationOwner {
         &self,
         segment_id: u64,
     ) -> Result<(), WalV7ReservationError> {
-        let mut state = self.state.lock();
+        let (_owner_lock_timer, mut state) =
+            mutex_diagnostics::lock(&self.state, MutexLockKind::ReservationOwner);
         if state.active_batch_operations != 0 {
             return Err(WalV7ReservationError::ActiveOperationsOutstanding);
         }
@@ -672,7 +685,8 @@ impl WalV7ReservationOwner {
     }
 
     fn finish_batch_operation(&self, id: u64, admitted: bool) -> Result<(), WalV7ReservationError> {
-        let mut state = self.state.lock();
+        let (_owner_lock_timer, mut state) =
+            mutex_diagnostics::lock(&self.state, MutexLockKind::ReservationOwner);
         let result = if admitted {
             match state.reservations.get_mut(&id) {
                 Some(reservation) => self.ledger.release_buffer_memory(reservation),
@@ -708,7 +722,8 @@ impl WalV7ReservationOwner {
         id: u64,
         source_credit: u64,
     ) -> Result<(), WalV7ReservationError> {
-        let mut state = self.state.lock();
+        let (_owner_lock_timer, mut state) =
+            mutex_diagnostics::lock(&self.state, MutexLockKind::ReservationOwner);
         let reservation = state
             .reservations
             .get_mut(&id)
@@ -828,8 +843,10 @@ impl WalV7OwnedBatchReservation {
 
         // Preserve the existing owner -> ledger lock order used by the
         // single-credit release path.
-        let mut owner_state = owner.state.lock();
-        let mut ledger_state = owner.ledger.inner.state.lock();
+        let (_owner_lock_timer, mut owner_state) =
+            mutex_diagnostics::lock(&owner.state, MutexLockKind::ReservationOwner);
+        let (_ledger_lock_timer, mut ledger_state) =
+            mutex_diagnostics::lock(&owner.ledger.inner.state, MutexLockKind::ResourceLedger);
         let credit = WAL_V7_FRAME_LEN as u64;
         let mut total_retired = WalV7ResourceCharge::default();
         let mut release_count = 0u64;
@@ -978,7 +995,8 @@ impl Drop for WalV7OwnedPreparationReservation {
         if !self.holds_source_spool {
             return;
         }
-        let mut state = self.owner.state.lock();
+        let (_owner_lock_timer, mut state) =
+            mutex_diagnostics::lock(&self.owner.state, MutexLockKind::ReservationOwner);
         if let Some(active_preparations) = state.active_source_spool_preparations.checked_sub(1) {
             state.active_source_spool_preparations = active_preparations;
         } else {
@@ -1078,7 +1096,8 @@ impl WalV7ResourceLedger {
             return Err(WalV7ReservationError::EmptyReservation);
         }
 
-        let mut state = self.inner.state.lock();
+        let (_lock_timer, mut state) =
+            mutex_diagnostics::lock(&self.inner.state, MutexLockKind::ResourceLedger);
         let next = state
             .charged
             .checked_add(charge)
@@ -1167,7 +1186,8 @@ impl WalV7ResourceLedger {
         if !Arc::ptr_eq(&reservation.ledger, &self.inner) {
             return Err(WalV7ReservationError::ForeignReservation);
         }
-        let mut state = self.inner.state.lock();
+        let (_lock_timer, mut state) =
+            mutex_diagnostics::lock(&self.inner.state, MutexLockKind::ResourceLedger);
         let issued_charge = state
             .reservations
             .get(&reservation.id)
@@ -1214,7 +1234,8 @@ impl WalV7ResourceLedger {
         if !Arc::ptr_eq(&reservation.ledger, &self.inner) {
             return Err(WalV7ReservationError::ForeignReservation);
         }
-        let mut state = self.inner.state.lock();
+        let (_ledger_lock_timer, mut state) =
+            mutex_diagnostics::lock(&self.inner.state, MutexLockKind::ResourceLedger);
         let issued_charge = state
             .reservations
             .get(&reservation.id)
@@ -1264,7 +1285,8 @@ impl WalV7ResourceLedger {
             return Ok(());
         }
 
-        let mut state = self.inner.state.lock();
+        let (_ledger_lock_timer, mut state) =
+            mutex_diagnostics::lock(&self.inner.state, MutexLockKind::ResourceLedger);
         let issued_charge = state
             .reservations
             .get(&reservation.id)
@@ -1310,7 +1332,8 @@ impl WalV7ResourceLedger {
             return Err(WalV7ReservationError::ForeignReservation);
         }
         let credit = WAL_V7_FRAME_LEN as u64;
-        let mut state = self.inner.state.lock();
+        let (_ledger_lock_timer, mut state) =
+            mutex_diagnostics::lock(&self.inner.state, MutexLockKind::ResourceLedger);
         let issued_charge = state
             .reservations
             .get(&reservation.id)
@@ -1357,15 +1380,20 @@ impl WalV7ResourceLedger {
     }
 
     pub(crate) fn snapshot(&self) -> WalV7ResourceCharge {
-        self.inner.state.lock().charged
+        let (_ledger_lock_timer, state) =
+            mutex_diagnostics::lock(&self.inner.state, MutexLockKind::ResourceLedger);
+        state.charged
     }
 
     fn source_spool_generation(&self) -> u64 {
-        self.inner.state.lock().source_spool_generation
+        let (_ledger_lock_timer, state) =
+            mutex_diagnostics::lock(&self.inner.state, MutexLockKind::ResourceLedger);
+        state.source_spool_generation
     }
 
     fn notify_source_spool_work_finished(&self) {
-        let mut state = self.inner.state.lock();
+        let (_lock_timer, mut state) =
+            mutex_diagnostics::lock(&self.inner.state, MutexLockKind::ResourceLedger);
         state.source_spool_work_generation = state.source_spool_work_generation.wrapping_add(1);
         drop(state);
         self.inner.source_spool_changed.notify_all();
@@ -1387,11 +1415,14 @@ impl WalV7ResourceLedger {
     ) -> bool {
         #[cfg(test)]
         let _waiter = SourceSpoolWaiter::new(&self.inner.source_spool_waiters);
-        let mut state = self.inner.state.lock();
+        let (mut lock_timer, mut state) =
+            mutex_diagnostics::lock(&self.inner.state, MutexLockKind::ResourceLedger);
         while !state.source_spool_progress_changed(generation, work_generation) && should_wait() {
+            let wait_started = lock_timer.pause_for_condvar();
             self.inner
                 .source_spool_changed
                 .wait_for(&mut state, Duration::from_millis(50));
+            lock_timer.resume_after_condvar(wait_started);
         }
 
         state.source_spool_progress_changed(generation, work_generation)
@@ -1404,16 +1435,19 @@ impl WalV7ResourceLedger {
     ) -> bool {
         #[cfg(test)]
         let _waiter = SourceSpoolWaiter::new(&self.inner.source_spool_waiters);
-        let mut state = self.inner.state.lock();
+        let (mut lock_timer, mut state) =
+            mutex_diagnostics::lock(&self.inner.state, MutexLockKind::ResourceLedger);
         let started = std::time::Instant::now();
         while state.source_spool_generation == generation {
             let remaining = timeout.saturating_sub(started.elapsed());
             if remaining.is_zero() {
                 break;
             }
+            let wait_started = lock_timer.pause_for_condvar();
             self.inner
                 .source_spool_changed
                 .wait_for(&mut state, remaining);
+            lock_timer.resume_after_condvar(wait_started);
         }
 
         state.source_spool_generation != generation
@@ -1446,12 +1480,12 @@ impl WalV7ResourceLedger {
         loop {
             notification.as_mut().enable();
             closing_notification.as_mut().enable();
-            if self
-                .inner
-                .state
-                .lock()
-                .source_spool_progress_changed(generation, work_generation)
-            {
+            let progress_changed = {
+                let (_ledger_lock_timer, state) =
+                    mutex_diagnostics::lock(&self.inner.state, MutexLockKind::ResourceLedger);
+                state.source_spool_progress_changed(generation, work_generation)
+            };
+            if progress_changed {
                 return true;
             }
             if !should_wait() {
@@ -1462,7 +1496,12 @@ impl WalV7ResourceLedger {
                     notification.set(self.inner.async_source_spool_changed.notified());
                 }
                 () = closing_notification.as_mut() => {
-                    return self.inner.state.lock().source_spool_progress_changed(generation, work_generation);
+                    let progress_changed = {
+                        let (_ledger_lock_timer, state) =
+                            mutex_diagnostics::lock(&self.inner.state, MutexLockKind::ResourceLedger);
+                        state.source_spool_progress_changed(generation, work_generation)
+                    };
+                    return progress_changed;
                 }
             }
         }
@@ -1793,7 +1832,8 @@ fn release_reservation(
     id: u64,
     charge: WalV7ResourceCharge,
 ) -> Result<(), WalV7ReservationError> {
-    let mut state = ledger.state.lock();
+    let (_ledger_lock_timer, mut state) =
+        mutex_diagnostics::lock(&ledger.state, MutexLockKind::ResourceLedger);
     let issued_charge = state
         .reservations
         .get(&id)

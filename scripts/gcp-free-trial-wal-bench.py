@@ -37,15 +37,21 @@ from gcp_wal_matrix import (
     FULL_DEFAULT_WRITERS,
     LEGACY_DEFAULT_WRITERS,
     POINT_LOOKAHEAD_WRITERS,
+    V8_MUTEX_DIAGNOSTIC_NUM,
+    V8_MUTEX_DIAGNOSTIC_SAMPLE_EVERY,
+    V8_MUTEX_DIAGNOSTIC_WRITERS,
     build_commit_order_trace_plan,
     build_commit_order_trace_schedule,
     build_batch64_schedule,
     build_benchmark_plan,
     build_point_lookahead_plan,
     build_point_lookahead_schedule,
+    build_v8_mutex_diagnostic_plan,
+    build_v8_mutex_diagnostic_schedule,
     build_rfc026_schedule,
     validate_commit_order_trace_rows,
     validate_point_lookahead_rows,
+    validate_v8_mutex_diagnostic_rows,
     validate_writer_counts,
 )
 from gcp_commit_order_trace_runner import analyze_trace
@@ -60,6 +66,7 @@ MATRIX_MODULE = Path(__file__).with_name("gcp_wal_matrix.py")
 PROFILE_RUNNER = Path(__file__).with_name("gcp_wal_profile_runner.py")
 COMMIT_ORDER_TRACE_RUNNER = Path(__file__).with_name("gcp_commit_order_trace_runner.py")
 POINT_LOOKAHEAD_RUNNER = Path(__file__).with_name("gcp_v8_point_lookahead_runner.py")
+V8_MUTEX_DIAGNOSTIC_RUNNER = Path(__file__).with_name("gcp_v8_mutex_diagnostic_runner.py")
 REPO_URL = "https://github.com/ben1009/toy-kv-engine.git"
 MAX_RUNTIME_MINUTES = 180
 MIN_RUNTIME_MINUTES = 60
@@ -79,7 +86,7 @@ if not root.is_dir():
 root_names = {
     "summary.json", "summary.tsv", "comparison.tsv", "benchmark-plan.json",
     "rfc026-schedule.tsv", "profile-schedule.tsv", "commit-order-trace-schedule.tsv",
-    "point-lookahead-schedule.tsv",
+    "point-lookahead-schedule.tsv", "v8-mutex-diagnostic-schedule.tsv",
     "commit-order-trace-analysis.json", "commit.txt", "remote-exit.json",
     "finished_utc.txt", "remote-finished-utc.txt", "remote-status.txt", "host.txt",
     "os-release.txt", "uname.txt", "lscpu.txt", "lsblk.txt", "findmnt.txt", "df.txt",
@@ -1053,6 +1060,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                              help="Trace commit order and run five untraced 16-writer V7/V8 Point pairs")
     suite_group.add_argument("--v8-point-lookahead-ab", action="store_true",
                              help="Compare V8 1 MiB fallocate vs Point-only lookahead, with batch guardrails")
+    suite_group.add_argument("--v8-mutex-diagnostic", action="store_true",
+                             help="Run five paired V7/V8 Point runs with sampled hot-mutex diagnostics")
     parser.add_argument("--source-patch-sha256",
                         help="SHA-256 of the exact source patch used for a commit-order trace run")
     parser.add_argument("--network", help="Existing VPC to use (default: default)")
@@ -1075,13 +1084,20 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                         help="Attest that Billing Overview says Free Trial and you will not upgrade to Paid")
     args = parser.parse_args(argv)
     if args.num is None:
-        args.num = COMMIT_ORDER_TRACE_NUM if args.commit_order_trace else 750_000
+        args.num = (
+            V8_MUTEX_DIAGNOSTIC_NUM if args.v8_mutex_diagnostic else
+            COMMIT_ORDER_TRACE_NUM if args.commit_order_trace else 750_000
+        )
     if args.machine_type is None:
-        args.machine_type = "c4-standard-16-lssd" if (args.commit_order_trace or args.v8_point_lookahead_ab) else MACHINE_TYPE
+        args.machine_type = "c4-standard-16-lssd" if (
+            args.commit_order_trace or args.v8_point_lookahead_ab or args.v8_mutex_diagnostic
+        ) else MACHINE_TYPE
     args.network = args.network or "default"
     if args.writers is None:
         if args.commit_order_trace:
             args.writers = (COMMIT_ORDER_TRACE_WRITERS,)
+        elif args.v8_mutex_diagnostic:
+            args.writers = V8_MUTEX_DIAGNOSTIC_WRITERS
         elif args.v8_point_lookahead_ab:
             args.writers = (POINT_LOOKAHEAD_WRITERS,)
         elif args.v8_small_ticket_profile:
@@ -1094,6 +1110,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error(str(error))
     if args.commit_order_trace and args.writers != (COMMIT_ORDER_TRACE_WRITERS,):
         parser.error("--commit-order-trace requires exactly 16 writers")
+    if args.v8_mutex_diagnostic and args.writers != V8_MUTEX_DIAGNOSTIC_WRITERS:
+        parser.error("--v8-mutex-diagnostic requires exactly 16 writers")
+    if args.v8_mutex_diagnostic and args.machine_type != "c4-standard-16-lssd":
+        parser.error("--v8-mutex-diagnostic requires c4-standard-16-lssd")
     if args.v8_point_lookahead_ab and args.writers != (POINT_LOOKAHEAD_WRITERS,):
         parser.error("--v8-point-lookahead-ab requires exactly 16 writers")
     if args.v8_point_lookahead_ab and args.machine_type != "c4-standard-16-lssd":
@@ -1104,6 +1124,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error("--num must be at least 64")
     if (args.full_rfc026_matrix or args.v8_small_ticket_profile or args.v8_point_lookahead_ab) and args.num != 750_000:
         parser.error("the selected multi-workload suite uses fixed operation counts; omit --num overrides")
+    if args.v8_mutex_diagnostic and args.num != V8_MUTEX_DIAGNOSTIC_NUM:
+        parser.error(f"--v8-mutex-diagnostic uses a fixed {V8_MUTEX_DIAGNOSTIC_NUM}-put workload")
     if args.commit_order_trace and args.num != COMMIT_ORDER_TRACE_NUM:
         parser.error(f"--commit-order-trace uses a fixed {COMMIT_ORDER_TRACE_NUM}-put workload")
     if args.commit_order_trace and (
@@ -1226,6 +1248,8 @@ def _run_identifier(row: dict[str, Any], suite: str) -> str:
         return f"w{row['writer']}-{row['workload']}-{row['phase']}-r{row['repetition']}-{row['arm']}"
     if suite == "v8-point-lookahead":
         return f"w{row['writer']}-{row['workload']}-r{row['repetition']}-{row['arm']}"
+    if suite == "v8-mutex-diagnostic":
+        return f"w{row['writer']}-{row['workload']}-r{row['repetition']}-{row['arm']}"
     raise ValueError(f"unsupported benchmark suite: {suite!r}")
 
 
@@ -1242,6 +1266,8 @@ def _summary_row_identifier(row: dict[str, Any], suite: str) -> str:
             f"{row['arm']}"
         )
     if suite == "v8-point-lookahead":
+        return f"w{int(row['writer'])}-{row['workload']}-r{int(row['repetition'])}-{row['arm']}"
+    if suite == "v8-mutex-diagnostic":
         return f"w{int(row['writer'])}-{row['workload']}-r{int(row['repetition'])}-{row['arm']}"
     raise ValueError(f"unsupported benchmark suite: {suite!r}")
 
@@ -1266,6 +1292,8 @@ def _expected_run_metadata(row: dict[str, Any], suite: str) -> dict[str, Any]:
                 "num", "sample_every", "extent_mode", "extent_window_bytes",
             )
         }
+    if suite == "v8-mutex-diagnostic":
+        return {key: row[key] for key in ("writer", "workload", "repetition", "arm", "bench", "num", "sample_every")}
     raise ValueError(f"unsupported benchmark suite: {suite!r}")
 
 
@@ -1349,6 +1377,36 @@ def _verify_result_set(results: Path) -> dict[str, Any]:
                     errors.append("commit-order analyzed traces do not match the summary")
                 if analysis.get("score_comparison") != summary.get("score_comparison"):
                     errors.append("commit-order score analysis does not match the summary")
+            elif suite == "v8-mutex-diagnostic":
+                schedule = build_v8_mutex_diagnostic_schedule()
+                if not isinstance(plan.get("commit"), str) or not re.fullmatch(r"[0-9a-f]{40}", plan["commit"]):
+                    errors.append("mutex diagnostic plan has an invalid source commit")
+                expected_plan = build_v8_mutex_diagnostic_plan(
+                    machine_type=plan.get("machine_type", ""),
+                    machine_spec={
+                        "vcpus": plan.get("vcpus", 0), "ssd_count": plan.get("local_ssd_count", 0),
+                        "ssd_gib": plan.get("local_ssd_total_gib", 0),
+                    },
+                    commit=plan.get("commit"), binary_sha256=plan.get("binary_sha256"),
+                )
+                for key, value in expected_plan.items():
+                    if plan.get(key) != value:
+                        errors.append(f"mutex diagnostic plan field {key} does not match the fixed suite")
+                if summary.get("suite") != suite or summary.get("diagnostic_only") is not True:
+                    errors.append("mutex diagnostic summary metadata is invalid")
+                try:
+                    binary_sha = (results / "write-perf.sha256").read_text(encoding="utf-8").strip()
+                except OSError as error:
+                    binary_sha = ""
+                    errors.append(f"mutex diagnostic binary checksum is missing: {error}")
+                if not re.fullmatch(r"[0-9a-f]{64}", binary_sha):
+                    errors.append("mutex diagnostic binary checksum is invalid")
+                if plan.get("binary_sha256") != binary_sha:
+                    errors.append("mutex diagnostic binary checksum does not match the plan")
+                if summary.get("source_commit") not in (None, plan.get("commit")):
+                    errors.append("mutex diagnostic source commit does not match the plan")
+                if summary.get("binary_sha256") != binary_sha:
+                    errors.append("mutex diagnostic binary checksum does not match the summary")
             else:
                 raise ValueError(f"unsupported benchmark plan suite: {suite!r}")
             planned = plan.get("runs_planned")
@@ -1388,6 +1446,7 @@ def _verify_result_set(results: Path) -> dict[str, Any]:
             errors.append(f"run directories do not match schedule (missing={missing}, unexpected={unexpected})")
 
         summary_rows = summary.get("results")
+        summary_by_id: dict[str, dict[str, Any]] = {}
         if not isinstance(summary_rows, list) or len(summary_rows) != planned:
             errors.append("summary does not contain one row for every planned run")
         else:
@@ -1397,7 +1456,9 @@ def _verify_result_set(results: Path) -> dict[str, Any]:
                     errors.append("summary contains a non-object run row")
                     continue
                 try:
-                    summary_ids.append(_summary_row_identifier(row, suite))
+                    summary_id = _summary_row_identifier(row, suite)
+                    summary_ids.append(summary_id)
+                    summary_by_id[summary_id] = row
                 except (KeyError, TypeError, ValueError) as error:
                     errors.append(f"summary contains an invalid run identifier: {error}")
                     continue
@@ -1575,6 +1636,55 @@ def _verify_result_set(results: Path) -> dict[str, Any]:
                             )
                     except (KeyError, AttributeError, TypeError, ValueError) as error:
                         errors.append(f"run {run_id} result parameters are invalid: {error}")
+                elif suite == "v8-mutex-diagnostic" and isinstance(record, dict):
+                    try:
+                        identity = expected[run_id]
+                        result = record["result"]
+                        params = record["params"]
+                        version = 7 if identity["arm"] == "v7_parallel" else 8
+                        wanted = {
+                            "num": V8_MUTEX_DIAGNOSTIC_NUM, "threads": identity["writer"],
+                            "value_size": 1024, "wal_format_version": version, "wal_io_mode": "parallel",
+                        }
+                        if int(result["ops"]) != V8_MUTEX_DIAGNOSTIC_NUM or any(
+                            params.get(key) != value for key, value in wanted.items()
+                        ):
+                            raise ValueError("benchmark parameters do not match the planned Point diagnostic")
+                        pipeline = result["wal_pipeline"]
+                        diagnostics = result.get("mutex_lock_diagnostics")
+                        if not isinstance(diagnostics, dict) or diagnostics.get("sample_every") != (
+                            V8_MUTEX_DIAGNOSTIC_SAMPLE_EVERY
+                        ):
+                            raise ValueError("mutex diagnostic payload is missing or has the wrong sample interval")
+                        if metadata.get("mutex_lock_diagnostics") != diagnostics:
+                            raise ValueError("run metadata mutex diagnostics differ from result.json")
+                        summary_row = summary_by_id.get(run_id)
+                        if summary_row is None or summary_row != metadata:
+                            raise ValueError("summary row differs from the per-run metadata")
+                        if version == 8:
+                            from gcp_wal_profile_runner import _validate_wal_io_metadata
+
+                            _validate_wal_io_metadata(pipeline, 8, expected_frontier_mode="direct")
+                            for boundary in ("wal_io_start", "wal_io_end"):
+                                preparation = pipeline[boundary]["sliding_extent_preparation"]
+                                if preparation.get("mode") != "sliding-point-lookahead" or (
+                                    preparation.get("window_bytes") != 1 << 20
+                                ):
+                                    raise ValueError(f"{boundary} does not report planned Point lookahead")
+                        expected_env = (
+                            "TOYKV_BENCH_V8_EXTENT_PREP=sliding-point-lookahead\n"
+                            "TOYKV_BENCH_V8_EXTENT_PREP_BYTES=1048576\n"
+                            "TOYKV_WAL_V8_FRONTIER_MODE=direct\n"
+                        )
+                        env_text = (run_dir / "environment.txt").read_text(encoding="utf-8")
+                        if identity["arm"] == "v8_point_lookahead_direct" and env_text != expected_env:
+                            raise ValueError("V8 extent/FRONTIER environment does not match the plan")
+                        if identity["arm"] == "v7_parallel" and env_text != "<V7 defaults>\n":
+                            raise ValueError("V7 unexpectedly has V8-only environment overrides")
+                        if version == 8 and pipeline.get("wal_io_stable") is not True:
+                            raise ValueError("WAL I/O metadata changed during the run")
+                    except (KeyError, AttributeError, TypeError, ValueError) as error:
+                        errors.append(f"run {run_id} mutex diagnostic result is invalid: {error}")
             except (OSError, json.JSONDecodeError, ValueError) as error:
                 errors.append(f"run {run_id} metadata is invalid: {error}")
 
@@ -1590,6 +1700,10 @@ def _verify_result_set(results: Path) -> dict[str, Any]:
             validation = validate_point_lookahead_rows(summary.get("results", []), plan["writers"])
             if validation != summary.get("matrix_validation"):
                 errors.append("Point lookahead matrix validation does not match its per-run results")
+        elif suite == "v8-mutex-diagnostic":
+            validation = validate_v8_mutex_diagnostic_rows(summary.get("results", []))
+            if validation != summary.get("matrix_validation"):
+                errors.append("mutex diagnostic matrix validation does not match its per-run results")
     except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError, csv.Error) as error:
         errors.append(f"result metadata is invalid: {error}")
         planned = 0
@@ -1931,6 +2045,7 @@ def provision_and_run(
     profile_suite = getattr(args, "v8_small_ticket_profile", False)
     trace_suite = getattr(args, "commit_order_trace", False)
     point_lookahead_suite = getattr(args, "v8_point_lookahead_ab", False)
+    mutex_diagnostic_suite = getattr(args, "v8_mutex_diagnostic", False)
     missing_tools = [tool for tool in ("ssh", "scp", "ssh-keygen") if not shutil.which(tool)]
     if missing_tools:
         raise BenchError("Required local tools are missing: " + ", ".join(missing_tools))
@@ -2185,6 +2300,16 @@ def provision_and_run(
                 append_local_log(key_log, point_copy.stdout + point_copy.stderr)
                 if point_copy.returncode:
                     raise BenchError(f"Could not copy Point lookahead runner: {point_copy.stderr.strip()}")
+            if mutex_diagnostic_suite:
+                if not V8_MUTEX_DIAGNOSTIC_RUNNER.is_file():
+                    raise BenchError(f"Mutex diagnostic helper is not present in this checkout: {V8_MUTEX_DIAGNOSTIC_RUNNER}")
+                mutex_copy = scp_to_vm(
+                    ip, V8_MUTEX_DIAGNOSTIC_RUNNER, "/tmp/gcp-v8-mutex-diagnostic-runner.py",
+                    key, known_hosts, timeout=120,
+                )
+                append_local_log(key_log, mutex_copy.stdout + mutex_copy.stderr)
+                if mutex_copy.returncode:
+                    raise BenchError(f"Could not copy mutex diagnostic runner: {mutex_copy.stderr.strip()}")
 
             safe_deadline_epoch = int(deadline_epoch - 600)
             remote_command = "sudo -n bash /tmp/run-wal-bench.sh " + shlex.join([
@@ -2192,8 +2317,10 @@ def provision_and_run(
                 args.machine_type, ",".join(str(writer) for writer in args.writers),
                 "v8-small-ticket-profile" if profile_suite else (
                     "commit-order-trace" if trace_suite else (
-                        "v8-point-lookahead" if point_lookahead_suite else (
-                            "rfc026-full" if args.full_rfc026_matrix else "batch64"
+                        "v8-mutex-diagnostic" if mutex_diagnostic_suite else (
+                            "v8-point-lookahead" if point_lookahead_suite else (
+                                "rfc026-full" if args.full_rfc026_matrix else "batch64"
+                            )
                         )
                     )
                 ),
@@ -2370,6 +2497,13 @@ def main(argv: list[str] | None = None) -> int:
             report["benchmark_suite"] = "v8-point-lookahead"
             report["benchmark_plan"] = build_point_lookahead_plan(
                 writers=args.writers,
+                machine_type=args.machine_type,
+                machine_spec=MACHINE_SPECS[args.machine_type],
+                commit=args.commit.lower(),
+            )
+        elif args.v8_mutex_diagnostic:
+            report["benchmark_suite"] = "v8-mutex-diagnostic"
+            report["benchmark_plan"] = build_v8_mutex_diagnostic_plan(
                 machine_type=args.machine_type,
                 machine_spec=MACHINE_SPECS[args.machine_type],
                 commit=args.commit.lower(),
