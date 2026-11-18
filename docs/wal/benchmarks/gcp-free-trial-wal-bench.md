@@ -176,18 +176,26 @@ python3 scripts/gcp-free-trial-wal-bench.py \
 ```
 
 After confirming the Free Trial status in Billing Overview and choosing your
-current public IPv4 CIDR, run the benchmark:
+current public IPv4 CIDR, run the benchmark. `--ssh-source-range auto` resolves
+the current public IPv4 as a `/32` through `https://api.ipify.org`; this sends
+the caller's public IP to that lookup service. Use an explicit CIDR instead if
+that lookup is not permitted or available:
 
 ```bash
 python3 scripts/gcp-free-trial-wal-bench.py \
   --project YOUR_PROJECT_ID \
   --zone us-central1-a \
   --commit 0123456789abcdef0123456789abcdef01234567 \
-  --ssh-source-range 203.0.113.10/32 \
+  --ssh-source-range auto \
   --estimated-hourly-cost-usd YOUR_CURRENT_ESTIMATE \
   --max-estimated-spend-usd YOUR_SPEND_CEILING \
   --confirm-free-trial
 ```
+
+Each invocation reserves its results directory. If you pass `--results-dir`
+to a standalone `--preflight-only` invocation and then to the real run, use two
+different directories. Omitting the option lets the runner choose a fresh
+timestamped directory each time.
 
 To run the full counterbalanced RFC 026 matrix on a 16-vCPU machine with the
 16-writer case included:

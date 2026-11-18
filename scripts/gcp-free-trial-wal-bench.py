@@ -29,6 +29,7 @@ import sys
 import tempfile
 import time
 from typing import Any
+import urllib.request
 import uuid
 
 from gcp_wal_matrix import (
@@ -170,6 +171,31 @@ def _build_remote_archive_command(
 
 class BenchError(RuntimeError):
     """Raised for a failed preflight or benchmark orchestration step."""
+
+
+PUBLIC_IPV4_LOOKUP_URL = "https://api.ipify.org"
+
+
+def resolve_ssh_source_range(source_range: str | None) -> str | None:
+    """Resolve `auto` to the caller's current public IPv4 /32, failing closed."""
+    if source_range is None or source_range.strip().lower() != "auto":
+        return source_range
+
+    request = urllib.request.Request(PUBLIC_IPV4_LOOKUP_URL, headers={"Accept": "text/plain"})
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            address_text = response.read(128).decode("ascii").strip()
+        address = ipaddress.ip_address(address_text)
+    except (OSError, UnicodeError, ValueError) as error:
+        raise BenchError(
+            "could not resolve the current public IPv4 address; no cloud resources were created"
+        ) from error
+
+    if address.version != 4 or not address.is_global:
+        raise BenchError(
+            "the public IP lookup did not return a globally routable IPv4 address; no cloud resources were created"
+        )
+    return f"{address}/32"
 
 
 def _is_transient_gcloud_error(detail: str) -> bool:
@@ -1105,7 +1131,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                         help="SHA-256 of the exact source patch used for a commit-order trace run")
     parser.add_argument("--network", help="Existing VPC to use (default: default)")
     parser.add_argument("--subnet", help="Subnetwork name for custom-mode VPCs (must be in the requested region)")
-    parser.add_argument("--ssh-source-range", help="Restricted IPv4 CIDR allowed to SSH to this ephemeral VM")
+    parser.add_argument(
+        "--ssh-source-range",
+        help=(
+            "Restricted IPv4 CIDR allowed to SSH to this ephemeral VM; use `auto` to resolve the current public IPv4 /32 "
+            "through api.ipify.org"
+        ),
+    )
     parser.add_argument("--results-dir", type=Path, help="Local directory for preflight and collected artifacts")
     parser.add_argument("--num", type=int, help="Writes per run (default depends on the selected suite)")
     parser.add_argument("--max-runtime-minutes", type=int, default=180,
@@ -1122,6 +1154,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--confirm-free-trial", action="store_true",
                         help="Attest that Billing Overview says Free Trial and you will not upgrade to Paid")
     args = parser.parse_args(argv)
+    try:
+        args.ssh_source_range = resolve_ssh_source_range(args.ssh_source_range)
+    except BenchError as error:
+        parser.error(str(error))
     if args.num is None:
         args.num = (
             POINT_DIRECT_FRAME_NUM if args.v8_point_direct_frame_ab else

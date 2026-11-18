@@ -5,7 +5,7 @@ from __future__ import annotations
 import base64
 import csv
 import importlib.util
-from io import StringIO
+from io import BytesIO, StringIO
 import json
 import os
 from pathlib import Path
@@ -184,6 +184,30 @@ def fake_keygen(command, **_kwargs):
 
 
 class GcpFreeTrialWalBenchTests(unittest.TestCase):
+    def test_auto_ssh_source_range_resolves_current_public_ipv4_as_host_rule(self) -> None:
+        with patch.object(BENCH.urllib.request, "urlopen", return_value=BytesIO(b"8.8.8.8\n")) as lookup:
+            args = BENCH.parse_args([
+                "--project", "project", "--zone", "us-central1-a", "--commit", "a" * 40,
+                "--ssh-source-range", "auto", "--preflight-only",
+            ])
+
+        self.assertEqual(args.ssh_source_range, "8.8.8.8/32")
+        lookup.assert_called_once()
+        self.assertEqual(lookup.call_args.args[0].full_url, BENCH.PUBLIC_IPV4_LOOKUP_URL)
+        self.assertEqual(lookup.call_args.kwargs["timeout"], 10)
+
+    def test_auto_ssh_source_range_rejects_non_global_or_non_ipv4_response(self) -> None:
+        for response in (b"2001:4860:4860::8888", b"192.168.1.2", b"not-an-ip"):
+            with self.subTest(response=response), patch.object(
+                BENCH.urllib.request, "urlopen", return_value=BytesIO(response),
+            ), self.assertRaises(BENCH.BenchError):
+                BENCH.resolve_ssh_source_range("auto")
+
+    def test_auto_ssh_source_range_lookup_failure_fails_closed(self) -> None:
+        with patch.object(BENCH.urllib.request, "urlopen", side_effect=TimeoutError("lookup timed out")):
+            with self.assertRaisesRegex(BENCH.BenchError, "no cloud resources were created"):
+                BENCH.resolve_ssh_source_range("auto")
+
     def test_point_borrowed_summary_columns_cover_run_metadata(self) -> None:
         schedule_row = build_point_borrowed_input_schedule((1, 8, 16))[0]
         metadata = {
