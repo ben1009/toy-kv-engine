@@ -52,6 +52,7 @@ and do not define the current writer selection.
 - [GCP V8 pre-publish retirement lock-scope A/B, 2026-11-17](wal/benchmarks/rfc-026-v8-retirement-lock-scope-gcp-20261117.md)
 - [GCP V8 Point retirement credit batching A/B, 2026-11-17](wal/benchmarks/rfc-026-v8-point-retirement-credit-batching-gcp-20261117.md)
 - [GCP V7/V8 hot-mutex diagnostics, 2026-11-18](wal/benchmarks/rfc-026-v7-v8-hot-mutex-gcp-20261118.md)
+- [GCP V7/V8 Point CPU attribution and sampler control, 2026-11-18](wal/benchmarks/rfc-026-v7-v8-point-cpu-attribution-gcp-20261118.md)
 - [GCP V8 Lookahead extent-policy scan diagnostic, 2026-11-18](wal/benchmarks/rfc-026-v8-lookahead-policy-scan-gcp-20261118.md)
 - [GCP V8 extent-policy Vec A/B, 2026-11-18](wal/benchmarks/rfc-026-v8-extent-policy-vec-ab-gcp-20261118.md)
 - [GCP V8 durability phase sampling, 2026-11-13](wal/benchmarks/rfc-026-v8-durability-sampling-gcp-20261113.md)
