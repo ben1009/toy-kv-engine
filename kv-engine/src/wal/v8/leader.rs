@@ -1241,7 +1241,11 @@ impl WalV8ExtentPreallocator {
         let lookahead = strategy.uses_lookahead();
         let point_only_lookahead = strategy.is_point_only();
         let extent_policy_storage_kind = extent_policy_storage_kind_from_env()?;
+        #[cfg(feature = "bench")]
         let extent_policy_scan_diagnostics_enabled =
+            extent_policy_scan_diagnostics_enabled_from_env()?;
+        #[cfg(not(feature = "bench"))]
+        let _extent_policy_scan_diagnostics_enabled =
             extent_policy_scan_diagnostics_enabled_from_env()?;
         ensure!(
             is_o_direct_file(&data_file)?,
@@ -1472,7 +1476,13 @@ impl WalV8ExtentPreallocator {
         let diagnostics_enabled = state.extent_policy_scan_diagnostics_enabled;
         #[cfg(not(feature = "bench"))]
         let diagnostics_enabled = false;
+        #[cfg(feature = "bench")]
         let (has_unprepared, entries_scanned) =
+            state
+                .extent_policies
+                .has_unprepared_lookahead(end, prepared_end, diagnostics_enabled);
+        #[cfg(not(feature = "bench"))]
+        let (has_unprepared, _) =
             state
                 .extent_policies
                 .has_unprepared_lookahead(end, prepared_end, diagnostics_enabled);
