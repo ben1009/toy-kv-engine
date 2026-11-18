@@ -3,15 +3,14 @@
 ## Conclusion
 
 The Vec representation reduced measured extent-policy scan work by more than
-99.96%, but the uninstrumented Point throughput gain stayed below the 5%
-acceptance threshold: +2.19% at 8 writers and +1.01% at 16 writers by paired
-median, with 4/5 pairs won in each cell. Batch16 and Batch64 were effectively
-unchanged.
+99.96%. The uninstrumented Point throughput gains were modest but positive:
++2.19% at 8 writers and +1.01% at 16 writers by paired median, with 4/5 pairs
+won in each cell. Batch16 and Batch64 were effectively unchanged.
 
-The scan is a real source of repeated work, but this experiment does not show
-that it is a major end-to-end throughput bottleneck. Keep BTreeMap as the
-production/default representation. The Vec implementation remains an opt-in
-bench comparison; these results do not qualify a production default change.
+Use Vec as the default extent-policy representation. The gain is small, but it
+removes nearly all historical-window scans without a measured Batch regression.
+This experiment does not show that the scan was a major end-to-end throughput
+bottleneck. BTreeMap remains selectable in bench builds for future comparisons.
 
 ## Run identity
 

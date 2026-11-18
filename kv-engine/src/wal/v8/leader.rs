@@ -754,7 +754,7 @@ impl WalV8SlidingExtentPreparation {
             extent_policy_entries_scanned: 0,
             extent_policy_map_max_entries: 0,
             lookahead_worker_cpu_ns: 0,
-            extent_policy_storage: "btree",
+            extent_policy_storage: "vec",
             extent_policy_scan_diagnostics_enabled: false,
         }
     }
@@ -1066,14 +1066,14 @@ fn extent_policy_storage_kind_from_env() -> Result<WalV8ExtentPolicyStorageKind>
         Ok(value) => anyhow::bail!(
             "TOYKV_BENCH_V8_EXTENT_POLICY_STORAGE must be `btree` or `vec`, got `{value}`"
         ),
-        Err(std::env::VarError::NotPresent) => Ok(WalV8ExtentPolicyStorageKind::BTreeMap),
+        Err(std::env::VarError::NotPresent) => Ok(WalV8ExtentPolicyStorageKind::Vec),
         Err(error) => Err(error).context("read V8 extent policy storage setting"),
     }
 }
 
 #[cfg(not(feature = "bench"))]
 fn extent_policy_storage_kind_from_env() -> Result<WalV8ExtentPolicyStorageKind> {
-    Ok(WalV8ExtentPolicyStorageKind::BTreeMap)
+    Ok(WalV8ExtentPolicyStorageKind::Vec)
 }
 
 #[cfg(feature = "bench")]

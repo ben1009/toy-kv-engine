@@ -10301,7 +10301,7 @@ mod tests {
                 extent_policy_entries_scanned: 0,
                 extent_policy_map_max_entries: 0,
                 lookahead_worker_cpu_ns: 0,
-                extent_policy_storage: "btree",
+                extent_policy_storage: "vec",
                 extent_policy_scan_diagnostics_enabled: false,
             }),
             ..WalIoDiagnosticsRecord::default()
