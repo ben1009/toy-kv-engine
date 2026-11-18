@@ -265,7 +265,6 @@ def build_point_borrowed_input_schedule(writers: Iterable[int]) -> list[dict[str
                     "extent_mode": "sliding-point-lookahead",
                     "extent_window_bytes": POINT_LOOKAHEAD_WINDOW_BYTES,
                     "frontier_mode": "direct",
-                    "point_direct_frame_enabled": False,
                 })
     return schedule
 

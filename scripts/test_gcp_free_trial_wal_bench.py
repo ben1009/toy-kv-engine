@@ -25,6 +25,7 @@ from gcp_wal_matrix import (
     FULL_DEFAULT_WRITERS,
     LEGACY_DEFAULT_WRITERS,
     POINT_LOOKAHEAD_WRITERS,
+    POINT_LOOKAHEAD_WINDOW_BYTES,
     POINT_BORROWED_INPUT_NUM,
     POINT_BORROWED_INPUT_WRITERS,
     POINT_DIRECT_FRAME_NUM,
@@ -561,6 +562,7 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
     def test_point_borrowed_input_schedule_is_counterbalanced_and_limited_to_point_and_batch_guardrails(self) -> None:
         schedule = build_point_borrowed_input_schedule(POINT_BORROWED_INPUT_WRITERS)
         self.assertEqual(len(schedule), 50)
+        self.assertTrue(all("point_direct_frame_enabled" not in row for row in schedule))
         for writer in POINT_BORROWED_INPUT_WRITERS:
             point_rows = [row for row in schedule if row["writer"] == writer and row["workload"] == "point"]
             self.assertEqual(len(point_rows), 10)
@@ -592,6 +594,105 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
         )
         self.assertEqual(plan["runs_planned"], 50)
         self.assertEqual(plan["suite"], "v8-point-borrowed-input")
+
+    def test_point_borrowed_input_verifier_accepts_legacy_artifact_schema(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            results = Path(temp) / "results"
+            results.mkdir()
+            baseline_commit = "1" * 40
+            candidate_commit = "2" * 40
+            source_patch_sha256 = "a" * 64
+            baseline_binary_sha256 = "b" * 64
+            candidate_binary_sha256 = "c" * 64
+            machine_spec = BENCH.MACHINE_SPECS["c4-standard-16-lssd"]
+            plan = build_point_borrowed_input_plan(
+                writers=POINT_BORROWED_INPUT_WRITERS,
+                machine_type="c4-standard-16-lssd",
+                machine_spec=machine_spec,
+                baseline_commit=baseline_commit,
+                candidate_commit=candidate_commit,
+                source_patch_sha256=source_patch_sha256,
+                baseline_binary_sha256=baseline_binary_sha256,
+                candidate_binary_sha256=candidate_binary_sha256,
+            )
+            (results / "benchmark-plan.json").write_text(json.dumps(plan), encoding="utf-8")
+            (results / "source-patch.sha256").write_text(f"{source_patch_sha256}\n", encoding="utf-8")
+            (results / "baseline-binary.sha256").write_text(f"{baseline_binary_sha256}\n", encoding="utf-8")
+            (results / "candidate-binary.sha256").write_text(f"{candidate_binary_sha256}\n", encoding="utf-8")
+
+            legacy_environment = (
+                "TOYKV_BENCH_V8_EXTENT_PREP=sliding-point-lookahead\n"
+                "TOYKV_BENCH_V8_EXTENT_PREP_BYTES=1048576\n"
+                "TOYKV_WAL_V8_FRONTIER_MODE=direct\n"
+            )
+            schedule = build_point_borrowed_input_schedule(POINT_BORROWED_INPUT_WRITERS)
+            summary_rows = []
+            for item in schedule:
+                run_id = BENCH._run_identifier(item, "v8-point-borrowed-input")
+                run_dir = results / run_id
+                run_dir.mkdir()
+                source_commit, binary_sha256 = (
+                    (baseline_commit, baseline_binary_sha256)
+                    if item["arm"] == "v8_owned_baseline"
+                    else (candidate_commit, candidate_binary_sha256)
+                )
+                row = {
+                    **BENCH._expected_run_metadata(item, "v8-point-borrowed-input"),
+                    "source_commit": source_commit,
+                    "binary_sha256": binary_sha256,
+                    "exit_code": 0,
+                    "ops": item["num"],
+                }
+                summary_rows.append(row)
+                preparation = {
+                    "mode": "sliding-point-lookahead",
+                    "window_bytes": POINT_LOOKAHEAD_WINDOW_BYTES,
+                    "initialized_bytes": int(item["workload"] == "point"),
+                }
+                record = {
+                    "params": {
+                        "num": item["num"],
+                        "threads": item["writer"],
+                        "value_size": 1024,
+                        "batch_size": item["batch_size"],
+                        "wal_format_version": 8,
+                        "wal_io_mode": "parallel",
+                    },
+                    "result": {
+                        "ops": item["num"],
+                        "wal_pipeline": {
+                            "wal_io_stable": True,
+                            "wal_io_start": {"sliding_extent_preparation": preparation},
+                            "wal_io_end": {"sliding_extent_preparation": preparation},
+                        },
+                    },
+                }
+                (run_dir / "run-metadata.json").write_text(json.dumps(row), encoding="utf-8")
+                (run_dir / "result.json").write_text(json.dumps(record), encoding="utf-8")
+                (run_dir / "environment.txt").write_text(legacy_environment, encoding="utf-8")
+
+            matrix_validation = validate_point_borrowed_input_rows(
+                summary_rows, POINT_BORROWED_INPUT_WRITERS,
+            )
+            (results / "summary.json").write_text(json.dumps({
+                "suite": "v8-point-borrowed-input",
+                "complete": True,
+                "runs_planned": len(schedule),
+                "runs_completed": len(schedule),
+                "source_commit": candidate_commit,
+                "baseline_commit": baseline_commit,
+                "source_patch_sha256": source_patch_sha256,
+                "baseline_binary_sha256": baseline_binary_sha256,
+                "candidate_binary_sha256": candidate_binary_sha256,
+                "matrix_validation": matrix_validation,
+                "results": summary_rows,
+            }), encoding="utf-8")
+            (results / "remote-exit.json").write_text(json.dumps({
+                "failed": False,
+                "runs_started": len(schedule),
+            }), encoding="utf-8")
+
+            self.assertTrue(BENCH._verify_result_set(results)["verified"])
 
     def test_point_borrowed_input_cli_requires_fixed_pair_and_source_identity(self) -> None:
         args = BENCH.parse_args([

@@ -1345,7 +1345,6 @@ def _expected_run_metadata(row: dict[str, Any], suite: str) -> dict[str, Any]:
             key: row[key] for key in (
                 "writer", "workload", "repetition", "arm", "bench", "batch_entries", "batch_size",
                 "num", "sample_every", "extent_mode", "extent_window_bytes", "frontier_mode",
-                "point_direct_frame_enabled",
             )
         }
     if suite == "v8-point-direct-frame":
@@ -1815,6 +1814,8 @@ def _verify_result_set(results: Path) -> dict[str, Any]:
                             metadata.get("binary_sha256") != wanted_binary
                         ):
                             raise ValueError("run source/binary identity does not match its planned arm")
+                        if metadata.get("point_direct_frame_enabled", False) is not False:
+                            raise ValueError("Point borrowed-input run unexpectedly enables direct-frame encoding")
                         pipeline = result["wal_pipeline"]
                         if pipeline.get("wal_io_stable") is not True:
                             raise ValueError("WAL I/O metadata changed during the run")
@@ -1829,13 +1830,16 @@ def _verify_result_set(results: Path) -> dict[str, Any]:
                         should_initialize = identity["workload"] == "point"
                         if type(initialized_bytes) is not int or (initialized_bytes > 0) != should_initialize:
                             raise ValueError("extent initialization does not match the planned Point/Batch cell")
-                        expected_env = (
+                        legacy_env = (
                             "TOYKV_BENCH_V8_EXTENT_PREP=sliding-point-lookahead\n"
                             "TOYKV_BENCH_V8_EXTENT_PREP_BYTES=1048576\n"
                             "TOYKV_WAL_V8_FRONTIER_MODE=direct\n"
+                        )
+                        current_env = legacy_env + (
                             "TOYKV_BENCH_V8_POINT_DIRECT_FRAME=0\n"
                         )
-                        if (run_dir / "environment.txt").read_text(encoding="utf-8") != expected_env:
+                        environment = (run_dir / "environment.txt").read_text(encoding="utf-8")
+                        if environment not in (legacy_env, current_env):
                             raise ValueError("Point borrowed-input run environment differs from the fixed suite")
                         summary_row = summary_by_id.get(run_id)
                         if summary_row is None or summary_row != metadata:

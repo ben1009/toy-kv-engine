@@ -6943,6 +6943,22 @@ mod tests {
 
     #[test]
     fn direct_point_frame_digest_is_ready_before_head_data_submission() -> Result<()> {
+        struct ReleaseFirstProducer(Option<mpsc::Sender<()>>);
+
+        impl ReleaseFirstProducer {
+            fn send(&mut self) {
+                if let Some(release_tx) = self.0.take() {
+                    let _ = release_tx.send(());
+                }
+            }
+        }
+
+        impl Drop for ReleaseFirstProducer {
+            fn drop(&mut self) {
+                self.send();
+            }
+        }
+
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("active-direct-point-ooo-v8.wal");
         let header = header();
@@ -6960,6 +6976,7 @@ mod tests {
         let (release_tx, release_rx) = mpsc::channel();
 
         thread::scope(|scope| -> Result<()> {
+            let mut release_first_producer = ReleaseFirstProducer(Some(release_tx));
             let first_writer = Arc::clone(&writer);
             let first_handle = scope.spawn(move || {
                 first_writer.append_prepared_batch_inner(
@@ -6970,7 +6987,9 @@ mod tests {
                         admitted_tx
                             .send(())
                             .expect("admission receiver remains open");
-                        release_rx.recv().expect("test releases the first producer");
+                        release_rx
+                            .recv_timeout(Duration::from_secs(5))
+                            .expect("test releases the first producer before timeout");
                     },
                 )
             });
@@ -7021,9 +7040,7 @@ mod tests {
                 }
             })();
 
-            release_tx
-                .send(())
-                .expect("first producer is still waiting");
+            release_first_producer.send();
             let first_result = first_handle
                 .join()
                 .map_err(|_| anyhow::anyhow!("first v8 producer panicked"))?;
