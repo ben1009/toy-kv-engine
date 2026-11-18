@@ -105,6 +105,7 @@ the retained and rejected experiments.
 - [RFC 026 V7/V8 Point thread-sample reanalysis on GCP, 2026-11-17](benchmarks/rfc-026-v7-v8-point-thread-sample-reanalysis-gcp-20261117.md)
 - [RFC 026 V8 pre-publish retirement lock-scope A/B on GCP, 2026-11-17](benchmarks/rfc-026-v8-retirement-lock-scope-gcp-20261117.md)
 - [RFC 026 V8 Point retirement credit batching A/B on GCP, 2026-11-17](benchmarks/rfc-026-v8-point-retirement-credit-batching-gcp-20261117.md)
+- [RFC 026 V8 Lookahead extent-policy scan diagnostic on GCP, 2026-11-18](benchmarks/rfc-026-v8-lookahead-policy-scan-gcp-20261118.md)
 - [RFC 026 V8 Point DATA group join experiment on GCP, 2026-11-17](benchmarks/rfc-026-v8-point-data-group-gcp-20261117.md)
 - [RFC 026 V8 batched durable-guard check GCP A/B, 2026-11-15](benchmarks/rfc-026-v8-durable-guard-check-gcp-20261115.md)
 - [RFC 026 full WAL matrix rerun on GCP, 2026-11-15](benchmarks/rfc-026-v8-durable-guard-full-matrix-gcp-20261115.md)
