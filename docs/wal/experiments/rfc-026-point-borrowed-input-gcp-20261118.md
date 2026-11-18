@@ -34,6 +34,16 @@ verified before cloud cleanup. The source patch SHA-256 was
 | Batch16 | 16 | 398.821 | 402.057 | +0.81% | 4/5 | 8.86 → 8.74 μs |
 | Batch64 | 16 | 628.692 | 626.954 | −0.28% | 0/5 | 5.10 → 5.15 μs |
 
+Sampled latency percentiles (milliseconds, baseline → candidate):
+
+| Workload | Writers | p50 | p95 | p99 |
+| --- | ---: | ---: | ---: | ---: |
+| Point | 1 | 0.127 → 0.126 | 0.151 → 0.151 | 0.601 → 0.581 |
+| Point | 8 | 0.231 → 0.229 | 0.420 → 0.417 | 0.825 → 0.828 |
+| Point | 16 | 0.345 → 0.337 | 0.770 → 0.758 | 1.413 → 1.664 |
+| Batch16 | 16 | 0.612 → 0.603 | 0.920 → 0.897 | 1.741 → 1.352 |
+| Batch64 | 16 | 1.654 → 1.680 | 2.458 → 2.449 | 2.753 → 2.895 |
+
 The 16-writer Point paired observations included one +17.22% outlier, while
 the other four were near zero or negative. The median paired change remained
 −0.18%; it does not meet the project's 5% gain threshold. Point p95/p99 samples
