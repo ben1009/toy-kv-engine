@@ -2842,7 +2842,32 @@ impl WalV8FrameJob<'_> {
             .admitted
             .take()
             .context("v8 producer job lost its admitted batch")?;
-        let mut encoded = match admitted.encode() {
+        // Benchmark-only opt-in; the default path remains exactly the same.
+        #[cfg(feature = "bench")]
+        let direct_point = admitted.can_encode_point_single_frame() && {
+            static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *ENABLED.get_or_init(|| {
+                std::env::var("TOYKV_BENCH_V8_POINT_DIRECT_FRAME").as_deref() == Ok("1")
+            })
+        };
+        #[cfg(not(feature = "bench"))]
+        let direct_point = false;
+        let mut early_buffer = if direct_point {
+            Some(WalV8DataBuffer(
+                self.data_buffer
+                    .take()
+                    .context("v8 producer job lost its DATA buffer")?
+                    .initialize(),
+            ))
+        } else {
+            None
+        };
+        let encode_result = if let Some(buffer) = early_buffer.as_mut() {
+            admitted.encode_point_single_frame_into(buffer.as_mut_slice())
+        } else {
+            admitted.encode()
+        };
+        let mut encoded = match encode_result {
             Ok(encoded) => encoded,
             Err(error) => {
                 self.coordinator.poison();
@@ -2861,13 +2886,21 @@ impl WalV8FrameJob<'_> {
             metrics
         };
 
-        let mut data_buffer = WalV8DataBuffer(
-            self.data_buffer
-                .take()
-                .context("v8 producer job lost its DATA buffer")?
-                .initialize(),
-        );
-        let data_len = encoded.encode_data_frames_into(data_buffer.as_mut_slice())?;
+        let mut data_buffer = if let Some(buffer) = early_buffer {
+            buffer
+        } else {
+            WalV8DataBuffer(
+                self.data_buffer
+                    .take()
+                    .context("v8 producer job lost its DATA buffer")?
+                    .initialize(),
+            )
+        };
+        let data_len = if direct_point {
+            encoded.frame_buffer_bytes()
+        } else {
+            encoded.encode_data_frames_into(data_buffer.as_mut_slice())?
+        };
         ensure!(
             data_len == data_buffer.cap(),
             "v8 DATA materializer returned an unexpected frame length"
