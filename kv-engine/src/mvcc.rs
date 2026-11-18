@@ -40,6 +40,29 @@ enum VersionedWalFrameJob<'a> {
     V8(Box<crate::wal::v8::leader::WalV8FrameJob<'a>>),
 }
 
+#[cfg(feature = "bench")]
+struct WalCpuPhaseTimer {
+    wall_started: std::time::Instant,
+    cpu_started: u64,
+}
+
+#[cfg(feature = "bench")]
+impl WalCpuPhaseTimer {
+    fn start() -> Self {
+        Self {
+            wall_started: std::time::Instant::now(),
+            cpu_started: crate::wal::v8::digest::thread_cpu_time_ns(),
+        }
+    }
+
+    fn finish(self) -> (u64, u64) {
+        (
+            self.wall_started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+            crate::wal::v8::digest::thread_cpu_time_ns().saturating_sub(self.cpu_started),
+        )
+    }
+}
+
 /// A caught versioned-WAL panic cannot leave an outstanding reservation without closing
 /// admission. The synchronous append may already have written or synced its
 /// batch, so conservatively require recovery even if the panic preceded I/O.
@@ -852,13 +875,15 @@ impl LsmMvccInner {
         memtable: &MemTable,
         commit_ts: u64,
         frame_job: crate::wal::v8::leader::WalV8FrameJob<'_>,
-    ) -> anyhow::Result<()> {
-        if let Err(error) = memtable.finish_v8_frame_job(frame_job) {
-            self.record_wal_append_failure(memtable, commit_ts);
-            return Err(error);
+        cpu_attribution_sampled: bool,
+    ) -> anyhow::Result<Option<crate::wal::v8::leader::WalV8ProducerCpuPhases>> {
+        match memtable.finish_v8_frame_job(frame_job, cpu_attribution_sampled) {
+            Ok(phases) => Ok(phases),
+            Err(error) => {
+                self.record_wal_append_failure(memtable, commit_ts);
+                Err(error)
+            }
         }
-
-        Ok(())
     }
 
     fn finish_versioned_frame_job(
@@ -869,7 +894,10 @@ impl LsmMvccInner {
     ) -> anyhow::Result<()> {
         match frame_job {
             VersionedWalFrameJob::V7(job) => self.finish_v7_frame_job(memtable, commit_ts, *job),
-            VersionedWalFrameJob::V8(job) => self.finish_v8_frame_job(memtable, commit_ts, *job),
+            VersionedWalFrameJob::V8(job) => {
+                self.finish_v8_frame_job(memtable, commit_ts, *job, false)?;
+                Ok(())
+            }
         }
     }
 
@@ -1286,6 +1314,12 @@ impl LsmMvccInner {
         value: &[u8],
         memtable: &MemTable,
     ) -> Result<WalPublish, anyhow::Error> {
+        #[cfg(feature = "bench")]
+        let profile = memtable.write_profile();
+        #[cfg(feature = "bench")]
+        let mut cpu_attribution = profile.begin_wal_cpu_attribution_sample(8, 1);
+        #[cfg(feature = "bench")]
+        let phase_timer = WalCpuPhaseTimer::start();
         let mut prefixed = Vec::with_capacity(1 + value.len());
         prefixed.push(crate::vlog::KvKind::Inline as u8);
         prefixed.extend_from_slice(value);
@@ -1297,14 +1331,45 @@ impl LsmMvccInner {
                 value: prefixed.clone(),
             }],
         };
-        let prepared = memtable.prepare_v8_pitr_wal_batch_with_write_class(
+        #[cfg(feature = "bench")]
+        if let Some(sample) = cpu_attribution.as_mut() {
+            let (wall_ns, cpu_ns) = phase_timer.finish();
+            sample.observation.input_build_wall_ns = wall_ns;
+            sample.observation.input_build_cpu_ns = cpu_ns;
+        }
+
+        #[cfg(feature = "bench")]
+        let phase_timer = WalCpuPhaseTimer::start();
+        let prepared_result = memtable.prepare_v8_pitr_wal_batch_with_write_class(
             &batch,
             crate::pitr::LIVE_WAL_V5_LIMITS,
             crate::wal::v8::prepare::WalV8WriteClass::Point,
-        )?;
+        );
+        #[cfg(feature = "bench")]
+        if let Some(sample) = cpu_attribution.as_mut() {
+            let (wall_ns, cpu_ns) = phase_timer.finish();
+            sample.observation.preflight_wall_ns = wall_ns;
+            sample.observation.preflight_cpu_ns = cpu_ns;
+        }
+        let prepared = prepared_result?;
 
+        #[cfg(feature = "bench")]
+        let phase_timer = WalCpuPhaseTimer::start();
         let write_guard = self.write_lock.lock();
+        #[cfg(feature = "bench")]
+        if let Some(sample) = cpu_attribution.as_mut() {
+            let (wall_ns, cpu_ns) = phase_timer.finish();
+            sample.observation.sequencer_wait_wall_ns = wall_ns;
+            sample.observation.sequencer_wait_cpu_ns = cpu_ns;
+        }
+
+        #[cfg(feature = "bench")]
+        let phase_timer = WalCpuPhaseTimer::start();
         let commit_ts = self.reserve_commit_ts()?;
+        #[cfg(feature = "bench")]
+        if let Some(sample) = cpu_attribution.as_mut() {
+            sample.observation.commit_ts = Some(commit_ts);
+        }
         #[cfg(feature = "bench")]
         memtable
             .write_profile()
@@ -1312,20 +1377,71 @@ impl LsmMvccInner {
         let _unwind_guard = self.guard_versioned_commit_unwind(memtable, commit_ts);
         let encoded_key = encode_internal_key(user_key, commit_ts);
         let recorded_at = self.pitr_recorded_at_for_commit(commit_ts)?;
-        let (ticket, frame_job) = match memtable.admit_prepared_v8_pitr_wal_batch_only(
-            prepared,
-            commit_ts,
-            recorded_at,
-        ) {
+        #[cfg(feature = "bench")]
+        if let Some(sample) = cpu_attribution.as_mut() {
+            let (wall_ns, cpu_ns) = phase_timer.finish();
+            sample.observation.commit_setup_wall_ns = wall_ns;
+            sample.observation.commit_setup_cpu_ns = cpu_ns;
+        }
+
+        #[cfg(feature = "bench")]
+        let phase_timer = WalCpuPhaseTimer::start();
+        let admission_result =
+            memtable.admit_prepared_v8_pitr_wal_batch_only(prepared, commit_ts, recorded_at);
+        #[cfg(feature = "bench")]
+        if let Some(sample) = cpu_attribution.as_mut() {
+            let (wall_ns, cpu_ns) = phase_timer.finish();
+            sample.observation.admission_wall_ns = wall_ns;
+            sample.observation.admission_cpu_ns = cpu_ns;
+        }
+        let (ticket, frame_job) = match admission_result {
             Ok((ticket, frame_job)) => (ticket, frame_job),
             Err(error) => {
                 self.record_wal_append_failure(memtable, commit_ts);
                 return Err(error);
             }
         };
+        #[cfg(feature = "bench")]
+        if let Some(sample) = cpu_attribution.as_mut() {
+            sample.observation.ticket = ticket;
+        }
         drop(write_guard);
         if let Some(frame_job) = frame_job {
-            self.finish_v8_frame_job(memtable, commit_ts, frame_job)?;
+            #[cfg(feature = "bench")]
+            let phase_timer = WalCpuPhaseTimer::start();
+            #[cfg(feature = "bench")]
+            let finish_result =
+                self.finish_v8_frame_job(memtable, commit_ts, frame_job, cpu_attribution.is_some());
+            #[cfg(not(feature = "bench"))]
+            let finish_result = self.finish_v8_frame_job(memtable, commit_ts, frame_job, false);
+            #[cfg(feature = "bench")]
+            if let Some(sample) = cpu_attribution.as_mut() {
+                let (wall_ns, cpu_ns) = phase_timer.finish();
+                sample.observation.frame_finish_wall_ns = wall_ns;
+                sample.observation.frame_finish_cpu_ns = cpu_ns;
+            }
+            #[cfg(feature = "bench")]
+            let phases = finish_result?;
+            #[cfg(not(feature = "bench"))]
+            let _ = finish_result?;
+            #[cfg(feature = "bench")]
+            if let (Some(sample), Some(phases)) = (cpu_attribution.as_mut(), phases) {
+                sample.observation.v8_logical_encode_wall_ns = phases.logical_encode_wall_ns;
+                sample.observation.v8_logical_encode_cpu_ns = phases.logical_encode_cpu_ns;
+                sample.observation.v8_digest_ready_wall_ns = phases.digest_ready_wall_ns;
+                sample.observation.v8_digest_ready_cpu_ns = phases.digest_ready_cpu_ns;
+                sample.observation.v8_frame_encode_wall_ns = phases.frame_encode_wall_ns;
+                sample.observation.v8_frame_encode_cpu_ns = phases.frame_encode_cpu_ns;
+                sample.observation.v8_frames_ready_submit_wall_ns =
+                    phases.frames_ready_submit_wall_ns;
+                sample.observation.v8_frames_ready_submit_cpu_ns =
+                    phases.frames_ready_submit_cpu_ns;
+            }
+        }
+
+        #[cfg(feature = "bench")]
+        if let Some(sample) = cpu_attribution.as_mut() {
+            sample.mark_completed();
         }
 
         Ok((commit_ts, encoded_key, prefixed, ticket))
@@ -1339,6 +1455,12 @@ impl LsmMvccInner {
         value: &[u8],
         memtable: &MemTable,
     ) -> Result<WalPublish, anyhow::Error> {
+        #[cfg(feature = "bench")]
+        let profile = memtable.write_profile();
+        #[cfg(feature = "bench")]
+        let mut cpu_attribution = profile.begin_wal_cpu_attribution_sample(7, 1);
+        #[cfg(feature = "bench")]
+        let phase_timer = WalCpuPhaseTimer::start();
         let recorded_at = self.next_pitr_recorded_at(std::time::SystemTime::now())?;
         let mut prefixed = Vec::with_capacity(1 + value.len());
         prefixed.push(crate::vlog::KvKind::Inline as u8);
@@ -1351,32 +1473,94 @@ impl LsmMvccInner {
                 value: prefixed.clone(),
             }],
         };
-        let prepared =
-            memtable.prepare_v7_pitr_wal_batch(&batch, crate::pitr::LIVE_WAL_V5_LIMITS)?;
+        #[cfg(feature = "bench")]
+        if let Some(sample) = cpu_attribution.as_mut() {
+            let (wall_ns, cpu_ns) = phase_timer.finish();
+            sample.observation.input_build_wall_ns = wall_ns;
+            sample.observation.input_build_cpu_ns = cpu_ns;
+        }
+
+        #[cfg(feature = "bench")]
+        let phase_timer = WalCpuPhaseTimer::start();
+        let prepared_result =
+            memtable.prepare_v7_pitr_wal_batch(&batch, crate::pitr::LIVE_WAL_V5_LIMITS);
+        #[cfg(feature = "bench")]
+        if let Some(sample) = cpu_attribution.as_mut() {
+            let (wall_ns, cpu_ns) = phase_timer.finish();
+            sample.observation.preflight_wall_ns = wall_ns;
+            sample.observation.preflight_cpu_ns = cpu_ns;
+        }
+        let prepared = prepared_result?;
         drop(batch);
 
+        #[cfg(feature = "bench")]
+        let phase_timer = WalCpuPhaseTimer::start();
         let _write_guard = self.write_lock.lock();
+        #[cfg(feature = "bench")]
+        if let Some(sample) = cpu_attribution.as_mut() {
+            let (wall_ns, cpu_ns) = phase_timer.finish();
+            sample.observation.sequencer_wait_wall_ns = wall_ns;
+            sample.observation.sequencer_wait_cpu_ns = cpu_ns;
+        }
+
+        #[cfg(feature = "bench")]
+        let phase_timer = WalCpuPhaseTimer::start();
         let commit_ts = self.reserve_commit_ts()?;
+        #[cfg(feature = "bench")]
+        if let Some(sample) = cpu_attribution.as_mut() {
+            sample.observation.commit_ts = Some(commit_ts);
+        }
         #[cfg(feature = "bench")]
         memtable
             .write_profile()
             .record_commit_order_timestamp_reserved(commit_ts);
         let _unwind_guard = self.guard_versioned_commit_unwind(memtable, commit_ts);
         let encoded_key = encode_internal_key(user_key, commit_ts);
-        let (ticket, frame_job) = match memtable.admit_prepared_v7_pitr_wal_batch_only(
-            prepared,
-            commit_ts,
-            recorded_at,
-        ) {
+        #[cfg(feature = "bench")]
+        if let Some(sample) = cpu_attribution.as_mut() {
+            let (wall_ns, cpu_ns) = phase_timer.finish();
+            sample.observation.commit_setup_wall_ns = wall_ns;
+            sample.observation.commit_setup_cpu_ns = cpu_ns;
+        }
+
+        #[cfg(feature = "bench")]
+        let phase_timer = WalCpuPhaseTimer::start();
+        let admission_result =
+            memtable.admit_prepared_v7_pitr_wal_batch_only(prepared, commit_ts, recorded_at);
+        #[cfg(feature = "bench")]
+        if let Some(sample) = cpu_attribution.as_mut() {
+            let (wall_ns, cpu_ns) = phase_timer.finish();
+            sample.observation.admission_wall_ns = wall_ns;
+            sample.observation.admission_cpu_ns = cpu_ns;
+        }
+        let (ticket, frame_job) = match admission_result {
             Ok(ticket) => ticket,
             Err(error) => {
                 self.record_wal_append_failure(memtable, commit_ts);
                 return Err(error);
             }
         };
+        #[cfg(feature = "bench")]
+        if let Some(sample) = cpu_attribution.as_mut() {
+            sample.observation.ticket = ticket;
+        }
         if let Some(frame_job) = frame_job {
             drop(_write_guard);
-            self.finish_v7_frame_job(memtable, commit_ts, frame_job)?;
+            #[cfg(feature = "bench")]
+            let phase_timer = WalCpuPhaseTimer::start();
+            let finish_result = self.finish_v7_frame_job(memtable, commit_ts, frame_job);
+            #[cfg(feature = "bench")]
+            if let Some(sample) = cpu_attribution.as_mut() {
+                let (wall_ns, cpu_ns) = phase_timer.finish();
+                sample.observation.frame_finish_wall_ns = wall_ns;
+                sample.observation.frame_finish_cpu_ns = cpu_ns;
+            }
+            finish_result?;
+        }
+
+        #[cfg(feature = "bench")]
+        if let Some(sample) = cpu_attribution.as_mut() {
+            sample.mark_completed();
         }
 
         Ok((commit_ts, encoded_key, prefixed, ticket))

@@ -301,6 +301,10 @@ struct Args {
     /// Captures phase wall/thread CPU time; requires a bench build with PITR V8 Parallel I/O.
     #[arg(long, requires = "pitr")]
     wal_v8_durability_sample_every: Option<u64>,
+    /// Sample every Nth V7/V8 Parallel Point producer operation and selected WAL worker phases.
+    /// Emits per-phase wall/thread CPU and reuses V8 durability phase sampling when applicable.
+    #[arg(long, requires = "pitr")]
+    wal_cpu_attribution_sample_every: Option<u64>,
     /// Sample every Nth acquisition of the selected hot WAL/MVCC mutexes.
     /// Emits lock acquisition/contended estimates, wall wait and hold histograms. Requires a
     /// bench build and PITR V7/V8 Parallel I/O.
@@ -399,6 +403,7 @@ struct HarnessConfig {
     wal_hol_diagnostics: bool,
     wal_completion_timeline: bool,
     wal_v8_durability_sample_every: Option<u64>,
+    wal_cpu_attribution_sample_every: Option<u64>,
     mutex_lock_sample_every: Option<u64>,
     mvcc_publication_sample_every: Option<u64>,
     commit_order_trace_limit: Option<u64>,
@@ -520,6 +525,7 @@ impl HarnessConfig {
             wal_hol_diagnostics: args.wal_hol_diagnostics,
             wal_completion_timeline: args.wal_completion_timeline,
             wal_v8_durability_sample_every: args.wal_v8_durability_sample_every,
+            wal_cpu_attribution_sample_every: args.wal_cpu_attribution_sample_every,
             mutex_lock_sample_every: args.mutex_lock_sample_every,
             mvcc_publication_sample_every: args.mvcc_publication_sample_every,
             commit_order_trace_limit: args.commit_order_trace_limit,
@@ -1146,6 +1152,8 @@ struct WalPipelineRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     v8_durability_diagnostics: Option<WalV8DurabilityDiagnosticsRunRecord>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    wal_cpu_attribution: Option<WalCpuAttributionRunRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     mvcc_publication_diagnostics: Option<MvccPublicationDiagnosticsRunRecord>,
     #[serde(skip_serializing_if = "Option::is_none")]
     commit_order_trace: Option<CommitOrderTraceRunRecord>,
@@ -1231,6 +1239,18 @@ struct WalV8DurabilityDiagnosticsRunRecord {
     follower_waits: Vec<WalV8FollowerWaitRecord>,
     ack_dropped_samples: u64,
     ack_samples: Vec<WalV8AckRecord>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+struct WalCpuAttributionRunRecord {
+    sample_every: u64,
+    operations_seen: u64,
+    selected_producer_samples: u64,
+    dropped_producer_samples: u64,
+    dropped_thread_samples: u64,
+    thread_cpu_time_supported: bool,
+    producer_samples: Vec<kv_engine_wrapper::mem_table::WalCpuAttributionObservation>,
+    thread_samples: Vec<kv_engine_wrapper::mem_table::WalCpuThreadObservation>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
@@ -1938,6 +1958,22 @@ fn wal_pipeline_record(
                 .collect(),
         }
     });
+    let wal_cpu_attribution = profile
+        .wal_cpu_attribution_sample_every
+        .map(|sample_every| {
+            let (operations_seen, selected_producer_samples, dropped_producer_samples) =
+                engine.wal_cpu_attribution_counts();
+            WalCpuAttributionRunRecord {
+                sample_every,
+                operations_seen,
+                selected_producer_samples,
+                dropped_producer_samples,
+                dropped_thread_samples: engine.wal_cpu_thread_dropped_samples(),
+                thread_cpu_time_supported: cfg!(target_os = "linux"),
+                producer_samples: engine.wal_cpu_attribution_observations(),
+                thread_samples: engine.wal_cpu_thread_observations(),
+            }
+        });
     let mvcc_publication_diagnostics = engine
         .mvcc_publication_diagnostics()
         .filter(|diagnostics| diagnostics.sample_every > 0)
@@ -1988,6 +2024,7 @@ fn wal_pipeline_record(
             .then_some(hol_diagnostics_enabled),
         v8_completion_timeline,
         v8_durability_diagnostics,
+        wal_cpu_attribution,
         mvcc_publication_diagnostics,
         commit_order_trace,
         v8_data_submit_hol_episodes: profile.wal_v8_data_submit_hol_episodes,
@@ -4941,7 +4978,14 @@ fn run_wal_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
         engine.set_wal_v8_completion_timeline_sample_every(
             cfg.wal_completion_timeline.then_some(128),
         )?;
-        engine.set_wal_v8_durability_sample_every(cfg.wal_v8_durability_sample_every)?;
+        engine.set_wal_cpu_attribution_sample_every(cfg.wal_cpu_attribution_sample_every)?;
+        engine.set_wal_v8_durability_sample_every(cfg.wal_v8_durability_sample_every.or_else(
+            || {
+                (wal_run_info.format_version == 8 && wal_run_info.io_mode == "parallel")
+                    .then_some(cfg.wal_cpu_attribution_sample_every)
+                    .flatten()
+            },
+        ))?;
     }
     let value = vec![b'x'; cfg.value_size];
     let num_keys = cfg.num;
@@ -5175,7 +5219,14 @@ fn run_wal_batch_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>
         engine.set_wal_v8_completion_timeline_sample_every(
             cfg.wal_completion_timeline.then_some(128),
         )?;
-        engine.set_wal_v8_durability_sample_every(cfg.wal_v8_durability_sample_every)?;
+        engine.set_wal_cpu_attribution_sample_every(cfg.wal_cpu_attribution_sample_every)?;
+        engine.set_wal_v8_durability_sample_every(cfg.wal_v8_durability_sample_every.or_else(
+            || {
+                (wal_run_info.format_version == 8 && wal_run_info.io_mode == "parallel")
+                    .then_some(cfg.wal_cpu_attribution_sample_every)
+                    .flatten()
+            },
+        ))?;
     }
     #[cfg(feature = "bench")]
     let wal_io_start = engine
@@ -10088,6 +10139,25 @@ fn validate_config(cfg: &HarnessConfig) -> Result<()> {
             "--wal-v8-durability-sample-every requires PITR V8 Parallel I/O"
         );
     }
+    if let Some(sample_every) = cfg.wal_cpu_attribution_sample_every {
+        anyhow::ensure!(
+            sample_every > 0,
+            "--wal-cpu-attribution-sample-every must be greater than zero"
+        );
+        anyhow::ensure!(
+            cfg!(feature = "bench"),
+            "--wal-cpu-attribution-sample-every requires a bench build"
+        );
+        anyhow::ensure!(
+            cfg.pitr
+                && matches!(
+                    cfg.pitr_format.unwrap_or(PitrFormatArg::V8),
+                    PitrFormatArg::V7 | PitrFormatArg::V8
+                )
+                && cfg.wal_io_mode == WalIoModeArg::Parallel,
+            "--wal-cpu-attribution-sample-every requires PITR V7/V8 Parallel I/O"
+        );
+    }
     if let Some(sample_every) = cfg.mutex_lock_sample_every {
         anyhow::ensure!(
             sample_every > 0,
@@ -10182,6 +10252,13 @@ fn validate_run_mode(cfg: &HarnessConfig, bench_arg: Option<&str>) -> Result<()>
         !(cfg.prepare_golden && bench_arg.is_some()),
         "--prepare-golden does not support --bench"
     );
+
+    if cfg.wal_cpu_attribution_sample_every.is_some() {
+        anyhow::ensure!(
+            bench_arg == Some("wal_concurrent"),
+            "--wal-cpu-attribution-sample-every requires --bench wal_concurrent"
+        );
+    }
 
     let extent_mode = std::env::var_os(WAL_V8_EXTENT_PREPARATION_ENV);
     let extent_bytes = std::env::var_os(WAL_V8_EXTENT_PREPARATION_BYTES_ENV);
@@ -10679,6 +10756,59 @@ mod tests {
                 .contains("requires PITR V8")
         );
         assert!(Args::try_parse_from(["write-perf", "--wal-sync-diagnostics"]).is_err());
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn wal_cpu_attribution_is_limited_to_point_wal_comparison() {
+        let point = HarnessConfig::from_args(
+            Args::try_parse_from([
+                "write-perf",
+                "--bench",
+                "wal_concurrent",
+                "--pitr",
+                "--wal-cpu-attribution-sample-every",
+                "64",
+            ])
+            .expect("parse Point CPU attribution options"),
+        );
+        validate_config(&point).expect("valid V8 Point attribution options");
+        validate_run_mode(&point, Some("wal_concurrent"))
+            .expect("accept Point CPU attribution workload");
+
+        let batch = HarnessConfig::from_args(
+            Args::try_parse_from([
+                "write-perf",
+                "--bench",
+                "wal_batch_concurrent",
+                "--pitr",
+                "--wal-cpu-attribution-sample-every",
+                "64",
+            ])
+            .expect("parse Batch CPU attribution options"),
+        );
+        assert!(
+            validate_run_mode(&batch, Some("wal_batch_concurrent"))
+                .unwrap_err()
+                .to_string()
+                .contains("requires --bench wal_concurrent")
+        );
+
+        let no_workload = HarnessConfig::from_args(
+            Args::try_parse_from([
+                "write-perf",
+                "--pitr",
+                "--wal-cpu-attribution-sample-every",
+                "64",
+            ])
+            .expect("parse CPU attribution options without workload"),
+        );
+        assert!(
+            validate_run_mode(&no_workload, None)
+                .unwrap_err()
+                .to_string()
+                .contains("requires --bench wal_concurrent")
+        );
     }
 
     #[test]
@@ -12199,6 +12329,7 @@ mod tests {
             wal_hol_diagnostics: false,
             wal_completion_timeline: false,
             wal_v8_durability_sample_every: None,
+            wal_cpu_attribution_sample_every: None,
             mutex_lock_sample_every: None,
             mvcc_publication_sample_every: None,
             commit_order_trace_limit: None,
@@ -14742,6 +14873,7 @@ mod tests {
             wal_hol_diagnostics: false,
             wal_completion_timeline: false,
             wal_v8_durability_sample_every: None,
+            wal_cpu_attribution_sample_every: None,
             mutex_lock_sample_every: None,
             mvcc_publication_sample_every: None,
             commit_order_trace_limit: None,

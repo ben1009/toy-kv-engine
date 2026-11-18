@@ -10224,6 +10224,47 @@ impl KvEngine {
     }
 
     #[cfg(feature = "bench")]
+    /// Sample Point producer CPU phases and selected WAL worker roles. Passing
+    /// `None` disables all attribution clocks and observations.
+    pub fn set_wal_cpu_attribution_sample_every(&self, sample_every: Option<u64>) -> Result<()> {
+        anyhow::ensure!(
+            sample_every.is_none_or(|every| every > 0),
+            "WAL CPU attribution sample interval must be greater than zero"
+        );
+        let _active_memtable = self.inner.active_memtable_lock.read();
+        self.inner
+            .write_profile
+            .set_wal_cpu_attribution_sample_every(sample_every.unwrap_or_default());
+
+        Ok(())
+    }
+
+    #[cfg(feature = "bench")]
+    /// Sampled per-ticket producer CPU attribution records.
+    pub fn wal_cpu_attribution_observations(
+        &self,
+    ) -> Vec<crate::mem_table::WalCpuAttributionObservation> {
+        self.inner.write_profile.wal_cpu_attribution_observations()
+    }
+
+    #[cfg(feature = "bench")]
+    /// Counts are `(operations_seen, samples_selected, samples_dropped_at_cap)`.
+    pub fn wal_cpu_attribution_counts(&self) -> (u64, u64, u64) {
+        self.inner.write_profile.wal_cpu_attribution_counts()
+    }
+
+    #[cfg(feature = "bench")]
+    /// Sampled CPU observations from the shared I/O worker and WAL coordinators.
+    pub fn wal_cpu_thread_observations(&self) -> Vec<crate::mem_table::WalCpuThreadObservation> {
+        self.inner.write_profile.wal_cpu_thread_observations()
+    }
+
+    #[cfg(feature = "bench")]
+    pub fn wal_cpu_thread_dropped_samples(&self) -> u64 {
+        self.inner.write_profile.wal_cpu_thread_dropped_samples()
+    }
+
+    #[cfg(feature = "bench")]
     /// Samples captured by the opt-in V8 Parallel durability phase diagnostics.
     pub fn wal_v8_durability_phase_observations(
         &self,

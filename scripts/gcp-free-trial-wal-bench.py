@@ -47,6 +47,9 @@ from gcp_wal_matrix import (
     V8_MUTEX_DIAGNOSTIC_NUM,
     V8_MUTEX_DIAGNOSTIC_SAMPLE_EVERY,
     V8_MUTEX_DIAGNOSTIC_WRITERS,
+    V8_POINT_CPU_ATTRIBUTION_NUM,
+    V8_POINT_CPU_ATTRIBUTION_SAMPLE_EVERY,
+    V8_POINT_CPU_ATTRIBUTION_WRITERS,
     build_commit_order_trace_plan,
     build_commit_order_trace_schedule,
     build_batch64_schedule,
@@ -61,6 +64,8 @@ from gcp_wal_matrix import (
     build_v8_extent_policy_storage_schedule,
     build_v8_mutex_diagnostic_plan,
     build_v8_mutex_diagnostic_schedule,
+    build_v8_point_cpu_attribution_plan,
+    build_v8_point_cpu_attribution_schedule,
     build_rfc026_schedule,
     validate_commit_order_trace_rows,
     validate_point_lookahead_rows,
@@ -68,6 +73,7 @@ from gcp_wal_matrix import (
     validate_point_direct_frame_rows,
     validate_v8_extent_policy_storage_rows,
     validate_v8_mutex_diagnostic_rows,
+    validate_v8_point_cpu_attribution_rows,
     validate_writer_counts,
 )
 from gcp_commit_order_trace_runner import analyze_trace
@@ -83,6 +89,7 @@ PROFILE_RUNNER = Path(__file__).with_name("gcp_wal_profile_runner.py")
 COMMIT_ORDER_TRACE_RUNNER = Path(__file__).with_name("gcp_commit_order_trace_runner.py")
 POINT_LOOKAHEAD_RUNNER = Path(__file__).with_name("gcp_v8_point_lookahead_runner.py")
 V8_MUTEX_DIAGNOSTIC_RUNNER = Path(__file__).with_name("gcp_v8_mutex_diagnostic_runner.py")
+V8_POINT_CPU_ATTRIBUTION_RUNNER = Path(__file__).with_name("gcp_v8_point_cpu_attribution_runner.py")
 POINT_BORROWED_INPUT_RUNNER = Path(__file__).with_name("gcp_v8_point_borrowed_input_runner.py")
 POINT_DIRECT_FRAME_RUNNER = Path(__file__).with_name("gcp_v8_point_direct_frame_runner.py")
 V8_EXTENT_POLICY_STORAGE_RUNNER = Path(__file__).with_name("gcp_v8_extent_policy_storage_runner.py")
@@ -106,6 +113,7 @@ root_names = {
     "summary.json", "summary.tsv", "comparison.tsv", "benchmark-plan.json",
     "rfc026-schedule.tsv", "profile-schedule.tsv", "commit-order-trace-schedule.tsv",
     "point-lookahead-schedule.tsv", "v8-mutex-diagnostic-schedule.tsv",
+    "v8-point-cpu-attribution-schedule.tsv",
     "point-borrowed-input-schedule.tsv",
     "point-direct-frame-schedule.tsv",
     "extent-policy-storage-schedule.tsv",
@@ -1084,6 +1092,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                              help="Compare V8 1 MiB fallocate vs Point-only lookahead, with batch guardrails")
     suite_group.add_argument("--v8-mutex-diagnostic", action="store_true",
                              help="Run five paired V7/V8 Point runs with sampled hot-mutex diagnostics")
+    suite_group.add_argument("--v8-point-cpu-attribution", action="store_true",
+                             help="Attribute sampled V7/V8 Point producer and WAL-thread CPU at 1/4/8/16 writers")
     suite_group.add_argument("--v8-point-borrowed-input-ab", action="store_true",
                              help="Compare V8 Point owned vs borrowed preparation with Batch16/64 guardrails")
     suite_group.add_argument("--v8-point-direct-frame-ab", action="store_true",
@@ -1118,11 +1128,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             V8_EXTENT_POLICY_STORAGE_NUM if args.v8_extent_policy_storage_ab else
             POINT_BORROWED_INPUT_NUM if args.v8_point_borrowed_input_ab else
             V8_MUTEX_DIAGNOSTIC_NUM if args.v8_mutex_diagnostic else
+            V8_POINT_CPU_ATTRIBUTION_NUM if args.v8_point_cpu_attribution else
             COMMIT_ORDER_TRACE_NUM if args.commit_order_trace else 750_000
         )
     if args.machine_type is None:
         args.machine_type = "c4-standard-16-lssd" if (
             args.commit_order_trace or args.v8_point_lookahead_ab or args.v8_mutex_diagnostic
+            or args.v8_point_cpu_attribution
             or args.v8_point_borrowed_input_ab or args.v8_point_direct_frame_ab
             or args.v8_extent_policy_storage_ab
         ) else MACHINE_TYPE
@@ -1132,6 +1144,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             args.writers = (COMMIT_ORDER_TRACE_WRITERS,)
         elif args.v8_mutex_diagnostic:
             args.writers = V8_MUTEX_DIAGNOSTIC_WRITERS
+        elif args.v8_point_cpu_attribution:
+            args.writers = V8_POINT_CPU_ATTRIBUTION_WRITERS
         elif args.v8_point_lookahead_ab:
             args.writers = (POINT_LOOKAHEAD_WRITERS,)
         elif args.v8_point_borrowed_input_ab:
@@ -1154,6 +1168,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error("--v8-mutex-diagnostic requires exactly 16 writers")
     if args.v8_mutex_diagnostic and args.machine_type != "c4-standard-16-lssd":
         parser.error("--v8-mutex-diagnostic requires c4-standard-16-lssd")
+    if args.v8_point_cpu_attribution and args.writers != V8_POINT_CPU_ATTRIBUTION_WRITERS:
+        parser.error(f"--v8-point-cpu-attribution requires writers {V8_POINT_CPU_ATTRIBUTION_WRITERS}")
+    if args.v8_point_cpu_attribution and args.machine_type != "c4-standard-16-lssd":
+        parser.error("--v8-point-cpu-attribution requires c4-standard-16-lssd")
     if args.v8_point_lookahead_ab and args.writers != (POINT_LOOKAHEAD_WRITERS,):
         parser.error("--v8-point-lookahead-ab requires exactly 16 writers")
     if args.v8_point_lookahead_ab and args.machine_type != "c4-standard-16-lssd":
@@ -1184,6 +1202,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error(f"--v8-extent-policy-storage-ab uses a fixed {V8_EXTENT_POLICY_STORAGE_NUM}-put workload")
     if args.v8_mutex_diagnostic and args.num != V8_MUTEX_DIAGNOSTIC_NUM:
         parser.error(f"--v8-mutex-diagnostic uses a fixed {V8_MUTEX_DIAGNOSTIC_NUM}-put workload")
+    if args.v8_point_cpu_attribution and args.num != V8_POINT_CPU_ATTRIBUTION_NUM:
+        parser.error(f"--v8-point-cpu-attribution uses a fixed {V8_POINT_CPU_ATTRIBUTION_NUM}-put workload")
     if args.commit_order_trace and args.num != COMMIT_ORDER_TRACE_NUM:
         parser.error(f"--commit-order-trace uses a fixed {COMMIT_ORDER_TRACE_NUM}-put workload")
     if args.commit_order_trace and (
@@ -1321,6 +1341,8 @@ def _run_identifier(row: dict[str, Any], suite: str) -> str:
         )
     if suite == "v8-mutex-diagnostic":
         return f"w{row['writer']}-{row['workload']}-r{row['repetition']}-{row['arm']}"
+    if suite == "v8-point-cpu-attribution":
+        return f"w{row['writer']}-{row['workload']}-{row['arm']}"
     raise ValueError(f"unsupported benchmark suite: {suite!r}")
 
 
@@ -1345,6 +1367,8 @@ def _summary_row_identifier(row: dict[str, Any], suite: str) -> str:
         )
     if suite == "v8-mutex-diagnostic":
         return f"w{int(row['writer'])}-{row['workload']}-r{int(row['repetition'])}-{row['arm']}"
+    if suite == "v8-point-cpu-attribution":
+        return f"w{int(row['writer'])}-{row['workload']}-{row['arm']}"
     raise ValueError(f"unsupported benchmark suite: {suite!r}")
 
 
@@ -1392,6 +1416,8 @@ def _expected_run_metadata(row: dict[str, Any], suite: str) -> dict[str, Any]:
             )
         }
     if suite == "v8-mutex-diagnostic":
+        return {key: row[key] for key in ("writer", "workload", "repetition", "arm", "bench", "num", "sample_every")}
+    if suite == "v8-point-cpu-attribution":
         return {key: row[key] for key in ("writer", "workload", "repetition", "arm", "bench", "num", "sample_every")}
     raise ValueError(f"unsupported benchmark suite: {suite!r}")
 
@@ -1626,6 +1652,34 @@ def _verify_result_set(results: Path) -> dict[str, Any]:
                     errors.append("mutex diagnostic source commit does not match the plan")
                 if summary.get("binary_sha256") != binary_sha:
                     errors.append("mutex diagnostic binary checksum does not match the summary")
+            elif suite == "v8-point-cpu-attribution":
+                schedule = build_v8_point_cpu_attribution_schedule()
+                try:
+                    recorded_commit = (results / "commit.txt").read_text(encoding="utf-8").strip()
+                    binary_sha = (results / "write-perf.sha256").read_text(encoding="utf-8").strip()
+                except OSError as error:
+                    recorded_commit = binary_sha = ""
+                    errors.append(f"CPU attribution source/binary identity is missing: {error}")
+                if not re.fullmatch(r"[0-9a-f]{40}", recorded_commit) or plan.get("commit") != recorded_commit:
+                    errors.append("CPU attribution plan source commit does not match commit.txt")
+                if not re.fullmatch(r"[0-9a-f]{64}", binary_sha) or plan.get("binary_sha256") != binary_sha:
+                    errors.append("CPU attribution binary checksum does not match the plan")
+                expected_plan = build_v8_point_cpu_attribution_plan(
+                    machine_type=plan.get("machine_type", ""),
+                    machine_spec={
+                        "vcpus": plan.get("vcpus", 0), "ssd_count": plan.get("local_ssd_count", 0),
+                        "ssd_gib": plan.get("local_ssd_total_gib", 0),
+                    },
+                    commit=recorded_commit,
+                    binary_sha256=binary_sha,
+                )
+                for key, value in expected_plan.items():
+                    if plan.get(key) != value:
+                        errors.append(f"CPU attribution plan field {key} does not match the fixed suite")
+                if summary.get("suite") != suite or summary.get("diagnostic_only") is not True:
+                    errors.append("CPU attribution summary metadata is invalid")
+                if summary.get("source_commit") != recorded_commit or summary.get("binary_sha256") != binary_sha:
+                    errors.append("CPU attribution summary source/binary identity does not match the plan")
             else:
                 raise ValueError(f"unsupported benchmark plan suite: {suite!r}")
             planned = plan.get("runs_planned")
@@ -2090,6 +2144,31 @@ def _verify_result_set(results: Path) -> dict[str, Any]:
                             raise ValueError("WAL I/O metadata changed during the run")
                     except (KeyError, AttributeError, TypeError, ValueError) as error:
                         errors.append(f"run {run_id} mutex diagnostic result is invalid: {error}")
+                elif suite == "v8-point-cpu-attribution" and isinstance(record, dict):
+                    try:
+                        from gcp_v8_point_cpu_attribution_runner import _validate_record
+
+                        identity = expected[run_id]
+                        validated = _validate_record(record, identity)
+                        if metadata.get("wal_cpu_attribution") != validated.get("wal_cpu_attribution"):
+                            raise ValueError("run metadata attribution payload differs from result.json")
+                        if metadata.get("v8_durability_diagnostics") != validated.get("v8_durability_diagnostics"):
+                            raise ValueError("run metadata V8 durability payload differs from result.json")
+                        summary_row = summary_by_id.get(run_id)
+                        if summary_row is None or summary_row != metadata:
+                            raise ValueError("summary row differs from the per-run metadata")
+                        expected_env = (
+                            "TOYKV_BENCH_V8_EXTENT_PREP=sliding-point-lookahead\n"
+                            "TOYKV_BENCH_V8_EXTENT_PREP_BYTES=1048576\n"
+                            "TOYKV_WAL_V8_FRONTIER_MODE=direct\n"
+                        )
+                        env_text = (run_dir / "environment.txt").read_text(encoding="utf-8")
+                        if identity["arm"] == "v8_point_lookahead_direct" and env_text != expected_env:
+                            raise ValueError("V8 extent/FRONTIER environment differs from the plan")
+                        if identity["arm"] == "v7_parallel" and env_text != "<V7 defaults>\n":
+                            raise ValueError("V7 unexpectedly has V8-only environment overrides")
+                    except (KeyError, AttributeError, OSError, TypeError, ValueError) as error:
+                        errors.append(f"run {run_id} CPU attribution result is invalid: {error}")
             except (OSError, json.JSONDecodeError, ValueError) as error:
                 errors.append(f"run {run_id} metadata is invalid: {error}")
 
@@ -2121,6 +2200,10 @@ def _verify_result_set(results: Path) -> dict[str, Any]:
             validation = validate_v8_mutex_diagnostic_rows(summary.get("results", []))
             if validation != summary.get("matrix_validation"):
                 errors.append("mutex diagnostic matrix validation does not match its per-run results")
+        elif suite == "v8-point-cpu-attribution":
+            validation = validate_v8_point_cpu_attribution_rows(summary.get("results", []))
+            if validation != summary.get("matrix_validation"):
+                errors.append("CPU attribution matrix validation does not match its per-run results")
     except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError, csv.Error) as error:
         errors.append(f"result metadata is invalid: {error}")
         planned = 0
@@ -2463,6 +2546,7 @@ def provision_and_run(
     trace_suite = getattr(args, "commit_order_trace", False)
     point_lookahead_suite = getattr(args, "v8_point_lookahead_ab", False)
     mutex_diagnostic_suite = getattr(args, "v8_mutex_diagnostic", False)
+    cpu_attribution_suite = getattr(args, "v8_point_cpu_attribution", False)
     point_borrowed_input_suite = getattr(args, "v8_point_borrowed_input_ab", False)
     point_direct_frame_suite = getattr(args, "v8_point_direct_frame_ab", False)
     extent_policy_storage_suite = getattr(args, "v8_extent_policy_storage_ab", False)
@@ -2730,6 +2814,16 @@ def provision_and_run(
                 append_local_log(key_log, mutex_copy.stdout + mutex_copy.stderr)
                 if mutex_copy.returncode:
                     raise BenchError(f"Could not copy mutex diagnostic runner: {mutex_copy.stderr.strip()}")
+            if cpu_attribution_suite:
+                if not V8_POINT_CPU_ATTRIBUTION_RUNNER.is_file():
+                    raise BenchError(f"Point CPU attribution helper is missing: {V8_POINT_CPU_ATTRIBUTION_RUNNER}")
+                cpu_copy = scp_to_vm(
+                    ip, V8_POINT_CPU_ATTRIBUTION_RUNNER, "/tmp/gcp-v8-point-cpu-attribution-runner.py",
+                    key, known_hosts, timeout=120,
+                )
+                append_local_log(key_log, cpu_copy.stdout + cpu_copy.stderr)
+                if cpu_copy.returncode:
+                    raise BenchError(f"Could not copy CPU attribution helper: {cpu_copy.stderr.strip()}")
             if point_borrowed_input_suite:
                 if not POINT_BORROWED_INPUT_RUNNER.is_file():
                     raise BenchError(f"Borrowed-input helper is missing: {POINT_BORROWED_INPUT_RUNNER}")
@@ -2771,8 +2865,10 @@ def provision_and_run(
                         "v8-point-direct-frame" if point_direct_frame_suite else (
                             "v8-point-borrowed-input" if point_borrowed_input_suite else (
                             "v8-mutex-diagnostic" if mutex_diagnostic_suite else (
+                                "v8-point-cpu-attribution" if cpu_attribution_suite else (
                                 "v8-point-lookahead" if point_lookahead_suite else (
                                     "rfc026-full" if args.full_rfc026_matrix else "batch64"
+                                )
                                 )
                             )
                             )
@@ -2961,6 +3057,13 @@ def main(argv: list[str] | None = None) -> int:
         elif args.v8_mutex_diagnostic:
             report["benchmark_suite"] = "v8-mutex-diagnostic"
             report["benchmark_plan"] = build_v8_mutex_diagnostic_plan(
+                machine_type=args.machine_type,
+                machine_spec=MACHINE_SPECS[args.machine_type],
+                commit=args.commit.lower(),
+            )
+        elif args.v8_point_cpu_attribution:
+            report["benchmark_suite"] = "v8-point-cpu-attribution"
+            report["benchmark_plan"] = build_v8_point_cpu_attribution_plan(
                 machine_type=args.machine_type,
                 machine_spec=MACHINE_SPECS[args.machine_type],
                 commit=args.commit.lower(),

@@ -2426,7 +2426,20 @@ fn run_worker_loop<B: WorkerBuffer>(
                 completed = ready;
             }
             let completion_count = completed.len();
-            process_completions(
+            #[cfg(feature = "bench")]
+            let mut cpu_sample = {
+                let profile = sync_progress.profile();
+                (completion_count > 0)
+                    .then_some(profile.as_ref())
+                    .flatten()
+                    .and_then(|profile| {
+                        profile.begin_wal_cpu_thread_sample(
+                            crate::mem_table::WalCpuThreadRole::IoWorkerCompletionProcessing,
+                            completion_count as u64,
+                        )
+                    })
+            };
+            let completion_result = process_completions(
                 completed,
                 core,
                 buffer_pool,
@@ -2434,7 +2447,14 @@ fn run_worker_loop<B: WorkerBuffer>(
                 completions,
                 slots,
                 &completion_event,
-            )?;
+            );
+            #[cfg(feature = "bench")]
+            if let Some(sample) = cpu_sample.as_mut()
+                && completion_result.is_ok()
+            {
+                sample.mark_completed();
+            }
+            completion_result?;
             completion_count
         };
 

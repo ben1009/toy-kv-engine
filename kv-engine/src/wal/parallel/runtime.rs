@@ -2733,6 +2733,16 @@ fn run_sync_coordinator(
     let v7_layout = inner.admission.lock().v7_allocator.is_some();
 
     while let Ok(result) = completions.recv() {
+        #[cfg(feature = "bench")]
+        let mut cpu_sample = {
+            let profile = inner.sync_progress.profile();
+            profile.as_ref().and_then(|profile| {
+                profile.begin_wal_cpu_thread_sample(
+                    crate::mem_table::WalCpuThreadRole::V7DurabilityCoordinator,
+                    0,
+                )
+            })
+        };
         process_group_result(&inner, result);
         #[cfg(all(test, feature = "chaos-testing"))]
         crate::chaos::failpoint::before_parallel_wal_result_drain();
@@ -2744,8 +2754,16 @@ fn run_sync_coordinator(
         if let Some(wait) = coalesce_wait {
             coalesce_before_capture(&inner, &completions, wait, v7_layout);
         }
-        if let Some(latency) = synchronize_written_prefix(&sync_file, &inner)? {
-            last_sync_latency = Some(latency);
+        let sync_result = synchronize_written_prefix(&sync_file, &inner);
+        #[cfg(feature = "bench")]
+        if let (Some(sample), Ok(Some(sync))) = (cpu_sample.as_mut(), sync_result.as_ref()) {
+            sample.set_work_items(sync.tickets_covered);
+            if sync.succeeded {
+                sample.mark_completed();
+            }
+        }
+        if let Some(sync) = sync_result? {
+            last_sync_latency = Some(sync.latency);
         }
     }
 
@@ -3291,7 +3309,19 @@ fn validate_sync_diagnostics_transition(
     Ok(())
 }
 
-fn synchronize_written_prefix(sync_file: &File, inner: &RuntimeInner) -> Result<Option<Duration>> {
+#[derive(Clone, Copy, Debug)]
+struct WrittenPrefixSync {
+    latency: Duration,
+    #[cfg(feature = "bench")]
+    tickets_covered: u64,
+    #[cfg(feature = "bench")]
+    succeeded: bool,
+}
+
+fn synchronize_written_prefix(
+    sync_file: &File,
+    inner: &RuntimeInner,
+) -> Result<Option<WrittenPrefixSync>> {
     let (target, durable, poison_ticket) = {
         let state = inner.durability.state.lock();
         let target = state
@@ -3375,7 +3405,7 @@ fn synchronize_written_prefix(sync_file: &File, inner: &RuntimeInner) -> Result<
                 write_cqes_completed: _sync_end.write_cqes_completed,
                 groups_completed: _sync_end.groups_completed,
                 groups_covered: _sync_end.groups_covered,
-                tickets_covered: None,
+                tickets_covered: Some(target.saturating_sub(durable)),
                 frontier_write_ns: 0,
                 data_completion_to_frontier_start_ns: None,
                 duration_ns,
@@ -3420,13 +3450,25 @@ fn synchronize_written_prefix(sync_file: &File, inner: &RuntimeInner) -> Result<
         drop(state);
         inner.sync_progress.mark_durable(acknowledged);
 
-        return Ok(Some(sync_latency));
+        return Ok(Some(WrittenPrefixSync {
+            latency: sync_latency,
+            #[cfg(feature = "bench")]
+            tickets_covered: acknowledged.saturating_sub(durable),
+            #[cfg(feature = "bench")]
+            succeeded: true,
+        }));
     };
 
     let message = format!("fdatasync failed: {error}");
     if let Some(cycle) = frontier_cycle {
         poison_v7_runtime(inner, Some(cycle.reservation), durable, message);
-        return Ok(Some(sync_latency));
+        return Ok(Some(WrittenPrefixSync {
+            latency: sync_latency,
+            #[cfg(feature = "bench")]
+            tickets_covered: target.saturating_sub(durable),
+            #[cfg(feature = "bench")]
+            succeeded: false,
+        }));
     }
     let mut state = inner.durability.state.lock();
     let poison = state.durable_frontier;
@@ -3446,7 +3488,13 @@ fn synchronize_written_prefix(sync_file: &File, inner: &RuntimeInner) -> Result<
     // batch into the still-open admission queue.
     inner.durability.notify_change();
 
-    Ok(Some(sync_latency))
+    Ok(Some(WrittenPrefixSync {
+        latency: sync_latency,
+        #[cfg(feature = "bench")]
+        tickets_covered: target.saturating_sub(durable),
+        #[cfg(feature = "bench")]
+        succeeded: false,
+    }))
 }
 
 fn fdatasync_file(sync_file: &File) -> io::Result<()> {

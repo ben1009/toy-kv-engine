@@ -35,6 +35,9 @@ from gcp_wal_matrix import (
     V8_MUTEX_DIAGNOSTIC_NUM,
     V8_MUTEX_DIAGNOSTIC_SAMPLE_EVERY,
     V8_MUTEX_DIAGNOSTIC_WRITERS,
+    V8_POINT_CPU_ATTRIBUTION_NUM,
+    V8_POINT_CPU_ATTRIBUTION_SAMPLE_EVERY,
+    V8_POINT_CPU_ATTRIBUTION_WRITERS,
     build_benchmark_plan,
     build_batch64_schedule,
     build_commit_order_trace_plan,
@@ -49,6 +52,8 @@ from gcp_wal_matrix import (
     build_v8_extent_policy_storage_schedule,
     build_v8_mutex_diagnostic_plan,
     build_v8_mutex_diagnostic_schedule,
+    build_v8_point_cpu_attribution_plan,
+    build_v8_point_cpu_attribution_schedule,
     build_rfc026_schedule,
     validate_commit_order_trace_rows,
     validate_batch64_rows,
@@ -57,6 +62,7 @@ from gcp_wal_matrix import (
     validate_point_direct_frame_rows,
     validate_v8_extent_policy_storage_rows,
     validate_v8_mutex_diagnostic_rows,
+    validate_v8_point_cpu_attribution_rows,
     validate_rfc026_rows,
 )
 from analyze_gcp_commit_order_trace import extract_trace
@@ -82,6 +88,7 @@ from gcp_v8_mutex_diagnostic_runner import (
     _validate_record as validate_mutex_record,
 )
 from gcp_v8_point_borrowed_input_runner import _summary_fields
+from gcp_v8_point_cpu_attribution_runner import _build_command as build_cpu_attribution_command
 
 
 SCRIPT = Path(__file__).with_name("gcp-free-trial-wal-bench.py")
@@ -420,6 +427,54 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
             BENCH.parse_args([*common, "--v8-mutex-diagnostic", "--writers", "8"])
         with self.assertRaises(SystemExit):
             BENCH.parse_args([*common, "--v8-mutex-diagnostic", "--num", "750000"])
+
+        cpu_attribution = BENCH.parse_args([*common, "--v8-point-cpu-attribution"])
+        self.assertEqual(cpu_attribution.num, V8_POINT_CPU_ATTRIBUTION_NUM)
+        self.assertEqual(cpu_attribution.writers, V8_POINT_CPU_ATTRIBUTION_WRITERS)
+        self.assertEqual(cpu_attribution.machine_type, "c4-standard-16-lssd")
+        with self.assertRaises(SystemExit):
+            BENCH.parse_args([*common, "--v8-point-cpu-attribution", "--writers", "16"])
+        with self.assertRaises(SystemExit):
+            BENCH.parse_args([*common, "--v8-point-cpu-attribution", "--num", "750000"])
+
+    def test_v8_point_cpu_attribution_plan_and_commands_are_fixed_and_counterbalanced(self) -> None:
+        schedule = build_v8_point_cpu_attribution_schedule()
+        self.assertEqual(len(schedule), 8)
+        self.assertEqual({row["writer"] for row in schedule}, set(V8_POINT_CPU_ATTRIBUTION_WRITERS))
+        self.assertEqual({row["num"] for row in schedule}, {V8_POINT_CPU_ATTRIBUTION_NUM})
+        self.assertEqual({row["sample_every"] for row in schedule}, {V8_POINT_CPU_ATTRIBUTION_SAMPLE_EVERY})
+        for index, writer in enumerate(V8_POINT_CPU_ATTRIBUTION_WRITERS):
+            pair = [row["arm"] for row in schedule if row["writer"] == writer]
+            expected = (
+                ["v7_parallel", "v8_point_lookahead_direct"] if index % 2 == 0 else
+                ["v8_point_lookahead_direct", "v7_parallel"]
+            )
+            self.assertEqual(pair, expected)
+            for arm in pair:
+                row = next(row for row in schedule if row["writer"] == writer and row["arm"] == arm)
+                command = build_cpu_attribution_command(Path("write-perf"), row, Path("dbs"))
+                self.assertIn("--wal-cpu-attribution-sample-every", command)
+                self.assertIn(str(V8_POINT_CPU_ATTRIBUTION_SAMPLE_EVERY), command)
+                self.assertIn(f"--threads", command)
+                self.assertIn(str(writer), command)
+
+        plan = build_v8_point_cpu_attribution_plan(
+            machine_type="c4-standard-16-lssd",
+            machine_spec=BENCH.MACHINE_SPECS["c4-standard-16-lssd"],
+            commit="a" * 40,
+            binary_sha256="b" * 64,
+        )
+        self.assertEqual(plan["runs_planned"], 8)
+        self.assertTrue(plan["diagnostic_only"])
+        self.assertEqual(plan["v8_configuration"]["frontier_mode"], "direct")
+
+        rows = [{
+            "writer": row["writer"], "workload": row["workload"], "repetition": row["repetition"],
+            "arm": row["arm"], "ops": row["num"], "sample_every": row["sample_every"],
+            "exit_code": 0, "wal_cpu_attribution_valid": True,
+        } for row in schedule]
+        self.assertTrue(validate_v8_point_cpu_attribution_rows(rows)["complete"])
+        self.assertFalse(validate_v8_point_cpu_attribution_rows(rows[:-1])["complete"])
 
     def test_v8_mutex_diagnostic_schedule_and_validation_are_counterbalanced(self) -> None:
         schedule = build_v8_mutex_diagnostic_schedule()

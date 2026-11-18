@@ -2572,9 +2572,20 @@ impl WalV8ParallelIo {
             .spawn(move || {
                 while let Ok(result) = completions.recv() {
                     #[cfg(feature = "bench")]
+                    let mut cpu_sample = {
+                        let profile = completion_progress.profile();
+                        let work_items = result.tickets.end.saturating_sub(result.tickets.start);
+                        profile.as_ref().and_then(|profile| {
+                            profile.begin_wal_cpu_thread_sample(
+                                crate::mem_table::WalCpuThreadRole::V8CompletionReaper,
+                                work_items,
+                            )
+                        })
+                    };
+                    #[cfg(feature = "bench")]
                     let timeline = completion_progress
                         .take_completion_timeline(result.group_id, Instant::now());
-                    if let Err(error) = {
+                    let reap_result = {
                         #[cfg(feature = "bench")]
                         {
                             reap_v8_group_result(&completion_coordinator, result, timeline)
@@ -2583,7 +2594,14 @@ impl WalV8ParallelIo {
                         {
                             reap_v8_group_result(&completion_coordinator, result)
                         }
-                    } {
+                    };
+                    #[cfg(feature = "bench")]
+                    if let Some(sample) = cpu_sample.as_mut()
+                        && reap_result.is_ok()
+                    {
+                        sample.mark_completed();
+                    }
+                    if let Err(error) = reap_result {
                         log::error!("v8 WAL completion reaper failed: {error:#}");
                         completion_coordinator.poison();
                     }
@@ -3178,6 +3196,18 @@ pub(crate) struct WalV8FrameJob<'a> {
     profile: Option<Arc<crate::mem_table::WriteProfile>>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct WalV8ProducerCpuPhases {
+    pub(crate) logical_encode_wall_ns: u64,
+    pub(crate) logical_encode_cpu_ns: u64,
+    pub(crate) digest_ready_wall_ns: u64,
+    pub(crate) digest_ready_cpu_ns: u64,
+    pub(crate) frame_encode_wall_ns: u64,
+    pub(crate) frame_encode_cpu_ns: u64,
+    pub(crate) frames_ready_submit_wall_ns: u64,
+    pub(crate) frames_ready_submit_cpu_ns: u64,
+}
+
 impl WalV8FrameJob<'_> {
     pub(crate) fn assignment(&self) -> WalV8BatchAssignment {
         self.assignment
@@ -3188,22 +3218,47 @@ impl WalV8FrameJob<'_> {
     }
 
     pub(crate) fn finish(self) -> Result<digest::WalV8DigestMetrics> {
+        self.finish_with_point_direct_frame(Self::point_direct_frame_enabled())
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn finish_with_cpu_attribution(
+        self,
+    ) -> Result<(digest::WalV8DigestMetrics, WalV8ProducerCpuPhases)> {
+        let mut phases = WalV8ProducerCpuPhases::default();
+        let metrics = self.finish_with_point_direct_frame_and_phases(
+            Self::point_direct_frame_enabled(),
+            Some(&mut phases),
+        )?;
+        Ok((metrics, phases))
+    }
+
+    fn finish_with_point_direct_frame(
+        self,
+        direct_point_enabled: bool,
+    ) -> Result<digest::WalV8DigestMetrics> {
+        self.finish_with_point_direct_frame_and_phases(direct_point_enabled, None)
+    }
+
+    fn point_direct_frame_enabled() -> bool {
         #[cfg(feature = "bench")]
-        let direct_point_enabled = {
+        {
             static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
             *ENABLED.get_or_init(|| {
                 std::env::var("TOYKV_BENCH_V8_POINT_DIRECT_FRAME").as_deref() == Ok("1")
             })
-        };
+        }
         #[cfg(not(feature = "bench"))]
-        let direct_point_enabled = false;
-
-        self.finish_with_point_direct_frame(direct_point_enabled)
+        {
+            false
+        }
     }
 
-    fn finish_with_point_direct_frame(
+    fn finish_with_point_direct_frame_and_phases(
         mut self,
         direct_point_enabled: bool,
+        #[cfg(feature = "bench")] mut phases: Option<&mut WalV8ProducerCpuPhases>,
+        #[cfg(not(feature = "bench"))] _phases: Option<&mut ()>,
     ) -> Result<digest::WalV8DigestMetrics> {
         let admitted = self
             .admitted
@@ -3222,11 +3277,23 @@ impl WalV8FrameJob<'_> {
         } else {
             None
         };
+        #[cfg(feature = "bench")]
+        let encode_started = phases
+            .as_ref()
+            .map(|_| (Instant::now(), digest::thread_cpu_time_ns()));
         let encode_result = if let Some(buffer) = early_buffer.as_mut() {
             admitted.encode_point_single_frame_logical_into(buffer.as_mut_slice())
         } else {
             admitted.encode()
         };
+        #[cfg(feature = "bench")]
+        if let (Some(phases), Some((wall_started, cpu_started))) =
+            (phases.as_deref_mut(), encode_started)
+        {
+            phases.logical_encode_wall_ns =
+                wall_started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+            phases.logical_encode_cpu_ns = digest::thread_cpu_time_ns().saturating_sub(cpu_started);
+        }
         let mut encoded = match encode_result {
             Ok(encoded) => encoded,
             Err(error) => {
@@ -3234,11 +3301,23 @@ impl WalV8FrameJob<'_> {
                 return Err(error);
             }
         };
+        #[cfg(feature = "bench")]
+        let digest_started = phases
+            .as_ref()
+            .map(|_| (Instant::now(), digest::thread_cpu_time_ns()));
         let digest_ready = encoded.digest_ready()?;
         #[cfg(feature = "bench")]
         let ordered_link_hash_cpu_ns = self.coordinator.mark_digest_ready_with_cpu(digest_ready)?;
         #[cfg(not(feature = "bench"))]
         self.coordinator.mark_digest_ready(digest_ready)?;
+        #[cfg(feature = "bench")]
+        if let (Some(phases), Some((wall_started, cpu_started))) =
+            (phases.as_deref_mut(), digest_started)
+        {
+            phases.digest_ready_wall_ns =
+                wall_started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+            phases.digest_ready_cpu_ns = digest::thread_cpu_time_ns().saturating_sub(cpu_started);
+        }
         #[cfg(feature = "bench")]
         let metrics = {
             let mut metrics = encoded.digest_metrics();
@@ -3256,6 +3335,10 @@ impl WalV8FrameJob<'_> {
                     .initialize(),
             )
         };
+        #[cfg(feature = "bench")]
+        let frame_encode_started = phases
+            .as_ref()
+            .map(|_| (Instant::now(), digest::thread_cpu_time_ns()));
         if direct_point {
             if let Err(error) = encoded.finish_point_frame_in_place(data_buffer.as_mut_slice()) {
                 self.coordinator.poison();
@@ -3276,6 +3359,18 @@ impl WalV8FrameJob<'_> {
             "v8 DATA materializer returned an unexpected frame length"
         );
         data_buffer.set_len(data_len);
+        #[cfg(feature = "bench")]
+        if let (Some(phases), Some((wall_started, cpu_started))) =
+            (phases.as_deref_mut(), frame_encode_started)
+        {
+            phases.frame_encode_wall_ns =
+                wall_started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+            phases.frame_encode_cpu_ns = digest::thread_cpu_time_ns().saturating_sub(cpu_started);
+        }
+        #[cfg(feature = "bench")]
+        let frames_ready_started = phases
+            .as_ref()
+            .map(|_| (Instant::now(), digest::thread_cpu_time_ns()));
         self.coordinator
             .mark_frames_ready(self.assignment.segment_ticket)?;
         #[cfg(feature = "bench")]
@@ -3299,6 +3394,14 @@ impl WalV8FrameJob<'_> {
         if let Err(error) = write_result {
             self.coordinator.poison();
             return Err(error).context("submit v8 Parallel DATA frames");
+        }
+
+        #[cfg(feature = "bench")]
+        if let (Some(phases), Some((wall_started, cpu_started))) = (phases, frames_ready_started) {
+            phases.frames_ready_submit_wall_ns =
+                wall_started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+            phases.frames_ready_submit_cpu_ns =
+                digest::thread_cpu_time_ns().saturating_sub(cpu_started);
         }
 
         #[cfg(feature = "bench")]
