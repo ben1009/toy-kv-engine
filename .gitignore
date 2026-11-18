@@ -20,6 +20,8 @@ lsm.db/
 .claude/settings.local.json
 .kimi-code/
 .claude/
+.codex/hooks.json
+.codex/hooks/gcp_readme.py
 perf.data*
 .remember/
 moka

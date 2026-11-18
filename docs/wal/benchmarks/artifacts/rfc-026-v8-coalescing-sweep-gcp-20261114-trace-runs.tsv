@@ -1,0 +1,6 @@
+budget_us	trace_records	complete_groups	incomplete_groups	complete_16_ticket_groups	intra_inversions	intra_comparable_pairs	intra_ties_excluded	intra_rate_pct	inter_inversions	inter_comparable_pairs	inter_ties_excluded	inter_rate_pct	complete_16_inversions	complete_16_comparable_pairs	complete_16_ties_excluded	complete_16_rate_pct	mvcc_samples	mvcc_out_of_order_samples	mvcc_out_of_order_pct	entry_distance_p50	decision_distance_p50	mvcc_dropped_samples
+0	1024	137	1	0	1965	3999	1	49.13728	0	519776	0	0.000000	0	0	0		1562	1016	65.04481	2	2	0
+50	1024	121	1	5	2130	4711	1	45.21333	0	519064	0	0.000000	234	599	1	39.06511	1562	1051	67.28553	3	2	0
+100	1024	103	1	21	2290	5687	0	40.26728	0	518089	0	0.000000	1004	2520	0	39.84127	1562	1090	69.78233	3	3	0
+200	1024	86	1	38	2416	6730	0	35.89896	0	517046	0	0.000000	1557	4560	0	34.14474	1562	1174	75.16005	5	4	0
+400	1024	65	1	62	2073	7626	0	27.18332	0	516150	0	0.000000	1981	7440	0	26.62634	1562	1178	75.41613	3	3	0

@@ -8,9 +8,18 @@ use anyhow::{Context, Result, ensure};
 
 use crate::pitr::{CanonicalWalEntryStream, RecordedAt, WalBatch, WalV5Limits};
 
-use super::{WAL_V8_HEADER_LEN, codec, digest};
+use super::{WAL_V8_HEADER_LEN, codec, digest, parallel::WalV8DurablePrefixCheck};
 
 const WAL_V8_DATA_START: u64 = (WAL_V8_HEADER_LEN + codec::WAL_V8_FRAME_LEN) as u64;
+
+/// API-level class used only to select benchmark DATA scheduling policy.
+/// It is not serialized and never changes ticket or durability ordering.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum WalV8WriteClass {
+    Point,
+    #[default]
+    Batch,
+}
 
 /// Coordinates assigned by the writer after resource reservation and before
 /// payload encoding begins.
@@ -30,7 +39,10 @@ pub(crate) struct WalV8BatchAssignment {
 pub(crate) struct WalV8AdmissionPlan {
     pub(crate) commit_ts: u64,
     pub(crate) recorded_at: RecordedAt,
+    pub(crate) write_class: WalV8WriteClass,
     pub(crate) logical_batch_bytes: usize,
+    #[cfg(feature = "bench")]
+    pub(crate) operation_count: u32,
     pub(crate) fragment_count: u32,
     pub(crate) frame_buffer_bytes: usize,
 }
@@ -43,6 +55,12 @@ pub(crate) trait WalV8AdmissionGuard {
     fn segment_ticket(&self) -> u64;
     fn poison(&mut self);
     fn disarm_after_durable(&mut self);
+
+    /// Disarm after the caller has checked the whole durable prefix once.
+    /// Implementations with cheap per-ticket checks can keep the default.
+    fn disarm_after_durable_prefix_check(&mut self, _prefix_check: &WalV8DurablePrefixCheck) {
+        self.disarm_after_durable();
+    }
 }
 
 /// Parallel admission boundary used by v8 producers.
@@ -62,6 +80,22 @@ pub(crate) trait WalV8AdmissionPublisher {
         &self,
         plan: WalV8AdmissionPlan,
     ) -> Result<(WalV8BatchAssignment, Self::Guard)>;
+
+    /// Run a range-registration callback after the assignment is known and
+    /// before it becomes visible to other producers. Implementations that can
+    /// do this atomically should override the default post-admission callback.
+    fn admit_and_publish_with<F>(
+        &self,
+        plan: WalV8AdmissionPlan,
+        register: F,
+    ) -> Result<(WalV8BatchAssignment, Self::Guard)>
+    where
+        F: FnOnce(WalV8BatchAssignment) -> Result<()>,
+    {
+        let (assignment, guard) = self.admit_and_publish(plan)?;
+        register(assignment)?;
+        Ok((assignment, guard))
+    }
 }
 
 /// Canonical operations and checked encoded sizes, with no serialized payload.
@@ -70,8 +104,11 @@ pub(crate) struct PreparedWalV8Batch<'a, R> {
     limits: WalV5Limits,
     commit_ts: u64,
     recorded_at: RecordedAt,
+    write_class: WalV8WriteClass,
     logical_batch_bytes: usize,
     preparation_buffer_bytes: u64,
+    #[cfg(feature = "bench")]
+    operation_count: u32,
     fragment_count: u32,
     frame_buffer_bytes: usize,
     preparation_reservation: R,
@@ -95,6 +132,24 @@ impl<'a, R> PreparedWalV8Batch<'a, R> {
     where
         F: FnOnce(u64) -> Result<R>,
     {
+        Self::preflight_with_write_class(batch, limits, WalV8WriteClass::Batch, reserve_preparation)
+    }
+
+    /// Preflight with the caller's API-level write class for benchmark-only
+    /// scheduling experiments. The class is carried with admission metadata,
+    /// but is not part of the WAL encoding.
+    pub(crate) fn preflight_with_write_class<F>(
+        batch: &'a WalBatch,
+        limits: WalV5Limits,
+        write_class: WalV8WriteClass,
+        reserve_preparation: F,
+    ) -> Result<PreparedWalV8Batch<'a, R>>
+    where
+        F: FnOnce(u64) -> Result<R>,
+    {
+        #[cfg(feature = "bench")]
+        let operation_count = u32::try_from(batch.entries.len())
+            .context("v8 operation count exceeds the admission limit")?;
         let preparation_bytes = Self::preparation_buffer_bytes(batch, limits)?;
         let preparation_reservation = reserve_preparation(preparation_bytes)?;
         let canonical = CanonicalWalEntryStream::new(batch, limits)?;
@@ -114,8 +169,11 @@ impl<'a, R> PreparedWalV8Batch<'a, R> {
             limits,
             commit_ts: batch.commit_ts,
             recorded_at: batch.recorded_at,
+            write_class,
             logical_batch_bytes,
             preparation_buffer_bytes: preparation_bytes,
+            #[cfg(feature = "bench")]
+            operation_count,
             fragment_count,
             frame_buffer_bytes,
             preparation_reservation,
@@ -172,7 +230,10 @@ impl<'a, R> PreparedWalV8Batch<'a, R> {
         let plan = WalV8AdmissionPlan {
             commit_ts,
             recorded_at,
+            write_class: self.write_class,
             logical_batch_bytes: self.logical_batch_bytes,
+            #[cfg(feature = "bench")]
+            operation_count: self.operation_count,
             fragment_count: self.fragment_count,
             frame_buffer_bytes: self.frame_buffer_bytes,
         };
@@ -188,6 +249,7 @@ impl<'a, R> PreparedWalV8Batch<'a, R> {
             limits: self.limits,
             logical_batch_bytes: self.logical_batch_bytes,
             assignment,
+            write_class: self.write_class,
             fragment_count: self.fragment_count,
             frame_buffer_bytes: self.frame_buffer_bytes,
             admission_guard,
@@ -234,6 +296,7 @@ pub(crate) struct AdmittedWalV8Batch<'a, G, R> {
     limits: WalV5Limits,
     logical_batch_bytes: usize,
     assignment: WalV8BatchAssignment,
+    write_class: WalV8WriteClass,
     fragment_count: u32,
     frame_buffer_bytes: usize,
     admission_guard: G,
@@ -245,6 +308,112 @@ impl<G: WalV8AdmissionGuard, R> AdmittedWalV8Batch<'_, G, R> {
     /// encoding so persistent reservations can be attached to the ticket.
     pub(crate) fn assignment(&self) -> WalV8BatchAssignment {
         self.assignment
+    }
+
+    pub(crate) fn write_class(&self) -> WalV8WriteClass {
+        self.write_class
+    }
+
+    /// True only for an API-level Point with one canonical entry in one DATA frame.
+    pub(crate) fn can_encode_point_single_frame(&self) -> bool {
+        self.write_class == WalV8WriteClass::Point
+            && self.fragment_count == 1
+            && self.canonical.entry_count() == 1
+    }
+
+    /// Experimental Point-only encoder: place the logical bytes inside the
+    /// already-allocated aligned DATA frame. The physical frame envelope is
+    /// deliberately finalized later, after the digest has been published.
+    pub(crate) fn encode_point_single_frame_logical_into(
+        self,
+        output: &mut [u8],
+    ) -> Result<EncodedWalV8Batch<G>> {
+        ensure!(
+            self.can_encode_point_single_frame(),
+            "direct v8 Point encoding requires exactly one Point DATA frame"
+        );
+        let Self {
+            preparation_reservation,
+            canonical,
+            limits,
+            logical_batch_bytes,
+            assignment,
+            fragment_count,
+            frame_buffer_bytes,
+            admission_guard,
+            write_class: _,
+        } = self;
+        ensure!(
+            frame_buffer_bytes == codec::WAL_V8_FRAME_LEN && output.len() == frame_buffer_bytes,
+            "v8 direct Point frame buffer size mismatch"
+        );
+        let payload_start = codec::WAL_V8_FRAME_HEADER_LEN + codec::WAL_V8_DATA_FRAGMENT_HEADER_LEN;
+        let payload_end = payload_start
+            .checked_add(logical_batch_bytes)
+            .context("v8 direct Point payload end overflows")?;
+        ensure!(
+            payload_end <= output.len(),
+            "v8 direct Point payload exceeds DATA frame"
+        );
+        let entry_stream_len = canonical.data_len();
+        let entry_count = canonical.entry_count();
+        ensure!(
+            logical_batch_bytes == codec::WAL_V8_LOGICAL_BATCH_HEADER_LEN + entry_stream_len,
+            "v8 direct Point logical batch size changed after admission"
+        );
+        let logical = &mut output[payload_start..payload_end];
+        let expected_entry_len = u64::try_from(entry_stream_len)?;
+        #[cfg(feature = "bench")]
+        let mut entry_hasher =
+            digest::WalV8EntryHasher::new_for_ticket(expected_entry_len, assignment.segment_ticket);
+        #[cfg(not(feature = "bench"))]
+        let mut entry_hasher = digest::WalV8EntryHasher::new(expected_entry_len);
+        let (written, entry_stream_crc) = canonical.encode_into_with_observer(
+            &mut logical[codec::WAL_V8_LOGICAL_BATCH_HEADER_LEN..],
+            |range| entry_hasher.update(range),
+        )?;
+        ensure!(
+            written == entry_stream_len,
+            "v8 direct Point entry stream length changed while encoding"
+        );
+        #[cfg(feature = "bench")]
+        let (entry_digest, mut digest_metrics) = entry_hasher.finish_with_metrics()?;
+        #[cfg(not(feature = "bench"))]
+        let entry_digest = entry_hasher.finish()?;
+        let header = codec::WalV8LogicalBatchHeader {
+            segment_ticket: assignment.segment_ticket,
+            commit_ts: assignment.commit_ts,
+            recorded_at_secs: assignment.recorded_at.secs,
+            recorded_at_nanos: assignment.recorded_at.nanos,
+            entry_count,
+        }
+        .encode_with_data_crc(written, entry_stream_crc, limits)?;
+        logical[..codec::WAL_V8_LOGICAL_BATCH_HEADER_LEN].copy_from_slice(&header);
+        #[cfg(feature = "bench")]
+        let batch_hash_started = digest::should_sample_hash_cpu(assignment.segment_ticket)
+            .then(digest::thread_cpu_time_ns);
+        let batch_digest = digest::batch_digest(&header, &entry_digest);
+        #[cfg(feature = "bench")]
+        if let Some(batch_hash_started) = batch_hash_started {
+            digest_metrics.header_batch_hash_cpu_ns =
+                digest::thread_cpu_time_ns().saturating_sub(batch_hash_started);
+        }
+
+        drop(canonical);
+        drop(preparation_reservation);
+
+        Ok(EncodedWalV8Batch {
+            storage: EncodedWalV8BatchStorage::DirectPointFramePending,
+            logical_batch_bytes,
+            assignment,
+            entry_digest,
+            batch_digest,
+            #[cfg(feature = "bench")]
+            digest_metrics,
+            fragment_count,
+            frame_buffer_bytes,
+            admission_guard,
+        })
     }
 
     /// Encode canonical entries while updating CRC and BLAKE3 from the same
@@ -259,6 +428,7 @@ impl<G: WalV8AdmissionGuard, R> AdmittedWalV8Batch<'_, G, R> {
             fragment_count,
             frame_buffer_bytes,
             admission_guard,
+            write_class: _,
         } = self;
         let entry_stream_len = canonical.data_len();
         let entry_count = canonical.entry_count();
@@ -313,7 +483,8 @@ impl<G: WalV8AdmissionGuard, R> AdmittedWalV8Batch<'_, G, R> {
         drop(preparation_reservation);
 
         Ok(EncodedWalV8Batch {
-            logical_batch,
+            storage: EncodedWalV8BatchStorage::Logical(logical_batch),
+            logical_batch_bytes,
             assignment,
             entry_digest,
             batch_digest,
@@ -337,7 +508,8 @@ pub(crate) struct WalV8DigestReady {
 
 /// Immutable canonical bytes and their digest, ready for independent framing.
 pub(crate) struct EncodedWalV8Batch<G> {
-    logical_batch: Vec<u8>,
+    storage: EncodedWalV8BatchStorage,
+    logical_batch_bytes: usize,
     assignment: WalV8BatchAssignment,
     entry_digest: digest::WalV8Digest,
     batch_digest: digest::WalV8Digest,
@@ -348,13 +520,25 @@ pub(crate) struct EncodedWalV8Batch<G> {
     admission_guard: G,
 }
 
+enum EncodedWalV8BatchStorage {
+    Logical(Vec<u8>),
+    DirectPointFramePending,
+    DirectPointFrameReady,
+}
+
 impl<G: WalV8AdmissionGuard> EncodedWalV8Batch<G> {
     pub(crate) fn assignment(&self) -> WalV8BatchAssignment {
         self.assignment
     }
 
-    pub(crate) fn as_bytes(&self) -> &[u8] {
-        &self.logical_batch
+    pub(crate) fn logical_bytes(&self) -> Result<&[u8]> {
+        match &self.storage {
+            EncodedWalV8BatchStorage::Logical(bytes) => Ok(bytes),
+            EncodedWalV8BatchStorage::DirectPointFramePending
+            | EncodedWalV8BatchStorage::DirectPointFrameReady => {
+                anyhow::bail!("direct DATA frame does not own a separate logical buffer")
+            }
+        }
     }
 
     pub(crate) fn entry_digest(&self) -> &digest::WalV8Digest {
@@ -375,7 +559,7 @@ impl<G: WalV8AdmissionGuard> EncodedWalV8Batch<G> {
         Ok(WalV8DigestReady {
             segment_incarnation: self.assignment.segment_incarnation,
             segment_ticket: self.assignment.segment_ticket,
-            logical_batch_bytes: u64::try_from(self.logical_batch.len())?,
+            logical_batch_bytes: u64::try_from(self.logical_batch_bytes)?,
             batch_digest: self.batch_digest,
         })
     }
@@ -384,9 +568,58 @@ impl<G: WalV8AdmissionGuard> EncodedWalV8Batch<G> {
         self.frame_buffer_bytes
     }
 
+    /// Finish the physical envelope of a Point frame after its logical digest
+    /// has been published to the ordered Coordinator.
+    pub(crate) fn finish_point_frame_in_place(&mut self, output: &mut [u8]) -> Result<()> {
+        let result = (|| {
+            ensure!(
+                matches!(
+                    &self.storage,
+                    EncodedWalV8BatchStorage::DirectPointFramePending
+                ),
+                "v8 direct Point frame is not pending physical finalization"
+            );
+            ensure!(
+                self.frame_buffer_bytes == codec::WAL_V8_FRAME_LEN
+                    && output.len() == self.frame_buffer_bytes,
+                "v8 direct Point frame buffer size mismatch"
+            );
+
+            codec::finish_preencoded_data_fragment_frame_in_place(
+                self.assignment.physical_header_digest,
+                self.assignment.initial_prefix_digest,
+                self.assignment.first_data_offset,
+                codec::WalV8DataFragmentHeader {
+                    segment_ticket: self.assignment.segment_ticket,
+                    fragment_index: 0,
+                    fragment_count: self.fragment_count,
+                    batch_bytes: u64::try_from(self.logical_batch_bytes)?,
+                },
+                self.logical_batch_bytes,
+                output,
+            )?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            self.admission_guard.poison();
+            return Err(error);
+        }
+        self.storage = EncodedWalV8BatchStorage::DirectPointFrameReady;
+        Ok(())
+    }
+
     /// Disarm the ticket's poison guard only after durable publication.
     pub(crate) fn disarm_after_durable(&mut self) {
         self.admission_guard.disarm_after_durable();
+    }
+
+    /// Disarm after the caller validates that the complete covered prefix is durable.
+    pub(crate) fn disarm_after_durable_prefix_check(
+        &mut self,
+        prefix_check: &WalV8DurablePrefixCheck,
+    ) {
+        self.admission_guard
+            .disarm_after_durable_prefix_check(prefix_check);
     }
 
     /// Materialize the assigned logical bytes into the v8 physical DATA frames.
@@ -403,6 +636,13 @@ impl<G: WalV8AdmissionGuard> EncodedWalV8Batch<G> {
 
     fn encode_data_frames(&self, output: &mut [u8]) -> Result<usize> {
         ensure!(
+            matches!(&self.storage, EncodedWalV8BatchStorage::Logical(_)),
+            "direct DATA frame is already materialized"
+        );
+        let EncodedWalV8BatchStorage::Logical(logical_batch) = &self.storage else {
+            anyhow::bail!("direct DATA frame is already materialized")
+        };
+        ensure!(
             output.len() >= self.frame_buffer_bytes,
             "v8 DATA frame output buffer is too small"
         );
@@ -413,7 +653,7 @@ impl<G: WalV8AdmissionGuard> EncodedWalV8Batch<G> {
             .context("v8 DATA frame range overflows")?;
 
         let chunk_capacity = codec::WAL_V8_DATA_FRAGMENT_PAYLOAD_CAPACITY;
-        let batch_bytes = u64::try_from(self.logical_batch.len())?;
+        let batch_bytes = u64::try_from(logical_batch.len())?;
         let actual_fragment_count = codec::data_fragment_count(batch_bytes)
             .context("v8 logical batch length is outside wire bounds")?;
         ensure!(
@@ -421,7 +661,7 @@ impl<G: WalV8AdmissionGuard> EncodedWalV8Batch<G> {
             "v8 DATA fragment count changed after admission"
         );
 
-        for (index, payload) in self.logical_batch.chunks(chunk_capacity).enumerate() {
+        for (index, payload) in logical_batch.chunks(chunk_capacity).enumerate() {
             let fragment_index = u32::try_from(index)?;
             let fragment = codec::WalV8DataFragmentHeader {
                 segment_ticket: self.assignment.segment_ticket,
@@ -621,6 +861,8 @@ mod tests {
             secs: 123,
             nanos: 456,
         };
+        #[cfg(feature = "bench")]
+        let operation_count = prepared.operation_count;
         publisher.assignment.commit_ts = commit_ts;
         publisher.assignment.recorded_at = recorded_at;
 
@@ -633,13 +875,16 @@ mod tests {
             &[WalV8AdmissionPlan {
                 commit_ts,
                 recorded_at,
-                logical_batch_bytes: encoded.as_bytes().len(),
+                write_class: WalV8WriteClass::Batch,
+                logical_batch_bytes: encoded.logical_bytes()?.len(),
+                #[cfg(feature = "bench")]
+                operation_count,
                 fragment_count: encoded.fragment_count,
                 frame_buffer_bytes: encoded.frame_buffer_bytes,
             }]
         );
 
-        let logical_bytes = encoded.as_bytes();
+        let logical_bytes = encoded.logical_bytes()?;
         let header = codec::WalV8LogicalBatchHeader::decode(
             &logical_bytes[..codec::WAL_V8_LOGICAL_BATCH_HEADER_LEN],
             &logical_bytes[codec::WAL_V8_LOGICAL_BATCH_HEADER_LEN..],
@@ -652,6 +897,299 @@ mod tests {
         assert_eq!(header.recorded_at_nanos, recorded_at.nanos);
         encoded.disarm_after_durable();
 
+        Ok(())
+    }
+
+    #[test]
+    fn admission_preserves_the_api_write_class_without_encoding_it() -> Result<()> {
+        let batch = batch(32);
+        let prepared =
+            PreparedWalV8Batch::<TestPreparationReservation>::preflight_with_write_class(
+                &batch,
+                crate::pitr::LIVE_WAL_V5_LIMITS,
+                WalV8WriteClass::Point,
+                |bytes| Ok(TestPreparationReservation { _bytes: bytes }),
+            )?;
+        let publisher = TestPublisher::new(WAL_V8_DATA_START);
+        let admitted = prepared.admit(&publisher)?;
+
+        assert_eq!(admitted.write_class(), WalV8WriteClass::Point);
+        assert_eq!(
+            publisher.plans.lock()[0].write_class,
+            WalV8WriteClass::Point
+        );
+
+        let mut point_encoded = admitted.encode()?;
+        let batch_publisher = TestPublisher::new(WAL_V8_DATA_START);
+        let mut batch_encoded = preflight(&batch)?.admit(&batch_publisher)?.encode()?;
+        assert_eq!(
+            point_encoded.logical_bytes()?,
+            batch_encoded.logical_bytes()?
+        );
+        point_encoded.disarm_after_durable();
+        batch_encoded.disarm_after_durable();
+
+        Ok(())
+    }
+
+    #[test]
+    fn direct_point_frame_is_byte_identical_to_existing_encoder() -> Result<()> {
+        let recorded_at = RecordedAt {
+            secs: 123,
+            nanos: 456,
+        };
+        let mut cases = [0_usize, 1024, 3900]
+            .into_iter()
+            .map(|value_len| {
+                let mut value = vec![0x5a; value_len + 1];
+                value[0] = crate::vlog::KvKind::Inline as u8;
+                (
+                    "inline Put",
+                    WalBatch {
+                        commit_ts: 17,
+                        recorded_at,
+                        entries: vec![crate::pitr::WalEntry::Put {
+                            key: b"point".to_vec(),
+                            value,
+                        }],
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        cases.push((
+            "PointDelete",
+            WalBatch {
+                commit_ts: 17,
+                recorded_at,
+                entries: vec![crate::pitr::WalEntry::PointDelete {
+                    key: b"point".to_vec(),
+                }],
+            },
+        ));
+        cases.push((
+            "TTL inline Put",
+            WalBatch {
+                commit_ts: 17,
+                recorded_at,
+                entries: vec![crate::pitr::WalEntry::Put {
+                    key: b"point".to_vec(),
+                    value: crate::vlog::encode_ttl_value(
+                        crate::vlog::KvKind::TtlInline,
+                        1_800_000_000,
+                        b"ttl-value",
+                    ),
+                }],
+            },
+        ));
+
+        for (case_name, batch) in cases {
+            let limits = crate::pitr::LIVE_WAL_V5_LIMITS;
+            let prepared =
+                PreparedWalV8Batch::<TestPreparationReservation>::preflight_with_write_class(
+                    &batch,
+                    limits,
+                    WalV8WriteClass::Point,
+                    |bytes| Ok(TestPreparationReservation { _bytes: bytes }),
+                )?;
+            let mut publisher = TestPublisher::new(WAL_V8_DATA_START);
+            publisher.assignment.commit_ts = batch.commit_ts;
+            publisher.assignment.recorded_at = batch.recorded_at;
+            let admitted =
+                prepared.admit_with_metadata(batch.commit_ts, batch.recorded_at, &publisher)?;
+            assert!(admitted.can_encode_point_single_frame());
+            let mut direct_frame = [0xa5_u8; codec::WAL_V8_FRAME_LEN];
+            let mut direct = admitted.encode_point_single_frame_logical_into(&mut direct_frame)?;
+            assert!(direct.logical_bytes().is_err());
+            assert!(
+                direct_frame
+                    [..codec::WAL_V8_FRAME_HEADER_LEN + codec::WAL_V8_DATA_FRAGMENT_HEADER_LEN]
+                    .iter()
+                    .all(|byte| *byte == 0xa5),
+                "physical frame envelope must remain unfinished before digest publication"
+            );
+
+            let reference =
+                PreparedWalV8Batch::<TestPreparationReservation>::preflight_with_write_class(
+                    &batch,
+                    limits,
+                    WalV8WriteClass::Point,
+                    |bytes| Ok(TestPreparationReservation { _bytes: bytes }),
+                )?;
+            let mut publisher = TestPublisher::new(WAL_V8_DATA_START);
+            publisher.assignment.commit_ts = batch.commit_ts;
+            publisher.assignment.recorded_at = batch.recorded_at;
+            let mut normal = reference
+                .admit_with_metadata(batch.commit_ts, batch.recorded_at, &publisher)?
+                .encode()?;
+            let mut expected = vec![0; codec::WAL_V8_FRAME_LEN];
+            assert_eq!(
+                normal.encode_data_frames_into(&mut expected)?,
+                expected.len(),
+                "unexpected encoded length for {case_name}"
+            );
+            assert_eq!(
+                direct.digest_ready()?,
+                normal.digest_ready()?,
+                "{case_name}"
+            );
+            assert_eq!(direct.entry_digest(), normal.entry_digest(), "{case_name}");
+            assert_eq!(direct.batch_digest(), normal.batch_digest(), "{case_name}");
+            direct.finish_point_frame_in_place(&mut direct_frame)?;
+            assert_eq!(direct_frame.as_slice(), expected.as_slice(), "{case_name}");
+            direct.disarm_after_durable();
+            normal.disarm_after_durable();
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn direct_point_frame_finalization_failure_poisons_admission() -> Result<()> {
+        let batch = WalBatch {
+            commit_ts: 17,
+            recorded_at: RecordedAt {
+                secs: 123,
+                nanos: 456,
+            },
+            entries: vec![WalEntry::Put {
+                key: b"point".to_vec(),
+                value: vec![crate::vlog::KvKind::Inline as u8, 0x5a],
+            }],
+        };
+        let prepared =
+            PreparedWalV8Batch::<TestPreparationReservation>::preflight_with_write_class(
+                &batch,
+                crate::pitr::LIVE_WAL_V5_LIMITS,
+                WalV8WriteClass::Point,
+                |bytes| Ok(TestPreparationReservation { _bytes: bytes }),
+            )?;
+        let mut publisher = TestPublisher::new(WAL_V8_DATA_START);
+        publisher.assignment.commit_ts = batch.commit_ts;
+        publisher.assignment.recorded_at = batch.recorded_at;
+        let mut direct_frame = [0_u8; codec::WAL_V8_FRAME_LEN];
+        let mut encoded = prepared
+            .admit_with_metadata(batch.commit_ts, batch.recorded_at, &publisher)?
+            .encode_point_single_frame_logical_into(&mut direct_frame)?;
+        let mut undersized_frame = vec![0_u8; codec::WAL_V8_FRAME_LEN - 1];
+
+        assert!(
+            encoded
+                .finish_point_frame_in_place(&mut undersized_frame)
+                .is_err()
+        );
+        assert!(publisher.is_poisoned());
+
+        Ok(())
+    }
+
+    #[test]
+    fn direct_point_frame_respects_exact_payload_boundary() -> Result<()> {
+        let capacity = codec::WAL_V8_DATA_FRAGMENT_PAYLOAD_CAPACITY;
+        let exact_value_bytes = (0..capacity)
+            .find(|value_bytes| {
+                let mut value = vec![0x5a; value_bytes + 1];
+                value[0] = crate::vlog::KvKind::Inline as u8;
+                let batch = WalBatch {
+                    commit_ts: 17,
+                    recorded_at: RecordedAt {
+                        secs: 123,
+                        nanos: 456,
+                    },
+                    entries: vec![WalEntry::Put {
+                        key: b"point".to_vec(),
+                        value,
+                    }],
+                };
+                PreparedWalV8Batch::<TestPreparationReservation>::preflight_with_write_class(
+                    &batch,
+                    crate::pitr::LIVE_WAL_V5_LIMITS,
+                    WalV8WriteClass::Point,
+                    |bytes| Ok(TestPreparationReservation { _bytes: bytes }),
+                )
+                .is_ok_and(|prepared| prepared.logical_batch_bytes() == capacity)
+            })
+            .context("could not construct an exact DATA fragment payload boundary")?;
+
+        let make_batch = |value_bytes: usize| {
+            let mut value = vec![0x5a; value_bytes + 1];
+            value[0] = crate::vlog::KvKind::Inline as u8;
+            WalBatch {
+                commit_ts: 17,
+                recorded_at: RecordedAt {
+                    secs: 123,
+                    nanos: 456,
+                },
+                entries: vec![WalEntry::Put {
+                    key: b"point".to_vec(),
+                    value,
+                }],
+            }
+        };
+        let exact = make_batch(exact_value_bytes);
+        let exact_prepared =
+            PreparedWalV8Batch::<TestPreparationReservation>::preflight_with_write_class(
+                &exact,
+                crate::pitr::LIVE_WAL_V5_LIMITS,
+                WalV8WriteClass::Point,
+                |bytes| Ok(TestPreparationReservation { _bytes: bytes }),
+            )?;
+        assert_eq!(exact_prepared.logical_batch_bytes(), capacity);
+        assert_eq!(exact_prepared.fragment_count(), 1);
+        let mut publisher = TestPublisher::new(WAL_V8_DATA_START);
+        publisher.assignment.commit_ts = exact.commit_ts;
+        publisher.assignment.recorded_at = exact.recorded_at;
+        assert!(
+            exact_prepared
+                .admit_with_metadata(exact.commit_ts, exact.recorded_at, &publisher)?
+                .can_encode_point_single_frame()
+        );
+
+        let over = make_batch(exact_value_bytes + 1);
+        let over_prepared =
+            PreparedWalV8Batch::<TestPreparationReservation>::preflight_with_write_class(
+                &over,
+                crate::pitr::LIVE_WAL_V5_LIMITS,
+                WalV8WriteClass::Point,
+                |bytes| Ok(TestPreparationReservation { _bytes: bytes }),
+            )?;
+        assert_eq!(over_prepared.logical_batch_bytes(), capacity + 1);
+        assert_eq!(over_prepared.fragment_count(), 2);
+        let mut publisher = TestPublisher::new(WAL_V8_DATA_START);
+        publisher.assignment.commit_ts = over.commit_ts;
+        publisher.assignment.recorded_at = over.recorded_at;
+        assert!(
+            !over_prepared
+                .admit_with_metadata(over.commit_ts, over.recorded_at, &publisher)?
+                .can_encode_point_single_frame()
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn multi_frame_point_cannot_use_direct_encoder() -> Result<()> {
+        let batch = WalBatch {
+            commit_ts: 3,
+            recorded_at: RecordedAt { secs: 0, nanos: 0 },
+            entries: vec![crate::pitr::WalEntry::Put {
+                key: b"k".to_vec(),
+                value: vec![0x42; 5000],
+            }],
+        };
+        let prepared =
+            PreparedWalV8Batch::<TestPreparationReservation>::preflight_with_write_class(
+                &batch,
+                crate::pitr::LIVE_WAL_V5_LIMITS,
+                WalV8WriteClass::Point,
+                |bytes| Ok(TestPreparationReservation { _bytes: bytes }),
+            )?;
+        let mut publisher = TestPublisher::new(WAL_V8_DATA_START);
+        publisher.assignment.commit_ts = batch.commit_ts;
+        publisher.assignment.recorded_at = batch.recorded_at;
+        let admitted =
+            prepared.admit_with_metadata(batch.commit_ts, batch.recorded_at, &publisher)?;
+        assert!(!admitted.can_encode_point_single_frame());
+        let mut encoded = admitted.encode()?;
+        encoded.disarm_after_durable();
         Ok(())
     }
 
@@ -705,7 +1243,10 @@ mod tests {
         let plan_expected = WalV8AdmissionPlan {
             commit_ts: batch.commit_ts,
             recorded_at: batch.recorded_at,
+            write_class: WalV8WriteClass::Batch,
             logical_batch_bytes: prepared.logical_batch_bytes(),
+            #[cfg(feature = "bench")]
+            operation_count: prepared.operation_count,
             fragment_count: prepared.fragment_count(),
             frame_buffer_bytes: prepared.frame_buffer_bytes(),
         };
@@ -717,16 +1258,17 @@ mod tests {
         let v7 = prepare_v7_logical_batch(&batch, crate::pitr::LIVE_WAL_V5_LIMITS)?
             .encode_entry_stream()?
             .into_logical_batch(3, batch.commit_ts, batch.recorded_at)?;
-        let entry_stream = &encoded.as_bytes()[codec::WAL_V8_LOGICAL_BATCH_HEADER_LEN..];
+        let logical_bytes = encoded.logical_bytes()?;
+        let entry_stream = &logical_bytes[codec::WAL_V8_LOGICAL_BATCH_HEADER_LEN..];
         assert_eq!(entry_stream, &v7.as_bytes()[48..]);
 
         let header: [u8; codec::WAL_V8_LOGICAL_BATCH_HEADER_LEN] =
-            encoded.as_bytes()[..codec::WAL_V8_LOGICAL_BATCH_HEADER_LEN].try_into()?;
+            logical_bytes[..codec::WAL_V8_LOGICAL_BATCH_HEADER_LEN].try_into()?;
         let decoded = WalV8LogicalBatchHeader::decode(
             &header,
             entry_stream,
             3,
-            u64::try_from(encoded.as_bytes().len())?,
+            u64::try_from(logical_bytes.len())?,
             crate::pitr::LIVE_WAL_V5_LIMITS,
         )?;
         assert_eq!(
@@ -785,7 +1327,7 @@ mod tests {
             assert_eq!(digest_ready.segment_ticket, 3);
             assert_eq!(
                 digest_ready.logical_batch_bytes,
-                u64::try_from(encoded.as_bytes().len())?
+                u64::try_from(encoded.logical_bytes()?.len())?
             );
             assert_eq!(digest_ready.batch_digest, *encoded.batch_digest());
 
@@ -813,13 +1355,13 @@ mod tests {
                 let payload_end = payload_start
                     .checked_add(codec::WAL_V8_DATA_FRAGMENT_PAYLOAD_CAPACITY)
                     .context("test DATA payload end overflows")?
-                    .min(encoded.as_bytes().len());
-                let payload = &encoded.as_bytes()[payload_start..payload_end];
+                    .min(encoded.logical_bytes()?.len());
+                let payload = &encoded.logical_bytes()?[payload_start..payload_end];
                 let expected_fragment = codec::WalV8DataFragmentHeader {
                     segment_ticket: encoded.assignment.segment_ticket,
                     fragment_index: u32::try_from(index)?,
                     fragment_count: encoded.fragment_count,
-                    batch_bytes: u64::try_from(encoded.as_bytes().len())?,
+                    batch_bytes: u64::try_from(encoded.logical_bytes()?.len())?,
                 };
                 let expected_body = expected_fragment.encode_body(payload)?;
                 let expected_frame = codec::encode_data_frame(
@@ -840,11 +1382,11 @@ mod tests {
                 assert_eq!(usize::try_from(fragment.fragment_count)?, frames.len());
                 assert_eq!(
                     fragment.batch_bytes,
-                    u64::try_from(encoded.as_bytes().len())?
+                    u64::try_from(encoded.logical_bytes()?.len())?
                 );
                 logical.extend_from_slice(payload);
             }
-            assert_eq!(logical, encoded.as_bytes());
+            assert_eq!(logical, encoded.logical_bytes()?);
             encoded.disarm_after_durable();
         }
 

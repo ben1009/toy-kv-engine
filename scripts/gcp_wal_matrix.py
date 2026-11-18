@@ -32,6 +32,72 @@ LEGACY_ORDERS = (
     ("v4", "v7", "v8", "v8", "v7", "v4"),
     ("v8", "v7", "v4", "v4", "v7", "v8"),
 )
+COMMIT_ORDER_TRACE_LIMIT = 1_024
+COMMIT_ORDER_TRACE_REPETITIONS = 5
+COMMIT_ORDER_TRACE_WRITERS = 16
+COMMIT_ORDER_TRACE_NUM = 100_000
+COMMIT_ORDER_TRACE_ORDERS = (("v7_parallel", "v8_parallel"), ("v8_parallel", "v7_parallel"))
+
+POINT_LOOKAHEAD_WORKLOADS = (
+    {"name": "point", "bench": "wal_concurrent", "batch_entries": 1, "batch_size": None,
+     "num": 100_000, "sample_every": 100},
+    {"name": "batch8", "bench": "wal_batch_concurrent", "batch_entries": 8, "batch_size": 8,
+     "num": 300_000, "sample_every": 10},
+    {"name": "batch16", "bench": "wal_batch_concurrent", "batch_entries": 16, "batch_size": 16,
+     "num": 500_000, "sample_every": 10},
+    {"name": "batch64", "bench": "wal_batch_concurrent", "batch_entries": 64, "batch_size": 64,
+     "num": 750_000, "sample_every": 10},
+)
+POINT_LOOKAHEAD_ORDERS = (
+    ("v8_fallocate", "v8_point_lookahead"),
+    ("v8_point_lookahead", "v8_fallocate"),
+)
+POINT_LOOKAHEAD_REPETITIONS = 5
+POINT_LOOKAHEAD_WRITERS = 16
+POINT_LOOKAHEAD_WINDOW_BYTES = 1 << 20
+
+POINT_BORROWED_INPUT_WRITERS = (1, 8, 16)
+POINT_BORROWED_INPUT_REPETITIONS = 5
+POINT_BORROWED_INPUT_NUM = 100_000
+POINT_BORROWED_INPUT_WORKLOADS = (
+    {"name": "point", "bench": "wal_concurrent", "batch_entries": 1, "batch_size": None},
+    {"name": "batch16", "bench": "wal_batch_concurrent", "batch_entries": 16, "batch_size": 16},
+    {"name": "batch64", "bench": "wal_batch_concurrent", "batch_entries": 64, "batch_size": 64},
+)
+POINT_BORROWED_INPUT_ARMS = ("v8_owned_baseline", "v8_borrowed_candidate")
+POINT_BORROWED_INPUT_ORDERS = (
+    ("v8_owned_baseline", "v8_borrowed_candidate"),
+    ("v8_borrowed_candidate", "v8_owned_baseline"),
+)
+
+POINT_DIRECT_FRAME_WRITERS = (1, 8, 16)
+POINT_DIRECT_FRAME_REPETITIONS = 5
+POINT_DIRECT_FRAME_NUM = 100_000
+POINT_DIRECT_FRAME_ARMS = ("direct_frame_off", "direct_frame_on")
+POINT_DIRECT_FRAME_ORDERS = (
+    ("direct_frame_off", "direct_frame_on"),
+    ("direct_frame_on", "direct_frame_off"),
+)
+
+V8_EXTENT_POLICY_STORAGE_WRITERS = (8, 16)
+V8_EXTENT_POLICY_STORAGE_REPETITIONS = 5
+V8_EXTENT_POLICY_STORAGE_NUM = 100_000
+V8_EXTENT_POLICY_STORAGE_ARMS = ("btree", "vec")
+V8_EXTENT_POLICY_STORAGE_ORDERS = (("btree", "vec"), ("vec", "btree"))
+V8_EXTENT_POLICY_STORAGE_WORKLOADS = (
+    {"name": "point", "bench": "wal_concurrent", "batch_entries": 1, "batch_size": None},
+    {"name": "batch16", "bench": "wal_batch_concurrent", "batch_entries": 16, "batch_size": 16},
+    {"name": "batch64", "bench": "wal_batch_concurrent", "batch_entries": 64, "batch_size": 64},
+)
+
+V8_MUTEX_DIAGNOSTIC_WRITERS = (16,)
+V8_MUTEX_DIAGNOSTIC_REPETITIONS = 5
+V8_MUTEX_DIAGNOSTIC_NUM = 100_000
+V8_MUTEX_DIAGNOSTIC_SAMPLE_EVERY = 64
+V8_MUTEX_DIAGNOSTIC_ORDERS = (
+    ("v7_parallel", "v8_point_lookahead_direct"),
+    ("v8_point_lookahead_direct", "v7_parallel"),
+)
 
 
 def validate_writer_counts(values: Iterable[int]) -> tuple[int, ...]:
@@ -80,6 +146,635 @@ def build_batch64_schedule(writers: Iterable[int]) -> list[dict[str, int | str]]
                     "arm": arm,
                 })
     return schedule
+
+
+def build_commit_order_trace_schedule() -> list[dict[str, int | str]]:
+    """Return two trace captures and five counterbalanced, untraced Point pairs."""
+    schedule: list[dict[str, int | str]] = []
+    for arm in ("v7_parallel", "v8_parallel"):
+        schedule.append({
+            "run_index": len(schedule) + 1,
+            "writer": COMMIT_ORDER_TRACE_WRITERS,
+            "workload": "point",
+            "phase": "trace",
+            "repetition": 0,
+            "arm": arm,
+            "trace_limit": COMMIT_ORDER_TRACE_LIMIT,
+            "bench": "wal_concurrent",
+            "batch_entries": 1,
+            "num": COMMIT_ORDER_TRACE_NUM,
+            "sample_every": 100,
+        })
+
+    for repetition in range(1, COMMIT_ORDER_TRACE_REPETITIONS + 1):
+        order = COMMIT_ORDER_TRACE_ORDERS[(repetition - 1) % len(COMMIT_ORDER_TRACE_ORDERS)]
+        for arm in order:
+            schedule.append({
+                "run_index": len(schedule) + 1,
+                "writer": COMMIT_ORDER_TRACE_WRITERS,
+                "workload": "point",
+                "phase": "score",
+                "repetition": repetition,
+                "arm": arm,
+                "trace_limit": 0,
+                "bench": "wal_concurrent",
+                "batch_entries": 1,
+                "num": COMMIT_ORDER_TRACE_NUM,
+                "sample_every": 100,
+            })
+    return schedule
+
+
+def build_point_lookahead_schedule(writers: Iterable[int]) -> list[dict[str, object]]:
+    """Compare V8 fallocate with Point-only lookahead, including batch guardrails."""
+    writer_counts = validate_writer_counts(writers)
+    schedule: list[dict[str, object]] = []
+    for writer in writer_counts:
+        for workload in POINT_LOOKAHEAD_WORKLOADS:
+            for repetition in range(1, POINT_LOOKAHEAD_REPETITIONS + 1):
+                order = POINT_LOOKAHEAD_ORDERS[(repetition - 1) % len(POINT_LOOKAHEAD_ORDERS)]
+                for arm in order:
+                    schedule.append({
+                        "run_index": len(schedule) + 1,
+                        "writer": writer,
+                        "workload": workload["name"],
+                        "repetition": repetition,
+                        "arm": arm,
+                        **{key: value for key, value in workload.items() if key != "name"},
+                        "extent_mode": (
+                            "sliding-point-lookahead"
+                            if arm == "v8_point_lookahead" and workload["name"] == "point"
+                            else "sliding-fallocate"
+                        ),
+                        "extent_window_bytes": POINT_LOOKAHEAD_WINDOW_BYTES,
+                    })
+    return schedule
+
+
+def build_point_lookahead_plan(
+    *, writers: Iterable[int], machine_type: str, machine_spec: Mapping[str, int],
+    commit: str | None = None, binary_sha256: str | None = None,
+) -> dict[str, object]:
+    writer_counts = validate_writer_counts(writers)
+    schedule = build_point_lookahead_schedule(writer_counts)
+    vcpus = int(machine_spec["vcpus"])
+    ssd_count = int(machine_spec["ssd_count"])
+    layout = "single Local SSD" if ssd_count == 1 else f"RAID0 over {ssd_count} Local SSDs"
+    plan: dict[str, object] = {
+        "suite": "v8-point-lookahead",
+        "writers": list(writer_counts),
+        "workloads": [dict(workload) for workload in POINT_LOOKAHEAD_WORKLOADS],
+        "arms": ["v8_fallocate", "v8_point_lookahead"],
+        "repetitions_per_cell": POINT_LOOKAHEAD_REPETITIONS,
+        "arm_orders": [list(order) for order in POINT_LOOKAHEAD_ORDERS],
+        "extent_window_bytes": POINT_LOOKAHEAD_WINDOW_BYTES,
+        "runs_planned": len(schedule),
+        "score_runs_planned": len(schedule),
+        "counterbalanced": True,
+        "machine_type": machine_type,
+        "vcpus": vcpus,
+        "local_ssd_count": ssd_count,
+        "local_ssd_total_gib": int(machine_spec["ssd_gib"]),
+        "runtime_protocol": f"single {vcpus}-vCPU host; {layout}",
+        "value_bytes": 1024,
+        "compaction": "none",
+        "qualification_note": (
+            "Same-VM V8 comparison. Point uses one-entry DATA writes; batch cells verify that the "
+            "point-only lookahead mode leaves multi-entry batches on fallocate-only preparation."
+        ),
+    }
+    if commit is not None:
+        plan["commit"] = commit
+    if binary_sha256 is not None:
+        plan["binary_sha256"] = binary_sha256
+    return plan
+
+
+def build_point_borrowed_input_schedule(writers: Iterable[int]) -> list[dict[str, object]]:
+    """Build paired Point and Batch guardrail runs for the borrowed-input change."""
+    writer_counts = validate_writer_counts(writers)
+    if writer_counts != POINT_BORROWED_INPUT_WRITERS:
+        raise ValueError(f"borrowed-input suite requires writers {POINT_BORROWED_INPUT_WRITERS}")
+    schedule: list[dict[str, object]] = []
+    cells = [(writer, POINT_BORROWED_INPUT_WORKLOADS[0]) for writer in writer_counts]
+    cells.extend((16, workload) for workload in POINT_BORROWED_INPUT_WORKLOADS[1:])
+    for writer, workload in cells:
+        for repetition in range(1, POINT_BORROWED_INPUT_REPETITIONS + 1):
+            order = POINT_BORROWED_INPUT_ORDERS[(repetition - 1) % len(POINT_BORROWED_INPUT_ORDERS)]
+            for arm in order:
+                schedule.append({
+                    "run_index": len(schedule) + 1,
+                    "writer": writer,
+                    "workload": workload["name"],
+                    "repetition": repetition,
+                    "arm": arm,
+                    "bench": workload["bench"],
+                    "batch_entries": workload["batch_entries"],
+                    "batch_size": workload["batch_size"],
+                    "num": POINT_BORROWED_INPUT_NUM,
+                    "sample_every": 100 if workload["name"] == "point" else 10,
+                    "extent_mode": "sliding-point-lookahead",
+                    "extent_window_bytes": POINT_LOOKAHEAD_WINDOW_BYTES,
+                    "frontier_mode": "direct",
+                })
+    return schedule
+
+
+def build_point_borrowed_input_plan(
+    *, writers: Iterable[int], machine_type: str, machine_spec: Mapping[str, int],
+    baseline_commit: str, candidate_commit: str, source_patch_sha256: str,
+    baseline_binary_sha256: str | None = None, candidate_binary_sha256: str | None = None,
+) -> dict[str, object]:
+    writer_counts = validate_writer_counts(writers)
+    schedule = build_point_borrowed_input_schedule(writer_counts)
+    vcpus = int(machine_spec["vcpus"])
+    ssd_count = int(machine_spec["ssd_count"])
+    layout = "single Local SSD" if ssd_count == 1 else f"RAID0 over {ssd_count} Local SSDs"
+    plan: dict[str, object] = {
+        "suite": "v8-point-borrowed-input",
+        "writers": list(writer_counts),
+        "workloads": [dict(workload, num=POINT_BORROWED_INPUT_NUM) for workload in POINT_BORROWED_INPUT_WORKLOADS],
+        "arms": list(POINT_BORROWED_INPUT_ARMS),
+        "repetitions_per_cell": POINT_BORROWED_INPUT_REPETITIONS,
+        "arm_orders": [list(order) for order in POINT_BORROWED_INPUT_ORDERS],
+        "runs_planned": len(schedule),
+        "score_runs_planned": len(schedule),
+        "counterbalanced": True,
+        "machine_type": machine_type,
+        "vcpus": vcpus,
+        "local_ssd_count": ssd_count,
+        "local_ssd_total_gib": int(machine_spec["ssd_gib"]),
+        "runtime_protocol": f"single {vcpus}-vCPU host; {layout}; both revisions built with the pinned toolchain",
+        "value_bytes": 1024,
+        "compaction": "none",
+        "baseline_commit": baseline_commit,
+        "candidate_commit": candidate_commit,
+        "source_patch_sha256": source_patch_sha256,
+        "extent_preparation": "sliding-point-lookahead, 1 MiB",
+        "frontier_mode": "direct",
+        "coalescing": "dynamic",
+        "qualification_note": (
+            "Only V8 Point preparation source differs. The candidate borrows the Point key/value during WAL "
+            "preparation; Point/Batch admission, frame jobs, durability, extent policy and frontier settings "
+            "are held fixed. Batch16/64 are paired regression guardrails."
+        ),
+    }
+    if baseline_binary_sha256 is not None:
+        plan["baseline_binary_sha256"] = baseline_binary_sha256
+    if candidate_binary_sha256 is not None:
+        plan["candidate_binary_sha256"] = candidate_binary_sha256
+    return plan
+
+
+def validate_point_borrowed_input_rows(rows: list[Mapping[str, object]], writers: Iterable[int]) -> dict[str, object]:
+    """Check every paired run identity, count and successful operation total."""
+    schedule = build_point_borrowed_input_schedule(writers)
+    expected = {
+        (
+            int(row["writer"]),
+            str(row["workload"]),
+            int(row["repetition"]),
+            str(row["arm"]),
+        ): int(row["num"])
+        for row in schedule
+    }
+    return _validate_rows(rows, expected, ("writer", "workload", "repetition", "arm"))
+
+
+def build_point_direct_frame_schedule(writers: Iterable[int]) -> list[dict[str, object]]:
+    """Build same-binary direct-frame A/B runs and Point/Batch guardrails."""
+    writer_counts = validate_writer_counts(writers)
+    if writer_counts != POINT_DIRECT_FRAME_WRITERS:
+        raise ValueError(f"direct-frame suite requires writers {POINT_DIRECT_FRAME_WRITERS}")
+    schedule: list[dict[str, object]] = []
+    cells = [(writer, POINT_BORROWED_INPUT_WORKLOADS[0]) for writer in writer_counts]
+    cells.extend((16, workload) for workload in POINT_BORROWED_INPUT_WORKLOADS[1:])
+    for writer, workload in cells:
+        for repetition in range(1, POINT_DIRECT_FRAME_REPETITIONS + 1):
+            order = POINT_DIRECT_FRAME_ORDERS[(repetition - 1) % len(POINT_DIRECT_FRAME_ORDERS)]
+            for arm in order:
+                schedule.append({
+                    "run_index": len(schedule) + 1,
+                    "writer": writer,
+                    "workload": workload["name"],
+                    "repetition": repetition,
+                    "arm": arm,
+                    "bench": workload["bench"],
+                    "batch_entries": workload["batch_entries"],
+                    "batch_size": workload["batch_size"],
+                    "num": POINT_DIRECT_FRAME_NUM,
+                    "sample_every": 100 if workload["name"] == "point" else 10,
+                    "extent_mode": "sliding-point-lookahead",
+                    "extent_window_bytes": POINT_LOOKAHEAD_WINDOW_BYTES,
+                    "frontier_mode": "direct",
+                    "point_direct_frame_enabled": arm == "direct_frame_on",
+                })
+    return schedule
+
+
+def build_point_direct_frame_plan(
+    *, writers: Iterable[int], machine_type: str, machine_spec: Mapping[str, int],
+    commit: str, binary_sha256: str | None = None,
+) -> dict[str, object]:
+    writer_counts = validate_writer_counts(writers)
+    schedule = build_point_direct_frame_schedule(writer_counts)
+    vcpus = int(machine_spec["vcpus"])
+    ssd_count = int(machine_spec["ssd_count"])
+    layout = "single Local SSD" if ssd_count == 1 else f"RAID0 over {ssd_count} Local SSDs"
+    plan: dict[str, object] = {
+        "suite": "v8-point-direct-frame",
+        "writers": list(writer_counts),
+        "workloads": [dict(workload, num=POINT_DIRECT_FRAME_NUM) for workload in POINT_BORROWED_INPUT_WORKLOADS],
+        "arms": list(POINT_DIRECT_FRAME_ARMS),
+        "repetitions_per_cell": POINT_DIRECT_FRAME_REPETITIONS,
+        "arm_orders": [list(order) for order in POINT_DIRECT_FRAME_ORDERS],
+        "runs_planned": len(schedule),
+        "score_runs_planned": len(schedule),
+        "counterbalanced": True,
+        "machine_type": machine_type,
+        "vcpus": vcpus,
+        "local_ssd_count": ssd_count,
+        "local_ssd_total_gib": int(machine_spec["ssd_gib"]),
+        "runtime_protocol": f"single {vcpus}-vCPU host; {layout}; same binary and source for both arms",
+        "value_bytes": 1024,
+        "compaction": "none",
+        "commit": commit,
+        "binary_sha256": binary_sha256,
+        "extent_preparation": "sliding-point-lookahead, 1 MiB",
+        "frontier_mode": "direct",
+        "coalescing": "dynamic",
+        "point_direct_frame_ab": {
+            "environment_variable": "TOYKV_BENCH_V8_POINT_DIRECT_FRAME",
+            "baseline_value": "0",
+            "candidate_value": "1",
+        },
+        "qualification_note": (
+            "The direct-frame flag is the only A/B difference; both arms use the same bench binary. "
+            "Every Point put must report one completed direct-frame encode. Batch16 and Batch64 must report zero."
+        ),
+    }
+    return plan
+
+
+def validate_point_direct_frame_rows(
+    rows: list[Mapping[str, object]], writers: Iterable[int]
+) -> dict[str, object]:
+    """Check planned run identities, success counts, and actual encoder hits."""
+    schedule = build_point_direct_frame_schedule(writers)
+    expected = {
+        (row["writer"], row["workload"], row["repetition"], row["arm"]): row for row in schedule
+    }
+    observed: dict[tuple[object, object, object, object], int] = {}
+    invalid: list[Mapping[str, object]] = []
+    for row in rows:
+        identity = tuple(row.get(key) for key in ("writer", "workload", "repetition", "arm"))
+        observed[identity] = observed.get(identity, 0) + 1
+        expected_row = expected.get(identity)
+        should_encode = bool(expected_row and expected_row["point_direct_frame_enabled"])
+        expected_hits = POINT_DIRECT_FRAME_NUM if should_encode and row.get("workload") == "point" else 0
+        if (
+            expected_row is None
+            or row.get("exit_code") != 0
+            or row.get("ops") != POINT_DIRECT_FRAME_NUM
+            or row.get("point_direct_frame_enabled") != should_encode
+            or row.get("direct_frame_encoded_count") != expected_hits
+        ):
+            invalid.append(row)
+
+    expected_cells = set(expected)
+    observed_cells = set(observed)
+    return {
+        "complete": not (
+            expected_cells != observed_cells or any(count != 1 for count in observed.values()) or invalid
+        ),
+        "planned": len(schedule),
+        "observed": len(rows),
+        "missing_cells": [list(cell) for cell in sorted(expected_cells - observed_cells)],
+        "unexpected_cells": [list(cell) for cell in sorted(observed_cells - expected_cells, key=str)],
+        "duplicate_cells": [list(cell) for cell, count in observed.items() if count != 1],
+        "invalid_rows": [dict(row) for row in invalid],
+    }
+
+
+def build_v8_extent_policy_storage_schedule(
+    writers: Iterable[int],
+) -> list[dict[str, object]]:
+    """Build uninstrumented BTreeMap/Vec score pairs and separate scan diagnostics."""
+    writer_counts = validate_writer_counts(writers)
+    if writer_counts != V8_EXTENT_POLICY_STORAGE_WRITERS:
+        raise ValueError(
+            f"extent-policy storage suite requires writers {V8_EXTENT_POLICY_STORAGE_WRITERS}"
+        )
+
+    cells = [(writer, V8_EXTENT_POLICY_STORAGE_WORKLOADS[0]) for writer in writer_counts]
+    cells.extend((16, workload) for workload in V8_EXTENT_POLICY_STORAGE_WORKLOADS[1:])
+    schedule: list[dict[str, object]] = []
+    for writer, workload in cells:
+        for repetition in range(1, V8_EXTENT_POLICY_STORAGE_REPETITIONS + 1):
+            order = V8_EXTENT_POLICY_STORAGE_ORDERS[(repetition - 1) % len(V8_EXTENT_POLICY_STORAGE_ORDERS)]
+            for arm in order:
+                schedule.append({
+                    "run_index": len(schedule) + 1,
+                    "writer": writer,
+                    "workload": workload["name"],
+                    "phase": "score",
+                    "repetition": repetition,
+                    "arm": arm,
+                    "bench": workload["bench"],
+                    "batch_entries": workload["batch_entries"],
+                    "batch_size": workload["batch_size"],
+                    "num": V8_EXTENT_POLICY_STORAGE_NUM,
+                    "sample_every": 100 if workload["name"] == "point" else 10,
+                    "extent_mode": "sliding-point-lookahead",
+                    "extent_window_bytes": POINT_LOOKAHEAD_WINDOW_BYTES,
+                    "frontier_mode": "direct",
+                    "scan_diagnostics_enabled": False,
+                })
+
+    for writer in writer_counts:
+        order = V8_EXTENT_POLICY_STORAGE_ORDERS[(writer // 8 - 1) % len(V8_EXTENT_POLICY_STORAGE_ORDERS)]
+        for arm in order:
+            schedule.append({
+                "run_index": len(schedule) + 1,
+                "writer": writer,
+                "workload": "point",
+                "phase": "diagnostic",
+                "repetition": 0,
+                "arm": arm,
+                "bench": "wal_concurrent",
+                "batch_entries": 1,
+                "batch_size": None,
+                "num": V8_EXTENT_POLICY_STORAGE_NUM,
+                "sample_every": 100,
+                "extent_mode": "sliding-point-lookahead",
+                "extent_window_bytes": POINT_LOOKAHEAD_WINDOW_BYTES,
+                "frontier_mode": "direct",
+                "scan_diagnostics_enabled": True,
+            })
+    return schedule
+
+
+def build_v8_extent_policy_storage_plan(
+    *, writers: Iterable[int], machine_type: str, machine_spec: Mapping[str, int],
+    commit: str, binary_sha256: str | None = None,
+) -> dict[str, object]:
+    writer_counts = validate_writer_counts(writers)
+    schedule = build_v8_extent_policy_storage_schedule(writer_counts)
+    vcpus = int(machine_spec["vcpus"])
+    ssd_count = int(machine_spec["ssd_count"])
+    layout = "single Local SSD" if ssd_count == 1 else f"RAID0 over {ssd_count} Local SSDs"
+    plan: dict[str, object] = {
+        "suite": "v8-extent-policy-storage",
+        "writers": list(writer_counts),
+        "workloads": [dict(workload, num=V8_EXTENT_POLICY_STORAGE_NUM)
+                      for workload in V8_EXTENT_POLICY_STORAGE_WORKLOADS],
+        "arms": list(V8_EXTENT_POLICY_STORAGE_ARMS),
+        "repetitions_per_cell": V8_EXTENT_POLICY_STORAGE_REPETITIONS,
+        "score_runs_planned": sum(row["phase"] == "score" for row in schedule),
+        "diagnostic_runs_planned": sum(row["phase"] == "diagnostic" for row in schedule),
+        "runs_planned": len(schedule),
+        "counterbalanced": True,
+        "machine_type": machine_type,
+        "vcpus": vcpus,
+        "local_ssd_count": ssd_count,
+        "local_ssd_total_gib": int(machine_spec["ssd_gib"]),
+        "runtime_protocol": f"single {vcpus}-vCPU host; {layout}; same binary and source for both arms",
+        "value_bytes": 1024,
+        "compaction": "none",
+        "commit": commit,
+        "binary_sha256": binary_sha256,
+        "extent_preparation": "sliding-point-lookahead, 1 MiB",
+        "frontier_mode": "direct",
+        "coalescing": "dynamic",
+        "storage_ab": {
+            "environment_variable": "TOYKV_BENCH_V8_EXTENT_POLICY_STORAGE",
+            "baseline": "btree",
+            "candidate": "vec",
+            "score_diagnostics": False,
+            "diagnostic_runs_per_storage": 1,
+        },
+        "qualification_note": (
+            "The BTreeMap and Vec score arms use one bench binary and differ only in extent-policy storage. "
+            "Scan counters are disabled for throughput runs; four separate Point runs enable them to verify "
+            "the work reduction. Batch16/64 remain independent regression guardrails."
+        ),
+    }
+    return plan
+
+
+def validate_v8_extent_policy_storage_rows(
+    rows: list[Mapping[str, object]], writers: Iterable[int],
+) -> dict[str, object]:
+    schedule = build_v8_extent_policy_storage_schedule(writers)
+    expected = {
+        (row["writer"], row["workload"], row["phase"], row["repetition"], row["arm"]): row
+        for row in schedule
+    }
+    observed: dict[tuple[object, ...], int] = {}
+    invalid: list[Mapping[str, object]] = []
+    for row in rows:
+        identity = tuple(row.get(key) for key in ("writer", "workload", "phase", "repetition", "arm"))
+        observed[identity] = observed.get(identity, 0) + 1
+        planned = expected.get(identity)
+        if (
+            planned is None
+            or row.get("exit_code") != 0
+            or row.get("ops") != V8_EXTENT_POLICY_STORAGE_NUM
+            or row.get("extent_policy_storage") != row.get("arm")
+            or row.get("scan_diagnostics_enabled") != bool(planned["scan_diagnostics_enabled"])
+        ):
+            invalid.append(row)
+            continue
+        if planned["phase"] == "score":
+            if row.get("lookahead_check_calls") != 0 or row.get("extent_policy_entries_scanned") != 0:
+                invalid.append(row)
+        elif (
+            row.get("workload") != "point"
+            or row.get("lookahead_check_calls", 0) <= 0
+            or row.get("extent_policy_entries_scanned", 0) <= 0
+        ):
+            invalid.append(row)
+        if row.get("workload") != "point" and row.get("initialized_bytes") != 0:
+            invalid.append(row)
+
+    expected_cells = set(expected)
+    observed_cells = set(observed)
+    return {
+        "complete": not (
+            expected_cells != observed_cells or any(count != 1 for count in observed.values()) or invalid
+        ),
+        "planned": len(schedule),
+        "observed": len(rows),
+        "missing_cells": [list(cell) for cell in sorted(expected_cells - observed_cells, key=str)],
+        "unexpected_cells": [list(cell) for cell in sorted(observed_cells - expected_cells, key=str)],
+        "duplicate_cells": [list(cell) for cell, count in observed.items() if count != 1],
+        "invalid_rows": [dict(row) for row in invalid],
+    }
+def build_v8_mutex_diagnostic_schedule() -> list[dict[str, object]]:
+    """Build five counterbalanced V7/V8 Point mutex-diagnostic pairs."""
+    schedule: list[dict[str, object]] = []
+    for repetition in range(1, V8_MUTEX_DIAGNOSTIC_REPETITIONS + 1):
+        order = V8_MUTEX_DIAGNOSTIC_ORDERS[(repetition - 1) % len(V8_MUTEX_DIAGNOSTIC_ORDERS)]
+        for arm in order:
+            is_v8 = arm == "v8_point_lookahead_direct"
+            schedule.append({
+                "run_index": len(schedule) + 1,
+                "writer": V8_MUTEX_DIAGNOSTIC_WRITERS[0],
+                "workload": "point",
+                "repetition": repetition,
+                "arm": arm,
+                "bench": "wal_concurrent",
+                "batch_entries": 1,
+                "batch_size": None,
+                "num": V8_MUTEX_DIAGNOSTIC_NUM,
+                "sample_every": V8_MUTEX_DIAGNOSTIC_SAMPLE_EVERY,
+                "extent_mode": "sliding-point-lookahead" if is_v8 else "none",
+                "extent_window_bytes": POINT_LOOKAHEAD_WINDOW_BYTES if is_v8 else 0,
+                "frontier_mode": "direct" if is_v8 else "n/a",
+            })
+    return schedule
+
+
+def build_v8_mutex_diagnostic_plan(
+    *, machine_type: str, machine_spec: Mapping[str, int], commit: str | None = None,
+    binary_sha256: str | None = None,
+) -> dict[str, object]:
+    schedule = build_v8_mutex_diagnostic_schedule()
+    vcpus = int(machine_spec["vcpus"])
+    ssd_count = int(machine_spec["ssd_count"])
+    layout = "single Local SSD" if ssd_count == 1 else f"RAID0 over {ssd_count} Local SSDs"
+    plan: dict[str, object] = {
+        "suite": "v8-mutex-diagnostic",
+        "diagnostic_only": True,
+        "writers": list(V8_MUTEX_DIAGNOSTIC_WRITERS),
+        "workloads": [{"name": "point", "bench": "wal_concurrent", "num": V8_MUTEX_DIAGNOSTIC_NUM}],
+        "arms": list(V8_MUTEX_DIAGNOSTIC_ORDERS[0]),
+        "repetitions_per_pair": V8_MUTEX_DIAGNOSTIC_REPETITIONS,
+        "arm_orders": [list(order) for order in V8_MUTEX_DIAGNOSTIC_ORDERS],
+        "mutex_sample_every": V8_MUTEX_DIAGNOSTIC_SAMPLE_EVERY,
+        "runs_planned": len(schedule),
+        "counterbalanced": True,
+        "machine_type": machine_type,
+        "vcpus": vcpus,
+        "local_ssd_count": ssd_count,
+        "local_ssd_total_gib": int(machine_spec["ssd_gib"]),
+        "runtime_protocol": f"single {vcpus}-vCPU host; {layout}",
+        "value_bytes": 1024,
+        "compaction": "none",
+        "v8_configuration": {
+            "extent_preparation": "sliding-point-lookahead",
+            "extent_window_bytes": POINT_LOOKAHEAD_WINDOW_BYTES,
+            "frontier_mode": "direct",
+            "coalescing": "dynamic",
+        },
+        "qualification_note": (
+            "Diagnostic-only paired runs; sampled mutex timings and estimates are not uninstrumented "
+            "throughput scores. V7 and V8 use the same binary and host."
+        ),
+    }
+    if commit is not None:
+        plan["commit"] = commit
+    if binary_sha256 is not None:
+        plan["binary_sha256"] = binary_sha256
+    return plan
+
+
+def validate_v8_mutex_diagnostic_rows(rows: list[Mapping[str, object]]) -> dict[str, object]:
+    """Validate each planned diagnostic run and its sampled mutex payload."""
+    schedule = build_v8_mutex_diagnostic_schedule()
+    expected = {
+        (row["writer"], row["workload"], row["repetition"], row["arm"]): row for row in schedule
+    }
+    observed: dict[tuple[object, object, object, object], int] = {}
+    invalid: list[Mapping[str, object]] = []
+    lock_names = {
+        "resource_ledger", "reservation_owner", "v8_extent_state", "v8_extent_preparation",
+        "mvcc_publication",
+    }
+    for row in rows:
+        identity = tuple(row.get(key) for key in ("writer", "workload", "repetition", "arm"))
+        observed[identity] = observed.get(identity, 0) + 1
+        try:
+            if identity not in expected or row.get("exit_code") != 0 or row.get("ops") != V8_MUTEX_DIAGNOSTIC_NUM:
+                invalid.append(row)
+                continue
+            diagnostics = row["mutex_lock_diagnostics"]
+            if not isinstance(diagnostics, Mapping):
+                invalid.append(row)
+                continue
+            if diagnostics.get("sample_every") != V8_MUTEX_DIAGNOSTIC_SAMPLE_EVERY:
+                invalid.append(row)
+                continue
+            locks = diagnostics.get("locks")
+            if not isinstance(locks, list) or {entry.get("name") for entry in locks if isinstance(entry, Mapping)} != lock_names:
+                invalid.append(row)
+                continue
+        except (KeyError, TypeError):
+            invalid.append(row)
+
+    expected_cells = set(expected)
+    observed_cells = set(observed)
+    return {
+        "complete": not (
+            expected_cells != observed_cells
+            or any(count != 1 for count in observed.values())
+            or invalid
+        ),
+        "planned": len(schedule),
+        "observed": len(rows),
+        "missing_cells": [list(cell) for cell in sorted(expected_cells - observed_cells)],
+        "unexpected_cells": [list(cell) for cell in sorted(observed_cells - expected_cells, key=str)],
+        "duplicate_cells": [list(cell) for cell, count in observed.items() if count != 1],
+        "invalid_rows": [dict(row) for row in invalid],
+    }
+
+
+def build_commit_order_trace_plan(
+    *, machine_type: str, machine_spec: Mapping[str, int], commit: str | None = None,
+    binary_sha256: str | None = None, source_patch_sha256: str | None = None,
+) -> dict[str, object]:
+    schedule = build_commit_order_trace_schedule()
+    plan: dict[str, object] = {
+        "suite": "commit-order-trace",
+        "writers": [COMMIT_ORDER_TRACE_WRITERS],
+        "formats": ["v7_parallel", "v8_parallel"],
+        "workloads": [{
+            "name": "point", "bench": "wal_concurrent", "batch_entries": 1,
+            "num": COMMIT_ORDER_TRACE_NUM, "sample_every": 100,
+        }],
+        "trace_records_per_diagnostic_run": COMMIT_ORDER_TRACE_LIMIT,
+        "diagnostic_sampling": {
+            "mvcc_publication_sample_every": 64,
+            "v8_durability_sample_every": 64,
+        },
+        "untraced_pairs_planned": COMMIT_ORDER_TRACE_REPETITIONS,
+        "runs_planned": len(schedule),
+        "score_runs_planned": COMMIT_ORDER_TRACE_REPETITIONS * 2,
+        "counterbalanced": True,
+        "qualification_note": (
+            "Trace runs are diagnostic only; throughput comparisons use separate runs without the "
+            "commit-order trace."
+        ),
+    }
+    if commit is not None:
+        plan["commit"] = commit
+    if binary_sha256 is not None:
+        plan["binary_sha256"] = binary_sha256
+    if source_patch_sha256 is not None:
+        plan["source_patch_sha256"] = source_patch_sha256
+    vcpus = int(machine_spec["vcpus"])
+    ssd_count = int(machine_spec["ssd_count"])
+    layout = "single Local SSD" if ssd_count == 1 else f"RAID0 over {ssd_count} Local SSDs"
+    plan.update({
+        "machine_type": machine_type,
+        "vcpus": vcpus,
+        "local_ssd_count": ssd_count,
+        "local_ssd_total_gib": int(machine_spec["ssd_gib"]),
+        "runtime_protocol": f"single {vcpus}-vCPU host; {layout}",
+        "value_bytes": 1024,
+        "compaction": "none",
+    })
+    return plan
 
 
 def build_benchmark_plan(
@@ -210,3 +905,25 @@ def validate_batch64_rows(rows: Iterable[Mapping[str, object]], writers: Iterabl
         for item in schedule
     }
     return _validate_rows(rows, expected, ("writer", "block", "position", "format"))
+
+
+def validate_commit_order_trace_rows(rows: Iterable[Mapping[str, object]]) -> dict[str, object]:
+    schedule = build_commit_order_trace_schedule()
+    expected = {
+        (int(item["writer"]), str(item["phase"]), int(item["repetition"]), str(item["arm"])):
+        int(item["num"])
+        for item in schedule
+    }
+    return _validate_rows(rows, expected, ("writer", "phase", "repetition", "arm"))
+
+
+def validate_point_lookahead_rows(
+    rows: Iterable[Mapping[str, object]], writers: Iterable[int],
+) -> dict[str, object]:
+    schedule = build_point_lookahead_schedule(writers)
+    expected = {
+        (int(item["writer"]), str(item["workload"]), int(item["repetition"]), str(item["arm"])):
+        int(item["num"])
+        for item in schedule
+    }
+    return _validate_rows(rows, expected, ("writer", "workload", "repetition", "arm"))

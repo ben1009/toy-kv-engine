@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+import csv
 from collections.abc import Callable
 from datetime import datetime, timezone
 import ipaddress
@@ -31,11 +32,45 @@ from typing import Any
 import uuid
 
 from gcp_wal_matrix import (
+    COMMIT_ORDER_TRACE_NUM,
+    COMMIT_ORDER_TRACE_WRITERS,
     FULL_DEFAULT_WRITERS,
     LEGACY_DEFAULT_WRITERS,
+    POINT_LOOKAHEAD_WINDOW_BYTES,
+    POINT_LOOKAHEAD_WRITERS,
+    POINT_BORROWED_INPUT_NUM,
+    POINT_BORROWED_INPUT_WRITERS,
+    POINT_DIRECT_FRAME_NUM,
+    POINT_DIRECT_FRAME_WRITERS,
+    V8_EXTENT_POLICY_STORAGE_NUM,
+    V8_EXTENT_POLICY_STORAGE_WRITERS,
+    V8_MUTEX_DIAGNOSTIC_NUM,
+    V8_MUTEX_DIAGNOSTIC_SAMPLE_EVERY,
+    V8_MUTEX_DIAGNOSTIC_WRITERS,
+    build_commit_order_trace_plan,
+    build_commit_order_trace_schedule,
+    build_batch64_schedule,
     build_benchmark_plan,
+    build_point_lookahead_plan,
+    build_point_lookahead_schedule,
+    build_point_borrowed_input_plan,
+    build_point_borrowed_input_schedule,
+    build_point_direct_frame_plan,
+    build_point_direct_frame_schedule,
+    build_v8_extent_policy_storage_plan,
+    build_v8_extent_policy_storage_schedule,
+    build_v8_mutex_diagnostic_plan,
+    build_v8_mutex_diagnostic_schedule,
+    build_rfc026_schedule,
+    validate_commit_order_trace_rows,
+    validate_point_lookahead_rows,
+    validate_point_borrowed_input_rows,
+    validate_point_direct_frame_rows,
+    validate_v8_extent_policy_storage_rows,
+    validate_v8_mutex_diagnostic_rows,
     validate_writer_counts,
 )
+from gcp_commit_order_trace_runner import analyze_trace
 MACHINE_TYPE = "c4-standard-8-lssd"
 MACHINE_SPECS = {
     "c4-standard-8-lssd": {"vcpus": 8, "ssd_count": 1, "ssd_gb": 375, "ssd_gib": 375},
@@ -45,13 +80,107 @@ VM_INSTANCE_QUOTA = "INSTANCES"
 RUNNERS = Path(__file__).with_name("gcp-free-trial-wal-bench-remote.sh")
 MATRIX_MODULE = Path(__file__).with_name("gcp_wal_matrix.py")
 PROFILE_RUNNER = Path(__file__).with_name("gcp_wal_profile_runner.py")
+COMMIT_ORDER_TRACE_RUNNER = Path(__file__).with_name("gcp_commit_order_trace_runner.py")
+POINT_LOOKAHEAD_RUNNER = Path(__file__).with_name("gcp_v8_point_lookahead_runner.py")
+V8_MUTEX_DIAGNOSTIC_RUNNER = Path(__file__).with_name("gcp_v8_mutex_diagnostic_runner.py")
+POINT_BORROWED_INPUT_RUNNER = Path(__file__).with_name("gcp_v8_point_borrowed_input_runner.py")
+POINT_DIRECT_FRAME_RUNNER = Path(__file__).with_name("gcp_v8_point_direct_frame_runner.py")
+V8_EXTENT_POLICY_STORAGE_RUNNER = Path(__file__).with_name("gcp_v8_extent_policy_storage_runner.py")
 REPO_URL = "https://github.com/ben1009/toy-kv-engine.git"
 MAX_RUNTIME_MINUTES = 180
 MIN_RUNTIME_MINUTES = 60
+MAX_ARTIFACT_BUNDLE_BYTES = 512 * 1024 * 1024
+
+REMOTE_ARCHIVE_SCRIPT = r'''
+import hashlib
+import os
+from pathlib import Path
+import tempfile
+import tarfile
+
+root = Path(os.environ["GCP_WAL_RESULTS_ROOT"])
+max_bytes = int(os.environ["GCP_WAL_MAX_ARCHIVE_BYTES"])
+if not root.is_dir():
+    raise SystemExit("benchmark results directory is missing")
+root_names = {
+    "summary.json", "summary.tsv", "comparison.tsv", "benchmark-plan.json",
+    "rfc026-schedule.tsv", "profile-schedule.tsv", "commit-order-trace-schedule.tsv",
+    "point-lookahead-schedule.tsv", "v8-mutex-diagnostic-schedule.tsv",
+    "point-borrowed-input-schedule.tsv",
+    "point-direct-frame-schedule.tsv",
+    "extent-policy-storage-schedule.tsv",
+    "commit-order-trace-analysis.json", "commit.txt", "remote-exit.json",
+    "finished_utc.txt", "remote-finished-utc.txt", "remote-status.txt", "host.txt",
+    "os-release.txt", "uname.txt", "lscpu.txt", "lsblk.txt", "findmnt.txt", "df.txt",
+    "setup.log", "rust-toolchain.txt", "rust-toolchain.toml", "write-perf.sha256", "source-patch.sha256",
+    "perf-version.txt", "baseline-binary.sha256", "candidate-binary.sha256", "baseline-commit.txt",
+}
+run_names = {
+    "result.json", "run-metadata.json", "environment.txt", "start_utc.txt", "end_utc.txt",
+    "start_epoch.txt", "command.sh", "stderr.log", "timeline.json", "perf.data",
+    "perf-report.txt", "perf-record.log", "perf-command.sh", "validation-error.txt",
+}
+selected = [path for path in root.iterdir() if path.is_file() and path.name in root_names]
+for run_dir in sorted(root.glob("w*")):
+    if run_dir.is_dir():
+        selected.extend(path for path in run_dir.iterdir() if path.is_file() and path.name in run_names)
+
+descriptor, archive_name = tempfile.mkstemp(prefix="gcp-wal-bench-results-", suffix=".tar.gz")
+os.close(descriptor)
+archive = Path(archive_name)
+try:
+    with tarfile.open(archive, "w:gz") as bundle:
+        for path in sorted(selected):
+            bundle.add(path, arcname=path.relative_to(root.parent).as_posix())
+    archive_bytes = archive.stat().st_size
+    if archive_bytes > max_bytes:
+        raise SystemExit(f"compact result bundle exceeds {max_bytes} byte limit: {archive_bytes}")
+    digest = hashlib.sha256()
+    with archive.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    print(f"ARCHIVE_PATH={archive}")
+    print(f"ARCHIVE_SHA256={digest.hexdigest()}")
+    print(f"ARCHIVE_BYTES={archive_bytes}")
+    print(f"ARCHIVE_FILES={len(selected)}")
+except BaseException:
+    archive.unlink(missing_ok=True)
+    raise
+'''
+
+
+def _build_remote_archive_command(
+    *, root: str = "/mnt/gcp-wal-bench/results", max_bytes: int = MAX_ARTIFACT_BUNDLE_BYTES
+) -> str:
+    return " ".join((
+        f"GCP_WAL_RESULTS_ROOT={shlex.quote(root)}",
+        f"GCP_WAL_MAX_ARCHIVE_BYTES={max_bytes}",
+        "python3 -c",
+        shlex.quote(REMOTE_ARCHIVE_SCRIPT),
+    ))
 
 
 class BenchError(RuntimeError):
     """Raised for a failed preflight or benchmark orchestration step."""
+
+
+def _is_transient_gcloud_error(detail: str) -> bool:
+    lowered = detail.lower()
+    transient_markers = (
+        "connectionerror",
+        "connection aborted",
+        "connection reset",
+        "remote end closed connection",
+        "remotedisconnected",
+        "timed out",
+        "timeout",
+        "temporarily unavailable",
+        "service unavailable",
+        "rate limit",
+    )
+    return any(marker in lowered for marker in transient_markers) or bool(
+        re.search(r"\b(?:429|500|502|503|504)\b", lowered)
+    )
 
 
 class Gcloud:
@@ -107,11 +236,31 @@ class Gcloud:
         return result
 
     def json(self, args: list[str], *, timeout: int = 120) -> Any:
-        result = self.run([*args, "--format=json"], timeout=timeout)
-        try:
-            return json.loads(result.stdout)
-        except json.JSONDecodeError as error:
-            raise BenchError(f"gcloud returned invalid JSON for {shlex.join(args)}") from error
+        command_args = [*args, "--format=json"]
+        for attempt in range(3):
+            try:
+                result = self.run(command_args, check=False, timeout=timeout)
+            except BenchError as error:
+                if attempt == 2 or not _is_transient_gcloud_error(str(error)):
+                    raise
+                time.sleep(2**attempt)
+                continue
+
+            if result.returncode:
+                detail = result.stderr.strip() or result.stdout.strip()
+                if attempt == 2 or not _is_transient_gcloud_error(detail):
+                    raise BenchError(
+                        f"gcloud command failed ({result.returncode}): {shlex.join(['gcloud', *command_args])}\n{detail}"
+                    )
+                time.sleep(2**attempt)
+                continue
+
+            try:
+                return json.loads(result.stdout)
+            except json.JSONDecodeError as error:
+                raise BenchError(f"gcloud returned invalid JSON for {shlex.join(args)}") from error
+
+        raise BenchError(f"gcloud command failed after retries: {shlex.join(['gcloud', *command_args])}")
 
     def _log(self, record: dict[str, Any]) -> None:
         with self.log_path.open("a", encoding="utf-8") as stream:
@@ -929,11 +1078,26 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                              help="Run point/batch8/batch16/batch64 across V4/V7/V8 parallel and V8 Leader")
     suite_group.add_argument("--v8-small-ticket-profile", action="store_true",
                              help="Collect Hotpath/perf diagnostics for V7/V8 point and batch workloads")
+    suite_group.add_argument("--commit-order-trace", action="store_true",
+                             help="Trace commit order and run five untraced 16-writer V7/V8 Point pairs")
+    suite_group.add_argument("--v8-point-lookahead-ab", action="store_true",
+                             help="Compare V8 1 MiB fallocate vs Point-only lookahead, with batch guardrails")
+    suite_group.add_argument("--v8-mutex-diagnostic", action="store_true",
+                             help="Run five paired V7/V8 Point runs with sampled hot-mutex diagnostics")
+    suite_group.add_argument("--v8-point-borrowed-input-ab", action="store_true",
+                             help="Compare V8 Point owned vs borrowed preparation with Batch16/64 guardrails")
+    suite_group.add_argument("--v8-point-direct-frame-ab", action="store_true",
+                             help="Compare V8 Point direct-frame encoding with the existing path and Batch guardrails")
+    suite_group.add_argument("--v8-extent-policy-storage-ab", action="store_true",
+                             help="Compare V8 BTreeMap and Vec extent-policy storage with Point/Batch guardrails")
+    parser.add_argument("--baseline-commit", help="Full source commit used as the borrowed-input A/B baseline")
+    parser.add_argument("--source-patch-sha256",
+                        help="SHA-256 of the exact source patch used for a commit-order trace run")
     parser.add_argument("--network", help="Existing VPC to use (default: default)")
     parser.add_argument("--subnet", help="Subnetwork name for custom-mode VPCs (must be in the requested region)")
     parser.add_argument("--ssh-source-range", help="Restricted IPv4 CIDR allowed to SSH to this ephemeral VM")
     parser.add_argument("--results-dir", type=Path, help="Local directory for preflight and collected artifacts")
-    parser.add_argument("--num", type=int, default=750_000, help="Writes per run (default: 750000)")
+    parser.add_argument("--num", type=int, help="Writes per run (default depends on the selected suite)")
     parser.add_argument("--max-runtime-minutes", type=int, default=180,
                         help=f"Server-enforced delete deadline, {MIN_RUNTIME_MINUTES}..{MAX_RUNTIME_MINUTES} minutes (default: 180)")
     parser.add_argument("--estimated-hourly-cost-usd", type=float,
@@ -948,11 +1112,35 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--confirm-free-trial", action="store_true",
                         help="Attest that Billing Overview says Free Trial and you will not upgrade to Paid")
     args = parser.parse_args(argv)
+    if args.num is None:
+        args.num = (
+            POINT_DIRECT_FRAME_NUM if args.v8_point_direct_frame_ab else
+            V8_EXTENT_POLICY_STORAGE_NUM if args.v8_extent_policy_storage_ab else
+            POINT_BORROWED_INPUT_NUM if args.v8_point_borrowed_input_ab else
+            V8_MUTEX_DIAGNOSTIC_NUM if args.v8_mutex_diagnostic else
+            COMMIT_ORDER_TRACE_NUM if args.commit_order_trace else 750_000
+        )
     if args.machine_type is None:
-        args.machine_type = MACHINE_TYPE
+        args.machine_type = "c4-standard-16-lssd" if (
+            args.commit_order_trace or args.v8_point_lookahead_ab or args.v8_mutex_diagnostic
+            or args.v8_point_borrowed_input_ab or args.v8_point_direct_frame_ab
+            or args.v8_extent_policy_storage_ab
+        ) else MACHINE_TYPE
     args.network = args.network or "default"
     if args.writers is None:
-        if args.v8_small_ticket_profile:
+        if args.commit_order_trace:
+            args.writers = (COMMIT_ORDER_TRACE_WRITERS,)
+        elif args.v8_mutex_diagnostic:
+            args.writers = V8_MUTEX_DIAGNOSTIC_WRITERS
+        elif args.v8_point_lookahead_ab:
+            args.writers = (POINT_LOOKAHEAD_WRITERS,)
+        elif args.v8_point_borrowed_input_ab:
+            args.writers = POINT_BORROWED_INPUT_WRITERS
+        elif args.v8_point_direct_frame_ab:
+            args.writers = POINT_DIRECT_FRAME_WRITERS
+        elif args.v8_extent_policy_storage_ab:
+            args.writers = V8_EXTENT_POLICY_STORAGE_WRITERS
+        elif args.v8_small_ticket_profile:
             args.writers = (1, 8, 16)
         else:
             args.writers = FULL_DEFAULT_WRITERS if args.full_rfc026_matrix else LEGACY_DEFAULT_WRITERS
@@ -960,12 +1148,59 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         args.writers = validate_writer_counts(args.writers)
     except ValueError as error:
         parser.error(str(error))
+    if args.commit_order_trace and args.writers != (COMMIT_ORDER_TRACE_WRITERS,):
+        parser.error("--commit-order-trace requires exactly 16 writers")
+    if args.v8_mutex_diagnostic and args.writers != V8_MUTEX_DIAGNOSTIC_WRITERS:
+        parser.error("--v8-mutex-diagnostic requires exactly 16 writers")
+    if args.v8_mutex_diagnostic and args.machine_type != "c4-standard-16-lssd":
+        parser.error("--v8-mutex-diagnostic requires c4-standard-16-lssd")
+    if args.v8_point_lookahead_ab and args.writers != (POINT_LOOKAHEAD_WRITERS,):
+        parser.error("--v8-point-lookahead-ab requires exactly 16 writers")
+    if args.v8_point_lookahead_ab and args.machine_type != "c4-standard-16-lssd":
+        parser.error("--v8-point-lookahead-ab requires c4-standard-16-lssd")
+    if args.v8_point_borrowed_input_ab and args.writers != POINT_BORROWED_INPUT_WRITERS:
+        parser.error(f"--v8-point-borrowed-input-ab requires writers {POINT_BORROWED_INPUT_WRITERS}")
+    if args.v8_point_borrowed_input_ab and args.machine_type != "c4-standard-16-lssd":
+        parser.error("--v8-point-borrowed-input-ab requires c4-standard-16-lssd")
+    if args.v8_point_direct_frame_ab and args.writers != POINT_DIRECT_FRAME_WRITERS:
+        parser.error(f"--v8-point-direct-frame-ab requires writers {POINT_DIRECT_FRAME_WRITERS}")
+    if args.v8_point_direct_frame_ab and args.machine_type != "c4-standard-16-lssd":
+        parser.error("--v8-point-direct-frame-ab requires c4-standard-16-lssd")
+    if args.v8_extent_policy_storage_ab and args.writers != V8_EXTENT_POLICY_STORAGE_WRITERS:
+        parser.error(f"--v8-extent-policy-storage-ab requires writers {V8_EXTENT_POLICY_STORAGE_WRITERS}")
+    if args.v8_extent_policy_storage_ab and args.machine_type != "c4-standard-16-lssd":
+        parser.error("--v8-extent-policy-storage-ab requires c4-standard-16-lssd")
     if not re.fullmatch(r"[0-9a-fA-F]{40}", args.commit):
         parser.error("--commit must be a full 40-character SHA")
     if args.num < 64:
         parser.error("--num must be at least 64")
-    if (args.full_rfc026_matrix or args.v8_small_ticket_profile) and args.num != 750_000:
+    if (args.full_rfc026_matrix or args.v8_small_ticket_profile or args.v8_point_lookahead_ab) and args.num != 750_000:
         parser.error("the selected multi-workload suite uses fixed operation counts; omit --num overrides")
+    if args.v8_point_borrowed_input_ab and args.num != POINT_BORROWED_INPUT_NUM:
+        parser.error(f"--v8-point-borrowed-input-ab uses a fixed {POINT_BORROWED_INPUT_NUM}-put workload")
+    if args.v8_point_direct_frame_ab and args.num != POINT_DIRECT_FRAME_NUM:
+        parser.error(f"--v8-point-direct-frame-ab uses a fixed {POINT_DIRECT_FRAME_NUM}-put workload")
+    if args.v8_extent_policy_storage_ab and args.num != V8_EXTENT_POLICY_STORAGE_NUM:
+        parser.error(f"--v8-extent-policy-storage-ab uses a fixed {V8_EXTENT_POLICY_STORAGE_NUM}-put workload")
+    if args.v8_mutex_diagnostic and args.num != V8_MUTEX_DIAGNOSTIC_NUM:
+        parser.error(f"--v8-mutex-diagnostic uses a fixed {V8_MUTEX_DIAGNOSTIC_NUM}-put workload")
+    if args.commit_order_trace and args.num != COMMIT_ORDER_TRACE_NUM:
+        parser.error(f"--commit-order-trace uses a fixed {COMMIT_ORDER_TRACE_NUM}-put workload")
+    if args.commit_order_trace and (
+        not args.source_patch_sha256 or not re.fullmatch(r"[0-9a-f]{64}", args.source_patch_sha256)
+    ):
+        parser.error("--commit-order-trace requires --source-patch-sha256 with 64 lowercase hex characters")
+    if args.v8_point_borrowed_input_ab and (
+        not args.source_patch_sha256 or not re.fullmatch(r"[0-9a-f]{64}", args.source_patch_sha256)
+    ):
+        parser.error("--v8-point-borrowed-input-ab requires --source-patch-sha256 with 64 lowercase hex characters")
+    if args.v8_point_borrowed_input_ab:
+        if not args.baseline_commit or not re.fullmatch(r"[0-9a-fA-F]{40}", args.baseline_commit):
+            parser.error("--v8-point-borrowed-input-ab requires --baseline-commit with a full 40-character SHA")
+    elif args.baseline_commit:
+        parser.error("--baseline-commit is only valid with --v8-point-borrowed-input-ab")
+    if not (args.commit_order_trace or args.v8_point_borrowed_input_ab) and args.source_patch_sha256:
+        parser.error("--source-patch-sha256 is only valid with trace or borrowed-input A/B suites")
     if not MIN_RUNTIME_MINUTES <= args.max_runtime_minutes <= MAX_RUNTIME_MINUTES:
         parser.error(f"--max-runtime-minutes must be between {MIN_RUNTIME_MINUTES} and {MAX_RUNTIME_MINUTES}")
     if (args.estimated_hourly_cost_usd is None) != (args.max_estimated_spend_usd is None):
@@ -1009,13 +1244,23 @@ def write_json(path: Path, value: Any) -> None:
 
 
 def should_retain_vm(args: argparse.Namespace, return_code: int, lifecycle: dict[str, Any]) -> bool:
-    return bool(
+    explicitly_requested = bool(
         getattr(args, "keep_vm_after_run", False)
-        and return_code == 0
         and lifecycle.get("created")
         and lifecycle.get("benchmark_started")
         and lifecycle.get("collected")
+        and lifecycle.get("results_verified")
     )
+    needs_artifact_recovery = bool(
+        lifecycle.get("created")
+        and (
+            lifecycle.get("benchmark_attempted")
+            or lifecycle.get("benchmark_started")
+            or lifecycle.get("remote_execution_uncertain")
+        )
+        and not lifecycle.get("results_verified")
+    )
+    return explicitly_requested or needs_artifact_recovery
 
 
 def retained_vm_reconnect_instructions(
@@ -1026,21 +1271,26 @@ def retained_vm_reconnect_instructions(
     firewall: str,
     project: str,
     connect_command: str,
+    cleanup_uncertain: bool = False,
 ) -> str:
     cleanup_command = (
         "gcloud compute firewall-rules delete "
         f"{shlex.quote(firewall)} --project={shlex.quote(project)} --quiet"
     )
 
-    return (
-        "VM retained until its GCP auto-delete deadline.\n"
+    return "".join((
+        (
+            "Cloud cleanup could not be verified; the VM may have been deleted or may still be running.\n"
+            if cleanup_uncertain else "VM retained until its GCP auto-delete deadline.\n"
+        ),
+        "Do not destroy the VM, firewall, VPC, subnet, route, or Terraform state until the complete local result set is recovered.\n"
         f"Auto-delete deadline: {termination_timestamp}\n"
         f"VPC: {network}\n"
         f"Subnet: {subnet}\n"
         f"SSH firewall rule: {firewall}\n"
         f"Delete the temporary SSH firewall rule after the VM is gone: {cleanup_command}\n"
-        f"{connect_command}\n"
-    )
+        f"{connect_command}\n",
+    ))
 
 
 def create_private_results_directory(path: Path) -> None:
@@ -1054,10 +1304,855 @@ def gcloud_base(project: str, zone: str) -> list[str]:
     return ["--project", project, "--zone", zone]
 
 
+def _run_identifier(row: dict[str, Any], suite: str) -> str:
+    if suite == "v8-small-ticket-profile":
+        return f"w{row['writer']}-{row['workload']}-{row['arm']}"
+    if suite == "rfc026-full":
+        return f"w{row['writer']}-{row['workload']}-r{row['repetition']}-{row['arm']}"
+    if suite == "batch64":
+        return f"w{row['writer']}-b{row['block']}-p{row['position']}-{row['arm']}"
+    if suite == "commit-order-trace":
+        return f"w{row['writer']}-{row['workload']}-{row['phase']}-r{row['repetition']}-{row['arm']}"
+    if suite in ("v8-point-lookahead", "v8-point-borrowed-input", "v8-point-direct-frame"):
+        return f"w{row['writer']}-{row['workload']}-r{row['repetition']}-{row['arm']}"
+    if suite == "v8-extent-policy-storage":
+        return (
+            f"w{row['writer']}-{row['workload']}-{row['phase']}-r{row['repetition']}-{row['arm']}"
+        )
+    if suite == "v8-mutex-diagnostic":
+        return f"w{row['writer']}-{row['workload']}-r{row['repetition']}-{row['arm']}"
+    raise ValueError(f"unsupported benchmark suite: {suite!r}")
+
+
+def _summary_row_identifier(row: dict[str, Any], suite: str) -> str:
+    if suite == "v8-small-ticket-profile":
+        return f"w{int(row['writer'])}-{row['workload']}-{row['arm']}"
+    if suite == "rfc026-full":
+        return f"w{int(row['writer'])}-{row['workload']}-r{int(row['repetition'])}-{row['arm']}"
+    if suite == "batch64":
+        return f"w{int(row['writer'])}-b{int(row['block'])}-p{int(row['position'])}-{row['format']}"
+    if suite == "commit-order-trace":
+        return (
+            f"w{int(row['writer'])}-{row['workload']}-{row['phase']}-r{int(row['repetition'])}-"
+            f"{row['arm']}"
+        )
+    if suite in ("v8-point-lookahead", "v8-point-borrowed-input", "v8-point-direct-frame"):
+        return f"w{int(row['writer'])}-{row['workload']}-r{int(row['repetition'])}-{row['arm']}"
+    if suite == "v8-extent-policy-storage":
+        return (
+            f"w{int(row['writer'])}-{row['workload']}-{row['phase']}-r{int(row['repetition'])}-"
+            f"{row['arm']}"
+        )
+    if suite == "v8-mutex-diagnostic":
+        return f"w{int(row['writer'])}-{row['workload']}-r{int(row['repetition'])}-{row['arm']}"
+    raise ValueError(f"unsupported benchmark suite: {suite!r}")
+
+
+def _expected_run_metadata(row: dict[str, Any], suite: str) -> dict[str, Any]:
+    if suite == "v8-small-ticket-profile":
+        return {key: row[key] for key in ("writer", "workload", "arm", "perf_capture")}
+    if suite == "rfc026-full":
+        return {key: row[key] for key in ("writer", "workload", "repetition", "arm")}
+    if suite == "batch64":
+        return {
+            "writer": row["writer"], "block": row["block"], "position": row["position"], "format": row["arm"],
+        }
+    if suite == "commit-order-trace":
+        return {
+            key: row[key] for key in ("writer", "workload", "phase", "repetition", "arm", "trace_limit")
+        }
+    if suite == "v8-point-lookahead":
+        return {
+            key: row[key] for key in (
+                "writer", "workload", "repetition", "arm", "bench", "batch_entries", "batch_size",
+                "num", "sample_every", "extent_mode", "extent_window_bytes",
+            )
+        }
+    if suite == "v8-point-borrowed-input":
+        return {
+            key: row[key] for key in (
+                "writer", "workload", "repetition", "arm", "bench", "batch_entries", "batch_size",
+                "num", "sample_every", "extent_mode", "extent_window_bytes", "frontier_mode",
+            )
+        }
+    if suite == "v8-point-direct-frame":
+        return {
+            key: row[key] for key in (
+                "writer", "workload", "repetition", "arm", "bench", "batch_entries", "batch_size",
+                "num", "sample_every", "extent_mode", "extent_window_bytes", "frontier_mode",
+                "point_direct_frame_enabled",
+            )
+        }
+    if suite == "v8-extent-policy-storage":
+        return {
+            key: row[key] for key in (
+                "writer", "workload", "phase", "repetition", "arm", "bench", "batch_entries",
+                "batch_size", "num", "sample_every", "extent_mode", "extent_window_bytes",
+                "frontier_mode", "scan_diagnostics_enabled",
+            )
+        }
+    if suite == "v8-mutex-diagnostic":
+        return {key: row[key] for key in ("writer", "workload", "repetition", "arm", "bench", "num", "sample_every")}
+    raise ValueError(f"unsupported benchmark suite: {suite!r}")
+
+
+def _verify_result_set(results: Path) -> dict[str, Any]:
+    """Validate suite metadata and one successful result/metadata pair per planned run."""
+    import json
+
+    errors: list[str] = []
+    try:
+        summary = json.loads((results / "summary.json").read_text(encoding="utf-8"))
+        remote_exit = json.loads((results / "remote-exit.json").read_text(encoding="utf-8"))
+        if not isinstance(summary, dict) or not isinstance(remote_exit, dict):
+            raise ValueError("summary and remote exit metadata must be JSON objects")
+        suite = summary.get("suite")
+        if suite == "v8-small-ticket-profile":
+            with (results / "profile-schedule.tsv").open(encoding="utf-8", newline="") as stream:
+                schedule_rows = list(csv.DictReader(stream, delimiter="\t"))
+            schedule: list[dict[str, Any]] = []
+            for row in schedule_rows:
+                if not {"writer", "workload", "arm", "perf_capture"}.issubset(row):
+                    raise ValueError("profile schedule is missing required columns")
+                schedule.append({
+                    **row,
+                    "writer": int(row["writer"]),
+                    "perf_capture": row["perf_capture"].strip().lower() == "true",
+                })
+            planned = len(schedule)
+            matrix_validation = summary.get("matrix_validation")
+            if not isinstance(matrix_validation, dict) or matrix_validation.get("complete") is not True:
+                errors.append("profile matrix validation is incomplete")
+            if not isinstance(matrix_validation, dict) or matrix_validation.get("planned") != planned:
+                errors.append("profile validation planned count does not match its schedule")
+            if not isinstance(matrix_validation, dict) or matrix_validation.get("observed") != summary.get("runs_completed"):
+                errors.append("profile validation observed count does not match its summary")
+        else:
+            plan = json.loads((results / "benchmark-plan.json").read_text(encoding="utf-8"))
+            if not isinstance(plan, dict):
+                raise ValueError("benchmark plan must be a JSON object")
+            suite = plan.get("suite")
+            if suite == "rfc026-full":
+                schedule = build_rfc026_schedule(plan["writers"])
+            elif suite == "v8-point-lookahead":
+                schedule = build_point_lookahead_schedule(plan["writers"])
+            elif suite == "v8-point-borrowed-input":
+                schedule = build_point_borrowed_input_schedule(plan["writers"])
+                if not isinstance(plan.get("candidate_commit"), str) or not re.fullmatch(
+                    r"[0-9a-f]{40}", plan["candidate_commit"]
+                ):
+                    errors.append("borrowed-input plan has an invalid candidate commit")
+                if not isinstance(plan.get("baseline_commit"), str) or not re.fullmatch(
+                    r"[0-9a-f]{40}", plan["baseline_commit"]
+                ):
+                    errors.append("borrowed-input plan has an invalid baseline commit")
+                patch_sha_path = results / "source-patch.sha256"
+                try:
+                    patch_sha = patch_sha_path.read_text(encoding="utf-8").strip()
+                except OSError as error:
+                    patch_sha = ""
+                    errors.append(f"borrowed-input patch checksum is missing: {error}")
+                if not re.fullmatch(r"[0-9a-f]{64}", patch_sha) or plan.get("source_patch_sha256") != patch_sha:
+                    errors.append("borrowed-input patch checksum does not match its plan")
+                try:
+                    baseline_sha = (results / "baseline-binary.sha256").read_text(encoding="utf-8").strip()
+                    candidate_sha = (results / "candidate-binary.sha256").read_text(encoding="utf-8").strip()
+                except OSError as error:
+                    baseline_sha = candidate_sha = ""
+                    errors.append(f"borrowed-input binary checksum is missing: {error}")
+                if not re.fullmatch(r"[0-9a-f]{64}", baseline_sha):
+                    errors.append("borrowed-input baseline binary checksum is invalid")
+                if not re.fullmatch(r"[0-9a-f]{64}", candidate_sha):
+                    errors.append("borrowed-input candidate binary checksum is invalid")
+                expected_plan = build_point_borrowed_input_plan(
+                    writers=plan.get("writers", ()),
+                    machine_type=plan.get("machine_type", ""),
+                    machine_spec={
+                        "vcpus": plan.get("vcpus", 0), "ssd_count": plan.get("local_ssd_count", 0),
+                        "ssd_gib": plan.get("local_ssd_total_gib", 0),
+                    },
+                    baseline_commit=plan.get("baseline_commit", ""),
+                    candidate_commit=plan.get("candidate_commit", ""),
+                    source_patch_sha256=patch_sha,
+                    baseline_binary_sha256=baseline_sha,
+                    candidate_binary_sha256=candidate_sha,
+                )
+                for key, value in expected_plan.items():
+                    if plan.get(key) != value:
+                        errors.append(f"borrowed-input plan field {key} does not match the fixed suite")
+                if summary.get("suite") != suite or summary.get("source_commit") != plan.get("candidate_commit"):
+                    errors.append("borrowed-input summary source metadata is invalid")
+                if summary.get("baseline_commit") != plan.get("baseline_commit"):
+                    errors.append("borrowed-input summary baseline commit does not match the plan")
+                if summary.get("source_patch_sha256") != patch_sha:
+                    errors.append("borrowed-input summary patch checksum does not match the plan")
+                if summary.get("baseline_binary_sha256") != baseline_sha or (
+                    summary.get("candidate_binary_sha256") != candidate_sha
+                ):
+                    errors.append("borrowed-input summary binary checksums do not match the plan")
+            elif suite == "v8-point-direct-frame":
+                schedule = build_point_direct_frame_schedule(plan["writers"])
+                commit_path = results / "commit.txt"
+                binary_sha_path = results / "write-perf.sha256"
+                try:
+                    recorded_commit = commit_path.read_text(encoding="utf-8").strip()
+                except OSError as error:
+                    recorded_commit = ""
+                    errors.append(f"direct-frame source commit is missing: {error}")
+                try:
+                    binary_sha = binary_sha_path.read_text(encoding="utf-8").strip()
+                except OSError as error:
+                    binary_sha = ""
+                    errors.append(f"direct-frame binary checksum is missing: {error}")
+                if not re.fullmatch(r"[0-9a-f]{40}", recorded_commit) or plan.get("commit") != recorded_commit:
+                    errors.append("direct-frame plan source commit does not match commit.txt")
+                if not re.fullmatch(r"[0-9a-f]{64}", binary_sha) or plan.get("binary_sha256") != binary_sha:
+                    errors.append("direct-frame binary checksum does not match the plan")
+                expected_plan = build_point_direct_frame_plan(
+                    writers=plan.get("writers", ()),
+                    machine_type=plan.get("machine_type", ""),
+                    machine_spec={
+                        "vcpus": plan.get("vcpus", 0),
+                        "ssd_count": plan.get("local_ssd_count", 0),
+                        "ssd_gib": plan.get("local_ssd_total_gib", 0),
+                    },
+                    commit=recorded_commit,
+                    binary_sha256=binary_sha,
+                )
+                for key, value in expected_plan.items():
+                    if plan.get(key) != value:
+                        errors.append(f"direct-frame plan field {key} does not match the fixed suite")
+                if summary.get("suite") != suite or summary.get("source_commit") != recorded_commit:
+                    errors.append("direct-frame summary source metadata is invalid")
+                if summary.get("binary_sha256") != binary_sha:
+                    errors.append("direct-frame summary binary checksum does not match the plan")
+            elif suite == "v8-extent-policy-storage":
+                schedule = build_v8_extent_policy_storage_schedule(plan["writers"])
+                try:
+                    recorded_commit = (results / "commit.txt").read_text(encoding="utf-8").strip()
+                    binary_sha = (results / "write-perf.sha256").read_text(encoding="utf-8").strip()
+                except OSError as error:
+                    recorded_commit = binary_sha = ""
+                    errors.append(f"extent-policy source/binary identity is missing: {error}")
+                if not re.fullmatch(r"[0-9a-f]{40}", recorded_commit) or plan.get("commit") != recorded_commit:
+                    errors.append("extent-policy plan source commit does not match commit.txt")
+                if not re.fullmatch(r"[0-9a-f]{64}", binary_sha) or plan.get("binary_sha256") != binary_sha:
+                    errors.append("extent-policy binary checksum does not match the plan")
+                expected_plan = build_v8_extent_policy_storage_plan(
+                    writers=plan.get("writers", ()),
+                    machine_type=plan.get("machine_type", ""),
+                    machine_spec={
+                        "vcpus": plan.get("vcpus", 0),
+                        "ssd_count": plan.get("local_ssd_count", 0),
+                        "ssd_gib": plan.get("local_ssd_total_gib", 0),
+                    },
+                    commit=recorded_commit,
+                    binary_sha256=binary_sha,
+                )
+                for key, value in expected_plan.items():
+                    if plan.get(key) != value:
+                        errors.append(f"extent-policy plan field {key} does not match the fixed suite")
+                if summary.get("suite") != suite or summary.get("source_commit") != recorded_commit:
+                    errors.append("extent-policy summary source metadata is invalid")
+                if summary.get("binary_sha256") != binary_sha:
+                    errors.append("extent-policy summary binary checksum does not match the plan")
+            elif suite == "batch64":
+                schedule = build_batch64_schedule(plan["writers"])
+            elif suite == "commit-order-trace":
+                schedule = build_commit_order_trace_schedule()
+                if not isinstance(plan.get("commit"), str) or not re.fullmatch(r"[0-9a-f]{40}", plan["commit"]):
+                    errors.append("commit-order plan has an invalid source commit")
+                patch_sha_path = results / "source-patch.sha256"
+                try:
+                    patch_sha = patch_sha_path.read_text(encoding="utf-8").strip()
+                except OSError as error:
+                    patch_sha = ""
+                    errors.append(f"commit-order patch checksum is missing: {error}")
+                if not re.fullmatch(r"[0-9a-f]{64}", patch_sha):
+                    errors.append("commit-order patch checksum is invalid")
+                if plan.get("source_patch_sha256") != patch_sha:
+                    errors.append("commit-order patch checksum does not match the plan")
+                if summary.get("source_commit") != plan.get("commit"):
+                    errors.append("summary source commit does not match the plan")
+                if summary.get("source_patch_sha256") != patch_sha:
+                    errors.append("summary patch checksum does not match the plan")
+                analysis = json.loads((results / "commit-order-trace-analysis.json").read_text(encoding="utf-8"))
+                if not isinstance(analysis, dict) or any(
+                    analysis.get(key) != value for key, value in (
+                        ("commit", plan.get("commit")), ("source_patch_sha256", patch_sha),
+                    )
+                ):
+                    errors.append("commit-order analysis metadata does not match the plan")
+                try:
+                    binary_sha = (results / "write-perf.sha256").read_text(encoding="utf-8").strip()
+                except OSError as error:
+                    binary_sha = ""
+                    errors.append(f"commit-order binary checksum is missing: {error}")
+                if not re.fullmatch(r"[0-9a-f]{64}", binary_sha):
+                    errors.append("commit-order binary checksum is invalid")
+                if any(metadata.get("binary_sha256") != binary_sha for metadata in (plan, summary, analysis)):
+                    errors.append("commit-order binary checksum metadata does not match")
+                if analysis.get("traced_runs") != summary.get("trace_analysis"):
+                    errors.append("commit-order analyzed traces do not match the summary")
+                if analysis.get("score_comparison") != summary.get("score_comparison"):
+                    errors.append("commit-order score analysis does not match the summary")
+            elif suite == "v8-mutex-diagnostic":
+                schedule = build_v8_mutex_diagnostic_schedule()
+                if not isinstance(plan.get("commit"), str) or not re.fullmatch(r"[0-9a-f]{40}", plan["commit"]):
+                    errors.append("mutex diagnostic plan has an invalid source commit")
+                expected_plan = build_v8_mutex_diagnostic_plan(
+                    machine_type=plan.get("machine_type", ""),
+                    machine_spec={
+                        "vcpus": plan.get("vcpus", 0), "ssd_count": plan.get("local_ssd_count", 0),
+                        "ssd_gib": plan.get("local_ssd_total_gib", 0),
+                    },
+                    commit=plan.get("commit"), binary_sha256=plan.get("binary_sha256"),
+                )
+                for key, value in expected_plan.items():
+                    if plan.get(key) != value:
+                        errors.append(f"mutex diagnostic plan field {key} does not match the fixed suite")
+                if summary.get("suite") != suite or summary.get("diagnostic_only") is not True:
+                    errors.append("mutex diagnostic summary metadata is invalid")
+                try:
+                    binary_sha = (results / "write-perf.sha256").read_text(encoding="utf-8").strip()
+                except OSError as error:
+                    binary_sha = ""
+                    errors.append(f"mutex diagnostic binary checksum is missing: {error}")
+                if not re.fullmatch(r"[0-9a-f]{64}", binary_sha):
+                    errors.append("mutex diagnostic binary checksum is invalid")
+                if plan.get("binary_sha256") != binary_sha:
+                    errors.append("mutex diagnostic binary checksum does not match the plan")
+                if summary.get("source_commit") not in (None, plan.get("commit")):
+                    errors.append("mutex diagnostic source commit does not match the plan")
+                if summary.get("binary_sha256") != binary_sha:
+                    errors.append("mutex diagnostic binary checksum does not match the summary")
+            else:
+                raise ValueError(f"unsupported benchmark plan suite: {suite!r}")
+            planned = plan.get("runs_planned")
+            if type(planned) is not int or planned != len(schedule):
+                errors.append("benchmark plan run count does not match its schedule")
+            matrix_validation = summary.get("matrix_validation")
+            if not isinstance(matrix_validation, dict) or matrix_validation.get("complete") is not True:
+                errors.append("benchmark matrix validation is incomplete")
+            if not isinstance(matrix_validation, dict) or matrix_validation.get("planned") != planned:
+                errors.append("matrix validation planned count does not match its plan")
+            if not isinstance(matrix_validation, dict) or matrix_validation.get("observed") != planned:
+                errors.append("matrix validation observed count does not match its plan")
+
+        summary_planned = summary.get("runs_planned")
+        completed = summary.get("runs_completed")
+        if type(summary_planned) is not int or summary_planned != planned:
+            errors.append("summary planned count does not match the run schedule")
+        if type(completed) is not int or completed != planned:
+            errors.append("summary completed count does not match the run schedule")
+        if summary.get("complete") is not True:
+            errors.append("summary does not report a complete run")
+        if remote_exit.get("failed") is not False:
+            errors.append("remote exit record reports failure")
+        if type(remote_exit.get("runs_started")) is not int or remote_exit.get("runs_started") != planned:
+            errors.append("remote exit run count does not match the plan")
+
+        expected: dict[str, dict[str, Any]] = {}
+        for row in schedule:
+            run_id = _run_identifier(row, suite)
+            if run_id in expected:
+                errors.append(f"duplicate run identifier in schedule: {run_id}")
+            expected[run_id] = _expected_run_metadata(row, suite)
+        actual_directories = {path.name for path in results.glob("w*") if path.is_dir()}
+        if actual_directories != set(expected):
+            missing = sorted(set(expected) - actual_directories)
+            unexpected = sorted(actual_directories - set(expected))
+            errors.append(f"run directories do not match schedule (missing={missing}, unexpected={unexpected})")
+
+        summary_rows = summary.get("results")
+        summary_by_id: dict[str, dict[str, Any]] = {}
+        if not isinstance(summary_rows, list) or len(summary_rows) != planned:
+            errors.append("summary does not contain one row for every planned run")
+        else:
+            summary_ids: list[str] = []
+            for row in summary_rows:
+                if not isinstance(row, dict):
+                    errors.append("summary contains a non-object run row")
+                    continue
+                try:
+                    summary_id = _summary_row_identifier(row, suite)
+                    summary_ids.append(summary_id)
+                    summary_by_id[summary_id] = row
+                except (KeyError, TypeError, ValueError) as error:
+                    errors.append(f"summary contains an invalid run identifier: {error}")
+                    continue
+                summary_exit_code = row.get("exit_code")
+                if not (
+                    (type(summary_exit_code) is int and summary_exit_code == 0)
+                    or summary_exit_code == "0"
+                ):
+                    errors.append(f"summary run {summary_ids[-1]} did not succeed")
+            if len(summary_ids) != len(set(summary_ids)) or set(summary_ids) != set(expected):
+                errors.append("summary run identifiers do not match the unique planned runs")
+
+        profile_capture_count = 0
+        for run_id, identity in expected.items():
+            perf_capture_expected = bool(identity.pop("perf_capture", False))
+            expected_trace_limit = int(identity.get("trace_limit", 0))
+            run_dir = results / run_id
+            result_path = run_dir / "result.json"
+            metadata_path = run_dir / "run-metadata.json"
+            if not result_path.is_file() or not metadata_path.is_file():
+                errors.append(f"run {run_id} is missing result.json or run-metadata.json")
+                continue
+            try:
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                if not isinstance(metadata, dict):
+                    raise ValueError("run metadata must be a JSON object")
+                if any(metadata.get(key) != value for key, value in identity.items()):
+                    errors.append(f"run metadata identity does not match {run_id}")
+                if type(metadata.get("exit_code")) is not int or metadata["exit_code"] != 0:
+                    errors.append(f"run metadata for {run_id} does not report success")
+                if suite == "v8-small-ticket-profile":
+                    if perf_capture_expected:
+                        status = str(metadata.get("perf_status", ""))
+                        captured = status == "captured" or status.startswith("report_failed:")
+                        perf_path = run_dir / "perf.data"
+                        report_path = run_dir / "perf-report.txt"
+                        if not captured or not perf_path.is_file() or perf_path.stat().st_size == 0 or not report_path.is_file():
+                            errors.append(f"profile capture artifacts are incomplete for {run_id}")
+                        else:
+                            profile_capture_count += 1
+                    elif metadata.get("perf_status") != "not_requested":
+                        errors.append(f"unexpected profile capture status for {run_id}")
+                record = None
+                try:
+                    if suite == "v8-small-ticket-profile":
+                        from gcp_wal_profile_runner import _load_benchmark_record
+
+                        _load_benchmark_record(result_path)
+                    else:
+                        record = json.loads(result_path.read_text(encoding="utf-8"))
+                        if not isinstance(record, dict):
+                            raise ValueError("benchmark result must be a JSON object")
+                except (OSError, json.JSONDecodeError, ValueError) as error:
+                    errors.append(f"run {run_id} result is invalid: {error}")
+                if suite == "commit-order-trace" and expected_trace_limit:
+                    try:
+                        if not isinstance(record, dict):
+                            raise ValueError("benchmark result is unavailable")
+                        trace = record.get("result", {}).get("wal_pipeline", {}).get("commit_order_trace")
+                        if not isinstance(trace, dict):
+                            raise ValueError("trace payload is missing")
+                        if not isinstance(trace.get("records"), list) or len(trace["records"]) != expected_trace_limit:
+                            raise ValueError("trace record list does not match the selected record count")
+                        if trace.get("limit") != expected_trace_limit:
+                            raise ValueError("trace limit does not match the plan")
+                        if trace.get("selected_records") != expected_trace_limit:
+                            raise ValueError("selected trace record count is incomplete")
+                        if (
+                            trace.get("dropped_records") != 0
+                            or trace.get("dropped_frontier_events") != 0
+                            or trace.get("incomplete_records") != 0
+                        ):
+                            raise ValueError("trace contains dropped or incomplete records")
+                        trace_stages = (
+                            "timestamp_reserved", "wal_ticket_admitted", "durable_frontier_published",
+                            "wal_return", "memtable_publish_complete", "mvcc_publication_entry",
+                            "mvcc_publication_complete",
+                        )
+                        for traced_record in trace["records"]:
+                            if not isinstance(traced_record, dict) or any(
+                                not isinstance(traced_record.get(stage), dict) for stage in trace_stages
+                            ):
+                                raise ValueError("trace contains a record missing a stage event")
+                            if not isinstance(traced_record.get("commit_ts"), int) or not isinstance(
+                                traced_record.get("wal_ticket"), int
+                            ):
+                                raise ValueError("trace record is missing its commit timestamp or WAL ticket")
+                            if type(traced_record.get("frontier_ticket_end")) is not int or (
+                                traced_record["frontier_ticket_end"] <= traced_record["wal_ticket"]
+                            ):
+                                raise ValueError("trace record has an invalid durable frontier ticket end")
+                            for stage in trace_stages:
+                                event = traced_record[stage]
+                                if any(type(event.get(field)) is not int for field in (
+                                    "sequence", "monotonic_ns", "thread_id",
+                                )):
+                                    raise ValueError("trace stage event metadata is invalid")
+                        analyze_trace(trace)
+                        if not isinstance(record.get("params"), dict) or not isinstance(record.get("result"), dict):
+                            raise ValueError("benchmark result is missing params or result objects")
+                        expected_version = 7 if identity["arm"] == "v7_parallel" else 8
+                        expected_params = {
+                            "num": COMMIT_ORDER_TRACE_NUM,
+                            "threads": COMMIT_ORDER_TRACE_WRITERS,
+                            "value_size": 1024,
+                            "wal_format_version": expected_version,
+                            "wal_io_mode": "parallel",
+                        }
+                        if record["result"].get("ops") != COMMIT_ORDER_TRACE_NUM or any(
+                            record["params"].get(key) != value for key, value in expected_params.items()
+                        ):
+                            raise ValueError("benchmark result parameters do not match the planned run")
+                    except (AttributeError, TypeError, ValueError) as error:
+                        errors.append(f"run {run_id} trace is invalid: {error}")
+                elif suite == "commit-order-trace" and isinstance(record, dict):
+                    trace = record.get("result", {}).get("wal_pipeline", {}).get("commit_order_trace")
+                    if trace is not None:
+                        errors.append(f"run {run_id} unexpectedly enabled commit-order tracing")
+                    try:
+                        params = record["params"]
+                        result = record["result"]
+                        expected_version = 7 if identity["arm"] == "v7_parallel" else 8
+                        expected_params = {
+                            "num": COMMIT_ORDER_TRACE_NUM,
+                            "threads": COMMIT_ORDER_TRACE_WRITERS,
+                            "value_size": 1024,
+                            "wal_format_version": expected_version,
+                            "wal_io_mode": "parallel",
+                        }
+                        if result.get("ops") != COMMIT_ORDER_TRACE_NUM or any(
+                            params.get(key) != value for key, value in expected_params.items()
+                        ):
+                            raise ValueError("benchmark result parameters do not match the planned run")
+                    except (KeyError, AttributeError, TypeError, ValueError) as error:
+                        errors.append(f"run {run_id} result parameters are invalid: {error}")
+                elif suite == "v8-point-lookahead" and isinstance(record, dict):
+                    try:
+                        params = record["params"]
+                        result = record["result"]
+                        expected_params = {
+                            "num": identity["num"],
+                            "threads": identity["writer"],
+                            "value_size": 1024,
+                            "batch_size": identity["batch_size"],
+                            "wal_format_version": 8,
+                            "wal_io_mode": "parallel",
+                        }
+                        if result.get("ops") != identity["num"] or any(
+                            params.get(key) != value for key, value in expected_params.items()
+                        ):
+                            raise ValueError("benchmark parameters do not match the planned Point/Batch run")
+                        pipeline = result["wal_pipeline"]
+                        if pipeline.get("wal_io_stable") is not True:
+                            raise ValueError("WAL I/O metadata changed during the run")
+                        expected_mode = identity["extent_mode"]
+                        expected_window = identity["extent_window_bytes"]
+                        for boundary in ("wal_io_start", "wal_io_end"):
+                            preparation = pipeline[boundary]["sliding_extent_preparation"]
+                            if preparation.get("mode") != expected_mode or (
+                                preparation.get("window_bytes") != expected_window
+                            ):
+                                raise ValueError(f"{boundary} does not report the planned extent mode/window")
+                        final_preparation = pipeline["wal_io_end"]["sliding_extent_preparation"]
+                        initialized_bytes = final_preparation.get("initialized_bytes")
+                        if type(initialized_bytes) is not int or initialized_bytes < 0:
+                            raise ValueError("extent initialization byte count is invalid")
+                        should_initialize = (
+                            identity["workload"] == "point" and identity["arm"] == "v8_point_lookahead"
+                        )
+                        if (initialized_bytes > 0) != should_initialize:
+                            raise ValueError(
+                                "extent initialization does not match the Point-only policy "
+                                f"(workload={identity['workload']}, arm={identity['arm']}, "
+                                f"bytes={initialized_bytes})"
+                            )
+                    except (KeyError, AttributeError, TypeError, ValueError) as error:
+                        errors.append(f"run {run_id} result parameters are invalid: {error}")
+                elif suite == "v8-point-borrowed-input" and isinstance(record, dict):
+                    try:
+                        identity = expected[run_id]
+                        result = record["result"]
+                        params = record["params"]
+                        expected_params = {
+                            "num": identity["num"], "threads": identity["writer"], "value_size": 1024,
+                            "batch_size": identity["batch_size"], "wal_format_version": 8,
+                            "wal_io_mode": "parallel",
+                        }
+                        if int(result["ops"]) != identity["num"] or any(
+                            params.get(key) != value for key, value in expected_params.items()
+                        ):
+                            raise ValueError("benchmark params do not match the borrowed-input plan")
+                        wanted_commit = plan[
+                            "baseline_commit" if identity["arm"] == "v8_owned_baseline" else "candidate_commit"
+                        ]
+                        wanted_binary = plan[
+                            "baseline_binary_sha256" if identity["arm"] == "v8_owned_baseline"
+                            else "candidate_binary_sha256"
+                        ]
+                        if metadata.get("source_commit") != wanted_commit or (
+                            metadata.get("binary_sha256") != wanted_binary
+                        ):
+                            raise ValueError("run source/binary identity does not match its planned arm")
+                        if metadata.get("point_direct_frame_enabled", False) is not False:
+                            raise ValueError("Point borrowed-input run unexpectedly enables direct-frame encoding")
+                        pipeline = result["wal_pipeline"]
+                        if pipeline.get("wal_io_stable") is not True:
+                            raise ValueError("WAL I/O metadata changed during the run")
+                        for boundary in ("wal_io_start", "wal_io_end"):
+                            preparation = pipeline[boundary]["sliding_extent_preparation"]
+                            if preparation.get("mode") != "sliding-point-lookahead" or (
+                                preparation.get("window_bytes") != POINT_LOOKAHEAD_WINDOW_BYTES
+                            ):
+                                raise ValueError(f"{boundary} does not report the planned Point lookahead")
+                        final_preparation = pipeline["wal_io_end"]["sliding_extent_preparation"]
+                        initialized_bytes = final_preparation.get("initialized_bytes")
+                        should_initialize = identity["workload"] == "point"
+                        if type(initialized_bytes) is not int or (initialized_bytes > 0) != should_initialize:
+                            raise ValueError("extent initialization does not match the planned Point/Batch cell")
+                        legacy_env = (
+                            "TOYKV_BENCH_V8_EXTENT_PREP=sliding-point-lookahead\n"
+                            "TOYKV_BENCH_V8_EXTENT_PREP_BYTES=1048576\n"
+                            "TOYKV_WAL_V8_FRONTIER_MODE=direct\n"
+                        )
+                        current_env = legacy_env + (
+                            "TOYKV_BENCH_V8_POINT_DIRECT_FRAME=0\n"
+                        )
+                        environment = (run_dir / "environment.txt").read_text(encoding="utf-8")
+                        if environment not in (legacy_env, current_env):
+                            raise ValueError("Point borrowed-input run environment differs from the fixed suite")
+                        summary_row = summary_by_id.get(run_id)
+                        if summary_row is None or summary_row != metadata:
+                            raise ValueError("summary row differs from borrowed-input run metadata")
+                    except (KeyError, AttributeError, TypeError, ValueError) as error:
+                        errors.append(f"run {run_id} borrowed-input result is invalid: {error}")
+                elif suite == "v8-point-direct-frame" and isinstance(record, dict):
+                    try:
+                        identity = expected[run_id]
+                        result = record["result"]
+                        params = record["params"]
+                        expected_params = {
+                            "num": POINT_DIRECT_FRAME_NUM, "threads": identity["writer"], "value_size": 1024,
+                            "batch_size": identity["batch_size"], "wal_format_version": 8,
+                            "wal_io_mode": "parallel",
+                        }
+                        if int(result["ops"]) != POINT_DIRECT_FRAME_NUM or any(
+                            params.get(key) != value for key, value in expected_params.items()
+                        ):
+                            raise ValueError("benchmark parameters do not match the direct-frame plan")
+                        if metadata.get("source_commit") != plan.get("commit") or (
+                            metadata.get("binary_sha256") != plan.get("binary_sha256")
+                        ):
+                            raise ValueError("run source/binary identity differs from the shared A/B identity")
+                        pipeline = result["wal_pipeline"]
+                        if pipeline.get("wal_io_stable") is not True:
+                            raise ValueError("WAL I/O metadata changed during the run")
+                        if pipeline.get("v8_point_direct_frame_enabled") is not identity["point_direct_frame_enabled"]:
+                            raise ValueError("runtime direct-frame selector differs from the planned arm")
+                        expected_direct_count = (
+                            POINT_DIRECT_FRAME_NUM
+                            if identity["point_direct_frame_enabled"] and identity["workload"] == "point"
+                            else 0
+                        )
+                        direct_count = pipeline.get("v8_point_direct_frame_encoded_count")
+                        if type(direct_count) is not int or direct_count != expected_direct_count or (
+                            metadata.get("direct_frame_encoded_count") != expected_direct_count
+                        ):
+                            raise ValueError(
+                                "runtime direct-frame hit count differs from the Point/Batch expectation "
+                                f"(expected={expected_direct_count}, actual={direct_count})"
+                            )
+                        for boundary in ("wal_io_start", "wal_io_end"):
+                            preparation = pipeline[boundary]["sliding_extent_preparation"]
+                            if preparation.get("mode") != identity["extent_mode"] or (
+                                preparation.get("window_bytes") != identity["extent_window_bytes"]
+                            ):
+                                raise ValueError(f"{boundary} does not report the planned extent policy")
+                        initialized_bytes = pipeline["wal_io_end"]["sliding_extent_preparation"].get(
+                            "initialized_bytes"
+                        )
+                        if type(initialized_bytes) is not int or (initialized_bytes > 0) != (
+                            identity["workload"] == "point"
+                        ):
+                            raise ValueError("extent initialization differs from the planned Point/Batch cell")
+                        expected_env = (
+                            f"TOYKV_BENCH_V8_EXTENT_PREP={identity['extent_mode']}\n"
+                            f"TOYKV_BENCH_V8_EXTENT_PREP_BYTES={POINT_LOOKAHEAD_WINDOW_BYTES}\n"
+                            "TOYKV_WAL_V8_FRONTIER_MODE=direct\n"
+                            "TOYKV_BENCH_V8_POINT_DIRECT_FRAME="
+                            f"{1 if identity['point_direct_frame_enabled'] else 0}\n"
+                        )
+                        if (run_dir / "environment.txt").read_text(encoding="utf-8") != expected_env:
+                            raise ValueError("direct-frame run environment differs from its planned arm")
+                        summary_row = summary_by_id.get(run_id)
+                        if summary_row is None or summary_row != metadata:
+                            raise ValueError("summary row differs from direct-frame run metadata")
+                    except (KeyError, AttributeError, TypeError, ValueError) as error:
+                        errors.append(f"run {run_id} direct-frame result is invalid: {error}")
+                elif suite == "v8-extent-policy-storage" and isinstance(record, dict):
+                    try:
+                        identity = expected[run_id]
+                        result = record["result"]
+                        params = record["params"]
+                        expected_params = {
+                            "num": V8_EXTENT_POLICY_STORAGE_NUM,
+                            "threads": identity["writer"],
+                            "value_size": 1024,
+                            "batch_size": identity["batch_size"],
+                            "wal_format_version": 8,
+                            "wal_io_mode": "parallel",
+                        }
+                        if int(result["ops"]) != V8_EXTENT_POLICY_STORAGE_NUM or any(
+                            params.get(key) != value for key, value in expected_params.items()
+                        ):
+                            raise ValueError("benchmark parameters do not match the extent-policy plan")
+                        if metadata.get("source_commit") != plan.get("commit") or (
+                            metadata.get("binary_sha256") != plan.get("binary_sha256")
+                        ):
+                            raise ValueError("run source/binary identity differs from the shared A/B identity")
+                        pipeline = result["wal_pipeline"]
+                        if pipeline.get("wal_io_stable") is not True:
+                            raise ValueError("WAL I/O metadata changed during the run")
+                        for boundary in ("wal_io_start", "wal_io_end"):
+                            preparation = pipeline[boundary]["sliding_extent_preparation"]
+                            if (
+                                preparation.get("mode") != identity["extent_mode"]
+                                or preparation.get("window_bytes") != identity["extent_window_bytes"]
+                                or preparation.get("extent_policy_storage") != identity["arm"]
+                                or preparation.get("extent_policy_scan_diagnostics_enabled")
+                                is not identity["scan_diagnostics_enabled"]
+                            ):
+                                raise ValueError(f"{boundary} extent-policy settings do not match the plan")
+                        start_prep = pipeline["wal_io_start"]["sliding_extent_preparation"]
+                        end_prep = pipeline["wal_io_end"]["sliding_extent_preparation"]
+                        check_calls = end_prep["lookahead_check_calls"] - start_prep["lookahead_check_calls"]
+                        entries_scanned = (
+                            end_prep["extent_policy_entries_scanned"]
+                            - start_prep["extent_policy_entries_scanned"]
+                        )
+                        if metadata.get("lookahead_check_calls") != check_calls or (
+                            metadata.get("extent_policy_entries_scanned") != entries_scanned
+                        ):
+                            raise ValueError("run metadata scan counters differ from runtime diagnostics")
+                        if not identity["scan_diagnostics_enabled"] and (check_calls or entries_scanned):
+                            raise ValueError("score run unexpectedly enabled scan diagnostics")
+                        initialized_bytes = end_prep["initialized_bytes"] - start_prep["initialized_bytes"]
+                        if (initialized_bytes > 0) != (identity["workload"] == "point"):
+                            raise ValueError("extent initialization differs from the planned Point/Batch cell")
+                        expected_environment = (
+                            "TOYKV_BENCH_V8_EXTENT_PREP=sliding-point-lookahead\n"
+                            "TOYKV_BENCH_V8_EXTENT_PREP_BYTES=1048576\n"
+                            "TOYKV_WAL_V8_FRONTIER_MODE=direct\n"
+                            "TOYKV_BENCH_V8_POINT_DIRECT_FRAME=0\n"
+                            f"TOYKV_BENCH_V8_EXTENT_POLICY_STORAGE={identity['arm']}\n"
+                            "TOYKV_BENCH_V8_EXTENT_POLICY_SCAN_DIAGNOSTICS="
+                            f"{int(identity['scan_diagnostics_enabled'])}\n"
+                        )
+                        if (run_dir / "environment.txt").read_text(encoding="utf-8") != expected_environment:
+                            raise ValueError("extent-policy run environment differs from the fixed plan")
+                        summary_row = summary_by_id.get(run_id)
+                        if summary_row is None or summary_row != metadata:
+                            raise ValueError("summary row differs from extent-policy run metadata")
+                    except (KeyError, AttributeError, TypeError, ValueError) as error:
+                        errors.append(f"run {run_id} extent-policy result is invalid: {error}")
+                elif suite == "v8-mutex-diagnostic" and isinstance(record, dict):
+                    try:
+                        identity = expected[run_id]
+                        result = record["result"]
+                        params = record["params"]
+                        version = 7 if identity["arm"] == "v7_parallel" else 8
+                        wanted = {
+                            "num": V8_MUTEX_DIAGNOSTIC_NUM, "threads": identity["writer"],
+                            "value_size": 1024, "wal_format_version": version, "wal_io_mode": "parallel",
+                        }
+                        if int(result["ops"]) != V8_MUTEX_DIAGNOSTIC_NUM or any(
+                            params.get(key) != value for key, value in wanted.items()
+                        ):
+                            raise ValueError("benchmark parameters do not match the planned Point diagnostic")
+                        pipeline = result["wal_pipeline"]
+                        diagnostics = result.get("mutex_lock_diagnostics")
+                        if not isinstance(diagnostics, dict) or diagnostics.get("sample_every") != (
+                            V8_MUTEX_DIAGNOSTIC_SAMPLE_EVERY
+                        ):
+                            raise ValueError("mutex diagnostic payload is missing or has the wrong sample interval")
+                        if metadata.get("mutex_lock_diagnostics") != diagnostics:
+                            raise ValueError("run metadata mutex diagnostics differ from result.json")
+                        summary_row = summary_by_id.get(run_id)
+                        if summary_row is None or summary_row != metadata:
+                            raise ValueError("summary row differs from the per-run metadata")
+                        if version == 8:
+                            from gcp_wal_profile_runner import _validate_wal_io_metadata
+
+                            _validate_wal_io_metadata(pipeline, 8, expected_frontier_mode="direct")
+                            for boundary in ("wal_io_start", "wal_io_end"):
+                                preparation = pipeline[boundary]["sliding_extent_preparation"]
+                                if preparation.get("mode") != "sliding-point-lookahead" or (
+                                    preparation.get("window_bytes") != 1 << 20
+                                ):
+                                    raise ValueError(f"{boundary} does not report planned Point lookahead")
+                        expected_env = (
+                            "TOYKV_BENCH_V8_EXTENT_PREP=sliding-point-lookahead\n"
+                            "TOYKV_BENCH_V8_EXTENT_PREP_BYTES=1048576\n"
+                            "TOYKV_WAL_V8_FRONTIER_MODE=direct\n"
+                        )
+                        env_text = (run_dir / "environment.txt").read_text(encoding="utf-8")
+                        if identity["arm"] == "v8_point_lookahead_direct" and env_text != expected_env:
+                            raise ValueError("V8 extent/FRONTIER environment does not match the plan")
+                        if identity["arm"] == "v7_parallel" and env_text != "<V7 defaults>\n":
+                            raise ValueError("V7 unexpectedly has V8-only environment overrides")
+                        if version == 8 and pipeline.get("wal_io_stable") is not True:
+                            raise ValueError("WAL I/O metadata changed during the run")
+                    except (KeyError, AttributeError, TypeError, ValueError) as error:
+                        errors.append(f"run {run_id} mutex diagnostic result is invalid: {error}")
+            except (OSError, json.JSONDecodeError, ValueError) as error:
+                errors.append(f"run {run_id} metadata is invalid: {error}")
+
+        if suite == "v8-small-ticket-profile":
+            captures_planned = sum(bool(row["perf_capture"]) for row in schedule)
+            if summary.get("perf_captures_planned") != captures_planned:
+                errors.append("profile planned capture count does not match schedule")
+            if summary.get("perf_captures_completed") != captures_planned or summary.get("perf_capture_complete") is not True:
+                errors.append("profile perf captures are incomplete")
+            if profile_capture_count != captures_planned:
+                errors.append("profile capture artifacts do not match planned captures")
+        elif suite == "v8-point-lookahead":
+            validation = validate_point_lookahead_rows(summary.get("results", []), plan["writers"])
+            if validation != summary.get("matrix_validation"):
+                errors.append("Point lookahead matrix validation does not match its per-run results")
+        elif suite == "v8-point-borrowed-input":
+            validation = validate_point_borrowed_input_rows(summary.get("results", []), plan["writers"])
+            if validation != summary.get("matrix_validation"):
+                errors.append("borrowed-input matrix validation does not match its per-run results")
+        elif suite == "v8-point-direct-frame":
+            validation = validate_point_direct_frame_rows(summary.get("results", []), plan["writers"])
+            if validation != summary.get("matrix_validation"):
+                errors.append("direct-frame matrix validation does not match its per-run results")
+        elif suite == "v8-extent-policy-storage":
+            validation = validate_v8_extent_policy_storage_rows(summary.get("results", []), plan["writers"])
+            if validation != summary.get("matrix_validation"):
+                errors.append("extent-policy matrix validation does not match its per-run results")
+        elif suite == "v8-mutex-diagnostic":
+            validation = validate_v8_mutex_diagnostic_rows(summary.get("results", []))
+            if validation != summary.get("matrix_validation"):
+                errors.append("mutex diagnostic matrix validation does not match its per-run results")
+    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError, csv.Error) as error:
+        errors.append(f"result metadata is invalid: {error}")
+        planned = 0
+        completed = 0
+        suite = None
+
+    return {
+        "verified": not errors,
+        "suite": suite,
+        "runs_planned": planned,
+        "runs_completed": completed,
+        "errors": errors,
+    }
+
+
+def _sha256_file(path: Path) -> str:
+    import hashlib
+
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def collect_artifacts(
     ip: str, key: Path, known_hosts: Path, results_dir: Path, *, before_connect: Callable[[], None]
 ) -> dict[str, Any]:
-    """Retry result transfer into isolated staging directories before teardown."""
+    """Bundle and verify compact benchmark artifacts before teardown."""
+    import tarfile
+    from pathlib import PurePosixPath
+
     collected = results_dir / "collected"
     attempts: list[dict[str, Any]] = []
     results_collected = False
@@ -1066,31 +2161,111 @@ def collect_artifacts(
     for attempt_number in range(1, 3):
         staging = results_dir / f"collection-attempt-{attempt_number:02d}"
         staging.mkdir(parents=True, exist_ok=False)
+        before_connect()
+        attempt: dict[str, Any] = {"number": attempt_number, "results_collected": False}
+        remote_archive_path: str | None = None
+        phase = "archive"
         try:
+            remote_pack = _build_remote_archive_command()
+            packed = ssh_command(key, known_hosts, ip, remote_pack, timeout=90)
+            if packed.returncode:
+                raise BenchError(f"Could not build compact result bundle: {packed.stderr.strip()}")
+            remote_path_match = re.search(r"ARCHIVE_PATH=(/[A-Za-z0-9._/-]+)", packed.stdout)
+            remote_digest = re.search(r"ARCHIVE_SHA256=([0-9a-f]{64})", packed.stdout)
+            remote_bytes = re.search(r"ARCHIVE_BYTES=(\d+)", packed.stdout)
+            remote_files = re.search(r"ARCHIVE_FILES=(\d+)", packed.stdout)
+            if None in (remote_path_match, remote_digest, remote_bytes, remote_files):
+                raise BenchError("Remote compact result bundle did not report complete archive metadata")
+            remote_archive_path = remote_path_match.group(1)
+            remote_archive = PurePosixPath(remote_archive_path)
+            if (
+                not remote_archive.is_absolute()
+                or ".." in remote_archive.parts
+                or not remote_archive.name.startswith("gcp-wal-bench-results-")
+                or not remote_archive.name.endswith(".tar.gz")
+            ):
+                raise BenchError("Remote compact result bundle reported an unsafe archive path")
+            archive_bytes = int(remote_bytes.group(1))
+            archive_files = int(remote_files.group(1))
+            attempt.update({
+                "remote_archive_path": remote_archive_path,
+                "remote_bundle_sha256": remote_digest.group(1),
+                "bundle_bytes": archive_bytes,
+                "bundle_files": archive_files,
+            })
+            if archive_bytes > MAX_ARTIFACT_BUNDLE_BYTES:
+                raise BenchError(
+                    f"Compact result bundle exceeds the {MAX_ARTIFACT_BUNDLE_BYTES} byte transfer limit; "
+                    "preserving the VM for artifact recovery"
+                )
+            phase = "transfer_firewall_audit"
             before_connect()
+            phase = "transfer"
+            archive_path = staging / "results.tar.gz"
             transfer = scp_from_vm(
-                ip, "/mnt/gcp-wal-bench/results", staging, key, known_hosts,
-                recursive=True, timeout=240,
+                ip, remote_archive_path, archive_path, key, known_hosts,
+                timeout=120,
             )
-            local_results = staging / "results"
-            results_collected = transfer.returncode == 0 and local_results.is_dir()
-            attempt = {"number": attempt_number, "returncode": transfer.returncode,
-                       "stderr": transfer.stderr[-4000:], "results_collected": results_collected}
+            if transfer.returncode:
+                raise BenchError(f"Could not transfer compact result bundle: {transfer.stderr.strip()}")
+            local_digest = _sha256_file(archive_path)
+            attempt["local_bundle_sha256"] = local_digest
+            attempt["local_bundle_bytes"] = archive_path.stat().st_size
+            attempt["bundle_checksum_verified"] = local_digest == remote_digest.group(1)
+            write_json(staging / "bundle-metadata.json", attempt)
+            if not attempt["bundle_checksum_verified"]:
+                raise BenchError("Compact result bundle SHA-256 mismatch")
+            if archive_path.stat().st_size != archive_bytes:
+                raise BenchError("Compact result bundle byte count mismatch")
+            unpacked = staging / "unpacked"
+            unpacked.mkdir()
+            with tarfile.open(archive_path, "r:gz") as bundle:
+                members = bundle.getmembers()
+                for member in members:
+                    path = PurePosixPath(member.name)
+                    if path.is_absolute() or ".." in path.parts or not member.isfile():
+                        raise BenchError("Compact result bundle contains an unsafe archive member")
+                bundle.extractall(unpacked, members=members)
+            local_results = unpacked / "results"
+            results_collected = local_results.is_dir()
+            validation = _verify_result_set(local_results) if results_collected else {
+                "verified": False, "errors": ["results directory is missing"], "runs_planned": 0, "runs_completed": 0,
+            }
+            summary_complete = bool(validation["verified"])
+            results_verified = summary_complete
+            attempt.update({
+                "returncode": transfer.returncode,
+                "stderr": transfer.stderr[-4000:],
+                "results_collected": results_collected,
+                "results_verified": results_verified,
+                "summary_complete": summary_complete,
+                "validation": validation,
+                "unpacked_bundle_files": len(members),
+            })
             if results_collected:
-                summary_path = local_results / "summary.json"
-                try:
-                    summary = json.loads(summary_path.read_text(encoding="utf-8"))
-                    summary_complete = summary.get("complete") is True
-                except (OSError, json.JSONDecodeError):
-                    summary_complete = False
                 collected.mkdir(parents=True, exist_ok=True)
-                os.replace(local_results, collected / "results")
-                attempts.append(attempt)
-                shutil.rmtree(staging, ignore_errors=True)
-                break
+                collected_results = collected / "results"
+                shutil.rmtree(collected_results, ignore_errors=True)
+                shutil.copytree(local_results, collected_results)
+                shutil.rmtree(unpacked, ignore_errors=True)
+                attempt["local_results"] = str(collected_results)
             attempts.append(attempt)
-        except (OSError, subprocess.TimeoutExpired) as error:
-            attempts.append({"number": attempt_number, "error": str(error), "results_collected": False})
+            write_json(staging / "bundle-metadata.json", attempt)
+            if results_verified:
+                break
+        except (BenchError, OSError, json.JSONDecodeError, tarfile.TarError, subprocess.TimeoutExpired) as error:
+            if phase == "transfer_firewall_audit":
+                raise
+            attempt["error"] = str(error)
+            attempt["results_collected"] = results_collected
+            attempt["results_verified"] = False
+            if remote_archive_path is not None:
+                attempt["remote_archive_path"] = remote_archive_path
+            attempts.append(attempt)
+            try:
+                write_json(staging / "bundle-metadata.json", attempt)
+            except OSError:
+                pass
         if attempt_number < 2:
             time.sleep(5)
 
@@ -1116,6 +2291,7 @@ def collect_artifacts(
     write_json(results_dir / "artifact-collection.json", {
         "attempts": attempts,
         "results_collected": results_collected,
+        "results_verified": results_collected and summary_complete,
         "summary_complete": summary_complete,
         "bootstrap_log_collected": boot_log_collected,
         "benchmark_started": benchmark_started,
@@ -1123,6 +2299,7 @@ def collect_artifacts(
     return {
         "bootstrap_log": boot_log_collected,
         "results": results_collected,
+        "results_verified": results_collected and summary_complete,
         "summary_complete": summary_complete,
         "benchmark_started": benchmark_started,
         "attempts": attempts,
@@ -1283,6 +2460,12 @@ def provision_and_run(
     args: argparse.Namespace, gcloud: Gcloud, results_dir: Path, preflight_result: dict[str, Any]
 ) -> int:
     profile_suite = getattr(args, "v8_small_ticket_profile", False)
+    trace_suite = getattr(args, "commit_order_trace", False)
+    point_lookahead_suite = getattr(args, "v8_point_lookahead_ab", False)
+    mutex_diagnostic_suite = getattr(args, "v8_mutex_diagnostic", False)
+    point_borrowed_input_suite = getattr(args, "v8_point_borrowed_input_ab", False)
+    point_direct_frame_suite = getattr(args, "v8_point_direct_frame_ab", False)
+    extent_policy_storage_suite = getattr(args, "v8_extent_policy_storage_ab", False)
     missing_tools = [tool for tool in ("ssh", "scp", "ssh-keygen") if not shutil.which(tool)]
     if missing_tools:
         raise BenchError("Required local tools are missing: " + ", ".join(missing_tools))
@@ -1303,9 +2486,16 @@ def provision_and_run(
     lifecycle = {"project": args.project, "zone": args.zone,
                  "instance": instance, "firewall": firewall, "created": False, "firewall_created": False,
                  "network": args.network, "subnet": args.subnet,
-                 "benchmark_started": False,
-                 "remote_execution_uncertain": False, "collected": False, "retained": False, "cleanup": []}
-    results_dir.mkdir(parents=True, exist_ok=True)
+                 "benchmark_attempted": False, "benchmark_started": False,
+                 "remote_execution_uncertain": False, "collected": False,
+                 "summary_complete": False, "results_verified": False,
+                 "retained": False, "cleanup": []}
+    results_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(results_dir, 0o700)
+    key = results_dir / "retained-ssh-key"
+    known_hosts = results_dir / "retained-known-hosts"
+    lifecycle["recovery_key"] = str(key)
+    lifecycle["recovery_known_hosts"] = str(known_hosts)
     lifecycle_path = results_dir / "lifecycle.json"
 
     def persist_lifecycle() -> None:
@@ -1330,8 +2520,6 @@ def provision_and_run(
     audit_ssh_firewall_rules(gcloud, args.project, args.network, network_region, tag, args.ssh_source_range)
 
     with tempfile.TemporaryDirectory(prefix="gcp-wal-bench-") as temporary:
-        key = Path(temporary) / "bench_ed25519"
-        known_hosts = Path(temporary) / "known_hosts"
         keygen = subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(key)],
                                 text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
                                 shell=False)
@@ -1341,8 +2529,59 @@ def provision_and_run(
         key_metadata = Path(temporary) / "ssh-keys"
         key_metadata.write_text(f"bench:{public_key}\n", encoding="utf-8")
         os.chmod(key, 0o600)
+        with key.open("rb") as stream:
+            os.fsync(stream.fileno())
+        key_directory_fd = os.open(results_dir, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(key_directory_fd)
+        finally:
+            os.close(key_directory_fd)
 
         connected = False
+        ip: str | None = None
+
+        def save_reconnect_instructions(*, cleanup_uncertain: bool = False) -> None:
+            if not ip:
+                raise BenchError("cannot write reconnect instructions before the VM address is known")
+            if not key.is_file():
+                raise BenchError(f"retained SSH private key is unavailable at {key}")
+            os.chmod(key, 0o600)
+            if known_hosts.is_file():
+                os.chmod(known_hosts, 0o600)
+                with known_hosts.open("rb") as stream:
+                    os.fsync(stream.fileno())
+            connect_command = shlex.join([
+                "ssh", "-i", str(key), "-o", "IdentitiesOnly=yes",
+                "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes",
+                "-o", "ConnectTimeout=8", "-o", "ServerAliveInterval=30",
+                "-o", "ServerAliveCountMax=3",
+                "-o", f"UserKnownHostsFile={known_hosts}",
+                "-o", "GlobalKnownHostsFile=/dev/null", f"bench@{ip}",
+            ])
+            reconnect_path = results_dir / "reconnect.txt"
+            temporary_reconnect = reconnect_path.with_name(".reconnect.txt.tmp")
+            temporary_reconnect.write_text(
+                retained_vm_reconnect_instructions(
+                    termination_timestamp=lifecycle.get("termination_timestamp", "see instance.json"),
+                    network=lifecycle.get("network"),
+                    subnet=lifecycle.get("subnet"),
+                    firewall=firewall,
+                    project=args.project,
+                    connect_command=connect_command,
+                    cleanup_uncertain=cleanup_uncertain,
+                ),
+                encoding="utf-8",
+            )
+            os.chmod(temporary_reconnect, 0o600)
+            with temporary_reconnect.open("rb") as stream:
+                os.fsync(stream.fileno())
+            os.replace(temporary_reconnect, reconnect_path)
+            directory_fd = os.open(results_dir, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+
         try:
             create = [
                 "beta", "compute", "instances", "create", instance,
@@ -1403,6 +2642,9 @@ def provision_and_run(
             if deadline <= time.monotonic():
                 raise BenchError("Less than ten minutes remain before the VM auto-delete deadline")
             wait_for_verified_host_keys(gcloud, instance, args.project, args.zone, ip, known_hosts, deadline)
+            os.chmod(known_hosts, 0o600)
+            with known_hosts.open("rb") as stream:
+                os.fsync(stream.fileno())
 
             # Create ingress only after the VM exists, so an interruption before
             # VM creation cannot orphan a firewall rule. The server-side VM
@@ -1458,20 +2700,96 @@ def provision_and_run(
                 append_local_log(key_log, profile_copy.stdout + profile_copy.stderr)
                 if profile_copy.returncode:
                     raise BenchError(f"Could not copy profile runner: {profile_copy.stderr.strip()}")
+            if trace_suite:
+                if not COMMIT_ORDER_TRACE_RUNNER.is_file():
+                    raise BenchError(f"Commit-order trace runner is not present in this checkout: {COMMIT_ORDER_TRACE_RUNNER}")
+                trace_copy = scp_to_vm(
+                    ip, COMMIT_ORDER_TRACE_RUNNER, "/tmp/gcp-commit-order-trace-runner.py",
+                    key, known_hosts, timeout=120,
+                )
+                append_local_log(key_log, trace_copy.stdout + trace_copy.stderr)
+                if trace_copy.returncode:
+                    raise BenchError(f"Could not copy commit-order trace runner: {trace_copy.stderr.strip()}")
+            if point_lookahead_suite:
+                if not POINT_LOOKAHEAD_RUNNER.is_file():
+                    raise BenchError(f"Point lookahead runner is not present in this checkout: {POINT_LOOKAHEAD_RUNNER}")
+                point_copy = scp_to_vm(
+                    ip, POINT_LOOKAHEAD_RUNNER, "/tmp/gcp-v8-point-lookahead-runner.py", key, known_hosts,
+                    timeout=120,
+                )
+                append_local_log(key_log, point_copy.stdout + point_copy.stderr)
+                if point_copy.returncode:
+                    raise BenchError(f"Could not copy Point lookahead runner: {point_copy.stderr.strip()}")
+            if mutex_diagnostic_suite:
+                if not V8_MUTEX_DIAGNOSTIC_RUNNER.is_file():
+                    raise BenchError(f"Mutex diagnostic helper is not present in this checkout: {V8_MUTEX_DIAGNOSTIC_RUNNER}")
+                mutex_copy = scp_to_vm(
+                    ip, V8_MUTEX_DIAGNOSTIC_RUNNER, "/tmp/gcp-v8-mutex-diagnostic-runner.py",
+                    key, known_hosts, timeout=120,
+                )
+                append_local_log(key_log, mutex_copy.stdout + mutex_copy.stderr)
+                if mutex_copy.returncode:
+                    raise BenchError(f"Could not copy mutex diagnostic runner: {mutex_copy.stderr.strip()}")
+            if point_borrowed_input_suite:
+                if not POINT_BORROWED_INPUT_RUNNER.is_file():
+                    raise BenchError(f"Borrowed-input helper is missing: {POINT_BORROWED_INPUT_RUNNER}")
+                borrowed_copy = scp_to_vm(
+                    ip, POINT_BORROWED_INPUT_RUNNER, "/tmp/gcp-v8-point-borrowed-input-runner.py",
+                    key, known_hosts, timeout=120,
+                )
+                append_local_log(key_log, borrowed_copy.stdout + borrowed_copy.stderr)
+                if borrowed_copy.returncode:
+                    raise BenchError(f"Could not copy borrowed-input helper: {borrowed_copy.stderr.strip()}")
+            if point_direct_frame_suite:
+                if not POINT_DIRECT_FRAME_RUNNER.is_file():
+                    raise BenchError(f"Direct-frame helper is missing: {POINT_DIRECT_FRAME_RUNNER}")
+                direct_copy = scp_to_vm(
+                    ip, POINT_DIRECT_FRAME_RUNNER, "/tmp/gcp-v8-point-direct-frame-runner.py",
+                    key, known_hosts, timeout=120,
+                )
+                append_local_log(key_log, direct_copy.stdout + direct_copy.stderr)
+                if direct_copy.returncode:
+                    raise BenchError(f"Could not copy direct-frame helper: {direct_copy.stderr.strip()}")
+            if extent_policy_storage_suite:
+                if not V8_EXTENT_POLICY_STORAGE_RUNNER.is_file():
+                    raise BenchError(f"Extent-policy storage runner is missing: {V8_EXTENT_POLICY_STORAGE_RUNNER}")
+                storage_copy = scp_to_vm(
+                    ip, V8_EXTENT_POLICY_STORAGE_RUNNER, "/tmp/gcp-v8-extent-policy-storage-runner.py",
+                    key, known_hosts, timeout=120,
+                )
+                append_local_log(key_log, storage_copy.stdout + storage_copy.stderr)
+                if storage_copy.returncode:
+                    raise BenchError(f"Could not copy extent-policy storage helper: {storage_copy.stderr.strip()}")
 
             safe_deadline_epoch = int(deadline_epoch - 600)
             remote_command = "sudo -n bash /tmp/run-wal-bench.sh " + shlex.join([
                 args.commit.lower(), str(args.num), args.project, args.zone, instance, str(safe_deadline_epoch),
                 args.machine_type, ",".join(str(writer) for writer in args.writers),
                 "v8-small-ticket-profile" if profile_suite else (
-                    "rfc026-full" if args.full_rfc026_matrix else "batch64"
+                    "commit-order-trace" if trace_suite else (
+                        "v8-extent-policy-storage" if extent_policy_storage_suite else (
+                        "v8-point-direct-frame" if point_direct_frame_suite else (
+                            "v8-point-borrowed-input" if point_borrowed_input_suite else (
+                            "v8-mutex-diagnostic" if mutex_diagnostic_suite else (
+                                "v8-point-lookahead" if point_lookahead_suite else (
+                                    "rfc026-full" if args.full_rfc026_matrix else "batch64"
+                                )
+                            )
+                            )
+                            )
+                        )
+                    )
                 ),
+                args.source_patch_sha256 or "-",
+                getattr(args, "baseline_commit", "").lower() if getattr(args, "baseline_commit", None) else "-",
             ])
             remaining = max(30, int(deadline - time.monotonic()))
             try:
                 audit_ssh_firewall_rules(
                     gcloud, args.project, args.network, network_region, tag, args.ssh_source_range
                 )
+                lifecycle["benchmark_attempted"] = True
+                persist_lifecycle()
                 run = ssh_command(key, known_hosts, ip, remote_command, timeout=remaining)
             except subprocess.TimeoutExpired as error:
                 lifecycle["remote_execution_uncertain"] = True
@@ -1505,46 +2823,23 @@ def provision_and_run(
                             lifecycle["benchmark_started"] = bool(
                                 lifecycle["benchmark_started"] or collection.get("benchmark_started")
                             )
-                            persist_lifecycle()
                             lifecycle["collected"] = bool(collection.get("results"))
+                            lifecycle["summary_complete"] = bool(collection.get("summary_complete"))
+                            lifecycle["results_verified"] = bool(collection.get("results_verified"))
+                            lifecycle["retained"] = should_retain_vm(args, return_code, lifecycle)
                             persist_lifecycle()
-                            if not lifecycle["collected"]:
+                            if not lifecycle["results_verified"]:
                                 return_code = 1
                                 lifecycle["cleanup"].append(
-                                    "result transfer incomplete after retries; see artifact-collection.json and local logs"
+                                    "result set is incomplete or unverified; preserving the VM and network for recovery"
                                 )
                                 persist_lifecycle()
                             elif not collection.get("bootstrap_log"):
                                 lifecycle["cleanup"].append("bootstrap log could not be collected; benchmark results are local")
                                 persist_lifecycle()
                         if should_retain_vm(args, return_code, lifecycle):
-                            retained_key = results_dir / "retained-ssh-key"
-                            retained_known_hosts = results_dir / "retained-known-hosts"
-                            shutil.copyfile(key, retained_key)
-                            os.chmod(retained_key, 0o600)
-                            shutil.copyfile(known_hosts, retained_known_hosts)
-                            os.chmod(retained_known_hosts, 0o600)
-                            connect_command = shlex.join([
-                                "ssh", "-i", str(retained_key), "-o", "IdentitiesOnly=yes",
-                                "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes",
-                                "-o", "ConnectTimeout=8", "-o", "ServerAliveInterval=30",
-                                "-o", "ServerAliveCountMax=3",
-                                "-o", f"UserKnownHostsFile={retained_known_hosts}",
-                                "-o", "GlobalKnownHostsFile=/dev/null", f"bench@{ip}",
-                            ])
-                            (results_dir / "reconnect.txt").write_text(
-                                retained_vm_reconnect_instructions(
-                                    termination_timestamp=lifecycle.get(
-                                        "termination_timestamp", "see instance.json"
-                                    ),
-                                    network=lifecycle.get("network"),
-                                    subnet=lifecycle.get("subnet"),
-                                    firewall=firewall,
-                                    project=args.project,
-                                    connect_command=connect_command,
-                                ),
-                                encoding="utf-8",
-                            )
+                            lifecycle["retained"] = True
+                            save_reconnect_instructions()
                             lifecycle["retained"] = True
                             lifecycle["cleanup"].append(
                                 "VM and restricted SSH firewall retained; only the VM has a server-side delete deadline"
@@ -1552,15 +2847,26 @@ def provision_and_run(
                             try:
                                 persist_lifecycle()
                             except BaseException:
-                                lifecycle["retained"] = False
+                                # The in-memory retention flag still prevents teardown if
+                                # the local filesystem cannot persist recovery metadata.
                                 raise
                     except BaseException as error:
                         return_code = 1
+                        if should_retain_vm(args, return_code, lifecycle):
+                            lifecycle["retained"] = True
+                            try:
+                                save_reconnect_instructions()
+                            except BaseException as recovery_error:
+                                print(
+                                    f"VM cleanup is disabled, but reconnect instructions could not be saved: "
+                                    f"{recovery_error}; recovery key path: {key}",
+                                    file=sys.stderr,
+                                )
                         lifecycle["cleanup"].append(f"local artifact/retention step failed: {error}")
                         persist_lifecycle()
             finally:
-                # Local log/collection I/O can fail (for example, a full disk).
-                # It must never prevent teardown of the cloud resources.
+                # Do not destroy the only remaining copy of a completed or
+                # uncertain benchmark until its full result set is verified locally.
                 if lifecycle["retained"]:
                     cleanup_messages, cleanup_verification, cleanup_failed = [], {}, False
                 else:
@@ -1578,6 +2884,22 @@ def provision_and_run(
                     lifecycle["cleanup_verification"] = cleanup_verification
                 if cleanup_failed:
                     return_code = 1
+                    if lifecycle["created"]:
+                        lifecycle["retained"] = True
+                        lifecycle["cleanup"].append(
+                            "resource cleanup could not be verified; preserving local recovery credentials"
+                        )
+                        try:
+                            save_reconnect_instructions(cleanup_uncertain=True)
+                        except BaseException as recovery_error:
+                            print(
+                                f"Cloud cleanup is uncertain and reconnect instructions could not be saved: "
+                                f"{recovery_error}; recovery key path: {key}",
+                                file=sys.stderr,
+                            )
+                elif not lifecycle["retained"]:
+                    for credential in (key, Path(str(key) + ".pub"), known_hosts):
+                        credential.unlink(missing_ok=True)
                 persist_lifecycle()
 
     return return_code
@@ -1618,6 +2940,55 @@ def main(argv: list[str] | None = None) -> int:
                 ) from error
             report["benchmark_plan"] = build_profile_plan(
                 args.writers, machine_type=args.machine_type, machine_spec=MACHINE_SPECS[args.machine_type],
+                commit=args.commit.lower(),
+            )
+        elif args.commit_order_trace:
+            report["benchmark_suite"] = "commit-order-trace"
+            report["benchmark_plan"] = build_commit_order_trace_plan(
+                machine_type=args.machine_type,
+                machine_spec=MACHINE_SPECS[args.machine_type],
+                commit=args.commit.lower(),
+                source_patch_sha256=args.source_patch_sha256,
+            )
+        elif args.v8_point_lookahead_ab:
+            report["benchmark_suite"] = "v8-point-lookahead"
+            report["benchmark_plan"] = build_point_lookahead_plan(
+                writers=args.writers,
+                machine_type=args.machine_type,
+                machine_spec=MACHINE_SPECS[args.machine_type],
+                commit=args.commit.lower(),
+            )
+        elif args.v8_mutex_diagnostic:
+            report["benchmark_suite"] = "v8-mutex-diagnostic"
+            report["benchmark_plan"] = build_v8_mutex_diagnostic_plan(
+                machine_type=args.machine_type,
+                machine_spec=MACHINE_SPECS[args.machine_type],
+                commit=args.commit.lower(),
+            )
+        elif args.v8_point_borrowed_input_ab:
+            report["benchmark_suite"] = "v8-point-borrowed-input"
+            report["benchmark_plan"] = build_point_borrowed_input_plan(
+                writers=args.writers,
+                machine_type=args.machine_type,
+                machine_spec=MACHINE_SPECS[args.machine_type],
+                baseline_commit=args.baseline_commit.lower(),
+                candidate_commit=args.commit.lower(),
+                source_patch_sha256=args.source_patch_sha256,
+            )
+        elif args.v8_point_direct_frame_ab:
+            report["benchmark_suite"] = "v8-point-direct-frame"
+            report["benchmark_plan"] = build_point_direct_frame_plan(
+                writers=args.writers,
+                machine_type=args.machine_type,
+                machine_spec=MACHINE_SPECS[args.machine_type],
+                commit=args.commit.lower(),
+            )
+        elif args.v8_extent_policy_storage_ab:
+            report["benchmark_suite"] = "v8-extent-policy-storage"
+            report["benchmark_plan"] = build_v8_extent_policy_storage_plan(
+                writers=args.writers,
+                machine_type=args.machine_type,
+                machine_spec=MACHINE_SPECS[args.machine_type],
                 commit=args.commit.lower(),
             )
         else:

@@ -161,7 +161,10 @@ def _validate_wal_io_metadata(
     end = pipeline.get("wal_io_end")
     if not isinstance(start, dict) or not isinstance(end, dict):
         raise ValueError("V8 benchmark record is missing start/end WAL I/O metadata")
-    if pipeline.get("wal_io_stable") is not True or start != end:
+    handle_names = ("data", "frontier", "sync")
+    start_handles = {name: start.get(name) for name in handle_names}
+    end_handles = {name: end.get(name) for name in handle_names}
+    if pipeline.get("wal_io_stable") is not True or start_handles != end_handles:
         raise ValueError("V8 active WAL I/O metadata changed during the benchmark")
 
     identities: set[tuple[int, int]] = set()

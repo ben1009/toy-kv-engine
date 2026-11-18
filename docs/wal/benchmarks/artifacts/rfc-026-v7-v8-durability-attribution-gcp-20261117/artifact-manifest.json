@@ -1,0 +1,15 @@
+{
+  "completed_runs": 12,
+  "original_local_archive_checksum_verified": true,
+  "original_local_archive_sha256": "754383f16ef4bb460302971758cbff5fecd46e199d5079716472005715f3272e",
+  "planned_runs": 12,
+  "redacted_members": [
+    "results/host.txt"
+  ],
+  "redaction_reason": "Removed results/host.txt because it contains the GCP project identifier.",
+  "sanitized_archive": "results-redacted.tar.gz",
+  "sanitized_archive_file_count": 93,
+  "sanitized_archive_sha256": "4e846ff40574e355e904c3ce90ffb6f1cbb39f128a28e712edc5fdecc760c22f",
+  "source_commit": "2511d69dc972f155e471dc0264210e70633911c7",
+  "source_patch_sha256": "6c38c076d1d568bf6b425cb0352a76c5aa80f50a3b5101894e4ea478da7a4586"
+}

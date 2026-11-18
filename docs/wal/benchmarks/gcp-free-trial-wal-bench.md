@@ -105,26 +105,28 @@ Local SSD data is ephemeral. Results are copied back to the local results
 directory before VM deletion. Collection requires a previously verified SSH
 connection and repeats the firewall audit before every transfer. Failures
 before SSH is established proceed directly to cleanup. `bench-results/` is
-ignored by Git. If result
-transfer still fails after two attempts, the runner preserves the local
-collection-attempt directories, transfer diagnostics, bootstrap log if
-available, and orchestration logs, then proceeds with VM and firewall cleanup.
-The runner prints the local artifact directory on success and failure. A
-complete remote benchmark result cannot be returned when every transfer
-attempt fails; `artifact-collection.json` records that condition and the local
-diagnostics remain available. On normal completion, failed benchmark runs, or
-when the benchmark never started, cleanup attempts to delete the VM and
-firewall rule, then describes each resource and records `absent`, `present`, or
-`unknown` in `lifecycle.json`. A resource that is present or cannot be verified
-causes the run to report cleanup failure. An interrupted verification is
-recorded as `unknown`, and cleanup continues to the other resource. Local
-artifact or lifecycle-write errors also trigger cleanup, even when those errors prevent saving the final
-diagnostics. A force-kill or host failure can
-still leave the temporary firewall rule behind; the lifecycle record contains
-its name for manual cleanup, and the VM has a server-side deletion deadline.
-Before retrying, the runner refuses to provision while any non-terminated
-`walbench-*` VM remains in the project, preventing an interrupted benchmark
-from silently creating a second VM.
+ignored by Git. If a benchmark was attempted or remote execution is uncertain
+and its complete result set is not verified locally, the runner preserves the
+VM and temporary SSH firewall rule for recovery instead of deleting the only
+remaining copy. Keep the isolated VPC, subnet, route, and Terraform state too;
+do not run `terraform destroy` while the VM may contain uncollected results.
+The runner writes reconnect instructions and retains its SSH key when possible.
+The VM's server-side deletion deadline remains the maximum lifetime, so recover
+the results before it expires.
+
+Collection is complete only when the archive checksum passes, `summary.json`
+reports `complete: true` and matching planned/completed run counts, the remote
+exit record reports all planned runs, and each completed run has both
+`result.json` and `run-metadata.json` locally. After these checks pass, the
+runner can delete the VM and temporary SSH rule. Then destroy the isolated
+Terraform network and verify every cloud resource is absent. If result
+collection or local lifecycle recording fails, the runner records the issue
+and leaves the environment available until recovery or the server-side
+deadline. A force-kill or host failure can still interrupt local bookkeeping;
+the lifecycle record contains resource names for recovery. Before retrying, the
+runner refuses to provision while any non-terminated `walbench-*` VM remains in
+the project, preventing an interrupted benchmark from silently creating a
+second VM.
 
 ## Requirements and preflight
 
@@ -241,11 +243,46 @@ matrix scores. If `perf` is missing, the runner collects the engine profile
 alone. A failed recording with no benchmark JSON may retry without perf within
 the original cell budget. Version probe failures are saved in `perf-version.txt`
 and do not abort the suite.
-By default, a completed run deletes its VM and temporary SSH firewall rule.
-`--keep-vm-after-run` instead retains both after a successful, collected run
+After a complete result set is copied and verified, the runner deletes its VM
+and temporary SSH firewall rule by default. If a benchmark was attempted but
+the local result set is incomplete or unverified, it retains the VM and
+firewall for recovery. `--keep-vm-after-run` also retains both after a
+verified result set is collected, regardless of the runner's final status,
 until the server-side VM deadline; the private reconnect key is saved in the
-results directory with mode `0600`. The retained VM is still automatically
+results directory with mode `0600`. Any retained VM is still automatically
 deleted at that deadline.
+
+For targeted V7/V8 hot-mutex attribution, use the 10-run `--v8-mutex-diagnostic`
+suite. It runs five counterbalanced pairs at 16 writers, 100,000 one-kilobyte
+Point puts, on one host and one release binary. The V8 arm uses the current
+Point-only 1 MiB extent lookahead and Direct FRONTIER candidate; V7 is the
+parallel-I/O reference. Both arms enable the same per-thread sampling interval
+for the instrumented call sites:
+
+```bash
+python3 scripts/gcp-free-trial-wal-bench.py \
+  --project YOUR_PROJECT_ID \
+  --zone us-east1-b \
+  --machine-type c4-standard-16-lssd \
+  --v8-mutex-diagnostic \
+  --commit 0123456789abcdef0123456789abcdef01234567 \
+  --network YOUR_ISOLATED_VPC \
+  --subnet YOUR_SUBNET \
+  --ssh-source-range YOUR_PUBLIC_IPV4/32 \
+  --estimated-hourly-cost-usd YOUR_CURRENT_ESTIMATE \
+  --max-estimated-spend-usd 2.00 \
+  --max-runtime-minutes 60 \
+  --confirm-free-trial
+```
+
+The report includes exact acquisition counts for instrumented call sites.
+Wait/hold timings and contention are sampled every 64th acquisition by default;
+scaled totals and contention counts are estimates. Percentiles are upper bounds
+from log2 nanosecond buckets, not exact quantiles. Compare Resource Ledger and
+MVCC publication between versions, and treat V8 extent-state/preparation locks
+as V8-only measurements. This suite is diagnostic: its instrumented throughput
+and latency are not unprofiled performance scores. It leaves WAL protocol and
+Coordinator Mutex behavior unchanged.
 
 Replace the example commit, CIDR, and cost values. Use a full 40-character
 commit SHA. The two cost arguments are mandatory for a full run: look up
@@ -279,11 +316,13 @@ raw JSON and stderr, 100 ms timeline captures when supported by the benchmark,
 p99, and CPU percentage deltas against V4),
 `summary.json`, and lifecycle/cleanup status. A comparison is descriptive for
 this capture only; it does not assert that the device stayed in one storage
-state. A nonzero benchmark exit still triggers artifact collection and VM
-teardown attempts. If results transfer remains incomplete, the runner still
-deletes the VM and temporary firewall rule, so remote results cannot be
-recovered later; incomplete collection or failed teardown returns a nonzero
-status.
+state. A nonzero benchmark exit still triggers artifact collection. If the
+benchmark ran or its remote outcome is uncertain and results are incomplete or
+unverified locally, the runner retains the VM and temporary firewall rule for
+recovery and returns a nonzero status. Do not destroy the Terraform network or
+state until the complete result set has been copied and verified. Cleanup is
+safe after the archive checksum, run counts, remote exit record, and per-run
+files have all been verified locally.
 
 The November 6, 2026 capture and sanitized per-run results are documented in the
 [GCP benchmark results report](gcp-free-trial-wal-bench-20261106-results.md).

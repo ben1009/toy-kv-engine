@@ -126,6 +126,60 @@ struct CoordinatorState {
     completion_timeline_frontier_ready_end: u64,
     #[cfg(feature = "bench")]
     completion_timeline_samples: BTreeMap<u64, PendingCompletionTimeline>,
+    #[cfg(feature = "bench")]
+    durability_driver_waiters: u64,
+    #[cfg(feature = "bench")]
+    last_durability_notify_at: Option<Instant>,
+    #[cfg(feature = "bench")]
+    last_durability_notify_waiters: u64,
+    #[cfg(feature = "bench")]
+    durable_publish_sample_timestamps: BTreeMap<u64, Instant>,
+}
+
+#[cfg(feature = "bench")]
+struct WalV8FollowerWaitSample {
+    sample_id: Option<u64>,
+    requested_ticket_end: u64,
+    durable_ticket_end_on_resume: u64,
+    coordinator_lock_wait_ns: u64,
+    coordinator_lock_wait_cpu_ns: u64,
+    wait_started: Option<Instant>,
+    wait_cpu_started: Option<u64>,
+    condvar_wait_count: u64,
+    notify_to_resume_ns: Option<u64>,
+    followers_woken_by_last_notify: u64,
+}
+
+#[cfg(feature = "bench")]
+fn make_follower_wait_observation(
+    sample: WalV8FollowerWaitSample,
+) -> Option<crate::mem_table::WalV8FollowerWaitObservation> {
+    let sample_id = sample.sample_id?;
+    let wait_started = sample.wait_started?;
+    let wait_cpu_started = sample.wait_cpu_started?;
+
+    Some(crate::mem_table::WalV8FollowerWaitObservation {
+        sample_id,
+        requested_ticket_end: sample.requested_ticket_end,
+        durable_ticket_end_on_resume: sample.durable_ticket_end_on_resume,
+        coordinator_lock_wait_ns: sample.coordinator_lock_wait_ns,
+        coordinator_lock_wait_cpu_ns: sample.coordinator_lock_wait_cpu_ns,
+        total_wait_wall_ns: wait_started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+        total_wait_cpu_ns: super::digest::thread_cpu_time_ns().saturating_sub(wait_cpu_started),
+        condvar_wait_count: sample.condvar_wait_count,
+        notify_to_resume_ns: sample.notify_to_resume_ns,
+        followers_woken_by_last_notify: sample.followers_woken_by_last_notify,
+    })
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct WalV8DurabilityPublishMetrics {
+    pub(crate) coordinator_lock_wait_ns: u64,
+    pub(crate) coordinator_lock_wait_cpu_ns: u64,
+    pub(crate) publish_wall_ns: u64,
+    pub(crate) publish_cpu_ns: u64,
+    pub(crate) notify_all_wall_ns: u64,
+    pub(crate) followers_waiting: u64,
 }
 
 struct TicketState {
@@ -181,6 +235,24 @@ pub(crate) struct WalV8FrontierReadySnapshot {
     pub(crate) next_not_ready: Option<WalV8TicketProgress>,
 }
 
+#[cfg(feature = "bench")]
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct WalV8CoalescingObservation {
+    pub(crate) waited: bool,
+    pub(crate) state_lock_wait_wall_ns: u64,
+    pub(crate) state_lock_wait_cpu_ns: u64,
+    pub(crate) condvar_wait_wall_ns: u64,
+    pub(crate) condvar_wait_count: u64,
+    pub(crate) condvar_reacquire_count: u64,
+    /// Non-timeout returns, including spurious condition-variable wakeups.
+    pub(crate) condvar_non_timeout_returns: u64,
+    pub(crate) condvar_prefix_growth_returns: u64,
+    pub(crate) condvar_generation_changed_returns: u64,
+    pub(crate) condvar_timeout_returns: u64,
+    pub(crate) loop_check_count: u64,
+    pub(crate) condvar_wait_cpu_ns: u64,
+}
+
 /// DATA group membership comes from admission, including tickets whose
 /// producers have not encoded or framed their bytes yet.
 pub(crate) struct WalV8DataGroupWindow {
@@ -203,6 +275,18 @@ pub(crate) struct WalV8CoordinatorWake {
     pub(crate) change_generation: u64,
     pub(crate) closed: bool,
     pub(crate) poisoned: bool,
+}
+
+/// Opaque proof that the coordinator checked a durable ticket prefix.
+pub(crate) struct WalV8DurablePrefixCheck {
+    coordinator: Arc<CoordinatorInner>,
+    ticket_end: u64,
+}
+
+impl WalV8DurablePrefixCheck {
+    fn covers(&self, coordinator: &WalV8ParallelCoordinator, ticket: u64) -> bool {
+        Arc::ptr_eq(&self.coordinator, &coordinator.inner) && ticket < self.ticket_end
+    }
 }
 
 impl WalV8ParallelCoordinator {
@@ -294,6 +378,14 @@ impl WalV8ParallelCoordinator {
                     completion_timeline_frontier_ready_end: config.next_ticket,
                     #[cfg(feature = "bench")]
                     completion_timeline_samples: BTreeMap::new(),
+                    #[cfg(feature = "bench")]
+                    durability_driver_waiters: 0,
+                    #[cfg(feature = "bench")]
+                    last_durability_notify_at: None,
+                    #[cfg(feature = "bench")]
+                    last_durability_notify_waiters: 0,
+                    #[cfg(feature = "bench")]
+                    durable_publish_sample_timestamps: BTreeMap::new(),
                 }),
                 changed: Condvar::new(),
                 durability_changed: Condvar::new(),
@@ -339,10 +431,13 @@ impl WalV8ParallelCoordinator {
             first_ticket >= state.durable_ticket_end && first_ticket <= state.next_ticket,
             "v8 DATA group starts outside the admitted window"
         );
-        let count = (state.next_ticket - first_ticket).min(u64::try_from(max_tickets)?);
+        let count =
+            usize::try_from((state.next_ticket - first_ticket).min(u64::try_from(max_tickets)?))?;
+        let ticket_count = count;
+        ensure!(ticket_count > 0, "v8 DATA group has no admitted tickets");
 
         Ok(WalV8DataGroupWindow {
-            ticket_end: first_ticket + count,
+            ticket_end: first_ticket + u64::try_from(ticket_count)?,
             closed: state.closed,
         })
     }
@@ -409,38 +504,165 @@ impl WalV8ParallelCoordinator {
     /// ready durability prefix. A lone producer or fully ready window never
     /// waits, and close/poison terminates the optional wait immediately.
     pub(crate) fn coalesce_frontier_ready(&self, budget: Duration) -> bool {
-        let mut state = self.inner.state.lock();
-        let deadline = Instant::now() + budget;
-        let mut waited = false;
-        while !state.closed
-            && !state.poisoned
-            && state
-                .tickets
-                .front()
-                .is_some_and(TicketState::is_frontier_ready)
-            && state
-                .tickets
-                .iter()
-                .any(|ticket| !ticket.is_frontier_ready())
+        #[cfg(feature = "bench")]
         {
+            self.coalesce_frontier_ready_observed(budget, false).waited
+        }
+        #[cfg(not(feature = "bench"))]
+        {
+            let mut state = self.inner.state.lock();
+            let deadline = Instant::now() + budget;
+            let mut waited = false;
+            loop {
+                if state.closed
+                    || state.poisoned
+                    || !state
+                        .tickets
+                        .front()
+                        .is_some_and(TicketState::is_frontier_ready)
+                    || !state
+                        .tickets
+                        .iter()
+                        .any(|ticket| !ticket.is_frontier_ready())
+                {
+                    break;
+                }
+                let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                    break;
+                };
+                waited = true;
+                #[cfg(test)]
+                {
+                    state.frontier_coalesce_waiters += 1;
+                }
+                self.inner
+                    .durability_changed
+                    .wait_for(&mut state, remaining);
+                #[cfg(test)]
+                {
+                    state.frontier_coalesce_waiters -= 1;
+                }
+            }
+
+            waited
+        }
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn coalesce_frontier_ready_sampled(
+        &self,
+        budget: Duration,
+    ) -> WalV8CoalescingObservation {
+        self.coalesce_frontier_ready_observed(budget, true)
+    }
+
+    #[cfg(feature = "bench")]
+    fn coalesce_frontier_ready_observed(
+        &self,
+        budget: Duration,
+        capture_metrics: bool,
+    ) -> WalV8CoalescingObservation {
+        let lock_wait_started = capture_metrics.then(Instant::now);
+        let lock_wait_cpu_started = capture_metrics.then(super::digest::thread_cpu_time_ns);
+        let mut observation = WalV8CoalescingObservation::default();
+        let mut state = self.inner.state.lock();
+        {
+            observation.state_lock_wait_wall_ns = lock_wait_started
+                .map(|started| started.elapsed().as_nanos().min(u64::MAX as u128) as u64)
+                .unwrap_or_default();
+            observation.state_lock_wait_cpu_ns = lock_wait_cpu_started
+                .map(|started| super::digest::thread_cpu_time_ns().saturating_sub(started))
+                .unwrap_or_default();
+        }
+        let deadline = Instant::now() + budget;
+        loop {
+            if capture_metrics {
+                observation.loop_check_count = observation.loop_check_count.saturating_add(1);
+            }
+            if state.closed
+                || state.poisoned
+                || !state
+                    .tickets
+                    .front()
+                    .is_some_and(TicketState::is_frontier_ready)
+                || !state
+                    .tickets
+                    .iter()
+                    .any(|ticket| !ticket.is_frontier_ready())
+            {
+                break;
+            }
             let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
                 break;
             };
-            waited = true;
+            observation.waited = true;
+            if capture_metrics {
+                observation.condvar_wait_count = observation.condvar_wait_count.saturating_add(1);
+            }
             #[cfg(test)]
             {
                 state.frontier_coalesce_waiters += 1;
             }
-            self.inner
+            let prior_generation = state.durability_generation;
+            let prior_ready = capture_metrics.then(|| {
+                state
+                    .tickets
+                    .iter()
+                    .take_while(|ticket| ticket.is_frontier_ready())
+                    .count()
+            });
+            let condvar_cpu_started = capture_metrics.then(super::digest::thread_cpu_time_ns);
+            let condvar_wall_started = capture_metrics.then(Instant::now);
+            let wait_result = self
+                .inner
                 .durability_changed
                 .wait_for(&mut state, remaining);
+            if capture_metrics {
+                if let Some(started) = condvar_cpu_started {
+                    observation.condvar_wait_cpu_ns =
+                        observation.condvar_wait_cpu_ns.saturating_add(
+                            super::digest::thread_cpu_time_ns().saturating_sub(started),
+                        );
+                }
+                if let Some(started) = condvar_wall_started {
+                    observation.condvar_wait_wall_ns = observation
+                        .condvar_wait_wall_ns
+                        .saturating_add(started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+                }
+                if wait_result.timed_out() {
+                    observation.condvar_timeout_returns =
+                        observation.condvar_timeout_returns.saturating_add(1);
+                }
+                if state.durability_generation != prior_generation {
+                    observation.condvar_generation_changed_returns = observation
+                        .condvar_generation_changed_returns
+                        .saturating_add(1);
+                }
+                if prior_ready.is_some_and(|before| {
+                    state
+                        .tickets
+                        .iter()
+                        .take_while(|ticket| ticket.is_frontier_ready())
+                        .count()
+                        > before
+                }) {
+                    observation.condvar_prefix_growth_returns =
+                        observation.condvar_prefix_growth_returns.saturating_add(1);
+                }
+                observation.condvar_reacquire_count =
+                    observation.condvar_reacquire_count.saturating_add(1);
+                if !wait_result.timed_out() {
+                    observation.condvar_non_timeout_returns =
+                        observation.condvar_non_timeout_returns.saturating_add(1);
+                }
+            }
             #[cfg(test)]
             {
                 state.frontier_coalesce_waiters -= 1;
             }
         }
 
-        waited
+        observation
     }
 
     /// Snapshot the frontier-ready prefix and the first admitted ticket that
@@ -879,7 +1101,40 @@ impl WalV8ParallelCoordinator {
         &self,
         reservation: WalV8FrontierReservation,
     ) -> Result<()> {
+        self.publish_durable_frontier_with_metrics(reservation, false)
+            .map(|_| ())
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn publish_durable_frontier_sampled(
+        &self,
+        reservation: WalV8FrontierReservation,
+    ) -> Result<WalV8DurabilityPublishMetrics> {
+        self.publish_durable_frontier_with_metrics(reservation, true)
+    }
+
+    fn publish_durable_frontier_with_metrics(
+        &self,
+        reservation: WalV8FrontierReservation,
+        sample: bool,
+    ) -> Result<WalV8DurabilityPublishMetrics> {
+        #[cfg(feature = "bench")]
+        let publish_started = sample.then(Instant::now);
+        #[cfg(feature = "bench")]
+        let publish_cpu_started = sample.then(super::digest::thread_cpu_time_ns);
+        #[cfg(feature = "bench")]
+        let lock_wait_started = sample.then(Instant::now);
+        #[cfg(feature = "bench")]
+        let lock_wait_cpu_started = sample.then(super::digest::thread_cpu_time_ns);
         let mut state = self.inner.state.lock();
+        #[cfg(feature = "bench")]
+        let coordinator_lock_wait_ns = lock_wait_started
+            .map(|started| started.elapsed().as_nanos().min(u64::MAX as u128) as u64)
+            .unwrap_or_default();
+        #[cfg(feature = "bench")]
+        let coordinator_lock_wait_cpu_ns = lock_wait_cpu_started
+            .map(|started| super::digest::thread_cpu_time_ns().saturating_sub(started))
+            .unwrap_or_default();
         ensure!(!state.poisoned, "v8 Parallel coordinator is poisoned");
         if state.pending_frontier != Some(reservation) {
             poison_locked(&self.inner, &mut state);
@@ -941,10 +1196,54 @@ impl WalV8ParallelCoordinator {
             state.tickets.pop_front();
         }
         state.reserved_bytes -= prefix_reserved_bytes;
+        #[cfg(feature = "bench")]
+        let durable_ticket_start = state.durable_ticket_end;
         state.durable_ticket_end = reservation.ticket_end;
         state.durable_prefix_digest = reservation.prefix_digest;
         state.last_frontier_end = frontier_end;
         state.pending_frontier = None;
+        #[cfg(feature = "bench")]
+        let durable_published_at = Instant::now();
+        #[cfg(feature = "bench")]
+        if let Some(profile) = self.inner.profile.load_full() {
+            profile.record_commit_order_frontier_published(
+                durable_ticket_start,
+                reservation.ticket_end,
+            );
+        }
+        #[cfg(feature = "bench")]
+        if let Some(profile) = self.inner.profile.load_full() {
+            let every = profile.wal_v8_durability_sample_every();
+            if every > 0 {
+                let first_sample_end = state
+                    .durable_ticket_end
+                    .checked_sub(ticket_span)
+                    .and_then(|previous_end| previous_end.checked_div(every))
+                    .and_then(|sample| sample.checked_add(1))
+                    .and_then(|sample| sample.checked_mul(every));
+                if let Some(mut sample_end) = first_sample_end {
+                    while sample_end <= reservation.ticket_end {
+                        state
+                            .durable_publish_sample_timestamps
+                            .insert(sample_end, durable_published_at);
+                        sample_end = match sample_end.checked_add(every) {
+                            Some(next) => next,
+                            None => break,
+                        };
+                    }
+                }
+                while state.durable_publish_sample_timestamps.len() > 4096 {
+                    let Some(oldest) = state
+                        .durable_publish_sample_timestamps
+                        .first_key_value()
+                        .map(|(ticket_end, _)| *ticket_end)
+                    else {
+                        break;
+                    };
+                    state.durable_publish_sample_timestamps.remove(&oldest);
+                }
+            }
+        }
         #[cfg(feature = "bench")]
         let covered_timeline_samples = {
             let covered_ends = state
@@ -959,11 +1258,21 @@ impl WalV8ParallelCoordinator {
         };
         signal_change(&self.inner, &mut state);
         signal_durability_progress(&self.inner, &mut state);
-        self.inner.durable_published.notify_all();
-        drop(state);
-
         #[cfg(feature = "bench")]
-        let durable_published_at = Instant::now();
+        if state.durability_driver_waiters > 0 {
+            state.last_durability_notify_at = Some(Instant::now());
+            state.last_durability_notify_waiters = state.durability_driver_waiters;
+        }
+        #[cfg(feature = "bench")]
+        let followers_waiting = state.durability_driver_waiters;
+        #[cfg(feature = "bench")]
+        let notify_started = sample.then(Instant::now);
+        self.inner.durable_published.notify_all();
+        #[cfg(feature = "bench")]
+        let notify_all_wall_ns = notify_started
+            .map(|started| started.elapsed().as_nanos().min(u64::MAX as u128) as u64)
+            .unwrap_or_default();
+        drop(state);
 
         #[cfg(feature = "bench")]
         if let Some(profile) = self.inner.profile.load_full() {
@@ -1026,7 +1335,28 @@ impl WalV8ParallelCoordinator {
             }
         }
 
-        Ok(())
+        #[cfg(feature = "bench")]
+        {
+            let metrics = WalV8DurabilityPublishMetrics {
+                coordinator_lock_wait_ns,
+                coordinator_lock_wait_cpu_ns,
+                publish_wall_ns: publish_started
+                    .map(|started| started.elapsed().as_nanos().min(u64::MAX as u128) as u64)
+                    .unwrap_or_default(),
+                publish_cpu_ns: publish_cpu_started
+                    .map(|started| super::digest::thread_cpu_time_ns().saturating_sub(started))
+                    .unwrap_or_default(),
+                notify_all_wall_ns,
+                followers_waiting,
+            };
+
+            Ok(metrics)
+        }
+        #[cfg(not(feature = "bench"))]
+        {
+            let _ = sample;
+            Ok(WalV8DurabilityPublishMetrics::default())
+        }
     }
 
     /// Stop new admissions and wake packer/durability waiters.
@@ -1037,6 +1367,8 @@ impl WalV8ParallelCoordinator {
             state.closed = true;
             signal_change(&self.inner, &mut state);
             signal_durability_progress(&self.inner, &mut state);
+            #[cfg(feature = "bench")]
+            record_durable_notification_for_waiters(&mut state);
             self.inner.durable_published.notify_all();
         }
     }
@@ -1058,6 +1390,17 @@ impl WalV8ParallelCoordinator {
 
     pub(crate) fn durable_ticket_end(&self) -> u64 {
         self.inner.state.lock().durable_ticket_end
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn take_durable_publish_sample_timestamp(&self, ticket: u64) -> Option<Instant> {
+        let ticket_end = ticket.checked_add(1)?;
+
+        self.inner
+            .state
+            .lock()
+            .durable_publish_sample_timestamps
+            .remove(&ticket_end)
     }
 
     /// Return the published durable ticket/image ends and admission end from
@@ -1148,23 +1491,109 @@ impl WalV8ParallelCoordinator {
         &self,
         ticket_end: u64,
     ) -> Result<Option<WalV8DurabilityDriver>> {
+        #[cfg(feature = "bench")]
+        let profile = self.inner.profile.load();
+        #[cfg(feature = "bench")]
+        let diagnostics_enabled = profile
+            .as_ref()
+            .is_some_and(|profile| profile.wal_v8_durability_sample_every() > 0);
+        #[cfg(feature = "bench")]
+        let lock_wait_started = diagnostics_enabled.then(Instant::now);
+        #[cfg(feature = "bench")]
+        let lock_wait_cpu_started = diagnostics_enabled.then(super::digest::thread_cpu_time_ns);
         let mut state = self.inner.state.lock();
+        #[cfg(feature = "bench")]
+        let coordinator_lock_wait_ns = lock_wait_started
+            .map(|started| started.elapsed().as_nanos().min(u64::MAX as u128) as u64)
+            .unwrap_or_default();
+        #[cfg(feature = "bench")]
+        let coordinator_lock_wait_cpu_ns = lock_wait_cpu_started
+            .map(|started| super::digest::thread_cpu_time_ns().saturating_sub(started))
+            .unwrap_or_default();
         ensure!(
             ticket_end <= state.next_ticket,
             "v8 durability driver names an unassigned ticket"
         );
 
+        #[cfg(feature = "bench")]
+        let mut follower_sampling_decided = false;
+        #[cfg(feature = "bench")]
+        let mut follower_sample_id = None;
+        #[cfg(feature = "bench")]
+        let mut follower_wait_started = None;
+        #[cfg(feature = "bench")]
+        let mut follower_wait_cpu_started = None;
+        #[cfg(feature = "bench")]
+        let mut follower_condvar_wait_count = 0_u64;
+        #[cfg(feature = "bench")]
+        let mut notify_to_resume_ns = None;
+        #[cfg(feature = "bench")]
+        let mut followers_woken_by_last_notify = 0_u64;
+
         loop {
             ensure!(!state.poisoned, "v8 Parallel coordinator is poisoned");
             if state.durable_ticket_end >= ticket_end {
+                #[cfg(feature = "bench")]
+                let observation = make_follower_wait_observation(WalV8FollowerWaitSample {
+                    sample_id: follower_sample_id,
+                    requested_ticket_end: ticket_end,
+                    durable_ticket_end_on_resume: state.durable_ticket_end,
+                    coordinator_lock_wait_ns,
+                    coordinator_lock_wait_cpu_ns,
+                    wait_started: follower_wait_started,
+                    wait_cpu_started: follower_wait_cpu_started,
+                    condvar_wait_count: follower_condvar_wait_count,
+                    notify_to_resume_ns,
+                    followers_woken_by_last_notify,
+                });
+                drop(state);
+                #[cfg(feature = "bench")]
+                if let (Some(profile), Some(observation)) = (profile.as_ref(), observation) {
+                    profile.record_wal_v8_follower_wait(observation);
+                }
+
                 return Ok(None);
             }
             if !state.durability_driver_active {
                 state.durability_driver_active = true;
-                return Ok(Some(WalV8DurabilityDriver {
+                let driver = WalV8DurabilityDriver {
                     coordinator: self.clone(),
                     completed: false,
-                }));
+                };
+                #[cfg(feature = "bench")]
+                let observation = make_follower_wait_observation(WalV8FollowerWaitSample {
+                    sample_id: follower_sample_id,
+                    requested_ticket_end: ticket_end,
+                    durable_ticket_end_on_resume: state.durable_ticket_end,
+                    coordinator_lock_wait_ns,
+                    coordinator_lock_wait_cpu_ns,
+                    wait_started: follower_wait_started,
+                    wait_cpu_started: follower_wait_cpu_started,
+                    condvar_wait_count: follower_condvar_wait_count,
+                    notify_to_resume_ns,
+                    followers_woken_by_last_notify,
+                });
+                drop(state);
+                #[cfg(feature = "bench")]
+                if let (Some(profile), Some(observation)) = (profile.as_ref(), observation) {
+                    profile.record_wal_v8_follower_wait(observation);
+                }
+
+                return Ok(Some(driver));
+            }
+            #[cfg(feature = "bench")]
+            if diagnostics_enabled {
+                state.durability_driver_waiters += 1;
+                if !follower_sampling_decided {
+                    follower_sampling_decided = true;
+                    follower_sample_id = profile
+                        .as_ref()
+                        .and_then(|profile| profile.next_wal_v8_follower_sample());
+                    if follower_sample_id.is_some() {
+                        follower_wait_started = Some(Instant::now());
+                        follower_wait_cpu_started = Some(super::digest::thread_cpu_time_ns());
+                    }
+                }
             }
             #[cfg(test)]
             {
@@ -1173,7 +1602,24 @@ impl WalV8ParallelCoordinator {
             // Close wakes followers as well, but admitted tickets may still
             // drain through the active driver. Poison or driver failure is
             // terminal; a normal handoff permits the next caller to drive.
+            #[cfg(feature = "bench")]
+            let observed_durability_generation = state.durability_generation;
             self.inner.durable_published.wait(&mut state);
+            #[cfg(feature = "bench")]
+            if diagnostics_enabled {
+                state.durability_driver_waiters -= 1;
+                if follower_sample_id.is_some() {
+                    follower_condvar_wait_count = follower_condvar_wait_count.saturating_add(1);
+                    if state.durability_generation != observed_durability_generation
+                        || !state.durability_driver_active
+                    {
+                        notify_to_resume_ns = state
+                            .last_durability_notify_at
+                            .map(|at| at.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+                        followers_woken_by_last_notify = state.last_durability_notify_waiters;
+                    }
+                }
+            }
             #[cfg(test)]
             {
                 state.durable_followers -= 1;
@@ -1292,6 +1738,8 @@ impl Drop for WalV8DurabilityDriver {
             poison_locked(&self.coordinator.inner, &mut state);
         }
         state.durability_driver_active = false;
+        #[cfg(feature = "bench")]
+        record_durable_notification_for_waiters(&mut state);
         self.coordinator.inner.durable_published.notify_all();
     }
 }
@@ -1303,6 +1751,17 @@ impl WalV8AdmissionPublisher for WalV8ParallelCoordinator {
         &self,
         plan: WalV8AdmissionPlan,
     ) -> Result<(WalV8BatchAssignment, Self::Guard)> {
+        self.admit_and_publish_with(plan, |_| Ok(()))
+    }
+
+    fn admit_and_publish_with<F>(
+        &self,
+        plan: WalV8AdmissionPlan,
+        register: F,
+    ) -> Result<(WalV8BatchAssignment, Self::Guard)>
+    where
+        F: FnOnce(WalV8BatchAssignment) -> Result<()>,
+    {
         validate_plan(plan)?;
         let data_bytes = u64::try_from(plan.frame_buffer_bytes)?;
         let reserved_bytes = u64::try_from(plan.logical_batch_bytes)?
@@ -1393,6 +1852,11 @@ impl WalV8AdmissionPublisher for WalV8ParallelCoordinator {
             initial_prefix_digest: self.inner.initial_prefix_digest,
         };
 
+        // Register physical-range ownership before publishing the assigned
+        // ticket. Extent preparation can otherwise race ahead and initialize
+        // a range whose DATA strategy has not yet been made visible.
+        register(assignment)?;
+
         state.tickets.push_back(TicketState {
             assignment,
             plan,
@@ -1418,6 +1882,10 @@ impl WalV8AdmissionPublisher for WalV8ParallelCoordinator {
         self.inner
             .admitted_ticket_end
             .store(next_ticket, Ordering::Release);
+        #[cfg(feature = "bench")]
+        if let Some(profile) = self.inner.profile.load_full() {
+            profile.record_commit_order_ticket_admitted(plan.commit_ts, ticket);
+        }
         signal_change(&self.inner, &mut state);
 
         Ok((
@@ -1479,6 +1947,14 @@ impl WalV8AdmissionGuard for WalV8ParallelAdmissionGuard {
             self.armed = false;
         }
     }
+
+    fn disarm_after_durable_prefix_check(&mut self, prefix_check: &WalV8DurablePrefixCheck) {
+        if self.armed && !prefix_check.covers(&self.coordinator, self.ticket) {
+            self.coordinator.poison_ticket_if_pending(self.ticket);
+        }
+
+        self.armed = false;
+    }
 }
 
 impl Drop for WalV8ParallelAdmissionGuard {
@@ -1493,6 +1969,24 @@ impl WalV8ParallelCoordinator {
 
         if ticket >= state.durable_ticket_end {
             poison_locked(&self.inner, &mut state);
+        }
+    }
+
+    /// Preserve the admission guards' poison fallback with one coordinator
+    /// lock when the caller is retiring a contiguous, already-collected range.
+    pub(crate) fn poison_ticket_prefix_if_pending(
+        &self,
+        ticket_end: u64,
+    ) -> WalV8DurablePrefixCheck {
+        let mut state = self.inner.state.lock();
+
+        if ticket_end > state.durable_ticket_end {
+            poison_locked(&self.inner, &mut state);
+        }
+
+        WalV8DurablePrefixCheck {
+            coordinator: Arc::clone(&self.inner),
+            ticket_end,
         }
     }
 }
@@ -1703,11 +2197,21 @@ fn signal_durability_progress(inner: &CoordinatorInner, state: &mut CoordinatorS
     inner.durability_changed.notify_all();
 }
 
+#[cfg(feature = "bench")]
+fn record_durable_notification_for_waiters(state: &mut CoordinatorState) {
+    if state.durability_driver_waiters > 0 {
+        state.last_durability_notify_at = Some(Instant::now());
+        state.last_durability_notify_waiters = state.durability_driver_waiters;
+    }
+}
+
 fn poison_locked(inner: &CoordinatorInner, state: &mut CoordinatorState) {
     if !state.poisoned {
         state.poisoned = true;
         signal_change(inner, state);
         signal_durability_progress(inner, state);
+        #[cfg(feature = "bench")]
+        record_durable_notification_for_waiters(state);
         inner.durable_published.notify_all();
     }
 }
@@ -1763,6 +2267,71 @@ mod tests {
 
     fn coordinator(max_inflight_tickets: usize) -> Result<WalV8ParallelCoordinator> {
         coordinator_with_byte_limit(max_inflight_tickets, 64 * 1024 * 1024)
+    }
+
+    #[test]
+    fn poison_ticket_prefix_if_pending_checks_the_prefix_once() -> Result<()> {
+        let coordinator = coordinator(4)?;
+        coordinator.inner.state.lock().durable_ticket_end = 3;
+
+        let covered = coordinator.poison_ticket_prefix_if_pending(3);
+        assert!(covered.covers(&coordinator, 2));
+        assert!(!covered.covers(&coordinator, 3));
+        assert!(!coordinator.is_poisoned());
+
+        coordinator.poison_ticket_prefix_if_pending(4);
+        assert!(coordinator.is_poisoned());
+
+        Ok(())
+    }
+
+    #[test]
+    fn disarm_after_durable_prefix_check_keeps_covered_guard_unarmed() -> Result<()> {
+        let coordinator = coordinator(4)?;
+        let batch = batch(1);
+        let mut encoded = admit(&batch, &coordinator)?.encode()?;
+        coordinator.inner.state.lock().durable_ticket_end = 1;
+
+        let prefix_check = coordinator.poison_ticket_prefix_if_pending(1);
+        encoded.disarm_after_durable_prefix_check(&prefix_check);
+        drop(encoded);
+
+        assert!(!coordinator.is_poisoned());
+
+        Ok(())
+    }
+
+    #[test]
+    fn disarm_after_durable_prefix_check_keeps_uncovered_guard_fail_safe() -> Result<()> {
+        let coordinator = coordinator(4)?;
+        let batch = batch(1);
+        let mut encoded = admit(&batch, &coordinator)?.encode()?;
+        let prefix_check = coordinator.poison_ticket_prefix_if_pending(0);
+
+        encoded.disarm_after_durable_prefix_check(&prefix_check);
+        drop(encoded);
+
+        assert!(coordinator.is_poisoned());
+
+        Ok(())
+    }
+
+    #[test]
+    fn durable_prefix_check_cannot_disarm_another_coordinators_guard() -> Result<()> {
+        let writer_coordinator = coordinator(4)?;
+        let other_coordinator = coordinator(4)?;
+        let batch = batch(1);
+        let mut encoded = admit(&batch, &writer_coordinator)?.encode()?;
+        other_coordinator.inner.state.lock().durable_ticket_end = 1;
+        let foreign_check = other_coordinator.poison_ticket_prefix_if_pending(1);
+
+        encoded.disarm_after_durable_prefix_check(&foreign_check);
+        drop(encoded);
+
+        assert!(writer_coordinator.is_poisoned());
+        assert!(!other_coordinator.is_poisoned());
+
+        Ok(())
     }
 
     fn batch(commit_ts: u64) -> WalBatch {

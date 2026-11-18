@@ -9,6 +9,7 @@ use std::{
     cell::RefCell,
     collections::{BTreeMap, BTreeSet},
     error::Error,
+    ffi::OsStr,
     fmt,
     fs::File,
     io,
@@ -17,19 +18,15 @@ use std::{
         fs::{FileExt, MetadataExt},
         io::AsRawFd,
     },
-    sync::Arc,
+    sync::{Arc, mpsc},
     thread,
     time::{Duration, Instant},
 };
 
-#[cfg(feature = "bench")]
-use std::ffi::OsStr;
-#[cfg(feature = "bench")]
-use std::sync::mpsc;
-
 #[cfg(test)]
 use std::os::unix::fs::OpenOptionsExt;
 
+use crate::wal::mutex_diagnostics::{self, MutexLockKind};
 use anyhow::{Context, Result, ensure};
 use crossbeam_queue::ArrayQueue;
 use parking_lot::{Condvar, Mutex};
@@ -71,7 +68,7 @@ use super::{
     },
     prepare::{
         AdmittedWalV8Batch, EncodedWalV8Batch, PreparedWalV8Batch, WalV8AdmissionPlan,
-        WalV8AdmissionPublisher, WalV8BatchAssignment, WalV8DigestReady,
+        WalV8AdmissionPublisher, WalV8BatchAssignment, WalV8DigestReady, WalV8WriteClass,
     },
     resource::WalV8ReservationOwner,
 };
@@ -84,6 +81,7 @@ const MAX_GROUP_TICKETS: usize = 8;
 const MAX_PARALLEL_INFLIGHT_TICKETS: usize = 32;
 const DATA_GROUP_JOIN_BUDGET: Duration = Duration::from_micros(10);
 const WAL_V8_PRODUCTION_EXTENT_WINDOW_BYTES: u64 = 1 << 20;
+const WAL_V8_EXTENT_LOOKAHEAD_ENV: &str = "TOYKV_WAL_V8_EXTENT_LOOKAHEAD";
 
 #[cfg(feature = "bench")]
 fn data_completion_to_frontier_start_ns(
@@ -191,7 +189,7 @@ pub(crate) struct WalV8ParallelWriter {
     io: Arc<WalV8ParallelIo>,
     reservation_owner: Option<Arc<WalV8ReservationOwner>>,
     frontier: Mutex<WalV8ParallelFrontier>,
-    frontier_resources: Mutex<BTreeMap<u64, WalV7OwnedBatchReservation>>,
+    frontier_resources: Mutex<BTreeMap<u64, WalV8FrontierResource>>,
     producer_guards: Arc<Mutex<BTreeMap<u64, EncodedWalV8Batch<WalV8ParallelAdmissionGuard>>>>,
     max_file_size: u64,
     installed_dev: u64,
@@ -204,8 +202,76 @@ pub(crate) struct WalV8ParallelWriter {
     /// detailed sync-observation capture.
     #[cfg(feature = "bench")]
     coalesce_budget_override_us: Option<u64>,
+    /// Benchmark-only experiment that batches credit release for Point-only
+    /// durable prefixes. Batch and mixed prefixes retain the existing path.
+    #[cfg(feature = "bench")]
+    batch_point_frontier_credits: bool,
     #[cfg(feature = "bench")]
     profile: arc_swap::ArcSwapOption<crate::mem_table::WriteProfile>,
+}
+
+struct WalV8FrontierResource {
+    reservation: WalV7OwnedBatchReservation,
+    #[cfg(feature = "bench")]
+    write_class: WalV8WriteClass,
+}
+
+#[cfg(feature = "bench")]
+struct WalV8DurabilityPhaseSampleGuard {
+    profile: Arc<crate::mem_table::WriteProfile>,
+    recorded: bool,
+}
+
+#[cfg(feature = "bench")]
+impl WalV8DurabilityPhaseSampleGuard {
+    fn new(profile: Arc<crate::mem_table::WriteProfile>) -> Self {
+        Self {
+            profile,
+            recorded: false,
+        }
+    }
+
+    fn record(mut self, observation: crate::mem_table::WalV8DurabilityPhaseObservation) {
+        self.profile.record_wal_v8_durability_phase(observation);
+        self.recorded = true;
+    }
+}
+
+#[cfg(feature = "bench")]
+impl Drop for WalV8DurabilityPhaseSampleGuard {
+    fn drop(&mut self) {
+        if !self.recorded {
+            self.profile.drop_wal_v8_durability_phase_sample();
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct WalV8RetirementObservation {
+    #[cfg(feature = "bench")]
+    wall_ns: u64,
+    #[cfg(feature = "bench")]
+    cpu_ns: u64,
+    #[cfg(feature = "bench")]
+    lock_wait_wall_ns: u64,
+    #[cfg(feature = "bench")]
+    lock_wait_cpu_ns: u64,
+    #[cfg(feature = "bench")]
+    lock_hold_wall_ns: u64,
+    #[cfg(feature = "bench")]
+    lock_hold_cpu_ns: u64,
+    #[cfg(feature = "bench")]
+    tickets: u64,
+    #[cfg(feature = "bench")]
+    collect_cpu_ns: u64,
+    #[cfg(feature = "bench")]
+    remove_cpu_ns: u64,
+    #[cfg(feature = "bench")]
+    release_cpu_ns: u64,
+    #[cfg(feature = "bench")]
+    finish_cpu_ns: u64,
+    #[cfg(feature = "bench")]
+    batch_point_frontier_credits: bool,
 }
 
 #[cfg(feature = "bench")]
@@ -267,6 +333,7 @@ const WAL_V8_EXTENT_PREPARATION_ENV: &str = "TOYKV_BENCH_V8_EXTENT_PREP";
 #[cfg(feature = "bench")]
 const WAL_V8_EXTENT_PREPARATION_BYTES_ENV: &str = "TOYKV_BENCH_V8_EXTENT_PREP_BYTES";
 #[cfg(feature = "bench")]
+const WAL_V8_POINT_FRONTIER_CREDIT_BATCH_ENV: &str = "TOYKV_BENCH_V8_POINT_FRONTIER_CREDIT_BATCH";
 const WAL_V8_EXTENT_PREPARATION_CHUNK_BYTES: usize = 128 * 1024;
 
 #[cfg(feature = "bench")]
@@ -290,8 +357,10 @@ impl WalExtentPreparationMode {
             Some("initialize") => Self::Initialize,
             Some("sliding-fallocate") => Self::SlidingFallocate,
             Some("sliding-initialize") => Self::SlidingInitialize,
+            Some("sliding-lookahead") => Self::SlidingLookahead,
+            Some("sliding-point-lookahead") => Self::SlidingPointLookahead,
             Some(value) => anyhow::bail!(
-                "invalid {WAL_V8_EXTENT_PREPARATION_ENV} {value:?}; expected `fallocate`, `initialize`, `sliding-fallocate`, or `sliding-initialize`"
+                "invalid {WAL_V8_EXTENT_PREPARATION_ENV} {value:?}; expected `fallocate`, `initialize`, `sliding-fallocate`, `sliding-initialize`, `sliding-lookahead`, or `sliding-point-lookahead`"
             ),
             None => anyhow::bail!("{WAL_V8_EXTENT_PREPARATION_ENV} is not valid UTF-8"),
         };
@@ -311,8 +380,28 @@ impl WalExtentPreparationMode {
     }
 
     const fn is_sliding(self) -> bool {
-        matches!(self, Self::SlidingFallocate | Self::SlidingInitialize)
+        matches!(
+            self,
+            Self::SlidingFallocate
+                | Self::SlidingInitialize
+                | Self::SlidingLookahead
+                | Self::SlidingPointLookahead
+        )
     }
+}
+
+fn wal_v8_extent_lookahead_from_value(value: Option<&OsStr>) -> Result<bool> {
+    match value.and_then(OsStr::to_str) {
+        None | Some("0" | "false") => Ok(false),
+        Some("1" | "true") => Ok(true),
+        Some(value) => anyhow::bail!(
+            "invalid {WAL_V8_EXTENT_LOOKAHEAD_ENV} {value:?}; expected `0`, `1`, `false`, or `true`"
+        ),
+    }
+}
+
+fn wal_v8_extent_lookahead_from_environment() -> Result<bool> {
+    wal_v8_extent_lookahead_from_value(std::env::var_os(WAL_V8_EXTENT_LOOKAHEAD_ENV).as_deref())
 }
 
 #[cfg(feature = "bench")]
@@ -661,6 +750,12 @@ impl WalV8SlidingExtentPreparation {
             initialization_elapsed_ns: state.initialization_elapsed_ns,
             wait_calls: state.wait_calls,
             wait_ns: state.wait_ns,
+            lookahead_check_calls: 0,
+            extent_policy_entries_scanned: 0,
+            extent_policy_map_max_entries: 0,
+            lookahead_worker_cpu_ns: 0,
+            extent_policy_storage: "vec",
+            extent_policy_scan_diagnostics_enabled: false,
         }
     }
 }
@@ -689,6 +784,15 @@ fn sliding_extent_target_end(
         .min(max_file_size))
 }
 
+fn extent_window_start(start_offset: u64, window_bytes: u64, offset: u64) -> Result<u64> {
+    let relative = offset
+        .checked_sub(start_offset)
+        .context("V8 extent offset precedes its initial cursor")?;
+    start_offset
+        .checked_add((relative / window_bytes) * window_bytes)
+        .context("V8 extent window start overflows")
+}
+
 struct WalV8ExtentSlack {
     start: u64,
     end: u64,
@@ -698,14 +802,348 @@ struct WalV8ExtentSlack {
 
 struct WalV8ExtentPreallocationState {
     prepared_end: u64,
+    allocated_end: u64,
+    requested_end: u64,
+    background_request_pending: bool,
+    extent_policies: WalV8ExtentPolicies,
     slack: Vec<WalV8ExtentSlack>,
     window_preallocation_disabled: bool,
+    failure: Option<String>,
     #[cfg(feature = "bench")]
     fallocate_calls: u64,
     #[cfg(feature = "bench")]
     allocated_bytes: u64,
     #[cfg(feature = "bench")]
+    initialization_chunks: u64,
+    #[cfg(feature = "bench")]
+    initialized_bytes: u64,
+    #[cfg(feature = "bench")]
+    initialization_elapsed_ns: u64,
+    #[cfg(feature = "bench")]
+    fallocate_elapsed_ns: u64,
+    #[cfg(feature = "bench")]
     elapsed_ns: u64,
+    #[cfg(feature = "bench")]
+    wait_calls: u64,
+    #[cfg(feature = "bench")]
+    wait_ns: u64,
+    #[cfg(feature = "bench")]
+    lookahead_check_calls: u64,
+    #[cfg(feature = "bench")]
+    extent_policy_scan_diagnostics_enabled: bool,
+    #[cfg(feature = "bench")]
+    extent_policy_entries_scanned: u64,
+    #[cfg(feature = "bench")]
+    extent_policy_map_max_entries: u64,
+    #[cfg(feature = "bench")]
+    lookahead_worker_cpu_ns: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WalV8ExtentPolicyStorageKind {
+    BTreeMap,
+    Vec,
+}
+
+enum WalV8ExtentPolicyStorage {
+    BTreeMap(BTreeMap<u64, WalV8ExtentPolicy>),
+    Vec(Vec<Option<WalV8ExtentPolicy>>),
+}
+
+/// Tracks the first write class assigned to each fixed WAL extent window.
+///
+/// The Vec representation keeps an `Option` per window so an unregistered
+/// window remains distinct from a window owned by a FallocateOnly write.
+struct WalV8ExtentPolicies {
+    start_offset: u64,
+    window_bytes: u64,
+    storage: WalV8ExtentPolicyStorage,
+    entries: usize,
+}
+
+impl WalV8ExtentPolicies {
+    fn new(start_offset: u64, window_bytes: u64, kind: WalV8ExtentPolicyStorageKind) -> Self {
+        let storage = match kind {
+            WalV8ExtentPolicyStorageKind::BTreeMap => {
+                WalV8ExtentPolicyStorage::BTreeMap(BTreeMap::new())
+            }
+            WalV8ExtentPolicyStorageKind::Vec => WalV8ExtentPolicyStorage::Vec(Vec::new()),
+        };
+        Self {
+            start_offset,
+            window_bytes,
+            storage,
+            entries: 0,
+        }
+    }
+
+    fn index(&self, extent_start: u64) -> Result<usize> {
+        let relative = extent_start
+            .checked_sub(self.start_offset)
+            .context("V8 extent policy precedes its initial cursor")?;
+        ensure!(
+            relative.is_multiple_of(self.window_bytes),
+            "V8 extent policy offset is not window-aligned"
+        );
+        usize::try_from(relative / self.window_bytes)
+            .context("V8 extent policy index exceeds addressable memory")
+    }
+
+    fn insert_if_absent(
+        &mut self,
+        extent_start: u64,
+        policy: WalV8ExtentPolicy,
+    ) -> Result<WalV8ExtentPolicy> {
+        let index = self.index(extent_start)?;
+        match &mut self.storage {
+            WalV8ExtentPolicyStorage::BTreeMap(policies) => {
+                let selected = *policies.entry(extent_start).or_insert(policy);
+                self.entries = policies.len();
+                Ok(selected)
+            }
+            WalV8ExtentPolicyStorage::Vec(policies) => {
+                let required_len = index
+                    .checked_add(1)
+                    .context("V8 extent policy vector length overflows")?;
+                if policies.len() < required_len {
+                    policies.resize(required_len, None);
+                }
+                let slot = &mut policies[index];
+                if let Some(existing) = slot {
+                    Ok(*existing)
+                } else {
+                    *slot = Some(policy);
+                    self.entries = self.entries.saturating_add(1);
+                    Ok(policy)
+                }
+            }
+        }
+    }
+
+    fn get(&self, extent_start: u64) -> Option<WalV8ExtentPolicy> {
+        let index = self.index(extent_start).ok()?;
+        match &self.storage {
+            WalV8ExtentPolicyStorage::BTreeMap(policies) => policies.get(&extent_start).copied(),
+            WalV8ExtentPolicyStorage::Vec(policies) => policies.get(index).copied().flatten(),
+        }
+    }
+
+    fn truncate_before(&mut self, end: u64) {
+        if end < self.start_offset {
+            return;
+        }
+        match &mut self.storage {
+            WalV8ExtentPolicyStorage::BTreeMap(policies) => {
+                policies.retain(|extent_start, _| *extent_start < end);
+                self.entries = policies.len();
+            }
+            WalV8ExtentPolicyStorage::Vec(policies) => {
+                let relative_end = end.saturating_sub(self.start_offset);
+                let retained_windows = relative_end / self.window_bytes
+                    + u64::from(!relative_end.is_multiple_of(self.window_bytes));
+                let retained_windows = usize::try_from(retained_windows).unwrap_or(usize::MAX);
+                let removed = policies
+                    .get(retained_windows..)
+                    .unwrap_or_default()
+                    .iter()
+                    .filter(|policy| policy.is_some())
+                    .count();
+                policies.truncate(retained_windows);
+                self.entries = self.entries.saturating_sub(removed);
+            }
+        }
+    }
+
+    fn has_unprepared_lookahead(
+        &self,
+        end: u64,
+        prepared_end: u64,
+        count_scanned: bool,
+    ) -> (bool, u64) {
+        match &self.storage {
+            WalV8ExtentPolicyStorage::BTreeMap(policies) => {
+                if count_scanned {
+                    let mut scanned = 0_u64;
+                    for (&extent_start, &policy) in policies {
+                        scanned = scanned.saturating_add(1);
+                        if policy == WalV8ExtentPolicy::Lookahead
+                            && extent_start < end
+                            && extent_start.saturating_add(self.window_bytes) > prepared_end
+                        {
+                            return (true, scanned);
+                        }
+                    }
+                    (false, scanned)
+                } else {
+                    (
+                        policies.iter().any(|(&extent_start, &policy)| {
+                            policy == WalV8ExtentPolicy::Lookahead
+                                && extent_start < end
+                                && extent_start.saturating_add(self.window_bytes) > prepared_end
+                        }),
+                        0,
+                    )
+                }
+            }
+            WalV8ExtentPolicyStorage::Vec(policies) => {
+                let lower = prepared_end.saturating_sub(self.window_bytes.saturating_sub(1));
+                if lower >= end || end <= self.start_offset {
+                    return (false, 0);
+                }
+                let relative_lower = lower.saturating_sub(self.start_offset);
+                let first_index = relative_lower / self.window_bytes
+                    + u64::from(!relative_lower.is_multiple_of(self.window_bytes));
+                let relative_end = end.saturating_sub(self.start_offset);
+                let end_index = relative_end / self.window_bytes
+                    + u64::from(!relative_end.is_multiple_of(self.window_bytes));
+                let Ok(first_index) = usize::try_from(first_index) else {
+                    return (false, 0);
+                };
+                let Ok(end_index) = usize::try_from(end_index) else {
+                    return (false, 0);
+                };
+                let start_index = first_index.min(policies.len());
+                let end_index = end_index.min(policies.len());
+                if start_index >= end_index {
+                    return (false, 0);
+                }
+
+                let Some(candidates) = policies.get(start_index..end_index) else {
+                    return (false, 0);
+                };
+                let Some(first_extent_start) = u64::try_from(start_index)
+                    .ok()
+                    .and_then(|index| index.checked_mul(self.window_bytes))
+                    .and_then(|relative| self.start_offset.checked_add(relative))
+                else {
+                    return (false, 0);
+                };
+
+                let mut scanned = 0_u64;
+                for (relative_index, policy) in candidates.iter().enumerate() {
+                    if count_scanned {
+                        scanned = scanned.saturating_add(1);
+                    }
+                    let Some(policy) = policy else {
+                        continue;
+                    };
+                    let Some(extent_start) = u64::try_from(relative_index)
+                        .ok()
+                        .and_then(|index| index.checked_mul(self.window_bytes))
+                        .and_then(|relative| first_extent_start.checked_add(relative))
+                    else {
+                        continue;
+                    };
+                    if *policy == WalV8ExtentPolicy::Lookahead
+                        && extent_start < end
+                        && extent_start.saturating_add(self.window_bytes) > prepared_end
+                    {
+                        return (true, scanned);
+                    }
+                }
+                (false, scanned)
+            }
+        }
+    }
+
+    fn kind(&self) -> WalV8ExtentPolicyStorageKind {
+        match &self.storage {
+            WalV8ExtentPolicyStorage::BTreeMap(_) => WalV8ExtentPolicyStorageKind::BTreeMap,
+            WalV8ExtentPolicyStorage::Vec(_) => WalV8ExtentPolicyStorageKind::Vec,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.entries
+    }
+}
+
+#[cfg(feature = "bench")]
+fn extent_policy_storage_kind_from_env() -> Result<WalV8ExtentPolicyStorageKind> {
+    match std::env::var("TOYKV_BENCH_V8_EXTENT_POLICY_STORAGE") {
+        Ok(value) if value == "btree" => Ok(WalV8ExtentPolicyStorageKind::BTreeMap),
+        Ok(value) if value == "vec" => Ok(WalV8ExtentPolicyStorageKind::Vec),
+        Ok(value) => anyhow::bail!(
+            "TOYKV_BENCH_V8_EXTENT_POLICY_STORAGE must be `btree` or `vec`, got `{value}`"
+        ),
+        Err(std::env::VarError::NotPresent) => Ok(WalV8ExtentPolicyStorageKind::Vec),
+        Err(error) => Err(error).context("read V8 extent policy storage setting"),
+    }
+}
+
+#[cfg(not(feature = "bench"))]
+fn extent_policy_storage_kind_from_env() -> Result<WalV8ExtentPolicyStorageKind> {
+    Ok(WalV8ExtentPolicyStorageKind::Vec)
+}
+
+#[cfg(feature = "bench")]
+fn extent_policy_scan_diagnostics_enabled_from_env() -> Result<bool> {
+    match std::env::var("TOYKV_BENCH_V8_EXTENT_POLICY_SCAN_DIAGNOSTICS") {
+        Ok(value) if value == "1" => Ok(true),
+        Ok(value) if value == "0" => Ok(false),
+        Ok(value) => anyhow::bail!(
+            "TOYKV_BENCH_V8_EXTENT_POLICY_SCAN_DIAGNOSTICS must be `0` or `1`, got `{value}`"
+        ),
+        Err(std::env::VarError::NotPresent) => Ok(true),
+        Err(error) => Err(error).context("read V8 extent policy scan diagnostics setting"),
+    }
+}
+
+#[cfg(not(feature = "bench"))]
+fn extent_policy_scan_diagnostics_enabled_from_env() -> Result<bool> {
+    Ok(false)
+}
+
+#[cfg(feature = "bench")]
+fn record_extent_policy_map_len(state: &mut WalV8ExtentPreallocationState) {
+    if !state.extent_policy_scan_diagnostics_enabled {
+        return;
+    }
+    let entries = u64::try_from(state.extent_policies.len()).unwrap_or(u64::MAX);
+    state.extent_policy_map_max_entries = state.extent_policy_map_max_entries.max(entries);
+}
+
+#[cfg(feature = "bench")]
+fn record_lookahead_worker_cpu(
+    state: &mut WalV8ExtentPreallocationState,
+    previous_cpu_ns: &mut u64,
+) {
+    let current_cpu_ns = digest::thread_cpu_time_ns();
+    state.lookahead_worker_cpu_ns = state
+        .lookahead_worker_cpu_ns
+        .saturating_add(current_cpu_ns.saturating_sub(*previous_cpu_ns));
+    *previous_cpu_ns = current_cpu_ns;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WalV8ExtentPolicy {
+    Lookahead,
+    FallocateOnly,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WalV8ExtentPreparationStrategy {
+    FallocateOnly,
+    Lookahead,
+    #[cfg(feature = "bench")]
+    PointOnlyLookahead,
+}
+
+impl WalV8ExtentPreparationStrategy {
+    const fn uses_lookahead(self) -> bool {
+        !matches!(self, Self::FallocateOnly)
+    }
+
+    const fn is_point_only(self) -> bool {
+        #[cfg(feature = "bench")]
+        {
+            matches!(self, Self::PointOnlyLookahead)
+        }
+        #[cfg(not(feature = "bench"))]
+        {
+            false
+        }
+    }
 }
 
 /// Sliding ext4 extent allocation for V8. Each window's unused suffix is
@@ -718,7 +1156,12 @@ struct WalV8ExtentPreallocator {
     window_bytes: u64,
     source_allocation_unit: u64,
     reservation_owner: Option<Arc<WalV8ReservationOwner>>,
-    state: Mutex<WalV8ExtentPreallocationState>,
+    strategy: WalV8ExtentPreparationStrategy,
+    state: Arc<Mutex<WalV8ExtentPreallocationState>>,
+    prepared: Arc<Condvar>,
+    preparation_lock: Arc<Mutex<()>>,
+    request_sender: Option<mpsc::Sender<()>>,
+    worker: Option<thread::JoinHandle<()>>,
 }
 
 impl WalV8ExtentPreallocator {
@@ -730,6 +1173,80 @@ impl WalV8ExtentPreallocator {
         window_bytes: u64,
         reservation_owner: Option<Arc<WalV8ReservationOwner>>,
     ) -> Result<Self> {
+        Self::new_with_strategy(
+            data_file,
+            sync_file,
+            start_offset,
+            max_file_size,
+            window_bytes,
+            reservation_owner,
+            WalV8ExtentPreparationStrategy::FallocateOnly,
+        )
+    }
+
+    fn new_with_lookahead(
+        data_file: File,
+        sync_file: &File,
+        start_offset: u64,
+        max_file_size: u64,
+        window_bytes: u64,
+        reservation_owner: Option<Arc<WalV8ReservationOwner>>,
+        lookahead: bool,
+    ) -> Result<Self> {
+        Self::new_with_strategy(
+            data_file,
+            sync_file,
+            start_offset,
+            max_file_size,
+            window_bytes,
+            reservation_owner,
+            if lookahead {
+                WalV8ExtentPreparationStrategy::Lookahead
+            } else {
+                WalV8ExtentPreparationStrategy::FallocateOnly
+            },
+        )
+    }
+
+    #[cfg(feature = "bench")]
+    fn new_with_point_only_lookahead(
+        data_file: File,
+        sync_file: &File,
+        start_offset: u64,
+        max_file_size: u64,
+        window_bytes: u64,
+        reservation_owner: Arc<WalV8ReservationOwner>,
+    ) -> Result<Self> {
+        Self::new_with_strategy(
+            data_file,
+            sync_file,
+            start_offset,
+            max_file_size,
+            window_bytes,
+            Some(reservation_owner),
+            #[cfg(feature = "bench")]
+            WalV8ExtentPreparationStrategy::PointOnlyLookahead,
+        )
+    }
+
+    fn new_with_strategy(
+        data_file: File,
+        sync_file: &File,
+        start_offset: u64,
+        max_file_size: u64,
+        window_bytes: u64,
+        reservation_owner: Option<Arc<WalV8ReservationOwner>>,
+        strategy: WalV8ExtentPreparationStrategy,
+    ) -> Result<Self> {
+        let lookahead = strategy.uses_lookahead();
+        let point_only_lookahead = strategy.is_point_only();
+        let extent_policy_storage_kind = extent_policy_storage_kind_from_env()?;
+        #[cfg(feature = "bench")]
+        let extent_policy_scan_diagnostics_enabled =
+            extent_policy_scan_diagnostics_enabled_from_env()?;
+        #[cfg(not(feature = "bench"))]
+        let _extent_policy_scan_diagnostics_enabled =
+            extent_policy_scan_diagnostics_enabled_from_env()?;
         ensure!(
             is_o_direct_file(&data_file)?,
             "V8 sliding extent preparation requires an O_DIRECT DATA worker"
@@ -767,6 +1284,104 @@ impl WalV8ExtentPreallocator {
             );
         }
 
+        ensure!(
+            !lookahead || reservation_owner.is_some(),
+            "V8 extent lookahead requires a quota reservation owner"
+        );
+
+        let state = Arc::new(Mutex::new(WalV8ExtentPreallocationState {
+            prepared_end: start_offset,
+            allocated_end: start_offset,
+            requested_end: start_offset,
+            background_request_pending: false,
+            extent_policies: WalV8ExtentPolicies::new(
+                start_offset,
+                window_bytes,
+                extent_policy_storage_kind,
+            ),
+            slack: Vec::new(),
+            window_preallocation_disabled: false,
+            failure: None,
+            #[cfg(feature = "bench")]
+            fallocate_calls: 0,
+            #[cfg(feature = "bench")]
+            allocated_bytes: 0,
+            #[cfg(feature = "bench")]
+            initialization_chunks: 0,
+            #[cfg(feature = "bench")]
+            initialized_bytes: 0,
+            #[cfg(feature = "bench")]
+            initialization_elapsed_ns: 0,
+            #[cfg(feature = "bench")]
+            fallocate_elapsed_ns: 0,
+            #[cfg(feature = "bench")]
+            elapsed_ns: 0,
+            #[cfg(feature = "bench")]
+            wait_calls: 0,
+            #[cfg(feature = "bench")]
+            wait_ns: 0,
+            #[cfg(feature = "bench")]
+            lookahead_check_calls: 0,
+            #[cfg(feature = "bench")]
+            extent_policy_scan_diagnostics_enabled,
+            #[cfg(feature = "bench")]
+            extent_policy_entries_scanned: 0,
+            #[cfg(feature = "bench")]
+            extent_policy_map_max_entries: 0,
+            #[cfg(feature = "bench")]
+            lookahead_worker_cpu_ns: 0,
+        }));
+        let prepared = Arc::new(Condvar::new());
+        let preparation_lock = Arc::new(Mutex::new(()));
+        let (request_sender, worker) = if lookahead {
+            let worker_file = data_file
+                .try_clone()
+                .context("clone V8 WAL handle for extent lookahead")?;
+            let worker_state = Arc::clone(&state);
+            let worker_prepared = Arc::clone(&prepared);
+            let worker_preparation_lock = Arc::clone(&preparation_lock);
+            let worker_owner = Arc::clone(
+                reservation_owner
+                    .as_ref()
+                    .context("V8 extent lookahead lost its quota owner")?,
+            );
+            let (request_sender, request_receiver) = mpsc::channel();
+            let worker = thread::Builder::new()
+                .name("toy-kv-v8-extent-lookahead".to_owned())
+                .spawn(move || {
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        WalV8ExtentLookaheadWorker {
+                            data_file: worker_file,
+                            requests: request_receiver,
+                            state: worker_state.clone(),
+                            prepared: worker_prepared.clone(),
+                            preparation_lock: worker_preparation_lock,
+                            owner: worker_owner,
+                            start_offset,
+                            max_file_size,
+                            window_bytes,
+                            point_only_lookahead,
+                        }
+                        .run()
+                    }));
+                    let failure = match result {
+                        Ok(Ok(())) => None,
+                        Ok(Err(error)) => Some(format!("{error:#}")),
+                        Err(_) => Some("background V8 extent lookahead panicked".to_owned()),
+                    };
+                    if let Some(failure) = failure {
+                        let (_extent_state_timer, mut state) =
+                            mutex_diagnostics::lock(&worker_state, MutexLockKind::ExtentState);
+                        state.failure = Some(failure);
+                        worker_prepared.notify_all();
+                    }
+                })
+                .context("failed to spawn V8 extent lookahead worker")?;
+            (Some(request_sender), Some(worker))
+        } else {
+            (None, None)
+        };
+
         Ok(Self {
             data_file,
             start_offset,
@@ -776,21 +1391,152 @@ impl WalV8ExtentPreallocator {
                 .as_ref()
                 .map_or(FRAME_LEN_U64, |owner| owner.source_allocation_unit()),
             reservation_owner,
-            state: Mutex::new(WalV8ExtentPreallocationState {
-                prepared_end: start_offset,
-                slack: Vec::new(),
-                window_preallocation_disabled: false,
-                #[cfg(feature = "bench")]
-                fallocate_calls: 0,
-                #[cfg(feature = "bench")]
-                allocated_bytes: 0,
-                #[cfg(feature = "bench")]
-                elapsed_ns: 0,
-            }),
+            strategy,
+            state,
+            prepared,
+            preparation_lock,
+            request_sender,
+            worker,
         })
     }
 
+    fn register_data_range(
+        &self,
+        start: u64,
+        end: u64,
+        write_class: WalV8WriteClass,
+        frame_bytes: u64,
+    ) -> Result<()> {
+        if !self.strategy.is_point_only() {
+            return Ok(());
+        }
+        ensure!(
+            start < end
+                && start >= self.start_offset
+                && end <= self.max_file_size
+                && start.is_multiple_of(FRAME_LEN_U64)
+                && end.is_multiple_of(FRAME_LEN_U64),
+            "invalid V8 DATA range for extent policy registration"
+        );
+
+        let policy = if write_class == WalV8WriteClass::Point && frame_bytes == FRAME_LEN_U64 {
+            WalV8ExtentPolicy::Lookahead
+        } else {
+            WalV8ExtentPolicy::FallocateOnly
+        };
+        let (_extent_state_timer, mut state) =
+            mutex_diagnostics::lock(&self.state, MutexLockKind::ExtentState);
+        if let Some(failure) = &state.failure {
+            anyhow::bail!("V8 extent lookahead failed: {failure}");
+        }
+        let prepared_end = state.prepared_end;
+        let mut extent_start = self.extent_window_start(start)?;
+        while extent_start < end {
+            // The first admitted DATA range chooses the policy for this
+            // physical extent. Single-frame Point API writes can use lookahead;
+            // Batch API writes and multi-frame writes keep the existing
+            // fallocate-only path. Later ranges inherit the first owner's policy.
+            // If preparation already passed it, keep the conservative
+            // fallocate-only policy instead of claiming bytes were initialized.
+            state.extent_policies.insert_if_absent(
+                extent_start,
+                if extent_start < prepared_end {
+                    WalV8ExtentPolicy::FallocateOnly
+                } else {
+                    policy
+                },
+            )?;
+            extent_start = extent_start
+                .checked_add(self.window_bytes)
+                .context("V8 extent policy cursor overflows")?;
+        }
+
+        #[cfg(feature = "bench")]
+        record_extent_policy_map_len(&mut state);
+
+        Ok(())
+    }
+
+    fn extent_window_start(&self, offset: u64) -> Result<u64> {
+        let relative = offset
+            .checked_sub(self.start_offset)
+            .context("V8 extent offset precedes its initial cursor")?;
+        self.start_offset
+            .checked_add((relative / self.window_bytes) * self.window_bytes)
+            .context("V8 extent window start overflows")
+    }
+
+    fn has_unprepared_lookahead_extent(
+        &self,
+        state: &mut WalV8ExtentPreallocationState,
+        end: u64,
+    ) -> bool {
+        let prepared_end = state.prepared_end;
+        #[cfg(feature = "bench")]
+        let diagnostics_enabled = state.extent_policy_scan_diagnostics_enabled;
+        #[cfg(not(feature = "bench"))]
+        let diagnostics_enabled = false;
+        #[cfg(feature = "bench")]
+        let (has_unprepared, entries_scanned) =
+            state
+                .extent_policies
+                .has_unprepared_lookahead(end, prepared_end, diagnostics_enabled);
+        #[cfg(not(feature = "bench"))]
+        let (has_unprepared, _) =
+            state
+                .extent_policies
+                .has_unprepared_lookahead(end, prepared_end, diagnostics_enabled);
+        #[cfg(feature = "bench")]
+        if diagnostics_enabled {
+            state.lookahead_check_calls = state.lookahead_check_calls.saturating_add(1);
+            state.extent_policy_entries_scanned = state
+                .extent_policy_entries_scanned
+                .saturating_add(entries_scanned);
+            state.extent_policy_map_max_entries = state
+                .extent_policy_map_max_entries
+                .max(u64::try_from(state.extent_policies.len()).unwrap_or(u64::MAX));
+        }
+
+        has_unprepared
+    }
+
+    fn claim_fallocate_only_windows(
+        &self,
+        state: &mut WalV8ExtentPreallocationState,
+        start: u64,
+        end: u64,
+    ) -> Result<()> {
+        if !self.strategy.is_point_only() || start >= end {
+            return Ok(());
+        }
+
+        let mut extent_start = self.extent_window_start(start)?;
+        while extent_start < end {
+            state
+                .extent_policies
+                .insert_if_absent(extent_start, WalV8ExtentPolicy::FallocateOnly)?;
+            extent_start = extent_start
+                .checked_add(self.window_bytes)
+                .context("V8 extent policy cursor overflows")?;
+        }
+
+        #[cfg(feature = "bench")]
+        record_extent_policy_map_len(state);
+
+        Ok(())
+    }
+
     fn ensure_prepared_through(&self, required_end: u64) -> Result<()> {
+        if self.strategy.uses_lookahead()
+            && (!self.strategy.is_point_only() || {
+                let (_extent_state_timer, mut state) =
+                    mutex_diagnostics::lock(&self.state, MutexLockKind::ExtentState);
+                self.has_unprepared_lookahead_extent(&mut state, required_end)
+            })
+        {
+            return self.wait_for_prepared_through(required_end);
+        }
+
         self.ensure_prepared_through_with(required_end, |start, end| {
             fallocate_wal_range(&self.data_file, start, end)
         })
@@ -805,7 +1551,18 @@ impl WalV8ExtentPreallocator {
             required_end <= self.max_file_size,
             "V8 sliding extent preparation exceeds the WAL segment limit"
         );
-        let mut state = self.state.lock();
+        let (_preparation_timer, _preparation) = self
+            .strategy
+            .uses_lookahead()
+            .then(|| {
+                mutex_diagnostics::lock(&self.preparation_lock, MutexLockKind::ExtentPreparation)
+            })
+            .unzip();
+        let (_extent_state_timer, mut state) =
+            mutex_diagnostics::lock(&self.state, MutexLockKind::ExtentState);
+        if let Some(failure) = &state.failure {
+            anyhow::bail!("V8 extent preparation failed: {failure}");
+        }
         if required_end <= state.prepared_end {
             return Ok(());
         }
@@ -825,6 +1582,15 @@ impl WalV8ExtentPreallocator {
             // keep those paths exact rather than allocating uncharged space.
             target_end = required_end;
         }
+        if self.strategy.is_point_only()
+            && self.has_unprepared_lookahead_extent(&mut state, target_end)
+        {
+            drop(state);
+            drop(_extent_state_timer);
+            drop(_preparation);
+            drop(_preparation_timer);
+            return self.wait_for_prepared_through(target_end);
+        }
         let mut slack_reservation = None;
         if target_end > required_end
             && let Some(owner) = &self.reservation_owner
@@ -843,7 +1609,7 @@ impl WalV8ExtentPreallocator {
             }
         }
 
-        let prepared_start = state.prepared_end;
+        let prepared_start = state.allocated_end;
         if let Some((reservation_id, charged_bytes)) = slack_reservation.take() {
             // Keep the charge reachable even if fallocate fails after
             // partially allocating the speculative suffix.
@@ -874,15 +1640,18 @@ impl WalV8ExtentPreallocator {
         #[cfg(feature = "bench")]
         {
             state.fallocate_calls = state.fallocate_calls.saturating_add(fallocate_calls);
-            state.elapsed_ns = state
-                .elapsed_ns
-                .saturating_add(u64::try_from(started_at.elapsed().as_nanos()).unwrap_or(u64::MAX));
+            let elapsed_ns = u64::try_from(started_at.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            state.fallocate_elapsed_ns = state.fallocate_elapsed_ns.saturating_add(elapsed_ns);
+            state.elapsed_ns = state.elapsed_ns.saturating_add(elapsed_ns);
         }
         let prepared_end = prepared_end?;
         target_end = prepared_end;
+        let prepared_start = state.prepared_end;
+        self.claim_fallocate_only_windows(&mut state, prepared_start, target_end)?;
         #[cfg(feature = "bench")]
         let allocated_bytes = target_end - prepared_start;
 
+        state.allocated_end = target_end;
         state.prepared_end = target_end;
         #[cfg(feature = "bench")]
         {
@@ -892,6 +1661,76 @@ impl WalV8ExtentPreallocator {
         ensure!(
             state.prepared_end >= required_end,
             "V8 sliding extent preparation did not cover the requested write"
+        );
+
+        Ok(())
+    }
+
+    fn queue_background_preparation(&self, required_end: u64) -> Result<()> {
+        ensure!(
+            self.strategy.uses_lookahead(),
+            "V8 background extent preparation is not enabled"
+        );
+        ensure!(
+            required_end <= self.max_file_size,
+            "V8 sliding extent preparation exceeds the WAL segment limit"
+        );
+        let (_extent_state_timer, mut state) =
+            mutex_diagnostics::lock(&self.state, MutexLockKind::ExtentState);
+        if let Some(failure) = &state.failure {
+            anyhow::bail!("V8 extent lookahead failed: {failure}");
+        }
+        if self.strategy.is_point_only()
+            && !self.has_unprepared_lookahead_extent(&mut state, required_end)
+        {
+            return Ok(());
+        }
+        if required_end <= state.prepared_end || required_end <= state.requested_end {
+            return Ok(());
+        }
+
+        if !state.background_request_pending {
+            let sender = self
+                .request_sender
+                .as_ref()
+                .context("V8 extent lookahead worker is unavailable")?;
+            sender
+                .send(())
+                .context("V8 extent lookahead worker stopped unexpectedly")?;
+            state.background_request_pending = true;
+        }
+        state.requested_end = required_end;
+
+        Ok(())
+    }
+
+    fn wait_for_prepared_through(&self, required_end: u64) -> Result<()> {
+        self.queue_background_preparation(required_end)?;
+        let (mut extent_state_timer, mut state) =
+            mutex_diagnostics::lock(&self.state, MutexLockKind::ExtentState);
+        while required_end > state.prepared_end && state.failure.is_none() {
+            #[cfg(feature = "bench")]
+            {
+                state.wait_calls = state.wait_calls.saturating_add(1);
+            }
+            #[cfg(feature = "bench")]
+            let wait_started = Instant::now();
+            let paused_at = extent_state_timer.pause_for_condvar();
+            self.prepared.wait(&mut state);
+            extent_state_timer.resume_after_condvar(paused_at);
+            #[cfg(feature = "bench")]
+            {
+                state.wait_ns = state.wait_ns.saturating_add(
+                    u64::try_from(wait_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                );
+            }
+        }
+        if let Some(failure) = &state.failure {
+            anyhow::bail!("V8 extent lookahead failed: {failure}");
+        }
+        ensure!(
+            required_end <= state.prepared_end,
+            "V8 extent lookahead stopped before preparing the requested range"
         );
 
         Ok(())
@@ -908,7 +1747,8 @@ impl WalV8ExtentPreallocator {
         let Some(owner) = &self.reservation_owner else {
             return Ok(());
         };
-        let mut state = self.state.lock();
+        let (_extent_state_timer, mut state) =
+            mutex_diagnostics::lock(&self.state, MutexLockKind::ExtentState);
         let first = state.slack.partition_point(|window| window.end <= start);
         for window in &mut state.slack[first..] {
             if window.start >= end {
@@ -942,7 +1782,15 @@ impl WalV8ExtentPreallocator {
         let Some(owner) = &self.reservation_owner else {
             return Ok(());
         };
-        let mut state = self.state.lock();
+        let (_preparation_timer, _preparation) = self
+            .strategy
+            .uses_lookahead()
+            .then(|| {
+                mutex_diagnostics::lock(&self.preparation_lock, MutexLockKind::ExtentPreparation)
+            })
+            .unzip();
+        let (_extent_state_timer, mut state) =
+            mutex_diagnostics::lock(&self.state, MutexLockKind::ExtentState);
         state.window_preallocation_disabled = true;
         if state.slack.iter().all(|window| window.charged_bytes == 0) {
             return Ok(());
@@ -953,6 +1801,9 @@ impl WalV8ExtentPreallocator {
         // the speculative suffix may be removed, and its charge stays held
         // until that removal is durable.
         state.prepared_end = state.prepared_end.min(allocated_tail);
+        state.allocated_end = state.allocated_end.min(allocated_tail);
+        state.requested_end = state.requested_end.min(allocated_tail);
+        state.extent_policies.truncate_before(allocated_tail);
         self.data_file
             .set_len(allocated_tail)
             .context("truncate speculative v8 WAL extent tail")?;
@@ -973,24 +1824,307 @@ impl WalV8ExtentPreallocator {
         let state = self.state.lock();
 
         WalV8SlidingExtentPreparationDiagnostics {
-            mode: WalExtentPreparationMode::SlidingFallocate,
+            mode: if self.strategy.is_point_only() {
+                WalExtentPreparationMode::SlidingPointLookahead
+            } else if self.strategy.uses_lookahead() {
+                WalExtentPreparationMode::SlidingLookahead
+            } else {
+                WalExtentPreparationMode::SlidingFallocate
+            },
             start_offset: self.start_offset,
             max_file_size: self.max_file_size,
             window_bytes: self.window_bytes,
             initialization_chunk_bytes: WAL_V8_EXTENT_PREPARATION_CHUNK_BYTES as u64,
             prepared_end: state.prepared_end,
-            allocated_end: state.prepared_end,
+            allocated_end: state.allocated_end,
             fallocate_calls: state.fallocate_calls,
             allocated_bytes: state.allocated_bytes,
-            initialization_chunks: 0,
-            initialized_bytes: 0,
+            initialization_chunks: state.initialization_chunks,
+            initialized_bytes: state.initialized_bytes,
             elapsed_ns: state.elapsed_ns,
-            fallocate_elapsed_ns: state.elapsed_ns,
-            initialization_elapsed_ns: 0,
-            wait_calls: 0,
-            wait_ns: 0,
+            fallocate_elapsed_ns: state.fallocate_elapsed_ns,
+            initialization_elapsed_ns: state.initialization_elapsed_ns,
+            wait_calls: state.wait_calls,
+            wait_ns: state.wait_ns,
+            lookahead_check_calls: state.lookahead_check_calls,
+            extent_policy_entries_scanned: state.extent_policy_entries_scanned,
+            extent_policy_map_max_entries: state.extent_policy_map_max_entries,
+            lookahead_worker_cpu_ns: state.lookahead_worker_cpu_ns,
+            extent_policy_storage: match state.extent_policies.kind() {
+                WalV8ExtentPolicyStorageKind::BTreeMap => "btree",
+                WalV8ExtentPolicyStorageKind::Vec => "vec",
+            },
+            extent_policy_scan_diagnostics_enabled: state.extent_policy_scan_diagnostics_enabled,
         }
     }
+}
+
+impl Drop for WalV8ExtentPreallocator {
+    fn drop(&mut self) {
+        self.request_sender.take();
+        if let Some(worker) = self.worker.take()
+            && worker.join().is_err()
+        {
+            log::error!("V8 extent lookahead worker panicked");
+        }
+    }
+}
+
+struct WalV8ExtentLookaheadWorker {
+    data_file: File,
+    requests: mpsc::Receiver<()>,
+    state: Arc<Mutex<WalV8ExtentPreallocationState>>,
+    prepared: Arc<Condvar>,
+    preparation_lock: Arc<Mutex<()>>,
+    owner: Arc<WalV8ReservationOwner>,
+    start_offset: u64,
+    max_file_size: u64,
+    window_bytes: u64,
+    point_only_lookahead: bool,
+}
+
+impl WalV8ExtentLookaheadWorker {
+    fn run(self) -> Result<()> {
+        let Self {
+            data_file,
+            requests,
+            state,
+            prepared,
+            preparation_lock,
+            owner,
+            start_offset,
+            max_file_size,
+            window_bytes,
+            point_only_lookahead,
+        } = self;
+        let chunk_bytes = WAL_V8_EXTENT_PREPARATION_CHUNK_BYTES as u64;
+        #[cfg(feature = "bench")]
+        let mut worker_cpu_checkpoint = digest::thread_cpu_time_ns();
+        let mut zeros = DirectBuf::new(chunk_bytes as usize);
+        while requests.recv().is_ok() {
+            let (_preparation_timer, _preparation) =
+                mutex_diagnostics::lock(&preparation_lock, MutexLockKind::ExtentPreparation);
+            loop {
+                let (_extent_state_timer, mut state_guard) =
+                    mutex_diagnostics::lock(&state, MutexLockKind::ExtentState);
+                let required_end = state_guard.requested_end;
+                if required_end <= state_guard.prepared_end {
+                    state_guard.background_request_pending = false;
+                    #[cfg(feature = "bench")]
+                    record_lookahead_worker_cpu(&mut state_guard, &mut worker_cpu_checkpoint);
+                    prepared.notify_all();
+                    break;
+                }
+                ensure!(
+                    required_end <= max_file_size,
+                    "V8 extent lookahead request exceeds the WAL segment limit"
+                );
+
+                let mut target_end = if state_guard.window_preallocation_disabled {
+                    required_end
+                } else {
+                    sliding_extent_target_end(
+                        start_offset,
+                        max_file_size,
+                        window_bytes,
+                        required_end,
+                    )?
+                };
+                let mut slack_reservation = None;
+                if target_end > required_end {
+                    let slack_bytes = target_end - required_end;
+                    let charged_bytes =
+                        round_up_extent_charge(slack_bytes, owner.source_allocation_unit())?;
+                    match owner.reserve_extent_slack(charged_bytes) {
+                        Ok(reservation_id) => {
+                            slack_reservation = Some((reservation_id, charged_bytes));
+                        }
+                        Err(WalV7ReservationError::SourceSpoolLimit { .. }) => {
+                            target_end = required_end;
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+
+                if let Some((reservation_id, charged_bytes)) = slack_reservation {
+                    state_guard.slack.push(WalV8ExtentSlack {
+                        start: required_end,
+                        end: target_end,
+                        reservation_id,
+                        charged_bytes,
+                    });
+                }
+                let allocated_start = state_guard.allocated_end;
+                let mut preallocation_disabled = state_guard.window_preallocation_disabled;
+                drop(state_guard);
+                drop(_extent_state_timer);
+
+                let mut fallocate_calls = 0_u64;
+                let allocation_started = Instant::now();
+                let allocated_end = if target_end > allocated_start {
+                    fallocate_sliding_extent_with_fallback(
+                        allocated_start,
+                        required_end,
+                        target_end,
+                        &mut preallocation_disabled,
+                        |start, end| {
+                            fallocate_calls = fallocate_calls.saturating_add(1);
+                            fallocate_wal_range(&data_file, start, end)
+                        },
+                    )?
+                } else {
+                    allocated_start
+                };
+                ensure!(
+                    allocated_end >= required_end,
+                    "V8 extent lookahead allocation missed the requested prefix"
+                );
+                let allocation_elapsed_ns =
+                    u64::try_from(allocation_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+
+                let (_extent_state_timer, mut state_guard) =
+                    mutex_diagnostics::lock(&state, MutexLockKind::ExtentState);
+                ensure!(
+                    state_guard.allocated_end == allocated_start,
+                    "V8 extent lookahead lost its serialized allocation prefix"
+                );
+                state_guard.window_preallocation_disabled = preallocation_disabled;
+                state_guard.allocated_end = allocated_end;
+                #[cfg(feature = "bench")]
+                {
+                    state_guard.fallocate_calls =
+                        state_guard.fallocate_calls.saturating_add(fallocate_calls);
+                    state_guard.allocated_bytes = state_guard
+                        .allocated_bytes
+                        .saturating_add(allocated_end - allocated_start);
+                    state_guard.fallocate_elapsed_ns = state_guard
+                        .fallocate_elapsed_ns
+                        .saturating_add(allocation_elapsed_ns);
+                    state_guard.elapsed_ns =
+                        state_guard.elapsed_ns.saturating_add(allocation_elapsed_ns);
+                }
+                #[cfg(not(feature = "bench"))]
+                let _ = (fallocate_calls, allocation_elapsed_ns);
+                drop(state_guard);
+
+                loop {
+                    let (_extent_state_timer, mut state_guard) =
+                        mutex_diagnostics::lock(&state, MutexLockKind::ExtentState);
+                    let initialized_start = state_guard.prepared_end;
+                    if initialized_start >= allocated_end {
+                        break;
+                    }
+                    let extent_start =
+                        extent_window_start(start_offset, window_bytes, initialized_start)?;
+                    let extent_end = extent_start
+                        .checked_add(window_bytes)
+                        .context("V8 extent lookahead window end overflows")?
+                        .min(allocated_end);
+                    let extent_policy = if point_only_lookahead {
+                        let policy = state_guard
+                            .extent_policies
+                            .insert_if_absent(extent_start, WalV8ExtentPolicy::FallocateOnly)?;
+                        #[cfg(feature = "bench")]
+                        record_extent_policy_map_len(&mut state_guard);
+                        policy
+                    } else {
+                        WalV8ExtentPolicy::Lookahead
+                    };
+                    if extent_policy == WalV8ExtentPolicy::FallocateOnly {
+                        state_guard.prepared_end = extent_end;
+                        prepared.notify_all();
+                        continue;
+                    }
+                    let initialized_end = initialized_start
+                        .checked_add(chunk_bytes)
+                        .context("V8 extent lookahead chunk end overflows")?
+                        .min(extent_end);
+                    let chunk_len = usize::try_from(initialized_end - initialized_start)?;
+                    ensure!(
+                        initialized_start.is_multiple_of(FRAME_LEN_U64)
+                            && chunk_len.is_multiple_of(FRAME_LEN_U64 as usize),
+                        "V8 extent lookahead lost direct-I/O alignment"
+                    );
+                    drop(state_guard);
+                    drop(_extent_state_timer);
+
+                    let initialization_started = Instant::now();
+                    initialize_v8_extent_chunk(&state, initialized_start, initialized_end, || {
+                        zeros.zero_range(0, chunk_len);
+                        data_file
+                            .write_all_at(zeros.initialized_slice(0, chunk_len), initialized_start)
+                            .with_context(|| {
+                                format!("initialize V8 WAL extent at offset {initialized_start}")
+                            })
+                    })?;
+
+                    #[allow(unused_mut)]
+                    let (extent_state_timer, mut state_guard) =
+                        mutex_diagnostics::lock(&state, MutexLockKind::ExtentState);
+                    ensure!(
+                        state_guard.prepared_end == initialized_end,
+                        "V8 extent lookahead failed to publish its initialized prefix"
+                    );
+                    ensure!(
+                        state_guard.allocated_end >= initialized_end,
+                        "V8 extent lookahead initialized beyond allocated space"
+                    );
+                    #[cfg(feature = "bench")]
+                    {
+                        let initialization_elapsed_ns =
+                            u64::try_from(initialization_started.elapsed().as_nanos())
+                                .unwrap_or(u64::MAX);
+                        state_guard.initialization_chunks =
+                            state_guard.initialization_chunks.saturating_add(1);
+                        state_guard.initialized_bytes = state_guard
+                            .initialized_bytes
+                            .saturating_add(initialized_end - initialized_start);
+                        state_guard.initialization_elapsed_ns = state_guard
+                            .initialization_elapsed_ns
+                            .saturating_add(initialization_elapsed_ns);
+                        state_guard.elapsed_ns = state_guard
+                            .elapsed_ns
+                            .saturating_add(initialization_elapsed_ns);
+                        record_lookahead_worker_cpu(&mut state_guard, &mut worker_cpu_checkpoint);
+                    }
+                    #[cfg(not(feature = "bench"))]
+                    let _ = initialization_started;
+                    drop(state_guard);
+                    drop(extent_state_timer);
+                    prepared.notify_all();
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+fn initialize_v8_extent_chunk(
+    state: &Mutex<WalV8ExtentPreallocationState>,
+    initialized_start: u64,
+    initialized_end: u64,
+    write_chunk: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    ensure!(
+        initialized_end > initialized_start,
+        "V8 extent initialization chunk is empty"
+    );
+    write_chunk()?;
+
+    let (_extent_state_timer, mut state) =
+        mutex_diagnostics::lock(state, MutexLockKind::ExtentState);
+    ensure!(
+        state.prepared_end == initialized_start,
+        "V8 extent lookahead lost its serialized initialization prefix"
+    );
+    ensure!(
+        state.allocated_end >= initialized_end,
+        "V8 extent lookahead initialized beyond allocated space"
+    );
+    state.prepared_end = initialized_end;
+
+    Ok(())
 }
 
 fn round_up_extent_charge(bytes: u64, unit: u64) -> Result<u64> {
@@ -1276,6 +2410,23 @@ fn coalesce_budget_override_from_environment() -> Result<Option<u64>> {
     Ok(Some(budget_us))
 }
 
+#[cfg(feature = "bench")]
+fn point_frontier_credit_batch_from_environment() -> Result<bool> {
+    let Some(value) = std::env::var_os(WAL_V8_POINT_FRONTIER_CREDIT_BATCH_ENV) else {
+        return Ok(false);
+    };
+    let value = value
+        .to_str()
+        .with_context(|| format!("{WAL_V8_POINT_FRONTIER_CREDIT_BATCH_ENV} is not valid UTF-8"))?;
+    match value {
+        "0" => Ok(false),
+        "1" => Ok(true),
+        _ => anyhow::bail!(
+            "invalid {WAL_V8_POINT_FRONTIER_CREDIT_BATCH_ENV} {value:?}; expected `0` or `1`"
+        ),
+    }
+}
+
 struct WalV8ParallelFrontier {
     frontier: WalV8Frontier,
     offset: u64,
@@ -1498,6 +2649,12 @@ impl WalV8ParallelIo {
     }
 
     fn request_extent_preparation_through(&self, required_end: u64) -> Result<()> {
+        if let Some(preallocator) = &self.extent_preallocator
+            && preallocator.strategy.uses_lookahead()
+        {
+            return preallocator.queue_background_preparation(required_end);
+        }
+
         #[cfg(feature = "bench")]
         if let Some(preparation) = &self.extent_preparation
             && preparation.mode == WalExtentPreparationMode::SlidingInitialize
@@ -1575,6 +2732,20 @@ impl WalV8ParallelIo {
         Ok(())
     }
 
+    fn default_group_join_budget(&self) -> Duration {
+        #[cfg(test)]
+        {
+            Duration::from_micros(
+                self.group_join_micros
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            )
+        }
+        #[cfg(not(test))]
+        {
+            DATA_GROUP_JOIN_BUDGET
+        }
+    }
+
     fn publish_data(&self, ticket: u64, file_offset: u64, buffer: WalV8DataBuffer) -> Result<()> {
         let allocation_end = file_offset
             .checked_add(u64::try_from(buffer.len())?)
@@ -1611,22 +2782,21 @@ impl WalV8ParallelIo {
             return Ok(());
         }
         // Admission publishes this atomic before any producer can encode.
-        // With no admitted successor there is no join opportunity. Single-
-        // frame jobs also keep immediate submission: their preparation is too
-        // small to justify an optional readiness wait. Both paths still use
-        // the admitted high-water mark as their grouping window.
-        let small_head =
-            submission.pending[&submission.next_ticket].buffer.len() == WAL_V8_FRAME_LEN;
+        // Single-frame writes submit immediately; larger writes may be
+        // coalesced with already-admitted successors.
+        let head = &submission.pending[&submission.next_ticket];
+        let small_head = head.buffer.len() == WAL_V8_FRAME_LEN;
         if small_head
             || self.coordinator.admitted_ticket_end() == submission.next_ticket.saturating_add(1)
         {
             return self.drain_ready_locked(&mut submission);
         }
+        let join_budget = self.default_group_join_budget();
         let first_ticket = submission.next_ticket;
         submission.packing = true;
         drop(submission);
 
-        self.pack_admitted_group(first_ticket)
+        self.pack_admitted_group(first_ticket, join_budget)
     }
 
     #[cfg(feature = "bench")]
@@ -1730,18 +2900,11 @@ impl WalV8ParallelIo {
         Ok(())
     }
 
-    fn pack_admitted_group(&self, first_ticket: u64) -> Result<()> {
+    fn pack_admitted_group(&self, first_ticket: u64, budget: Duration) -> Result<()> {
         let mut guard = WalV8DataPackingGuard {
             io: self,
             armed: true,
         };
-        #[cfg(test)]
-        let budget = Duration::from_micros(
-            self.group_join_micros
-                .load(std::sync::atomic::Ordering::Relaxed),
-        );
-        #[cfg(not(test))]
-        let budget = DATA_GROUP_JOIN_BUDGET;
         let mut deadline = None;
 
         loop {
@@ -2024,12 +3187,47 @@ impl WalV8FrameJob<'_> {
         self.data_buffer.as_ref().map_or(0, |buffer| buffer.cap())
     }
 
-    pub(crate) fn finish(mut self) -> Result<digest::WalV8DigestMetrics> {
+    pub(crate) fn finish(self) -> Result<digest::WalV8DigestMetrics> {
+        #[cfg(feature = "bench")]
+        let direct_point_enabled = {
+            static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *ENABLED.get_or_init(|| {
+                std::env::var("TOYKV_BENCH_V8_POINT_DIRECT_FRAME").as_deref() == Ok("1")
+            })
+        };
+        #[cfg(not(feature = "bench"))]
+        let direct_point_enabled = false;
+
+        self.finish_with_point_direct_frame(direct_point_enabled)
+    }
+
+    fn finish_with_point_direct_frame(
+        mut self,
+        direct_point_enabled: bool,
+    ) -> Result<digest::WalV8DigestMetrics> {
         let admitted = self
             .admitted
             .take()
             .context("v8 producer job lost its admitted batch")?;
-        let mut encoded = match admitted.encode() {
+        // The selector is injectable in unit tests. Production only enables it
+        // through the bench-only OnceLock above.
+        let direct_point = direct_point_enabled && admitted.can_encode_point_single_frame();
+        let mut early_buffer = if direct_point {
+            Some(WalV8DataBuffer(
+                self.data_buffer
+                    .take()
+                    .context("v8 producer job lost its DATA buffer")?
+                    .initialize(),
+            ))
+        } else {
+            None
+        };
+        let encode_result = if let Some(buffer) = early_buffer.as_mut() {
+            admitted.encode_point_single_frame_logical_into(buffer.as_mut_slice())
+        } else {
+            admitted.encode()
+        };
+        let mut encoded = match encode_result {
             Ok(encoded) => encoded,
             Err(error) => {
                 self.coordinator.poison();
@@ -2048,13 +3246,31 @@ impl WalV8FrameJob<'_> {
             metrics
         };
 
-        let mut data_buffer = WalV8DataBuffer(
-            self.data_buffer
-                .take()
-                .context("v8 producer job lost its DATA buffer")?
-                .initialize(),
-        );
-        let data_len = encoded.encode_data_frames_into(data_buffer.as_mut_slice())?;
+        let mut data_buffer = if let Some(buffer) = early_buffer {
+            buffer
+        } else {
+            WalV8DataBuffer(
+                self.data_buffer
+                    .take()
+                    .context("v8 producer job lost its DATA buffer")?
+                    .initialize(),
+            )
+        };
+        if direct_point {
+            if let Err(error) = encoded.finish_point_frame_in_place(data_buffer.as_mut_slice()) {
+                self.coordinator.poison();
+                return Err(error).context("finish v8 direct Point DATA frame");
+            }
+            #[cfg(feature = "bench")]
+            if let Some(profile) = &self.profile {
+                profile.record_v8_point_direct_frame_encoded();
+            }
+        }
+        let data_len = if direct_point {
+            encoded.frame_buffer_bytes()
+        } else {
+            encoded.encode_data_frames_into(data_buffer.as_mut_slice())?
+        };
         ensure!(
             data_len == data_buffer.cap(),
             "v8 DATA materializer returned an unexpected frame length"
@@ -2100,6 +3316,7 @@ impl WalV8FrameJob<'_> {
 struct WalV8LeaderAdmissionPublisher<'a> {
     coordinator: &'a WalV8ParallelCoordinator,
     reservation: RefCell<&'a mut Option<WalV7OwnedBatchReservation>>,
+    extent_preallocator: Option<&'a WalV8ExtentPreallocator>,
 }
 
 impl WalV8AdmissionPublisher for WalV8LeaderAdmissionPublisher<'_> {
@@ -2109,6 +3326,29 @@ impl WalV8AdmissionPublisher for WalV8LeaderAdmissionPublisher<'_> {
         &self,
         plan: WalV8AdmissionPlan,
     ) -> Result<(WalV8BatchAssignment, Self::Guard)> {
+        #[cfg(feature = "bench")]
+        let admitted = self
+            .coordinator
+            .admit_and_publish_with(plan, |assignment| {
+                if let Some(preallocator) = self
+                    .extent_preallocator
+                    .filter(|preallocator| preallocator.strategy.is_point_only())
+                {
+                    let data_end = assignment
+                        .first_data_offset
+                        .checked_add(u64::try_from(plan.frame_buffer_bytes)?)
+                        .context("V8 admitted DATA range end overflows")?;
+                    preallocator.register_data_range(
+                        assignment.first_data_offset,
+                        data_end,
+                        plan.write_class,
+                        u64::try_from(plan.frame_buffer_bytes)?,
+                    )?;
+                }
+
+                Ok(())
+            })?;
+        #[cfg(not(feature = "bench"))]
         let admitted = self.coordinator.admit_and_publish(plan)?;
         if let Some(reservation) = self.reservation.borrow_mut().as_mut() {
             reservation.mark_admitted();
@@ -2341,6 +3581,8 @@ impl WalV8LeaderWriter {
         #[cfg(feature = "bench")]
         let coalesce_budget_override_us = coalesce_budget_override_from_environment()?;
         #[cfg(feature = "bench")]
+        let batch_point_frontier_credits = point_frontier_credit_batch_from_environment()?;
+        #[cfg(feature = "bench")]
         {
             io_diagnostics.data = WalIoHandleMetadata::from_file(&worker_file)?;
         }
@@ -2349,19 +3591,63 @@ impl WalV8LeaderWriter {
             match WalExtentPreparationMode::from_environment()? {
                 Some((mode, window_bytes)) if mode.is_sliding() => {
                     let start_offset = self.coordinator.last_frontier_end();
-                    if mode == WalExtentPreparationMode::SlidingFallocate
-                        && let Some(owner) = &self.reservation_owner
-                    {
-                        let preallocator = Arc::new(WalV8ExtentPreallocator::new(
-                            worker_file
-                                .try_clone()
-                                .context("clone v8 WAL handle for sliding extent preparation")?,
-                            &self.sync_file,
-                            start_offset,
-                            self.max_file_size,
-                            window_bytes,
-                            Some(Arc::clone(owner)),
-                        )?);
+                    let owned_preallocator = match mode {
+                        WalExtentPreparationMode::SlidingLookahead => {
+                            let owner = self.reservation_owner.as_ref().context(
+                                "sliding lookahead benchmark requires PITR quota accounting",
+                            )?;
+                            Some(Arc::new(WalV8ExtentPreallocator::new_with_lookahead(
+                                worker_file
+                                    .try_clone()
+                                    .context("clone v8 WAL handle for sliding extent lookahead")?,
+                                &self.sync_file,
+                                start_offset,
+                                self.max_file_size,
+                                window_bytes,
+                                Some(Arc::clone(owner)),
+                                true,
+                            )?))
+                        }
+                        WalExtentPreparationMode::SlidingPointLookahead => {
+                            let owner = self.reservation_owner.as_ref().context(
+                                "point-only sliding lookahead benchmark requires PITR quota accounting",
+                            )?;
+                            Some(Arc::new(
+                                WalV8ExtentPreallocator::new_with_point_only_lookahead(
+                                    worker_file.try_clone().context(
+                                        "clone v8 WAL handle for point-only extent lookahead",
+                                    )?,
+                                    &self.sync_file,
+                                    start_offset,
+                                    self.max_file_size,
+                                    window_bytes,
+                                    Arc::clone(owner),
+                                )?,
+                            ))
+                        }
+                        WalExtentPreparationMode::SlidingFallocate => {
+                            if let Some(owner) = &self.reservation_owner {
+                                Some(Arc::new(WalV8ExtentPreallocator::new(
+                                    worker_file.try_clone().context(
+                                        "clone v8 WAL handle for sliding extent preparation",
+                                    )?,
+                                    &self.sync_file,
+                                    start_offset,
+                                    self.max_file_size,
+                                    window_bytes,
+                                    Some(Arc::clone(owner)),
+                                )?))
+                            } else {
+                                None
+                            }
+                        }
+                        WalExtentPreparationMode::SlidingInitialize => None,
+                        WalExtentPreparationMode::Fallocate
+                        | WalExtentPreparationMode::Initialize => {
+                            anyhow::bail!("invalid sliding V8 extent preparation mode")
+                        }
+                    };
+                    if let Some(preallocator) = owned_preallocator {
                         io_diagnostics.sliding_extent_preparation =
                             Some(preallocator.diagnostics());
 
@@ -2425,22 +3711,32 @@ impl WalV8LeaderWriter {
         #[cfg(not(feature = "bench"))]
         let frontier_file = self.write_file;
         #[cfg(not(feature = "bench"))]
-        let extent_preallocator = if let Some(owner) = &self.reservation_owner
-            && is_ext_family_filesystem(&worker_file)
-            && is_o_direct_file(&worker_file)?
-        {
-            Some(Arc::new(WalV8ExtentPreallocator::new(
-                worker_file
-                    .try_clone()
-                    .context("clone v8 WAL handle for production extent preparation")?,
-                &self.sync_file,
-                self.coordinator.last_frontier_end(),
-                self.max_file_size,
-                WAL_V8_PRODUCTION_EXTENT_WINDOW_BYTES,
-                Some(Arc::clone(owner)),
-            )?))
-        } else {
-            None
+        let extent_preallocator = {
+            let lookahead = wal_v8_extent_lookahead_from_environment()?;
+            let eligible = self.reservation_owner.is_some()
+                && is_ext_family_filesystem(&worker_file)
+                && is_o_direct_file(&worker_file)?;
+            ensure!(
+                !lookahead || eligible,
+                "{WAL_V8_EXTENT_LOOKAHEAD_ENV} requires an ext4 WAL, an O_DIRECT DATA worker, and a quota owner"
+            );
+            if let Some(owner) = &self.reservation_owner
+                && eligible
+            {
+                Some(Arc::new(WalV8ExtentPreallocator::new_with_lookahead(
+                    worker_file
+                        .try_clone()
+                        .context("clone v8 WAL handle for production extent preparation")?,
+                    &self.sync_file,
+                    self.coordinator.last_frontier_end(),
+                    self.max_file_size,
+                    WAL_V8_PRODUCTION_EXTENT_WINDOW_BYTES,
+                    Some(Arc::clone(owner)),
+                    lookahead,
+                )?))
+            } else {
+                None
+            }
         };
         let initial_ticket = self.coordinator.next_ticket();
         let io = WalV8ParallelIo::spawn(
@@ -2482,6 +3778,8 @@ impl WalV8LeaderWriter {
             io_diagnostics,
             #[cfg(feature = "bench")]
             coalesce_budget_override_us,
+            #[cfg(feature = "bench")]
+            batch_point_frontier_credits,
             #[cfg(feature = "bench")]
             profile: self.profile,
         })
@@ -2536,10 +3834,19 @@ impl WalV8LeaderWriter {
         batch: &'a WalBatch,
         limits: WalV5Limits,
     ) -> Result<WalV8PreparedBatch<'a>> {
+        self.preflight_batch_with_write_class(batch, limits, WalV8WriteClass::Batch)
+    }
+
+    pub(crate) fn preflight_batch_with_write_class<'a>(
+        &self,
+        batch: &'a WalBatch,
+        limits: WalV5Limits,
+        write_class: WalV8WriteClass,
+    ) -> Result<WalV8PreparedBatch<'a>> {
         ensure!(!self.is_poisoned(), "v8 Leader WAL is poisoned");
         let limits = bounded_limits(limits);
 
-        WalV8PreparedBatch::preflight(batch, limits, |bytes| {
+        WalV8PreparedBatch::preflight_with_write_class(batch, limits, write_class, |bytes| {
             ensure!(
                 bytes <= self.max_file_size,
                 WalV8LeaderCapacityError::GroupExceedsAdmissionWindow
@@ -2745,6 +4052,7 @@ impl WalV8LeaderWriter {
             let publisher = WalV8LeaderAdmissionPublisher {
                 coordinator: &self.coordinator,
                 reservation: RefCell::new(reservation),
+                extent_preallocator: None,
             };
             admitted_batches.push(prepared.admit_with_metadata(
                 commit_ts,
@@ -3103,10 +4411,19 @@ impl WalV8ParallelWriter {
         batch: &'a WalBatch,
         limits: WalV5Limits,
     ) -> Result<WalV8PreparedBatch<'a>> {
+        self.preflight_batch_with_write_class(batch, limits, WalV8WriteClass::Batch)
+    }
+
+    pub(crate) fn preflight_batch_with_write_class<'a>(
+        &self,
+        batch: &'a WalBatch,
+        limits: WalV5Limits,
+        write_class: WalV8WriteClass,
+    ) -> Result<WalV8PreparedBatch<'a>> {
         ensure!(!self.is_poisoned(), "v8 Parallel WAL is poisoned");
         let limits = bounded_limits(limits);
 
-        WalV8PreparedBatch::preflight(batch, limits, |bytes| {
+        WalV8PreparedBatch::preflight_with_write_class(batch, limits, write_class, |bytes| {
             ensure!(
                 bytes <= self.max_file_size,
                 WalV8LeaderCapacityError::GroupExceedsAdmissionWindow
@@ -3232,14 +4549,21 @@ impl WalV8ParallelWriter {
         let publisher = WalV8LeaderAdmissionPublisher {
             coordinator: &self.coordinator,
             reservation: RefCell::new(&mut reservation),
+            extent_preallocator: self.io.extent_preallocator.as_deref(),
         };
         let admitted = prepared.admit_with_metadata(commit_ts, recorded_at, &publisher)?;
         let assignment = admitted.assignment();
+        #[cfg(feature = "bench")]
+        let write_class = admitted.write_class();
         if let Some(reservation) = reservation.take() {
-            let previous = self
-                .frontier_resources
-                .lock()
-                .insert(assignment.segment_ticket, reservation);
+            let previous = self.frontier_resources.lock().insert(
+                assignment.segment_ticket,
+                WalV8FrontierResource {
+                    reservation,
+                    #[cfg(feature = "bench")]
+                    write_class,
+                },
+            );
             if previous.is_some() {
                 self.coordinator.poison();
                 anyhow::bail!("v8 Parallel ticket already owns a resource reservation");
@@ -3283,21 +4607,62 @@ impl WalV8ParallelWriter {
                 return Ok(());
             }
 
+            #[cfg(feature = "bench")]
+            let profile = self.profile.load_full();
+            #[cfg(feature = "bench")]
+            let driver_attempt_sequence = profile
+                .as_ref()
+                .and_then(|profile| profile.record_wal_v8_durability_driver_attempt());
+            #[cfg(feature = "bench")]
+            let phase_sample_candidate = driver_attempt_sequence.and_then(|_| {
+                profile
+                    .as_ref()
+                    .and_then(|profile| profile.next_wal_v8_durability_advance_sample_candidate())
+            });
+            #[cfg(feature = "bench")]
+            let frontier_lock_wait_started = phase_sample_candidate.map(|_| Instant::now());
+            #[cfg(feature = "bench")]
+            let driver_wall_started = phase_sample_candidate.map(|_| Instant::now());
+            #[cfg(feature = "bench")]
+            let driver_cpu_started = phase_sample_candidate.map(|_| digest::thread_cpu_time_ns());
             let observed_generation = self.coordinator.durability_generation();
             let mut previous = self.frontier.lock();
+            #[cfg(feature = "bench")]
+            let frontier_lock_wait_ns = frontier_lock_wait_started
+                .map(|started| started.elapsed().as_nanos().min(u64::MAX as u128) as u64)
+                .unwrap_or_default();
             if self.coordinator.durable_ticket_end() >= ticket_end {
                 return Ok(());
             }
 
-            #[cfg(feature = "bench")]
-            let profile = self.profile.load_full();
             #[cfg(feature = "bench")]
             let diagnostics_enabled = profile
                 .as_ref()
                 .is_some_and(|profile| profile.wal_sync_diagnostics_enabled());
             #[cfg(feature = "bench")]
             let mut coalescing_observation = None;
+            #[cfg(feature = "bench")]
+            let mut coalescing_detail = None;
+            #[cfg(feature = "bench")]
+            let mut coalescing_wall_ns = 0_u64;
+            #[cfg(feature = "bench")]
+            let mut coalescing_cpu_ns = 0_u64;
             let mut snapshot = self.coordinator.frontier_ready_snapshot();
+            #[cfg(feature = "bench")]
+            let has_ready_prefix = !snapshot.ready_prefix.is_empty();
+            #[cfg(feature = "bench")]
+            if has_ready_prefix && driver_attempt_sequence.is_some() {
+                profile
+                    .as_ref()
+                    .expect("sampled durability driver has a write profile")
+                    .record_wal_v8_durability_advance_attempt();
+            }
+            #[cfg(feature = "bench")]
+            let phase_sample_id = has_ready_prefix.then_some(phase_sample_candidate).flatten();
+            #[cfg(feature = "bench")]
+            let phase_sample_guard = phase_sample_id
+                .and_then(|_| profile.as_ref().cloned())
+                .map(WalV8DurabilityPhaseSampleGuard::new);
             if !snapshot.ready_prefix.is_empty()
                 && snapshot.ready_prefix.len() < snapshot.admitted_ticket_count
                 && let Some(latency) = previous.last_sync_latency
@@ -3323,7 +4688,30 @@ impl WalV8ParallelWriter {
                 let admitted_tickets_before_coalescing = snapshot.admitted_ticket_count as u64;
                 #[cfg(feature = "bench")]
                 let started = profile.as_ref().map(|_| Instant::now());
+                #[cfg(feature = "bench")]
+                let phase_started = phase_sample_id.map(|_| Instant::now());
+                #[cfg(feature = "bench")]
+                let phase_cpu_started = phase_sample_id.map(|_| digest::thread_cpu_time_ns());
+                #[cfg(feature = "bench")]
+                let waited = if phase_sample_id.is_some() {
+                    let observation = self.coordinator.coalesce_frontier_ready_sampled(budget);
+                    let waited = observation.waited;
+                    coalescing_detail = Some(observation);
+                    waited
+                } else {
+                    self.coordinator.coalesce_frontier_ready(budget)
+                };
+                #[cfg(not(feature = "bench"))]
                 let waited = self.coordinator.coalesce_frontier_ready(budget);
+                #[cfg(feature = "bench")]
+                {
+                    coalescing_wall_ns = phase_started
+                        .map(|started| started.elapsed().as_nanos().min(u64::MAX as u128) as u64)
+                        .unwrap_or_default();
+                    coalescing_cpu_ns = phase_cpu_started
+                        .map(|started| digest::thread_cpu_time_ns().saturating_sub(started))
+                        .unwrap_or_default();
+                }
                 #[cfg(feature = "bench")]
                 let coalescing_wait_ns = started
                     .map(|started| started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
@@ -3359,6 +4747,13 @@ impl WalV8ParallelWriter {
             let ready = snapshot.ready_prefix;
 
             if ready.is_empty() {
+                #[cfg(feature = "bench")]
+                if driver_attempt_sequence.is_some() {
+                    profile
+                        .as_ref()
+                        .expect("sampled durability driver has a write profile")
+                        .record_wal_v8_durability_empty_driver_attempt();
+                }
                 drop(previous);
                 let wake = self
                     .coordinator
@@ -3388,6 +4783,10 @@ impl WalV8ParallelWriter {
                 .offset
                 .checked_add(FRAME_LEN_U64)
                 .context("v8 previous FRONTIER end overflows")?;
+            #[cfg(feature = "bench")]
+            let preparation_started = phase_sample_id.map(|_| Instant::now());
+            #[cfg(feature = "bench")]
+            let preparation_cpu_started = phase_sample_id.map(|_| digest::thread_cpu_time_ns());
             let reservation = self
                 .coordinator
                 .reserve_frontier_with(frontier_ticket_end, |reservation| {
@@ -3435,13 +4834,34 @@ impl WalV8ParallelWriter {
             frontier_buffer.as_mut_slice()[..WAL_V8_FRAME_LEN].copy_from_slice(&frontier_frame);
             frontier_buffer.set_len(WAL_V8_FRAME_LEN);
             #[cfg(feature = "bench")]
+            let preparation_wall_ns = preparation_started
+                .map(|started| started.elapsed().as_nanos().min(u64::MAX as u128) as u64)
+                .unwrap_or_default();
+            #[cfg(feature = "bench")]
+            let preparation_cpu_ns = preparation_cpu_started
+                .map(|started| digest::thread_cpu_time_ns().saturating_sub(started))
+                .unwrap_or_default();
+            #[cfg(feature = "bench")]
             let frontier_write_started = profile.as_ref().map(|_| Instant::now());
+            #[cfg(feature = "bench")]
+            let phase_frontier_write_started = phase_sample_id.map(|_| Instant::now());
+            #[cfg(feature = "bench")]
+            let phase_frontier_write_cpu_started =
+                phase_sample_id.map(|_| digest::thread_cpu_time_ns());
             write_aligned_once(
                 &self.frontier_file,
                 frontier_buffer.initialized_slice(0, WAL_V8_FRAME_LEN),
                 reservation.frame_offset,
             )
             .context("write v8 Parallel FRONTIER")?;
+            #[cfg(feature = "bench")]
+            let phase_frontier_write_wall_ns = phase_frontier_write_started
+                .map(|started| started.elapsed().as_nanos().min(u64::MAX as u128) as u64)
+                .unwrap_or_default();
+            #[cfg(feature = "bench")]
+            let phase_frontier_write_cpu_ns = phase_frontier_write_cpu_started
+                .map(|started| digest::thread_cpu_time_ns().saturating_sub(started))
+                .unwrap_or_default();
             #[cfg(feature = "chaos-testing")]
             crate::chaos::failpoint::wal_crash_point("wal_v8.parallel.after_frontier_write");
             #[cfg(feature = "bench")]
@@ -3460,8 +4880,17 @@ impl WalV8ParallelWriter {
                 None
             };
             let sync_started = Instant::now();
+            #[cfg(feature = "bench")]
+            let phase_sync_cpu_started = phase_sample_id.map(|_| digest::thread_cpu_time_ns());
             let sync_result = fdatasync_once(&self.sync_file);
             previous.last_sync_latency = Some(sync_started.elapsed());
+            #[cfg(feature = "bench")]
+            let phase_fdatasync_wall_ns =
+                sync_started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+            #[cfg(feature = "bench")]
+            let phase_fdatasync_cpu_ns = phase_sync_cpu_started
+                .map(|started| digest::thread_cpu_time_ns().saturating_sub(started))
+                .unwrap_or_default();
             #[cfg(feature = "bench")]
             if let Some(profile) = &profile {
                 let duration_ns = sync_started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
@@ -3517,72 +4946,461 @@ impl WalV8ParallelWriter {
             #[cfg(feature = "chaos-testing")]
             crate::chaos::failpoint::wal_crash_point("wal_v8.parallel.after_fdatasync");
 
-            self.retire_frontier_resources(first_ticket, frontier_ticket_end)?;
+            #[cfg(feature = "bench")]
+            let resource_retire_before_publish = self.retire_frontier_resources(
+                first_ticket,
+                frontier_ticket_end,
+                phase_sample_id.is_some(),
+            )?;
+            #[cfg(not(feature = "bench"))]
+            let _ = self.retire_frontier_resources(first_ticket, frontier_ticket_end, false)?;
+            #[cfg(feature = "bench")]
+            let publish_metrics = if phase_sample_id.is_some() {
+                Some(
+                    self.coordinator
+                        .publish_durable_frontier_sampled(reservation)?,
+                )
+            } else {
+                self.coordinator.publish_durable_frontier(reservation)?;
+                None
+            };
+            #[cfg(not(feature = "bench"))]
             self.coordinator.publish_durable_frontier(reservation)?;
+            #[cfg(feature = "bench")]
+            let advance_sequence = if driver_attempt_sequence.is_some() {
+                Some(
+                    profile
+                        .as_ref()
+                        .expect("sampled durability driver has a write profile")
+                        .complete_wal_v8_durability_advance(),
+                )
+            } else {
+                None
+            };
             // The shared worker tracks completed groups for its diagnostics.
             // Retire the physical DATA groups covered by this V8 durability
             // boundary so long-running diagnostic runs keep that map bounded.
+            #[cfg(feature = "bench")]
+            let sample_guard_retirement = phase_sample_id.is_some();
             self.io.progress.mark_durable(frontier_ticket_end);
             #[cfg(feature = "chaos-testing")]
             crate::chaos::failpoint::wal_crash_point("wal_v8.parallel.after_durable_publish");
-            self.retire_frontier_guards(first_ticket, frontier_ticket_end)?;
+            #[cfg(not(feature = "bench"))]
+            let _ = self.retire_frontier_guards(first_ticket, frontier_ticket_end, false)?;
+            #[cfg(feature = "bench")]
+            let resource_retire_after_publish = self.retire_frontier_guards(
+                first_ticket,
+                frontier_ticket_end,
+                sample_guard_retirement,
+            )?;
             previous.frontier = frontier;
             previous.offset = reservation.frame_offset;
             previous.digest = frontier_digest;
             cycle_guard.complete();
+            #[cfg(feature = "bench")]
+            if let (
+                Some(sample_id),
+                Some(driver_attempt_sequence),
+                Some(wall_started),
+                Some(cpu_started),
+            ) = (
+                phase_sample_id,
+                driver_attempt_sequence,
+                driver_wall_started,
+                driver_cpu_started,
+            ) {
+                let advance_sequence =
+                    advance_sequence.expect("sampled durability advance has a completed sequence");
+                debug_assert_eq!(sample_id, advance_sequence);
+                let publish_metrics =
+                    publish_metrics.expect("sampled durability advance records publish metrics");
+                phase_sample_guard
+                    .expect("sampled durability advance has a sample guard")
+                    .record(crate::mem_table::WalV8DurabilityPhaseObservation {
+                        sample_id,
+                        driver_attempt_sequence,
+                        advance_sequence,
+                        ticket_start: first_ticket,
+                        ticket_end: frontier_ticket_end,
+                        tickets_covered: frontier_ticket_end.saturating_sub(first_ticket),
+                        driver_wall_ns: wall_started.elapsed().as_nanos().min(u64::MAX as u128)
+                            as u64,
+                        driver_cpu_ns: digest::thread_cpu_time_ns().saturating_sub(cpu_started),
+                        frontier_lock_wait_ns,
+                        coalescing_wall_ns,
+                        coalescing_cpu_ns,
+                        coalescing_active_wall_ns: coalescing_wall_ns.saturating_sub(
+                            coalescing_detail.map_or(0, |detail| {
+                                detail
+                                    .state_lock_wait_wall_ns
+                                    .saturating_add(detail.condvar_wait_wall_ns)
+                            }),
+                        ),
+                        coalescing_active_cpu_ns: coalescing_cpu_ns.saturating_sub(
+                            coalescing_detail.map_or(0, |detail| {
+                                detail
+                                    .state_lock_wait_cpu_ns
+                                    .saturating_add(detail.condvar_wait_cpu_ns)
+                            }),
+                        ),
+                        coalescing_state_lock_wait_wall_ns: coalescing_detail
+                            .map_or(0, |detail| detail.state_lock_wait_wall_ns),
+                        coalescing_state_lock_wait_cpu_ns: coalescing_detail
+                            .map_or(0, |detail| detail.state_lock_wait_cpu_ns),
+                        coalescing_condvar_wait_wall_ns: coalescing_detail
+                            .map_or(0, |detail| detail.condvar_wait_wall_ns),
+                        coalescing_condvar_wait_cpu_ns: coalescing_detail
+                            .map_or(0, |detail| detail.condvar_wait_cpu_ns),
+                        coalescing_condvar_wait_count: coalescing_detail
+                            .map_or(0, |detail| detail.condvar_wait_count),
+                        coalescing_condvar_reacquire_count: coalescing_detail
+                            .map_or(0, |detail| detail.condvar_reacquire_count),
+                        coalescing_condvar_non_timeout_returns: coalescing_detail
+                            .map_or(0, |detail| detail.condvar_non_timeout_returns),
+                        coalescing_condvar_prefix_growth_returns: coalescing_detail
+                            .map_or(0, |detail| detail.condvar_prefix_growth_returns),
+                        coalescing_condvar_generation_changed_returns: coalescing_detail
+                            .map_or(0, |detail| detail.condvar_generation_changed_returns),
+                        coalescing_condvar_timeout_returns: coalescing_detail
+                            .map_or(0, |detail| detail.condvar_timeout_returns),
+                        coalescing_loop_check_count: coalescing_detail
+                            .map_or(0, |detail| detail.loop_check_count),
+                        preparation_wall_ns,
+                        preparation_cpu_ns,
+                        frontier_write_wall_ns: phase_frontier_write_wall_ns,
+                        frontier_write_cpu_ns: phase_frontier_write_cpu_ns,
+                        fdatasync_wall_ns: phase_fdatasync_wall_ns,
+                        fdatasync_cpu_ns: phase_fdatasync_cpu_ns,
+                        resource_retire_before_publish_wall_ns: resource_retire_before_publish
+                            .wall_ns,
+                        resource_retire_before_publish_cpu_ns: resource_retire_before_publish
+                            .cpu_ns,
+                        resource_retire_before_publish_lock_wait_wall_ns:
+                            resource_retire_before_publish.lock_wait_wall_ns,
+                        resource_retire_before_publish_lock_wait_cpu_ns:
+                            resource_retire_before_publish.lock_wait_cpu_ns,
+                        resource_retire_before_publish_lock_hold_wall_ns:
+                            resource_retire_before_publish.lock_hold_wall_ns,
+                        resource_retire_before_publish_lock_hold_cpu_ns:
+                            resource_retire_before_publish.lock_hold_cpu_ns,
+                        resource_retire_before_publish_tickets: resource_retire_before_publish
+                            .tickets,
+                        resource_retire_before_publish_collect_cpu_ns:
+                            resource_retire_before_publish.collect_cpu_ns,
+                        resource_retire_before_publish_remove_cpu_ns:
+                            resource_retire_before_publish.remove_cpu_ns,
+                        resource_retire_before_publish_release_cpu_ns:
+                            resource_retire_before_publish.release_cpu_ns,
+                        resource_retire_before_publish_finish_cpu_ns:
+                            resource_retire_before_publish.finish_cpu_ns,
+                        resource_retire_before_publish_batched_point_credits:
+                            resource_retire_before_publish.batch_point_frontier_credits,
+                        resource_retire_after_publish_wall_ns: resource_retire_after_publish
+                            .wall_ns,
+                        resource_retire_after_publish_cpu_ns: resource_retire_after_publish.cpu_ns,
+                        resource_retire_after_publish_lock_wait_wall_ns:
+                            resource_retire_after_publish.lock_wait_wall_ns,
+                        resource_retire_after_publish_lock_wait_cpu_ns:
+                            resource_retire_after_publish.lock_wait_cpu_ns,
+                        resource_retire_after_publish_lock_hold_wall_ns:
+                            resource_retire_after_publish.lock_hold_wall_ns,
+                        resource_retire_after_publish_lock_hold_cpu_ns:
+                            resource_retire_after_publish.lock_hold_cpu_ns,
+                        resource_retire_after_publish_tickets: resource_retire_after_publish
+                            .tickets,
+                        resource_retire_after_publish_collect_cpu_ns: resource_retire_after_publish
+                            .collect_cpu_ns,
+                        resource_retire_after_publish_remove_cpu_ns: resource_retire_after_publish
+                            .remove_cpu_ns,
+                        resource_retire_after_publish_finish_cpu_ns: resource_retire_after_publish
+                            .finish_cpu_ns,
+                        coordinator_publish_lock_wait_ns: publish_metrics.coordinator_lock_wait_ns,
+                        coordinator_publish_lock_wait_cpu_ns: publish_metrics
+                            .coordinator_lock_wait_cpu_ns,
+                        coordinator_publish_wall_ns: publish_metrics.publish_wall_ns,
+                        coordinator_publish_cpu_ns: publish_metrics.publish_cpu_ns,
+                        notify_all_wall_ns: publish_metrics.notify_all_wall_ns,
+                        followers_waiting_at_publish: publish_metrics.followers_waiting,
+                    });
+            }
         }
     }
 
-    fn retire_frontier_resources(&self, first_ticket: u64, ticket_end: u64) -> Result<()> {
+    fn retire_frontier_resources(
+        &self,
+        first_ticket: u64,
+        ticket_end: u64,
+        sample: bool,
+    ) -> Result<WalV8RetirementObservation> {
+        #[cfg(not(feature = "bench"))]
+        let _ = sample;
+        #[cfg(feature = "bench")]
+        let started = sample.then(Instant::now);
+        #[cfg(feature = "bench")]
+        let cpu_started = sample.then(digest::thread_cpu_time_ns);
         if self.reservation_owner.is_none() {
-            return Ok(());
+            return Ok(WalV8RetirementObservation::default());
         }
-        let mut resources = self.frontier_resources.lock();
-        let tickets: Vec<u64> = resources
-            .range(first_ticket..ticket_end)
-            .map(|(&t, _)| t)
-            .collect();
         let expected = usize::try_from(ticket_end - first_ticket)?;
+        #[cfg(feature = "bench")]
+        let lock_wait_started = sample.then(Instant::now);
+        #[cfg(feature = "bench")]
+        let lock_wait_cpu_started = sample.then(digest::thread_cpu_time_ns);
+        let mut resources = self.frontier_resources.lock();
+        #[cfg(feature = "bench")]
+        let lock_wait_wall_ns = lock_wait_started
+            .map(|started| started.elapsed().as_nanos().min(u64::MAX as u128) as u64)
+            .unwrap_or_default();
+        #[cfg(feature = "bench")]
+        let lock_wait_cpu_ns = lock_wait_cpu_started
+            .map(|started| digest::thread_cpu_time_ns().saturating_sub(started))
+            .unwrap_or_default();
+        #[cfg(feature = "bench")]
+        let lock_hold_started = sample.then(Instant::now);
+        #[cfg(feature = "bench")]
+        let lock_hold_cpu_started = sample.then(digest::thread_cpu_time_ns);
+        #[cfg(feature = "bench")]
+        let collect_started = sample.then(digest::thread_cpu_time_ns);
+        #[cfg(feature = "bench")]
+        let mut point_only_prefix = true;
+        let mut tickets = Vec::with_capacity(expected);
+        for (&ticket, _resource) in resources.range(first_ticket..ticket_end) {
+            #[cfg(feature = "bench")]
+            {
+                point_only_prefix &= _resource.write_class == WalV8WriteClass::Point;
+            }
+            tickets.push(ticket);
+        }
+        #[cfg(feature = "bench")]
+        let collect_cpu_ns = collect_started
+            .map(|t| digest::thread_cpu_time_ns().saturating_sub(t))
+            .unwrap_or_default();
+        #[cfg(feature = "bench")]
+        let (mut remove_cpu_ns, mut release_cpu_ns, mut finish_cpu_ns) = (0u64, 0u64, 0u64);
         ensure!(
             tickets.len() == expected,
             "v8 Parallel durable prefix is missing resource reservations"
         );
-        for (index, ticket) in tickets.into_iter().enumerate() {
-            let mut reservation = resources
-                .remove(&ticket)
-                .context("v8 Parallel resource reservation disappeared")?;
-            if index > 0 {
-                reservation
-                    .release_unused_frontier_credit()
-                    .context("release coalesced v8 FRONTIER reservation")?;
+
+        #[cfg(feature = "bench")]
+        let batch_point_frontier_credits =
+            self.batch_point_frontier_credits && point_only_prefix && expected > 1;
+        #[cfg(not(feature = "bench"))]
+        let batch_point_frontier_credits = false;
+
+        if batch_point_frontier_credits {
+            #[cfg(feature = "bench")]
+            let step_started = sample.then(digest::thread_cpu_time_ns);
+            let mut reservations: Vec<&mut WalV7OwnedBatchReservation> = resources
+                .range_mut(first_ticket..ticket_end)
+                .skip(1)
+                .map(|(_, resource)| &mut resource.reservation)
+                .collect();
+            WalV7OwnedBatchReservation::release_unused_frontier_credits_batch(&mut reservations)
+                .context("release batched Point v8 FRONTIER credits")?;
+            #[cfg(feature = "bench")]
+            {
+                release_cpu_ns = release_cpu_ns.saturating_add(
+                    step_started
+                        .map(|t| digest::thread_cpu_time_ns().saturating_sub(t))
+                        .unwrap_or_default(),
+                );
             }
-            reservation
-                .finish_after_io()
-                .context("retire durable v8 batch resources")?;
         }
 
-        Ok(())
+        for (index, ticket) in tickets.into_iter().enumerate() {
+            #[cfg(feature = "bench")]
+            let step_started = sample.then(digest::thread_cpu_time_ns);
+            let resource = resources
+                .remove(&ticket)
+                .context("v8 Parallel resource reservation disappeared")?;
+            #[cfg(feature = "bench")]
+            {
+                remove_cpu_ns = remove_cpu_ns.saturating_add(
+                    step_started
+                        .map(|t| digest::thread_cpu_time_ns().saturating_sub(t))
+                        .unwrap_or_default(),
+                );
+            }
+            let mut reservation = resource.reservation;
+            if index > 0 && !batch_point_frontier_credits {
+                #[cfg(feature = "bench")]
+                let step_started = sample.then(digest::thread_cpu_time_ns);
+                if let Err(error) = reservation.release_unused_frontier_credit() {
+                    return Err(error).context("release coalesced v8 FRONTIER reservation");
+                }
+                #[cfg(feature = "bench")]
+                {
+                    release_cpu_ns = release_cpu_ns.saturating_add(
+                        step_started
+                            .map(|t| digest::thread_cpu_time_ns().saturating_sub(t))
+                            .unwrap_or_default(),
+                    );
+                }
+            }
+            #[cfg(feature = "bench")]
+            let step_started = sample.then(digest::thread_cpu_time_ns);
+            if let Err(error) = reservation.finish_after_io() {
+                return Err(error).context("retire durable v8 batch resources");
+            }
+            #[cfg(feature = "bench")]
+            {
+                finish_cpu_ns = finish_cpu_ns.saturating_add(
+                    step_started
+                        .map(|t| digest::thread_cpu_time_ns().saturating_sub(t))
+                        .unwrap_or_default(),
+                );
+            }
+        }
+
+        #[cfg(feature = "bench")]
+        let lock_hold_wall_ns = lock_hold_started
+            .map(|started| started.elapsed().as_nanos().min(u64::MAX as u128) as u64)
+            .unwrap_or_default();
+        #[cfg(feature = "bench")]
+        let lock_hold_cpu_ns = lock_hold_cpu_started
+            .map(|started| digest::thread_cpu_time_ns().saturating_sub(started))
+            .unwrap_or_default();
+        drop(resources);
+
+        #[allow(unused_mut)]
+        let mut observation = WalV8RetirementObservation::default();
+        #[cfg(feature = "bench")]
+        {
+            observation.collect_cpu_ns = collect_cpu_ns;
+            observation.remove_cpu_ns = remove_cpu_ns;
+            observation.release_cpu_ns = release_cpu_ns;
+            observation.finish_cpu_ns = finish_cpu_ns;
+            observation.batch_point_frontier_credits = batch_point_frontier_credits;
+            observation.tickets = u64::try_from(expected).unwrap_or(u64::MAX);
+            observation.wall_ns = started
+                .map(|started| started.elapsed().as_nanos().min(u64::MAX as u128) as u64)
+                .unwrap_or_default();
+            observation.cpu_ns = cpu_started
+                .map(|started| digest::thread_cpu_time_ns().saturating_sub(started))
+                .unwrap_or_default();
+            observation.lock_wait_wall_ns = lock_wait_wall_ns;
+            observation.lock_wait_cpu_ns = lock_wait_cpu_ns;
+            observation.lock_hold_wall_ns = lock_hold_wall_ns;
+            observation.lock_hold_cpu_ns = lock_hold_cpu_ns;
+        }
+
+        Ok(observation)
     }
 
-    fn retire_frontier_guards(&self, first_ticket: u64, ticket_end: u64) -> Result<()> {
+    fn retire_frontier_guards(
+        &self,
+        first_ticket: u64,
+        ticket_end: u64,
+        sample: bool,
+    ) -> Result<WalV8RetirementObservation> {
+        #[cfg(not(feature = "bench"))]
+        let _ = sample;
+        #[cfg(feature = "bench")]
+        let started = sample.then(Instant::now);
+        #[cfg(feature = "bench")]
+        let cpu_started = sample.then(digest::thread_cpu_time_ns);
+        // The prefix was just published by this durability driver. Preserve
+        // the guards' fail-safe behavior with one coordinator lock instead of
+        // reacquiring it once for every covered ticket.
+        let prefix_check = self.coordinator.poison_ticket_prefix_if_pending(ticket_end);
+        #[cfg(feature = "bench")]
+        let lock_wait_started = sample.then(Instant::now);
+        #[cfg(feature = "bench")]
+        let lock_wait_cpu_started = sample.then(digest::thread_cpu_time_ns);
         let mut guards = self.producer_guards.lock();
+        #[cfg(feature = "bench")]
+        let lock_wait_wall_ns = lock_wait_started
+            .map(|started| started.elapsed().as_nanos().min(u64::MAX as u128) as u64)
+            .unwrap_or_default();
+        #[cfg(feature = "bench")]
+        let lock_wait_cpu_ns = lock_wait_cpu_started
+            .map(|started| digest::thread_cpu_time_ns().saturating_sub(started))
+            .unwrap_or_default();
+        #[cfg(feature = "bench")]
+        let lock_hold_started = sample.then(Instant::now);
+        #[cfg(feature = "bench")]
+        let lock_hold_cpu_started = sample.then(digest::thread_cpu_time_ns);
+        #[cfg(feature = "bench")]
+        let collect_started = sample.then(digest::thread_cpu_time_ns);
         let tickets: Vec<u64> = guards
             .range(first_ticket..ticket_end)
             .map(|(&ticket, _)| ticket)
             .collect();
+        #[cfg(feature = "bench")]
+        let collect_cpu_ns = collect_started
+            .map(|t| digest::thread_cpu_time_ns().saturating_sub(t))
+            .unwrap_or_default();
+        #[cfg(feature = "bench")]
+        let (mut remove_cpu_ns, mut finish_cpu_ns) = (0u64, 0u64);
         let expected = usize::try_from(ticket_end - first_ticket)?;
         ensure!(
             tickets.len() == expected,
             "v8 Parallel durable prefix is missing producer guards"
         );
         for ticket in tickets {
+            #[cfg(feature = "bench")]
+            let step_started = sample.then(digest::thread_cpu_time_ns);
             let mut encoded = guards
                 .remove(&ticket)
                 .context("v8 Parallel producer guard disappeared")?;
-            encoded.disarm_after_durable();
+            ensure!(
+                encoded.assignment().segment_ticket == ticket
+                    && (first_ticket..ticket_end).contains(&ticket),
+                "v8 Parallel producer guard ticket does not match its durable prefix"
+            );
+            #[cfg(feature = "bench")]
+            {
+                remove_cpu_ns = remove_cpu_ns.saturating_add(
+                    step_started
+                        .map(|t| digest::thread_cpu_time_ns().saturating_sub(t))
+                        .unwrap_or_default(),
+                );
+            }
+            #[cfg(feature = "bench")]
+            let step_started = sample.then(digest::thread_cpu_time_ns);
+            encoded.disarm_after_durable_prefix_check(&prefix_check);
+            #[cfg(feature = "bench")]
+            {
+                finish_cpu_ns = finish_cpu_ns.saturating_add(
+                    step_started
+                        .map(|t| digest::thread_cpu_time_ns().saturating_sub(t))
+                        .unwrap_or_default(),
+                );
+            }
         }
 
-        Ok(())
+        #[cfg(feature = "bench")]
+        let lock_hold_wall_ns = lock_hold_started
+            .map(|started| started.elapsed().as_nanos().min(u64::MAX as u128) as u64)
+            .unwrap_or_default();
+        #[cfg(feature = "bench")]
+        let lock_hold_cpu_ns = lock_hold_cpu_started
+            .map(|started| digest::thread_cpu_time_ns().saturating_sub(started))
+            .unwrap_or_default();
+        drop(guards);
+
+        #[allow(unused_mut)]
+        let mut observation = WalV8RetirementObservation::default();
+        #[cfg(feature = "bench")]
+        {
+            observation.collect_cpu_ns = collect_cpu_ns;
+            observation.remove_cpu_ns = remove_cpu_ns;
+            observation.finish_cpu_ns = finish_cpu_ns;
+            observation.tickets = u64::try_from(expected).unwrap_or(u64::MAX);
+            observation.wall_ns = started
+                .map(|started| started.elapsed().as_nanos().min(u64::MAX as u128) as u64)
+                .unwrap_or_default();
+            observation.cpu_ns = cpu_started
+                .map(|started| digest::thread_cpu_time_ns().saturating_sub(started))
+                .unwrap_or_default();
+            observation.lock_wait_wall_ns = lock_wait_wall_ns;
+            observation.lock_wait_cpu_ns = lock_wait_cpu_ns;
+            observation.lock_hold_wall_ns = lock_hold_wall_ns;
+            observation.lock_hold_cpu_ns = lock_hold_cpu_ns;
+        }
+
+        Ok(observation)
     }
 
     pub(crate) fn sync(&self) -> Result<()> {
@@ -3614,6 +5432,12 @@ impl WalV8ParallelWriter {
         }
 
         Ok(())
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn take_durable_publish_sample_timestamp(&self, ticket: u64) -> Option<Instant> {
+        self.coordinator
+            .take_durable_publish_sample_timestamp(ticket)
     }
 
     pub(crate) fn next_ticket(&self) -> u64 {
@@ -3819,9 +5643,128 @@ mod tests {
         ArchiveEpochId, ChainAnchor, RecordedAt, SegmentId, TimelineId, WalEntry,
         manifest::ActiveBoundary,
     };
+    use crate::tests::harness::is_io_uring_unavailable_error;
     use crate::wal::v7::admission::{
         WalV7ResourceCharge, WalV7ResourceLedger, WalV7ResourceLimits, WalV7RetainedResources,
     };
+
+    #[test]
+    fn extent_policy_vec_matches_btree_for_mixed_out_of_order_ranges() -> Result<()> {
+        const START: u64 = 4096;
+        const WINDOW: u64 = 16 * 1024;
+        const WINDOW_COUNT: u64 = 128;
+
+        let mut btree =
+            WalV8ExtentPolicies::new(START, WINDOW, WalV8ExtentPolicyStorageKind::BTreeMap);
+        let mut vector = WalV8ExtentPolicies::new(START, WINDOW, WalV8ExtentPolicyStorageKind::Vec);
+
+        // Admission order is deliberately different from physical order. Repeated
+        // registrations model Point/Batch writes sharing an extent; the first
+        // policy must remain authoritative in both representations.
+        let registration_order = [17, 3, 88, 0, 16, 42, 1, 127, 5, 42, 17, 64, 2, 90, 4];
+        for (position, window) in registration_order.into_iter().enumerate() {
+            let extent_start = START + window * WINDOW;
+            let policy = if (position + window as usize).is_multiple_of(2) {
+                WalV8ExtentPolicy::Lookahead
+            } else {
+                WalV8ExtentPolicy::FallocateOnly
+            };
+            let prepared_end = START + (u64::try_from(position % 6)? * WINDOW) + WINDOW / 2;
+            let first_owner_policy = if extent_start < prepared_end {
+                WalV8ExtentPolicy::FallocateOnly
+            } else {
+                policy
+            };
+            assert_eq!(
+                btree.insert_if_absent(extent_start, first_owner_policy)?,
+                vector.insert_if_absent(extent_start, first_owner_policy)?
+            );
+        }
+        assert_eq!(btree.len(), vector.len());
+
+        // Exercise exact window boundaries, partial windows, gaps between
+        // out-of-order admissions, and endpoints immediately around a window.
+        let mut endpoints = vec![START, START + 1, START + WINDOW_COUNT * WINDOW];
+        for index in 0..=WINDOW_COUNT {
+            let boundary = START + index * WINDOW;
+            endpoints.extend([
+                boundary.saturating_sub(1),
+                boundary,
+                boundary.saturating_add(1),
+            ]);
+        }
+        let prepared_ends = endpoints.clone();
+        for prepared_end in prepared_ends {
+            for end in &endpoints {
+                assert_eq!(
+                    btree.has_unprepared_lookahead(*end, prepared_end, false).0,
+                    vector.has_unprepared_lookahead(*end, prepared_end, false).0,
+                    "prepared_end={prepared_end}, end={end}"
+                );
+            }
+        }
+
+        // Deterministic randomized admission and query states add coverage for
+        // sparse Vec slots and first-owner-wins collisions without a new crate.
+        let mut random_btree =
+            WalV8ExtentPolicies::new(START, WINDOW, WalV8ExtentPolicyStorageKind::BTreeMap);
+        let mut random_vector =
+            WalV8ExtentPolicies::new(START, WINDOW, WalV8ExtentPolicyStorageKind::Vec);
+        let mut seed = 0x7d31_9a5b_u64;
+        let mut next = || {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            seed
+        };
+        for _ in 0..512 {
+            let window = next() % WINDOW_COUNT;
+            let extent_start = START + window * WINDOW;
+            let prepared_end = START + (next() % (WINDOW_COUNT + 1)) * WINDOW;
+            let policy = if next() & 1 == 0 {
+                WalV8ExtentPolicy::Lookahead
+            } else {
+                WalV8ExtentPolicy::FallocateOnly
+            };
+            let first_owner_policy = if extent_start < prepared_end {
+                WalV8ExtentPolicy::FallocateOnly
+            } else {
+                policy
+            };
+            assert_eq!(
+                random_btree.insert_if_absent(extent_start, first_owner_policy)?,
+                random_vector.insert_if_absent(extent_start, first_owner_policy)?
+            );
+        }
+        for _ in 0..10_000 {
+            let prepared_end = START + (next() % (WINDOW_COUNT + 2)) * WINDOW;
+            let end = START + (next() % (WINDOW_COUNT + 2)) * WINDOW;
+            assert_eq!(
+                random_btree
+                    .has_unprepared_lookahead(end, prepared_end, false)
+                    .0,
+                random_vector
+                    .has_unprepared_lookahead(end, prepared_end, false)
+                    .0,
+                "random prepared_end={prepared_end}, end={end}"
+            );
+        }
+
+        let truncate_end = START + 65 * WINDOW + 1;
+        let btree_len = btree.len();
+        let vector_len = vector.len();
+        btree.truncate_before(START - 1);
+        vector.truncate_before(START - 1);
+        assert_eq!(btree.len(), btree_len);
+        assert_eq!(vector.len(), vector_len);
+        btree.truncate_before(truncate_end);
+        vector.truncate_before(truncate_end);
+        assert_eq!(btree.len(), vector.len());
+        for index in 0..WINDOW_COUNT {
+            let extent_start = START + index * WINDOW;
+            assert_eq!(btree.get(extent_start), vector.get(extent_start));
+        }
+
+        Ok(())
+    }
 
     #[test]
     fn sliding_extent_falls_back_to_exact_prefix_after_capacity_error() -> Result<()> {
@@ -3891,7 +5834,8 @@ mod tests {
 
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("active-v8.wal");
-        let fixture = accounted_extent_preallocator_fixture(&path, SEGMENT_LIMIT, WINDOW_BYTES)?;
+        let fixture =
+            accounted_extent_preallocator_fixture(&path, SEGMENT_LIMIT, WINDOW_BYTES, false)?;
         let slack_bytes = fixture.window_end - fixture.required_end;
 
         let mut calls = Vec::new();
@@ -3957,7 +5901,8 @@ mod tests {
 
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("active-v8.wal");
-        let fixture = accounted_extent_preallocator_fixture(&path, SEGMENT_LIMIT, WINDOW_BYTES)?;
+        let fixture =
+            accounted_extent_preallocator_fixture(&path, SEGMENT_LIMIT, WINDOW_BYTES, false)?;
         let slack_bytes = fixture.window_end - fixture.required_end;
 
         let mut calls = Vec::new();
@@ -3994,7 +5939,7 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("active-v8.wal");
         let mut fixture =
-            accounted_extent_preallocator_fixture(&path, 64 * 1024, FRAME_LEN_U64 * 4)?;
+            accounted_extent_preallocator_fixture(&path, 64 * 1024, FRAME_LEN_U64 * 4, false)?;
         fixture
             .preallocator
             .ensure_prepared_through_with(fixture.required_end, |_, _| Ok(()))?;
@@ -4014,6 +5959,290 @@ mod tests {
         assert_eq!(
             fixture.owner.image_owner().snapshot().source_spool_bytes,
             source_bytes
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn extent_lookahead_initializes_window_before_releasing_waiters() -> Result<()> {
+        const SEGMENT_LIMIT: u64 = 64 * 1024;
+        const WINDOW_BYTES: u64 = FRAME_LEN_U64 * 4;
+
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("lookahead-v8.wal");
+        let fixture =
+            accounted_extent_preallocator_fixture(&path, SEGMENT_LIMIT, WINDOW_BYTES, true)?;
+        fixture
+            .preallocator
+            .ensure_prepared_through(fixture.required_end)?;
+
+        let state = fixture.preallocator.state.lock();
+        assert_eq!(state.allocated_end, fixture.window_end);
+        assert_eq!(state.prepared_end, fixture.window_end);
+        drop(state);
+        assert_eq!(std::fs::metadata(&path)?.len(), fixture.window_end);
+        assert_eq!(
+            fixture.owner.image_owner().snapshot().source_spool_bytes,
+            FIXED_IMAGE_TEST_BYTES + fixture.window_end - fixture.required_end
+        );
+
+        fixture
+            .preallocator
+            .consume_source_credit(fixture.required_end, fixture.window_end)?;
+        assert_eq!(
+            fixture.owner.image_owner().snapshot().source_spool_bytes,
+            FIXED_IMAGE_TEST_BYTES
+        );
+        let prepared_bytes = std::fs::read(&path)?;
+        assert!(
+            prepared_bytes[fixture.start_offset as usize..fixture.window_end as usize]
+                .iter()
+                .all(|byte| *byte == 0)
+        );
+
+        Ok(())
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn point_only_lookahead_keeps_batches_on_fallocate_path() -> Result<()> {
+        const SEGMENT_LIMIT: u64 = 1024 * 1024;
+        const WINDOW_BYTES: u64 = WAL_V8_EXTENT_PREPARATION_CHUNK_BYTES as u64;
+
+        let point_directory = tempfile::tempdir()?;
+        let point_path = point_directory.path().join("point-only-lookahead-v8.wal");
+        let point_fixture =
+            point_only_extent_preallocator_fixture(&point_path, SEGMENT_LIMIT, WINDOW_BYTES)?;
+        point_fixture.preallocator.register_data_range(
+            point_fixture.start_offset,
+            point_fixture.required_end,
+            WalV8WriteClass::Point,
+            FRAME_LEN_U64,
+        )?;
+        point_fixture.preallocator.register_data_range(
+            point_fixture.required_end,
+            point_fixture.required_end + FRAME_LEN_U64 * 3,
+            WalV8WriteClass::Batch,
+            FRAME_LEN_U64 * 3,
+        )?;
+        point_fixture
+            .preallocator
+            .ensure_prepared_through(point_fixture.required_end)?;
+
+        let point_state = point_fixture.preallocator.state.lock();
+        assert_eq!(point_state.prepared_end, point_fixture.window_end);
+        assert_eq!(point_state.initialized_bytes, WINDOW_BYTES);
+        assert_eq!(
+            point_state.extent_policies.get(point_fixture.start_offset),
+            Some(WalV8ExtentPolicy::Lookahead)
+        );
+        drop(point_state);
+
+        let batch_directory = tempfile::tempdir()?;
+        let batch_path = batch_directory.path().join("batch-fallocate-only-v8.wal");
+        let batch_fixture =
+            point_only_extent_preallocator_fixture(&batch_path, SEGMENT_LIMIT, WINDOW_BYTES)?;
+        // Even a one-entry WriteBatch remains a Batch API request and keeps
+        // the existing fallocate-only path.
+        let batch_frame_bytes = FRAME_LEN_U64;
+        let batch_end = batch_fixture.start_offset + batch_frame_bytes;
+        batch_fixture.preallocator.register_data_range(
+            batch_fixture.start_offset,
+            batch_end,
+            WalV8WriteClass::Batch,
+            batch_frame_bytes,
+        )?;
+        batch_fixture.preallocator.register_data_range(
+            batch_end,
+            batch_end + FRAME_LEN_U64,
+            WalV8WriteClass::Point,
+            FRAME_LEN_U64,
+        )?;
+        batch_fixture
+            .preallocator
+            .ensure_prepared_through(batch_end)?;
+
+        let batch_state = batch_fixture.preallocator.state.lock();
+        assert_eq!(batch_state.prepared_end, batch_fixture.window_end);
+        assert_eq!(batch_state.initialized_bytes, 0);
+        assert_eq!(
+            batch_state.extent_policies.get(batch_fixture.start_offset),
+            Some(WalV8ExtentPolicy::FallocateOnly)
+        );
+
+        let large_directory = tempfile::tempdir()?;
+        let large_path = large_directory
+            .path()
+            .join("large-point-fallocate-only-v8.wal");
+        let large_fixture =
+            point_only_extent_preallocator_fixture(&large_path, SEGMENT_LIMIT, WINDOW_BYTES)?;
+        large_fixture.preallocator.register_data_range(
+            large_fixture.start_offset,
+            large_fixture.start_offset + FRAME_LEN_U64 * 3,
+            WalV8WriteClass::Point,
+            FRAME_LEN_U64 * 3,
+        )?;
+        assert_eq!(
+            large_fixture
+                .preallocator
+                .state
+                .lock()
+                .extent_policies
+                .get(large_fixture.start_offset),
+            Some(WalV8ExtentPolicy::FallocateOnly)
+        );
+
+        Ok(())
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn extent_lookahead_records_condvar_waits() -> Result<()> {
+        const SEGMENT_LIMIT: u64 = 64 * 1024;
+        const WINDOW_BYTES: u64 = FRAME_LEN_U64 * 4;
+
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("lookahead-wait-v8.wal");
+        let fixture =
+            accounted_extent_preallocator_fixture(&path, SEGMENT_LIMIT, WINDOW_BYTES, true)?;
+        let required_end = fixture.required_end;
+        let preallocator = Arc::new(fixture.preallocator);
+        let preparation = preallocator.preparation_lock.lock();
+        let waiting_preallocator = Arc::clone(&preallocator);
+        let waiter =
+            thread::spawn(move || waiting_preallocator.ensure_prepared_through(required_end));
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut observed_wait = false;
+        while Instant::now() < deadline {
+            if preallocator.state.lock().wait_calls > 0 {
+                observed_wait = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        drop(preparation);
+        waiter
+            .join()
+            .expect("lookahead preparation waiter panicked")?;
+
+        assert!(observed_wait, "lookahead wait counter was not recorded");
+        let diagnostics = preallocator.diagnostics();
+        assert_eq!(diagnostics.wait_calls, 1);
+        assert!(diagnostics.wait_ns > 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn extent_lookahead_falls_back_to_quota_covered_prefix() -> Result<()> {
+        const SEGMENT_LIMIT: u64 = 64 * 1024;
+        const WINDOW_BYTES: u64 = FRAME_LEN_U64 * 4;
+
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("lookahead-quota-v8.wal");
+        let fixture =
+            accounted_extent_preallocator_fixture(&path, SEGMENT_LIMIT, WINDOW_BYTES, true)?;
+        let slack_bytes = fixture.window_end - fixture.required_end;
+        let occupying_reservation = fixture.owner.reserve_extent_slack(slack_bytes)?;
+
+        fixture
+            .preallocator
+            .ensure_prepared_through(fixture.required_end)?;
+
+        let state = fixture.preallocator.state.lock();
+        assert_eq!(state.allocated_end, fixture.required_end);
+        assert_eq!(state.prepared_end, fixture.required_end);
+        assert!(state.slack.is_empty());
+        drop(state);
+        assert_eq!(std::fs::metadata(&path)?.len(), fixture.required_end);
+        fixture
+            .owner
+            .release_extent_slack(occupying_reservation, slack_bytes)?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn extent_lookahead_failure_wakes_preparation_waiters() -> Result<()> {
+        const SEGMENT_LIMIT: u64 = 64 * 1024;
+        const WINDOW_BYTES: u64 = FRAME_LEN_U64 * 4;
+
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("lookahead-failure-v8.wal");
+        let fixture =
+            accounted_extent_preallocator_fixture(&path, SEGMENT_LIMIT, WINDOW_BYTES, false)?;
+        let AccountedExtentPreallocatorFixture {
+            owner,
+            preallocator,
+            start_offset,
+            required_end,
+            ..
+        } = fixture;
+        drop(preallocator);
+        let data_file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECT)
+            .open(&path)?;
+        let sync_file = OpenOptions::new().read(true).write(true).open(&path)?;
+        let preallocator = WalV8ExtentPreallocator::new_with_lookahead(
+            data_file,
+            &sync_file,
+            start_offset,
+            SEGMENT_LIMIT,
+            WINDOW_BYTES,
+            Some(owner),
+            true,
+        )?;
+
+        assert!(preallocator.ensure_prepared_through(required_end).is_err());
+        assert!(preallocator.state.lock().failure.is_some());
+
+        Ok(())
+    }
+
+    #[test]
+    fn extent_lookahead_does_not_publish_a_partial_chunk() -> Result<()> {
+        const SEGMENT_LIMIT: u64 = 64 * 1024;
+        const WINDOW_BYTES: u64 = FRAME_LEN_U64 * 4;
+
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("lookahead-partial-v8.wal");
+        let fixture =
+            accounted_extent_preallocator_fixture(&path, SEGMENT_LIMIT, WINDOW_BYTES, false)?;
+        let initialized_start = fixture.start_offset;
+        let initialized_end = initialized_start + 2 * FRAME_LEN_U64;
+        fixture.preallocator.state.lock().allocated_end = initialized_end;
+
+        let mut partial = DirectBuf::new(WAL_V8_FRAME_LEN);
+        partial.zero_range(0, WAL_V8_FRAME_LEN);
+        let error = initialize_v8_extent_chunk(
+            &fixture.preallocator.state,
+            initialized_start,
+            initialized_end,
+            || {
+                fixture
+                    .preallocator
+                    .data_file
+                    .write_all_at(
+                        partial.initialized_slice(0, WAL_V8_FRAME_LEN),
+                        initialized_start,
+                    )
+                    .context("write first frame of injected partial initialization")?;
+                anyhow::bail!("injected partial extent initialization failure")
+            },
+        )
+        .expect_err("partial initialization must not publish its chunk");
+
+        assert!(error.to_string().contains("injected partial"));
+        assert_eq!(
+            fixture.preallocator.state.lock().prepared_end,
+            initialized_start
+        );
+        assert_eq!(
+            std::fs::metadata(&path)?.len(),
+            initialized_start + FRAME_LEN_U64
         );
 
         Ok(())
@@ -4077,6 +6306,22 @@ mod tests {
             .unwrap(),
             Some((WalExtentPreparationMode::SlidingInitialize, 1024 * 1024,))
         );
+        assert_eq!(
+            WalExtentPreparationMode::from_values(
+                Some(OsStr::new("sliding-lookahead")),
+                Some(OsStr::new("1048576")),
+            )
+            .unwrap(),
+            Some((WalExtentPreparationMode::SlidingLookahead, 1024 * 1024,))
+        );
+        assert_eq!(
+            WalExtentPreparationMode::from_values(
+                Some(OsStr::new("sliding-point-lookahead")),
+                Some(OsStr::new("1048576")),
+            )
+            .unwrap(),
+            Some((WalExtentPreparationMode::SlidingPointLookahead, 1024 * 1024,))
+        );
         assert!(WalExtentPreparationMode::from_values(None, Some(OsStr::new("131072"))).is_err());
         assert!(WalExtentPreparationMode::from_values(Some(OsStr::new("none")), None).is_err());
         assert!(
@@ -4089,6 +6334,16 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn production_extent_lookahead_is_explicitly_opt_in() {
+        assert!(!wal_v8_extent_lookahead_from_value(None).unwrap());
+        assert!(!wal_v8_extent_lookahead_from_value(Some(OsStr::new("0"))).unwrap());
+        assert!(!wal_v8_extent_lookahead_from_value(Some(OsStr::new("false"))).unwrap());
+        assert!(wal_v8_extent_lookahead_from_value(Some(OsStr::new("1"))).unwrap());
+        assert!(wal_v8_extent_lookahead_from_value(Some(OsStr::new("true"))).unwrap());
+        assert!(wal_v8_extent_lookahead_from_value(Some(OsStr::new("yes"))).is_err());
     }
 
     fn header() -> WalV8Header {
@@ -4347,7 +6602,27 @@ mod tests {
                     .write(true)
                     .custom_flags(libc::O_DIRECT)
                     .open(wal_path)?;
-                open_writer(wal_path, &installed)?.into_parallel_with_worker_file(worker_file)?
+                if std::env::var_os(EXTENT_PREPARATION_ENV)
+                    .as_deref()
+                    .is_some_and(|mode| {
+                        mode == OsStr::new("sliding-lookahead")
+                            || mode == OsStr::new("sliding-point-lookahead")
+                    })
+                {
+                    let sync_file = OpenOptions::new().read(true).write(true).open(wal_path)?;
+                    let (leader, _owner) = open_accounted_writer(
+                        wal_path,
+                        &installed,
+                        MAX_WAL_FILE_SIZE,
+                        2 * MAX_WAL_FILE_SIZE,
+                        FRAME_LEN_U64,
+                        sync_file,
+                    )?;
+                    leader.into_parallel_with_worker_file(worker_file)?
+                } else {
+                    open_writer(wal_path, &installed)?
+                        .into_parallel_with_worker_file(worker_file)?
+                }
             } else {
                 open_writer(wal_path, &installed)?.into_parallel()?
             };
@@ -4358,7 +6633,13 @@ mod tests {
                     Some("fallocate" | "initialize") => {
                         installed.image_len + WAL_V8_EXTENT_PREPARATION_CHUNK_BYTES as u64
                     }
-                    None | Some("sliding-fallocate" | "sliding-initialize") => installed.image_len,
+                    None
+                    | Some(
+                        "sliding-fallocate"
+                        | "sliding-initialize"
+                        | "sliding-lookahead"
+                        | "sliding-point-lookahead",
+                    ) => installed.image_len,
                     Some(other) => anyhow::bail!("unexpected V8 extent preparation mode {other:?}"),
                 };
                 ensure!(
@@ -4405,6 +6686,8 @@ mod tests {
             "initialize",
             "sliding-fallocate",
             "sliding-initialize",
+            "sliding-lookahead",
+            "sliding-point-lookahead",
         ];
         #[cfg(not(feature = "bench"))]
         let extent_preparation_modes = ["none"];
@@ -4504,6 +6787,19 @@ mod tests {
                                 && (physical_len - preparation_start)
                                     .is_multiple_of(WAL_V8_EXTENT_PREPARATION_CHUNK_BYTES as u64),
                             "sliding V8 initialization did not prepare the multi-window DATA range"
+                        );
+                    }
+                    #[cfg(feature = "bench")]
+                    if matches!(
+                        extent_preparation_mode,
+                        "sliding-lookahead" | "sliding-point-lookahead"
+                    ) {
+                        ensure!(
+                            std::fs::metadata(&wal_path)?.len()
+                                == HEADER_LEN_U64
+                                    + FRAME_LEN_U64
+                                    + WAL_V8_EXTENT_PREPARATION_CHUNK_BYTES as u64,
+                            "sliding V8 lookahead did not initialize its full first window"
                         );
                     }
 
@@ -4721,6 +7017,28 @@ mod tests {
         Arc<WalV8ReservationOwner>,
         Arc<WalV8ExtentPreallocator>,
     )> {
+        open_extent_accounted_parallel_writer_with_lookahead(
+            path,
+            installed,
+            max_file_size,
+            max_source_spool_bytes,
+            window_bytes,
+            false,
+        )
+    }
+
+    fn open_extent_accounted_parallel_writer_with_lookahead(
+        path: &Path,
+        installed: &WalV8InstalledRecovery,
+        max_file_size: u64,
+        max_source_spool_bytes: u64,
+        window_bytes: u64,
+        lookahead: bool,
+    ) -> Result<(
+        WalV8ParallelWriter,
+        Arc<WalV8ReservationOwner>,
+        Arc<WalV8ExtentPreallocator>,
+    )> {
         let sync_file = OpenOptions::new().read(true).write(true).open(path)?;
         let (leader, owner) = open_accounted_writer(
             path,
@@ -4735,13 +7053,14 @@ mod tests {
             .write(true)
             .custom_flags(libc::O_DIRECT)
             .open(path)?;
-        let preallocator = Arc::new(WalV8ExtentPreallocator::new(
+        let preallocator = Arc::new(WalV8ExtentPreallocator::new_with_lookahead(
             worker_file.try_clone()?,
             &sync_file,
             installed.image_len,
             max_file_size,
             window_bytes,
             Some(Arc::clone(&owner)),
+            lookahead,
         )?);
         let mut writer = leader.into_parallel_with_worker_file(worker_file)?;
         Arc::get_mut(&mut writer.io)
@@ -4763,6 +7082,7 @@ mod tests {
         path: &Path,
         max_file_size: u64,
         window_bytes: u64,
+        lookahead: bool,
     ) -> Result<AccountedExtentPreallocatorFixture> {
         let installed = install_empty(path, header())?;
         let start_offset = installed.image_len;
@@ -4787,13 +7107,55 @@ mod tests {
             .custom_flags(libc::O_DIRECT)
             .open(path)?;
         let sync_file = OpenOptions::new().read(true).write(true).open(path)?;
-        let preallocator = WalV8ExtentPreallocator::new(
+        let preallocator = WalV8ExtentPreallocator::new_with_lookahead(
             data_file,
             &sync_file,
             start_offset,
             max_file_size,
             window_bytes,
             Some(Arc::clone(&owner)),
+            lookahead,
+        )?;
+
+        Ok(AccountedExtentPreallocatorFixture {
+            owner,
+            preallocator,
+            start_offset,
+            required_end,
+            window_end,
+        })
+    }
+
+    #[cfg(feature = "bench")]
+    fn point_only_extent_preallocator_fixture(
+        path: &Path,
+        max_file_size: u64,
+        window_bytes: u64,
+    ) -> Result<AccountedExtentPreallocatorFixture> {
+        let fixture =
+            accounted_extent_preallocator_fixture(path, max_file_size, window_bytes, false)?;
+        let AccountedExtentPreallocatorFixture {
+            owner,
+            preallocator,
+            start_offset,
+            required_end,
+            window_end,
+        } = fixture;
+        drop(preallocator);
+
+        let data_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_DIRECT)
+            .open(path)?;
+        let sync_file = OpenOptions::new().read(true).write(true).open(path)?;
+        let preallocator = WalV8ExtentPreallocator::new_with_point_only_lookahead(
+            data_file,
+            &sync_file,
+            start_offset,
+            max_file_size,
+            window_bytes,
+            Arc::clone(&owner),
         )?;
 
         Ok(AccountedExtentPreallocatorFixture {
@@ -5007,6 +7369,171 @@ mod tests {
         assert!(recovered.selection.batches.is_empty());
         assert_eq!(recovered.replay_tickets.len(), 1);
         assert_eq!(replayed_batches(&path, &recovered)?, [batch(10)]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn direct_point_frame_syncs_and_recovers_through_parallel_runtime() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("active-direct-point-v8.wal");
+        let header = header();
+        let installed = install_empty(&path, header)?;
+        let writer = open_writer(&path, &installed)?.into_parallel()?;
+        let input = batch(10);
+        let prepared = writer.preflight_batch_with_write_class(
+            &input,
+            LIVE_WAL_V5_LIMITS,
+            WalV8WriteClass::Point,
+        )?;
+        let job = writer.admit_prepared_batch(prepared, input.commit_ts, input.recorded_at)?;
+        let ticket = job.assignment().segment_ticket;
+
+        job.finish_with_point_direct_frame(true)?;
+        writer.wait_durable(ticket)?;
+        let durable_frontier = writer.active_boundaries()?.1;
+        assert_eq!(durable_frontier.ticket_end, 1);
+        assert!(!writer.is_poisoned());
+
+        drop(writer);
+        let recovered = super::super::install::recover_and_install_active(
+            &path,
+            &[installed.active_boundary],
+            header.predecessor,
+            LIVE_WAL_V5_LIMITS,
+            MAX_WAL_FILE_SIZE,
+        )?;
+        assert_eq!(recovered.active_boundary.ticket_end, 1);
+        assert_eq!(replayed_batches(&path, &recovered)?, [input]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn direct_point_frame_digest_is_ready_before_head_data_submission() -> Result<()> {
+        struct ReleaseFirstProducer(Option<mpsc::Sender<()>>);
+
+        impl ReleaseFirstProducer {
+            fn send(&mut self) {
+                if let Some(release_tx) = self.0.take() {
+                    let _ = release_tx.send(());
+                }
+            }
+        }
+
+        impl Drop for ReleaseFirstProducer {
+            fn drop(&mut self) {
+                self.send();
+            }
+        }
+
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("active-direct-point-ooo-v8.wal");
+        let header = header();
+        let installed = install_empty(&path, header)?;
+        let writer = Arc::new(open_writer(&path, &installed)?.into_parallel()?);
+        let first_batch = batch(10);
+        let first_prepared = writer.preflight_batch(&first_batch, LIVE_WAL_V5_LIMITS)?;
+        let second_batch = batch(20);
+        let second_prepared = writer.preflight_batch_with_write_class(
+            &second_batch,
+            LIVE_WAL_V5_LIMITS,
+            WalV8WriteClass::Point,
+        )?;
+        let (admitted_tx, admitted_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+
+        thread::scope(|scope| -> Result<()> {
+            let mut release_first_producer = ReleaseFirstProducer(Some(release_tx));
+            let first_writer = Arc::clone(&writer);
+            let first_handle = scope.spawn(move || {
+                first_writer.append_prepared_batch_inner(
+                    first_prepared,
+                    10,
+                    first_batch.recorded_at,
+                    || {
+                        admitted_tx
+                            .send(())
+                            .expect("admission receiver remains open");
+                        release_rx
+                            .recv_timeout(Duration::from_secs(5))
+                            .expect("test releases the first producer before timeout");
+                    },
+                )
+            });
+            admitted_rx.recv_timeout(Duration::from_secs(2))?;
+
+            let second_job =
+                writer.admit_prepared_batch(second_prepared, 20, second_batch.recorded_at)?;
+            let second_ticket = second_job.assignment().segment_ticket;
+            assert_eq!(second_ticket, 1);
+            let second_writer = Arc::clone(&writer);
+            let second_handle = scope.spawn(move || -> Result<()> {
+                second_job.finish_with_point_direct_frame(true)?;
+                second_writer.wait_durable(second_ticket)
+            });
+
+            // Ticket 1 can publish its digest and frame while ticket 0's
+            // producer is paused, but the submission worker cannot complete
+            // ticket 1's DATA write until the missing head frame is submitted.
+            // Keep this wait result separate so the head producer is always
+            // released before propagating a timeout or assertion failure.
+            let readiness_result = (|| -> Result<()> {
+                let deadline = Instant::now() + Duration::from_secs(2);
+                loop {
+                    let admitted = writer.coordinator.admitted_window();
+                    if admitted.len() == 2
+                        && admitted[1].frames_ready
+                        && admitted[1].digest_ready.is_some()
+                    {
+                        ensure!(
+                            !admitted[0].frames_ready && !admitted[0].data_complete,
+                            "head DATA producer unexpectedly advanced while paused"
+                        );
+                        ensure!(
+                            !admitted[1].data_complete,
+                            "later DATA completed before the missing head was submitted"
+                        );
+                        ensure!(
+                            writer.coordinator.durable_ticket_end() == 0,
+                            "durable frontier advanced across an incomplete head ticket"
+                        );
+                        return Ok(());
+                    }
+                    ensure!(
+                        Instant::now() < deadline,
+                        "later direct-frame ticket did not publish its digest and frame"
+                    );
+                    thread::yield_now();
+                }
+            })();
+
+            release_first_producer.send();
+            let first_result = first_handle
+                .join()
+                .map_err(|_| anyhow::anyhow!("first v8 producer panicked"))?;
+            let second_result = second_handle
+                .join()
+                .map_err(|_| anyhow::anyhow!("direct-frame producer panicked"))?;
+            readiness_result?;
+            first_result?;
+            second_result?;
+
+            Ok(())
+        })?;
+
+        assert_eq!(writer.active_boundaries()?.1.ticket_end, 2);
+        assert!(!writer.is_poisoned());
+        drop(writer);
+        let recovered = super::super::install::recover_and_install_active(
+            &path,
+            &[installed.active_boundary],
+            header.predecessor,
+            LIVE_WAL_V5_LIMITS,
+            MAX_WAL_FILE_SIZE,
+        )?;
+        assert_eq!(recovered.active_boundary.ticket_end, 2);
+        assert_eq!(replayed_batches(&path, &recovered)?, [batch(10), batch(20)]);
 
         Ok(())
     }
@@ -5346,6 +7873,7 @@ mod tests {
         let publisher = WalV8LeaderAdmissionPublisher {
             coordinator: &writer.coordinator,
             reservation: RefCell::new(&mut reservation),
+            extent_preallocator: writer.io.extent_preallocator.as_deref(),
         };
         let admitted = prepared.admit_with_metadata(10, first_batch.recorded_at, &publisher)?;
         let mut encoded = admitted.encode()?;
@@ -5713,8 +8241,11 @@ mod tests {
 
     #[test]
     fn parallel_frontier_gaps_keep_unused_extent_space_charged() -> Result<()> {
-        const SEGMENT_LIMIT: u64 = 256 * 1024;
-        const WINDOW_BYTES: u64 = FRAME_LEN_U64 * 8;
+        const SEGMENT_LIMIT: u64 = 2 * 1024 * 1024;
+        const WINDOW_BYTES: u64 = 256 * 1024;
+        const DATA_AND_FRONTIER_BYTES_PER_COMMIT: u64 = 2 * FRAME_LEN_U64;
+        const COMMITS_TO_CROSS_TWO_WINDOWS: u64 =
+            (2 * WINDOW_BYTES) / DATA_AND_FRONTIER_BYTES_PER_COMMIT + 1;
 
         let parent = Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/wal-v8-tests");
         std::fs::create_dir_all(&parent)?;
@@ -5730,7 +8261,8 @@ mod tests {
         )?;
 
         let mut previous_frontier_end = installed.image_len;
-        for commit_ts in 10..20 {
+        // Each single-entry commit advances one DATA frame and one FRONTIER frame.
+        for commit_ts in 10..(10 + COMMITS_TO_CROSS_TWO_WINDOWS) {
             let batch = batch(commit_ts);
             let (commit, _) = writer.append_prepared_batch(
                 writer.preflight_batch(&batch, LIVE_WAL_V5_LIMITS)?,
@@ -5749,6 +8281,74 @@ mod tests {
             );
         }
         assert!(previous_frontier_end > installed.image_len + 2 * WINDOW_BYTES);
+
+        Ok(())
+    }
+
+    #[test]
+    fn parallel_lookahead_replays_across_extent_windows() -> Result<()> {
+        const SEGMENT_LIMIT: u64 = 1024 * 1024;
+        const WINDOW_BYTES: u64 = FRAME_LEN_U64 * 8;
+
+        let parent = Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/wal-v8-tests");
+        std::fs::create_dir_all(&parent)?;
+        let directory = tempfile::tempdir_in(parent)?;
+        let path = directory.path().join("lookahead-recovery-v8.wal");
+        let installed = install_empty(&path, header())?;
+        let (writer, owner, preallocator) =
+            match open_extent_accounted_parallel_writer_with_lookahead(
+                &path,
+                &installed,
+                SEGMENT_LIMIT,
+                2 * SEGMENT_LIMIT,
+                WINDOW_BYTES,
+                true,
+            ) {
+                Ok(writer) => writer,
+                Err(error) if is_io_uring_unavailable_error(&error) => {
+                    eprintln!("skipping test (io_uring unavailable): {error:#}");
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            };
+
+        let batches: Vec<_> = (10..80).map(batch).collect();
+        for batch in &batches {
+            writer.append_prepared_batch(
+                writer.preflight_batch(batch, LIVE_WAL_V5_LIMITS)?,
+                batch.commit_ts,
+                batch.recorded_at,
+            )?;
+
+            let state = preallocator.state.lock();
+            let allocated_end = state.allocated_end;
+            assert!(state.prepared_end >= writer.image_len()?);
+            assert!(state.prepared_end <= allocated_end);
+            drop(state);
+            assert_eq!(std::fs::metadata(&path)?.len(), allocated_end);
+            assert_eq!(
+                owner.image_owner().snapshot().source_spool_bytes,
+                allocated_end,
+                "lookahead suffix must remain charged after commit {}",
+                batch.commit_ts
+            );
+        }
+
+        let (_, boundary) = writer.active_boundaries()?;
+        assert!(preallocator.state.lock().allocated_end > installed.image_len + 2 * WINDOW_BYTES);
+        drop(writer);
+        drop(preallocator);
+        drop(owner);
+
+        let recovered = super::super::install::recover_and_install_active(
+            &path,
+            &[boundary],
+            header().predecessor,
+            LIVE_WAL_V5_LIMITS,
+            SEGMENT_LIMIT,
+        )?;
+        assert_eq!(replayed_batches(&path, &recovered)?, batches);
+        assert_eq!(std::fs::metadata(&path)?.len(), recovered.image_len);
 
         Ok(())
     }

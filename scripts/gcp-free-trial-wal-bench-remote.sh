@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-if [[ $# -ne 9 ]]; then
-    echo "usage: $0 <commit> <num> <project> <zone> <instance> <safe-deadline-epoch> <machine-type> <writers-csv> <suite>" >&2
+if [[ $# -ne 11 ]]; then
+    echo "usage: $0 <commit> <num> <project> <zone> <instance> <safe-deadline-epoch> <machine-type> <writers-csv> <suite> <source-patch-sha256> <baseline-commit>" >&2
     exit 64
 fi
 
@@ -15,6 +15,8 @@ SAFE_DEADLINE_EPOCH="$6"
 MACHINE_TYPE="$7"
 WRITERS_CSV="$8"
 SUITE="$9"
+SOURCE_PATCH_SHA256="${10}"
+BASELINE_COMMIT="${11}"
 
 case "$MACHINE_TYPE" in
     c4-standard-8-lssd) SSD_COUNT=1; SSD_TOTAL_GIB=375 ;;
@@ -39,7 +41,10 @@ for writer in "${WRITERS[@]}"; do
     SEEN_WRITERS[$writer]=1
 done
 if [[ "$SUITE" != "batch64" && "$SUITE" != "rfc026-full" \
-    && "$SUITE" != "v8-small-ticket-profile" ]]; then
+    && "$SUITE" != "v8-small-ticket-profile" && "$SUITE" != "commit-order-trace" \
+    && "$SUITE" != "v8-point-lookahead" && "$SUITE" != "v8-mutex-diagnostic" \
+    && "$SUITE" != "v8-point-borrowed-input" && "$SUITE" != "v8-point-direct-frame" \
+    && "$SUITE" != "v8-extent-policy-storage" ]]; then
     echo "unsupported benchmark suite: $SUITE" >&2
     exit 64
 fi
@@ -52,8 +57,57 @@ if [[ ! "$NUM" =~ ^[0-9]+$ ]] || (( NUM < 64 )); then
     echo "num must be >=64" >&2
     exit 64
 fi
+if [[ "$SUITE" == "commit-order-trace" ]] \
+    && { [[ "$NUM" != "100000" ]] || [[ "$MACHINE_TYPE" != "c4-standard-16-lssd" ]] \
+        || [[ "$WRITERS_CSV" != "16" ]]; }; then
+    echo "commit-order-trace requires c4-standard-16-lssd, 16 writers, and 100000 puts" >&2
+    exit 64
+fi
+if [[ "$SUITE" == "v8-mutex-diagnostic" ]] \
+    && { [[ "$NUM" != "100000" ]] || [[ "$MACHINE_TYPE" != "c4-standard-16-lssd" ]] \
+        || [[ "$WRITERS_CSV" != "16" ]]; }; then
+    echo "v8-mutex-diagnostic requires c4-standard-16-lssd, 16 writers, and 100000 puts" >&2
+    exit 64
+fi
+if [[ "$SUITE" == "v8-point-borrowed-input" ]] \
+    && { [[ "$NUM" != "100000" ]] || [[ "$MACHINE_TYPE" != "c4-standard-16-lssd" ]] \
+        || [[ "$WRITERS_CSV" != "1,8,16" ]]; }; then
+    echo "v8-point-borrowed-input requires c4-standard-16-lssd, writers 1,8,16, and 100000 operations" >&2
+    exit 64
+fi
+if [[ "$SUITE" == "v8-point-direct-frame" ]] \
+    && { [[ "$NUM" != "100000" ]] || [[ "$MACHINE_TYPE" != "c4-standard-16-lssd" ]] \
+        || [[ "$WRITERS_CSV" != "1,8,16" ]]; }; then
+    echo "v8-point-direct-frame requires c4-standard-16-lssd, writers 1,8,16, and 100000 operations" >&2
+    exit 64
+fi
+if [[ "$SUITE" == "v8-extent-policy-storage" ]] \
+    && { [[ "$NUM" != "100000" ]] || [[ "$MACHINE_TYPE" != "c4-standard-16-lssd" ]] \
+        || [[ "$WRITERS_CSV" != "8,16" ]]; }; then
+    echo "v8-extent-policy-storage requires c4-standard-16-lssd, writers 8,16, and 100000 operations" >&2
+    exit 64
+fi
 if [[ ! "$SAFE_DEADLINE_EPOCH" =~ ^[0-9]+$ ]] || (( SAFE_DEADLINE_EPOCH < 1 )); then
     echo "safe VM deadline must be a positive Unix epoch" >&2
+    exit 64
+fi
+if [[ "$SUITE" == "commit-order-trace" || "$SUITE" == "v8-point-borrowed-input" ]] \
+    && [[ ! "$SOURCE_PATCH_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+    echo "$SUITE requires a lowercase source patch SHA-256" >&2
+    exit 64
+fi
+if [[ "$SUITE" != "commit-order-trace" && "$SUITE" != "v8-point-borrowed-input" ]] \
+    && [[ "$SOURCE_PATCH_SHA256" != "-" ]]; then
+    echo "source patch SHA-256 is only valid for commit-order-trace and v8-point-borrowed-input" >&2
+    exit 64
+fi
+if [[ "$SUITE" == "v8-point-borrowed-input" ]]; then
+    if [[ ! "$BASELINE_COMMIT" =~ ^[0-9a-fA-F]{40}$ ]]; then
+        echo "v8-point-borrowed-input requires a full baseline commit SHA" >&2
+        exit 64
+    fi
+elif [[ "$BASELINE_COMMIT" != "-" ]]; then
+    echo "baseline commit is only valid for v8-point-borrowed-input" >&2
     exit 64
 fi
 
@@ -175,6 +229,8 @@ runuser -u bench -- env \
     BENCH_DEVICE="$WAL_DEVICE" \
     BENCH_WRITERS="$WRITERS_CSV" \
     BENCH_SUITE="$SUITE" \
+    BENCH_SOURCE_PATCH_SHA256="$SOURCE_PATCH_SHA256" \
+    BENCH_BASELINE_COMMIT="$BASELINE_COMMIT" \
     BENCH_BOOT_LOG="$BOOT_LOG" \
     bash -s <<'BENCH_USER_SCRIPT'
 set -Eeuo pipefail
@@ -233,6 +289,105 @@ printf '%s\n' "$TOOLCHAIN" >"$BENCH_RESULTS/rust-toolchain.txt"
 printf '%s\n' "$BINARY_SHA256" >"$BENCH_RESULTS/write-perf.sha256"
 cp "$REPO/rust-toolchain" "$BENCH_RESULTS/rust-toolchain.toml"
 
+if [[ "$BENCH_SUITE" == "v8-point-borrowed-input" ]]; then
+    if [[ ! -r /tmp/gcp-v8-point-borrowed-input-runner.py ]]; then
+        echo "borrowed-input runner was not uploaded" >&2
+        exit 1
+    fi
+    CANDIDATE_BINARY="$BENCH_WORK/write-perf-candidate"
+    BASELINE_BINARY="$BENCH_WORK/write-perf-baseline"
+    cp "$BINARY" "$CANDIDATE_BINARY"
+    printf '%s\n' "$BINARY_SHA256" >"$BENCH_RESULTS/candidate-binary.sha256"
+    git -C "$REPO" fetch --depth=1 origin "$BENCH_BASELINE_COMMIT"
+    BASELINE_REPO="$BENCH_WORK/toy-kv-engine-baseline"
+    git -C "$REPO" worktree add --quiet --detach "$BASELINE_REPO" FETCH_HEAD
+    BASELINE_ACTUAL="$(git -C "$BASELINE_REPO" rev-parse HEAD)"
+    if [[ "$BASELINE_ACTUAL" != "$BENCH_BASELINE_COMMIT" ]]; then
+        echo "checked out baseline $BASELINE_ACTUAL instead of $BENCH_BASELINE_COMMIT" >&2
+        exit 1
+    fi
+    BASELINE_TOOLCHAIN="$(sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$BASELINE_REPO/rust-toolchain")"
+    if [[ "$BASELINE_TOOLCHAIN" != "$TOOLCHAIN" ]]; then
+        echo "baseline and candidate Rust toolchains differ" >&2
+        exit 1
+    fi
+    ACTUAL_SOURCE_PATCH_SHA256="$(git -C "$REPO" diff --binary "$BENCH_BASELINE_COMMIT" "$ACTUAL_COMMIT" -- \
+        kv-engine/src/mem_table.rs kv-engine/src/mvcc.rs kv-engine/src/wal.rs \
+        kv-engine/src/wal/v8/leader.rs kv-engine/src/wal/v8/prepare.rs | sha256sum | cut -d' ' -f1)"
+    if [[ "$ACTUAL_SOURCE_PATCH_SHA256" != "$BENCH_SOURCE_PATCH_SHA256" ]]; then
+        echo "candidate Rust source patch SHA-256 differs from the local experiment record" >&2
+        exit 1
+    fi
+    (
+        cd "$BASELINE_REPO"
+        CARGO_TARGET_DIR="$REPO/target" cargo "+$TOOLCHAIN" build --locked --release \
+            --package kv-engine --features bench --bin write-perf
+    )
+    cp "$REPO/target/release/write-perf" "$BASELINE_BINARY"
+    BASELINE_BINARY_SHA256="$(sha256sum "$BASELINE_BINARY" | cut -d' ' -f1)"
+    printf '%s\n' "$BASELINE_BINARY_SHA256" >"$BENCH_RESULTS/baseline-binary.sha256"
+    printf '%s\n' "$BENCH_BASELINE_COMMIT" >"$BENCH_RESULTS/baseline-commit.txt"
+    printf '%s\n' "$BENCH_SOURCE_PATCH_SHA256" >"$BENCH_RESULTS/source-patch.sha256"
+    cp /tmp/gcp-v8-point-borrowed-input-runner.py "$REPO/scripts/gcp_v8_point_borrowed_input_runner.py"
+    echo "WAL_BENCHMARK_STARTED $(date --iso-8601=seconds)" | tee -a "$BENCH_BOOT_LOG"
+    PYTHONPATH="$REPO/scripts${PYTHONPATH:+:$PYTHONPATH}" \
+        python3 "$REPO/scripts/gcp_v8_point_borrowed_input_runner.py" \
+        --baseline-binary "$BASELINE_BINARY" --candidate-binary "$CANDIDATE_BINARY" \
+        --results-dir "$BENCH_RESULTS" --db-root "$BENCH_WORK/databases" \
+        --writers "$BENCH_WRITERS" --safe-deadline-epoch "$BENCH_SAFE_DEADLINE_EPOCH" \
+        --baseline-commit "$BENCH_BASELINE_COMMIT" --candidate-commit "$ACTUAL_COMMIT" \
+        --source-patch-sha256 "$BENCH_SOURCE_PATCH_SHA256" \
+        --baseline-binary-sha256 "$BASELINE_BINARY_SHA256" \
+        --candidate-binary-sha256 "$BINARY_SHA256" \
+        --machine-type "$BENCH_MACHINE_TYPE" --ssd-count "$BENCH_SSD_COUNT" \
+        --ssd-gib "$BENCH_SSD_TOTAL_GIB"
+    exit $?
+fi
+
+if [[ "$BENCH_SUITE" == "v8-point-direct-frame" ]]; then
+    if [[ ! -r /tmp/gcp-v8-point-direct-frame-runner.py ]]; then
+        echo "direct-frame runner was not uploaded" >&2
+        exit 1
+    fi
+    cp /tmp/gcp-v8-point-direct-frame-runner.py "$REPO/scripts/gcp_v8_point_direct_frame_runner.py"
+    echo "WAL_BENCHMARK_STARTED $(date --iso-8601=seconds)" | tee -a "$BENCH_BOOT_LOG"
+    PYTHONPATH="$REPO/scripts${PYTHONPATH:+:$PYTHONPATH}" \
+        python3 "$REPO/scripts/gcp_v8_point_direct_frame_runner.py" \
+        --binary "$BINARY" \
+        --results-dir "$BENCH_RESULTS" \
+        --db-root "$BENCH_WORK/databases" \
+        --writers "$BENCH_WRITERS" \
+        --safe-deadline-epoch "$BENCH_SAFE_DEADLINE_EPOCH" \
+        --commit "$ACTUAL_COMMIT" \
+        --binary-sha256 "$BINARY_SHA256" \
+        --machine-type "$BENCH_MACHINE_TYPE" \
+        --ssd-count "$BENCH_SSD_COUNT" \
+        --ssd-gib "$BENCH_SSD_TOTAL_GIB"
+    exit $?
+fi
+
+if [[ "$BENCH_SUITE" == "v8-extent-policy-storage" ]]; then
+    if [[ ! -r /tmp/gcp-v8-extent-policy-storage-runner.py ]]; then
+        echo "extent-policy storage runner was not uploaded" >&2
+        exit 1
+    fi
+    cp /tmp/gcp-v8-extent-policy-storage-runner.py "$REPO/scripts/gcp_v8_extent_policy_storage_runner.py"
+    echo "WAL_BENCHMARK_STARTED $(date --iso-8601=seconds)" | tee -a "$BENCH_BOOT_LOG"
+    PYTHONPATH="$REPO/scripts${PYTHONPATH:+:$PYTHONPATH}" \
+        python3 "$REPO/scripts/gcp_v8_extent_policy_storage_runner.py" \
+        --binary "$BINARY" \
+        --results-dir "$BENCH_RESULTS" \
+        --db-root "$BENCH_WORK/databases" \
+        --writers "$BENCH_WRITERS" \
+        --safe-deadline-epoch "$BENCH_SAFE_DEADLINE_EPOCH" \
+        --commit "$ACTUAL_COMMIT" \
+        --binary-sha256 "$BINARY_SHA256" \
+        --machine-type "$BENCH_MACHINE_TYPE" \
+        --ssd-count "$BENCH_SSD_COUNT" \
+        --ssd-gib "$BENCH_SSD_TOTAL_GIB"
+    exit $?
+fi
+
 if [[ "$BENCH_SUITE" == "v8-small-ticket-profile" ]]; then
     if [[ ! -r /tmp/gcp-wal-profile-runner.py ]]; then
         echo "profile runner was not uploaded" >&2
@@ -247,6 +402,60 @@ if [[ "$BENCH_SUITE" == "v8-small-ticket-profile" ]]; then
         --db-root "$BENCH_WORK/databases" \
         --writers "$BENCH_WRITERS" \
         --safe-deadline-epoch "$BENCH_SAFE_DEADLINE_EPOCH"
+elif [[ "$BENCH_SUITE" == "commit-order-trace" ]]; then
+    if [[ ! -r /tmp/gcp-commit-order-trace-runner.py ]]; then
+        echo "commit-order trace runner was not uploaded" >&2
+        exit 1
+    fi
+    printf '%s\n' "$BENCH_SOURCE_PATCH_SHA256" >"$BENCH_RESULTS/source-patch.sha256"
+    cp /tmp/gcp-commit-order-trace-runner.py "$REPO/scripts/gcp_commit_order_trace_runner.py"
+    echo "WAL_BENCHMARK_STARTED $(date --iso-8601=seconds)" | tee -a "$BENCH_BOOT_LOG"
+    PYTHONPATH="$REPO/scripts${PYTHONPATH:+:$PYTHONPATH}" \
+        python3 "$REPO/scripts/gcp_commit_order_trace_runner.py" \
+        --binary "$BINARY" \
+        --results-dir "$BENCH_RESULTS" \
+        --db-root "$BENCH_WORK/databases" \
+        --safe-deadline-epoch "$BENCH_SAFE_DEADLINE_EPOCH" \
+        --commit "$ACTUAL_COMMIT" \
+        --binary-sha256 "$BINARY_SHA256" \
+        --source-patch-sha256 "$BENCH_SOURCE_PATCH_SHA256"
+elif [[ "$BENCH_SUITE" == "v8-point-lookahead" ]]; then
+    if [[ ! -r /tmp/gcp-v8-point-lookahead-runner.py ]]; then
+        echo "Point lookahead runner was not uploaded" >&2
+        exit 1
+    fi
+    cp /tmp/gcp-v8-point-lookahead-runner.py "$REPO/scripts/gcp_v8_point_lookahead_runner.py"
+    echo "WAL_BENCHMARK_STARTED $(date --iso-8601=seconds)" | tee -a "$BENCH_BOOT_LOG"
+    PYTHONPATH="$REPO/scripts${PYTHONPATH:+:$PYTHONPATH}" \
+        python3 "$REPO/scripts/gcp_v8_point_lookahead_runner.py" \
+        --binary "$BINARY" \
+        --results-dir "$BENCH_RESULTS" \
+        --db-root "$BENCH_WORK/databases" \
+        --writers "$BENCH_WRITERS" \
+        --safe-deadline-epoch "$BENCH_SAFE_DEADLINE_EPOCH" \
+        --commit "$ACTUAL_COMMIT" \
+        --binary-sha256 "$BINARY_SHA256" \
+        --machine-type "$BENCH_MACHINE_TYPE" \
+        --ssd-count "$BENCH_SSD_COUNT" \
+        --ssd-gib "$BENCH_SSD_TOTAL_GIB"
+elif [[ "$BENCH_SUITE" == "v8-mutex-diagnostic" ]]; then
+    if [[ ! -r /tmp/gcp-v8-mutex-diagnostic-runner.py ]]; then
+        echo "V8 mutex diagnostic runner was not uploaded" >&2
+        exit 1
+    fi
+    cp /tmp/gcp-v8-mutex-diagnostic-runner.py "$REPO/scripts/gcp_v8_mutex_diagnostic_runner.py"
+    echo "WAL_BENCHMARK_STARTED $(date --iso-8601=seconds)" | tee -a "$BENCH_BOOT_LOG"
+    PYTHONPATH="$REPO/scripts${PYTHONPATH:+:$PYTHONPATH}" \
+        python3 "$REPO/scripts/gcp_v8_mutex_diagnostic_runner.py" \
+        --binary "$BINARY" \
+        --results-dir "$BENCH_RESULTS" \
+        --db-root "$BENCH_WORK/databases" \
+        --safe-deadline-epoch "$BENCH_SAFE_DEADLINE_EPOCH" \
+        --commit "$ACTUAL_COMMIT" \
+        --binary-sha256 "$BINARY_SHA256" \
+        --machine-type "$BENCH_MACHINE_TYPE" \
+        --ssd-count "$BENCH_SSD_COUNT" \
+        --ssd-gib "$BENCH_SSD_TOTAL_GIB"
 elif [[ "$BENCH_SUITE" == "rfc026-full" ]]; then
     python3 - "$BENCH_RESULTS/benchmark-plan.json" "$ACTUAL_COMMIT" "$BINARY_SHA256" \
         "$BENCH_WRITERS" "$BENCH_MACHINE_TYPE" "$BENCH_SSD_COUNT" "$BENCH_SSD_TOTAL_GIB" <<'PY'
@@ -284,7 +493,7 @@ from gcp_wal_matrix import build_rfc026_schedule
 path, writers_csv = sys.argv[1:]
 schedule = build_rfc026_schedule(int(value) for value in writers_csv.split(","))
 with open(path, "w", encoding="utf-8", newline="") as stream:
-    writer = csv.DictWriter(stream, fieldnames=schedule[0].keys(), delimiter="\t")
+    writer = csv.DictWriter(stream, fieldnames=schedule[0].keys(), delimiter="\t", lineterminator="\n")
     writer.writeheader()
     writer.writerows({**item, "batch_size": item["batch_size"] or "none"} for item in schedule)
 PY
