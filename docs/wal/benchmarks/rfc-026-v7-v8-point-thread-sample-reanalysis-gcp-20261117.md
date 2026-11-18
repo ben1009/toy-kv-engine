@@ -15,11 +15,11 @@ samples. The event is `task-clock` sampled at 199 Hz. I grouped
 command name and summed sample periods. The values below are **sample-weighted
 CPU estimates**, not exact per-thread `CLOCK_THREAD_CPUTIME_ID` totals.
 
-Linux truncates thread command names to 15 bytes. The `toy-kv-v8-exten` prefix
-identifies the V8 extent-lookahead worker; `wal-v8-completi` identifies the
-completion reaper. `write-perf` includes the main and writer threads. V8's
-durability driver runs on whichever writer wins election, so its CPU is also
-inside the `write-perf` group.
+Linux truncates thread command names to 15 bytes. The observed truncated
+command name identifies the V8 extent-lookahead worker; `wal-v8-completi`
+identifies the completion reaper. `write-perf` includes the main and writer
+threads. V8's durability driver runs on whichever writer wins election, so its
+CPU is also inside the `write-perf` group.
 
 ## V8 sampled thread CPU
 
