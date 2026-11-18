@@ -2539,22 +2539,6 @@ impl Wal {
             .preflight_batch_with_write_class(batch, limits, write_class)
     }
 
-    pub(crate) fn preflight_v8_parallel_point<'a>(
-        &self,
-        input: v8::prepare::WalV8PointInput<'a>,
-        limits: crate::pitr::WalV5Limits,
-    ) -> Result<v8::leader::WalV8PreparedBatch<'a>> {
-        ensure!(
-            self.format_version == WAL_FORMAT_VERSION_V8,
-            "v8 Point preflight selected for format {}",
-            self.format_version
-        );
-        self.v8_parallel
-            .as_ref()
-            .context("v8 WAL has no Parallel writer")?
-            .preflight_point(input, limits)
-    }
-
     pub(crate) fn admit_v8_prepared_parallel_batch<'a>(
         &self,
         prepared: v8::leader::WalV8PreparedBatch<'a>,

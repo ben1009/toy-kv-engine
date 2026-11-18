@@ -21,14 +21,6 @@ pub(crate) enum WalV8WriteClass {
     Batch,
 }
 
-/// Borrowed input for a single Point API operation. The value for Put is
-/// already KV-kind-prefixed, matching the canonical `WalEntry::Put` payload.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum WalV8PointInput<'a> {
-    Put { key: &'a [u8], value: &'a [u8] },
-    Delete { key: &'a [u8] },
-}
-
 /// Coordinates assigned by the writer after resource reservation and before
 /// payload encoding begins.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -106,179 +98,9 @@ pub(crate) trait WalV8AdmissionPublisher {
     }
 }
 
-enum WalV8CanonicalInput<'a> {
-    Batch(CanonicalWalEntryStream<'a>),
-    Point(CanonicalWalV8PointEntry<'a>),
-}
-
-struct WalV8PreflightMetadata {
-    commit_ts: u64,
-    recorded_at: RecordedAt,
-    write_class: WalV8WriteClass,
-    preparation_buffer_bytes: u64,
-    #[cfg(feature = "bench")]
-    operation_count: u32,
-}
-
-impl WalV8CanonicalInput<'_> {
-    fn data_len(&self) -> usize {
-        match self {
-            Self::Batch(canonical) => canonical.data_len(),
-            Self::Point(canonical) => canonical.data_len,
-        }
-    }
-
-    fn entry_count(&self) -> u32 {
-        match self {
-            Self::Batch(canonical) => canonical.entry_count(),
-            Self::Point(_) => 1,
-        }
-    }
-
-    fn encode_into_with_observer<F>(&self, dst: &mut [u8], observe: F) -> Result<(usize, u32)>
-    where
-        F: FnMut(&[u8]) -> Result<()>,
-    {
-        match self {
-            Self::Batch(canonical) => canonical.encode_into_with_observer(dst, observe),
-            Self::Point(canonical) => canonical.encode_into_with_observer(dst, observe),
-        }
-    }
-}
-
-struct CanonicalWalV8PointEntry<'a> {
-    input: WalV8PointInput<'a>,
-    data_len: usize,
-}
-
-impl<'a> CanonicalWalV8PointEntry<'a> {
-    fn new(input: WalV8PointInput<'a>, limits: WalV5Limits) -> Result<Self> {
-        let limits = limits.validate()?;
-        ensure!(
-            limits.max_input_entry_count >= 1,
-            "v5 input entry count exceeds configured limit"
-        );
-        ensure!(
-            limits.max_entry_count >= 1,
-            "v5 entry count exceeds configured limit"
-        );
-
-        let payload_len = match input {
-            WalV8PointInput::Put { key, value } => {
-                validate_point_field(key, limits.max_key_bytes, "key")?;
-                validate_point_field(value, limits.max_value_bytes, "value")?;
-                8_usize
-                    .checked_add(key.len())
-                    .and_then(|len| len.checked_add(value.len()))
-                    .context("v5 entry payload size overflow")?
-            }
-            WalV8PointInput::Delete { key } => {
-                validate_point_field(key, limits.max_key_bytes, "key")?;
-                4_usize
-                    .checked_add(key.len())
-                    .context("v5 entry payload size overflow")?
-            }
-        };
-        u32::try_from(payload_len).context("v5 payload too large")?;
-        let data_len = payload_len
-            .checked_add(6)
-            .context("v5 entry size overflow")?;
-        ensure!(
-            data_len <= limits.max_batch_data_bytes,
-            "v5 batch data exceeds configured limit"
-        );
-
-        Ok(Self { input, data_len })
-    }
-
-    fn encode_into_with_observer<F>(&self, dst: &mut [u8], mut observe: F) -> Result<(usize, u32)>
-    where
-        F: FnMut(&[u8]) -> Result<()>,
-    {
-        ensure!(
-            dst.len() >= self.data_len,
-            "v5 entry stream output buffer is too small"
-        );
-
-        let mut crc = crc32fast::Hasher::new();
-        let (kind, payload_len) = match self.input {
-            WalV8PointInput::Put { key, value } => (
-                1,
-                8_usize
-                    .checked_add(key.len())
-                    .and_then(|len| len.checked_add(value.len()))
-                    .context("v5 entry payload size overflow")?,
-            ),
-            WalV8PointInput::Delete { key } => (
-                2,
-                4_usize
-                    .checked_add(key.len())
-                    .context("v5 entry payload size overflow")?,
-            ),
-        };
-
-        let mut entry_header = [0_u8; 6];
-        entry_header[0] = kind;
-        entry_header[2..6].copy_from_slice(
-            &u32::try_from(payload_len)
-                .context("v5 payload too large")?
-                .to_be_bytes(),
-        );
-        dst[..entry_header.len()].copy_from_slice(&entry_header);
-        crc.update(&entry_header);
-        let mut position = entry_header.len();
-
-        match self.input {
-            WalV8PointInput::Put { key, value } => {
-                position = write_point_field(dst, position, key, &mut crc)?;
-                position = write_point_field(dst, position, value, &mut crc)?;
-            }
-            WalV8PointInput::Delete { key } => {
-                position = write_point_field(dst, position, key, &mut crc)?;
-            }
-        }
-        ensure!(
-            position == self.data_len,
-            "v5 entry stream length changed while encoding"
-        );
-        observe(&dst[..position])?;
-
-        Ok((position, crc.finalize()))
-    }
-}
-
-fn validate_point_field(bytes: &[u8], max_len: usize, name: &str) -> Result<()> {
-    ensure!(bytes.len() <= max_len, "v5 {name} exceeds configured limit");
-    u32::try_from(bytes.len()).context("v5 batch size overflow")?;
-    Ok(())
-}
-
-fn write_point_field(
-    dst: &mut [u8],
-    position: usize,
-    field: &[u8],
-    crc: &mut crc32fast::Hasher,
-) -> Result<usize> {
-    let end = position
-        .checked_add(4)
-        .context("v5 entry offset overflow")?;
-    dst[position..end].copy_from_slice(
-        &u32::try_from(field.len())
-            .context("v5 batch size overflow")?
-            .to_be_bytes(),
-    );
-    crc.update(&dst[position..end]);
-    let field_end = end
-        .checked_add(field.len())
-        .context("v5 entry offset overflow")?;
-    dst[end..field_end].copy_from_slice(field);
-    crc.update(field);
-    Ok(field_end)
-}
-
 /// Canonical operations and checked encoded sizes, with no serialized payload.
 pub(crate) struct PreparedWalV8Batch<'a, R> {
-    canonical: WalV8CanonicalInput<'a>,
+    canonical: CanonicalWalEntryStream<'a>,
     limits: WalV5Limits,
     commit_ts: u64,
     recorded_at: RecordedAt,
@@ -330,57 +152,7 @@ impl<'a, R> PreparedWalV8Batch<'a, R> {
             .context("v8 operation count exceeds the admission limit")?;
         let preparation_bytes = Self::preparation_buffer_bytes(batch, limits)?;
         let preparation_reservation = reserve_preparation(preparation_bytes)?;
-        let canonical = WalV8CanonicalInput::Batch(CanonicalWalEntryStream::new(batch, limits)?);
-
-        Self::from_canonical(
-            canonical,
-            limits,
-            WalV8PreflightMetadata {
-                commit_ts: batch.commit_ts,
-                recorded_at: batch.recorded_at,
-                write_class,
-                preparation_buffer_bytes: preparation_bytes,
-                #[cfg(feature = "bench")]
-                operation_count,
-            },
-            preparation_reservation,
-        )
-    }
-
-    pub(crate) fn preflight_point<F>(
-        input: WalV8PointInput<'a>,
-        limits: WalV5Limits,
-        reserve_preparation: F,
-    ) -> Result<PreparedWalV8Batch<'a, R>>
-    where
-        F: FnOnce(u64) -> Result<R>,
-    {
-        let limits = limits.validate()?;
-        let canonical = WalV8CanonicalInput::Point(CanonicalWalV8PointEntry::new(input, limits)?);
-        let preparation_bytes = 0;
-        let preparation_reservation = reserve_preparation(preparation_bytes)?;
-
-        Self::from_canonical(
-            canonical,
-            limits,
-            WalV8PreflightMetadata {
-                commit_ts: 1,
-                recorded_at: RecordedAt { secs: 0, nanos: 0 },
-                write_class: WalV8WriteClass::Point,
-                preparation_buffer_bytes: preparation_bytes,
-                #[cfg(feature = "bench")]
-                operation_count: 1,
-            },
-            preparation_reservation,
-        )
-    }
-
-    fn from_canonical(
-        canonical: WalV8CanonicalInput<'a>,
-        limits: WalV5Limits,
-        metadata: WalV8PreflightMetadata,
-        preparation_reservation: R,
-    ) -> Result<PreparedWalV8Batch<'a, R>> {
+        let canonical = CanonicalWalEntryStream::new(batch, limits)?;
         let logical_batch_bytes = codec::WAL_V8_LOGICAL_BATCH_HEADER_LEN
             .checked_add(canonical.data_len())
             .context("v8 logical batch length overflows")?;
@@ -395,13 +167,13 @@ impl<'a, R> PreparedWalV8Batch<'a, R> {
         Ok(PreparedWalV8Batch {
             canonical,
             limits,
-            commit_ts: metadata.commit_ts,
-            recorded_at: metadata.recorded_at,
-            write_class: metadata.write_class,
+            commit_ts: batch.commit_ts,
+            recorded_at: batch.recorded_at,
+            write_class,
             logical_batch_bytes,
-            preparation_buffer_bytes: metadata.preparation_buffer_bytes,
+            preparation_buffer_bytes: preparation_bytes,
             #[cfg(feature = "bench")]
-            operation_count: metadata.operation_count,
+            operation_count,
             fragment_count,
             frame_buffer_bytes,
             preparation_reservation,
@@ -520,7 +292,7 @@ fn validate_assignment(assignment: WalV8BatchAssignment, plan: WalV8AdmissionPla
 
 /// A preflighted batch whose group membership has already been published.
 pub(crate) struct AdmittedWalV8Batch<'a, G, R> {
-    canonical: WalV8CanonicalInput<'a>,
+    canonical: CanonicalWalEntryStream<'a>,
     limits: WalV5Limits,
     logical_batch_bytes: usize,
     assignment: WalV8BatchAssignment,
@@ -916,50 +688,6 @@ mod tests {
         preflight(batch)?.admit(&publisher)?.encode()
     }
 
-    fn assert_point_encoding_matches_batch(
-        point: WalV8PointInput<'_>,
-        batch: &WalBatch,
-    ) -> Result<()> {
-        let point_prepared = PreparedWalV8Batch::<TestPreparationReservation>::preflight_point(
-            point,
-            crate::pitr::LIVE_WAL_V5_LIMITS,
-            |bytes| Ok(TestPreparationReservation { _bytes: bytes }),
-        )?;
-        let point_publisher = TestPublisher::new(WAL_V8_DATA_START);
-        let mut point_encoded = point_prepared
-            .admit_with_metadata(batch.commit_ts, batch.recorded_at, &point_publisher)?
-            .encode()?;
-
-        let batch_publisher = TestPublisher::new(WAL_V8_DATA_START);
-        let mut batch_encoded = preflight(batch)?
-            .admit_with_metadata(batch.commit_ts, batch.recorded_at, &batch_publisher)?
-            .encode()?;
-
-        assert_eq!(point_encoded.as_bytes(), batch_encoded.as_bytes());
-        assert_eq!(point_encoded.entry_digest(), batch_encoded.entry_digest());
-        assert_eq!(point_encoded.batch_digest(), batch_encoded.batch_digest());
-        assert_eq!(
-            point_encoded.frame_buffer_bytes(),
-            batch_encoded.frame_buffer_bytes()
-        );
-
-        let point_bytes = point_encoded.as_bytes();
-        let entry_stream = &point_bytes[codec::WAL_V8_LOGICAL_BATCH_HEADER_LEN..];
-        assert_eq!(
-            u32::from_be_bytes(point_bytes[36..40].try_into()?),
-            crc32fast::hash(entry_stream)
-        );
-        let mut point_frames = vec![0; point_encoded.frame_buffer_bytes()];
-        let mut batch_frames = vec![0; batch_encoded.frame_buffer_bytes()];
-        point_encoded.encode_data_frames_into(&mut point_frames)?;
-        batch_encoded.encode_data_frames_into(&mut batch_frames)?;
-        assert_eq!(point_frames, batch_frames);
-
-        point_encoded.disarm_after_durable();
-        batch_encoded.disarm_after_durable();
-        Ok(())
-    }
-
     #[test]
     fn admission_uses_sequencer_metadata_from_after_preflight() -> Result<()> {
         let batch = batch(32);
@@ -1036,34 +764,6 @@ mod tests {
         batch_encoded.disarm_after_durable();
 
         Ok(())
-    }
-
-    #[test]
-    fn borrowed_point_put_matches_batch_wire_bytes_crc_and_digests() -> Result<()> {
-        let key = b"point-key";
-        let value = [crate::vlog::KvKind::Inline as u8, 0x5a, 0xa5];
-        let batch = WalBatch {
-            commit_ts: 17,
-            recorded_at: RecordedAt { secs: -2, nanos: 7 },
-            entries: vec![crate::pitr::WalEntry::Put {
-                key: key.to_vec(),
-                value: value.to_vec(),
-            }],
-        };
-
-        assert_point_encoding_matches_batch(WalV8PointInput::Put { key, value: &value }, &batch)
-    }
-
-    #[test]
-    fn borrowed_point_delete_matches_batch_wire_bytes_crc_and_digests() -> Result<()> {
-        let key = b"point-key";
-        let batch = WalBatch {
-            commit_ts: 17,
-            recorded_at: RecordedAt { secs: -2, nanos: 7 },
-            entries: vec![crate::pitr::WalEntry::PointDelete { key: key.to_vec() }],
-        };
-
-        assert_point_encoding_matches_batch(WalV8PointInput::Delete { key }, &batch)
     }
 
     #[test]

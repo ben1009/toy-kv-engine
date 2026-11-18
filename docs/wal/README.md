@@ -239,6 +239,7 @@ experiments. Each report records its own outcome and measurement limits.
 - [Batch64 publication and packing follow-up, 2026-10-04](experiments/rfc-024-batch64-publication-and-packing-20261004.md)
 - [Background-I/O gate — measured, rejected](experiments/rfc-024-bg-io-gate-20261002.md)
 - [Context switches and worker retirement, 2026-10-04](experiments/rfc-024-context-switch-and-worker-retirement-20261004.md)
+- [RFC 026 Point borrowed-input experiment — no stable gain, 2026-11-18](experiments/rfc-026-point-borrowed-input-gcp-20261118.md)
 - [Deferred task work with native completion waiting](experiments/rfc-024-deferred-ring-wait-20261003.md)
 - [Extent preparation for large batches](experiments/rfc-024-large-batch-preallocation-20261004.md)
 - [Native forced-async kernel dispatch, 2026-10-06](experiments/rfc-024-native-async-kernel-dispatch-20261006.md)
