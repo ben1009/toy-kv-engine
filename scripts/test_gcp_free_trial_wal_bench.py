@@ -728,12 +728,35 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
             len(sequence) - 1,
         )
 
-    def test_v8_cpu_attribution_reads_digest_from_result_object(self) -> None:
+    def test_v8_cpu_attribution_validates_digest_schema(self) -> None:
         # The digest is serialized beside wal_pipeline inside result, not at the JSON record root.
+        digest = {field: 7 for field in cpu_attribution_runner.V8_DIGEST_COUNTER_FIELDS}
+        digest["cpu_timing_sample_rate"] = cpu_attribution_runner.V8_DIGEST_CPU_SAMPLE_RATE
         self.assertEqual(
-            cpu_attribution_runner._extract_v8_digest({"wal_v8_digest": {"payload_hash_cpu_ns": 7}}),
-            {"payload_hash_cpu_ns": 7},
+            cpu_attribution_runner._extract_v8_digest({"wal_v8_digest": digest}, 8),
+            digest,
         )
+        self.assertIsNone(cpu_attribution_runner._extract_v8_digest({}, 7))
+
+        invalid_results = (
+            None,
+            [],
+            {"payload_hash_cpu_ns": 7},
+            {**digest, "payload_hash_cpu_ns": True},
+            {**digest, "ordered_link_hash_cpu_ns": -1},
+            {**digest, "cpu_timing_sample_rate": 32},
+        )
+        for invalid_digest in invalid_results:
+            with self.subTest(invalid_digest=invalid_digest), self.assertRaises(ValueError):
+                cpu_attribution_runner._extract_v8_digest(
+                    {"wal_v8_digest": invalid_digest}, 8,
+                )
+
+        with self.assertRaisesRegex(ValueError, "missing fields"):
+            cpu_attribution_runner._digest_summary([{"v8_digest": {"payload_hash_cpu_ns": 7}}])
+
+        summary = cpu_attribution_runner._digest_summary([{"v8_digest": digest}])
+        self.assertEqual(summary["payload_hash_cpu_ns_per_sampled_ticket"], 1)
 
     def test_v8_mutex_diagnostic_schedule_and_validation_are_counterbalanced(self) -> None:
         schedule = build_v8_mutex_diagnostic_schedule()

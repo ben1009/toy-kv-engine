@@ -42,6 +42,18 @@ V8_DURABILITY_FIELDS = (
     "resource_retire_before_publish_cpu_ns", "resource_retire_after_publish_cpu_ns",
     "coordinator_publish_cpu_ns",
 )
+V8_DIGEST_COUNTER_FIELDS = (
+    "payload_hash_bytes",
+    "payload_hash_cpu_ns",
+    "header_batch_hash_cpu_ns",
+    "ordered_link_hash_cpu_ns",
+    "post_encode_hash_reread_bytes",
+    "cpu_timing_sample_rate",
+    "cpu_timing_sampled_tickets",
+)
+# Keep in sync with wal::v8::digest::WAL_V8_HASH_CPU_SAMPLE_RATE and
+# write-perf.rs::WAL_V8_HASH_CPU_SAMPLE_RATE.
+V8_DIGEST_CPU_SAMPLE_RATE = 64
 
 
 def _run_id(row: dict[str, Any]) -> str:
@@ -78,9 +90,29 @@ def _valid_nonnegative_int(value: Any) -> bool:
     return type(value) is int and value >= 0
 
 
-def _extract_v8_digest(result: dict[str, Any]) -> dict[str, Any] | None:
+def _validate_v8_digest(digest: Any) -> dict[str, Any]:
+    if not isinstance(digest, dict):
+        raise ValueError("V8 digest metrics are missing or are not an object")
+    missing = [field for field in V8_DIGEST_COUNTER_FIELDS if field not in digest]
+    if missing:
+        raise ValueError(f"V8 digest metrics are missing fields: {', '.join(missing)}")
+    invalid = [field for field in V8_DIGEST_COUNTER_FIELDS if not _valid_nonnegative_int(digest[field])]
+    if invalid:
+        raise ValueError(f"V8 digest metrics have invalid counters: {', '.join(invalid)}")
+    if digest["cpu_timing_sample_rate"] != V8_DIGEST_CPU_SAMPLE_RATE:
+        raise ValueError("V8 digest CPU timing sample rate does not match the expected rate")
+    return digest
+
+
+def _extract_v8_digest(result: dict[str, Any], wal_version: int) -> dict[str, Any] | None:
     digest = result.get("wal_v8_digest")
-    return digest if isinstance(digest, dict) else None
+    if wal_version == 7:
+        if digest is not None:
+            raise ValueError("V7 result unexpectedly contains V8 digest metrics")
+        return None
+    if wal_version != 8:
+        raise ValueError(f"unsupported WAL version for digest validation: {wal_version}")
+    return _validate_v8_digest(digest)
 
 
 def _validate_v8_durability_phase_samples(durability: dict[str, Any]) -> None:
@@ -223,7 +255,7 @@ def _validate_record(record: dict[str, Any], row: dict[str, Any]) -> dict[str, A
         "wal_cpu_attribution_retry_attempts": retry_attempts,
         "wal_cpu_attribution": attribution,
         "v8_durability_diagnostics": durability,
-        "v8_digest": _extract_v8_digest(result),
+        "v8_digest": _extract_v8_digest(result, version),
     }
 
 
@@ -307,10 +339,12 @@ def _durability_summary(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
 
 
 def _digest_summary(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
-    digest = next((row.get("v8_digest") for row in rows if isinstance(row.get("v8_digest"), dict)), None)
-    if digest is None:
+    digest_values = [row["v8_digest"] for row in rows if row.get("v8_digest") is not None]
+    if not digest_values:
         return None
-    sampled_tickets = int(digest.get("cpu_timing_sampled_tickets", 0))
+    digests = [_validate_v8_digest(value) for value in digest_values]
+    digest = digests[0]
+    sampled_tickets = digest["cpu_timing_sampled_tickets"]
     return {
         **digest,
         "payload_hash_cpu_ns_per_sampled_ticket": (
