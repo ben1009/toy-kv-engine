@@ -1670,6 +1670,10 @@ struct WalV8SlidingExtentPreparationRecord {
     initialization_elapsed_ns: u64,
     wait_calls: u64,
     wait_ns: u64,
+    lookahead_check_calls: u64,
+    extent_policy_entries_scanned: u64,
+    extent_policy_map_max_entries: u64,
+    lookahead_worker_cpu_ns: u64,
 }
 
 #[cfg(feature = "bench")]
@@ -1731,6 +1735,10 @@ impl From<WalV8SlidingExtentPreparationDiagnostics> for WalV8SlidingExtentPrepar
             initialization_elapsed_ns: diagnostics.initialization_elapsed_ns,
             wait_calls: diagnostics.wait_calls,
             wait_ns: diagnostics.wait_ns,
+            lookahead_check_calls: diagnostics.lookahead_check_calls,
+            extent_policy_entries_scanned: diagnostics.extent_policy_entries_scanned,
+            extent_policy_map_max_entries: diagnostics.extent_policy_map_max_entries,
+            lookahead_worker_cpu_ns: diagnostics.lookahead_worker_cpu_ns,
         }
     }
 }
@@ -10281,6 +10289,10 @@ mod tests {
                 initialization_elapsed_ns: 0,
                 wait_calls: 0,
                 wait_ns: 0,
+                lookahead_check_calls: 0,
+                extent_policy_entries_scanned: 0,
+                extent_policy_map_max_entries: 0,
+                lookahead_worker_cpu_ns: 0,
             }),
             ..WalIoDiagnosticsRecord::default()
         };

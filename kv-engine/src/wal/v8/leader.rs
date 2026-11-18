@@ -750,6 +750,10 @@ impl WalV8SlidingExtentPreparation {
             initialization_elapsed_ns: state.initialization_elapsed_ns,
             wait_calls: state.wait_calls,
             wait_ns: state.wait_ns,
+            lookahead_check_calls: 0,
+            extent_policy_entries_scanned: 0,
+            extent_policy_map_max_entries: 0,
+            lookahead_worker_cpu_ns: 0,
         }
     }
 }
@@ -821,6 +825,32 @@ struct WalV8ExtentPreallocationState {
     wait_calls: u64,
     #[cfg(feature = "bench")]
     wait_ns: u64,
+    #[cfg(feature = "bench")]
+    lookahead_check_calls: u64,
+    #[cfg(feature = "bench")]
+    extent_policy_entries_scanned: u64,
+    #[cfg(feature = "bench")]
+    extent_policy_map_max_entries: u64,
+    #[cfg(feature = "bench")]
+    lookahead_worker_cpu_ns: u64,
+}
+
+#[cfg(feature = "bench")]
+fn record_extent_policy_map_len(state: &mut WalV8ExtentPreallocationState) {
+    let entries = u64::try_from(state.extent_policies.len()).unwrap_or(u64::MAX);
+    state.extent_policy_map_max_entries = state.extent_policy_map_max_entries.max(entries);
+}
+
+#[cfg(feature = "bench")]
+fn record_lookahead_worker_cpu(
+    state: &mut WalV8ExtentPreallocationState,
+    previous_cpu_ns: &mut u64,
+) {
+    let current_cpu_ns = digest::thread_cpu_time_ns();
+    state.lookahead_worker_cpu_ns = state
+        .lookahead_worker_cpu_ns
+        .saturating_add(current_cpu_ns.saturating_sub(*previous_cpu_ns));
+    *previous_cpu_ns = current_cpu_ns;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1017,6 +1047,14 @@ impl WalV8ExtentPreallocator {
             wait_calls: 0,
             #[cfg(feature = "bench")]
             wait_ns: 0,
+            #[cfg(feature = "bench")]
+            lookahead_check_calls: 0,
+            #[cfg(feature = "bench")]
+            extent_policy_entries_scanned: 0,
+            #[cfg(feature = "bench")]
+            extent_policy_map_max_entries: 0,
+            #[cfg(feature = "bench")]
+            lookahead_worker_cpu_ns: 0,
         }));
         let prepared = Arc::new(Condvar::new());
         let preparation_lock = Arc::new(Mutex::new(()));
@@ -1140,6 +1178,9 @@ impl WalV8ExtentPreallocator {
                 .context("V8 extent policy cursor overflows")?;
         }
 
+        #[cfg(feature = "bench")]
+        record_extent_policy_map_len(&mut state);
+
         Ok(())
     }
 
@@ -1154,17 +1195,51 @@ impl WalV8ExtentPreallocator {
 
     fn has_unprepared_lookahead_extent(
         &self,
-        state: &WalV8ExtentPreallocationState,
+        state: &mut WalV8ExtentPreallocationState,
         end: u64,
     ) -> bool {
-        state
-            .extent_policies
-            .iter()
-            .any(|(&extent_start, &policy)| {
-                policy == WalV8ExtentPolicy::Lookahead
-                    && extent_start < end
-                    && extent_start.saturating_add(self.window_bytes) > state.prepared_end
-            })
+        #[cfg(feature = "bench")]
+        let map_entries = state.extent_policies.len();
+        #[cfg(feature = "bench")]
+        let mut entries_scanned = 0_u64;
+        let prepared_end = state.prepared_end;
+        let has_unprepared = {
+            #[cfg(feature = "bench")]
+            {
+                state
+                    .extent_policies
+                    .iter()
+                    .any(|(&extent_start, &policy)| {
+                        entries_scanned = entries_scanned.saturating_add(1);
+                        policy == WalV8ExtentPolicy::Lookahead
+                            && extent_start < end
+                            && extent_start.saturating_add(self.window_bytes) > prepared_end
+                    })
+            }
+            #[cfg(not(feature = "bench"))]
+            {
+                state
+                    .extent_policies
+                    .iter()
+                    .any(|(&extent_start, &policy)| {
+                        policy == WalV8ExtentPolicy::Lookahead
+                            && extent_start < end
+                            && extent_start.saturating_add(self.window_bytes) > prepared_end
+                    })
+            }
+        };
+        #[cfg(feature = "bench")]
+        {
+            state.lookahead_check_calls = state.lookahead_check_calls.saturating_add(1);
+            state.extent_policy_entries_scanned = state
+                .extent_policy_entries_scanned
+                .saturating_add(entries_scanned);
+            state.extent_policy_map_max_entries = state
+                .extent_policy_map_max_entries
+                .max(u64::try_from(map_entries).unwrap_or(u64::MAX));
+        }
+
+        has_unprepared
     }
 
     fn claim_fallocate_only_windows(
@@ -1188,15 +1263,18 @@ impl WalV8ExtentPreallocator {
                 .context("V8 extent policy cursor overflows")?;
         }
 
+        #[cfg(feature = "bench")]
+        record_extent_policy_map_len(state);
+
         Ok(())
     }
 
     fn ensure_prepared_through(&self, required_end: u64) -> Result<()> {
         if self.strategy.uses_lookahead()
             && (!self.strategy.is_point_only() || {
-                let (_extent_state_timer, state) =
+                let (_extent_state_timer, mut state) =
                     mutex_diagnostics::lock(&self.state, MutexLockKind::ExtentState);
-                self.has_unprepared_lookahead_extent(&state, required_end)
+                self.has_unprepared_lookahead_extent(&mut state, required_end)
             })
         {
             return self.wait_for_prepared_through(required_end);
@@ -1247,7 +1325,8 @@ impl WalV8ExtentPreallocator {
             // keep those paths exact rather than allocating uncharged space.
             target_end = required_end;
         }
-        if self.strategy.is_point_only() && self.has_unprepared_lookahead_extent(&state, target_end)
+        if self.strategy.is_point_only()
+            && self.has_unprepared_lookahead_extent(&mut state, target_end)
         {
             drop(state);
             drop(_extent_state_timer);
@@ -1345,7 +1424,7 @@ impl WalV8ExtentPreallocator {
             anyhow::bail!("V8 extent lookahead failed: {failure}");
         }
         if self.strategy.is_point_only()
-            && !self.has_unprepared_lookahead_extent(&state, required_end)
+            && !self.has_unprepared_lookahead_extent(&mut state, required_end)
         {
             return Ok(());
         }
@@ -1512,6 +1591,10 @@ impl WalV8ExtentPreallocator {
             initialization_elapsed_ns: state.initialization_elapsed_ns,
             wait_calls: state.wait_calls,
             wait_ns: state.wait_ns,
+            lookahead_check_calls: state.lookahead_check_calls,
+            extent_policy_entries_scanned: state.extent_policy_entries_scanned,
+            extent_policy_map_max_entries: state.extent_policy_map_max_entries,
+            lookahead_worker_cpu_ns: state.lookahead_worker_cpu_ns,
         }
     }
 }
@@ -1555,6 +1638,8 @@ impl WalV8ExtentLookaheadWorker {
             point_only_lookahead,
         } = self;
         let chunk_bytes = WAL_V8_EXTENT_PREPARATION_CHUNK_BYTES as u64;
+        #[cfg(feature = "bench")]
+        let mut worker_cpu_checkpoint = digest::thread_cpu_time_ns();
         let mut zeros = DirectBuf::new(chunk_bytes as usize);
         while requests.recv().is_ok() {
             let (_preparation_timer, _preparation) =
@@ -1565,6 +1650,8 @@ impl WalV8ExtentLookaheadWorker {
                 let required_end = state_guard.requested_end;
                 if required_end <= state_guard.prepared_end {
                     state_guard.background_request_pending = false;
+                    #[cfg(feature = "bench")]
+                    record_lookahead_worker_cpu(&mut state_guard, &mut worker_cpu_checkpoint);
                     prepared.notify_all();
                     break;
                 }
@@ -1674,10 +1761,13 @@ impl WalV8ExtentLookaheadWorker {
                         .context("V8 extent lookahead window end overflows")?
                         .min(allocated_end);
                     let extent_policy = if point_only_lookahead {
-                        *state_guard
+                        let policy = *state_guard
                             .extent_policies
                             .entry(extent_start)
-                            .or_insert(WalV8ExtentPolicy::FallocateOnly)
+                            .or_insert(WalV8ExtentPolicy::FallocateOnly);
+                        #[cfg(feature = "bench")]
+                        record_extent_policy_map_len(&mut state_guard);
+                        policy
                     } else {
                         WalV8ExtentPolicy::Lookahead
                     };
@@ -1736,6 +1826,7 @@ impl WalV8ExtentLookaheadWorker {
                         state_guard.elapsed_ns = state_guard
                             .elapsed_ns
                             .saturating_add(initialization_elapsed_ns);
+                        record_lookahead_worker_cpu(&mut state_guard, &mut worker_cpu_checkpoint);
                     }
                     #[cfg(not(feature = "bench"))]
                     let _ = initialization_started;
