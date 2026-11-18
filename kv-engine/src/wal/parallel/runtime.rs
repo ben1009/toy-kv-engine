@@ -2756,10 +2756,19 @@ fn run_sync_coordinator(
         }
         let sync_result = synchronize_written_prefix(&sync_file, &inner);
         #[cfg(feature = "bench")]
-        if let (Some(sample), Ok(Some(sync))) = (cpu_sample.as_mut(), sync_result.as_ref()) {
-            sample.set_work_items(sync.tickets_covered);
-            if sync.succeeded {
-                sample.mark_completed();
+        if let Some(sample) = cpu_sample.as_mut() {
+            match sync_result.as_ref() {
+                Ok(Some(sync)) => {
+                    sample.set_work_items(sync.tickets_covered);
+                    if sync.succeeded {
+                        sample.mark_completed();
+                    }
+                }
+                // A coordinator iteration that finds no eligible written
+                // prefix is still a successfully completed sample. It simply
+                // covered no durable tickets in this iteration.
+                Ok(None) => sample.mark_completed(),
+                Err(_) => {}
             }
         }
         if let Some(sync) = sync_result? {
