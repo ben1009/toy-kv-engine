@@ -77,6 +77,25 @@ def _valid_nonnegative_int(value: Any) -> bool:
     return type(value) is int and value >= 0
 
 
+def _validate_v8_durability_phase_samples(durability: dict[str, Any]) -> None:
+    phases = durability.get("phases")
+    if (
+        durability.get("sample_every") != V8_POINT_CPU_ATTRIBUTION_SAMPLE_EVERY
+        or durability.get("sampled_advances", 0) <= 0
+        or durability.get("dropped_samples") != 0
+        or not isinstance(phases, list)
+        or len(phases) != durability.get("sampled_advances")
+        or any(not isinstance(sample, dict) for sample in phases)
+    ):
+        raise ValueError("V8 durability-driver samples are missing or incomplete")
+    # Rust emits phase records only after the full durability advance succeeds;
+    # failed or interrupted samples are counted as dropped instead. Older
+    # records therefore have no per-phase `succeeded` field. If a future schema
+    # provides it, reject only an explicit failure.
+    if any(sample.get("succeeded") is False for sample in phases):
+        raise ValueError("V8 durability-driver sample reports a failed advance")
+
+
 def _validate_record(record: dict[str, Any], row: dict[str, Any]) -> dict[str, Any]:
     result = record["result"]
     params = record["params"]
@@ -145,16 +164,9 @@ def _validate_record(record: dict[str, Any], row: dict[str, Any]) -> dict[str, A
 
     durability = pipeline.get("v8_durability_diagnostics")
     if version == 8:
-        if (
-            not isinstance(durability, dict)
-            or durability.get("sample_every") != V8_POINT_CPU_ATTRIBUTION_SAMPLE_EVERY
-            or durability.get("sampled_advances", 0) <= 0
-            or durability.get("dropped_samples") != 0
-            or len(durability.get("phases", [])) != durability.get("sampled_advances")
-        ):
+        if not isinstance(durability, dict):
             raise ValueError("V8 durability-driver samples are missing or incomplete")
-        if any(sample.get("succeeded") is not True for sample in durability["phases"]):
-            raise ValueError("V8 durability-driver sample includes a failed advance")
+        _validate_v8_durability_phase_samples(durability)
         if pipeline.get("wal_io_stable") is not True:
             raise ValueError("WAL I/O metadata changed during the run")
         _validate_wal_io_metadata(pipeline, 8, expected_frontier_mode="direct")
@@ -389,7 +401,9 @@ def run_suite(args: Any) -> int:
 
     rows: list[dict[str, Any]] = []
     failed = False
+    runs_started = 0
     for index, item in enumerate(schedule, start=1):
+        runs_started += 1
         try:
             row = _run_one(
                 binary=args.binary, row=item, results_dir=args.results_dir, db_root=args.db_root,
@@ -416,7 +430,12 @@ def run_suite(args: Any) -> int:
         writer.writeheader()
         for row in rows:
             writer.writerow({key: row.get(key, "") for key in fields})
-    return 1 if failed or not summary["complete"] else 0
+    failed = failed or not summary["complete"]
+    (args.results_dir / "remote-exit.json").write_text(
+        json.dumps({"failed": failed, "runs_started": runs_started}, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return 1 if failed else 0
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -16,6 +16,7 @@ import subprocess
 import tempfile
 import tarfile
 import time
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -88,7 +89,12 @@ from gcp_v8_mutex_diagnostic_runner import (
     _validate_record as validate_mutex_record,
 )
 from gcp_v8_point_borrowed_input_runner import _summary_fields
-from gcp_v8_point_cpu_attribution_runner import _build_command as build_cpu_attribution_command
+import gcp_v8_point_cpu_attribution_runner as cpu_attribution_runner
+from gcp_v8_point_cpu_attribution_runner import (
+    _build_command as build_cpu_attribution_command,
+    _validate_v8_durability_phase_samples,
+    run_suite as run_cpu_attribution_suite,
+)
 
 
 SCRIPT = Path(__file__).with_name("gcp-free-trial-wal-bench.py")
@@ -499,6 +505,48 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
         } for row in schedule]
         self.assertTrue(validate_v8_point_cpu_attribution_rows(rows)["complete"])
         self.assertFalse(validate_v8_point_cpu_attribution_rows(rows[:-1])["complete"])
+
+    def test_v8_durability_phase_validation_matches_serialized_schema(self) -> None:
+        # Rust phase records are emitted only for completed advances and do not
+        # serialize a per-record `succeeded` field.
+        diagnostics = {
+            "sample_every": V8_POINT_CPU_ATTRIBUTION_SAMPLE_EVERY,
+            "sampled_advances": 1,
+            "dropped_samples": 0,
+            "phases": [{"sample_id": 64, "advance_sequence": 64}],
+        }
+        _validate_v8_durability_phase_samples(diagnostics)
+
+        diagnostics["phases"][0]["succeeded"] = False
+        with self.assertRaisesRegex(ValueError, "reports a failed advance"):
+            _validate_v8_durability_phase_samples(diagnostics)
+
+    def test_v8_cpu_attribution_writes_standard_remote_exit_metadata(self) -> None:
+        for failed, expected_started in ((False, 8), (True, 1)):
+            with self.subTest(failed=failed), tempfile.TemporaryDirectory() as temporary:
+                results_dir = Path(temporary) / "results"
+                args = SimpleNamespace(
+                    binary=Path("write-perf"),
+                    results_dir=results_dir,
+                    db_root=Path(temporary) / "databases",
+                    safe_deadline_epoch=9_999_999_999,
+                    commit="a" * 40,
+                    binary_sha256="b" * 64,
+                    machine_type="c4-standard-16-lssd",
+                    ssd_count=1,
+                    ssd_gib=375,
+                )
+                row = {"exit_code": 65 if failed else 0}
+                summary = {"complete": not failed}
+                with (
+                    patch.object(cpu_attribution_runner, "_run_one", return_value=row),
+                    patch.object(cpu_attribution_runner, "_summarize", return_value=summary),
+                ):
+                    exit_code = run_cpu_attribution_suite(args)
+
+                remote_exit = json.loads((results_dir / "remote-exit.json").read_text(encoding="utf-8"))
+                self.assertEqual(exit_code, int(failed))
+                self.assertEqual(remote_exit, {"failed": failed, "runs_started": expected_started})
 
     def test_v8_mutex_diagnostic_schedule_and_validation_are_counterbalanced(self) -> None:
         schedule = build_v8_mutex_diagnostic_schedule()
