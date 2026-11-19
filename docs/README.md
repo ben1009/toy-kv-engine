@@ -57,6 +57,7 @@ and do not define the current writer selection.
 - [GCP V8 Point Admission and sequencer breakdown, 2026-11-19](wal/benchmarks/rfc-026-v8-point-admission-sequencer-gcp-20261119.md)
 - [GCP V7/V8 sync decision snapshots, 2026-11-19](wal/benchmarks/rfc-026-v7-v8-sync-decision-snapshots-gcp-20261119.md)
 - [GCP V7/V8 DATA completion timeline, 2026-11-19](wal/benchmarks/rfc-026-v7-v8-data-completion-timeline-gcp-20261119.md)
+- [GCP V7/V8 DATA completion handoff retest, 2026-11-19](wal/benchmarks/rfc-026-v7-v8-completion-handoff-retest-gcp-20261119.md)
 - [GCP V8 Lookahead extent-policy scan diagnostic, 2026-11-18](wal/benchmarks/rfc-026-v8-lookahead-policy-scan-gcp-20261118.md)
 - [GCP V8 extent-policy Vec A/B, 2026-11-18](wal/benchmarks/rfc-026-v8-extent-policy-vec-ab-gcp-20261118.md)
 - [GCP V8 durability phase sampling, 2026-11-13](wal/benchmarks/rfc-026-v8-durability-sampling-gcp-20261113.md)
