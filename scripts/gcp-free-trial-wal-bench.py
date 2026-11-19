@@ -129,7 +129,7 @@ run_names = {
     "result.json", "run-metadata.json", "environment.txt", "start_utc.txt", "end_utc.txt",
     "start_epoch.txt", "command.sh", "stderr.log", "timeline.json", "perf.data",
     "perf-report.txt", "perf-record.log", "perf-command.sh", "validation-error.txt",
-    "sync-observations.json",
+    "sync-observations.json", "completion-timeline.json",
 }
 selected = [path for path in root.iterdir() if path.is_file() and path.name in root_names]
 for run_dir in sorted(root.glob("w*")):

@@ -54,6 +54,7 @@ V8_DIGEST_COUNTER_FIELDS = (
 # Keep in sync with wal::v8::digest::WAL_V8_HASH_CPU_SAMPLE_RATE and
 # write-perf.rs::WAL_V8_HASH_CPU_SAMPLE_RATE.
 V8_DIGEST_CPU_SAMPLE_RATE = 64
+V8_COMPLETION_TIMELINE_SAMPLE_EVERY = 128
 
 
 def _run_id(row: dict[str, Any]) -> str:
@@ -62,7 +63,7 @@ def _run_id(row: dict[str, Any]) -> str:
 
 def _build_command(binary: Path, row: dict[str, Any], db_root: Path) -> list[str]:
     version = 7 if row["arm"] == "v7_parallel" else 8
-    return [
+    command = [
         str(binary), "--bench", "wal_concurrent", "--wal", "--pitr", "--pitr-format", f"v{version}",
         "--wal-io-mode", "parallel", "--num", str(V8_POINT_CPU_ATTRIBUTION_NUM),
         "--threads", str(row["writer"]), "--value-size", "1024", "--target-sst-size", "2147483648",
@@ -71,6 +72,9 @@ def _build_command(binary: Path, row: dict[str, Any], db_root: Path) -> list[str
         "--wal-sync-diagnostics",
         "--path", str(db_root / _run_id(row)),
     ]
+    if version == 8:
+        command.append("--wal-completion-timeline")
+    return command
 
 
 def _parse_record(stdout: str) -> dict[str, Any]:
@@ -212,6 +216,92 @@ def _sync_decision_summary(observations: Any) -> dict[str, Any]:
     }
 
 
+def _completion_timeline_summary(timeline: Any) -> dict[str, Any]:
+    if not isinstance(timeline, dict):
+        raise ValueError("V8 completion timeline is missing or is not an object")
+    samples = timeline.get("samples")
+    if (
+        timeline.get("sample_every") != V8_COMPLETION_TIMELINE_SAMPLE_EVERY
+        or timeline.get("dropped_samples") != 0
+        or not isinstance(samples, list)
+        or not samples
+    ):
+        raise ValueError("V8 completion timeline samples are missing or incomplete")
+
+    duration_fields = (
+        "submit_to_cqe_observed_ns",
+        "cqe_observed_to_group_finished_ns",
+        "group_finished_to_result_send_start_ns",
+        "result_send_start_to_reaper_recv_ns",
+        "reaper_recv_to_data_complete_publish_ns",
+        "data_complete_lock_wait_wall_ns",
+        "data_complete_lock_wait_cpu_ns",
+        "data_complete_lock_hold_wall_ns",
+        "data_complete_lock_hold_cpu_ns",
+        "reaper_recv_to_prefix_ready_ns",
+        "prefix_ready_to_durable_ns",
+    )
+    for index, sample in enumerate(samples):
+        if not isinstance(sample, dict):
+            raise ValueError(f"V8 completion timeline sample {index} is not an object")
+        required_ints = (
+            "group_id", "ticket_start", "ticket_end", "request_id", "request_start", "request_end",
+            "data_complete_prefix_end_before", "data_complete_prefix_end_after", *duration_fields,
+        )
+        if any(not _valid_nonnegative_int(sample.get(field)) for field in required_ints):
+            raise ValueError(f"V8 completion timeline sample {index} has missing or invalid counters")
+        if (
+            sample["ticket_start"] >= sample["ticket_end"]
+            or sample["request_start"] > sample["request_id"]
+            or sample["request_id"] >= sample["request_end"]
+            or sample["request_id"] % V8_COMPLETION_TIMELINE_SAMPLE_EVERY != 0
+            or sample["data_complete_prefix_end_after"] < sample["data_complete_prefix_end_before"]
+        ):
+            raise ValueError(f"V8 completion timeline sample {index} has inconsistent identities or prefix data")
+        blocker_ticket = sample.get("hol_blocker_ticket")
+        blocker_frames_ready = sample.get("hol_blocker_frames_ready")
+        blocker_digest_folded = sample.get("hol_blocker_digest_folded")
+        blocker_write_elapsed = sample.get("hol_blocker_data_write_elapsed_ns")
+        if blocker_ticket is None:
+            if any(value is not None for value in (blocker_frames_ready, blocker_digest_folded, blocker_write_elapsed)):
+                raise ValueError(f"V8 completion timeline sample {index} reports blocker attributes without a blocker")
+        elif (
+            not _valid_nonnegative_int(blocker_ticket)
+            or type(blocker_frames_ready) is not bool
+            or type(blocker_digest_folded) is not bool
+            or (blocker_write_elapsed is not None and not _valid_nonnegative_int(blocker_write_elapsed))
+        ):
+            raise ValueError(f"V8 completion timeline sample {index} has invalid blocker attributes")
+    return {
+        "sample_every": V8_COMPLETION_TIMELINE_SAMPLE_EVERY,
+        "sample_count": len(samples),
+        **{field: _distribution([float(sample[field]) for sample in samples]) for field in duration_fields},
+        "prefix_advanced_count": sum(
+            sample["data_complete_prefix_end_after"] > sample["data_complete_prefix_end_before"]
+            for sample in samples
+        ),
+        "hol_blocker_count": sum(sample["hol_blocker_ticket"] is not None for sample in samples),
+        "hol_blocker_frames_ready_count": sum(sample["hol_blocker_frames_ready"] is True for sample in samples),
+        "hol_blocker_digest_folded_count": sum(sample["hol_blocker_digest_folded"] is True for sample in samples),
+        "data_complete_prefix_growth_tickets": _distribution([
+            float(sample["data_complete_prefix_end_after"] - sample["data_complete_prefix_end_before"])
+            for sample in samples
+        ]),
+        "hol_blocker_data_write_elapsed_ns": _distribution([
+            float(sample["hol_blocker_data_write_elapsed_ns"])
+            for sample in samples
+            if sample["hol_blocker_data_write_elapsed_ns"] is not None
+        ]),
+        "unit_note": (
+            "One request is sampled per cadence and carries its worker group ticket range. Submit-to-CQE is when "
+            "userspace observes completion; it includes kernel completion plus notification and scheduling delay, "
+            "so it is not an SSD-only latency. The blocker write age starts when the producer begins publishing DATA "
+            "to the ordered worker submitter, before SQE submission, so it includes queueing. Reaper-to-prefix-ready "
+            "includes readiness and predecessor ordering."
+        ),
+    }
+
+
 def _validate_record(record: dict[str, Any], row: dict[str, Any]) -> dict[str, Any]:
     result = record["result"]
     params = record["params"]
@@ -308,8 +398,13 @@ def _validate_record(record: dict[str, Any], row: dict[str, Any]) -> dict[str, A
             prep = pipeline[boundary]["sliding_extent_preparation"]
             if prep.get("mode") != "sliding-point-lookahead" or prep.get("window_bytes") != 1 << 20:
                 raise ValueError(f"{boundary} does not report the planned 1 MiB Point lookahead")
+        completion_timeline = _completion_timeline_summary(pipeline.get("v8_completion_timeline"))
     elif durability is not None:
         raise ValueError("V7 run unexpectedly reports V8 durability-driver diagnostics")
+    elif pipeline.get("v8_completion_timeline") is not None:
+        raise ValueError("V7 run unexpectedly reports a V8 completion timeline")
+    else:
+        completion_timeline = None
 
     throughput = float(result["ops_per_sec"])
     cpu_seconds = (float(result["process_cpu_user_ms"]) + float(result["process_cpu_system_ms"])) / 1000
@@ -322,6 +417,7 @@ def _validate_record(record: dict[str, Any], row: dict[str, Any]) -> dict[str, A
         "process_cpu_us_per_put": cpu_seconds * 1_000_000 / int(result["ops"]),
         "sync_count": int(pipeline["sync_count"]),
         "wal_sync_decision_summary": sync_decision,
+        "v8_completion_timeline_summary": completion_timeline,
         "p50_ms": float(record["latency"]["p50_ms"]),
         "p95_ms": float(record["latency"]["p95_ms"]),
         "p99_ms": float(record["latency"]["p99_ms"]),
@@ -478,6 +574,13 @@ def _run_one(
                 (run_dir / "sync-observations.json").write_text(
                     json.dumps(sync_observations, indent=2) + "\n", encoding="utf-8",
                 )
+            completion_timeline = record.get("result", {}).get("wal_pipeline", {}).get(
+                "v8_completion_timeline"
+            )
+            if isinstance(completion_timeline, dict):
+                (run_dir / "completion-timeline.json").write_text(
+                    json.dumps(completion_timeline, indent=2) + "\n", encoding="utf-8",
+                )
             values = _validate_record(record, row)
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
             exit_code = 65
@@ -510,6 +613,7 @@ def _summarize(rows: list[dict[str, Any]], planned: int) -> dict[str, Any]:
                 "durability_advance_cpu_ns": _durability_summary([run]),
                 "digest_cpu": _digest_summary([run]),
                 "sync_decisions": run.get("wal_sync_decision_summary"),
+                "data_completion_timeline": run.get("v8_completion_timeline_summary"),
             }
     return {
         "suite": "v8-point-cpu-attribution",

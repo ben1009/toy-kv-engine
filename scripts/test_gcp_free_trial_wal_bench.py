@@ -93,6 +93,7 @@ from gcp_v8_point_borrowed_input_runner import _summary_fields
 import gcp_v8_point_cpu_attribution_runner as cpu_attribution_runner
 from gcp_v8_point_cpu_attribution_runner import (
     _build_command as build_cpu_attribution_command,
+    _completion_timeline_summary,
     _validate_v8_durability_phase_samples,
     run_suite as run_cpu_attribution_suite,
 )
@@ -499,6 +500,10 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
                 self.assertIn("--wal-sync-diagnostics", command)
                 self.assertIn(f"--threads", command)
                 self.assertIn(str(writer), command)
+                if arm == "v8_point_lookahead_direct":
+                    self.assertIn("--wal-completion-timeline", command)
+                else:
+                    self.assertNotIn("--wal-completion-timeline", command)
 
         plan = build_v8_point_cpu_attribution_plan(
             machine_type="c4-standard-16-lssd",
@@ -573,6 +578,54 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
                         [{**observation, "succeeded": False}]):
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
                 cpu_attribution_runner._sync_decision_summary(invalid)
+
+    def test_v8_completion_timeline_validation_and_summary(self) -> None:
+        timeline = {
+            "sample_every": 128,
+            "dropped_samples": 0,
+            "samples": [{
+                "group_id": 7,
+                "ticket_start": 106,
+                "ticket_end": 108,
+                "request_id": 128,
+                "request_start": 128,
+                "request_end": 130,
+                "submit_to_cqe_observed_ns": 1_000,
+                "cqe_observed_to_group_finished_ns": 200,
+                "group_finished_to_result_send_start_ns": 100,
+                "result_send_start_to_reaper_recv_ns": 300,
+                "reaper_recv_to_data_complete_publish_ns": 400,
+                "data_complete_lock_wait_wall_ns": 20,
+                "data_complete_lock_wait_cpu_ns": 5,
+                "data_complete_lock_hold_wall_ns": 60,
+                "data_complete_lock_hold_cpu_ns": 40,
+                "data_complete_prefix_end_before": 100,
+                "data_complete_prefix_end_after": 100,
+                "hol_blocker_ticket": 100,
+                "hol_blocker_frames_ready": True,
+                "hol_blocker_digest_folded": True,
+                "hol_blocker_data_write_elapsed_ns": 2_000,
+                "reaper_recv_to_prefix_ready_ns": 600,
+                "prefix_ready_to_durable_ns": 3_000,
+            }],
+        }
+        summary = _completion_timeline_summary(timeline)
+        self.assertEqual(summary["sample_count"], 1)
+        self.assertEqual(summary["hol_blocker_count"], 1)
+        self.assertEqual(summary["hol_blocker_frames_ready_count"], 1)
+        self.assertEqual(summary["submit_to_cqe_observed_ns"]["p50"], 1_000)
+        self.assertEqual(summary["data_complete_prefix_growth_tickets"]["p50"], 0)
+        self.assertEqual(summary["hol_blocker_data_write_elapsed_ns"]["p50"], 2_000)
+
+        for invalid in (
+            None,
+            {**timeline, "dropped_samples": 1},
+            {**timeline, "samples": [{**timeline["samples"][0], "request_id": 129}]},
+            {**timeline, "samples": [{**timeline["samples"][0], "data_complete_lock_wait_cpu_ns": True}]},
+            {**timeline, "samples": [{**timeline["samples"][0], "hol_blocker_frames_ready": None}]},
+        ):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                _completion_timeline_summary(invalid)
 
     def test_v8_cpu_attribution_failed_launch_writes_partial_summary_and_zero_started(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2875,7 +2928,10 @@ print('[hotpath] diagnostic report follows')
                 "profile-schedule.tsv", "rust-toolchain.txt", "write-perf.sha256", "perf-version.txt",
             ):
                 (results / name).write_text("fixture\n", encoding="utf-8")
-            for name in ("stderr.log", "timeline.json", "perf.data", "perf-report.txt", "sync-observations.json"):
+            for name in (
+                "stderr.log", "timeline.json", "perf.data", "perf-report.txt", "sync-observations.json",
+                "completion-timeline.json",
+            ):
                 (run_dir / name).write_bytes(b"capture")
             (run_dir / "ignored.db").write_bytes(b"should not be bundled")
 
@@ -2883,7 +2939,7 @@ print('[hotpath] diagnostic report follows')
             result = self._run_remote_bundle(command, results, root)
             self.assertEqual(result.returncode, 0, result.stderr)
             metadata = self._archive_metadata(result.stdout)
-            self.assertEqual(metadata["ARCHIVE_FILES"], "9")
+            self.assertEqual(metadata["ARCHIVE_FILES"], "10")
             archive = Path(metadata["ARCHIVE_PATH"])
             self.assertEqual(archive.parent, root / "remote-tmp")
             with tarfile.open(archive, "r:gz") as bundle:
@@ -2894,6 +2950,7 @@ print('[hotpath] diagnostic report follows')
                 "results/w16-point-v8_parallel/stderr.log", "results/w16-point-v8_parallel/timeline.json",
                 "results/w16-point-v8_parallel/perf.data", "results/w16-point-v8_parallel/perf-report.txt",
                 "results/w16-point-v8_parallel/sync-observations.json",
+                "results/w16-point-v8_parallel/completion-timeline.json",
             ):
                 self.assertIn(name, names)
             self.assertFalse(any(name.endswith("ignored.db") for name in names))

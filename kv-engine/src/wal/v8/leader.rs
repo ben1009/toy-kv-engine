@@ -3122,13 +3122,11 @@ fn reap_v8_group_result(
     crate::chaos::failpoint::wal_crash_point("wal_v8.parallel.after_data_write");
 
     #[cfg(feature = "bench")]
-    if let Some(timeline) = timeline {
-        coordinator.record_data_completion_timeline(timeline)?;
-    }
+    let completion = coordinator.mark_data_group_complete_with_timeline(result.tickets, timeline);
+    #[cfg(not(feature = "bench"))]
+    let completion = coordinator.mark_data_group_complete(result.tickets);
 
-    coordinator
-        .mark_data_group_complete(result.tickets)
-        .context("publish v8 DATA worker group completion")
+    completion.context("publish v8 DATA worker group completion")
 }
 
 impl Drop for WalV8ParallelIo {

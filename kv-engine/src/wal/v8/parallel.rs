@@ -203,6 +203,17 @@ struct TicketState {
 #[cfg(feature = "bench")]
 struct PendingCompletionTimeline {
     group: crate::wal::parallel_worker::WalV8GroupCompletionTimeline,
+    reaper_recv_to_data_complete_publish_ns: Option<u64>,
+    data_complete_lock_wait_wall_ns: Option<u64>,
+    data_complete_lock_wait_cpu_ns: Option<u64>,
+    data_complete_lock_hold_wall_ns: Option<u64>,
+    data_complete_lock_hold_cpu_ns: Option<u64>,
+    data_complete_prefix_end_before: Option<u64>,
+    data_complete_prefix_end_after: Option<u64>,
+    hol_blocker_ticket: Option<u64>,
+    hol_blocker_frames_ready: Option<bool>,
+    hol_blocker_digest_folded: Option<bool>,
+    hol_blocker_data_write_elapsed_ns: Option<u64>,
     prefix_ready_at: Option<Instant>,
 }
 
@@ -917,7 +928,100 @@ impl WalV8ParallelCoordinator {
     /// Publish a worker group's DATA completion atomically so frontier
     /// formation cannot observe a partial completion from one group.
     pub(crate) fn mark_data_group_complete(&self, tickets: Range<u64>) -> Result<()> {
+        #[cfg(feature = "bench")]
+        {
+            self.mark_data_group_complete_inner(tickets, None)
+        }
+        #[cfg(not(feature = "bench"))]
+        {
+            self.mark_data_group_complete_inner(tickets)
+        }
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn mark_data_group_complete_with_timeline(
+        &self,
+        tickets: Range<u64>,
+        timeline: Option<crate::wal::parallel_worker::WalV8GroupCompletionTimeline>,
+    ) -> Result<()> {
+        self.mark_data_group_complete_inner(tickets, timeline)
+    }
+
+    #[inline(always)]
+    fn mark_data_group_complete_inner(
+        &self,
+        tickets: Range<u64>,
+        #[cfg(feature = "bench")] timeline: Option<
+            crate::wal::parallel_worker::WalV8GroupCompletionTimeline,
+        >,
+    ) -> Result<()> {
+        #[cfg(feature = "bench")]
+        let timeline_sampled = timeline.is_some();
+        #[cfg(feature = "bench")]
+        let lock_wait_started = timeline_sampled.then(Instant::now);
+        #[cfg(feature = "bench")]
+        let lock_wait_cpu_started =
+            timeline_sampled.then(crate::wal::v8::digest::thread_cpu_time_ns);
         let mut state = self.inner.state.lock();
+
+        #[cfg(feature = "bench")]
+        let lock_acquired_at = timeline_sampled.then(Instant::now);
+        #[cfg(feature = "bench")]
+        let lock_acquired_cpu = timeline_sampled.then(crate::wal::v8::digest::thread_cpu_time_ns);
+
+        #[cfg(feature = "bench")]
+        if let Some(group) = timeline {
+            ensure!(!state.poisoned, "v8 Parallel coordinator is poisoned");
+            ensure!(
+                group.ticket_start < group.ticket_end
+                    && group.ticket_start >= state.durable_ticket_end
+                    && group.ticket_end <= state.next_ticket,
+                "v8 completion timeline names an invalid ticket range"
+            );
+            ensure!(
+                group.ticket_start == tickets.start && group.ticket_end == tickets.end,
+                "v8 completion timeline ticket range differs from DATA completion"
+            );
+            ensure!(
+                group.request_start <= group.request_id && group.request_id < group.request_end,
+                "v8 completion timeline request is outside its group"
+            );
+            ensure!(
+                group.ticket_end > state.completion_timeline_frontier_ready_end,
+                "v8 completion timeline was recorded after its prefix became ready"
+            );
+            ensure!(
+                state.completion_timeline_samples.len() < self.inner.max_inflight_tickets,
+                "v8 completion timeline exceeded the bounded ticket window"
+            );
+            ensure!(
+                !state
+                    .completion_timeline_samples
+                    .contains_key(&group.ticket_end),
+                "v8 completion timeline duplicates a ticket range"
+            );
+            let ticket_end = group.ticket_end;
+            state.completion_timeline_samples.insert(
+                ticket_end,
+                PendingCompletionTimeline {
+                    group,
+                    reaper_recv_to_data_complete_publish_ns: None,
+                    data_complete_lock_wait_wall_ns: None,
+                    data_complete_lock_wait_cpu_ns: None,
+                    data_complete_lock_hold_wall_ns: None,
+                    data_complete_lock_hold_cpu_ns: None,
+                    data_complete_prefix_end_before: None,
+                    data_complete_prefix_end_after: None,
+                    hol_blocker_ticket: None,
+                    hol_blocker_frames_ready: None,
+                    hol_blocker_digest_folded: None,
+                    hol_blocker_data_write_elapsed_ns: None,
+                    prefix_ready_at: None,
+                },
+            );
+            advance_completion_timeline_prefix(&mut state);
+        }
+
         ensure!(!state.poisoned, "v8 Parallel coordinator is poisoned");
         let Some(ticket_count) = tickets.end.checked_sub(tickets.start) else {
             poison_locked(&self.inner, &mut state);
@@ -978,6 +1082,11 @@ impl WalV8ParallelCoordinator {
             poison_locked(&self.inner, &mut state);
             anyhow::bail!("v8 DATA-completion group partially duplicates prior completion")
         }
+
+        #[cfg(feature = "bench")]
+        let data_complete_prefix_end_before =
+            timeline_sampled.then(|| data_complete_prefix_end(&state));
+
         #[cfg(feature = "bench")]
         let data_completed_at = self
             .inner
@@ -996,6 +1105,36 @@ impl WalV8ParallelCoordinator {
                 entry.data_completed_at = data_completed_at;
             }
         }
+
+        #[cfg(feature = "bench")]
+        let data_complete_published_at = timeline_sampled.then(Instant::now);
+        #[cfg(feature = "bench")]
+        let data_complete_prefix_end_after =
+            timeline_sampled.then(|| data_complete_prefix_end(&state));
+        #[cfg(feature = "bench")]
+        let blocker_observed_at = timeline_sampled.then(Instant::now);
+        #[cfg(feature = "bench")]
+        let hol_blocker = timeline_sampled.then(|| {
+            state
+                .tickets
+                .iter()
+                .find(|entry| !entry.data_complete)
+                .map(|entry| {
+                    (
+                        entry.assignment.segment_ticket,
+                        entry.frames_ready,
+                        entry.prefix_digest_after.is_some(),
+                        entry.data_write_started_at.map(|started_at| {
+                            blocker_observed_at
+                                .expect("sampled blocker timestamp exists")
+                                .saturating_duration_since(started_at)
+                                .as_nanos()
+                                .min(u64::MAX as u128) as u64
+                        }),
+                    )
+                })
+        });
+
         #[cfg(feature = "bench")]
         refresh_data_completion_order_hol(&self.inner, &mut state);
         #[cfg(feature = "bench")]
@@ -1003,48 +1142,50 @@ impl WalV8ParallelCoordinator {
         signal_change(&self.inner, &mut state);
         signal_durability_progress(&self.inner, &mut state);
 
-        Ok(())
-    }
-
-    #[cfg(feature = "bench")]
-    pub(crate) fn record_data_completion_timeline(
-        &self,
-        group: crate::wal::parallel_worker::WalV8GroupCompletionTimeline,
-    ) -> Result<()> {
-        let mut state = self.inner.state.lock();
-        ensure!(!state.poisoned, "v8 Parallel coordinator is poisoned");
-        ensure!(
-            group.ticket_start < group.ticket_end
-                && group.ticket_start >= state.durable_ticket_end
-                && group.ticket_end <= state.next_ticket,
-            "v8 completion timeline names an invalid ticket range"
-        );
-        ensure!(
-            group.request_start <= group.request_id && group.request_id < group.request_end,
-            "v8 completion timeline request is outside its group"
-        );
-        ensure!(
-            group.ticket_end > state.completion_timeline_frontier_ready_end,
-            "v8 completion timeline was recorded after its prefix became ready"
-        );
-        ensure!(
-            state.completion_timeline_samples.len() < self.inner.max_inflight_tickets,
-            "v8 completion timeline exceeded the bounded ticket window"
-        );
-        ensure!(
-            !state
+        #[cfg(feature = "bench")]
+        if timeline_sampled {
+            let lock_released_at = Instant::now();
+            let lock_released_cpu = crate::wal::v8::digest::thread_cpu_time_ns();
+            let lock_wait_wall_ns =
+                completion_timeline_duration_ns(lock_wait_started, lock_acquired_at)
+                    .unwrap_or_default();
+            let lock_wait_cpu_ns = lock_acquired_cpu
+                .zip(lock_wait_cpu_started)
+                .map(|(end, start)| end.saturating_sub(start))
+                .unwrap_or_default();
+            let lock_hold_wall_ns =
+                completion_timeline_duration_ns(lock_acquired_at, Some(lock_released_at))
+                    .unwrap_or_default();
+            let lock_hold_cpu_ns = lock_released_cpu
+                .checked_sub(lock_acquired_cpu.unwrap_or_default())
+                .unwrap_or_default();
+            let ticket_end = tickets.end;
+            let pending = state
                 .completion_timeline_samples
-                .contains_key(&group.ticket_end),
-            "v8 completion timeline duplicates a ticket range"
-        );
-        state.completion_timeline_samples.insert(
-            group.ticket_end,
-            PendingCompletionTimeline {
-                group,
-                prefix_ready_at: None,
-            },
-        );
-        advance_completion_timeline_prefix(&mut state);
+                .get_mut(&ticket_end)
+                .context("sampled DATA completion timeline disappeared")?;
+            let reaper_recv_at = pending.group.reaper_recv_at;
+            pending.data_complete_lock_wait_wall_ns = Some(lock_wait_wall_ns);
+            pending.data_complete_lock_wait_cpu_ns = Some(lock_wait_cpu_ns);
+            pending.data_complete_lock_hold_wall_ns = Some(lock_hold_wall_ns);
+            pending.data_complete_lock_hold_cpu_ns = Some(lock_hold_cpu_ns);
+            pending.data_complete_prefix_end_before = data_complete_prefix_end_before;
+            pending.data_complete_prefix_end_after = data_complete_prefix_end_after;
+            if let Some(published_at) = data_complete_published_at {
+                pending.reaper_recv_to_data_complete_publish_ns = Some(
+                    completion_timeline_duration_ns(reaper_recv_at, Some(published_at))
+                        .unwrap_or_default(),
+                );
+            }
+            if let Some((ticket, frames_ready, digest_folded, write_elapsed_ns)) =
+                hol_blocker.flatten()
+            {
+                pending.hol_blocker_ticket = Some(ticket);
+                pending.hol_blocker_frames_ready = Some(frames_ready);
+                pending.hol_blocker_digest_folded = Some(digest_folded);
+                pending.hol_blocker_data_write_elapsed_ns = write_elapsed_ns;
+            }
+        }
 
         Ok(())
     }
@@ -1352,6 +1493,31 @@ impl WalV8ParallelCoordinator {
                     cqe_observed_to_group_finished_ns,
                     group_finished_to_result_send_start_ns,
                     result_send_start_to_reaper_recv_ns: result_send_to_reaper_ns,
+                    reaper_recv_to_data_complete_publish_ns: sample
+                        .reaper_recv_to_data_complete_publish_ns
+                        .unwrap_or_default(),
+                    data_complete_lock_wait_wall_ns: sample
+                        .data_complete_lock_wait_wall_ns
+                        .unwrap_or_default(),
+                    data_complete_lock_wait_cpu_ns: sample
+                        .data_complete_lock_wait_cpu_ns
+                        .unwrap_or_default(),
+                    data_complete_lock_hold_wall_ns: sample
+                        .data_complete_lock_hold_wall_ns
+                        .unwrap_or_default(),
+                    data_complete_lock_hold_cpu_ns: sample
+                        .data_complete_lock_hold_cpu_ns
+                        .unwrap_or_default(),
+                    data_complete_prefix_end_before: sample
+                        .data_complete_prefix_end_before
+                        .unwrap_or_default(),
+                    data_complete_prefix_end_after: sample
+                        .data_complete_prefix_end_after
+                        .unwrap_or_default(),
+                    hol_blocker_ticket: sample.hol_blocker_ticket,
+                    hol_blocker_frames_ready: sample.hol_blocker_frames_ready,
+                    hol_blocker_digest_folded: sample.hol_blocker_digest_folded,
+                    hol_blocker_data_write_elapsed_ns: sample.hol_blocker_data_write_elapsed_ns,
                     reaper_recv_to_prefix_ready_ns: reaper_to_prefix_ready_ns,
                     prefix_ready_to_durable_ns,
                 };
@@ -2168,6 +2334,18 @@ fn advance_completion_timeline_prefix(state: &mut CoordinatorState) {
             sample.prefix_ready_at = Some(now);
         }
     }
+}
+
+#[cfg(feature = "bench")]
+fn data_complete_prefix_end(state: &CoordinatorState) -> u64 {
+    let completed = state
+        .tickets
+        .iter()
+        .take_while(|ticket| ticket.data_complete)
+        .count();
+    state
+        .durable_ticket_end
+        .saturating_add(u64::try_from(completed).unwrap_or(u64::MAX))
 }
 
 #[cfg(feature = "bench")]
