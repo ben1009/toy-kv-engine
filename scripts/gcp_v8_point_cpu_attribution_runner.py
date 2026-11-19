@@ -279,9 +279,9 @@ def _completion_timeline_summary(timeline: Any) -> dict[str, Any]:
             sample["data_complete_prefix_end_after"] > sample["data_complete_prefix_end_before"]
             for sample in samples
         ),
-        "hol_blocker_count": sum(sample["hol_blocker_ticket"] is not None for sample in samples),
-        "hol_blocker_frames_ready_count": sum(sample["hol_blocker_frames_ready"] is True for sample in samples),
-        "hol_blocker_digest_folded_count": sum(sample["hol_blocker_digest_folded"] is True for sample in samples),
+        "hol_blocker_count": sum(sample.get("hol_blocker_ticket") is not None for sample in samples),
+        "hol_blocker_frames_ready_count": sum(sample.get("hol_blocker_frames_ready") is True for sample in samples),
+        "hol_blocker_digest_folded_count": sum(sample.get("hol_blocker_digest_folded") is True for sample in samples),
         "data_complete_prefix_growth_tickets": _distribution([
             float(sample["data_complete_prefix_end_after"] - sample["data_complete_prefix_end_before"])
             for sample in samples
@@ -289,7 +289,7 @@ def _completion_timeline_summary(timeline: Any) -> dict[str, Any]:
         "hol_blocker_data_write_elapsed_ns": _distribution([
             float(sample["hol_blocker_data_write_elapsed_ns"])
             for sample in samples
-            if sample["hol_blocker_data_write_elapsed_ns"] is not None
+            if sample.get("hol_blocker_data_write_elapsed_ns") is not None
         ]),
         "unit_note": (
             "One request is sampled per cadence and carries its worker group ticket range. Submit-to-CQE is when "
@@ -364,7 +364,7 @@ def _completion_handoff_timeline_summary(
         "sample_count": len(samples),
         "unique_sampled_ticket_count": len(sampled_tickets),
         **{field: _distribution([float(sample[field]) for sample in samples]) for field in duration_fields},
-        "hol_blocker_count": sum(sample["hol_blocker_ticket"] is not None for sample in samples),
+        "hol_blocker_count": sum(sample.get("hol_blocker_ticket") is not None for sample in samples),
         "data_complete_prefix_growth_tickets": _distribution([
             float(sample["data_complete_prefix_end_after"] - sample["data_complete_prefix_end_before"])
             for sample in samples

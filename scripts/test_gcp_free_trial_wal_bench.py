@@ -615,6 +615,18 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
         self.assertEqual(summary["data_complete_prefix_growth_tickets"]["p50"], 0)
         self.assertEqual(summary["hol_blocker_data_write_elapsed_ns"]["p50"], 2_000)
 
+        no_blocker_sample = {
+            key: value for key, value in timeline["samples"][0].items()
+            if not key.startswith("hol_blocker_")
+        }
+        no_blocker_summary = _completion_timeline_summary({
+            **timeline, "samples": [no_blocker_sample],
+        })
+        self.assertEqual(no_blocker_summary["hol_blocker_count"], 0)
+        self.assertEqual(no_blocker_summary["hol_blocker_frames_ready_count"], 0)
+        self.assertEqual(no_blocker_summary["hol_blocker_digest_folded_count"], 0)
+        self.assertEqual(no_blocker_summary["hol_blocker_data_write_elapsed_ns"]["count"], 0)
+
         for invalid in (
             None,
             {**timeline, "dropped_samples": 1},
@@ -894,6 +906,14 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
         self.assertEqual(summary["result_send_start_to_receiver_ns"]["p50"], 40)
         self.assertEqual(summary["frame_ready_to_submit_request_ns"]["p50"], 5)
         self.assertEqual(summary["unique_sampled_ticket_count"], 1)
+        no_blocker_sample = {
+            key: value for key, value in valid["samples"][0].items()
+            if key != "hol_blocker_ticket"
+        }
+        no_blocker_summary = _completion_handoff_timeline_summary({
+            **valid, "samples": [no_blocker_sample],
+        })
+        self.assertEqual(no_blocker_summary["hol_blocker_count"], 0)
         with self.assertRaises(ValueError):
             _completion_handoff_timeline_summary(valid, expected_operations=100_000)
 
