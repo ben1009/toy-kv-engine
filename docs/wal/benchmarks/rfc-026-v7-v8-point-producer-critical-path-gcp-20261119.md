@@ -73,8 +73,16 @@ Before changing synchronization, split the time spent under `write_lock` into ti
 
 - Planned workload: 45 runs total — 20 uninstrumented score runs, 4 CPU-attribution runs, 20 mutex-diagnostic runs, and 1 `perf` run. All 45 planned runs are present and validated.
 - A first `perf` capture failed before workload launch because the disposable VM's perf permissions blocked recording; a retry after a temporary, non-persistent sysctl adjustment succeeded. The failed attempt is retained separately and is not a score.
-- Source patch SHA-256: `d30d38d5dce29ea4c920e7fa3a56c0c763f2a4550296c43926fd6c2918ef2a60`.
+- Diagnostic source patch: [`rfc-026-v8-point-producer-critical-path-daaf03c9.patch`](artifacts/rfc-026-v8-point-producer-critical-path-daaf03c9.patch), SHA-256
+  `d30d38d5dce29ea4c920e7fa3a56c0c763f2a4550296c43926fd6c2918ef2a60`. It applies cleanly to source commit
+  `daaf03c9dc4da52db32a9d847ea33ad6d74eb8e8`.
+- The diagnostic binary was built after applying this patch with the repository's pinned toolchain:
+  `cargo +nightly-2026-09-23 build --locked --release --package kv-engine --features bench --bin write-perf`.
+  Its original-run SHA-256 is recorded above.
 - Transferred archive: 37,846,589 bytes; local SHA-256 matches the remote checksum: `507b0b47652d8e3578baad14a9bb20ed05fe94b960472329646b2b4469fe429f`.
 - Cleanup verification passed: VM, boot disk, temporary SSH firewall, isolated subnet/VPC, route, and Terraform state are absent.
 
-The 37.8 MB raw archive, checksum sidecar, and temporary diagnostic patch are retained locally under `bench-results/gcp-v8-point-critical-path-daaf03c9-20261119/`; they are not checked into this PR. The patch SHA-256 is recorded above. This committed report contains the summarized results and the source/environment identity needed to interpret them.
+The 37.8 MB raw archive and checksum sidecar are retained locally under
+`bench-results/gcp-v8-point-critical-path-daaf03c9-20261119/`; they are not checked into this PR. The diagnostic patch is
+committed at the linked artifact path so the source changes can be inspected and reapplied. The report retains the
+original source, patch, binary, and archive hashes for verification.

@@ -1,0 +1,488 @@
+--- a/kv-engine/src/mvcc.rs
++++ b/kv-engine/src/mvcc.rs
+@@ -1361,6 +1361,12 @@
+ 
+         #[cfg(feature = "bench")]
+         let phase_timer = WalCpuPhaseTimer::start(cpu_attribution.is_some());
++        #[cfg(feature = "bench")]
++        let (sequencer_lock_timer, write_guard) = crate::wal::mutex_diagnostics::lock(
++            &self.write_lock,
++            crate::wal::mutex_diagnostics::MutexLockKind::MvccSequencer,
++        );
++        #[cfg(not(feature = "bench"))]
+         let write_guard = self.write_lock.lock();
+         #[cfg(feature = "bench")]
+         if let Some(sample) = cpu_attribution.as_mut() {
+@@ -1412,6 +1418,8 @@
+             sample.observation.ticket = ticket;
+         }
+         drop(write_guard);
++        #[cfg(feature = "bench")]
++        drop(sequencer_lock_timer);
+         if let Some(frame_job) = frame_job {
+             #[cfg(feature = "bench")]
+             let phase_timer = WalCpuPhaseTimer::start(cpu_attribution.is_some());
+@@ -1436,12 +1444,24 @@
+                 sample.observation.v8_logical_encode_cpu_ns = phases.logical_encode_cpu_ns;
+                 sample.observation.v8_digest_ready_wall_ns = phases.digest_ready_wall_ns;
+                 sample.observation.v8_digest_ready_cpu_ns = phases.digest_ready_cpu_ns;
++                sample.observation.v8_digest_prepare_wall_ns = phases.digest_prepare_wall_ns;
++                sample.observation.v8_digest_prepare_cpu_ns = phases.digest_prepare_cpu_ns;
++                sample.observation.v8_digest_publish_wall_ns = phases.digest_publish_wall_ns;
++                sample.observation.v8_digest_publish_cpu_ns = phases.digest_publish_cpu_ns;
+                 sample.observation.v8_frame_encode_wall_ns = phases.frame_encode_wall_ns;
+                 sample.observation.v8_frame_encode_cpu_ns = phases.frame_encode_cpu_ns;
+                 sample.observation.v8_frames_ready_submit_wall_ns =
+                     phases.frames_ready_submit_wall_ns;
+                 sample.observation.v8_frames_ready_submit_cpu_ns =
+                     phases.frames_ready_submit_cpu_ns;
++                sample.observation.v8_frames_ready_wall_ns = phases.frames_ready_wall_ns;
++                sample.observation.v8_frames_ready_cpu_ns = phases.frames_ready_cpu_ns;
++                sample.observation.v8_producer_guard_insert_wall_ns =
++                    phases.producer_guard_insert_wall_ns;
++                sample.observation.v8_producer_guard_insert_cpu_ns =
++                    phases.producer_guard_insert_cpu_ns;
++                sample.observation.v8_data_submit_wall_ns = phases.data_submit_wall_ns;
++                sample.observation.v8_data_submit_cpu_ns = phases.data_submit_cpu_ns;
+             }
+         }
+ 
+@@ -1501,7 +1521,13 @@
+ 
+         #[cfg(feature = "bench")]
+         let phase_timer = WalCpuPhaseTimer::start(cpu_attribution.is_some());
+-        let _write_guard = self.write_lock.lock();
++        #[cfg(feature = "bench")]
++        let (sequencer_lock_timer, write_guard) = crate::wal::mutex_diagnostics::lock(
++            &self.write_lock,
++            crate::wal::mutex_diagnostics::MutexLockKind::MvccSequencer,
++        );
++        #[cfg(not(feature = "bench"))]
++        let write_guard = self.write_lock.lock();
+         #[cfg(feature = "bench")]
+         if let Some(sample) = cpu_attribution.as_mut() {
+             let (wall_ns, cpu_ns) = phase_timer.finish();
+@@ -1551,7 +1577,9 @@
+             sample.observation.ticket = ticket;
+         }
+         if let Some(frame_job) = frame_job {
+-            drop(_write_guard);
++            drop(write_guard);
++            #[cfg(feature = "bench")]
++            drop(sequencer_lock_timer);
+             #[cfg(feature = "bench")]
+             let phase_timer = WalCpuPhaseTimer::start(cpu_attribution.is_some());
+             let finish_result = self.finish_v7_frame_job(memtable, commit_ts, frame_job);
+@@ -1562,6 +1590,10 @@
+                 sample.observation.frame_finish_cpu_ns = cpu_ns;
+             }
+             finish_result?;
++        } else {
++            drop(write_guard);
++            #[cfg(feature = "bench")]
++            drop(sequencer_lock_timer);
+         }
+ 
+         #[cfg(feature = "bench")]
+--- a/kv-engine/src/mem_table.rs
++++ b/kv-engine/src/mem_table.rs
+@@ -520,10 +520,20 @@
+     pub v8_logical_encode_cpu_ns: u64,
+     pub v8_digest_ready_wall_ns: u64,
+     pub v8_digest_ready_cpu_ns: u64,
++    pub v8_digest_prepare_wall_ns: u64,
++    pub v8_digest_prepare_cpu_ns: u64,
++    pub v8_digest_publish_wall_ns: u64,
++    pub v8_digest_publish_cpu_ns: u64,
+     pub v8_frame_encode_wall_ns: u64,
+     pub v8_frame_encode_cpu_ns: u64,
+     pub v8_frames_ready_submit_wall_ns: u64,
+     pub v8_frames_ready_submit_cpu_ns: u64,
++    pub v8_frames_ready_wall_ns: u64,
++    pub v8_frames_ready_cpu_ns: u64,
++    pub v8_producer_guard_insert_wall_ns: u64,
++    pub v8_producer_guard_insert_cpu_ns: u64,
++    pub v8_data_submit_wall_ns: u64,
++    pub v8_data_submit_cpu_ns: u64,
+     pub producer_total_wall_ns: u64,
+     pub producer_total_cpu_ns: u64,
+     pub completed: bool,
+--- a/kv-engine/src/wal/mutex_diagnostics.rs
++++ b/kv-engine/src/wal/mutex_diagnostics.rs
+@@ -17,11 +17,12 @@
+     ReservationOwner,
+     ExtentState,
+     ExtentPreparation,
++    MvccSequencer,
+     MvccPublication,
+ }
+ 
+ #[cfg(feature = "bench")]
+-const LOCK_KIND_COUNT: usize = 5;
++const LOCK_KIND_COUNT: usize = 6;
+ #[cfg(feature = "bench")]
+ const HISTOGRAM_BUCKETS: usize = 64;
+ 
+@@ -35,14 +36,24 @@
+     pub estimated_contended_count: u64,
+     pub sampled_wait_ns_total: u64,
+     pub estimated_wait_ns_total: u64,
++    pub sampled_wait_cpu_ns_total: u64,
++    pub estimated_wait_cpu_ns_total: u64,
+     pub wait_p50_ns: Option<u64>,
+     pub wait_p95_ns: Option<u64>,
+     pub wait_p99_ns: Option<u64>,
++    pub wait_cpu_p50_ns: Option<u64>,
++    pub wait_cpu_p95_ns: Option<u64>,
++    pub wait_cpu_p99_ns: Option<u64>,
+     pub sampled_hold_ns_total: u64,
+     pub estimated_hold_ns_total: u64,
++    pub sampled_hold_cpu_ns_total: u64,
++    pub estimated_hold_cpu_ns_total: u64,
+     pub hold_p50_ns: Option<u64>,
+     pub hold_p95_ns: Option<u64>,
+     pub hold_p99_ns: Option<u64>,
++    pub hold_cpu_p50_ns: Option<u64>,
++    pub hold_cpu_p95_ns: Option<u64>,
++    pub hold_cpu_p99_ns: Option<u64>,
+     pub condvar_reacquisitions: u64,
+     pub sampled_condvar_wait_ns_total: u64,
+     pub condvar_wait_p50_ns: Option<u64>,
+@@ -65,11 +76,15 @@
+     sampled_acquisition_count: AtomicU64,
+     sampled_contended_count: AtomicU64,
+     sampled_wait_ns_total: AtomicU64,
++    sampled_wait_cpu_ns_total: AtomicU64,
+     sampled_hold_ns_total: AtomicU64,
++    sampled_hold_cpu_ns_total: AtomicU64,
+     condvar_reacquisitions: AtomicU64,
+     sampled_condvar_wait_ns_total: AtomicU64,
+     wait_histogram: [AtomicU64; HISTOGRAM_BUCKETS],
++    wait_cpu_histogram: [AtomicU64; HISTOGRAM_BUCKETS],
+     hold_histogram: [AtomicU64; HISTOGRAM_BUCKETS],
++    hold_cpu_histogram: [AtomicU64; HISTOGRAM_BUCKETS],
+     condvar_wait_histogram: [AtomicU64; HISTOGRAM_BUCKETS],
+ }
+ 
+@@ -81,11 +96,15 @@
+             sampled_acquisition_count: AtomicU64::new(0),
+             sampled_contended_count: AtomicU64::new(0),
+             sampled_wait_ns_total: AtomicU64::new(0),
++            sampled_wait_cpu_ns_total: AtomicU64::new(0),
+             sampled_hold_ns_total: AtomicU64::new(0),
++            sampled_hold_cpu_ns_total: AtomicU64::new(0),
+             condvar_reacquisitions: AtomicU64::new(0),
+             sampled_condvar_wait_ns_total: AtomicU64::new(0),
+             wait_histogram: std::array::from_fn(|_| AtomicU64::new(0)),
++            wait_cpu_histogram: std::array::from_fn(|_| AtomicU64::new(0)),
+             hold_histogram: std::array::from_fn(|_| AtomicU64::new(0)),
++            hold_cpu_histogram: std::array::from_fn(|_| AtomicU64::new(0)),
+             condvar_wait_histogram: std::array::from_fn(|_| AtomicU64::new(0)),
+         }
+     }
+@@ -95,14 +114,18 @@
+         self.sampled_acquisition_count.store(0, Ordering::Relaxed);
+         self.sampled_contended_count.store(0, Ordering::Relaxed);
+         self.sampled_wait_ns_total.store(0, Ordering::Relaxed);
++        self.sampled_wait_cpu_ns_total.store(0, Ordering::Relaxed);
+         self.sampled_hold_ns_total.store(0, Ordering::Relaxed);
++        self.sampled_hold_cpu_ns_total.store(0, Ordering::Relaxed);
+         self.condvar_reacquisitions.store(0, Ordering::Relaxed);
+         self.sampled_condvar_wait_ns_total
+             .store(0, Ordering::Relaxed);
+         for bucket in self
+             .wait_histogram
+             .iter()
++            .chain(&self.wait_cpu_histogram)
+             .chain(&self.hold_histogram)
++            .chain(&self.hold_cpu_histogram)
+             .chain(&self.condvar_wait_histogram)
+         {
+             bucket.store(0, Ordering::Relaxed);
+@@ -166,6 +189,7 @@
+         MutexLockKind::ReservationOwner => "reservation_owner",
+         MutexLockKind::ExtentState => "v8_extent_state",
+         MutexLockKind::ExtentPreparation => "v8_extent_preparation",
++        MutexLockKind::MvccSequencer => "mvcc_sequencer",
+         MutexLockKind::MvccPublication => "mvcc_publication",
+     }
+ }
+@@ -218,11 +242,15 @@
+     let mut sampled_acquisition_count = 0u64;
+     let mut sampled_contended_count = 0u64;
+     let mut sampled_wait_ns_total = 0u64;
++    let mut sampled_wait_cpu_ns_total = 0u64;
+     let mut sampled_hold_ns_total = 0u64;
++    let mut sampled_hold_cpu_ns_total = 0u64;
+     let mut condvar_reacquisitions = 0u64;
+     let mut sampled_condvar_wait_ns_total = 0u64;
+     let mut wait_histogram = [0u64; HISTOGRAM_BUCKETS];
++    let mut wait_cpu_histogram = [0u64; HISTOGRAM_BUCKETS];
+     let mut hold_histogram = [0u64; HISTOGRAM_BUCKETS];
++    let mut hold_cpu_histogram = [0u64; HISTOGRAM_BUCKETS];
+     let mut condvar_wait_histogram = [0u64; HISTOGRAM_BUCKETS];
+ 
+     for thread in threads {
+@@ -235,8 +263,12 @@
+             .saturating_add(counters.sampled_contended_count.load(Ordering::Relaxed));
+         sampled_wait_ns_total = sampled_wait_ns_total
+             .saturating_add(counters.sampled_wait_ns_total.load(Ordering::Relaxed));
++        sampled_wait_cpu_ns_total = sampled_wait_cpu_ns_total
++            .saturating_add(counters.sampled_wait_cpu_ns_total.load(Ordering::Relaxed));
+         sampled_hold_ns_total = sampled_hold_ns_total
+             .saturating_add(counters.sampled_hold_ns_total.load(Ordering::Relaxed));
++        sampled_hold_cpu_ns_total = sampled_hold_cpu_ns_total
++            .saturating_add(counters.sampled_hold_cpu_ns_total.load(Ordering::Relaxed));
+         condvar_reacquisitions = condvar_reacquisitions
+             .saturating_add(counters.condvar_reacquisitions.load(Ordering::Relaxed));
+         sampled_condvar_wait_ns_total = sampled_condvar_wait_ns_total.saturating_add(
+@@ -247,8 +279,12 @@
+         for index in 0..HISTOGRAM_BUCKETS {
+             wait_histogram[index] = wait_histogram[index]
+                 .saturating_add(counters.wait_histogram[index].load(Ordering::Relaxed));
++            wait_cpu_histogram[index] = wait_cpu_histogram[index]
++                .saturating_add(counters.wait_cpu_histogram[index].load(Ordering::Relaxed));
+             hold_histogram[index] = hold_histogram[index]
+                 .saturating_add(counters.hold_histogram[index].load(Ordering::Relaxed));
++            hold_cpu_histogram[index] = hold_cpu_histogram[index]
++                .saturating_add(counters.hold_cpu_histogram[index].load(Ordering::Relaxed));
+             condvar_wait_histogram[index] = condvar_wait_histogram[index]
+                 .saturating_add(counters.condvar_wait_histogram[index].load(Ordering::Relaxed));
+         }
+@@ -271,14 +307,24 @@
+         estimated_contended_count: scale(sampled_contended_count),
+         sampled_wait_ns_total,
+         estimated_wait_ns_total: scale(sampled_wait_ns_total),
++        sampled_wait_cpu_ns_total,
++        estimated_wait_cpu_ns_total: scale(sampled_wait_cpu_ns_total),
+         wait_p50_ns: histogram_quantile(&wait_histogram, 50, 100),
+         wait_p95_ns: histogram_quantile(&wait_histogram, 95, 100),
+         wait_p99_ns: histogram_quantile(&wait_histogram, 99, 100),
++        wait_cpu_p50_ns: histogram_quantile(&wait_cpu_histogram, 50, 100),
++        wait_cpu_p95_ns: histogram_quantile(&wait_cpu_histogram, 95, 100),
++        wait_cpu_p99_ns: histogram_quantile(&wait_cpu_histogram, 99, 100),
+         sampled_hold_ns_total,
+         estimated_hold_ns_total: scale(sampled_hold_ns_total),
++        sampled_hold_cpu_ns_total,
++        estimated_hold_cpu_ns_total: scale(sampled_hold_cpu_ns_total),
+         hold_p50_ns: histogram_quantile(&hold_histogram, 50, 100),
+         hold_p95_ns: histogram_quantile(&hold_histogram, 95, 100),
+         hold_p99_ns: histogram_quantile(&hold_histogram, 99, 100),
++        hold_cpu_p50_ns: histogram_quantile(&hold_cpu_histogram, 50, 100),
++        hold_cpu_p95_ns: histogram_quantile(&hold_cpu_histogram, 95, 100),
++        hold_cpu_p99_ns: histogram_quantile(&hold_cpu_histogram, 99, 100),
+         condvar_reacquisitions,
+         sampled_condvar_wait_ns_total,
+         condvar_wait_p50_ns: histogram_quantile(&condvar_wait_histogram, 50, 100),
+@@ -314,12 +360,13 @@
+         Some(MutexLockDiagnosticsSnapshot {
+             sample_every,
+             histogram: "log2_upper_bound_nanoseconds",
+-            acquisition_scope: "instrumented synchronous WAL resource/extent and MVCC publication call sites",
++            acquisition_scope: "instrumented synchronous WAL resource/extent, MVCC sequencer, and publication call sites",
+             locks: [
+                 MutexLockKind::ResourceLedger,
+                 MutexLockKind::ReservationOwner,
+                 MutexLockKind::ExtentState,
+                 MutexLockKind::ExtentPreparation,
++                MutexLockKind::MvccSequencer,
+                 MutexLockKind::MvccPublication,
+             ]
+             .into_iter()
+@@ -341,7 +388,11 @@
+     #[cfg(feature = "bench")]
+     hold_started: Option<Instant>,
+     #[cfg(feature = "bench")]
++    hold_cpu_started: Option<u64>,
++    #[cfg(feature = "bench")]
+     held_ns: u64,
++    #[cfg(feature = "bench")]
++    held_cpu_ns: u64,
+ }
+ 
+ impl MutexLockTimer {
+@@ -354,7 +405,11 @@
+             #[cfg(feature = "bench")]
+             hold_started: None,
+             #[cfg(feature = "bench")]
++            hold_cpu_started: None,
++            #[cfg(feature = "bench")]
+             held_ns: 0,
++            #[cfg(feature = "bench")]
++            held_cpu_ns: 0,
+         }
+     }
+ 
+@@ -386,6 +441,7 @@
+                 .fetch_add(wait_ns, Ordering::Relaxed);
+             record_histogram(&counters.condvar_wait_histogram, wait_ns);
+             self.hold_started = Some(Instant::now());
++            self.hold_cpu_started = Some(crate::wal::v8::digest::thread_cpu_time_ns());
+         }
+         #[cfg(not(feature = "bench"))]
+         let _ = started;
+@@ -395,6 +451,12 @@
+     fn finish_hold_segment(&mut self) {
+         if let Some(started) = self.hold_started.take() {
+             self.held_ns = self.held_ns.saturating_add(elapsed_ns(started));
++        }
++        #[cfg(feature = "bench")]
++        if let Some(started) = self.hold_cpu_started.take() {
++            self.held_cpu_ns = self.held_cpu_ns.saturating_add(
++                crate::wal::v8::digest::thread_cpu_time_ns().saturating_sub(started),
++            );
+         }
+     }
+ }
+@@ -412,6 +474,10 @@
+                 .sampled_hold_ns_total
+                 .fetch_add(self.held_ns, Ordering::Relaxed);
+             record_histogram(&counters.hold_histogram, self.held_ns);
++            counters
++                .sampled_hold_cpu_ns_total
++                .fetch_add(self.held_cpu_ns, Ordering::Relaxed);
++            record_histogram(&counters.hold_cpu_histogram, self.held_cpu_ns);
+         }
+     }
+ }
+@@ -456,11 +522,13 @@
+ 
+         let counters = thread_counters.counter(kind);
+         let started = Instant::now();
++        let cpu_started = crate::wal::v8::digest::thread_cpu_time_ns();
+         let (guard, contended) = match mutex.try_lock() {
+             Some(guard) => (guard, false),
+             None => (mutex.lock(), true),
+         };
+         let wait_ns = elapsed_ns(started);
++        let wait_cpu_ns = crate::wal::v8::digest::thread_cpu_time_ns().saturating_sub(cpu_started);
+         counters
+             .sampled_acquisition_count
+             .fetch_add(1, Ordering::Relaxed);
+@@ -473,12 +541,18 @@
+             .sampled_wait_ns_total
+             .fetch_add(wait_ns, Ordering::Relaxed);
+         record_histogram(&counters.wait_histogram, wait_ns);
++        counters
++            .sampled_wait_cpu_ns_total
++            .fetch_add(wait_cpu_ns, Ordering::Relaxed);
++        record_histogram(&counters.wait_cpu_histogram, wait_cpu_ns);
+         (
+             MutexLockTimer {
+                 counters: Some(thread_counters),
+                 kind: Some(kind),
+                 hold_started: Some(Instant::now()),
++                hold_cpu_started: Some(crate::wal::v8::digest::thread_cpu_time_ns()),
+                 held_ns: 0,
++                held_cpu_ns: 0,
+             },
+             guard,
+         )
+--- a/kv-engine/src/wal/v8/leader.rs
++++ b/kv-engine/src/wal/v8/leader.rs
+@@ -3202,10 +3202,20 @@
+     pub(crate) logical_encode_cpu_ns: u64,
+     pub(crate) digest_ready_wall_ns: u64,
+     pub(crate) digest_ready_cpu_ns: u64,
++    pub(crate) digest_prepare_wall_ns: u64,
++    pub(crate) digest_prepare_cpu_ns: u64,
++    pub(crate) digest_publish_wall_ns: u64,
++    pub(crate) digest_publish_cpu_ns: u64,
+     pub(crate) frame_encode_wall_ns: u64,
+     pub(crate) frame_encode_cpu_ns: u64,
+     pub(crate) frames_ready_submit_wall_ns: u64,
+     pub(crate) frames_ready_submit_cpu_ns: u64,
++    pub(crate) frames_ready_wall_ns: u64,
++    pub(crate) frames_ready_cpu_ns: u64,
++    pub(crate) producer_guard_insert_wall_ns: u64,
++    pub(crate) producer_guard_insert_cpu_ns: u64,
++    pub(crate) data_submit_wall_ns: u64,
++    pub(crate) data_submit_cpu_ns: u64,
+ }
+ 
+ impl WalV8FrameJob<'_> {
+@@ -3305,11 +3315,35 @@
+         let digest_started = phases
+             .as_ref()
+             .map(|_| (Instant::now(), digest::thread_cpu_time_ns()));
++        #[cfg(feature = "bench")]
++        let digest_prepare_started = phases
++            .as_ref()
++            .map(|_| (Instant::now(), digest::thread_cpu_time_ns()));
+         let digest_ready = encoded.digest_ready()?;
++        #[cfg(feature = "bench")]
++        if let (Some(phases), Some((wall_started, cpu_started))) =
++            (phases.as_deref_mut(), digest_prepare_started)
++        {
++            phases.digest_prepare_wall_ns =
++                wall_started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
++            phases.digest_prepare_cpu_ns = digest::thread_cpu_time_ns().saturating_sub(cpu_started);
++        }
++        #[cfg(feature = "bench")]
++        let digest_publish_started = phases
++            .as_ref()
++            .map(|_| (Instant::now(), digest::thread_cpu_time_ns()));
+         #[cfg(feature = "bench")]
+         let ordered_link_hash_cpu_ns = self.coordinator.mark_digest_ready_with_cpu(digest_ready)?;
+         #[cfg(not(feature = "bench"))]
+         self.coordinator.mark_digest_ready(digest_ready)?;
++        #[cfg(feature = "bench")]
++        if let (Some(phases), Some((wall_started, cpu_started))) =
++            (phases.as_deref_mut(), digest_publish_started)
++        {
++            phases.digest_publish_wall_ns =
++                wall_started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
++            phases.digest_publish_cpu_ns = digest::thread_cpu_time_ns().saturating_sub(cpu_started);
++        }
+         #[cfg(feature = "bench")]
+         if let (Some(phases), Some((wall_started, cpu_started))) =
+             (phases.as_deref_mut(), digest_started)
+@@ -3382,15 +3416,48 @@
+             self.coordinator
+                 .mark_data_write_started(self.assignment.segment_ticket)?;
+         }
++        #[cfg(feature = "bench")]
++        if let (Some(phases), Some((wall_started, cpu_started))) =
++            (phases.as_deref_mut(), frames_ready_started)
++        {
++            phases.frames_ready_wall_ns =
++                wall_started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
++            phases.frames_ready_cpu_ns = digest::thread_cpu_time_ns().saturating_sub(cpu_started);
++        }
+         let ticket = self.assignment.segment_ticket;
++        #[cfg(feature = "bench")]
++        let guard_insert_started = phases
++            .as_ref()
++            .map(|_| (Instant::now(), digest::thread_cpu_time_ns()));
+         let previous = self.producer_guards.lock().insert(ticket, encoded);
++        #[cfg(feature = "bench")]
++        if let (Some(phases), Some((wall_started, cpu_started))) =
++            (phases.as_deref_mut(), guard_insert_started)
++        {
++            phases.producer_guard_insert_wall_ns =
++                wall_started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
++            phases.producer_guard_insert_cpu_ns =
++                digest::thread_cpu_time_ns().saturating_sub(cpu_started);
++        }
+         if previous.is_some() {
+             self.coordinator.poison();
+             anyhow::bail!("v8 Parallel ticket already owns a producer guard");
+         }
++        #[cfg(feature = "bench")]
++        let data_submit_started = phases
++            .as_ref()
++            .map(|_| (Instant::now(), digest::thread_cpu_time_ns()));
+         let write_result =
+             self.io
+                 .publish_data(ticket, self.assignment.first_data_offset, data_buffer);
++        #[cfg(feature = "bench")]
++        if let (Some(phases), Some((wall_started, cpu_started))) =
++            (phases.as_deref_mut(), data_submit_started)
++        {
++            phases.data_submit_wall_ns =
++                wall_started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
++            phases.data_submit_cpu_ns = digest::thread_cpu_time_ns().saturating_sub(cpu_started);
++        }
+         if let Err(error) = write_result {
+             self.coordinator.poison();
+             return Err(error).context("submit v8 Parallel DATA frames");
