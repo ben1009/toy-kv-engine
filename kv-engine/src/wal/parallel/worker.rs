@@ -3740,6 +3740,18 @@ mod tests {
         core.mark_submitted(staged[1].request_id)
             .expect("submit remaining SQE");
         assert_eq!(core.outstanding_sqe_count(), 2);
+
+        // The test has verified submission accounting. Deliver the matching
+        // CQEs so the mock worker can retire its buffers instead of leaking
+        // kernel-owned allocations when Core is dropped.
+        for submission in staged {
+            drop(
+                core.complete_write(submission.request_id, 4096)
+                    .expect("complete staged write for test cleanup"),
+            );
+        }
+        assert!(core.is_idle());
+        assert_eq!(drops.load(Ordering::Acquire), 2);
     }
 
     #[test]
@@ -3918,6 +3930,13 @@ mod tests {
             Err(WorkerError::UnknownRequest)
         ));
         assert_eq!(drops.load(Ordering::Acquire), 0);
+
+        drop(
+            core.complete_write(requests[0], 4096)
+                .expect("complete the real request for test cleanup"),
+        );
+        assert!(core.is_idle());
+        assert_eq!(drops.load(Ordering::Acquire), 1);
     }
 
     #[test]
