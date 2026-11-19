@@ -2875,7 +2875,7 @@ print('[hotpath] diagnostic report follows')
                 "profile-schedule.tsv", "rust-toolchain.txt", "write-perf.sha256", "perf-version.txt",
             ):
                 (results / name).write_text("fixture\n", encoding="utf-8")
-            for name in ("stderr.log", "timeline.json", "perf.data", "perf-report.txt"):
+            for name in ("stderr.log", "timeline.json", "perf.data", "perf-report.txt", "sync-observations.json"):
                 (run_dir / name).write_bytes(b"capture")
             (run_dir / "ignored.db").write_bytes(b"should not be bundled")
 
@@ -2883,7 +2883,7 @@ print('[hotpath] diagnostic report follows')
             result = self._run_remote_bundle(command, results, root)
             self.assertEqual(result.returncode, 0, result.stderr)
             metadata = self._archive_metadata(result.stdout)
-            self.assertEqual(metadata["ARCHIVE_FILES"], "8")
+            self.assertEqual(metadata["ARCHIVE_FILES"], "9")
             archive = Path(metadata["ARCHIVE_PATH"])
             self.assertEqual(archive.parent, root / "remote-tmp")
             with tarfile.open(archive, "r:gz") as bundle:
@@ -2893,6 +2893,7 @@ print('[hotpath] diagnostic report follows')
                 "results/write-perf.sha256", "results/perf-version.txt",
                 "results/w16-point-v8_parallel/stderr.log", "results/w16-point-v8_parallel/timeline.json",
                 "results/w16-point-v8_parallel/perf.data", "results/w16-point-v8_parallel/perf-report.txt",
+                "results/w16-point-v8_parallel/sync-observations.json",
             ):
                 self.assertIn(name, names)
             self.assertFalse(any(name.endswith("ignored.db") for name in names))
