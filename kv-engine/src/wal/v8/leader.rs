@@ -2571,11 +2571,14 @@ impl WalV8ParallelIo {
             .name("wal-v8-completion-reaper".to_owned())
             .spawn(move || {
                 #[cfg(feature = "bench")]
-                let completion_timeline_enabled =
-                    completion_progress.completion_timeline_sample_every() > 0;
+                let mut completion_timeline_enabled = None;
                 while let Ok(result) = completions.recv() {
                     #[cfg(feature = "bench")]
-                    let reaper_recv_at = completion_timeline_enabled.then(Instant::now);
+                    let timeline_enabled = *completion_timeline_enabled.get_or_insert_with(|| {
+                        completion_progress.completion_timeline_sample_every() > 0
+                    });
+                    #[cfg(feature = "bench")]
+                    let reaper_recv_at = timeline_enabled.then(Instant::now);
                     #[cfg(feature = "bench")]
                     let mut cpu_sample = {
                         let profile = completion_progress.profile();

@@ -2732,20 +2732,19 @@ fn run_sync_coordinator(
     let mut last_sync_latency = None;
     let v7_layout = inner.admission.lock().v7_allocator.is_some();
     #[cfg(feature = "bench")]
-    let completion_timeline_enabled = inner.sync_progress.completion_timeline_sample_every() > 0;
+    let mut completion_timeline_enabled = None;
 
     while let Ok(result) = completions.recv() {
         #[cfg(feature = "bench")]
-        let result_recv_at = completion_timeline_enabled.then(Instant::now);
+        let timeline_enabled = *completion_timeline_enabled
+            .get_or_insert_with(|| inner.sync_progress.completion_timeline_sample_every() > 0);
+        #[cfg(not(feature = "bench"))]
+        let timeline_enabled = false;
         #[cfg(feature = "bench")]
-        if let Some(received_at) = result_recv_at
-            && let Some(timeline) = inner
-                .sync_progress
-                .take_completion_timeline(result.group_id, received_at)
-        {
-            inner
-                .sync_progress
-                .record_completion_handoff_timeline(&timeline);
+        let result_recv_at = timeline_enabled.then(Instant::now);
+        #[cfg(feature = "bench")]
+        if let Some(received_at) = result_recv_at {
+            record_completion_handoff_received(&inner, &result, received_at);
         }
         #[cfg(feature = "bench")]
         let mut cpu_sample = {
@@ -2760,13 +2759,13 @@ fn run_sync_coordinator(
         process_group_result(&inner, result);
         #[cfg(all(test, feature = "chaos-testing"))]
         crate::chaos::failpoint::before_parallel_wal_result_drain();
-        drain_ready_results(&inner, &completions);
+        drain_ready_results(&inner, &completions, timeline_enabled);
         let large_batch_wave = v7_layout
             && last_sync_latency.is_some_and(|latency| latency >= SYNC_COALESCE_MIN_SYNC)
             && inner.durability.state.lock().large_batch_wave;
         let coalesce_wait = sync_coalesce_wait(last_sync_latency, v7_layout, large_batch_wave);
         if let Some(wait) = coalesce_wait {
-            coalesce_before_capture(&inner, &completions, wait, v7_layout);
+            coalesce_before_capture(&inner, &completions, wait, v7_layout, timeline_enabled);
         }
         let sync_result = synchronize_written_prefix(&sync_file, &inner);
         #[cfg(feature = "bench")]
@@ -2803,6 +2802,7 @@ fn coalesce_before_capture(
     completions: &Receiver<GroupWriteResult>,
     wait: Duration,
     v7_layout: bool,
+    completion_timeline_enabled: bool,
 ) {
     if v7_layout {
         let target = {
@@ -2823,11 +2823,11 @@ fn coalesce_before_capture(
             }
         }
     }
-    coalesce_admitted_prefix(inner, completions, wait);
+    coalesce_admitted_prefix(inner, completions, wait, completion_timeline_enabled);
     // Coalescing may return at its captured admission cutoff while later
     // results are queued. Bound this drain to its initial length so new
     // completions cannot extend the optional window indefinitely.
-    drain_results_at_capture(inner, completions);
+    drain_results_at_capture(inner, completions, completion_timeline_enabled);
 }
 
 fn sync_coalesce_wait(
@@ -2852,7 +2852,11 @@ fn coalesce_admitted_prefix(
     inner: &RuntimeInner,
     completions: &Receiver<GroupWriteResult>,
     wait: Duration,
+    completion_timeline_enabled: bool,
 ) {
+    #[cfg(not(feature = "bench"))]
+    let _ = completion_timeline_enabled;
+
     {
         let state = inner.durability.state.lock();
         if state.poison_ticket.is_some() || state.written_frontier <= state.durable_frontier {
@@ -2890,6 +2894,11 @@ fn coalesce_admitted_prefix(
         let wait_started = profile.as_ref().map(|_| Instant::now());
         let result = completions.recv_timeout(remaining);
         #[cfg(feature = "bench")]
+        if completion_timeline_enabled && let Ok(group_result) = &result {
+            let received_at = Instant::now();
+            record_completion_handoff_received(inner, group_result, received_at);
+        }
+        #[cfg(feature = "bench")]
         if let (Some(profile), Some(started)) = (profile, wait_started) {
             profile.record_wal_sync_coalesce_wait(
                 started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
@@ -2915,18 +2924,56 @@ fn has_pending_v7_preparations(admission: &AdmissionState, durable: u64) -> bool
             })
 }
 
-fn drain_results_at_capture(inner: &RuntimeInner, completions: &Receiver<GroupWriteResult>) {
+fn drain_results_at_capture(
+    inner: &RuntimeInner,
+    completions: &Receiver<GroupWriteResult>,
+    completion_timeline_enabled: bool,
+) {
+    #[cfg(not(feature = "bench"))]
+    let _ = completion_timeline_enabled;
     for _ in 0..completions.len() {
         let Ok(result) = completions.try_recv() else {
             break;
         };
+        #[cfg(feature = "bench")]
+        if completion_timeline_enabled {
+            let received_at = Instant::now();
+            record_completion_handoff_received(inner, &result, received_at);
+        }
         process_group_result(inner, result);
     }
 }
 
-fn drain_ready_results(inner: &RuntimeInner, completions: &Receiver<GroupWriteResult>) {
+fn drain_ready_results(
+    inner: &RuntimeInner,
+    completions: &Receiver<GroupWriteResult>,
+    completion_timeline_enabled: bool,
+) {
+    #[cfg(not(feature = "bench"))]
+    let _ = completion_timeline_enabled;
     while let Ok(result) = completions.try_recv() {
+        #[cfg(feature = "bench")]
+        if completion_timeline_enabled {
+            let received_at = Instant::now();
+            record_completion_handoff_received(inner, &result, received_at);
+        }
         process_group_result(inner, result);
+    }
+}
+
+#[cfg(feature = "bench")]
+fn record_completion_handoff_received(
+    inner: &RuntimeInner,
+    result: &GroupWriteResult,
+    received_at: Instant,
+) {
+    if let Some(timeline) = inner
+        .sync_progress
+        .take_completion_timeline(result.group_id, received_at)
+    {
+        inner
+            .sync_progress
+            .record_completion_handoff_timeline(&timeline);
     }
 }
 
@@ -6158,6 +6205,7 @@ mod tests {
             &runtime.inner,
             &completions,
             std::time::Duration::from_millis(1),
+            false,
         );
         {
             let state = runtime.inner.durability.state.lock();
@@ -6225,7 +6273,13 @@ mod tests {
         // F(T=1) follows D0,D1,D2. T=2 cannot retain that marker without
         // retaining excluded D2. Even with its CQE queued, skip this optional
         // window and leave the result for the next coordinator iteration.
-        super::coalesce_before_capture(&runtime.inner, &completions, Duration::from_secs(1), true);
+        super::coalesce_before_capture(
+            &runtime.inner,
+            &completions,
+            Duration::from_secs(1),
+            true,
+            false,
+        );
         assert_eq!(completions.len(), 1);
         assert!(!runtime.is_poisoned());
         let tail = runtime.logical_length();
@@ -6247,7 +6301,13 @@ mod tests {
         let admitted = take_test_ready_v7_batch(&runtime.inner);
         let last = prepare_test_v7_data(&runtime.inner, &mut packer, admitted)?;
         sender.send(finish_test_v7_data(&runtime.inner, last, None)?)?;
-        super::coalesce_before_capture(&runtime.inner, &completions, Duration::from_secs(1), true);
+        super::coalesce_before_capture(
+            &runtime.inner,
+            &completions,
+            Duration::from_secs(1),
+            true,
+            false,
+        );
         assert!(completions.is_empty());
         {
             let state = runtime.inner.durability.state.lock();
