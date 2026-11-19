@@ -93,6 +93,7 @@ from gcp_v8_point_borrowed_input_runner import _summary_fields
 import gcp_v8_point_cpu_attribution_runner as cpu_attribution_runner
 from gcp_v8_point_cpu_attribution_runner import (
     _build_command as build_cpu_attribution_command,
+    _completion_handoff_timeline_summary,
     _completion_timeline_summary,
     _validate_v8_durability_phase_samples,
     run_suite as run_cpu_attribution_suite,
@@ -500,10 +501,7 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
                 self.assertIn("--wal-sync-diagnostics", command)
                 self.assertIn(f"--threads", command)
                 self.assertIn(str(writer), command)
-                if arm == "v8_point_lookahead_direct":
-                    self.assertIn("--wal-completion-timeline", command)
-                else:
-                    self.assertNotIn("--wal-completion-timeline", command)
+                self.assertIn("--wal-completion-timeline", command)
 
         plan = build_v8_point_cpu_attribution_plan(
             machine_type="c4-standard-16-lssd",
@@ -785,6 +783,23 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
                         "next_ticket_data_complete": False,
                         "succeeded": True,
                     }],
+                    "completion_handoff_timeline": {
+                        "sample_every": cpu_attribution_runner.V8_COMPLETION_TIMELINE_SAMPLE_EVERY,
+                        "dropped_samples": 0,
+                        "samples": [{
+                            "group_id": 7,
+                            "ticket_start": 120,
+                            "ticket_end": 130,
+                            "worker_tid": 42,
+                            "request_id": 128,
+                            "request_start": 120,
+                            "request_end": 131,
+                            "submit_to_cqe_observed_ns": 10,
+                            "cqe_observed_to_group_finished_ns": 20,
+                            "group_finished_to_result_send_start_ns": 30,
+                            "result_send_start_to_receiver_ns": 40,
+                        }],
+                    },
                     "wal_cpu_attribution": {
                         "sample_every": V8_POINT_CPU_ATTRIBUTION_SAMPLE_EVERY,
                         "operations_seen": V8_POINT_CPU_ATTRIBUTION_NUM + 1,
@@ -817,6 +832,10 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
         validated = cpu_attribution_runner._validate_record(record, row)
 
         self.assertEqual(validated["wal_cpu_attribution_retry_attempts"], 1)
+        self.assertEqual(
+            validated["completion_handoff_timeline_summary"]["sample_count"],
+            1,
+        )
         producer_summary = cpu_attribution_runner._producer_phase_summary([{
             **validated, "arm": "v7_parallel",
         }])
@@ -824,6 +843,41 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
             producer_summary["v7_parallel"]["producer_total_cpu_ns"]["count"],
             len(sequence) - 1,
         )
+
+    def test_completion_handoff_timeline_requires_matched_complete_samples(self) -> None:
+        valid = {
+            "sample_every": cpu_attribution_runner.V8_COMPLETION_TIMELINE_SAMPLE_EVERY,
+            "dropped_samples": 0,
+            "samples": [{
+                "group_id": 7,
+                "ticket_start": 120,
+                "ticket_end": 130,
+                "worker_tid": 42,
+                "request_id": 128,
+                "request_start": 120,
+                "request_end": 131,
+                "submit_to_cqe_observed_ns": 10,
+                "cqe_observed_to_group_finished_ns": 20,
+                "group_finished_to_result_send_start_ns": 30,
+                "result_send_start_to_receiver_ns": 40,
+            }],
+        }
+        summary = _completion_handoff_timeline_summary(valid)
+        self.assertEqual(summary["sample_count"], 1)
+        self.assertEqual(summary["result_send_start_to_receiver_ns"]["p50"], 40)
+
+        invalid_timelines = (
+            None,
+            {**valid, "sample_every": 64},
+            {**valid, "dropped_samples": 1},
+            {**valid, "samples": []},
+            {**valid, "samples": [{**valid["samples"][0], "request_id": 127}]},
+            {**valid, "samples": [{**valid["samples"][0], "ticket_end": 120}]},
+            {**valid, "samples": [{**valid["samples"][0], "result_send_start_to_receiver_ns": -1}]},
+        )
+        for timeline in invalid_timelines:
+            with self.subTest(timeline=timeline), self.assertRaises(ValueError):
+                _completion_handoff_timeline_summary(timeline)
 
     def test_v8_cpu_attribution_validates_digest_schema(self) -> None:
         # The digest is serialized beside wal_pipeline inside result, not at the JSON record root.
@@ -2930,7 +2984,7 @@ print('[hotpath] diagnostic report follows')
                 (results / name).write_text("fixture\n", encoding="utf-8")
             for name in (
                 "stderr.log", "timeline.json", "perf.data", "perf-report.txt", "sync-observations.json",
-                "completion-timeline.json",
+                "completion-timeline.json", "completion-handoff-timeline.json",
             ):
                 (run_dir / name).write_bytes(b"capture")
             (run_dir / "ignored.db").write_bytes(b"should not be bundled")
@@ -2939,7 +2993,7 @@ print('[hotpath] diagnostic report follows')
             result = self._run_remote_bundle(command, results, root)
             self.assertEqual(result.returncode, 0, result.stderr)
             metadata = self._archive_metadata(result.stdout)
-            self.assertEqual(metadata["ARCHIVE_FILES"], "10")
+            self.assertEqual(metadata["ARCHIVE_FILES"], "11")
             archive = Path(metadata["ARCHIVE_PATH"])
             self.assertEqual(archive.parent, root / "remote-tmp")
             with tarfile.open(archive, "r:gz") as bundle:
@@ -2951,6 +3005,7 @@ print('[hotpath] diagnostic report follows')
                 "results/w16-point-v8_parallel/perf.data", "results/w16-point-v8_parallel/perf-report.txt",
                 "results/w16-point-v8_parallel/sync-observations.json",
                 "results/w16-point-v8_parallel/completion-timeline.json",
+                "results/w16-point-v8_parallel/completion-handoff-timeline.json",
             ):
                 self.assertIn(name, names)
             self.assertFalse(any(name.endswith("ignored.db") for name in names))

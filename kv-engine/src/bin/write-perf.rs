@@ -293,8 +293,8 @@ struct Args {
     /// Requires a bench build with PITR V8 Parallel I/O.
     #[arg(long, requires = "pitr")]
     wal_hol_diagnostics: bool,
-    /// Sample V8 DATA requests across CQE observation, reaper, ready-prefix, and durability
-    /// stages. Requires a bench build with PITR V8 Parallel I/O.
+    /// Sample parallel DATA completion handoff for V7/V8, plus V8 prefix/durability stages.
+    /// Requires a bench build with PITR V7 or V8 Parallel I/O.
     #[arg(long, requires = "pitr")]
     wal_completion_timeline: bool,
     /// Sample every Nth completed V8 Parallel durability advance and follower wait.
@@ -1158,6 +1158,8 @@ struct WalPipelineRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     v8_completion_timeline: Option<WalV8CompletionTimelineRunRecord>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    completion_handoff_timeline: Option<WalCompletionHandoffTimelineRunRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     v8_durability_diagnostics: Option<WalV8DurabilityDiagnosticsRunRecord>,
     #[serde(skip_serializing_if = "Option::is_none")]
     wal_cpu_attribution: Option<WalCpuAttributionRunRecord>,
@@ -1209,6 +1211,51 @@ struct WalV8CompletionTimelineRunRecord {
     sample_every: u64,
     dropped_samples: u64,
     samples: Vec<WalV8CompletionTimelineRecord>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+struct WalCompletionHandoffTimelineRunRecord {
+    sample_every: u64,
+    dropped_samples: u64,
+    samples: Vec<WalCompletionHandoffTimelineRecord>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
+struct WalCompletionHandoffTimelineRecord {
+    group_id: u64,
+    ticket_start: u64,
+    ticket_end: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    worker_tid: Option<u64>,
+    request_id: u64,
+    request_start: u64,
+    request_end: u64,
+    submit_to_cqe_observed_ns: u64,
+    cqe_observed_to_group_finished_ns: u64,
+    group_finished_to_result_send_start_ns: u64,
+    result_send_start_to_receiver_ns: u64,
+}
+
+#[cfg(feature = "bench")]
+impl From<kv_engine_wrapper::mem_table::WalCompletionHandoffObservation>
+    for WalCompletionHandoffTimelineRecord
+{
+    fn from(observation: kv_engine_wrapper::mem_table::WalCompletionHandoffObservation) -> Self {
+        Self {
+            group_id: observation.group_id,
+            ticket_start: observation.ticket_start,
+            ticket_end: observation.ticket_end,
+            worker_tid: observation.worker_tid,
+            request_id: observation.request_id,
+            request_start: observation.request_start,
+            request_end: observation.request_end,
+            submit_to_cqe_observed_ns: observation.submit_to_cqe_observed_ns,
+            cqe_observed_to_group_finished_ns: observation.cqe_observed_to_group_finished_ns,
+            group_finished_to_result_send_start_ns: observation
+                .group_finished_to_result_send_start_ns,
+            result_send_start_to_receiver_ns: observation.result_send_start_to_receiver_ns,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
@@ -1953,8 +2000,20 @@ fn wal_pipeline_record(
             .map(WalSyncObservationRecord::from)
             .collect()
     });
-    let v8_completion_timeline =
-        completion_timeline_enabled.then(|| WalV8CompletionTimelineRunRecord {
+    let completion_handoff_timeline =
+        completion_timeline_enabled.then(|| WalCompletionHandoffTimelineRunRecord {
+            sample_every: profile
+                .wal_v8_completion_timeline_sample_every
+                .unwrap_or_default(),
+            dropped_samples: engine.wal_completion_handoff_timeline_dropped_samples(),
+            samples: engine
+                .wal_completion_handoff_timeline_observations()
+                .into_iter()
+                .map(WalCompletionHandoffTimelineRecord::from)
+                .collect(),
+        });
+    let v8_completion_timeline = (completion_timeline_enabled && wal_run_info.format_version == 8)
+        .then(|| WalV8CompletionTimelineRunRecord {
             sample_every: profile
                 .wal_v8_completion_timeline_sample_every
                 .unwrap_or_default(),
@@ -2057,6 +2116,7 @@ fn wal_pipeline_record(
             && wal_run_info.io_mode == "parallel")
             .then_some(hol_diagnostics_enabled),
         v8_completion_timeline,
+        completion_handoff_timeline,
         v8_durability_diagnostics,
         wal_cpu_attribution,
         mvcc_publication_diagnostics,
@@ -10163,9 +10223,11 @@ fn validate_config(cfg: &HarnessConfig) -> Result<()> {
             "--wal-completion-timeline requires a bench build"
         );
         anyhow::ensure!(
-            cfg.pitr_format.unwrap_or(PitrFormatArg::V8) == PitrFormatArg::V8
-                && cfg.wal_io_mode == WalIoModeArg::Parallel,
-            "--wal-completion-timeline requires PITR V8 Parallel I/O"
+            matches!(
+                cfg.pitr_format.unwrap_or(PitrFormatArg::V8),
+                PitrFormatArg::V7 | PitrFormatArg::V8
+            ) && cfg.wal_io_mode == WalIoModeArg::Parallel,
+            "--wal-completion-timeline requires PITR V7 or V8 Parallel I/O"
         );
     }
     if let Some(sample_every) = cfg.wal_v8_durability_sample_every {
@@ -10922,7 +10984,7 @@ mod tests {
     }
 
     #[test]
-    fn wal_completion_timeline_requires_bench_build_and_v8_parallel() {
+    fn wal_completion_timeline_requires_bench_build_and_v7_or_v8_parallel() {
         let parallel = HarnessConfig::from_args(
             Args::try_parse_from([
                 "write-perf",
@@ -10935,7 +10997,31 @@ mod tests {
         );
         let result = validate_config(&parallel);
         if cfg!(feature = "bench") {
-            result.expect("bench build can capture V8 completion timeline samples");
+            result.expect("bench build can capture parallel completion timeline samples");
+        } else {
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("requires a bench build")
+            );
+        }
+
+        let v7_parallel = HarnessConfig::from_args(
+            Args::try_parse_from([
+                "write-perf",
+                "--pitr",
+                "--pitr-format",
+                "v7",
+                "--wal-io-mode",
+                "parallel",
+                "--wal-completion-timeline",
+            ])
+            .expect("parse V7 completion timeline option"),
+        );
+        let result = validate_config(&v7_parallel);
+        if cfg!(feature = "bench") {
+            result.expect("bench build can capture V7 completion handoff samples");
         } else {
             assert!(
                 result
@@ -10957,7 +11043,7 @@ mod tests {
         );
         let leader_error = validate_config(&leader).unwrap_err().to_string();
         let expected_leader_error = if cfg!(feature = "bench") {
-            "requires PITR V8 Parallel I/O"
+            "requires PITR V7 or V8 Parallel I/O"
         } else {
             "requires a bench build"
         };

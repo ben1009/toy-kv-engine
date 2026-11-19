@@ -202,7 +202,7 @@ struct TicketState {
 
 #[cfg(feature = "bench")]
 struct PendingCompletionTimeline {
-    group: crate::wal::parallel_worker::WalV8GroupCompletionTimeline,
+    group: crate::wal::parallel_worker::WalWorkerGroupCompletionTimeline,
     reaper_recv_to_data_complete_publish_ns: Option<u64>,
     data_complete_lock_wait_wall_ns: Option<u64>,
     data_complete_lock_wait_cpu_ns: Option<u64>,
@@ -942,7 +942,7 @@ impl WalV8ParallelCoordinator {
     pub(crate) fn mark_data_group_complete_with_timeline(
         &self,
         tickets: Range<u64>,
-        timeline: Option<crate::wal::parallel_worker::WalV8GroupCompletionTimeline>,
+        timeline: Option<crate::wal::parallel_worker::WalWorkerGroupCompletionTimeline>,
     ) -> Result<()> {
         self.mark_data_group_complete_inner(tickets, timeline)
     }
@@ -952,7 +952,7 @@ impl WalV8ParallelCoordinator {
         &self,
         tickets: Range<u64>,
         #[cfg(feature = "bench")] timeline: Option<
-            crate::wal::parallel_worker::WalV8GroupCompletionTimeline,
+            crate::wal::parallel_worker::WalWorkerGroupCompletionTimeline,
         >,
     ) -> Result<()> {
         #[cfg(feature = "bench")]
@@ -1156,9 +1156,8 @@ impl WalV8ParallelCoordinator {
             let lock_hold_wall_ns =
                 completion_timeline_duration_ns(lock_acquired_at, Some(lock_released_at))
                     .unwrap_or_default();
-            let lock_hold_cpu_ns = lock_released_cpu
-                .checked_sub(lock_acquired_cpu.unwrap_or_default())
-                .unwrap_or_default();
+            let lock_hold_cpu_ns =
+                lock_released_cpu.saturating_sub(lock_acquired_cpu.unwrap_or_default());
             let ticket_end = tickets.end;
             let pending = state
                 .completion_timeline_samples

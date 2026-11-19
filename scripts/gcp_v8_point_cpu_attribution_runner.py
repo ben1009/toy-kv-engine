@@ -72,8 +72,7 @@ def _build_command(binary: Path, row: dict[str, Any], db_root: Path) -> list[str
         "--wal-sync-diagnostics",
         "--path", str(db_root / _run_id(row)),
     ]
-    if version == 8:
-        command.append("--wal-completion-timeline")
+    command.append("--wal-completion-timeline")
     return command
 
 
@@ -302,6 +301,47 @@ def _completion_timeline_summary(timeline: Any) -> dict[str, Any]:
     }
 
 
+def _completion_handoff_timeline_summary(timeline: Any) -> dict[str, Any]:
+    if not isinstance(timeline, dict):
+        raise ValueError("parallel completion handoff timeline is missing or is not an object")
+    samples = timeline.get("samples")
+    if (
+        timeline.get("sample_every") != V8_COMPLETION_TIMELINE_SAMPLE_EVERY
+        or timeline.get("dropped_samples") != 0
+        or not isinstance(samples, list)
+        or not samples
+    ):
+        raise ValueError("parallel completion handoff samples are missing or incomplete")
+
+    duration_fields = (
+        "submit_to_cqe_observed_ns",
+        "cqe_observed_to_group_finished_ns",
+        "group_finished_to_result_send_start_ns",
+        "result_send_start_to_receiver_ns",
+    )
+    for index, sample in enumerate(samples):
+        if not isinstance(sample, dict):
+            raise ValueError(f"completion handoff sample {index} is not an object")
+        required_ints = (
+            "group_id", "ticket_start", "ticket_end", "request_id", "request_start", "request_end",
+            *duration_fields,
+        )
+        if any(not _valid_nonnegative_int(sample.get(field)) for field in required_ints):
+            raise ValueError(f"completion handoff sample {index} has missing or invalid fields")
+        if (
+            sample["ticket_start"] >= sample["ticket_end"]
+            or sample["request_start"] > sample["request_id"]
+            or sample["request_id"] >= sample["request_end"]
+            or sample["request_id"] % V8_COMPLETION_TIMELINE_SAMPLE_EVERY != 0
+        ):
+            raise ValueError(f"completion handoff sample {index} has inconsistent identities")
+    return {
+        "sample_every": V8_COMPLETION_TIMELINE_SAMPLE_EVERY,
+        "sample_count": len(samples),
+        **{field: _distribution([float(sample[field]) for sample in samples]) for field in duration_fields},
+    }
+
+
 def _validate_record(record: dict[str, Any], row: dict[str, Any]) -> dict[str, Any]:
     result = record["result"]
     params = record["params"]
@@ -406,6 +446,10 @@ def _validate_record(record: dict[str, Any], row: dict[str, Any]) -> dict[str, A
     else:
         completion_timeline = None
 
+    completion_handoff_timeline = _completion_handoff_timeline_summary(
+        pipeline.get("completion_handoff_timeline")
+    )
+
     throughput = float(result["ops_per_sec"])
     cpu_seconds = (float(result["process_cpu_user_ms"]) + float(result["process_cpu_system_ms"])) / 1000
     if not all(math.isfinite(value) and value >= 0 for value in (throughput, cpu_seconds)):
@@ -418,6 +462,7 @@ def _validate_record(record: dict[str, Any], row: dict[str, Any]) -> dict[str, A
         "sync_count": int(pipeline["sync_count"]),
         "wal_sync_decision_summary": sync_decision,
         "v8_completion_timeline_summary": completion_timeline,
+        "completion_handoff_timeline_summary": completion_handoff_timeline,
         "p50_ms": float(record["latency"]["p50_ms"]),
         "p95_ms": float(record["latency"]["p95_ms"]),
         "p99_ms": float(record["latency"]["p99_ms"]),
@@ -581,6 +626,13 @@ def _run_one(
                 (run_dir / "completion-timeline.json").write_text(
                     json.dumps(completion_timeline, indent=2) + "\n", encoding="utf-8",
                 )
+            completion_handoff_timeline = record.get("result", {}).get("wal_pipeline", {}).get(
+                "completion_handoff_timeline"
+            )
+            if isinstance(completion_handoff_timeline, dict):
+                (run_dir / "completion-handoff-timeline.json").write_text(
+                    json.dumps(completion_handoff_timeline, indent=2) + "\n", encoding="utf-8",
+                )
             values = _validate_record(record, row)
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
             exit_code = 65
@@ -614,6 +666,7 @@ def _summarize(rows: list[dict[str, Any]], planned: int) -> dict[str, Any]:
                 "digest_cpu": _digest_summary([run]),
                 "sync_decisions": run.get("wal_sync_decision_summary"),
                 "data_completion_timeline": run.get("v8_completion_timeline_summary"),
+                "completion_handoff_timeline": run.get("completion_handoff_timeline_summary"),
             }
     return {
         "suite": "v8-point-cpu-attribution",

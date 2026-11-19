@@ -10207,6 +10207,24 @@ impl KvEngine {
     }
 
     #[cfg(feature = "bench")]
+    /// Samples of the shared parallel-worker completion handoff for V7 and V8.
+    pub fn wal_completion_handoff_timeline_observations(
+        &self,
+    ) -> Vec<crate::mem_table::WalCompletionHandoffObservation> {
+        self.inner
+            .write_profile
+            .wal_completion_handoff_timeline_observations()
+    }
+
+    #[cfg(feature = "bench")]
+    /// Number of completion handoff samples dropped after reaching the bound.
+    pub fn wal_completion_handoff_timeline_dropped_samples(&self) -> u64 {
+        self.inner
+            .write_profile
+            .wal_completion_handoff_timeline_dropped_samples()
+    }
+
+    #[cfg(feature = "bench")]
     /// Sample every Nth completed V8 Parallel durability advance and follower
     /// wait. Driver attempt counters are also collected while enabled.
     /// Passing `None` disables phase timing and counters.

@@ -2731,8 +2731,22 @@ fn run_sync_coordinator(
 ) -> Result<()> {
     let mut last_sync_latency = None;
     let v7_layout = inner.admission.lock().v7_allocator.is_some();
+    #[cfg(feature = "bench")]
+    let completion_timeline_enabled = inner.sync_progress.completion_timeline_sample_every() > 0;
 
     while let Ok(result) = completions.recv() {
+        #[cfg(feature = "bench")]
+        let result_recv_at = completion_timeline_enabled.then(Instant::now);
+        #[cfg(feature = "bench")]
+        if let Some(received_at) = result_recv_at
+            && let Some(timeline) = inner
+                .sync_progress
+                .take_completion_timeline(result.group_id, received_at)
+        {
+            inner
+                .sync_progress
+                .record_completion_handoff_timeline(&timeline);
+        }
         #[cfg(feature = "bench")]
         let mut cpu_sample = {
             let profile = inner.sync_progress.profile();

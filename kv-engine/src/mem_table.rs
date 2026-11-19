@@ -274,10 +274,15 @@ pub struct WriteProfile {
     /// Enables opt-in V8 ordering HOL diagnostics for benchmark runs.
     #[cfg(feature = "bench")]
     wal_hol_diagnostics_enabled: AtomicBool,
-    /// Sample one request per N io_uring user_data values for V8 completion timing.
-    /// Zero disables the timeline without adding timestamps to worker groups.
+    /// Sample one request per N io_uring user_data values for worker completion
+    /// handoff timing. Zero disables the timeline without adding timestamps to worker groups.
     #[cfg(feature = "bench")]
     wal_v8_completion_timeline_sample_every: AtomicU64,
+    /// Bounded worker-result handoff samples shared by V7 and V8 Parallel.
+    #[cfg(feature = "bench")]
+    wal_completion_handoff_timeline: Mutex<Vec<WalCompletionHandoffObservation>>,
+    #[cfg(feature = "bench")]
+    wal_completion_handoff_timeline_dropped_samples: AtomicU64,
     /// Bounded samples spanning DATA submission through durable publication.
     #[cfg(feature = "bench")]
     wal_v8_completion_timeline: Mutex<Vec<WalV8CompletionTimelineObservation>>,
@@ -442,6 +447,25 @@ pub struct WalV8CompletionTimelineObservation {
     pub hol_blocker_data_write_elapsed_ns: Option<u64>,
     pub reaper_recv_to_prefix_ready_ns: u64,
     pub prefix_ready_to_durable_ns: u64,
+}
+
+/// One sampled worker completion handoff, with identical boundaries for V7
+/// and V8 Parallel. Durations are nanoseconds; receiver time is captured as
+/// the first operation after the completion channel receive returns.
+#[cfg(feature = "bench")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WalCompletionHandoffObservation {
+    pub group_id: u64,
+    pub ticket_start: u64,
+    pub ticket_end: u64,
+    pub worker_tid: Option<u64>,
+    pub request_id: u64,
+    pub request_start: u64,
+    pub request_end: u64,
+    pub submit_to_cqe_observed_ns: u64,
+    pub cqe_observed_to_group_finished_ns: u64,
+    pub group_finished_to_result_send_start_ns: u64,
+    pub result_send_start_to_receiver_ns: u64,
 }
 
 /// One sampled, actual V8 durability advance. Wall and thread CPU durations
@@ -1075,6 +1099,9 @@ impl WriteProfile {
         self.wal_v8_completion_timeline_dropped_samples.store(0, o);
         #[cfg(feature = "bench")]
         {
+            self.wal_completion_handoff_timeline.lock().clear();
+            self.wal_completion_handoff_timeline_dropped_samples
+                .store(0, o);
             self.wal_v8_completion_timeline_sample_every.store(0, o);
             self.wal_v8_durability_sample_every.store(0, o);
             self.wal_cpu_attribution_sample_every.store(0, o);
@@ -1339,6 +1366,34 @@ impl WriteProfile {
     #[cfg(feature = "bench")]
     pub(crate) fn wal_v8_completion_timeline_dropped_samples(&self) -> u64 {
         self.wal_v8_completion_timeline_dropped_samples
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn record_wal_completion_handoff_timeline(
+        &self,
+        observation: WalCompletionHandoffObservation,
+    ) {
+        const MAX_SAMPLES: usize = 4096;
+        let mut samples = self.wal_completion_handoff_timeline.lock();
+        if samples.len() < MAX_SAMPLES {
+            samples.push(observation);
+        } else {
+            self.wal_completion_handoff_timeline_dropped_samples
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn wal_completion_handoff_timeline_observations(
+        &self,
+    ) -> Vec<WalCompletionHandoffObservation> {
+        self.wal_completion_handoff_timeline.lock().clone()
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn wal_completion_handoff_timeline_dropped_samples(&self) -> u64 {
+        self.wal_completion_handoff_timeline_dropped_samples
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 

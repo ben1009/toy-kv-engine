@@ -2570,7 +2570,12 @@ impl WalV8ParallelIo {
         let completion_thread = thread::Builder::new()
             .name("wal-v8-completion-reaper".to_owned())
             .spawn(move || {
+                #[cfg(feature = "bench")]
+                let completion_timeline_enabled =
+                    completion_progress.completion_timeline_sample_every() > 0;
                 while let Ok(result) = completions.recv() {
+                    #[cfg(feature = "bench")]
+                    let reaper_recv_at = completion_timeline_enabled.then(Instant::now);
                     #[cfg(feature = "bench")]
                     let mut cpu_sample = {
                         let profile = completion_progress.profile();
@@ -2583,8 +2588,12 @@ impl WalV8ParallelIo {
                         })
                     };
                     #[cfg(feature = "bench")]
-                    let timeline = completion_progress
-                        .take_completion_timeline(result.group_id, Instant::now());
+                    let timeline = reaper_recv_at.and_then(|received_at| {
+                        let timeline = completion_progress
+                            .take_completion_timeline(result.group_id, received_at)?;
+                        completion_progress.record_completion_handoff_timeline(&timeline);
+                        Some(timeline)
+                    });
                     let reap_result = {
                         #[cfg(feature = "bench")]
                         {
@@ -3111,7 +3120,7 @@ fn reap_v8_group_result(
     coordinator: &WalV8ParallelCoordinator,
     result: GroupWriteResult,
     #[cfg(feature = "bench")] timeline: Option<
-        crate::wal::parallel_worker::WalV8GroupCompletionTimeline,
+        crate::wal::parallel_worker::WalWorkerGroupCompletionTimeline,
     >,
 ) -> Result<()> {
     if let Some(error) = result.error {

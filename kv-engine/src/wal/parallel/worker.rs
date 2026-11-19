@@ -132,7 +132,7 @@ impl WalIoEvent<'_> {
     }
 
     #[cfg(feature = "bench")]
-    fn record_completion_timeline(&self, timeline: WalV8GroupCompletionTimeline) {
+    fn record_completion_timeline(&self, timeline: WalWorkerGroupCompletionTimeline) {
         self.progress.record_completion_timeline(timeline);
     }
 
@@ -156,12 +156,12 @@ struct WalSyncProgressState {
     written_frontier: u64,
     durable_frontier: u64,
     completed_groups: BTreeMap<u64, (u64, u64, u64, Instant)>,
-    completion_timelines: HashMap<u64, WalV8GroupCompletionTimeline>,
+    completion_timelines: HashMap<u64, WalWorkerGroupCompletionTimeline>,
 }
 
 #[cfg(feature = "bench")]
 #[derive(Clone, Debug)]
-pub(crate) struct WalV8GroupCompletionTimeline {
+pub(crate) struct WalWorkerGroupCompletionTimeline {
     pub(crate) group_id: u64,
     pub(crate) ticket_start: u64,
     pub(crate) ticket_end: u64,
@@ -228,14 +228,14 @@ impl WalSyncProgress {
     }
 
     #[cfg(feature = "bench")]
-    fn completion_timeline_sample_every(&self) -> u64 {
+    pub(crate) fn completion_timeline_sample_every(&self) -> u64 {
         self.profile().map_or(0, |profile| {
             profile.wal_v8_completion_timeline_sample_every()
         })
     }
 
     #[cfg(feature = "bench")]
-    fn record_completion_timeline(&self, timeline: WalV8GroupCompletionTimeline) {
+    fn record_completion_timeline(&self, timeline: WalWorkerGroupCompletionTimeline) {
         let mut state = self.state.lock();
         state
             .completion_timelines
@@ -254,10 +254,60 @@ impl WalSyncProgress {
         &self,
         group_id: u64,
         reaper_recv_at: Instant,
-    ) -> Option<WalV8GroupCompletionTimeline> {
+    ) -> Option<WalWorkerGroupCompletionTimeline> {
         let mut timeline = self.state.lock().completion_timelines.remove(&group_id)?;
         timeline.reaper_recv_at = Some(reaper_recv_at);
         Some(timeline)
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn record_completion_handoff_timeline(
+        &self,
+        timeline: &WalWorkerGroupCompletionTimeline,
+    ) {
+        let Some(profile) = self.profile() else {
+            return;
+        };
+        let duration_ns = |start: Option<Instant>, end: Option<Instant>| {
+            let elapsed = end?.saturating_duration_since(start?).as_nanos();
+            Some(elapsed.min(u64::MAX as u128) as u64)
+        };
+        let Some(submit_to_cqe_observed_ns) =
+            duration_ns(timeline.sqe_submitted_at, timeline.cqe_observed_at)
+        else {
+            return;
+        };
+        let Some(cqe_observed_to_group_finished_ns) =
+            duration_ns(timeline.cqe_observed_at, timeline.group_finished_at)
+        else {
+            return;
+        };
+        let Some(group_finished_to_result_send_start_ns) =
+            duration_ns(timeline.group_finished_at, timeline.result_send_started_at)
+        else {
+            return;
+        };
+        let Some(result_send_start_to_receiver_ns) =
+            duration_ns(timeline.result_send_started_at, timeline.reaper_recv_at)
+        else {
+            return;
+        };
+
+        profile.record_wal_completion_handoff_timeline(
+            crate::mem_table::WalCompletionHandoffObservation {
+                group_id: timeline.group_id,
+                ticket_start: timeline.ticket_start,
+                ticket_end: timeline.ticket_end,
+                worker_tid: timeline.worker_tid,
+                request_id: timeline.request_id,
+                request_start: timeline.request_start,
+                request_end: timeline.request_end,
+                submit_to_cqe_observed_ns,
+                cqe_observed_to_group_finished_ns,
+                group_finished_to_result_send_start_ns,
+                result_send_start_to_receiver_ns,
+            },
+        );
     }
 
     /// Let a format with its own logical durability groups report those groups
@@ -959,7 +1009,7 @@ struct WriteSubmission {
 enum WorkerEvent<B> {
     BufferRetired(B),
     #[cfg(feature = "bench")]
-    CompletionTimeline(WalV8GroupCompletionTimeline),
+    CompletionTimeline(WalWorkerGroupCompletionTimeline),
     GroupFinished(GroupWriteResult),
 }
 
@@ -1472,7 +1522,7 @@ impl<B: WorkerBuffer> WorkerCore<B> {
                 && let Some(timeline) = group.completion_timeline
             {
                 events.push(WorkerEvent::CompletionTimeline(
-                    WalV8GroupCompletionTimeline {
+                    WalWorkerGroupCompletionTimeline {
                         group_id: group_id.0,
                         ticket_start: group.tickets.start,
                         ticket_end: group.tickets.end,
