@@ -169,6 +169,11 @@ pub(crate) struct WalWorkerGroupCompletionTimeline {
     pub(crate) request_start: u64,
     pub(crate) request_end: u64,
     pub(crate) request_id: u64,
+    pub(crate) sampled_ticket: Option<u64>,
+    pub(crate) frame_ready_at: Option<Instant>,
+    pub(crate) submit_requested_at: Option<Instant>,
+    pub(crate) worker_queue_enqueued_at: Option<Instant>,
+    pub(crate) worker_accepted_at: Option<Instant>,
     pub(crate) sqe_submitted_at: Option<Instant>,
     pub(crate) cqe_observed_at: Option<Instant>,
     pub(crate) cqe_observed_monotonic_ns: Option<u64>,
@@ -176,6 +181,10 @@ pub(crate) struct WalWorkerGroupCompletionTimeline {
     pub(crate) group_finished_monotonic_ns: Option<u64>,
     pub(crate) result_send_started_at: Option<Instant>,
     pub(crate) reaper_recv_at: Option<Instant>,
+    pub(crate) data_complete_published_at: Option<Instant>,
+    pub(crate) data_complete_prefix_end_before: Option<u64>,
+    pub(crate) data_complete_prefix_end_after: Option<u64>,
+    pub(crate) hol_blocker_ticket: Option<u64>,
 }
 
 #[cfg(feature = "bench")]
@@ -261,6 +270,43 @@ impl WalSyncProgress {
     }
 
     #[cfg(feature = "bench")]
+    pub(crate) fn mark_completion_timeline_received(&self, group_id: u64, reaper_recv_at: Instant) {
+        if let Some(timeline) = self.state.lock().completion_timelines.get_mut(&group_id) {
+            timeline.reaper_recv_at = Some(reaper_recv_at);
+        }
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn has_completion_timeline(&self, group_id: u64) -> bool {
+        self.state
+            .lock()
+            .completion_timelines
+            .contains_key(&group_id)
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn finish_completion_timeline(
+        &self,
+        group_id: u64,
+        data_complete_published_at: Instant,
+        prefix_end_before: u64,
+        prefix_end_after: u64,
+        hol_blocker_ticket: Option<u64>,
+    ) -> Option<WalWorkerGroupCompletionTimeline> {
+        let mut timeline = self.state.lock().completion_timelines.remove(&group_id)?;
+        timeline.data_complete_published_at = Some(data_complete_published_at);
+        timeline.data_complete_prefix_end_before = Some(prefix_end_before);
+        timeline.data_complete_prefix_end_after = Some(prefix_end_after);
+        timeline.hol_blocker_ticket = hol_blocker_ticket;
+        Some(timeline)
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn discard_completion_timeline(&self, group_id: u64) {
+        self.state.lock().completion_timelines.remove(&group_id);
+    }
+
+    #[cfg(feature = "bench")]
     pub(crate) fn record_completion_handoff_timeline(
         &self,
         timeline: &WalWorkerGroupCompletionTimeline,
@@ -268,46 +314,65 @@ impl WalSyncProgress {
         let Some(profile) = self.profile() else {
             return;
         };
+        if let Some(observation) = Self::handoff_observation(timeline) {
+            profile.record_wal_completion_handoff_timeline(observation);
+        }
+    }
+
+    /// Build the shared V7/V8 per-ticket observation once DATA completion has
+    /// been published by the format-specific coordinator.
+    #[cfg(feature = "bench")]
+    pub(crate) fn handoff_observation(
+        timeline: &WalWorkerGroupCompletionTimeline,
+    ) -> Option<crate::mem_table::WalCompletionHandoffObservation> {
         let duration_ns = |start: Option<Instant>, end: Option<Instant>| {
             let elapsed = end?.saturating_duration_since(start?).as_nanos();
             Some(elapsed.min(u64::MAX as u128) as u64)
         };
-        let Some(submit_to_cqe_observed_ns) =
-            duration_ns(timeline.sqe_submitted_at, timeline.cqe_observed_at)
-        else {
-            return;
-        };
-        let Some(cqe_observed_to_group_finished_ns) =
-            duration_ns(timeline.cqe_observed_at, timeline.group_finished_at)
-        else {
-            return;
-        };
-        let Some(group_finished_to_result_send_start_ns) =
-            duration_ns(timeline.group_finished_at, timeline.result_send_started_at)
-        else {
-            return;
-        };
-        let Some(result_send_start_to_receiver_ns) =
-            duration_ns(timeline.result_send_started_at, timeline.reaper_recv_at)
-        else {
-            return;
-        };
-
-        profile.record_wal_completion_handoff_timeline(
-            crate::mem_table::WalCompletionHandoffObservation {
-                group_id: timeline.group_id,
-                ticket_start: timeline.ticket_start,
-                ticket_end: timeline.ticket_end,
-                worker_tid: timeline.worker_tid,
-                request_id: timeline.request_id,
-                request_start: timeline.request_start,
-                request_end: timeline.request_end,
-                submit_to_cqe_observed_ns,
-                cqe_observed_to_group_finished_ns,
-                group_finished_to_result_send_start_ns,
-                result_send_start_to_receiver_ns,
-            },
+        let submit_to_cqe_observed_ns =
+            duration_ns(timeline.sqe_submitted_at, timeline.cqe_observed_at)?;
+        let cqe_observed_to_group_finished_ns =
+            duration_ns(timeline.cqe_observed_at, timeline.group_finished_at)?;
+        let group_finished_to_result_send_start_ns =
+            duration_ns(timeline.group_finished_at, timeline.result_send_started_at)?;
+        let result_send_start_to_receiver_ns =
+            duration_ns(timeline.result_send_started_at, timeline.reaper_recv_at)?;
+        let frame_ready_to_submit_request_ns =
+            duration_ns(timeline.frame_ready_at, timeline.submit_requested_at);
+        let submit_request_to_worker_queue_ns = duration_ns(
+            timeline.submit_requested_at,
+            timeline.worker_queue_enqueued_at,
         );
+        let worker_queue_to_worker_accept_ns = duration_ns(
+            timeline.worker_queue_enqueued_at,
+            timeline.worker_accepted_at,
+        );
+        let worker_accept_to_sqe_submit_ns =
+            duration_ns(timeline.worker_accepted_at, timeline.sqe_submitted_at);
+        let receiver_to_data_complete_publish_ns =
+            duration_ns(timeline.reaper_recv_at, timeline.data_complete_published_at);
+        Some(crate::mem_table::WalCompletionHandoffObservation {
+            group_id: timeline.group_id,
+            ticket_start: timeline.ticket_start,
+            ticket_end: timeline.ticket_end,
+            worker_tid: timeline.worker_tid,
+            request_id: timeline.request_id,
+            request_start: timeline.request_start,
+            request_end: timeline.request_end,
+            sampled_ticket: timeline.sampled_ticket,
+            frame_ready_to_submit_request_ns,
+            submit_request_to_worker_queue_ns,
+            worker_queue_to_worker_accept_ns,
+            worker_accept_to_sqe_submit_ns,
+            submit_to_cqe_observed_ns,
+            cqe_observed_to_group_finished_ns,
+            group_finished_to_result_send_start_ns,
+            result_send_start_to_receiver_ns,
+            receiver_to_data_complete_publish_ns,
+            data_complete_prefix_end_before: timeline.data_complete_prefix_end_before,
+            data_complete_prefix_end_after: timeline.data_complete_prefix_end_after,
+            hol_blocker_ticket: timeline.hol_blocker_ticket,
+        })
     }
 
     /// Let a format with its own logical durability groups report those groups
@@ -682,6 +747,8 @@ pub(crate) struct WriteBuffer<B = DirectBuf> {
     buffer: B,
     file_offset: u64,
     write_len: usize,
+    #[cfg(feature = "bench")]
+    ticket_timeline: Option<WalWorkerTicketTimelineSeed>,
 }
 
 impl<B> WriteBuffer<B> {
@@ -690,8 +757,26 @@ impl<B> WriteBuffer<B> {
             buffer,
             file_offset,
             write_len,
+            #[cfg(feature = "bench")]
+            ticket_timeline: None,
         }
     }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn with_ticket_timeline(mut self, ticket: u64, frame_ready_at: Instant) -> Self {
+        self.ticket_timeline = Some(WalWorkerTicketTimelineSeed {
+            ticket,
+            frame_ready_at,
+        });
+        self
+    }
+}
+
+#[cfg(feature = "bench")]
+#[derive(Clone, Copy)]
+struct WalWorkerTicketTimelineSeed {
+    ticket: u64,
+    frame_ready_at: Instant,
 }
 
 /// Avoid a heap allocation for the common one-write group while retaining a
@@ -760,6 +845,12 @@ pub(crate) struct WriteGroup<B = DirectBuf> {
     writes: WriteGroupBuffers<B>,
     allocation_range: Range<u64>,
     write_bytes: u64,
+    #[cfg(feature = "bench")]
+    submit_requested_at: Option<Instant>,
+    #[cfg(feature = "bench")]
+    worker_queue_enqueued_at: Option<Instant>,
+    #[cfg(feature = "bench")]
+    worker_accepted_at: Option<Instant>,
 }
 
 impl<B> WriteGroup<B> {
@@ -872,6 +963,12 @@ impl<B> WriteGroup<B> {
             writes,
             allocation_range,
             write_bytes,
+            #[cfg(feature = "bench")]
+            submit_requested_at: None,
+            #[cfg(feature = "bench")]
+            worker_queue_enqueued_at: None,
+            #[cfg(feature = "bench")]
+            worker_accepted_at: None,
         })
     }
 }
@@ -931,6 +1028,8 @@ struct OwnedWrite<B> {
     file_offset: u64,
     write_len: usize,
     state: WriteState,
+    #[cfg(feature = "bench")]
+    ticket_timeline: Option<WalWorkerTicketTimelineSeed>,
 }
 
 struct GroupState {
@@ -943,11 +1042,22 @@ struct GroupState {
     error: Option<String>,
     #[cfg(feature = "bench")]
     completion_timeline: Option<GroupCompletionTimeline>,
+    #[cfg(feature = "bench")]
+    submit_requested_at: Option<Instant>,
+    #[cfg(feature = "bench")]
+    worker_queue_enqueued_at: Option<Instant>,
+    #[cfg(feature = "bench")]
+    worker_accepted_at: Option<Instant>,
 }
 
 #[cfg(feature = "bench")]
 struct GroupCompletionTimeline {
     request_id: u64,
+    sampled_ticket: Option<u64>,
+    frame_ready_at: Option<Instant>,
+    submit_requested_at: Option<Instant>,
+    worker_queue_enqueued_at: Option<Instant>,
+    worker_accepted_at: Option<Instant>,
     sqe_submitted_at: Option<Instant>,
     cqe_observed_at: Option<Instant>,
     cqe_observed_monotonic_ns: Option<u64>,
@@ -1009,7 +1119,7 @@ struct WriteSubmission {
 enum WorkerEvent<B> {
     BufferRetired(B),
     #[cfg(feature = "bench")]
-    CompletionTimeline(WalWorkerGroupCompletionTimeline),
+    CompletionTimeline(Box<WalWorkerGroupCompletionTimeline>),
     GroupFinished(GroupWriteResult),
 }
 
@@ -1128,6 +1238,12 @@ impl<B: WorkerBuffer> WorkerCore<B> {
             .checked_add(request_count)
             .ok_or(WorkerError::CounterOverflow)?;
         let request_ids_start = self.next_request_id;
+        #[cfg(feature = "bench")]
+        let submit_requested_at = group.submit_requested_at;
+        #[cfg(feature = "bench")]
+        let worker_queue_enqueued_at = group.worker_queue_enqueued_at;
+        #[cfg(feature = "bench")]
+        let worker_accepted_at = group.worker_accepted_at;
         for write in group.writes.into_iter() {
             let request_id = RequestId(self.next_request_id);
             self.next_request_id += 1;
@@ -1142,6 +1258,8 @@ impl<B: WorkerBuffer> WorkerCore<B> {
                     file_offset: write.file_offset,
                     write_len: write.write_len,
                     state: WriteState::Ready,
+                    #[cfg(feature = "bench")]
+                    ticket_timeline: write.ticket_timeline,
                 },
             );
         }
@@ -1178,6 +1296,12 @@ impl<B: WorkerBuffer> WorkerCore<B> {
                 error: None,
                 #[cfg(feature = "bench")]
                 completion_timeline: None,
+                #[cfg(feature = "bench")]
+                submit_requested_at,
+                #[cfg(feature = "bench")]
+                worker_queue_enqueued_at,
+                #[cfg(feature = "bench")]
+                worker_accepted_at,
             },
         );
         self.assert_invariants();
@@ -1191,27 +1315,42 @@ impl<B: WorkerBuffer> WorkerCore<B> {
             return;
         }
 
+        let (request_ids, submit_requested_at, worker_queue_enqueued_at, worker_accepted_at) = {
+            let group = self.groups.get(&group_id).expect("assigned group exists");
+            (
+                group.request_ids.clone(),
+                group.submit_requested_at,
+                group.worker_queue_enqueued_at,
+                group.worker_accepted_at,
+            )
+        };
+        let ticket_sample = request_ids.clone().find_map(|request_id| {
+            self.writes
+                .get(&RequestId(request_id))
+                .and_then(|write| write.ticket_timeline.map(|seed| (request_id, seed)))
+        });
+        let Some((request_id, ticket_seed)) = ticket_sample else {
+            // This trace is sampled by WAL ticket, not worker request ID. A
+            // request-ID fallback could emit a group with no sampled ticket
+            // or frame-ready timestamp and would make the V7/V8 timelines
+            // incomparable.
+            return;
+        };
         let group = self
             .groups
             .get_mut(&group_id)
             .expect("assigned group exists");
-        let remainder = group.request_ids.start % sample_every;
-        let offset = if remainder == 0 {
-            0
-        } else {
-            sample_every - remainder
-        };
-        let Some(request_id) = group.request_ids.start.checked_add(offset) else {
-            return;
-        };
-        if request_id < group.request_ids.end {
-            group.completion_timeline = Some(GroupCompletionTimeline {
-                request_id,
-                sqe_submitted_at: None,
-                cqe_observed_at: None,
-                cqe_observed_monotonic_ns: None,
-            });
-        }
+        group.completion_timeline = Some(GroupCompletionTimeline {
+            request_id,
+            sampled_ticket: Some(ticket_seed.ticket),
+            frame_ready_at: Some(ticket_seed.frame_ready_at),
+            submit_requested_at,
+            worker_queue_enqueued_at,
+            worker_accepted_at,
+            sqe_submitted_at: None,
+            cqe_observed_at: None,
+            cqe_observed_monotonic_ns: None,
+        });
     }
 
     /// Stage SQEs across groups in round-robin order without waiting for any
@@ -1521,7 +1660,7 @@ impl<B: WorkerBuffer> WorkerCore<B> {
             if error.is_none()
                 && let Some(timeline) = group.completion_timeline
             {
-                events.push(WorkerEvent::CompletionTimeline(
+                events.push(WorkerEvent::CompletionTimeline(Box::new(
                     WalWorkerGroupCompletionTimeline {
                         group_id: group_id.0,
                         ticket_start: group.tickets.start,
@@ -1530,6 +1669,11 @@ impl<B: WorkerBuffer> WorkerCore<B> {
                         request_start: group.request_ids.start,
                         request_end: group.request_ids.end,
                         request_id: timeline.request_id,
+                        sampled_ticket: timeline.sampled_ticket,
+                        frame_ready_at: timeline.frame_ready_at,
+                        submit_requested_at: timeline.submit_requested_at,
+                        worker_queue_enqueued_at: timeline.worker_queue_enqueued_at,
+                        worker_accepted_at: timeline.worker_accepted_at,
                         sqe_submitted_at: timeline.sqe_submitted_at,
                         cqe_observed_at: timeline.cqe_observed_at,
                         cqe_observed_monotonic_ns: timeline.cqe_observed_monotonic_ns,
@@ -1537,8 +1681,12 @@ impl<B: WorkerBuffer> WorkerCore<B> {
                         group_finished_monotonic_ns: monotonic_now_ns(),
                         result_send_started_at: None,
                         reaper_recv_at: None,
+                        data_complete_published_at: None,
+                        data_complete_prefix_end_before: None,
+                        data_complete_prefix_end_after: None,
+                        hol_blocker_ticket: None,
                     },
-                ));
+                )));
             }
             events.push(WorkerEvent::GroupFinished(GroupWriteResult {
                 group_id: group_id.0,
@@ -2215,6 +2363,17 @@ impl<B: WorkerBuffer> IoWorkerClient<B> {
     /// Queue a preallocated group. Backpressure counts queued and in-flight
     /// groups together, not just groups already submitted to the ring.
     pub(crate) fn submit_group(&self, group: WriteGroup<B>) -> Result<u64> {
+        #[cfg(feature = "bench")]
+        let mut group = group;
+        #[cfg(feature = "bench")]
+        let has_ticket_sample = group
+            .writes
+            .iter()
+            .any(|write| write.ticket_timeline.is_some());
+        #[cfg(feature = "bench")]
+        if has_ticket_sample {
+            group.submit_requested_at = Some(Instant::now());
+        }
         let tickets = group.tickets.clone();
         for write in group.writes.iter() {
             ensure!(
@@ -2235,6 +2394,10 @@ impl<B: WorkerBuffer> IoWorkerClient<B> {
             let permit = GroupPermit {
                 slots: Arc::clone(&self.slots),
             };
+            #[cfg(feature = "bench")]
+            if has_ticket_sample {
+                group.worker_queue_enqueued_at = Some(Instant::now());
+            }
             let send_result = self.commands.send(WorkerCommand::Group {
                 id: group_id,
                 group,
@@ -2561,7 +2724,17 @@ fn enqueue_group_command<B: WorkerBuffer>(
     completions: &Sender<GroupWriteResult>,
     timeline_sample_every: u64,
 ) -> Result<()> {
+    #[cfg(feature = "bench")]
+    let mut group = group;
     let tickets = group.tickets.clone();
+    #[cfg(feature = "bench")]
+    if group
+        .writes
+        .iter()
+        .any(|write| write.ticket_timeline.is_some())
+    {
+        group.worker_accepted_at = Some(Instant::now());
+    }
     match core.enqueue(group) {
         Ok(assigned_id) if assigned_id == id => {
             #[cfg(feature = "bench")]
@@ -2787,7 +2960,7 @@ fn process_worker_events<B: WorkerBuffer>(
             }
             #[cfg(feature = "bench")]
             WorkerEvent::CompletionTimeline(timeline) => {
-                pending_timeline = Some(timeline);
+                pending_timeline = Some(*timeline);
             }
             WorkerEvent::GroupFinished(result) => {
                 #[cfg(all(test, feature = "chaos-testing"))]
@@ -3113,6 +3286,52 @@ mod tests {
         }
         assert!(core.is_idle());
         assert_eq!(drops.load(Ordering::Acquire), 4);
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn completion_timeline_requires_a_sampled_wal_ticket() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut core = WorkerCore::with_ordering(true);
+        let unsampled = WriteGroup::new(
+            1..2,
+            vec![WriteBuffer::new(
+                DropProbe::new(4096, Arc::clone(&drops)),
+                0,
+                4096,
+            )],
+        )
+        .expect("build unsampled group");
+        let unsampled_id = core.enqueue(unsampled).expect("enqueue unsampled group");
+        core.sample_completion_timeline(unsampled_id, 128);
+        assert!(
+            core.groups
+                .get(&unsampled_id)
+                .unwrap()
+                .completion_timeline
+                .is_none()
+        );
+
+        let frame_ready_at = std::time::Instant::now();
+        let sampled = WriteGroup::new(
+            128..129,
+            vec![
+                WriteBuffer::new(DropProbe::new(4096, Arc::clone(&drops)), 4096, 4096)
+                    .with_ticket_timeline(128, frame_ready_at),
+            ],
+        )
+        .expect("build sampled group");
+        let sampled_id = core.enqueue(sampled).expect("enqueue sampled group");
+        core.sample_completion_timeline(sampled_id, 128);
+        let timeline = core
+            .groups
+            .get(&sampled_id)
+            .unwrap()
+            .completion_timeline
+            .as_ref()
+            .expect("sampled ticket has a completion timeline");
+        assert_eq!(timeline.sampled_ticket, Some(128));
+        assert_eq!(timeline.frame_ready_at, Some(frame_ready_at));
     }
 
     #[test]

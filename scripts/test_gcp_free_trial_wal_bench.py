@@ -754,6 +754,36 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
                 sample.update({"ticket": sample_sequence, "commit_ts": sample_sequence})
             producer_samples.append(sample)
 
+        completion_handoff_samples = [
+            {
+                "group_id": ticket,
+                "ticket_start": ticket,
+                "ticket_end": ticket + 1,
+                "worker_tid": 42,
+                "request_id": ticket,
+                "request_start": ticket,
+                "request_end": ticket + 1,
+                "sampled_ticket": ticket,
+                "frame_ready_to_submit_request_ns": 5,
+                "submit_request_to_worker_queue_ns": 6,
+                "worker_queue_to_worker_accept_ns": 7,
+                "worker_accept_to_sqe_submit_ns": 8,
+                "submit_to_cqe_observed_ns": 10,
+                "cqe_observed_to_group_finished_ns": 20,
+                "group_finished_to_result_send_start_ns": 30,
+                "result_send_start_to_receiver_ns": 40,
+                "receiver_to_data_complete_publish_ns": 9,
+                "data_complete_prefix_end_before": ticket,
+                "data_complete_prefix_end_after": ticket + 1,
+                "hol_blocker_ticket": None,
+            }
+            for ticket in range(
+                0,
+                V8_POINT_CPU_ATTRIBUTION_NUM,
+                cpu_attribution_runner.V8_COMPLETION_TIMELINE_SAMPLE_EVERY,
+            )
+        ]
+
         record = {
             "params": {
                 "num": V8_POINT_CPU_ATTRIBUTION_NUM,
@@ -786,19 +816,7 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
                     "completion_handoff_timeline": {
                         "sample_every": cpu_attribution_runner.V8_COMPLETION_TIMELINE_SAMPLE_EVERY,
                         "dropped_samples": 0,
-                        "samples": [{
-                            "group_id": 7,
-                            "ticket_start": 120,
-                            "ticket_end": 130,
-                            "worker_tid": 42,
-                            "request_id": 128,
-                            "request_start": 120,
-                            "request_end": 131,
-                            "submit_to_cqe_observed_ns": 10,
-                            "cqe_observed_to_group_finished_ns": 20,
-                            "group_finished_to_result_send_start_ns": 30,
-                            "result_send_start_to_receiver_ns": 40,
-                        }],
+                        "samples": completion_handoff_samples,
                     },
                     "wal_cpu_attribution": {
                         "sample_every": V8_POINT_CPU_ATTRIBUTION_SAMPLE_EVERY,
@@ -834,7 +852,7 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
         self.assertEqual(validated["wal_cpu_attribution_retry_attempts"], 1)
         self.assertEqual(
             validated["completion_handoff_timeline_summary"]["sample_count"],
-            1,
+            len(completion_handoff_samples),
         )
         producer_summary = cpu_attribution_runner._producer_phase_summary([{
             **validated, "arm": "v7_parallel",
@@ -856,23 +874,39 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
                 "request_id": 128,
                 "request_start": 120,
                 "request_end": 131,
+                "sampled_ticket": 128,
+                "frame_ready_to_submit_request_ns": 5,
+                "submit_request_to_worker_queue_ns": 6,
+                "worker_queue_to_worker_accept_ns": 7,
+                "worker_accept_to_sqe_submit_ns": 8,
                 "submit_to_cqe_observed_ns": 10,
                 "cqe_observed_to_group_finished_ns": 20,
                 "group_finished_to_result_send_start_ns": 30,
                 "result_send_start_to_receiver_ns": 40,
+                "receiver_to_data_complete_publish_ns": 9,
+                "data_complete_prefix_end_before": 120,
+                "data_complete_prefix_end_after": 130,
+                "hol_blocker_ticket": 130,
             }],
         }
         summary = _completion_handoff_timeline_summary(valid)
         self.assertEqual(summary["sample_count"], 1)
         self.assertEqual(summary["result_send_start_to_receiver_ns"]["p50"], 40)
+        self.assertEqual(summary["frame_ready_to_submit_request_ns"]["p50"], 5)
+        self.assertEqual(summary["unique_sampled_ticket_count"], 1)
+        with self.assertRaises(ValueError):
+            _completion_handoff_timeline_summary(valid, expected_operations=100_000)
 
         invalid_timelines = (
             None,
             {**valid, "sample_every": 64},
             {**valid, "dropped_samples": 1},
             {**valid, "samples": []},
-            {**valid, "samples": [{**valid["samples"][0], "request_id": 127}]},
+            {**valid, "samples": [{**valid["samples"][0], "sampled_ticket": 127}]},
+            {**valid, "samples": [valid["samples"][0], valid["samples"][0]]},
             {**valid, "samples": [{**valid["samples"][0], "ticket_end": 120}]},
+            {**valid, "samples": [{**valid["samples"][0], "receiver_to_data_complete_publish_ns": None}]},
+            {**valid, "samples": [{**valid["samples"][0], "data_complete_prefix_end_after": 119}]},
             {**valid, "samples": [{**valid["samples"][0], "result_send_start_to_receiver_ns": -1}]},
         )
         for timeline in invalid_timelines:

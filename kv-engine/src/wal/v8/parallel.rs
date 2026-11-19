@@ -741,6 +741,23 @@ impl WalV8ParallelCoordinator {
 
     /// Publish that one ticket's physical DATA frames have been materialized.
     pub(crate) fn mark_frames_ready(&self, ticket: u64) -> Result<()> {
+        self.mark_frames_ready_inner(ticket, false).map(|_| ())
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn mark_frames_ready_with_timeline_sample(
+        &self,
+        ticket: u64,
+        sample_timeline: bool,
+    ) -> Result<Option<Instant>> {
+        self.mark_frames_ready_inner(ticket, sample_timeline)
+    }
+
+    fn mark_frames_ready_inner(
+        &self,
+        ticket: u64,
+        sample_timeline: bool,
+    ) -> Result<Option<Instant>> {
         let mut state = self.inner.state.lock();
         ensure!(!state.poisoned, "v8 Parallel coordinator is poisoned");
         let Some(index) = state
@@ -752,16 +769,23 @@ impl WalV8ParallelCoordinator {
             anyhow::bail!("v8 frame-ready event names an unknown ticket")
         };
         if state.tickets[index].frames_ready {
-            return Ok(());
+            return Ok(None);
         }
         state.tickets[index].frames_ready = true;
+        #[cfg(feature = "bench")]
+        let frame_ready_at = sample_timeline.then(Instant::now);
+        #[cfg(not(feature = "bench"))]
+        let frame_ready_at = {
+            let _ = sample_timeline;
+            None
+        };
         #[cfg(feature = "bench")]
         refresh_data_completion_order_hol(&self.inner, &mut state);
         #[cfg(feature = "bench")]
         advance_completion_timeline_prefix(&mut state);
         signal_change(&self.inner, &mut state);
 
-        Ok(())
+        Ok(frame_ready_at)
     }
 
     /// Record when a producer begins publishing DATA to the ordered worker
@@ -957,6 +981,8 @@ impl WalV8ParallelCoordinator {
     ) -> Result<()> {
         #[cfg(feature = "bench")]
         let timeline_sampled = timeline.is_some();
+        #[cfg(feature = "bench")]
+        let mut handoff_timeline = timeline.clone();
         #[cfg(feature = "bench")]
         let lock_wait_started = timeline_sampled.then(Instant::now);
         #[cfg(feature = "bench")]
@@ -1184,6 +1210,24 @@ impl WalV8ParallelCoordinator {
                 pending.hol_blocker_digest_folded = Some(digest_folded);
                 pending.hol_blocker_data_write_elapsed_ns = write_elapsed_ns;
             }
+        }
+
+        #[cfg(feature = "bench")]
+        if let Some(timeline) = handoff_timeline.as_mut() {
+            timeline.data_complete_published_at = data_complete_published_at;
+            timeline.data_complete_prefix_end_before = data_complete_prefix_end_before;
+            timeline.data_complete_prefix_end_after = data_complete_prefix_end_after;
+            timeline.hol_blocker_ticket = hol_blocker.flatten().map(|(ticket, _, _, _)| ticket);
+        }
+
+        drop(state);
+
+        #[cfg(feature = "bench")]
+        if let (Some(profile), Some(timeline)) = (self.inner.profile.load_full(), handoff_timeline)
+            && let Some(observation) =
+                crate::wal::parallel_worker::WalSyncProgress::handoff_observation(&timeline)
+        {
+            profile.record_wal_completion_handoff_timeline(observation);
         }
 
         Ok(())

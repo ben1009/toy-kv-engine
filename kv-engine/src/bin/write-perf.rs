@@ -1230,10 +1230,28 @@ struct WalCompletionHandoffTimelineRecord {
     request_id: u64,
     request_start: u64,
     request_end: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sampled_ticket: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    frame_ready_to_submit_request_ns: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    submit_request_to_worker_queue_ns: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    worker_queue_to_worker_accept_ns: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    worker_accept_to_sqe_submit_ns: Option<u64>,
     submit_to_cqe_observed_ns: u64,
     cqe_observed_to_group_finished_ns: u64,
     group_finished_to_result_send_start_ns: u64,
     result_send_start_to_receiver_ns: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    receiver_to_data_complete_publish_ns: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data_complete_prefix_end_before: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data_complete_prefix_end_after: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hol_blocker_ticket: Option<u64>,
 }
 
 #[cfg(feature = "bench")]
@@ -1249,11 +1267,20 @@ impl From<kv_engine_wrapper::mem_table::WalCompletionHandoffObservation>
             request_id: observation.request_id,
             request_start: observation.request_start,
             request_end: observation.request_end,
+            sampled_ticket: observation.sampled_ticket,
+            frame_ready_to_submit_request_ns: observation.frame_ready_to_submit_request_ns,
+            submit_request_to_worker_queue_ns: observation.submit_request_to_worker_queue_ns,
+            worker_queue_to_worker_accept_ns: observation.worker_queue_to_worker_accept_ns,
+            worker_accept_to_sqe_submit_ns: observation.worker_accept_to_sqe_submit_ns,
             submit_to_cqe_observed_ns: observation.submit_to_cqe_observed_ns,
             cqe_observed_to_group_finished_ns: observation.cqe_observed_to_group_finished_ns,
             group_finished_to_result_send_start_ns: observation
                 .group_finished_to_result_send_start_ns,
             result_send_start_to_receiver_ns: observation.result_send_start_to_receiver_ns,
+            receiver_to_data_complete_publish_ns: observation.receiver_to_data_complete_publish_ns,
+            data_complete_prefix_end_before: observation.data_complete_prefix_end_before,
+            data_complete_prefix_end_after: observation.data_complete_prefix_end_after,
+            hol_blocker_ticket: observation.hol_blocker_ticket,
         }
     }
 }

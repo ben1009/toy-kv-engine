@@ -2437,6 +2437,8 @@ struct WalV8ParallelFrontier {
 struct PendingV8DataWrite {
     file_offset: u64,
     buffer: WalV8DataBuffer,
+    #[cfg(feature = "bench")]
+    frame_ready_at: Option<Instant>,
 }
 
 /// V8 accounts DATA frame buffers per admitted ticket, so completed buffers
@@ -2592,10 +2594,7 @@ impl WalV8ParallelIo {
                     };
                     #[cfg(feature = "bench")]
                     let timeline = reaper_recv_at.and_then(|received_at| {
-                        let timeline = completion_progress
-                            .take_completion_timeline(result.group_id, received_at)?;
-                        completion_progress.record_completion_handoff_timeline(&timeline);
-                        Some(timeline)
+                        completion_progress.take_completion_timeline(result.group_id, received_at)
                     });
                     let reap_result = {
                         #[cfg(feature = "bench")]
@@ -2776,11 +2775,19 @@ impl WalV8ParallelIo {
         }
     }
 
-    fn publish_data(&self, ticket: u64, file_offset: u64, buffer: WalV8DataBuffer) -> Result<()> {
+    fn publish_data(
+        &self,
+        ticket: u64,
+        file_offset: u64,
+        buffer: WalV8DataBuffer,
+        frame_ready_at: Option<Instant>,
+    ) -> Result<()> {
         let allocation_end = file_offset
             .checked_add(u64::try_from(buffer.len())?)
             .context("v8 worker DATA allocation end overflows")?;
         self.request_extent_preparation_through(allocation_end)?;
+        #[cfg(not(feature = "bench"))]
+        let _ = frame_ready_at;
 
         let mut submission = self.submission.lock();
         ensure!(
@@ -2794,7 +2801,9 @@ impl WalV8ParallelIo {
                     ticket,
                     PendingV8DataWrite {
                         file_offset,
-                        buffer
+                        buffer,
+                        #[cfg(feature = "bench")]
+                        frame_ready_at,
                     }
                 )
                 .is_none(),
@@ -3066,11 +3075,13 @@ impl WalV8ParallelIo {
                     .context("v8 DATA source-credit range overflows")?;
                 // The driver transfers credit for FRONTIER gaps separately.
                 self.consume_extent_source_credit(pending.file_offset, write_end)?;
-                writes.push(WriteBuffer::new(
-                    pending.buffer,
-                    pending.file_offset,
-                    write_len,
-                ));
+                let write = WriteBuffer::new(pending.buffer, pending.file_offset, write_len);
+                #[cfg(feature = "bench")]
+                let write = match pending.frame_ready_at {
+                    Some(frame_ready_at) => write.with_ticket_timeline(*ticket, frame_ready_at),
+                    None => write,
+                };
+                writes.push(write);
             }
 
             let group = WriteGroup::new_with_frontiers(
@@ -3381,8 +3392,21 @@ impl WalV8FrameJob<'_> {
         let frames_ready_started = phases
             .as_ref()
             .map(|_| (Instant::now(), digest::thread_cpu_time_ns()));
+        #[cfg(feature = "bench")]
+        let frame_ready_at = {
+            let sample_every = self.profile.as_ref().map_or(0, |profile| {
+                profile.wal_v8_completion_timeline_sample_every()
+            });
+            self.coordinator.mark_frames_ready_with_timeline_sample(
+                self.assignment.segment_ticket,
+                sample_every > 0 && self.assignment.segment_ticket.is_multiple_of(sample_every),
+            )?
+        };
+        #[cfg(not(feature = "bench"))]
         self.coordinator
             .mark_frames_ready(self.assignment.segment_ticket)?;
+        #[cfg(not(feature = "bench"))]
+        let frame_ready_at = None;
         #[cfg(feature = "bench")]
         if self
             .profile
@@ -3398,9 +3422,12 @@ impl WalV8FrameJob<'_> {
             self.coordinator.poison();
             anyhow::bail!("v8 Parallel ticket already owns a producer guard");
         }
-        let write_result =
-            self.io
-                .publish_data(ticket, self.assignment.first_data_offset, data_buffer);
+        let write_result = self.io.publish_data(
+            ticket,
+            self.assignment.first_data_offset,
+            data_buffer,
+            frame_ready_at,
+        );
         if let Err(error) = write_result {
             self.coordinator.poison();
             return Err(error).context("submit v8 Parallel DATA frames");

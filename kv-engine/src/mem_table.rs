@@ -462,10 +462,19 @@ pub struct WalCompletionHandoffObservation {
     pub request_id: u64,
     pub request_start: u64,
     pub request_end: u64,
+    pub sampled_ticket: Option<u64>,
+    pub frame_ready_to_submit_request_ns: Option<u64>,
+    pub submit_request_to_worker_queue_ns: Option<u64>,
+    pub worker_queue_to_worker_accept_ns: Option<u64>,
+    pub worker_accept_to_sqe_submit_ns: Option<u64>,
     pub submit_to_cqe_observed_ns: u64,
     pub cqe_observed_to_group_finished_ns: u64,
     pub group_finished_to_result_send_start_ns: u64,
     pub result_send_start_to_receiver_ns: u64,
+    pub receiver_to_data_complete_publish_ns: Option<u64>,
+    pub data_complete_prefix_end_before: Option<u64>,
+    pub data_complete_prefix_end_after: Option<u64>,
+    pub hol_blocker_ticket: Option<u64>,
 }
 
 /// One sampled, actual V8 durability advance. Wall and thread CPU durations

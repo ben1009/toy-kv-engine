@@ -301,7 +301,10 @@ def _completion_timeline_summary(timeline: Any) -> dict[str, Any]:
     }
 
 
-def _completion_handoff_timeline_summary(timeline: Any) -> dict[str, Any]:
+def _completion_handoff_timeline_summary(
+    timeline: Any,
+    expected_operations: int | None = None,
+) -> dict[str, Any]:
     if not isinstance(timeline, dict):
         raise ValueError("parallel completion handoff timeline is missing or is not an object")
     samples = timeline.get("samples")
@@ -314,31 +317,58 @@ def _completion_handoff_timeline_summary(timeline: Any) -> dict[str, Any]:
         raise ValueError("parallel completion handoff samples are missing or incomplete")
 
     duration_fields = (
+        "frame_ready_to_submit_request_ns",
+        "submit_request_to_worker_queue_ns",
+        "worker_queue_to_worker_accept_ns",
+        "worker_accept_to_sqe_submit_ns",
         "submit_to_cqe_observed_ns",
         "cqe_observed_to_group_finished_ns",
         "group_finished_to_result_send_start_ns",
         "result_send_start_to_receiver_ns",
+        "receiver_to_data_complete_publish_ns",
     )
+    sampled_tickets: set[int] = set()
     for index, sample in enumerate(samples):
         if not isinstance(sample, dict):
             raise ValueError(f"completion handoff sample {index} is not an object")
         required_ints = (
             "group_id", "ticket_start", "ticket_end", "request_id", "request_start", "request_end",
+            "sampled_ticket", "data_complete_prefix_end_before", "data_complete_prefix_end_after",
             *duration_fields,
         )
         if any(not _valid_nonnegative_int(sample.get(field)) for field in required_ints):
             raise ValueError(f"completion handoff sample {index} has missing or invalid fields")
         if (
             sample["ticket_start"] >= sample["ticket_end"]
+            or not sample["ticket_start"] <= sample["sampled_ticket"] < sample["ticket_end"]
+            or sample["sampled_ticket"] % V8_COMPLETION_TIMELINE_SAMPLE_EVERY != 0
             or sample["request_start"] > sample["request_id"]
             or sample["request_id"] >= sample["request_end"]
-            or sample["request_id"] % V8_COMPLETION_TIMELINE_SAMPLE_EVERY != 0
+            or sample["data_complete_prefix_end_after"] < sample["data_complete_prefix_end_before"]
         ):
             raise ValueError(f"completion handoff sample {index} has inconsistent identities")
+        if sample["sampled_ticket"] in sampled_tickets:
+            raise ValueError(f"completion handoff sample {index} duplicates a sampled ticket")
+        sampled_tickets.add(sample["sampled_ticket"])
+        blocker_ticket = sample.get("hol_blocker_ticket")
+        if blocker_ticket is not None and not _valid_nonnegative_int(blocker_ticket):
+            raise ValueError(f"completion handoff sample {index} has an invalid HOL blocker ticket")
+    if expected_operations is not None:
+        expected_tickets = set(
+            range(0, expected_operations, V8_COMPLETION_TIMELINE_SAMPLE_EVERY)
+        )
+        if sampled_tickets != expected_tickets:
+            raise ValueError("completion handoff samples do not cover every planned ticket sample")
     return {
         "sample_every": V8_COMPLETION_TIMELINE_SAMPLE_EVERY,
         "sample_count": len(samples),
+        "unique_sampled_ticket_count": len(sampled_tickets),
         **{field: _distribution([float(sample[field]) for sample in samples]) for field in duration_fields},
+        "hol_blocker_count": sum(sample["hol_blocker_ticket"] is not None for sample in samples),
+        "data_complete_prefix_growth_tickets": _distribution([
+            float(sample["data_complete_prefix_end_after"] - sample["data_complete_prefix_end_before"])
+            for sample in samples
+        ]),
     }
 
 
@@ -447,7 +477,8 @@ def _validate_record(record: dict[str, Any], row: dict[str, Any]) -> dict[str, A
         completion_timeline = None
 
     completion_handoff_timeline = _completion_handoff_timeline_summary(
-        pipeline.get("completion_handoff_timeline")
+        pipeline.get("completion_handoff_timeline"),
+        int(result["ops"]),
     )
 
     throughput = float(result["ops_per_sec"])
