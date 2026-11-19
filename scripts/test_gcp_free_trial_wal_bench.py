@@ -496,6 +496,7 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
                 command = build_cpu_attribution_command(Path("write-perf"), row, Path("dbs"))
                 self.assertIn("--wal-cpu-attribution-sample-every", command)
                 self.assertIn(str(V8_POINT_CPU_ATTRIBUTION_SAMPLE_EVERY), command)
+                self.assertIn("--wal-sync-diagnostics", command)
                 self.assertIn(f"--threads", command)
                 self.assertIn(str(writer), command)
 
@@ -543,6 +544,35 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
         diagnostics["phases"] = [{**phase, "succeeded": False}]
         with self.assertRaisesRegex(ValueError, "reports a failed advance"):
             _validate_v8_durability_phase_samples(diagnostics)
+
+    def test_sync_decision_validation_requires_complete_prefix_snapshot(self) -> None:
+        observation = {
+            "captured_target": 11,
+            "decision_ticket_start": 10,
+            "written_frontier_start": 10,
+            "written_frontier_end": 11,
+            "admitted_ticket_count": 3,
+            "frames_ready_prefix_tickets": 3,
+            "data_complete_prefix_tickets": 1,
+            "durability_ready_prefix_tickets": 1,
+            "next_ticket_present": True,
+            "next_ticket_frames_ready": True,
+            "next_ticket_data_complete": False,
+            "succeeded": True,
+        }
+        summary = cpu_attribution_runner._sync_decision_summary([observation])
+        self.assertEqual(summary["count"], 1)
+        self.assertEqual(summary["later_ticket_present_count"], 1)
+        self.assertEqual(summary["later_ticket_frames_ready_count"], 1)
+        self.assertEqual(summary["later_ticket_data_complete_count"], 0)
+
+        for invalid in (None, [], ["bad"], [{**observation, "decision_ticket_start": None}],
+                        [{**observation, "frames_ready_prefix_tickets": None}],
+                        [{**observation, "durability_ready_prefix_tickets": 2}],
+                        [{**observation, "next_ticket_present": False}],
+                        [{**observation, "succeeded": False}]):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                cpu_attribution_runner._sync_decision_summary(invalid)
 
     def test_v8_cpu_attribution_failed_launch_writes_partial_summary_and_zero_started(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -688,6 +718,20 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
                 "process_cpu_system_ms": 100,
                 "wal_pipeline": {
                     "sync_count": 1,
+                    "sync_observations": [{
+                        "captured_target": 2,
+                        "decision_ticket_start": 1,
+                        "written_frontier_start": 1,
+                        "written_frontier_end": 2,
+                        "admitted_ticket_count": 2,
+                        "frames_ready_prefix_tickets": 2,
+                        "data_complete_prefix_tickets": 1,
+                        "durability_ready_prefix_tickets": 1,
+                        "next_ticket_present": True,
+                        "next_ticket_frames_ready": True,
+                        "next_ticket_data_complete": False,
+                        "succeeded": True,
+                    }],
                     "wal_cpu_attribution": {
                         "sample_every": V8_POINT_CPU_ATTRIBUTION_SAMPLE_EVERY,
                         "operations_seen": V8_POINT_CPU_ATTRIBUTION_NUM + 1,

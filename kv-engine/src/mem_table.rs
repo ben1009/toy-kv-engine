@@ -349,16 +349,31 @@ pub struct WriteProfile {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct WalSyncObservation {
     pub captured_target: u64,
+    /// Durable ticket frontier at the moment the next durability target was selected.
+    /// Prefix counts below are measured from this exclusive ticket boundary.
+    pub decision_ticket_start: Option<u64>,
     pub written_frontier_start: u64,
     pub written_frontier_end: u64,
-    /// Number of unresolved tickets admitted when a v8 FRONTIER decision was
-    /// made. Other WAL formats leave this at zero.
+    /// Number of unresolved tickets admitted when a v7/v8 parallel durability
+    /// group was selected. Other WAL formats leave this at zero.
     pub admitted_ticket_count: u64,
+    /// Contiguous admitted prefix with producer frames ready at sync selection,
+    /// measured from `decision_ticket_start`. `None` means this path does not
+    /// expose the prefix snapshot.
+    pub frames_ready_prefix_tickets: Option<u64>,
+    /// Contiguous admitted prefix whose DATA I/O had completed at sync
+    /// selection, measured from `decision_ticket_start`.
+    pub data_complete_prefix_tickets: Option<u64>,
+    /// Contiguous prefix eligible for the selected durability operation,
+    /// measured from `decision_ticket_start`.
+    pub durability_ready_prefix_tickets: Option<u64>,
     /// Bytes held by v8 preflight reservations that have not finished encoding.
     pub v8_preparation_reserved_bytes: u64,
-    /// Whether there is an admitted ticket beyond the candidate v8 prefix.
+    /// Whether there is an admitted ticket beyond the selected v7/v8 group.
     pub next_ticket_present: bool,
-    /// Readiness of the first admitted ticket beyond the candidate v8 prefix.
+    /// Whether the first admitted ticket beyond the selected group has a
+    /// completed producer frame. For v7 this means it is queued in `pending`;
+    /// for v8 it is the ticket's `frames_ready` state.
     pub next_ticket_frames_ready: bool,
     pub next_ticket_digest_folded: bool,
     pub next_ticket_data_complete: bool,

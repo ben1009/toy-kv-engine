@@ -230,6 +230,10 @@ pub(crate) struct WalV8FrontierReadySnapshot {
     pub(crate) ready_prefix: Vec<WalV8TicketProgress>,
     pub(crate) admitted_ticket_count: usize,
     #[cfg(feature = "bench")]
+    pub(crate) frames_ready_prefix_count: usize,
+    #[cfg(feature = "bench")]
+    pub(crate) data_complete_prefix_count: usize,
+    #[cfg(feature = "bench")]
     pub(crate) reserved_preparation_bytes: u64,
     #[cfg(feature = "bench")]
     pub(crate) next_not_ready: Option<WalV8TicketProgress>,
@@ -676,6 +680,10 @@ impl WalV8ParallelCoordinator {
                 ready_prefix: Vec::new(),
                 admitted_ticket_count: 0,
                 #[cfg(feature = "bench")]
+                frames_ready_prefix_count: 0,
+                #[cfg(feature = "bench")]
+                data_complete_prefix_count: 0,
+                #[cfg(feature = "bench")]
                 reserved_preparation_bytes: 0,
                 #[cfg(feature = "bench")]
                 next_not_ready: None,
@@ -689,6 +697,18 @@ impl WalV8ParallelCoordinator {
             ready_prefix.push(ticket.progress());
         }
         #[cfg(feature = "bench")]
+        let frames_ready_prefix_count = state
+            .tickets
+            .iter()
+            .take_while(|ticket| ticket.frames_ready)
+            .count();
+        #[cfg(feature = "bench")]
+        let data_complete_prefix_count = state
+            .tickets
+            .iter()
+            .take_while(|ticket| ticket.data_complete)
+            .count();
+        #[cfg(feature = "bench")]
         let next_not_ready = state
             .tickets
             .get(ready_prefix.len())
@@ -697,6 +717,10 @@ impl WalV8ParallelCoordinator {
         WalV8FrontierReadySnapshot {
             ready_prefix,
             admitted_ticket_count: state.tickets.len(),
+            #[cfg(feature = "bench")]
+            frames_ready_prefix_count,
+            #[cfg(feature = "bench")]
+            data_complete_prefix_count,
             #[cfg(feature = "bench")]
             reserved_preparation_bytes: state.reserved_preparation_bytes,
             #[cfg(feature = "bench")]
@@ -2594,6 +2618,8 @@ mod tests {
 
         let snapshot = coordinator.frontier_ready_snapshot();
         assert_eq!(snapshot.admitted_ticket_count, 2);
+        assert_eq!(snapshot.frames_ready_prefix_count, 1);
+        assert_eq!(snapshot.data_complete_prefix_count, 1);
         assert_eq!(snapshot.reserved_preparation_bytes, 640);
         assert_eq!(snapshot.ready_prefix.len(), 1);
         let blocked = snapshot
@@ -2608,6 +2634,8 @@ mod tests {
         second.encode_data_frames_into(&mut second_frames)?;
         coordinator.mark_frames_ready(1)?;
         let snapshot = coordinator.frontier_ready_snapshot();
+        assert_eq!(snapshot.frames_ready_prefix_count, 2);
+        assert_eq!(snapshot.data_complete_prefix_count, 1);
         let blocked = snapshot
             .next_not_ready
             .expect("second ticket still awaits DATA completion");
@@ -2626,6 +2654,8 @@ mod tests {
         coordinator.mark_data_complete(1)?;
         let snapshot = coordinator.frontier_ready_snapshot();
         assert_eq!(snapshot.ready_prefix.len(), 2);
+        assert_eq!(snapshot.frames_ready_prefix_count, 2);
+        assert_eq!(snapshot.data_complete_prefix_count, 2);
         assert!(snapshot.next_not_ready.is_none());
 
         let reservation = coordinator.reserve_frontier(2)?;

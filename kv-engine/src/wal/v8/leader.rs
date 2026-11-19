@@ -4327,6 +4327,7 @@ impl WalV8LeaderWriter {
             if profile.wal_sync_diagnostics_enabled() {
                 profile.record_wal_sync_observation(crate::mem_table::WalSyncObservation {
                     captured_target: ticket_end,
+                    decision_ticket_start: Some(self.frontier.ticket_end),
                     written_frontier_start: self.frontier.ticket_end,
                     written_frontier_end: ticket_end,
                     groups_completed: producer_completions.len() as u64,
@@ -4845,6 +4846,9 @@ impl WalV8ParallelWriter {
             let frontier_observation = diagnostics_enabled.then_some((
                 snapshot.admitted_ticket_count as u64,
                 snapshot.reserved_preparation_bytes,
+                snapshot.frames_ready_prefix_count as u64,
+                snapshot.data_complete_prefix_count as u64,
+                snapshot.ready_prefix.len() as u64,
                 snapshot.next_not_ready,
             ));
             let ready = snapshot.ready_prefix;
@@ -5001,14 +5005,24 @@ impl WalV8ParallelWriter {
                 profile.record_wal_sync(groups);
                 profile.record_wal_fdatasync_ns(duration_ns);
                 if diagnostics_enabled {
-                    let (admitted_ticket_count, v8_preparation_reserved_bytes, next_ticket) =
-                        frontier_observation
-                            .expect("detailed v8 sync diagnostics capture a frontier snapshot");
+                    let (
+                        admitted_ticket_count,
+                        v8_preparation_reserved_bytes,
+                        frames_ready_prefix_tickets,
+                        data_complete_prefix_tickets,
+                        durability_ready_prefix_tickets,
+                        next_ticket,
+                    ) = frontier_observation
+                        .expect("detailed v8 sync diagnostics capture a frontier snapshot");
                     profile.record_wal_sync_observation(crate::mem_table::WalSyncObservation {
                         captured_target: frontier_ticket_end,
+                        decision_ticket_start: Some(first_ticket),
                         written_frontier_start: first_ticket,
                         written_frontier_end: frontier_ticket_end,
                         admitted_ticket_count,
+                        frames_ready_prefix_tickets: Some(frames_ready_prefix_tickets),
+                        data_complete_prefix_tickets: Some(data_complete_prefix_tickets),
+                        durability_ready_prefix_tickets: Some(durability_ready_prefix_tickets),
                         v8_preparation_reserved_bytes,
                         next_ticket_present: next_ticket.is_some(),
                         next_ticket_frames_ready: next_ticket

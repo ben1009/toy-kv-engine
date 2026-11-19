@@ -1094,9 +1094,17 @@ struct MeasurementResult {
 #[derive(Clone, Debug, PartialEq, Serialize)]
 struct WalSyncObservationRecord {
     captured_target: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    decision_ticket_start: Option<u64>,
     written_frontier_start: u64,
     written_frontier_end: u64,
     admitted_ticket_count: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    frames_ready_prefix_tickets: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data_complete_prefix_tickets: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    durability_ready_prefix_tickets: Option<u64>,
     v8_preparation_reserved_bytes: u64,
     next_ticket_present: bool,
     next_ticket_frames_ready: bool,
@@ -1853,9 +1861,13 @@ impl From<kv_engine_wrapper::mem_table::WalSyncObservation> for WalSyncObservati
     fn from(observation: kv_engine_wrapper::mem_table::WalSyncObservation) -> Self {
         Self {
             captured_target: observation.captured_target,
+            decision_ticket_start: observation.decision_ticket_start,
             written_frontier_start: observation.written_frontier_start,
             written_frontier_end: observation.written_frontier_end,
             admitted_ticket_count: observation.admitted_ticket_count,
+            frames_ready_prefix_tickets: observation.frames_ready_prefix_tickets,
+            data_complete_prefix_tickets: observation.data_complete_prefix_tickets,
+            durability_ready_prefix_tickets: observation.durability_ready_prefix_tickets,
             v8_preparation_reserved_bytes: observation.v8_preparation_reserved_bytes,
             next_ticket_present: observation.next_ticket_present,
             next_ticket_frames_ready: observation.next_ticket_frames_ready,
@@ -10102,8 +10114,13 @@ fn validate_config(cfg: &HarnessConfig) -> Result<()> {
             "--wal-sync-diagnostics requires a bench build"
         );
         anyhow::ensure!(
-            cfg.pitr_format.unwrap_or(PitrFormatArg::V8) == PitrFormatArg::V8,
-            "--wal-sync-diagnostics requires PITR V8"
+            cfg.pitr
+                && cfg.wal_io_mode == WalIoModeArg::Parallel
+                && matches!(
+                    cfg.pitr_format.unwrap_or(PitrFormatArg::V8),
+                    PitrFormatArg::V7 | PitrFormatArg::V8
+                ),
+            "--wal-sync-diagnostics requires PITR V7 or V8 Parallel I/O"
         );
     }
     if cfg.wal_hol_diagnostics {
@@ -10726,7 +10743,7 @@ mod tests {
     }
 
     #[test]
-    fn wal_sync_diagnostics_require_bench_build_and_v8_pitr() {
+    fn wal_sync_diagnostics_require_bench_build_and_parallel_v7_or_v8_pitr() {
         let v8 = HarnessConfig::from_args(
             Args::try_parse_from(["write-perf", "--pitr", "--wal-sync-diagnostics"])
                 .expect("parse V8 diagnostics option"),
@@ -10751,14 +10768,33 @@ mod tests {
                 "v7",
                 "--wal-sync-diagnostics",
             ])
-            .expect("parse incompatible V7 diagnostics option"),
+            .expect("parse V7 diagnostics option"),
         );
-        assert!(
-            validate_config(&v7)
-                .unwrap_err()
-                .to_string()
-                .contains("requires PITR V8")
+        let result = validate_config(&v7);
+        if cfg!(feature = "bench") {
+            result.expect("bench build can capture V7 sync diagnostics");
+        } else {
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("requires a bench build")
+            );
+        }
+
+        let v7_leader = HarnessConfig::from_args(
+            Args::try_parse_from([
+                "write-perf",
+                "--pitr",
+                "--pitr-format",
+                "v7",
+                "--wal-io-mode",
+                "leader",
+                "--wal-sync-diagnostics",
+            ])
+            .expect("parse V7 Leader diagnostics option"),
         );
+        assert!(validate_config(&v7_leader).is_err());
         assert!(Args::try_parse_from(["write-perf", "--wal-sync-diagnostics"]).is_err());
     }
 
@@ -15009,9 +15045,13 @@ mod tests {
         let observation =
             WalSyncObservationRecord::from(kv_engine_wrapper::mem_table::WalSyncObservation {
                 captured_target: 10,
+                decision_ticket_start: Some(6),
                 written_frontier_start: 10,
                 written_frontier_end: 14,
                 admitted_ticket_count: 5,
+                frames_ready_prefix_tickets: Some(5),
+                data_complete_prefix_tickets: Some(4),
+                durability_ready_prefix_tickets: Some(4),
                 v8_preparation_reserved_bytes: 640,
                 next_ticket_present: true,
                 next_ticket_frames_ready: true,
@@ -15032,9 +15072,13 @@ mod tests {
 
         let json = serde_json::to_value(observation).expect("serialize sync observation");
         assert_eq!(json["captured_target"], 10);
+        assert_eq!(json["decision_ticket_start"], 6);
         assert_eq!(json["written_frontier_start"], 10);
         assert_eq!(json["written_frontier_end"], 14);
         assert_eq!(json["admitted_ticket_count"], 5);
+        assert_eq!(json["frames_ready_prefix_tickets"], 5);
+        assert_eq!(json["data_complete_prefix_tickets"], 4);
+        assert_eq!(json["durability_ready_prefix_tickets"], 4);
         assert_eq!(json["v8_preparation_reserved_bytes"], 640);
         assert_eq!(json["next_ticket_present"], true);
         assert_eq!(json["next_ticket_frames_ready"], true);

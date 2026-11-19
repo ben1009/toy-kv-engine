@@ -3331,7 +3331,7 @@ fn synchronize_written_prefix(
     sync_file: &File,
     inner: &RuntimeInner,
 ) -> Result<Option<WrittenPrefixSync>> {
-    let (target, durable, poison_ticket) = {
+    let (target, durable, poison_ticket, _written_frontier) = {
         let state = inner.durability.state.lock();
         let target = state
             .poison_ticket
@@ -3342,11 +3342,35 @@ fn synchronize_written_prefix(
         if state.poison_ticket.is_some() && target > state.durable_frontier {
             crate::chaos::failpoint::note_parallel_wal_sync_with_poison();
         }
-        (target, state.durable_frontier, state.poison_ticket)
+        (
+            target,
+            state.durable_frontier,
+            state.poison_ticket,
+            state.written_frontier,
+        )
     };
     if target <= durable {
         return Ok(None);
     }
+
+    #[cfg(feature = "bench")]
+    let sync_decision_snapshot = inner
+        .sync_progress
+        .profile()
+        .filter(|profile| profile.wal_sync_diagnostics_enabled())
+        .map(|_| {
+            let admission = inner.admission.lock();
+            let admitted_ticket_end = admission.next_ticket;
+            let frames_ready_ticket_end = admission.v7_ready_ticket.min(admitted_ticket_end);
+            (
+                admitted_ticket_end.saturating_sub(durable),
+                frames_ready_ticket_end.saturating_sub(durable),
+                _written_frontier.saturating_sub(durable),
+                admitted_ticket_end > target,
+                frames_ready_ticket_end > target,
+                _written_frontier > target,
+            )
+        });
 
     let frontier_cycle = if inner.admission.lock().v7_allocator.is_some() {
         let cycle = append_v7_frontier(sync_file, inner, target, durable, poison_ticket)?;
@@ -3399,16 +3423,29 @@ fn synchronize_written_prefix(
         profile.record_wal_sync(_sync_end.groups_covered);
         profile.record_wal_fdatasync_ns(duration_ns);
         if profile.wal_sync_diagnostics_enabled() {
+            let (
+                admitted_ticket_count,
+                frames_ready_prefix_tickets,
+                data_complete_prefix_tickets,
+                next_ticket_present,
+                next_ticket_frames_ready,
+                next_ticket_data_complete,
+            ) = sync_decision_snapshot
+                .expect("enabled sync diagnostics capture a V7 Parallel decision snapshot");
             profile.record_wal_sync_observation(crate::mem_table::WalSyncObservation {
                 captured_target: target,
+                decision_ticket_start: Some(durable),
                 written_frontier_start: _sync_end.written_frontier_start,
                 written_frontier_end: _sync_end.written_frontier_end,
-                admitted_ticket_count: 0,
+                admitted_ticket_count,
+                frames_ready_prefix_tickets: Some(frames_ready_prefix_tickets),
+                data_complete_prefix_tickets: Some(data_complete_prefix_tickets),
+                durability_ready_prefix_tickets: Some(target.saturating_sub(durable)),
                 v8_preparation_reserved_bytes: 0,
-                next_ticket_present: false,
-                next_ticket_frames_ready: false,
+                next_ticket_present,
+                next_ticket_frames_ready,
                 next_ticket_digest_folded: false,
-                next_ticket_data_complete: false,
+                next_ticket_data_complete,
                 next_ticket_data_write_elapsed_ns: None,
                 write_sqes_submitted: _sync_end.write_sqes_submitted,
                 write_cqes_completed: _sync_end.write_cqes_completed,

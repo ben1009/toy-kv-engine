@@ -68,6 +68,7 @@ def _build_command(binary: Path, row: dict[str, Any], db_root: Path) -> list[str
         "--threads", str(row["writer"]), "--value-size", "1024", "--target-sst-size", "2147483648",
         "--compaction", "none", "--output", "json", "--latency-sample-every", "100",
         "--wal-cpu-attribution-sample-every", str(V8_POINT_CPU_ATTRIBUTION_SAMPLE_EVERY),
+        "--wal-sync-diagnostics",
         "--path", str(db_root / _run_id(row)),
     ]
 
@@ -140,11 +141,83 @@ def _validate_v8_durability_phase_samples(durability: dict[str, Any]) -> None:
         raise ValueError("V8 durability-driver phase has a missing or invalid summary field")
 
 
+def _sync_decision_summary(observations: Any) -> dict[str, Any]:
+    if not isinstance(observations, list) or not observations:
+        raise ValueError("WAL sync decision observations are missing or empty")
+    prefix_fields = (
+        "admitted_ticket_count",
+        "frames_ready_prefix_tickets",
+        "data_complete_prefix_tickets",
+        "durability_ready_prefix_tickets",
+    )
+    bool_fields = (
+        "next_ticket_present",
+        "next_ticket_frames_ready",
+        "next_ticket_data_complete",
+        "succeeded",
+    )
+    for index, observation in enumerate(observations):
+        if not isinstance(observation, dict):
+            raise ValueError(f"WAL sync decision observation {index} is not an object")
+        if any(not _valid_nonnegative_int(observation.get(field)) for field in prefix_fields):
+            raise ValueError(f"WAL sync decision observation {index} has missing prefix counts")
+        if any(type(observation.get(field)) is not bool for field in bool_fields):
+            raise ValueError(f"WAL sync decision observation {index} has invalid readiness state")
+        if not _valid_nonnegative_int(observation.get("captured_target")):
+            raise ValueError(f"WAL sync decision observation {index} has no captured target")
+        if not _valid_nonnegative_int(observation.get("decision_ticket_start")):
+            raise ValueError(f"WAL sync decision observation {index} has no decision ticket start")
+        if not _valid_nonnegative_int(observation.get("written_frontier_start")) or not _valid_nonnegative_int(
+            observation.get("written_frontier_end")
+        ):
+            raise ValueError(f"WAL sync decision observation {index} has invalid ticket frontiers")
+        admitted = observation["admitted_ticket_count"]
+        decision_start = observation["decision_ticket_start"]
+        target = observation["captured_target"]
+        frames_ready = observation["frames_ready_prefix_tickets"]
+        data_complete = observation["data_complete_prefix_tickets"]
+        durability_ready = observation["durability_ready_prefix_tickets"]
+        if max(frames_ready, data_complete, durability_ready) > admitted:
+            raise ValueError(f"WAL sync decision observation {index} prefix exceeds admitted tickets")
+        if target < decision_start or durability_ready != target - decision_start:
+            raise ValueError(f"WAL sync decision observation {index} target does not match its decision prefix")
+        if durability_ready > min(frames_ready, data_complete):
+            raise ValueError(f"WAL sync decision observation {index} durability prefix exceeds an input prefix")
+        if observation["succeeded"] is not True:
+            raise ValueError(f"WAL sync decision observation {index} reports a failed sync")
+        if not observation["next_ticket_present"] and any(
+            observation[field] for field in ("next_ticket_frames_ready", "next_ticket_data_complete")
+        ):
+            raise ValueError(f"WAL sync decision observation {index} reports readiness without a later ticket")
+
+    return {
+        "count": len(observations),
+        **{
+            field: _distribution([float(observation[field]) for observation in observations])
+            for field in prefix_fields
+        },
+        "later_ticket_present_count": sum(observation["next_ticket_present"] for observation in observations),
+        "later_ticket_frames_ready_count": sum(
+            observation["next_ticket_frames_ready"] for observation in observations
+        ),
+        "later_ticket_data_complete_count": sum(
+            observation["next_ticket_data_complete"] for observation in observations
+        ),
+        "unit_note": (
+            "Prefix counts start at decision_ticket_start, the durable frontier when the target was selected. "
+            "written_frontier_start/end describe the separate sync event window. Later-ticket readiness records "
+            "the first admitted ticket beyond the selected group; it does not by itself prove that ticket was "
+            "waiting for the current sync."
+        ),
+    }
+
+
 def _validate_record(record: dict[str, Any], row: dict[str, Any]) -> dict[str, Any]:
     result = record["result"]
     params = record["params"]
     pipeline = result["wal_pipeline"]
     version = 7 if row["arm"] == "v7_parallel" else 8
+    sync_decision = _sync_decision_summary(pipeline.get("sync_observations"))
     expected_params = {
         "num": V8_POINT_CPU_ATTRIBUTION_NUM,
         "threads": row["writer"],
@@ -248,6 +321,7 @@ def _validate_record(record: dict[str, Any], row: dict[str, Any]) -> dict[str, A
         "process_cpu_seconds": cpu_seconds,
         "process_cpu_us_per_put": cpu_seconds * 1_000_000 / int(result["ops"]),
         "sync_count": int(pipeline["sync_count"]),
+        "wal_sync_decision_summary": sync_decision,
         "p50_ms": float(record["latency"]["p50_ms"]),
         "p95_ms": float(record["latency"]["p95_ms"]),
         "p99_ms": float(record["latency"]["p99_ms"]),
@@ -398,7 +472,13 @@ def _run_one(
     exit_code = completed.returncode
     if exit_code == 0:
         try:
-            values = _validate_record(_parse_record(completed.stdout), row)
+            record = _parse_record(completed.stdout)
+            sync_observations = record.get("result", {}).get("wal_pipeline", {}).get("sync_observations")
+            if isinstance(sync_observations, list):
+                (run_dir / "sync-observations.json").write_text(
+                    json.dumps(sync_observations, indent=2) + "\n", encoding="utf-8",
+                )
+            values = _validate_record(record, row)
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
             exit_code = 65
             (run_dir / "validation-error.txt").write_text(f"invalid benchmark result: {error}\n", encoding="utf-8")
@@ -429,6 +509,7 @@ def _summarize(rows: list[dict[str, Any]], planned: int) -> dict[str, Any]:
                 "thread_roles": _thread_role_summary([run]),
                 "durability_advance_cpu_ns": _durability_summary([run]),
                 "digest_cpu": _digest_summary([run]),
+                "sync_decisions": run.get("wal_sync_decision_summary"),
             }
     return {
         "suite": "v8-point-cpu-attribution",

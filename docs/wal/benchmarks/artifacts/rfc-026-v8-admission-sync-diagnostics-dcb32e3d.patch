@@ -1,0 +1,100 @@
+diff --git a/kv-engine/src/bin/write-perf.rs b/kv-engine/src/bin/write-perf.rs
+index 1efc383..1a797c2 100644
+--- a/kv-engine/src/bin/write-perf.rs
++++ b/kv-engine/src/bin/write-perf.rs
+@@ -10102,8 +10102,10 @@ fn validate_config(cfg: &HarnessConfig) -> Result<()> {
+             "--wal-sync-diagnostics requires a bench build"
+         );
+         anyhow::ensure!(
+-            cfg.pitr_format.unwrap_or(PitrFormatArg::V8) == PitrFormatArg::V8,
+-            "--wal-sync-diagnostics requires PITR V8"
++            cfg.pitr
++                && cfg.wal_io_mode == WalIoModeArg::Parallel
++                && matches!(cfg.pitr_format.unwrap_or(PitrFormatArg::V8), PitrFormatArg::V7 | PitrFormatArg::V8),
++            "--wal-sync-diagnostics requires PITR V7 or V8 Parallel I/O"
+         );
+     }
+     if cfg.wal_hol_diagnostics {
+diff --git a/kv-engine/src/mem_table.rs b/kv-engine/src/mem_table.rs
+index 6d917bf..ba78f9b 100644
+--- a/kv-engine/src/mem_table.rs
++++ b/kv-engine/src/mem_table.rs
+@@ -351,14 +351,16 @@ pub struct WalSyncObservation {
+     pub captured_target: u64,
+     pub written_frontier_start: u64,
+     pub written_frontier_end: u64,
+-    /// Number of unresolved tickets admitted when a v8 FRONTIER decision was
+-    /// made. Other WAL formats leave this at zero.
++    /// Number of unresolved tickets admitted when a v7/v8 parallel durability
++    /// group was selected. Other WAL formats leave this at zero.
+     pub admitted_ticket_count: u64,
+     /// Bytes held by v8 preflight reservations that have not finished encoding.
+     pub v8_preparation_reserved_bytes: u64,
+-    /// Whether there is an admitted ticket beyond the candidate v8 prefix.
++    /// Whether there is an admitted ticket beyond the selected v7/v8 group.
+     pub next_ticket_present: bool,
+-    /// Readiness of the first admitted ticket beyond the candidate v8 prefix.
++    /// Whether the first admitted ticket beyond the selected group has a
++    /// completed producer frame. For v7 this means it is queued in `pending`;
++    /// for v8 it is the ticket's `frames_ready` state.
+     pub next_ticket_frames_ready: bool,
+     pub next_ticket_digest_folded: bool,
+     pub next_ticket_data_complete: bool,
+diff --git a/kv-engine/src/wal.rs b/kv-engine/src/wal.rs
+index ecfb017..587a975 100644
+--- a/kv-engine/src/wal.rs
++++ b/kv-engine/src/wal.rs
+@@ -4368,6 +4368,24 @@ impl Wal {
+         #[cfg(not(feature = "bench"))]
+         let _ = (captured_target, profile);
+ 
++        // Diagnostic-only snapshot at the selected v7 group boundary. The
++        // pending queue contains encoded producer frames that were ready but
++        // not included in this group's drain.
++        #[cfg(feature = "bench")]
++        let sync_decision_snapshot = profile
++            .filter(|profile| profile.wal_sync_diagnostics_enabled())
++            .map(|_| {
++                let durable_ticket_end =
++                    self.completion_state.durable_ticket.load(Ordering::Acquire);
++                let admitted_ticket_end = self.next_ticket.load(Ordering::Acquire);
++                let next_ticket_frames_ready = self
++                    .pending
++                    .lock()
++                    .iter()
++                    .any(|buffer| buffer.ticket == captured_target);
++                (durable_ticket_end, admitted_ticket_end, next_ticket_frames_ready)
++            });
++
+         // Compute total aligned size first, then preallocate to cover the full batch.
+         //
+         // This preallocation sits outside the `wal_submit` span, which opens
+@@ -4590,10 +4608,15 @@ impl Wal {
+                 let duration_ns = fdatasync_start.elapsed().as_nanos() as u64;
+                 profile.record_wal_fdatasync_ns(duration_ns);
+                 if profile.wal_sync_diagnostics_enabled() {
++                    let (durable_ticket_end, admitted_ticket_end, next_ticket_frames_ready) =
++                        sync_decision_snapshot.expect("enabled sync diagnostics capture v7 group state");
+                     profile.record_wal_sync_observation(crate::mem_table::WalSyncObservation {
+                         captured_target,
+-                        written_frontier_start: captured_target,
++                        written_frontier_start: durable_ticket_end,
+                         written_frontier_end: captured_target,
++                        admitted_ticket_count: admitted_ticket_end.saturating_sub(durable_ticket_end),
++                        next_ticket_present: captured_target < admitted_ticket_end,
++                        next_ticket_frames_ready,
+                         groups_covered: 1,
+                         duration_ns,
+                         succeeded: fdatasync_err.is_none(),
+diff --git a/scripts/gcp_v8_point_cpu_attribution_runner.py b/scripts/gcp_v8_point_cpu_attribution_runner.py
+index 5c6f147..380990c 100644
+--- a/scripts/gcp_v8_point_cpu_attribution_runner.py
++++ b/scripts/gcp_v8_point_cpu_attribution_runner.py
+@@ -68,6 +68,7 @@ def _build_command(binary: Path, row: dict[str, Any], db_root: Path) -> list[str
+         "--threads", str(row["writer"]), "--value-size", "1024", "--target-sst-size", "2147483648",
+         "--compaction", "none", "--output", "json", "--latency-sample-every", "100",
+         "--wal-cpu-attribution-sample-every", str(V8_POINT_CPU_ATTRIBUTION_SAMPLE_EVERY),
++        "--wal-sync-diagnostics",
+         "--path", str(db_root / _run_id(row)),
+     ]
+ 
