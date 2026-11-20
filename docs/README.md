@@ -60,6 +60,7 @@ and do not define the current writer selection.
 - [GCP V7/V8 DATA completion handoff retest, 2026-11-19](wal/benchmarks/rfc-026-v7-v8-completion-handoff-retest-gcp-20261119.md)
 - [GCP V7/V8 Point DATA submission and HOL timeline rerun, 2026-11-19](wal/benchmarks/rfc-026-v7-v8-point-data-completion-hol-rerun-gcp-20261119.md)
 - [GCP V7/V8 Point same-ticket DATA HOL diagnosis, 2026-11-20](wal/benchmarks/rfc-026-v7-v8-point-hol-ticket-gcp-20261120.md)
+- [GCP V7/V8 Point CPU attribution retest, 2026-11-20](wal/benchmarks/rfc-026-v7-v8-point-cpu-attribution-gcp-20261120.md)
 - [GCP V8 Lookahead extent-policy scan diagnostic, 2026-11-18](wal/benchmarks/rfc-026-v8-lookahead-policy-scan-gcp-20261118.md)
 - [GCP V8 extent-policy Vec A/B, 2026-11-18](wal/benchmarks/rfc-026-v8-extent-policy-vec-ab-gcp-20261118.md)
 - [GCP V8 durability phase sampling, 2026-11-13](wal/benchmarks/rfc-026-v8-durability-sampling-gcp-20261113.md)
