@@ -357,6 +357,8 @@ pub struct WalSyncObservation {
     /// Durable ticket frontier at the moment the next durability target was selected.
     /// Prefix counts below are measured from this exclusive ticket boundary.
     pub decision_ticket_start: Option<u64>,
+    /// CLOCK_MONOTONIC timestamp for the sync-selection snapshot.
+    pub sync_decision_monotonic_ns: Option<u64>,
     pub written_frontier_start: u64,
     pub written_frontier_end: u64,
     /// Number of unresolved tickets admitted when a v7/v8 parallel durability
@@ -369,6 +371,13 @@ pub struct WalSyncObservation {
     /// Contiguous admitted prefix whose DATA I/O had completed at sync
     /// selection, measured from `decision_ticket_start`.
     pub data_complete_prefix_tickets: Option<u64>,
+    /// First admitted ticket outside the contiguous DATA-complete prefix at
+    /// this decision snapshot. This is the ticket whose completion can extend
+    /// the observed DATA prefix.
+    pub data_hol_blocker_ticket: Option<u64>,
+    pub data_hol_blocker_frames_ready: Option<bool>,
+    pub data_hol_blocker_digest_folded: Option<bool>,
+    pub data_hol_blocker_data_write_elapsed_ns: Option<u64>,
     /// Contiguous prefix eligible for the selected durability operation,
     /// measured from `decision_ticket_start`.
     pub durability_ready_prefix_tickets: Option<u64>,
@@ -463,6 +472,13 @@ pub struct WalCompletionHandoffObservation {
     pub request_start: u64,
     pub request_end: u64,
     pub sampled_ticket: Option<u64>,
+    /// CLOCK_MONOTONIC timestamp when the sampled ticket's frame became ready.
+    pub frame_ready_monotonic_ns: Option<u64>,
+    /// CLOCK_MONOTONIC timestamps for the sampled request's SQE, CQE, and
+    /// DATA-complete publication. These share a clock with sync decisions.
+    pub sqe_submitted_monotonic_ns: Option<u64>,
+    pub cqe_observed_monotonic_ns: Option<u64>,
+    pub data_complete_published_monotonic_ns: Option<u64>,
     pub frame_ready_to_submit_request_ns: Option<u64>,
     pub submit_request_to_worker_queue_ns: Option<u64>,
     pub worker_queue_to_worker_accept_ns: Option<u64>,
@@ -746,7 +762,7 @@ impl CommitOrderTraceState {
 }
 
 #[cfg(all(feature = "bench", target_os = "linux"))]
-fn benchmark_monotonic_ns() -> u64 {
+pub(crate) fn benchmark_monotonic_ns() -> u64 {
     let mut timestamp = std::mem::MaybeUninit::<libc::timespec>::uninit();
     // SAFETY: `timestamp` points to writable storage for `clock_gettime`.
     if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, timestamp.as_mut_ptr()) } != 0 {
@@ -767,7 +783,7 @@ fn benchmark_thread_id() -> u64 {
 }
 
 #[cfg(all(feature = "bench", not(target_os = "linux")))]
-fn benchmark_monotonic_ns() -> u64 {
+pub(crate) fn benchmark_monotonic_ns() -> u64 {
     0
 }
 

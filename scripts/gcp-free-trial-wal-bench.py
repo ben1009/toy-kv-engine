@@ -1206,8 +1206,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error("--v8-mutex-diagnostic requires exactly 16 writers")
     if args.v8_mutex_diagnostic and args.machine_type != "c4-standard-16-lssd":
         parser.error("--v8-mutex-diagnostic requires c4-standard-16-lssd")
-    if args.v8_point_cpu_attribution and args.writers != V8_POINT_CPU_ATTRIBUTION_WRITERS:
-        parser.error(f"--v8-point-cpu-attribution requires writers {V8_POINT_CPU_ATTRIBUTION_WRITERS}")
+    if args.v8_point_cpu_attribution and not set(args.writers).issubset(V8_POINT_CPU_ATTRIBUTION_WRITERS):
+        parser.error(f"--v8-point-cpu-attribution writers must be selected from {V8_POINT_CPU_ATTRIBUTION_WRITERS}")
     if args.v8_point_cpu_attribution and args.machine_type != "c4-standard-16-lssd":
         parser.error("--v8-point-cpu-attribution requires c4-standard-16-lssd")
     if args.v8_point_lookahead_ab and args.writers != (POINT_LOOKAHEAD_WRITERS,):
@@ -1691,7 +1691,8 @@ def _verify_result_set(results: Path) -> dict[str, Any]:
                 if summary.get("binary_sha256") != binary_sha:
                     errors.append("mutex diagnostic binary checksum does not match the summary")
             elif suite == "v8-point-cpu-attribution":
-                schedule = build_v8_point_cpu_attribution_schedule()
+                suite_writers = plan.get("writers", V8_POINT_CPU_ATTRIBUTION_WRITERS)
+                schedule = build_v8_point_cpu_attribution_schedule(suite_writers)
                 try:
                     recorded_commit = (results / "commit.txt").read_text(encoding="utf-8").strip()
                     binary_sha = (results / "write-perf.sha256").read_text(encoding="utf-8").strip()
@@ -1710,6 +1711,7 @@ def _verify_result_set(results: Path) -> dict[str, Any]:
                     },
                     commit=recorded_commit,
                     binary_sha256=binary_sha,
+                    writers=suite_writers,
                 )
                 for key, value in expected_plan.items():
                     if plan.get(key) != value:
@@ -2239,7 +2241,9 @@ def _verify_result_set(results: Path) -> dict[str, Any]:
             if validation != summary.get("matrix_validation"):
                 errors.append("mutex diagnostic matrix validation does not match its per-run results")
         elif suite == "v8-point-cpu-attribution":
-            validation = validate_v8_point_cpu_attribution_rows(summary.get("results", []))
+            validation = validate_v8_point_cpu_attribution_rows(
+                summary.get("results", []), plan.get("writers", V8_POINT_CPU_ATTRIBUTION_WRITERS)
+            )
             if validation != summary.get("matrix_validation"):
                 errors.append("CPU attribution matrix validation does not match its per-run results")
     except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError, csv.Error) as error:
@@ -3105,6 +3109,7 @@ def main(argv: list[str] | None = None) -> int:
                 machine_type=args.machine_type,
                 machine_spec=MACHINE_SPECS[args.machine_type],
                 commit=args.commit.lower(),
+                writers=args.writers,
             )
         elif args.v8_point_borrowed_input_ab:
             report["benchmark_suite"] = "v8-point-borrowed-input"

@@ -475,8 +475,12 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
         self.assertEqual(cpu_attribution.num, V8_POINT_CPU_ATTRIBUTION_NUM)
         self.assertEqual(cpu_attribution.writers, V8_POINT_CPU_ATTRIBUTION_WRITERS)
         self.assertEqual(cpu_attribution.machine_type, "c4-standard-16-lssd")
+        cpu_attribution_subset = BENCH.parse_args([
+            *common, "--v8-point-cpu-attribution", "--writers", "8", "16",
+        ])
+        self.assertEqual(cpu_attribution_subset.writers, (8, 16))
         with self.assertRaises(SystemExit):
-            BENCH.parse_args([*common, "--v8-point-cpu-attribution", "--writers", "16"])
+            BENCH.parse_args([*common, "--v8-point-cpu-attribution", "--writers", "2"])
         with self.assertRaises(SystemExit):
             BENCH.parse_args([*common, "--v8-point-cpu-attribution", "--num", "750000"])
 
@@ -552,12 +556,17 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
         observation = {
             "captured_target": 11,
             "decision_ticket_start": 10,
+            "sync_decision_monotonic_ns": 123456,
             "written_frontier_start": 10,
             "written_frontier_end": 11,
             "admitted_ticket_count": 3,
             "frames_ready_prefix_tickets": 3,
             "data_complete_prefix_tickets": 1,
             "durability_ready_prefix_tickets": 1,
+            "data_hol_blocker_ticket": 11,
+            "data_hol_blocker_frames_ready": True,
+            "data_hol_blocker_digest_folded": None,
+            "data_hol_blocker_data_write_elapsed_ns": None,
             "next_ticket_present": True,
             "next_ticket_frames_ready": True,
             "next_ticket_data_complete": False,
@@ -579,7 +588,7 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
 
     def test_v8_completion_timeline_validation_and_summary(self) -> None:
         timeline = {
-            "sample_every": 128,
+            "sample_every": cpu_attribution_runner.V8_COMPLETION_TIMELINE_SAMPLE_EVERY,
             "dropped_samples": 0,
             "samples": [{
                 "group_id": 7,
@@ -599,6 +608,10 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
                 "data_complete_lock_hold_cpu_ns": 40,
                 "data_complete_prefix_end_before": 100,
                 "data_complete_prefix_end_after": 100,
+                "frame_ready_monotonic_ns": 10,
+                "sqe_submitted_monotonic_ns": 20,
+                "cqe_observed_monotonic_ns": 30,
+                "data_complete_published_monotonic_ns": 40,
                 "hol_blocker_ticket": 100,
                 "hol_blocker_frames_ready": True,
                 "hol_blocker_digest_folded": True,
@@ -653,6 +666,7 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
                 machine_type="c4-standard-16-lssd",
                 ssd_count=2,
                 ssd_gib=750,
+                writers=V8_POINT_CPU_ATTRIBUTION_WRITERS,
             )
             with patch.object(
                 cpu_attribution_runner,
@@ -687,6 +701,7 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
                     machine_type="c4-standard-16-lssd",
                     ssd_count=2,
                     ssd_gib=750,
+                    writers=V8_POINT_CPU_ATTRIBUTION_WRITERS,
                 )
                 scheduled = build_v8_point_cpu_attribution_schedule()[0]
 
@@ -723,6 +738,7 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
                 machine_type="c4-standard-16-lssd",
                 ssd_count=2,
                 ssd_gib=750,
+                writers=V8_POINT_CPU_ATTRIBUTION_WRITERS,
             )
 
             def successful_run(**kwargs):
@@ -787,6 +803,10 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
                 "receiver_to_data_complete_publish_ns": 9,
                 "data_complete_prefix_end_before": ticket,
                 "data_complete_prefix_end_after": ticket + 1,
+                "frame_ready_monotonic_ns": ticket + 1,
+                "sqe_submitted_monotonic_ns": ticket + 2,
+                "cqe_observed_monotonic_ns": ticket + 3,
+                "data_complete_published_monotonic_ns": ticket + 4,
                 "hol_blocker_ticket": None,
             }
             for ticket in range(
@@ -823,6 +843,11 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
                         "next_ticket_present": True,
                         "next_ticket_frames_ready": True,
                         "next_ticket_data_complete": False,
+                        "sync_decision_monotonic_ns": 100,
+                        "data_hol_blocker_ticket": 2,
+                        "data_hol_blocker_frames_ready": True,
+                        "data_hol_blocker_digest_folded": None,
+                        "data_hol_blocker_data_write_elapsed_ns": None,
                         "succeeded": True,
                     }],
                     "completion_handoff_timeline": {
@@ -887,6 +912,10 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
                 "request_start": 120,
                 "request_end": 131,
                 "sampled_ticket": 128,
+                "frame_ready_monotonic_ns": 10,
+                "sqe_submitted_monotonic_ns": 20,
+                "cqe_observed_monotonic_ns": 30,
+                "data_complete_published_monotonic_ns": 40,
                 "frame_ready_to_submit_request_ns": 5,
                 "submit_request_to_worker_queue_ns": 6,
                 "worker_queue_to_worker_accept_ns": 7,
@@ -932,6 +961,29 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
         for timeline in invalid_timelines:
             with self.subTest(timeline=timeline), self.assertRaises(ValueError):
                 _completion_handoff_timeline_summary(timeline)
+
+    def test_same_ticket_hol_join_classifies_stage_at_sync_snapshot(self) -> None:
+        observation = {
+            "data_hol_blocker_ticket": 32,
+            "sync_decision_monotonic_ns": 25,
+            "decision_ticket_start": 16,
+            "data_complete_prefix_tickets": 16,
+        }
+        timeline = {
+            "samples": [{
+                "sampled_ticket": 32,
+                "frame_ready_monotonic_ns": 10,
+                "sqe_submitted_monotonic_ns": 20,
+                "cqe_observed_monotonic_ns": 30,
+                "data_complete_published_monotonic_ns": 40,
+            }],
+        }
+
+        summary = cpu_attribution_runner._same_ticket_hol_summary([observation], timeline)
+
+        self.assertEqual(summary["matched_blocker_decision_count"], 1)
+        self.assertEqual(summary["stage_at_sync_decision"]["sqe_submitted_waiting_for_cqe"], 1)
+        self.assertEqual(summary["frame_ready_age_at_decision_ns"]["p50"], 15)
 
     def test_v8_cpu_attribution_validates_digest_schema(self) -> None:
         # The digest is serialized beside wal_pipeline inside result, not at the JSON record root.

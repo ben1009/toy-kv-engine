@@ -4788,6 +4788,13 @@ impl WalV8ParallelWriter {
             let mut coalescing_wall_ns = 0_u64;
             #[cfg(feature = "bench")]
             let mut coalescing_cpu_ns = 0_u64;
+            #[cfg(feature = "bench")]
+            let mut snapshot = if diagnostics_enabled {
+                self.coordinator.frontier_ready_snapshot_with_monotonic_ns()
+            } else {
+                self.coordinator.frontier_ready_snapshot()
+            };
+            #[cfg(not(feature = "bench"))]
             let mut snapshot = self.coordinator.frontier_ready_snapshot();
             #[cfg(feature = "bench")]
             let has_ready_prefix = !snapshot.ready_prefix.is_empty();
@@ -4862,7 +4869,18 @@ impl WalV8ParallelWriter {
                 }
                 #[cfg(not(feature = "bench"))]
                 let _ = waited;
-                snapshot = self.coordinator.frontier_ready_snapshot();
+                #[cfg(feature = "bench")]
+                {
+                    snapshot = if diagnostics_enabled {
+                        self.coordinator.frontier_ready_snapshot_with_monotonic_ns()
+                    } else {
+                        self.coordinator.frontier_ready_snapshot()
+                    };
+                }
+                #[cfg(not(feature = "bench"))]
+                {
+                    snapshot = self.coordinator.frontier_ready_snapshot();
+                }
                 #[cfg(feature = "bench")]
                 if diagnostics_enabled {
                     let ready_tickets_after_coalescing = snapshot.ready_prefix.len() as u64;
@@ -4880,14 +4898,20 @@ impl WalV8ParallelWriter {
                 }
             }
             #[cfg(feature = "bench")]
-            let frontier_observation = diagnostics_enabled.then_some((
-                snapshot.admitted_ticket_count as u64,
-                snapshot.reserved_preparation_bytes,
-                snapshot.frames_ready_prefix_count as u64,
-                snapshot.data_complete_prefix_count as u64,
-                snapshot.ready_prefix.len() as u64,
-                snapshot.next_not_ready,
-            ));
+            let frontier_observation = diagnostics_enabled.then(|| {
+                (
+                    snapshot.admitted_ticket_count as u64,
+                    snapshot.reserved_preparation_bytes,
+                    snapshot.frames_ready_prefix_count as u64,
+                    snapshot.data_complete_prefix_count as u64,
+                    snapshot.ready_prefix.len() as u64,
+                    snapshot.next_not_ready,
+                    snapshot
+                        .snapshot_monotonic_ns
+                        .expect("diagnostic frontier snapshots capture their lock timestamp"),
+                    snapshot.data_hol_blocker,
+                )
+            });
             let ready = snapshot.ready_prefix;
 
             if ready.is_empty() {
@@ -5049,16 +5073,27 @@ impl WalV8ParallelWriter {
                         data_complete_prefix_tickets,
                         durability_ready_prefix_tickets,
                         next_ticket,
+                        sync_decision_monotonic_ns,
+                        data_hol_blocker,
                     ) = frontier_observation
                         .expect("detailed v8 sync diagnostics capture a frontier snapshot");
                     profile.record_wal_sync_observation(crate::mem_table::WalSyncObservation {
                         captured_target: frontier_ticket_end,
                         decision_ticket_start: Some(first_ticket),
+                        sync_decision_monotonic_ns: Some(sync_decision_monotonic_ns),
                         written_frontier_start: first_ticket,
                         written_frontier_end: frontier_ticket_end,
                         admitted_ticket_count,
                         frames_ready_prefix_tickets: Some(frames_ready_prefix_tickets),
                         data_complete_prefix_tickets: Some(data_complete_prefix_tickets),
+                        data_hol_blocker_ticket: data_hol_blocker
+                            .map(|ticket| ticket.assignment.segment_ticket),
+                        data_hol_blocker_frames_ready: data_hol_blocker
+                            .map(|ticket| ticket.frames_ready),
+                        data_hol_blocker_digest_folded: data_hol_blocker
+                            .map(|ticket| ticket.prefix_digest_after.is_some()),
+                        data_hol_blocker_data_write_elapsed_ns: data_hol_blocker
+                            .and_then(|ticket| ticket.data_write_elapsed_ns),
                         durability_ready_prefix_tickets: Some(durability_ready_prefix_tickets),
                         v8_preparation_reserved_bytes,
                         next_ticket_present: next_ticket.is_some(),

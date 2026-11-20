@@ -171,10 +171,12 @@ pub(crate) struct WalWorkerGroupCompletionTimeline {
     pub(crate) request_id: u64,
     pub(crate) sampled_ticket: Option<u64>,
     pub(crate) frame_ready_at: Option<Instant>,
+    pub(crate) frame_ready_monotonic_ns: Option<u64>,
     pub(crate) submit_requested_at: Option<Instant>,
     pub(crate) worker_queue_enqueued_at: Option<Instant>,
     pub(crate) worker_accepted_at: Option<Instant>,
     pub(crate) sqe_submitted_at: Option<Instant>,
+    pub(crate) sqe_submitted_monotonic_ns: Option<u64>,
     pub(crate) cqe_observed_at: Option<Instant>,
     pub(crate) cqe_observed_monotonic_ns: Option<u64>,
     pub(crate) group_finished_at: Option<Instant>,
@@ -182,6 +184,7 @@ pub(crate) struct WalWorkerGroupCompletionTimeline {
     pub(crate) result_send_started_at: Option<Instant>,
     pub(crate) reaper_recv_at: Option<Instant>,
     pub(crate) data_complete_published_at: Option<Instant>,
+    pub(crate) data_complete_published_monotonic_ns: Option<u64>,
     pub(crate) data_complete_prefix_end_before: Option<u64>,
     pub(crate) data_complete_prefix_end_after: Option<u64>,
     pub(crate) hol_blocker_ticket: Option<u64>,
@@ -289,12 +292,14 @@ impl WalSyncProgress {
         &self,
         group_id: u64,
         data_complete_published_at: Instant,
+        data_complete_published_monotonic_ns: Option<u64>,
         prefix_end_before: u64,
         prefix_end_after: u64,
         hol_blocker_ticket: Option<u64>,
     ) -> Option<WalWorkerGroupCompletionTimeline> {
         let mut timeline = self.state.lock().completion_timelines.remove(&group_id)?;
         timeline.data_complete_published_at = Some(data_complete_published_at);
+        timeline.data_complete_published_monotonic_ns = data_complete_published_monotonic_ns;
         timeline.data_complete_prefix_end_before = Some(prefix_end_before);
         timeline.data_complete_prefix_end_after = Some(prefix_end_after);
         timeline.hol_blocker_ticket = hol_blocker_ticket;
@@ -360,6 +365,10 @@ impl WalSyncProgress {
             request_start: timeline.request_start,
             request_end: timeline.request_end,
             sampled_ticket: timeline.sampled_ticket,
+            frame_ready_monotonic_ns: timeline.frame_ready_monotonic_ns,
+            sqe_submitted_monotonic_ns: timeline.sqe_submitted_monotonic_ns,
+            cqe_observed_monotonic_ns: timeline.cqe_observed_monotonic_ns,
+            data_complete_published_monotonic_ns: timeline.data_complete_published_monotonic_ns,
             frame_ready_to_submit_request_ns,
             submit_request_to_worker_queue_ns,
             worker_queue_to_worker_accept_ns,
@@ -764,9 +773,17 @@ impl<B> WriteBuffer<B> {
 
     #[cfg(feature = "bench")]
     pub(crate) fn with_ticket_timeline(mut self, ticket: u64, frame_ready_at: Instant) -> Self {
+        let frame_ready_monotonic_ns = monotonic_now_ns().map(|now| {
+            let elapsed = Instant::now()
+                .saturating_duration_since(frame_ready_at)
+                .as_nanos()
+                .min(u64::MAX as u128) as u64;
+            now.saturating_sub(elapsed)
+        });
         self.ticket_timeline = Some(WalWorkerTicketTimelineSeed {
             ticket,
             frame_ready_at,
+            frame_ready_monotonic_ns,
         });
         self
     }
@@ -777,6 +794,7 @@ impl<B> WriteBuffer<B> {
 struct WalWorkerTicketTimelineSeed {
     ticket: u64,
     frame_ready_at: Instant,
+    frame_ready_monotonic_ns: Option<u64>,
 }
 
 /// Avoid a heap allocation for the common one-write group while retaining a
@@ -1055,10 +1073,12 @@ struct GroupCompletionTimeline {
     request_id: u64,
     sampled_ticket: Option<u64>,
     frame_ready_at: Option<Instant>,
+    frame_ready_monotonic_ns: Option<u64>,
     submit_requested_at: Option<Instant>,
     worker_queue_enqueued_at: Option<Instant>,
     worker_accepted_at: Option<Instant>,
     sqe_submitted_at: Option<Instant>,
+    sqe_submitted_monotonic_ns: Option<u64>,
     cqe_observed_at: Option<Instant>,
     cqe_observed_monotonic_ns: Option<u64>,
 }
@@ -1344,10 +1364,12 @@ impl<B: WorkerBuffer> WorkerCore<B> {
             request_id,
             sampled_ticket: Some(ticket_seed.ticket),
             frame_ready_at: Some(ticket_seed.frame_ready_at),
+            frame_ready_monotonic_ns: ticket_seed.frame_ready_monotonic_ns,
             submit_requested_at,
             worker_queue_enqueued_at,
             worker_accepted_at,
             sqe_submitted_at: None,
+            sqe_submitted_monotonic_ns: None,
             cqe_observed_at: None,
             cqe_observed_monotonic_ns: None,
         });
@@ -1447,6 +1469,7 @@ impl<B: WorkerBuffer> WorkerCore<B> {
             && timeline.request_id == request_id.0
         {
             timeline.sqe_submitted_at = Some(Instant::now());
+            timeline.sqe_submitted_monotonic_ns = monotonic_now_ns();
         }
         self.assert_invariants();
 
@@ -1671,10 +1694,12 @@ impl<B: WorkerBuffer> WorkerCore<B> {
                         request_id: timeline.request_id,
                         sampled_ticket: timeline.sampled_ticket,
                         frame_ready_at: timeline.frame_ready_at,
+                        frame_ready_monotonic_ns: timeline.frame_ready_monotonic_ns,
                         submit_requested_at: timeline.submit_requested_at,
                         worker_queue_enqueued_at: timeline.worker_queue_enqueued_at,
                         worker_accepted_at: timeline.worker_accepted_at,
                         sqe_submitted_at: timeline.sqe_submitted_at,
+                        sqe_submitted_monotonic_ns: timeline.sqe_submitted_monotonic_ns,
                         cqe_observed_at: timeline.cqe_observed_at,
                         cqe_observed_monotonic_ns: timeline.cqe_observed_monotonic_ns,
                         group_finished_at: Some(Instant::now()),
@@ -1682,6 +1707,7 @@ impl<B: WorkerBuffer> WorkerCore<B> {
                         result_send_started_at: None,
                         reaper_recv_at: None,
                         data_complete_published_at: None,
+                        data_complete_published_monotonic_ns: None,
                         data_complete_prefix_end_before: None,
                         data_complete_prefix_end_after: None,
                         hol_blocker_ticket: None,

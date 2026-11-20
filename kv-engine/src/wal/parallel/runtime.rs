@@ -3039,6 +3039,8 @@ fn process_group_result(inner: &RuntimeInner, result: GroupWriteResult) {
     let data_complete_prefix_end_before = timeline_sampled.then_some(state.written_frontier);
     #[cfg(feature = "bench")]
     let mut data_complete_published_at = None;
+    #[cfg(feature = "bench")]
+    let mut data_complete_published_monotonic_ns = None;
     #[cfg(feature = "chaos-testing")]
     let out_of_order_completion =
         result.error.is_none() && result.tickets.start > state.written_frontier;
@@ -3074,6 +3076,7 @@ fn process_group_result(inner: &RuntimeInner, result: GroupWriteResult) {
         #[cfg(feature = "bench")]
         if timeline_sampled {
             data_complete_published_at = Some(Instant::now());
+            data_complete_published_monotonic_ns = Some(crate::mem_table::benchmark_monotonic_ns());
         }
     }
 
@@ -3125,6 +3128,7 @@ fn process_group_result(inner: &RuntimeInner, result: GroupWriteResult) {
             if let Some(timeline) = inner.sync_progress.finish_completion_timeline(
                 result_group_id,
                 published_at,
+                data_complete_published_monotonic_ns,
                 data_complete_prefix_end_before.unwrap_or_default(),
                 data_complete_prefix_end_after.unwrap_or_default(),
                 hol_blocker_ticket,
@@ -3483,6 +3487,13 @@ fn synchronize_written_prefix(
     sync_file: &File,
     inner: &RuntimeInner,
 ) -> Result<Option<WrittenPrefixSync>> {
+    #[cfg(feature = "bench")]
+    let sync_diagnostics_enabled = inner
+        .sync_progress
+        .profile()
+        .is_some_and(|profile| profile.wal_sync_diagnostics_enabled());
+    #[cfg(feature = "bench")]
+    let mut sync_decision_monotonic_ns = None;
     let (target, durable, poison_ticket, _written_frontier) = {
         let state = inner.durability.state.lock();
         let target = state
@@ -3490,6 +3501,10 @@ fn synchronize_written_prefix(
             .map_or(state.written_frontier, |poison| {
                 state.written_frontier.min(poison)
             });
+        #[cfg(feature = "bench")]
+        if sync_diagnostics_enabled && target > state.durable_frontier {
+            sync_decision_monotonic_ns = Some(crate::mem_table::benchmark_monotonic_ns());
+        }
         #[cfg(all(test, feature = "chaos-testing"))]
         if state.poison_ticket.is_some() && target > state.durable_frontier {
             crate::chaos::failpoint::note_parallel_wal_sync_with_poison();
@@ -3506,23 +3521,28 @@ fn synchronize_written_prefix(
     }
 
     #[cfg(feature = "bench")]
-    let sync_decision_snapshot = inner
-        .sync_progress
-        .profile()
-        .filter(|profile| profile.wal_sync_diagnostics_enabled())
-        .map(|_| {
-            let admission = inner.admission.lock();
-            let admitted_ticket_end = admission.next_ticket;
-            let frames_ready_ticket_end = admission.v7_ready_ticket.min(admitted_ticket_end);
-            (
-                admitted_ticket_end.saturating_sub(durable),
-                frames_ready_ticket_end.saturating_sub(durable),
-                _written_frontier.saturating_sub(durable),
-                admitted_ticket_end > target,
-                frames_ready_ticket_end > target,
-                _written_frontier > target,
-            )
+    let sync_decision_snapshot = sync_diagnostics_enabled.then(|| {
+        let admission = inner.admission.lock();
+        let admitted_ticket_end = admission.next_ticket;
+        let frames_ready_ticket_end = admission.v7_ready_ticket.min(admitted_ticket_end);
+        let data_hol_blocker_ticket =
+            (_written_frontier < admitted_ticket_end).then_some(_written_frontier);
+        let data_hol_blocker_frames_ready = data_hol_blocker_ticket.map(|ticket| {
+            admission.v7_ready_ticket > ticket || admission.v7_ready_batches.contains_key(&ticket)
         });
+        (
+            admitted_ticket_end.saturating_sub(durable),
+            frames_ready_ticket_end.saturating_sub(durable),
+            _written_frontier.saturating_sub(durable),
+            admitted_ticket_end > target,
+            frames_ready_ticket_end > target,
+            _written_frontier > target,
+            sync_decision_monotonic_ns
+                .expect("enabled sync diagnostics capture a frontier lock timestamp"),
+            data_hol_blocker_ticket,
+            data_hol_blocker_frames_ready,
+        )
+    });
 
     let frontier_cycle = if inner.admission.lock().v7_allocator.is_some() {
         let cycle = append_v7_frontier(sync_file, inner, target, durable, poison_ticket)?;
@@ -3582,16 +3602,22 @@ fn synchronize_written_prefix(
                 next_ticket_present,
                 next_ticket_frames_ready,
                 next_ticket_data_complete,
+                sync_decision_monotonic_ns,
+                data_hol_blocker_ticket,
+                data_hol_blocker_frames_ready,
             ) = sync_decision_snapshot
                 .expect("enabled sync diagnostics capture a V7 Parallel decision snapshot");
             profile.record_wal_sync_observation(crate::mem_table::WalSyncObservation {
                 captured_target: target,
                 decision_ticket_start: Some(durable),
+                sync_decision_monotonic_ns: Some(sync_decision_monotonic_ns),
                 written_frontier_start: _sync_end.written_frontier_start,
                 written_frontier_end: _sync_end.written_frontier_end,
                 admitted_ticket_count,
                 frames_ready_prefix_tickets: Some(frames_ready_prefix_tickets),
                 data_complete_prefix_tickets: Some(data_complete_prefix_tickets),
+                data_hol_blocker_ticket,
+                data_hol_blocker_frames_ready,
                 durability_ready_prefix_tickets: Some(target.saturating_sub(durable)),
                 v8_preparation_reserved_bytes: 0,
                 next_ticket_present,

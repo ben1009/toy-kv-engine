@@ -18,9 +18,11 @@ from typing import Any, Callable
 from gcp_wal_matrix import (
     V8_POINT_CPU_ATTRIBUTION_NUM,
     V8_POINT_CPU_ATTRIBUTION_SAMPLE_EVERY,
+    V8_POINT_CPU_ATTRIBUTION_WRITERS,
     build_v8_point_cpu_attribution_plan,
     build_v8_point_cpu_attribution_schedule,
     validate_v8_point_cpu_attribution_rows,
+    validate_writer_counts,
 )
 from gcp_wal_profile_runner import _validate_wal_io_metadata
 
@@ -54,7 +56,7 @@ V8_DIGEST_COUNTER_FIELDS = (
 # Keep in sync with wal::v8::digest::WAL_V8_HASH_CPU_SAMPLE_RATE and
 # write-perf.rs::WAL_V8_HASH_CPU_SAMPLE_RATE.
 V8_DIGEST_CPU_SAMPLE_RATE = 64
-V8_COMPLETION_TIMELINE_SAMPLE_EVERY = 128
+V8_COMPLETION_TIMELINE_SAMPLE_EVERY = 32
 
 
 def _run_id(row: dict[str, Any]) -> str:
@@ -73,6 +75,7 @@ def _build_command(binary: Path, row: dict[str, Any], db_root: Path) -> list[str
         "--path", str(db_root / _run_id(row)),
     ]
     command.append("--wal-completion-timeline")
+    command.extend(("--wal-completion-timeline-sample-every", str(V8_COMPLETION_TIMELINE_SAMPLE_EVERY)))
     return command
 
 
@@ -170,6 +173,10 @@ def _sync_decision_summary(observations: Any) -> dict[str, Any]:
             raise ValueError(f"WAL sync decision observation {index} has no captured target")
         if not _valid_nonnegative_int(observation.get("decision_ticket_start")):
             raise ValueError(f"WAL sync decision observation {index} has no decision ticket start")
+        if not _valid_nonnegative_int(observation.get("sync_decision_monotonic_ns")) or observation[
+            "sync_decision_monotonic_ns"
+        ] == 0:
+            raise ValueError(f"WAL sync decision observation {index} has no monotonic timestamp")
         if not _valid_nonnegative_int(observation.get("written_frontier_start")) or not _valid_nonnegative_int(
             observation.get("written_frontier_end")
         ):
@@ -182,6 +189,23 @@ def _sync_decision_summary(observations: Any) -> dict[str, Any]:
         durability_ready = observation["durability_ready_prefix_tickets"]
         if max(frames_ready, data_complete, durability_ready) > admitted:
             raise ValueError(f"WAL sync decision observation {index} prefix exceeds admitted tickets")
+        blocker = observation.get("data_hol_blocker_ticket")
+        blocker_frames_ready = observation.get("data_hol_blocker_frames_ready")
+        blocker_digest_folded = observation.get("data_hol_blocker_digest_folded")
+        blocker_write_elapsed = observation.get("data_hol_blocker_data_write_elapsed_ns")
+        if blocker is None:
+            if data_complete < admitted or any(
+                value is not None for value in (blocker_frames_ready, blocker_digest_folded, blocker_write_elapsed)
+            ):
+                raise ValueError(f"WAL sync decision observation {index} has inconsistent HOL blocker state")
+        elif (
+            not _valid_nonnegative_int(blocker)
+            or blocker != decision_start + data_complete
+            or type(blocker_frames_ready) is not bool
+            or (blocker_digest_folded is not None and type(blocker_digest_folded) is not bool)
+            or (blocker_write_elapsed is not None and not _valid_nonnegative_int(blocker_write_elapsed))
+        ):
+            raise ValueError(f"WAL sync decision observation {index} has invalid HOL blocker data")
         if target < decision_start or durability_ready != target - decision_start:
             raise ValueError(f"WAL sync decision observation {index} target does not match its decision prefix")
         if durability_ready > min(frames_ready, data_complete):
@@ -206,6 +230,7 @@ def _sync_decision_summary(observations: Any) -> dict[str, Any]:
         "later_ticket_data_complete_count": sum(
             observation["next_ticket_data_complete"] for observation in observations
         ),
+        "data_hol_blocker_count": sum(observation.get("data_hol_blocker_ticket") is not None for observation in observations),
         "unit_note": (
             "Prefix counts start at decision_ticket_start, the durable frontier when the target was selected. "
             "written_frontier_start/end describe the separate sync event window. Later-ticket readiness records "
@@ -349,6 +374,17 @@ def _completion_handoff_timeline_summary(
             raise ValueError(f"completion handoff sample {index} has inconsistent identities")
         if sample["sampled_ticket"] in sampled_tickets:
             raise ValueError(f"completion handoff sample {index} duplicates a sampled ticket")
+        monotonic_fields = (
+            "frame_ready_monotonic_ns", "sqe_submitted_monotonic_ns", "cqe_observed_monotonic_ns",
+            "data_complete_published_monotonic_ns",
+        )
+        if any(not _valid_nonnegative_int(sample.get(field)) or sample[field] == 0 for field in monotonic_fields):
+            raise ValueError(f"completion handoff sample {index} has missing monotonic stage timestamps")
+        if not (
+            sample["frame_ready_monotonic_ns"] <= sample["sqe_submitted_monotonic_ns"]
+            <= sample["cqe_observed_monotonic_ns"] <= sample["data_complete_published_monotonic_ns"]
+        ):
+            raise ValueError(f"completion handoff sample {index} has out-of-order monotonic timestamps")
         sampled_tickets.add(sample["sampled_ticket"])
         blocker_ticket = sample.get("hol_blocker_ticket")
         if blocker_ticket is not None and not _valid_nonnegative_int(blocker_ticket):
@@ -369,6 +405,77 @@ def _completion_handoff_timeline_summary(
             float(sample["data_complete_prefix_end_after"] - sample["data_complete_prefix_end_before"])
             for sample in samples
         ]),
+    }
+
+
+def _same_ticket_hol_summary(observations: Any, timeline: Any) -> dict[str, Any]:
+    if not isinstance(observations, list) or not isinstance(timeline, dict):
+        raise ValueError("same-ticket HOL inputs are missing")
+    samples = timeline.get("samples")
+    if not isinstance(samples, list):
+        raise ValueError("same-ticket HOL completion timeline is malformed")
+    by_ticket = {sample["sampled_ticket"]: sample for sample in samples if isinstance(sample, dict)}
+    cadence = V8_COMPLETION_TIMELINE_SAMPLE_EVERY
+    categories = {
+        "not_frame_ready_at_decision": 0,
+        "frame_ready_waiting_for_sqe": 0,
+        "sqe_submitted_waiting_for_cqe": 0,
+        "cqe_observed_waiting_for_data_complete_publish": 0,
+        "published_before_sync_snapshot": 0,
+    }
+    matched: list[dict[str, int | str]] = []
+    eligible_blockers = 0
+    unmatched_sampled_blockers = 0
+    blocker_age_ns: list[float] = []
+    for index, observation in enumerate(observations):
+        if not isinstance(observation, dict):
+            raise ValueError(f"same-ticket HOL sync observation {index} is malformed")
+        ticket = observation.get("data_hol_blocker_ticket")
+        if ticket is None or ticket % cadence:
+            continue
+        eligible_blockers += 1
+        sample = by_ticket.get(ticket)
+        if sample is None:
+            unmatched_sampled_blockers += 1
+            continue
+        decision_ns = observation["sync_decision_monotonic_ns"]
+        frame_ns = sample["frame_ready_monotonic_ns"]
+        sqe_ns = sample["sqe_submitted_monotonic_ns"]
+        cqe_ns = sample["cqe_observed_monotonic_ns"]
+        publish_ns = sample["data_complete_published_monotonic_ns"]
+        if frame_ns > decision_ns:
+            category = "not_frame_ready_at_decision"
+        elif sqe_ns > decision_ns:
+            category = "frame_ready_waiting_for_sqe"
+        elif cqe_ns > decision_ns:
+            category = "sqe_submitted_waiting_for_cqe"
+        elif publish_ns > decision_ns:
+            category = "cqe_observed_waiting_for_data_complete_publish"
+        else:
+            category = "published_before_sync_snapshot"
+        categories[category] += 1
+        if frame_ns <= decision_ns:
+            blocker_age_ns.append(float(decision_ns - frame_ns))
+        matched.append({"ticket": ticket, "decision_monotonic_ns": decision_ns, "category": category})
+    if unmatched_sampled_blockers:
+        raise ValueError(
+            f"same-ticket HOL join missed {unmatched_sampled_blockers} of {eligible_blockers} cadence-eligible blockers"
+        )
+    return {
+        "sample_every": cadence,
+        "sync_decision_count": len(observations),
+        "blocker_decision_count": sum(item.get("data_hol_blocker_ticket") is not None for item in observations),
+        "cadence_eligible_blocker_count": eligible_blockers,
+        "matched_blocker_decision_count": len(matched),
+        "stage_at_sync_decision": categories,
+        "frame_ready_age_at_decision_ns": _distribution(blocker_age_ns),
+        "matched_decisions": matched,
+        "unit_note": (
+            "Sync snapshots are joined to the exact blocker ticket's worker timeline using CLOCK_MONOTONIC. "
+            "The blocker is the first ticket outside the contiguous DATA-complete prefix. Stage classification "
+            "shows which recorded event had not happened at snapshot time; submit-to-CQE includes kernel, "
+            "notification, and scheduling delay and is not SSD-only latency."
+        ),
     }
 
 
@@ -480,6 +587,10 @@ def _validate_record(record: dict[str, Any], row: dict[str, Any]) -> dict[str, A
         pipeline.get("completion_handoff_timeline"),
         int(result["ops"]),
     )
+    same_ticket_hol = _same_ticket_hol_summary(
+        pipeline.get("sync_observations"),
+        pipeline.get("completion_handoff_timeline"),
+    )
 
     throughput = float(result["ops_per_sec"])
     cpu_seconds = (float(result["process_cpu_user_ms"]) + float(result["process_cpu_system_ms"])) / 1000
@@ -494,6 +605,7 @@ def _validate_record(record: dict[str, Any], row: dict[str, Any]) -> dict[str, A
         "wal_sync_decision_summary": sync_decision,
         "v8_completion_timeline_summary": completion_timeline,
         "completion_handoff_timeline_summary": completion_handoff_timeline,
+        "same_ticket_hol_summary": same_ticket_hol,
         "p50_ms": float(record["latency"]["p50_ms"]),
         "p95_ms": float(record["latency"]["p95_ms"]),
         "p99_ms": float(record["latency"]["p99_ms"]),
@@ -677,10 +789,10 @@ def _run_one(
     return metadata
 
 
-def _summarize(rows: list[dict[str, Any]], planned: int) -> dict[str, Any]:
-    validation = validate_v8_point_cpu_attribution_rows(rows)
+def _summarize(rows: list[dict[str, Any]], planned: int, writers: tuple[int, ...]) -> dict[str, Any]:
+    validation = validate_v8_point_cpu_attribution_rows(rows, writers)
     by_writer: dict[str, Any] = {}
-    for writer in (1, 4, 8, 16):
+    for writer in writers:
         by_writer[str(writer)] = {}
         for arm in ("v7_parallel", "v8_point_lookahead_direct"):
             run = next((row for row in rows if row.get("writer") == writer and row.get("arm") == arm), None)
@@ -698,6 +810,7 @@ def _summarize(rows: list[dict[str, Any]], planned: int) -> dict[str, Any]:
                 "sync_decisions": run.get("wal_sync_decision_summary"),
                 "data_completion_timeline": run.get("v8_completion_timeline_summary"),
                 "completion_handoff_timeline": run.get("completion_handoff_timeline_summary"),
+                "same_ticket_hol": run.get("same_ticket_hol_summary"),
             }
     return {
         "suite": "v8-point-cpu-attribution",
@@ -705,7 +818,7 @@ def _summarize(rows: list[dict[str, Any]], planned: int) -> dict[str, Any]:
         "complete": len(rows) == planned and validation["complete"],
         "runs_completed": len(rows),
         "runs_planned": planned,
-        "writers": [1, 4, 8, 16],
+        "writers": list(writers),
         "sample_every": V8_POINT_CPU_ATTRIBUTION_SAMPLE_EVERY,
         "results": rows,
         "by_writer": by_writer,
@@ -735,13 +848,14 @@ def run_suite(args: Any) -> int:
         raise ValueError("write-perf binary SHA-256 does not match the benchmark plan")
     (args.results_dir / "commit.txt").write_text(args.commit + "\n", encoding="utf-8")
     (args.results_dir / "write-perf.sha256").write_text(args.binary_sha256 + "\n", encoding="utf-8")
-    schedule = build_v8_point_cpu_attribution_schedule()
+    writers = tuple(args.writers)
+    schedule = build_v8_point_cpu_attribution_schedule(writers)
     machine_spec = {
         "vcpus": int(args.machine_type.split("-")[2]), "ssd_count": args.ssd_count, "ssd_gib": args.ssd_gib,
     }
     plan = build_v8_point_cpu_attribution_plan(
         machine_type=args.machine_type, machine_spec=machine_spec,
-        commit=args.commit, binary_sha256=args.binary_sha256,
+        commit=args.commit, binary_sha256=args.binary_sha256, writers=writers,
     )
     (args.results_dir / "benchmark-plan.json").write_text(json.dumps(plan, indent=2) + "\n", encoding="utf-8")
     with (args.results_dir / "v8-point-cpu-attribution-schedule.tsv").open("w", encoding="utf-8", newline="") as stream:
@@ -771,7 +885,7 @@ def run_suite(args: Any) -> int:
             failed = True
             break
 
-    summary = _summarize(rows, len(schedule))
+    summary = _summarize(rows, len(schedule), writers)
     summary["source_commit"] = args.commit
     summary["binary_sha256"] = args.binary_sha256
     summary["results_complete"] = summary["complete"] and not failed
@@ -802,7 +916,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--machine-type", required=True)
     parser.add_argument("--ssd-count", type=int, required=True)
     parser.add_argument("--ssd-gib", type=int, required=True)
-    return run_suite(parser.parse_args(argv))
+    parser.add_argument("--writers", required=True, help="Comma-separated writer counts from 1,4,8,16")
+    args = parser.parse_args(argv)
+    try:
+        args.writers = validate_writer_counts(int(value) for value in args.writers.split(","))
+    except ValueError as error:
+        parser.error(str(error))
+    return run_suite(args)
 
 
 if __name__ == "__main__":

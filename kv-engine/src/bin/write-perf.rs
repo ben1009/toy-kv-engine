@@ -297,6 +297,9 @@ struct Args {
     /// Requires a bench build with PITR V7 or V8 Parallel I/O.
     #[arg(long, requires = "pitr")]
     wal_completion_timeline: bool,
+    /// Override the ticket sampling cadence for `--wal-completion-timeline` (default: 128).
+    #[arg(long, requires = "wal_completion_timeline")]
+    wal_completion_timeline_sample_every: Option<u64>,
     /// Sample every Nth completed V8 Parallel durability advance and follower wait.
     /// Captures phase wall/thread CPU time; requires a bench build with PITR V8 Parallel I/O.
     #[arg(long, requires = "pitr")]
@@ -402,6 +405,7 @@ struct HarnessConfig {
     wal_sync_diagnostics: bool,
     wal_hol_diagnostics: bool,
     wal_completion_timeline: bool,
+    wal_completion_timeline_sample_every: Option<u64>,
     wal_v8_durability_sample_every: Option<u64>,
     wal_cpu_attribution_sample_every: Option<u64>,
     mutex_lock_sample_every: Option<u64>,
@@ -524,6 +528,7 @@ impl HarnessConfig {
             wal_sync_diagnostics: args.wal_sync_diagnostics,
             wal_hol_diagnostics: args.wal_hol_diagnostics,
             wal_completion_timeline: args.wal_completion_timeline,
+            wal_completion_timeline_sample_every: args.wal_completion_timeline_sample_every,
             wal_v8_durability_sample_every: args.wal_v8_durability_sample_every,
             wal_cpu_attribution_sample_every: args.wal_cpu_attribution_sample_every,
             mutex_lock_sample_every: args.mutex_lock_sample_every,
@@ -1096,6 +1101,8 @@ struct WalSyncObservationRecord {
     captured_target: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     decision_ticket_start: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sync_decision_monotonic_ns: Option<u64>,
     written_frontier_start: u64,
     written_frontier_end: u64,
     admitted_ticket_count: u64,
@@ -1103,6 +1110,14 @@ struct WalSyncObservationRecord {
     frames_ready_prefix_tickets: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     data_complete_prefix_tickets: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data_hol_blocker_ticket: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data_hol_blocker_frames_ready: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data_hol_blocker_digest_folded: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data_hol_blocker_data_write_elapsed_ns: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     durability_ready_prefix_tickets: Option<u64>,
     v8_preparation_reserved_bytes: u64,
@@ -1233,6 +1248,14 @@ struct WalCompletionHandoffTimelineRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     sampled_ticket: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    frame_ready_monotonic_ns: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sqe_submitted_monotonic_ns: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cqe_observed_monotonic_ns: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data_complete_published_monotonic_ns: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     frame_ready_to_submit_request_ns: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     submit_request_to_worker_queue_ns: Option<u64>,
@@ -1268,6 +1291,10 @@ impl From<kv_engine_wrapper::mem_table::WalCompletionHandoffObservation>
             request_start: observation.request_start,
             request_end: observation.request_end,
             sampled_ticket: observation.sampled_ticket,
+            frame_ready_monotonic_ns: observation.frame_ready_monotonic_ns,
+            sqe_submitted_monotonic_ns: observation.sqe_submitted_monotonic_ns,
+            cqe_observed_monotonic_ns: observation.cqe_observed_monotonic_ns,
+            data_complete_published_monotonic_ns: observation.data_complete_published_monotonic_ns,
             frame_ready_to_submit_request_ns: observation.frame_ready_to_submit_request_ns,
             submit_request_to_worker_queue_ns: observation.submit_request_to_worker_queue_ns,
             worker_queue_to_worker_accept_ns: observation.worker_queue_to_worker_accept_ns,
@@ -1959,11 +1986,17 @@ impl From<kv_engine_wrapper::mem_table::WalSyncObservation> for WalSyncObservati
         Self {
             captured_target: observation.captured_target,
             decision_ticket_start: observation.decision_ticket_start,
+            sync_decision_monotonic_ns: observation.sync_decision_monotonic_ns,
             written_frontier_start: observation.written_frontier_start,
             written_frontier_end: observation.written_frontier_end,
             admitted_ticket_count: observation.admitted_ticket_count,
             frames_ready_prefix_tickets: observation.frames_ready_prefix_tickets,
             data_complete_prefix_tickets: observation.data_complete_prefix_tickets,
+            data_hol_blocker_ticket: observation.data_hol_blocker_ticket,
+            data_hol_blocker_frames_ready: observation.data_hol_blocker_frames_ready,
+            data_hol_blocker_digest_folded: observation.data_hol_blocker_digest_folded,
+            data_hol_blocker_data_write_elapsed_ns: observation
+                .data_hol_blocker_data_write_elapsed_ns,
             durability_ready_prefix_tickets: observation.durability_ready_prefix_tickets,
             v8_preparation_reserved_bytes: observation.v8_preparation_reserved_bytes,
             next_ticket_present: observation.next_ticket_present,
@@ -5097,7 +5130,8 @@ fn run_wal_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
         )?;
         engine.set_wal_hol_diagnostics_enabled(cfg.wal_hol_diagnostics)?;
         engine.set_wal_v8_completion_timeline_sample_every(
-            cfg.wal_completion_timeline.then_some(128),
+            cfg.wal_completion_timeline
+                .then_some(cfg.wal_completion_timeline_sample_every.unwrap_or(128)),
         )?;
     }
     let value = vec![b'x'; cfg.value_size];
@@ -5342,7 +5376,8 @@ fn run_wal_batch_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>
         )?;
         engine.set_wal_hol_diagnostics_enabled(cfg.wal_hol_diagnostics)?;
         engine.set_wal_v8_completion_timeline_sample_every(
-            cfg.wal_completion_timeline.then_some(128),
+            cfg.wal_completion_timeline
+                .then_some(cfg.wal_completion_timeline_sample_every.unwrap_or(128)),
         )?;
         engine.set_wal_cpu_attribution_sample_every(cfg.wal_cpu_attribution_sample_every)?;
         engine.set_wal_v8_durability_sample_every(cfg.wal_v8_durability_sample_every.or_else(
@@ -10255,6 +10290,20 @@ fn validate_config(cfg: &HarnessConfig) -> Result<()> {
                 PitrFormatArg::V7 | PitrFormatArg::V8
             ) && cfg.wal_io_mode == WalIoModeArg::Parallel,
             "--wal-completion-timeline requires PITR V7 or V8 Parallel I/O"
+        );
+    }
+    if let Some(sample_every) = cfg.wal_completion_timeline_sample_every {
+        anyhow::ensure!(
+            sample_every > 0,
+            "--wal-completion-timeline-sample-every must be greater than zero"
+        );
+        anyhow::ensure!(
+            cfg.wal_completion_timeline,
+            "--wal-completion-timeline-sample-every requires --wal-completion-timeline"
+        );
+        anyhow::ensure!(
+            cfg!(feature = "bench"),
+            "--wal-completion-timeline-sample-every requires a bench build"
         );
     }
     if let Some(sample_every) = cfg.wal_v8_durability_sample_every {

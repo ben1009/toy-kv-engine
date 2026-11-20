@@ -934,10 +934,15 @@ def validate_point_lookahead_rows(
     return _validate_rows(rows, expected, ("writer", "workload", "repetition", "arm"))
 
 
-def build_v8_point_cpu_attribution_schedule() -> list[dict[str, object]]:
+def build_v8_point_cpu_attribution_schedule(
+    writers: Iterable[int] = V8_POINT_CPU_ATTRIBUTION_WRITERS,
+) -> list[dict[str, object]]:
     """Build one diagnostic-only V7/V8 Point comparison at each concurrency level."""
     schedule: list[dict[str, object]] = []
-    for index, writer in enumerate(V8_POINT_CPU_ATTRIBUTION_WRITERS):
+    writer_counts = validate_writer_counts(writers)
+    if not set(writer_counts).issubset(V8_POINT_CPU_ATTRIBUTION_WRITERS):
+        raise ValueError(f"CPU attribution writers must be selected from {V8_POINT_CPU_ATTRIBUTION_WRITERS}")
+    for index, writer in enumerate(writer_counts):
         order = V8_POINT_CPU_ATTRIBUTION_ARMS if index % 2 == 0 else tuple(reversed(V8_POINT_CPU_ATTRIBUTION_ARMS))
         for arm in order:
             is_v8 = arm == "v8_point_lookahead_direct"
@@ -961,16 +966,17 @@ def build_v8_point_cpu_attribution_schedule() -> list[dict[str, object]]:
 
 def build_v8_point_cpu_attribution_plan(
     *, machine_type: str, machine_spec: Mapping[str, int], commit: str | None = None,
-    binary_sha256: str | None = None,
+    binary_sha256: str | None = None, writers: Iterable[int] = V8_POINT_CPU_ATTRIBUTION_WRITERS,
 ) -> dict[str, object]:
-    schedule = build_v8_point_cpu_attribution_schedule()
+    writer_counts = validate_writer_counts(writers)
+    schedule = build_v8_point_cpu_attribution_schedule(writer_counts)
     vcpus = int(machine_spec["vcpus"])
     ssd_count = int(machine_spec["ssd_count"])
     layout = "single Local SSD" if ssd_count == 1 else f"RAID0 over {ssd_count} Local SSDs"
     plan: dict[str, object] = {
         "suite": "v8-point-cpu-attribution",
         "diagnostic_only": True,
-        "writers": list(V8_POINT_CPU_ATTRIBUTION_WRITERS),
+        "writers": list(writer_counts),
         "workloads": [{"name": "point", "bench": "wal_concurrent", "num": V8_POINT_CPU_ATTRIBUTION_NUM}],
         "arms": list(V8_POINT_CPU_ATTRIBUTION_ARMS),
         "runs_per_writer": 2,
@@ -1004,9 +1010,12 @@ def build_v8_point_cpu_attribution_plan(
     return plan
 
 
-def validate_v8_point_cpu_attribution_rows(rows: Iterable[Mapping[str, object]]) -> dict[str, object]:
+def validate_v8_point_cpu_attribution_rows(
+    rows: Iterable[Mapping[str, object]],
+    writers: Iterable[int] = V8_POINT_CPU_ATTRIBUTION_WRITERS,
+) -> dict[str, object]:
     """Validate one successful diagnostic result for each V7/V8 writer cell."""
-    schedule = build_v8_point_cpu_attribution_schedule()
+    schedule = build_v8_point_cpu_attribution_schedule(writers)
     expected = {
         (int(row["writer"]), str(row["workload"]), int(row["repetition"]), str(row["arm"])):
         int(row["num"])

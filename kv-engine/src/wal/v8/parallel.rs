@@ -248,6 +248,10 @@ pub(crate) struct WalV8FrontierReadySnapshot {
     pub(crate) reserved_preparation_bytes: u64,
     #[cfg(feature = "bench")]
     pub(crate) next_not_ready: Option<WalV8TicketProgress>,
+    #[cfg(feature = "bench")]
+    pub(crate) data_hol_blocker: Option<WalV8TicketProgress>,
+    #[cfg(feature = "bench")]
+    pub(crate) snapshot_monotonic_ns: Option<u64>,
 }
 
 #[cfg(feature = "bench")]
@@ -685,6 +689,21 @@ impl WalV8ParallelCoordinator {
     /// the blocked ticket's readiness to identify why a durability group
     /// stopped at this boundary.
     pub(crate) fn frontier_ready_snapshot(&self) -> WalV8FrontierReadySnapshot {
+        self.frontier_ready_snapshot_inner(false)
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn frontier_ready_snapshot_with_monotonic_ns(&self) -> WalV8FrontierReadySnapshot {
+        self.frontier_ready_snapshot_inner(true)
+    }
+
+    fn frontier_ready_snapshot_inner(
+        &self,
+        capture_monotonic_ns: bool,
+    ) -> WalV8FrontierReadySnapshot {
+        #[cfg(not(feature = "bench"))]
+        let _ = capture_monotonic_ns;
+
         let state = self.inner.state.lock();
         if state.poisoned {
             return WalV8FrontierReadySnapshot {
@@ -698,6 +717,10 @@ impl WalV8ParallelCoordinator {
                 reserved_preparation_bytes: 0,
                 #[cfg(feature = "bench")]
                 next_not_ready: None,
+                #[cfg(feature = "bench")]
+                data_hol_blocker: None,
+                #[cfg(feature = "bench")]
+                snapshot_monotonic_ns: None,
             };
         }
         let mut ready_prefix = Vec::new();
@@ -720,10 +743,18 @@ impl WalV8ParallelCoordinator {
             .take_while(|ticket| ticket.data_complete)
             .count();
         #[cfg(feature = "bench")]
+        let data_hol_blocker = state
+            .tickets
+            .get(data_complete_prefix_count)
+            .map(TicketState::progress);
+        #[cfg(feature = "bench")]
         let next_not_ready = state
             .tickets
             .get(ready_prefix.len())
             .map(TicketState::progress);
+        #[cfg(feature = "bench")]
+        let snapshot_monotonic_ns =
+            capture_monotonic_ns.then(crate::mem_table::benchmark_monotonic_ns);
 
         WalV8FrontierReadySnapshot {
             ready_prefix,
@@ -736,6 +767,10 @@ impl WalV8ParallelCoordinator {
             reserved_preparation_bytes: state.reserved_preparation_bytes,
             #[cfg(feature = "bench")]
             next_not_ready,
+            #[cfg(feature = "bench")]
+            data_hol_blocker,
+            #[cfg(feature = "bench")]
+            snapshot_monotonic_ns,
         }
     }
 
@@ -1135,6 +1170,9 @@ impl WalV8ParallelCoordinator {
         #[cfg(feature = "bench")]
         let data_complete_published_at = timeline_sampled.then(Instant::now);
         #[cfg(feature = "bench")]
+        let data_complete_published_monotonic_ns =
+            timeline_sampled.then(crate::mem_table::benchmark_monotonic_ns);
+        #[cfg(feature = "bench")]
         let data_complete_prefix_end_after =
             timeline_sampled.then(|| data_complete_prefix_end(&state));
         #[cfg(feature = "bench")]
@@ -1215,6 +1253,7 @@ impl WalV8ParallelCoordinator {
         #[cfg(feature = "bench")]
         if let Some(timeline) = handoff_timeline.as_mut() {
             timeline.data_complete_published_at = data_complete_published_at;
+            timeline.data_complete_published_monotonic_ns = data_complete_published_monotonic_ns;
             timeline.data_complete_prefix_end_before = data_complete_prefix_end_before;
             timeline.data_complete_prefix_end_after = data_complete_prefix_end_after;
             timeline.hol_blocker_ticket = hol_blocker.flatten().map(|(ticket, _, _, _)| ticket);

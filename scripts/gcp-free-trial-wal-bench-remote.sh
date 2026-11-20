@@ -89,8 +89,8 @@ if [[ "$SUITE" == "v8-extent-policy-storage" ]] \
 fi
 if [[ "$SUITE" == "v8-point-cpu-attribution" ]] \
     && { [[ "$NUM" != "100000" ]] || [[ "$MACHINE_TYPE" != "c4-standard-16-lssd" ]] \
-        || [[ "$WRITERS_CSV" != "1,4,8,16" ]]; }; then
-    echo "v8-point-cpu-attribution requires c4-standard-16-lssd, writers 1,4,8,16, and 100000 operations" >&2
+        || { [[ "$WRITERS_CSV" != "1,4,8,16" ]] && [[ "$WRITERS_CSV" != "8,16" ]]; }; }; then
+    echo "v8-point-cpu-attribution requires c4-standard-16-lssd, writers 8,16 or 1,4,8,16, and 100000 operations" >&2
     exit 64
 fi
 if [[ ! "$SAFE_DEADLINE_EPOCH" =~ ^[0-9]+$ ]] || (( SAFE_DEADLINE_EPOCH < 1 )); then
@@ -384,6 +384,7 @@ if [[ "$BENCH_SUITE" == "v8-point-cpu-attribution" ]]; then
         --binary "$BINARY" \
         --results-dir "$BENCH_RESULTS" \
         --db-root "$BENCH_WORK/databases" \
+        --writers "$BENCH_WRITERS" \
         --safe-deadline-epoch "$BENCH_SAFE_DEADLINE_EPOCH" \
         --commit "$ACTUAL_COMMIT" \
         --binary-sha256 "$BINARY_SHA256" \
