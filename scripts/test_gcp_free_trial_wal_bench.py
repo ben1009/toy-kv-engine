@@ -108,24 +108,52 @@ BENCH = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(BENCH)
 
 
-class ScpTransferTests(unittest.TestCase):
-    def test_transfers_use_legacy_scp_with_strict_host_key_checking(self) -> None:
-        completed = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
-        with patch.object(BENCH.subprocess, "run", return_value=completed) as run:
-            BENCH.scp_to_vm(
-                "192.0.2.10", Path("/tmp/runner.sh"), "/tmp/runner.sh",
-                Path("/tmp/key"), Path("/tmp/known-hosts"), timeout=30,
-            )
-            upload = run.call_args.args[0]
-            BENCH.scp_from_vm(
-                "192.0.2.10", "/tmp/results.tar.gz", Path("/tmp/results.tar.gz"),
-                Path("/tmp/key"), Path("/tmp/known-hosts"), timeout=30,
-            )
-            download = run.call_args.args[0]
+class SshStreamTransferTests(unittest.TestCase):
+    def test_upload_streams_bytes_over_strict_ssh(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            local = Path(temporary) / "runner.sh"
+            local.write_bytes(b"runner bytes\x00\xff")
+            observed = {}
 
-        for command in (upload, download):
-            self.assertEqual(command[0], "scp")
-            self.assertIn("-O", command)
+            def run(command, **kwargs):
+                observed["command"] = command
+                observed["bytes"] = kwargs["stdin"].read()
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            with patch.object(BENCH.subprocess, "run", side_effect=run):
+                result = BENCH.stream_file_to_vm(
+                    "192.0.2.10", local, "/tmp/runner with space.sh",
+                    Path("/tmp/key"), Path("/tmp/known-hosts"), timeout=30,
+                )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(observed["bytes"], b"runner bytes\x00\xff")
+        command = observed["command"]
+        self.assertEqual(command[0], "ssh")
+        self.assertEqual(command[-1], "umask 077 && cat > '/tmp/runner with space.sh'")
+        self.assertIn("StrictHostKeyChecking=yes", command)
+        self.assertIn("GlobalKnownHostsFile=/dev/null", command)
+
+    def test_download_streams_binary_file_to_destination(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            destination = Path(temporary) / "nested" / "results.tar.gz"
+            observed = {}
+
+            def run(command, **kwargs):
+                observed["command"] = command
+                kwargs["stdout"].write(b"archive bytes\x00\xff")
+                return subprocess.CompletedProcess(command, 0, None, "")
+
+            with patch.object(BENCH.subprocess, "run", side_effect=run):
+                result = BENCH.stream_file_from_vm(
+                    "192.0.2.10", "/tmp/results;echo unsafe", destination,
+                    Path("/tmp/key"), Path("/tmp/known-hosts"), timeout=30,
+                )
+            self.assertEqual(result.returncode, 0)
+            self.assertEqual(destination.read_bytes(), b"archive bytes\x00\xff")
+            command = observed["command"]
+            self.assertEqual(command[0], "ssh")
+            self.assertEqual(command[-1], "cat -- '/tmp/results;echo unsafe'")
             self.assertIn("StrictHostKeyChecking=yes", command)
             self.assertIn("GlobalKnownHostsFile=/dev/null", command)
 
@@ -2819,7 +2847,7 @@ print('[hotpath] diagnostic report follows')
                 patch.object(BENCH, "wait_for_verified_host_keys", side_effect=make_known_hosts),
                 patch.object(BENCH.subprocess, "run", side_effect=fake_keygen),
                 patch.object(BENCH, "ssh_command", return_value=success),
-                patch.object(BENCH, "scp_to_vm", return_value=success),
+                patch.object(BENCH, "stream_file_to_vm", return_value=success),
                 patch.object(BENCH, "collect_artifacts", side_effect=collect),
                 patch.object(BENCH.os, "fsync", side_effect=fsync),
                 patch.object(BENCH, "cleanup_gcp_resources", return_value=([], {}, False)) as cleanup,
@@ -2897,7 +2925,7 @@ print('[hotpath] diagnostic report follows')
                 patch.object(BENCH, "wait_for_verified_host_keys", side_effect=wait_for_host_keys),
                 patch.object(BENCH.subprocess, "run", side_effect=fake_keygen),
                 patch.object(BENCH, "ssh_command", side_effect=ssh),
-                patch.object(BENCH, "scp_to_vm", return_value=successful_ssh),
+                patch.object(BENCH, "stream_file_to_vm", return_value=successful_ssh),
                 patch.object(BENCH, "collect_artifacts", side_effect=fail_collection),
                 patch.object(BENCH, "cleanup_gcp_resources", return_value=([], {}, False)) as cleanup,
             ):
@@ -2945,7 +2973,7 @@ print('[hotpath] diagnostic report follows')
                 patch.object(BENCH, "wait_for_verified_host_keys", side_effect=wait_for_host_keys),
                 patch.object(BENCH.subprocess, "run", side_effect=fake_keygen),
                 patch.object(BENCH, "ssh_command", side_effect=ssh),
-                patch.object(BENCH, "scp_to_vm", return_value=successful_ssh),
+                patch.object(BENCH, "stream_file_to_vm", return_value=successful_ssh),
                 patch.object(BENCH, "collect_artifacts", side_effect=fail_collection),
                 patch.object(BENCH, "retained_vm_reconnect_instructions", side_effect=OSError("disk full")),
                 patch.object(BENCH, "cleanup_gcp_resources", return_value=([], {}, False)) as cleanup,
@@ -3195,11 +3223,11 @@ print('[hotpath] diagnostic report follows')
                 archives[metadata["ARCHIVE_PATH"]] = Path(metadata["ARCHIVE_PATH"])
                 return packed
 
-            def scp(_ip, remote, destination, _key, _known_hosts, *, recursive=False, timeout):
+            def transfer(_ip, remote, destination, _key, _known_hosts, *, recursive=False, timeout):
                 nonlocal calls
                 self.assertFalse(recursive)
                 self.assertEqual(events[-1], "audit")
-                events.append("scp")
+                events.append("ssh-stream")
                 if remote.endswith(".tar.gz"):
                     calls += 1
                     if calls == 1:
@@ -3211,7 +3239,7 @@ print('[hotpath] diagnostic report follows')
 
             with (
                 patch.object(BENCH, "ssh_command", side_effect=pack),
-                patch.object(BENCH, "scp_from_vm", side_effect=scp),
+                patch.object(BENCH, "stream_file_from_vm", side_effect=transfer),
                 patch.object(BENCH.time, "sleep"),
             ):
                 result = BENCH.collect_artifacts(
@@ -3226,7 +3254,7 @@ print('[hotpath] diagnostic report follows')
             self.assertEqual(calls, 2)
             self.assertEqual(
                 events,
-                ["audit", "ssh", "audit", "scp", "audit", "ssh", "audit", "scp", "audit", "scp"],
+                ["audit", "ssh", "audit", "ssh-stream", "audit", "ssh", "audit", "ssh-stream", "audit", "ssh-stream"],
             )
 
     def test_collection_rejects_complete_summary_with_missing_run_metadata(self) -> None:
@@ -3241,7 +3269,7 @@ print('[hotpath] diagnostic report follows')
                 archives[metadata["ARCHIVE_PATH"]] = Path(metadata["ARCHIVE_PATH"])
                 return packed
 
-            def scp(_ip, remote, destination, _key, _known_hosts, *, recursive=False, timeout):
+            def transfer(_ip, remote, destination, _key, _known_hosts, *, recursive=False, timeout):
                 self.assertFalse(recursive)
                 if remote in archives:
                     shutil.copyfile(archives[remote], destination)
@@ -3251,7 +3279,7 @@ print('[hotpath] diagnostic report follows')
 
             with (
                 patch.object(BENCH, "ssh_command", side_effect=pack),
-                patch.object(BENCH, "scp_from_vm", side_effect=scp),
+                patch.object(BENCH, "stream_file_from_vm", side_effect=transfer),
                 patch.object(BENCH.time, "sleep"),
             ):
                 result = BENCH.collect_artifacts(
@@ -3301,7 +3329,7 @@ print('[hotpath] diagnostic report follows')
                 archives[metadata["ARCHIVE_PATH"]] = Path(metadata["ARCHIVE_PATH"])
                 return packed
 
-            def scp(_ip, remote, destination, _key, _known_hosts, *, recursive=False, timeout):
+            def transfer(_ip, remote, destination, _key, _known_hosts, *, recursive=False, timeout):
                 self.assertFalse(recursive)
                 if remote in archives:
                     shutil.copyfile(archives[remote], destination)
@@ -3311,7 +3339,7 @@ print('[hotpath] diagnostic report follows')
 
             with (
                 patch.object(BENCH, "ssh_command", side_effect=pack),
-                patch.object(BENCH, "scp_from_vm", side_effect=scp),
+                patch.object(BENCH, "stream_file_from_vm", side_effect=transfer),
                 patch.object(BENCH.time, "sleep"),
             ):
                 result = BENCH.collect_artifacts(
@@ -3427,7 +3455,7 @@ print('[hotpath] diagnostic report follows')
                 archives[metadata["ARCHIVE_PATH"]] = Path(metadata["ARCHIVE_PATH"])
                 return packed
 
-            def scp(_ip, remote, destination, _key, _known_hosts, *, recursive=False, timeout):
+            def transfer(_ip, remote, destination, _key, _known_hosts, *, recursive=False, timeout):
                 if remote in archives:
                     shutil.copyfile(archives[remote], destination)
                     with destination.open("ab") as stream:
@@ -3438,7 +3466,7 @@ print('[hotpath] diagnostic report follows')
 
             with (
                 patch.object(BENCH, "ssh_command", side_effect=pack),
-                patch.object(BENCH, "scp_from_vm", side_effect=scp),
+                patch.object(BENCH, "stream_file_from_vm", side_effect=transfer),
                 patch.object(BENCH.time, "sleep"),
             ):
                 result = BENCH.collect_artifacts(
@@ -3458,7 +3486,7 @@ print('[hotpath] diagnostic report follows')
             key.write_text("private", encoding="utf-8")
             known_hosts.write_text("host-key", encoding="utf-8")
 
-            def scp(_ip, remote, destination, _key, _known_hosts, *, recursive=False, timeout):
+            def transfer(_ip, remote, destination, _key, _known_hosts, *, recursive=False, timeout):
                 self.assertFalse(recursive)
                 self.assertEqual(remote, "/var/log/gcp-free-trial-wal-bench.log")
                 destination.write_text(
@@ -3472,7 +3500,7 @@ print('[hotpath] diagnostic report follows')
                     "ssh_command",
                     return_value=subprocess.CompletedProcess([], 1, "", "Local SSD setup failed"),
                 ),
-                patch.object(BENCH, "scp_from_vm", side_effect=scp),
+                patch.object(BENCH, "stream_file_from_vm", side_effect=transfer),
                 patch.object(BENCH.time, "sleep"),
             ):
                 result = BENCH.collect_artifacts("192.0.2.1", key, known_hosts, root, before_connect=lambda: None)
@@ -3502,8 +3530,8 @@ print('[hotpath] diagnostic report follows')
                     archives[metadata["ARCHIVE_PATH"]] = Path(metadata["ARCHIVE_PATH"])
                     return result
 
-                def scp(_ip, remote, destination, _key, _known_hosts, *, recursive=False, timeout):
-                    events.append("scp")
+                def transfer(_ip, remote, destination, _key, _known_hosts, *, recursive=False, timeout):
+                    events.append("ssh-stream")
                     self.assertFalse(recursive)
                     if remote in archives:
                         shutil.copyfile(archives[remote], destination)
@@ -3513,7 +3541,7 @@ print('[hotpath] diagnostic report follows')
 
                 with (
                     patch.object(BENCH, "ssh_command", side_effect=pack),
-                    patch.object(BENCH, "scp_from_vm", side_effect=scp),
+                    patch.object(BENCH, "stream_file_from_vm", side_effect=transfer),
                 ):
                     with self.assertRaisesRegex(BENCH.BenchError, "SSH firewall policy changed"):
                         BENCH.collect_artifacts(

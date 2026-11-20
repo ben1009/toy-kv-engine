@@ -2337,7 +2337,7 @@ def collect_artifacts(
             before_connect()
             phase = "transfer"
             archive_path = staging / "results.tar.gz"
-            transfer = scp_from_vm(
+            transfer = stream_file_from_vm(
                 ip, remote_archive_path, archive_path, key, known_hosts,
                 timeout=120,
             )
@@ -2411,7 +2411,7 @@ def collect_artifacts(
     boot_log_collected = False
     try:
         before_connect()
-        boot_log = scp_from_vm(
+        boot_log = stream_file_from_vm(
             ip, "/var/log/gcp-free-trial-wal-bench.log", boot_log_destination,
             key, known_hosts, timeout=30,
         )
@@ -2540,51 +2540,55 @@ def wait_for_verified_host_keys(
     raise BenchError("The VM did not publish verifiable SSH host keys through GCP guest attributes")
 
 
-def ssh_command(
-    key: Path, known_hosts: Path, ip: str, remote_command: str, timeout: int
-) -> subprocess.CompletedProcess[str]:
-    command = [
+def ssh_command_argv(key: Path, known_hosts: Path, ip: str, remote_command: str) -> list[str]:
+    return [
         "ssh", "-i", str(key), "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes",
         "-o", "StrictHostKeyChecking=yes", "-o", f"UserKnownHostsFile={known_hosts}",
         "-o", "GlobalKnownHostsFile=/dev/null", "-o", "ConnectTimeout=8", "-o", "ServerAliveInterval=30",
         "-o", "ServerAliveCountMax=3", f"bench@{ip}", remote_command,
     ]
+
+
+def ssh_command(
+    key: Path, known_hosts: Path, ip: str, remote_command: str, timeout: int
+) -> subprocess.CompletedProcess[str]:
+    command = ssh_command_argv(key, known_hosts, ip, remote_command)
     # Local argv is not shell-evaluated; dynamic remote arguments are built with shlex.join.
     # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
     return subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                           timeout=timeout, check=False, shell=False)
 
 
-def scp_from_vm(
+def stream_file_from_vm(
     ip: str, remote_path: str, destination: Path, key: Path, known_hosts: Path,
-    *, recursive: bool = False, timeout: int,
+    *, timeout: int,
 ) -> subprocess.CompletedProcess[str]:
-    # Use the remote-shell SCP protocol. The GCP guest accepts ordinary SSH
-    # commands, but its SFTP subsystem can close during initial file transfer.
-    # Remote paths are either fixed by this runner or validated archive paths.
-    command = ["scp", "-O", "-i", str(key), "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes",
-               "-o", "StrictHostKeyChecking=yes", "-o", f"UserKnownHostsFile={known_hosts}",
-               "-o", "GlobalKnownHostsFile=/dev/null", "-o", "ConnectTimeout=8"]
-    if recursive:
-        command.append("-r")
-    command.extend((f"bench@{ip}:{remote_path}", str(destination)))
-    # SCP receives separate argv items and does not pass them through a local shell.
-    # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
-    return subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                          timeout=timeout, check=False, shell=False)
+    # Use the already-verified SSH command channel instead of SCP/SFTP, which
+    # can be closed by the GCE guest during file transfer. Quote the remote path
+    # because ssh passes the remote command through the guest's shell.
+    command = ssh_command_argv(key, known_hosts, ip, f"cat -- {shlex.quote(remote_path)}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with destination.open("wb") as output:
+        # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
+        result = subprocess.run(command, text=True, stdout=output, stderr=subprocess.PIPE,
+                                timeout=timeout, check=False, shell=False)
+    if result.returncode:
+        destination.unlink(missing_ok=True)
+    return result
 
 
-def scp_to_vm(
+def stream_file_to_vm(
     ip: str, local_path: Path, remote_path: str, key: Path, known_hosts: Path, timeout: int
 ) -> subprocess.CompletedProcess[str]:
-    command = ["scp", "-O", "-i", str(key), "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes",
-               "-o", "StrictHostKeyChecking=yes", "-o", f"UserKnownHostsFile={known_hosts}",
-               "-o", "GlobalKnownHostsFile=/dev/null", "-o", "ConnectTimeout=8",
-               str(local_path), f"bench@{ip}:{remote_path}"]
-    # SCP receives separate argv items and does not pass them through a local shell.
-    # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
-    return subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                          timeout=timeout, check=False, shell=False)
+    # Stream bytes over ordinary SSH stdin; do not rely on the guest SCP/SFTP
+    # server. Keep the remote file private while writing it.
+    command = ssh_command_argv(
+        key, known_hosts, ip, f"umask 077 && cat > {shlex.quote(remote_path)}"
+    )
+    with local_path.open("rb") as source:
+        # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
+        return subprocess.run(command, text=True, stdin=source, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              timeout=timeout, check=False, shell=False)
 
 
 def append_local_log(path: Path, text: str) -> None:
@@ -2605,7 +2609,7 @@ def provision_and_run(
     point_borrowed_input_suite = getattr(args, "v8_point_borrowed_input_ab", False)
     point_direct_frame_suite = getattr(args, "v8_point_direct_frame_ab", False)
     extent_policy_storage_suite = getattr(args, "v8_extent_policy_storage_ab", False)
-    missing_tools = [tool for tool in ("ssh", "scp", "ssh-keygen") if not shutil.which(tool)]
+    missing_tools = [tool for tool in ("ssh", "ssh-keygen") if not shutil.which(tool)]
     if missing_tools:
         raise BenchError("Required local tools are missing: " + ", ".join(missing_tools))
     create_help = gcloud.run(["beta", "compute", "instances", "create", "--help"])
@@ -2815,16 +2819,18 @@ def provision_and_run(
             audit_ssh_firewall_rules(
                 gcloud, args.project, args.network, network_region, tag, args.ssh_source_range
             )
-            scp_result = scp_to_vm(ip, remote_script, "/tmp/run-wal-bench.sh", key, known_hosts, timeout=120)
-            append_local_log(key_log, scp_result.stdout + scp_result.stderr)
-            if scp_result.returncode:
-                raise BenchError(f"Could not copy remote runner: {scp_result.stderr.strip()}")
+            upload_result = stream_file_to_vm(
+                ip, remote_script, "/tmp/run-wal-bench.sh", key, known_hosts, timeout=120
+            )
+            append_local_log(key_log, upload_result.stdout + upload_result.stderr)
+            if upload_result.returncode:
+                raise BenchError(f"Could not copy remote runner: {upload_result.stderr.strip()}")
             if not MATRIX_MODULE.is_file():
                 raise BenchError(f"Benchmark matrix module is not present in this checkout: {MATRIX_MODULE}")
             audit_ssh_firewall_rules(
                 gcloud, args.project, args.network, network_region, tag, args.ssh_source_range
             )
-            matrix_copy = scp_to_vm(
+            matrix_copy = stream_file_to_vm(
                 ip, MATRIX_MODULE, "/tmp/gcp_wal_matrix.py", key, known_hosts, timeout=120
             )
             append_local_log(key_log, matrix_copy.stdout + matrix_copy.stderr)
@@ -2833,7 +2839,7 @@ def provision_and_run(
             if profile_suite:
                 if not PROFILE_RUNNER.is_file():
                     raise BenchError(f"Profiling helper is not present in this checkout: {PROFILE_RUNNER}")
-                profile_copy = scp_to_vm(
+                profile_copy = stream_file_to_vm(
                     ip, PROFILE_RUNNER, "/tmp/gcp-wal-profile-runner.py", key, known_hosts, timeout=120
                 )
                 append_local_log(key_log, profile_copy.stdout + profile_copy.stderr)
@@ -2842,7 +2848,7 @@ def provision_and_run(
             if trace_suite:
                 if not COMMIT_ORDER_TRACE_RUNNER.is_file():
                     raise BenchError(f"Commit-order trace runner is not present in this checkout: {COMMIT_ORDER_TRACE_RUNNER}")
-                trace_copy = scp_to_vm(
+                trace_copy = stream_file_to_vm(
                     ip, COMMIT_ORDER_TRACE_RUNNER, "/tmp/gcp-commit-order-trace-runner.py",
                     key, known_hosts, timeout=120,
                 )
@@ -2852,7 +2858,7 @@ def provision_and_run(
             if point_lookahead_suite:
                 if not POINT_LOOKAHEAD_RUNNER.is_file():
                     raise BenchError(f"Point lookahead runner is not present in this checkout: {POINT_LOOKAHEAD_RUNNER}")
-                point_copy = scp_to_vm(
+                point_copy = stream_file_to_vm(
                     ip, POINT_LOOKAHEAD_RUNNER, "/tmp/gcp-v8-point-lookahead-runner.py", key, known_hosts,
                     timeout=120,
                 )
@@ -2862,7 +2868,7 @@ def provision_and_run(
             if mutex_diagnostic_suite:
                 if not V8_MUTEX_DIAGNOSTIC_RUNNER.is_file():
                     raise BenchError(f"Mutex diagnostic helper is not present in this checkout: {V8_MUTEX_DIAGNOSTIC_RUNNER}")
-                mutex_copy = scp_to_vm(
+                mutex_copy = stream_file_to_vm(
                     ip, V8_MUTEX_DIAGNOSTIC_RUNNER, "/tmp/gcp-v8-mutex-diagnostic-runner.py",
                     key, known_hosts, timeout=120,
                 )
@@ -2872,7 +2878,7 @@ def provision_and_run(
             if cpu_attribution_suite:
                 if not V8_POINT_CPU_ATTRIBUTION_RUNNER.is_file():
                     raise BenchError(f"Point CPU attribution helper is missing: {V8_POINT_CPU_ATTRIBUTION_RUNNER}")
-                cpu_copy = scp_to_vm(
+                cpu_copy = stream_file_to_vm(
                     ip, V8_POINT_CPU_ATTRIBUTION_RUNNER, "/tmp/gcp-v8-point-cpu-attribution-runner.py",
                     key, known_hosts, timeout=120,
                 )
@@ -2882,7 +2888,7 @@ def provision_and_run(
             if point_borrowed_input_suite:
                 if not POINT_BORROWED_INPUT_RUNNER.is_file():
                     raise BenchError(f"Borrowed-input helper is missing: {POINT_BORROWED_INPUT_RUNNER}")
-                borrowed_copy = scp_to_vm(
+                borrowed_copy = stream_file_to_vm(
                     ip, POINT_BORROWED_INPUT_RUNNER, "/tmp/gcp-v8-point-borrowed-input-runner.py",
                     key, known_hosts, timeout=120,
                 )
@@ -2892,7 +2898,7 @@ def provision_and_run(
             if point_direct_frame_suite:
                 if not POINT_DIRECT_FRAME_RUNNER.is_file():
                     raise BenchError(f"Direct-frame helper is missing: {POINT_DIRECT_FRAME_RUNNER}")
-                direct_copy = scp_to_vm(
+                direct_copy = stream_file_to_vm(
                     ip, POINT_DIRECT_FRAME_RUNNER, "/tmp/gcp-v8-point-direct-frame-runner.py",
                     key, known_hosts, timeout=120,
                 )
@@ -2902,7 +2908,7 @@ def provision_and_run(
             if extent_policy_storage_suite:
                 if not V8_EXTENT_POLICY_STORAGE_RUNNER.is_file():
                     raise BenchError(f"Extent-policy storage runner is missing: {V8_EXTENT_POLICY_STORAGE_RUNNER}")
-                storage_copy = scp_to_vm(
+                storage_copy = stream_file_to_vm(
                     ip, V8_EXTENT_POLICY_STORAGE_RUNNER, "/tmp/gcp-v8-extent-policy-storage-runner.py",
                     key, known_hosts, timeout=120,
                 )
@@ -2982,9 +2988,14 @@ def provision_and_run(
                             persist_lifecycle()
                             if not lifecycle["results_verified"]:
                                 return_code = 1
-                                lifecycle["cleanup"].append(
-                                    "result set is incomplete or unverified; preserving the VM and network for recovery"
-                                )
+                                if should_retain_vm(args, return_code, lifecycle):
+                                    lifecycle["cleanup"].append(
+                                        "result set is incomplete or unverified; preserving the VM and network for recovery"
+                                    )
+                                else:
+                                    lifecycle["cleanup"].append(
+                                        "benchmark did not start and remote execution is certain; cleaning up failed setup"
+                                    )
                                 persist_lifecycle()
                             elif not collection.get("bootstrap_log"):
                                 lifecycle["cleanup"].append("bootstrap log could not be collected; benchmark results are local")

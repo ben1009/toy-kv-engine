@@ -82,7 +82,7 @@ single public IP as `/32` is preferred). The runner audits project firewall
 rules and global and regional effective firewall policies before creating the
 VM or firewall rule. It refuses to proceed if an applicable SSH allow rule
 permits a broader source, and repeats the audit immediately before opening each
-SSH/SCP connection. This requires `compute.firewalls.list`,
+SSH command or streamed-file connection. This requires `compute.firewalls.list`,
 `compute.networks.getEffectiveFirewalls`, and
 `compute.networks.getRegionEffectiveFirewalls`; default networks with a
 target-all `0.0.0.0/0` SSH rule must be narrowed or replaced with an isolated
@@ -147,7 +147,7 @@ The project must already
 have `compute.googleapis.com` and `cloudquotas.googleapis.com` enabled. The
 runner uses `gcloud beta compute instances create` to set a server-enforced
 delete deadline; its preflight checks that the installed CLI exposes the
-required flags. Local `ssh`, `scp`, and `ssh-keygen` are also required for a
+required flags. Local `ssh` and `ssh-keygen` are also required for a
 full run. Use an existing VPC network with outbound internet access and
 permissions to create/delete a VM and temporary firewall rule. For a
 custom-mode VPC, pass `--subnet SUBNETWORK_NAME`; preflight verifies that the
@@ -323,7 +323,7 @@ sets the VM auto-delete deadline. The runner exits before creating resources
 when quota or machine support cannot be verified.
 
 The runner enables guest attributes and obtains the VM's SSH host keys from
-the Compute Engine API before connecting. SSH and SCP use strict host-key
+the Compute Engine API before connecting. SSH commands and file streams use strict host-key
 checking against that API response. The runner polls guest attributes at a
 bounded rate. See [guest attributes and SSH
 host-key verification](https://docs.cloud.google.com/compute/docs/metadata/manage-guest-attributes).
