@@ -273,3 +273,5 @@ experiments. Each report records its own outcome and measurement limits.
 - [Release-mode worker invariant bookkeeping](experiments/rfc-024-worker-invariants-20261003.md)
 
 [All documentation](../README.md).
+
+- [V7/V8 Point Frame Finish to DATA submission on GCP](benchmarks/rfc-026-v8-frame-finish-gcp-20261120.md)
