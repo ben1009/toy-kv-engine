@@ -99,6 +99,9 @@ REPO_URL = "https://github.com/ben1009/toy-kv-engine.git"
 MAX_RUNTIME_MINUTES = 180
 MIN_RUNTIME_MINUTES = 60
 MAX_ARTIFACT_BUNDLE_BYTES = 512 * 1024 * 1024
+SSH_READY_TIMEOUT_SECONDS = 120
+SSH_READY_POLL_INTERVAL_SECONDS = 5
+SSH_PROBE_TIMEOUT_SECONDS = 12
 
 REMOTE_ARCHIVE_SCRIPT = r'''
 import hashlib
@@ -2569,6 +2572,40 @@ def ssh_command(
                           timeout=timeout, check=False, shell=False)
 
 
+def wait_for_ssh_ready(
+    probe: Callable[[int], subprocess.CompletedProcess[str]],
+    *,
+    timeout_seconds: int = SSH_READY_TIMEOUT_SECONDS,
+    poll_interval_seconds: int = SSH_READY_POLL_INTERVAL_SECONDS,
+) -> None:
+    """Wait briefly for SSH after opening ingress; never consume the VM lifetime retrying."""
+    if timeout_seconds <= 0:
+        raise ValueError("timeout_seconds must be positive")
+    if poll_interval_seconds <= 0:
+        raise ValueError("poll_interval_seconds must be positive")
+
+    deadline = time.monotonic() + timeout_seconds
+    last_error = "no SSH probe completed"
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        probe_timeout = max(1, min(SSH_PROBE_TIMEOUT_SECONDS, math.ceil(remaining)))
+        result = probe(probe_timeout)
+        if result.returncode == 0:
+            return
+        last_error = (result.stderr or result.stdout or f"probe exited {result.returncode}").strip()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(poll_interval_seconds, remaining))
+
+    raise BenchError(
+        f"SSH did not become ready within {timeout_seconds} seconds after the restricted ingress rule "
+        f"was audited; last probe: {last_error}"
+    )
+
+
 def stream_file_from_vm(
     ip: str, remote_path: str, destination: Path, key: Path, known_hosts: Path,
     *, timeout: int,
@@ -2864,20 +2901,25 @@ def provision_and_run(
                     before_attempt=audit_before_retry,
                 )
 
-            while time.monotonic() < deadline:
-                # Recheck immediately before each new connection so a changed
-                # effective policy fails closed before this runner opens SSH.
-                audit_ssh_firewall_rules(
-                    gcloud, args.project, args.network, network_region, tag, args.ssh_source_range
-                )
-                probe = ssh_command(key, known_hosts, ip, "true", timeout=12)
+            # Verify the effective policy after creating the one-shot ingress
+            # rule, then keep readiness retries bounded. Repeating the three
+            # firewall inventory APIs for every failed SSH probe obscures a
+            # broken SSH handshake and can spend most of the VM lifetime idle.
+            audit_ssh_firewall_rules(
+                gcloud, args.project, args.network, network_region, tag, args.ssh_source_range
+            )
+
+            def probe_ssh(timeout: int) -> subprocess.CompletedProcess[str]:
+                probe = ssh_command(key, known_hosts, ip, "true", timeout=timeout)
                 append_local_log(key_log, probe.stdout + probe.stderr)
-                if probe.returncode == 0:
-                    connected = True
-                    break
-                time.sleep(10)
-            if not connected:
-                raise BenchError("SSH did not become ready before timeout")
+                return probe
+
+            ssh_ready_timeout = min(
+                SSH_READY_TIMEOUT_SECONDS,
+                max(1, math.floor(deadline - time.monotonic())),
+            )
+            wait_for_ssh_ready(probe_ssh, timeout_seconds=ssh_ready_timeout)
+            connected = True
 
             remote_script = RUNNERS
             upload_result = upload_to_vm(remote_script, "/tmp/run-wal-bench.sh")

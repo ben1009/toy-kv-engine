@@ -300,6 +300,58 @@ def fake_keygen(command, **_kwargs):
 
 
 class GcpFreeTrialWalBenchTests(unittest.TestCase):
+    def test_ssh_readiness_retries_within_a_fixed_deadline(self) -> None:
+        now = [0.0]
+        timeouts = []
+
+        def monotonic() -> float:
+            return now[0]
+
+        def sleep(seconds: float) -> None:
+            now[0] += seconds
+
+        def probe(timeout: int) -> subprocess.CompletedProcess[str]:
+            timeouts.append(timeout)
+            return subprocess.CompletedProcess([], 255, "", "timed out during banner exchange")
+
+        with (
+            patch.object(BENCH.time, "monotonic", side_effect=monotonic),
+            patch.object(BENCH.time, "sleep", side_effect=sleep) as sleep_mock,
+            self.assertRaisesRegex(
+                BENCH.BenchError,
+                "did not become ready within 21 seconds.*banner exchange",
+            ),
+        ):
+            BENCH.wait_for_ssh_ready(probe, timeout_seconds=21, poll_interval_seconds=10)
+
+        self.assertEqual(timeouts, [12, 11, 1])
+        self.assertEqual(sleep_mock.call_args_list, [unittest.mock.call(10), unittest.mock.call(10), unittest.mock.call(1)])
+
+    def test_ssh_readiness_returns_when_a_retry_succeeds(self) -> None:
+        now = [0.0]
+        attempts = [
+            subprocess.CompletedProcess([], 255, "", "connection closed"),
+            subprocess.CompletedProcess([], 0, "", ""),
+        ]
+
+        def monotonic() -> float:
+            return now[0]
+
+        def sleep(seconds: float) -> None:
+            now[0] += seconds
+
+        def probe(_timeout: int) -> subprocess.CompletedProcess[str]:
+            return attempts.pop(0)
+
+        with (
+            patch.object(BENCH.time, "monotonic", side_effect=monotonic),
+            patch.object(BENCH.time, "sleep", side_effect=sleep) as sleep_mock,
+        ):
+            BENCH.wait_for_ssh_ready(probe, timeout_seconds=30, poll_interval_seconds=5)
+
+        self.assertEqual(now[0], 5)
+        sleep_mock.assert_called_once_with(5)
+
     def test_auto_ssh_source_range_resolves_current_public_ipv4_as_host_rule(self) -> None:
         with patch.object(BENCH.urllib.request, "urlopen", return_value=BytesIO(b"8.8.8.8\n")) as lookup:
             args = BENCH.parse_args([
