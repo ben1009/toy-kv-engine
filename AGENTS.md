@@ -370,14 +370,18 @@ Before creating the benchmark VM:
 1. Confirm the active `gcloud` identity and that Billing Overview still shows
    Free Trial. Set `--confirm-free-trial` only after that attestation. Never
    enable Paid billing, APIs, or quotas.
-2. Audit effective ingress rules on the default VPC. If it has broad SSH or
-   other conflicting ingress rules, do not use it or weaken or delete its shared
-   rules. Provision a temporary isolated VPC and regional subnet with Terraform,
-   including the internet-egress route needed for bootstrap and downloads. Audit
-   the isolated network's effective ingress too, and restrict the benchmark's
-   temporary SSH rule to the supplied CIDR (prefer `/32`). Use the repository's
-   Terraform configuration as the resource/authentication pattern, and keep
-   temporary state outside the repository.
+2. Known condition for the active Free Trial project, verified 2026-11-20:
+   the default VPC has an effective project-wide SSH allow rule for
+   `0.0.0.0/0`. Treat this as a standing environment condition: do not use,
+   weaken, or delete the default VPC rule, and do not repeat its audit or report
+   it as a new blocker on every run unless the project or firewall policy has
+   changed. Go directly to a temporary isolated VPC and regional subnet managed
+   by Terraform, including the internet-egress route needed for bootstrap and
+   downloads. Audit the selected isolated network's effective ingress, and
+   restrict the benchmark's temporary SSH rule to the supplied CIDR (prefer
+   `/32`). Use the repository's Terraform configuration as the
+   resource/authentication pattern, and keep temporary state outside the
+   repository.
 3. After the selected network and subnet exist, run the benchmark runner with
    `--preflight-only` using the same machine, runtime, network, and cost
    arguments planned for the run. Require this preflight to pass before creating

@@ -108,6 +108,28 @@ BENCH = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(BENCH)
 
 
+class ScpTransferTests(unittest.TestCase):
+    def test_transfers_use_legacy_scp_with_strict_host_key_checking(self) -> None:
+        completed = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+        with patch.object(BENCH.subprocess, "run", return_value=completed) as run:
+            BENCH.scp_to_vm(
+                "192.0.2.10", Path("/tmp/runner.sh"), "/tmp/runner.sh",
+                Path("/tmp/key"), Path("/tmp/known-hosts"), timeout=30,
+            )
+            upload = run.call_args.args[0]
+            BENCH.scp_from_vm(
+                "192.0.2.10", "/tmp/results.tar.gz", Path("/tmp/results.tar.gz"),
+                Path("/tmp/key"), Path("/tmp/known-hosts"), timeout=30,
+            )
+            download = run.call_args.args[0]
+
+        for command in (upload, download):
+            self.assertEqual(command[0], "scp")
+            self.assertIn("-O", command)
+            self.assertIn("StrictHostKeyChecking=yes", command)
+            self.assertIn("GlobalKnownHostsFile=/dev/null", command)
+
+
 class PreflightGcloud:
     """Read-only API fixtures using Compute Engine's actual response fields."""
 

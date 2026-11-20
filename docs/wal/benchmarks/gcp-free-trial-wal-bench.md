@@ -91,6 +91,17 @@ with firewall-policy permissions could change the effective policy after a
 check. Do not run while another actor is changing firewall policy; use a
 dedicated network or an enforced policy when concurrent policy changes cannot
 be ruled out.
+
+For the active Free Trial benchmark project, the default VPC's broad SSH allow
+rule is a known, recurring condition. Do not use or modify that shared VPC rule,
+and do not repeat this known finding as a per-run failure. Start WAL benchmark
+runs on a temporary isolated VPC and regional subnet provisioned with
+Terraform, including the default internet-egress route. Keep its Terraform state
+outside the repository. After creation, audit the isolated network's effective
+firewall policy, then run the benchmark runner's `--preflight-only` with the
+same network, subnet, machine, runtime, and cost arguments as the real run.
+Only the runner's temporary SSH rule should admit inbound SSH, restricted to
+the supplied source CIDR (prefer `/32`).
 The VM blocks project-wide SSH keys, has no service account, and receives a
 temporary firewall rule targeted only at its unique network tag; the rule is
 removed during teardown. The VM has a server-side maximum runtime (default 180

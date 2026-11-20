@@ -2559,7 +2559,10 @@ def scp_from_vm(
     ip: str, remote_path: str, destination: Path, key: Path, known_hosts: Path,
     *, recursive: bool = False, timeout: int,
 ) -> subprocess.CompletedProcess[str]:
-    command = ["scp", "-i", str(key), "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes",
+    # Use the remote-shell SCP protocol. The GCP guest accepts ordinary SSH
+    # commands, but its SFTP subsystem can close during initial file transfer.
+    # Remote paths are either fixed by this runner or validated archive paths.
+    command = ["scp", "-O", "-i", str(key), "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes",
                "-o", "StrictHostKeyChecking=yes", "-o", f"UserKnownHostsFile={known_hosts}",
                "-o", "GlobalKnownHostsFile=/dev/null", "-o", "ConnectTimeout=8"]
     if recursive:
@@ -2574,7 +2577,7 @@ def scp_from_vm(
 def scp_to_vm(
     ip: str, local_path: Path, remote_path: str, key: Path, known_hosts: Path, timeout: int
 ) -> subprocess.CompletedProcess[str]:
-    command = ["scp", "-i", str(key), "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes",
+    command = ["scp", "-O", "-i", str(key), "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes",
                "-o", "StrictHostKeyChecking=yes", "-o", f"UserKnownHostsFile={known_hosts}",
                "-o", "GlobalKnownHostsFile=/dev/null", "-o", "ConnectTimeout=8",
                str(local_path), f"bench@{ip}:{remote_path}"]
