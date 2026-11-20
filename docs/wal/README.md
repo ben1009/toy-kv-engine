@@ -79,6 +79,7 @@ the retained and rejected experiments.
 
 ## Benchmarks and qualification
 
+- [V7/V8 Point Frame Finish to DATA submission on GCP](benchmarks/rfc-026-v8-frame-finish-gcp-20261120.md)
 - [GCP Free Trial WAL benchmark runner](benchmarks/gcp-free-trial-wal-bench.md)
 - [RFC 026 GCP V8 point sync diagnostic, 2026-11-10](benchmarks/rfc-026-v8-point-sync-gcp-20261110.md)
 - [RFC 026 V8 FRONTIER I/O A/B on GCP, 2026-11-11](benchmarks/rfc-026-v8-frontier-io-ab-gcp-20261111.md)
@@ -273,5 +274,3 @@ experiments. Each report records its own outcome and measurement limits.
 - [Release-mode worker invariant bookkeeping](experiments/rfc-024-worker-invariants-20261003.md)
 
 [All documentation](../README.md).
-
-- [V7/V8 Point Frame Finish to DATA submission on GCP](benchmarks/rfc-026-v8-frame-finish-gcp-20261120.md)
