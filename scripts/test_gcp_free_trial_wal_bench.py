@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import base64
 import csv
+import hashlib
 import importlib.util
-from io import StringIO
+from io import BytesIO, StringIO
 import json
 import os
 from pathlib import Path
@@ -16,8 +17,9 @@ import subprocess
 import tempfile
 import tarfile
 import time
+from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from gcp_wal_matrix import (
     COMMIT_ORDER_TRACE_NUM,
@@ -35,6 +37,9 @@ from gcp_wal_matrix import (
     V8_MUTEX_DIAGNOSTIC_NUM,
     V8_MUTEX_DIAGNOSTIC_SAMPLE_EVERY,
     V8_MUTEX_DIAGNOSTIC_WRITERS,
+    V8_POINT_CPU_ATTRIBUTION_NUM,
+    V8_POINT_CPU_ATTRIBUTION_SAMPLE_EVERY,
+    V8_POINT_CPU_ATTRIBUTION_WRITERS,
     build_benchmark_plan,
     build_batch64_schedule,
     build_commit_order_trace_plan,
@@ -49,6 +54,8 @@ from gcp_wal_matrix import (
     build_v8_extent_policy_storage_schedule,
     build_v8_mutex_diagnostic_plan,
     build_v8_mutex_diagnostic_schedule,
+    build_v8_point_cpu_attribution_plan,
+    build_v8_point_cpu_attribution_schedule,
     build_rfc026_schedule,
     validate_commit_order_trace_rows,
     validate_batch64_rows,
@@ -57,6 +64,7 @@ from gcp_wal_matrix import (
     validate_point_direct_frame_rows,
     validate_v8_extent_policy_storage_rows,
     validate_v8_mutex_diagnostic_rows,
+    validate_v8_point_cpu_attribution_rows,
     validate_rfc026_rows,
 )
 from analyze_gcp_commit_order_trace import extract_trace
@@ -82,6 +90,15 @@ from gcp_v8_mutex_diagnostic_runner import (
     _validate_record as validate_mutex_record,
 )
 from gcp_v8_point_borrowed_input_runner import _summary_fields
+import gcp_v8_point_cpu_attribution_runner as cpu_attribution_runner
+from gcp_v8_point_cpu_attribution_runner import (
+    _build_command as build_cpu_attribution_command,
+    _completion_handoff_timeline_summary,
+    _completion_timeline_summary,
+    _run_id as cpu_attribution_run_id,
+    _validate_v8_durability_phase_samples,
+    run_suite as run_cpu_attribution_suite,
+)
 
 
 SCRIPT = Path(__file__).with_name("gcp-free-trial-wal-bench.py")
@@ -89,6 +106,112 @@ SPEC = importlib.util.spec_from_file_location("gcp_free_trial_wal_bench", SCRIPT
 assert SPEC and SPEC.loader
 BENCH = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(BENCH)
+
+
+class SshStreamTransferTests(unittest.TestCase):
+    def test_upload_streams_bytes_over_strict_ssh(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            local = Path(temporary) / "runner.sh"
+            local.write_bytes(b"runner bytes\x00\xff")
+            observed = {}
+
+            def run(command, **kwargs):
+                observed["command"] = command
+                observed["bytes"] = kwargs["stdin"].read()
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            with patch.object(BENCH.subprocess, "run", side_effect=run):
+                result = BENCH.stream_file_to_vm(
+                    "192.0.2.10", local, "/tmp/runner with space.sh",
+                    Path("/tmp/key"), Path("/tmp/known-hosts"), timeout=30,
+                )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(observed["bytes"], b"runner bytes\x00\xff")
+        command = observed["command"]
+        self.assertEqual(command[0], "ssh")
+        self.assertEqual(command[-1], "umask 077 && cat > '/tmp/runner with space.sh'")
+        self.assertIn("StrictHostKeyChecking=yes", command)
+        self.assertIn("GlobalKnownHostsFile=/dev/null", command)
+
+    def test_upload_retries_transient_disconnect_and_reaudits_before_reconnect(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            local = Path(temporary) / "runner.sh"
+            payload = b"runner bytes"
+            local.write_bytes(payload)
+            order: list[str] = []
+            results = [
+                subprocess.CompletedProcess([], 255, "", "Connection closed by 192.0.2.10 port 22"),
+                subprocess.CompletedProcess([], 0, "", ""),
+            ]
+
+            def run(command, **kwargs):
+                order.append("ssh")
+                self.assertEqual(kwargs["stdin"].read(), payload)
+                return results.pop(0)
+
+            def audit_before_retry() -> None:
+                order.append("audit")
+
+            with (
+                patch.object(BENCH.subprocess, "run", side_effect=run),
+                patch.object(BENCH.time, "sleep") as sleep,
+            ):
+                # The caller audits before attempt one; the callback is used
+                # for each reconnect after a transient transport failure.
+                order.append("audit")
+                result = BENCH.stream_file_to_vm(
+                    "192.0.2.10", local, "/tmp/runner.sh", Path("/tmp/key"),
+                    Path("/tmp/known-hosts"), timeout=30, before_attempt=audit_before_retry,
+                )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(order, ["audit", "ssh", "audit", "ssh"])
+        self.assertIn("transient transport error", result.stderr)
+        sleep.assert_called_once_with(1)
+
+    def test_upload_does_not_retry_authentication_failures(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            local = Path(temporary) / "runner.sh"
+            local.write_bytes(b"runner bytes")
+            before_retry = Mock()
+            failure = subprocess.CompletedProcess([], 255, "", "Permission denied (publickey)")
+            with (
+                patch.object(BENCH.subprocess, "run", return_value=failure) as run,
+                patch.object(BENCH.time, "sleep") as sleep,
+            ):
+                result = BENCH.stream_file_to_vm(
+                    "192.0.2.10", local, "/tmp/runner.sh", Path("/tmp/key"),
+                    Path("/tmp/known-hosts"), timeout=30, before_attempt=before_retry,
+                )
+
+        self.assertEqual(result.returncode, 255)
+        run.assert_called_once()
+        before_retry.assert_not_called()
+        sleep.assert_not_called()
+
+    def test_download_streams_binary_file_to_destination(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            destination = Path(temporary) / "nested" / "results.tar.gz"
+            observed = {}
+
+            def run(command, **kwargs):
+                observed["command"] = command
+                kwargs["stdout"].write(b"archive bytes\x00\xff")
+                return subprocess.CompletedProcess(command, 0, None, "")
+
+            with patch.object(BENCH.subprocess, "run", side_effect=run):
+                result = BENCH.stream_file_from_vm(
+                    "192.0.2.10", "/tmp/results;echo unsafe", destination,
+                    Path("/tmp/key"), Path("/tmp/known-hosts"), timeout=30,
+                )
+            self.assertEqual(result.returncode, 0)
+            self.assertEqual(destination.read_bytes(), b"archive bytes\x00\xff")
+            command = observed["command"]
+            self.assertEqual(command[0], "ssh")
+            self.assertEqual(command[-1], "cat -- '/tmp/results;echo unsafe'")
+            self.assertIn("StrictHostKeyChecking=yes", command)
+            self.assertIn("GlobalKnownHostsFile=/dev/null", command)
 
 
 class PreflightGcloud:
@@ -177,6 +300,110 @@ def fake_keygen(command, **_kwargs):
 
 
 class GcpFreeTrialWalBenchTests(unittest.TestCase):
+    def test_ssh_readiness_retries_within_a_fixed_deadline(self) -> None:
+        now = [0.0]
+        timeouts = []
+
+        def monotonic() -> float:
+            return now[0]
+
+        def sleep(seconds: float) -> None:
+            now[0] += seconds
+
+        def probe(timeout: int) -> subprocess.CompletedProcess[str]:
+            timeouts.append(timeout)
+            return subprocess.CompletedProcess([], 255, "", "timed out during banner exchange")
+
+        with (
+            patch.object(BENCH.time, "monotonic", side_effect=monotonic),
+            patch.object(BENCH.time, "sleep", side_effect=sleep) as sleep_mock,
+            self.assertRaisesRegex(
+                BENCH.BenchError,
+                "did not become ready within 21 seconds.*banner exchange",
+            ),
+        ):
+            BENCH.wait_for_ssh_ready(probe, timeout_seconds=21, poll_interval_seconds=10)
+
+        self.assertEqual(timeouts, [12, 11, 1])
+        self.assertEqual(sleep_mock.call_args_list, [unittest.mock.call(10), unittest.mock.call(10), unittest.mock.call(1)])
+
+    def test_ssh_readiness_returns_when_a_retry_succeeds(self) -> None:
+        now = [0.0]
+        attempts = [
+            subprocess.CompletedProcess([], 255, "", "connection closed"),
+            subprocess.CompletedProcess([], 0, "", ""),
+        ]
+
+        def monotonic() -> float:
+            return now[0]
+
+        def sleep(seconds: float) -> None:
+            now[0] += seconds
+
+        def probe(_timeout: int) -> subprocess.CompletedProcess[str]:
+            return attempts.pop(0)
+
+        with (
+            patch.object(BENCH.time, "monotonic", side_effect=monotonic),
+            patch.object(BENCH.time, "sleep", side_effect=sleep) as sleep_mock,
+        ):
+            BENCH.wait_for_ssh_ready(probe, timeout_seconds=30, poll_interval_seconds=5)
+
+        self.assertEqual(now[0], 5)
+        sleep_mock.assert_called_once_with(5)
+
+    def test_stale_ssh_source_stops_before_cloud_preflight(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as temp,
+            patch.object(BENCH.urllib.request, "urlopen", return_value=BytesIO(b"8.8.8.8")),
+            patch.object(BENCH, "preflight") as preflight,
+        ):
+            results = Path(temp) / "results"
+            code = BENCH.main([
+                "--project", "project", "--zone", "us-central1-a", "--commit", "a" * 40,
+                "--ssh-source-range", "9.9.9.9/32", "--preflight-only",
+                "--results-dir", str(results),
+            ])
+            self.assertEqual(code, 2)
+            preflight.assert_not_called()
+            failure = json.loads((results / "preflight-failure.json").read_text())
+            self.assertIn("outside --ssh-source-range", failure["error"])
+            self.assertFalse(failure["vm_created"])
+
+    def test_auto_ssh_source_range_resolves_current_public_ipv4_as_host_rule(self) -> None:
+        with patch.object(BENCH.urllib.request, "urlopen", return_value=BytesIO(b"8.8.8.8\n")) as lookup:
+            args = BENCH.parse_args([
+                "--project", "project", "--zone", "us-central1-a", "--commit", "a" * 40,
+                "--ssh-source-range", "auto", "--preflight-only",
+            ])
+
+        self.assertEqual(args.ssh_source_range, "8.8.8.8/32")
+        lookup.assert_called_once()
+        self.assertEqual(lookup.call_args.args[0].full_url, BENCH.PUBLIC_IPV4_LOOKUP_URL)
+        self.assertEqual(lookup.call_args.kwargs["timeout"], 10)
+
+    def test_auto_ssh_source_range_rejects_non_global_or_non_ipv4_response(self) -> None:
+        for response in (b"2001:4860:4860::8888", b"192.168.1.2", b"224.0.0.1", b"not-an-ip"):
+            with self.subTest(response=response), patch.object(
+                BENCH.urllib.request, "urlopen", return_value=BytesIO(response),
+            ), self.assertRaises(BENCH.BenchError):
+                BENCH.resolve_ssh_source_range("auto")
+
+    def test_auto_ssh_source_range_wraps_incomplete_lookup_response(self) -> None:
+        class IncompleteReadResponse(BytesIO):
+            def read(self, _size: int = -1) -> bytes:
+                raise BENCH.http.client.IncompleteRead(b"8.8.")
+
+        with patch.object(
+            BENCH.urllib.request, "urlopen", return_value=IncompleteReadResponse(),
+        ), self.assertRaisesRegex(BENCH.BenchError, "no cloud resources were created"):
+            BENCH.resolve_ssh_source_range("auto")
+
+    def test_auto_ssh_source_range_lookup_failure_fails_closed(self) -> None:
+        with patch.object(BENCH.urllib.request, "urlopen", side_effect=TimeoutError("lookup timed out")):
+            with self.assertRaisesRegex(BENCH.BenchError, "no cloud resources were created"):
+                BENCH.resolve_ssh_source_range("auto")
+
     def test_point_borrowed_summary_columns_cover_run_metadata(self) -> None:
         schedule_row = build_point_borrowed_input_schedule((1, 8, 16))[0]
         metadata = {
@@ -420,6 +647,584 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
             BENCH.parse_args([*common, "--v8-mutex-diagnostic", "--writers", "8"])
         with self.assertRaises(SystemExit):
             BENCH.parse_args([*common, "--v8-mutex-diagnostic", "--num", "750000"])
+
+        cpu_attribution = BENCH.parse_args([*common, "--v8-point-cpu-attribution"])
+        self.assertEqual(cpu_attribution.num, V8_POINT_CPU_ATTRIBUTION_NUM)
+        self.assertEqual(cpu_attribution.writers, V8_POINT_CPU_ATTRIBUTION_WRITERS)
+        self.assertEqual(cpu_attribution.machine_type, "c4-standard-16-lssd")
+        cpu_attribution_subset = BENCH.parse_args([
+            *common, "--v8-point-cpu-attribution", "--writers", "8", "16",
+        ])
+        self.assertEqual(cpu_attribution_subset.writers, (8, 16))
+        with self.assertRaises(SystemExit):
+            BENCH.parse_args([*common, "--v8-point-cpu-attribution", "--writers", "2"])
+        with self.assertRaises(SystemExit):
+            BENCH.parse_args([*common, "--v8-point-cpu-attribution", "--num", "750000"])
+
+    def test_v8_point_cpu_attribution_plan_and_commands_are_fixed_and_counterbalanced(self) -> None:
+        schedule = build_v8_point_cpu_attribution_schedule()
+        self.assertEqual(len(schedule), 8)
+        self.assertEqual({row["writer"] for row in schedule}, set(V8_POINT_CPU_ATTRIBUTION_WRITERS))
+        self.assertEqual({row["num"] for row in schedule}, {V8_POINT_CPU_ATTRIBUTION_NUM})
+        self.assertEqual({row["sample_every"] for row in schedule}, {V8_POINT_CPU_ATTRIBUTION_SAMPLE_EVERY})
+        for index, writer in enumerate(V8_POINT_CPU_ATTRIBUTION_WRITERS):
+            pair = [row["arm"] for row in schedule if row["writer"] == writer]
+            expected = (
+                ["v7_parallel", "v8_point_lookahead_direct"] if index % 2 == 0 else
+                ["v8_point_lookahead_direct", "v7_parallel"]
+            )
+            self.assertEqual(pair, expected)
+            for arm in pair:
+                row = next(row for row in schedule if row["writer"] == writer and row["arm"] == arm)
+                command = build_cpu_attribution_command(Path("write-perf"), row, Path("dbs"))
+                self.assertIn("--wal-cpu-attribution-sample-every", command)
+                self.assertIn(str(V8_POINT_CPU_ATTRIBUTION_SAMPLE_EVERY), command)
+                self.assertIn("--wal-sync-diagnostics", command)
+                self.assertIn(f"--threads", command)
+                self.assertIn(str(writer), command)
+                self.assertIn("--wal-completion-timeline", command)
+
+        plan = build_v8_point_cpu_attribution_plan(
+            machine_type="c4-standard-16-lssd",
+            machine_spec=BENCH.MACHINE_SPECS["c4-standard-16-lssd"],
+            commit="a" * 40,
+            binary_sha256="b" * 64,
+        )
+        self.assertEqual(plan["runs_planned"], 8)
+        self.assertTrue(plan["diagnostic_only"])
+        self.assertEqual(plan["v8_configuration"]["frontier_mode"], "direct")
+
+        rows = [{
+            "writer": row["writer"], "workload": row["workload"], "repetition": row["repetition"],
+            "arm": row["arm"], "ops": row["num"], "sample_every": row["sample_every"],
+            "exit_code": 0, "wal_cpu_attribution_valid": True,
+        } for row in schedule]
+        self.assertTrue(validate_v8_point_cpu_attribution_rows(rows)["complete"])
+        self.assertFalse(validate_v8_point_cpu_attribution_rows(rows[:-1])["complete"])
+
+        repeated_schedule = build_v8_point_cpu_attribution_schedule((8, 16), repetitions=3)
+        self.assertEqual(len(repeated_schedule), 12)
+        self.assertEqual({row["repetition"] for row in repeated_schedule}, {1, 2, 3})
+        self.assertEqual(len({cpu_attribution_run_id(row) for row in repeated_schedule}), 12)
+        for row in repeated_schedule:
+            expected_run_id = f"r{row['repetition']}-w{row['writer']}-point-{row['arm']}"
+            self.assertEqual(BENCH._run_identifier(row, "v8-point-cpu-attribution"), expected_run_id)
+            self.assertEqual(BENCH._summary_row_identifier(row, "v8-point-cpu-attribution"), expected_run_id)
+        repeated_rows = [{
+            "writer": row["writer"], "workload": row["workload"], "repetition": row["repetition"],
+            "arm": row["arm"], "ops": row["num"], "sample_every": row["sample_every"],
+            "exit_code": 0, "wal_cpu_attribution_valid": True,
+        } for row in repeated_schedule]
+        self.assertTrue(validate_v8_point_cpu_attribution_rows(repeated_rows, (8, 16), 3)["complete"])
+        repeated_plan = build_v8_point_cpu_attribution_plan(
+            machine_type="c4-standard-16-lssd",
+            machine_spec=BENCH.MACHINE_SPECS["c4-standard-16-lssd"],
+            writers=(8, 16),
+            repetitions=3,
+        )
+        self.assertEqual(repeated_plan["runs_planned"], 12)
+        with self.assertRaises(ValueError):
+            build_v8_point_cpu_attribution_schedule((8, 16), repetitions=0)
+
+    def test_v8_durability_phase_validation_matches_serialized_schema(self) -> None:
+        # Rust phase records are emitted only after completed advances and use integer timing/count fields.
+        phase = {field: 10 for field in cpu_attribution_runner.V8_DURABILITY_FIELDS}
+        diagnostics = {
+            "sample_every": V8_POINT_CPU_ATTRIBUTION_SAMPLE_EVERY,
+            "sampled_advances": 1,
+            "dropped_samples": 0,
+            "phases": [phase],
+        }
+        _validate_v8_durability_phase_samples(diagnostics)
+
+        diagnostics["phases"] = ["not a phase record"]
+        with self.assertRaisesRegex(ValueError, "missing or incomplete"):
+            _validate_v8_durability_phase_samples(diagnostics)
+
+        diagnostics["phases"] = [{key: value for key, value in phase.items() if key != "driver_cpu_ns"}]
+        with self.assertRaisesRegex(ValueError, "missing or invalid summary field"):
+            _validate_v8_durability_phase_samples(diagnostics)
+
+        diagnostics["phases"] = [{**phase, "driver_cpu_ns": True}]
+        with self.assertRaisesRegex(ValueError, "missing or invalid summary field"):
+            _validate_v8_durability_phase_samples(diagnostics)
+
+        diagnostics["phases"] = [{**phase, "succeeded": False}]
+        with self.assertRaisesRegex(ValueError, "reports a failed advance"):
+            _validate_v8_durability_phase_samples(diagnostics)
+
+    def test_sync_decision_validation_requires_complete_prefix_snapshot(self) -> None:
+        observation = {
+            "captured_target": 11,
+            "decision_ticket_start": 10,
+            "sync_decision_monotonic_ns": 123456,
+            "written_frontier_start": 10,
+            "written_frontier_end": 11,
+            "admitted_ticket_count": 3,
+            "frames_ready_prefix_tickets": 3,
+            "data_complete_prefix_tickets": 1,
+            "durability_ready_prefix_tickets": 1,
+            "data_hol_blocker_ticket": 11,
+            "data_hol_blocker_frames_ready": True,
+            "data_hol_blocker_digest_folded": None,
+            "data_hol_blocker_data_write_elapsed_ns": None,
+            "next_ticket_present": True,
+            "next_ticket_frames_ready": True,
+            "next_ticket_data_complete": False,
+            "succeeded": True,
+        }
+        summary = cpu_attribution_runner._sync_decision_summary([observation])
+        self.assertEqual(summary["count"], 1)
+        self.assertEqual(summary["later_ticket_present_count"], 1)
+        self.assertEqual(summary["later_ticket_frames_ready_count"], 1)
+        self.assertEqual(summary["later_ticket_data_complete_count"], 0)
+
+        for invalid in (None, [], ["bad"], [{**observation, "decision_ticket_start": None}],
+                        [{**observation, "frames_ready_prefix_tickets": None}],
+                        [{**observation, "durability_ready_prefix_tickets": 2}],
+                        [{**observation, "next_ticket_present": False}],
+                        [{**observation, "succeeded": False}]):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                cpu_attribution_runner._sync_decision_summary(invalid)
+
+    def test_v8_completion_timeline_validation_and_summary(self) -> None:
+        timeline = {
+            "sample_every": cpu_attribution_runner.V8_COMPLETION_TIMELINE_SAMPLE_EVERY,
+            "dropped_samples": 0,
+            "samples": [{
+                "group_id": 7,
+                "ticket_start": 106,
+                "ticket_end": 108,
+                "request_id": 128,
+                "request_start": 128,
+                "request_end": 130,
+                "submit_to_cqe_observed_ns": 1_000,
+                "cqe_observed_to_group_finished_ns": 200,
+                "group_finished_to_result_send_start_ns": 100,
+                "result_send_start_to_reaper_recv_ns": 300,
+                "reaper_recv_to_data_complete_publish_ns": 400,
+                "data_complete_lock_wait_wall_ns": 20,
+                "data_complete_lock_wait_cpu_ns": 5,
+                "data_complete_lock_hold_wall_ns": 60,
+                "data_complete_lock_hold_cpu_ns": 40,
+                "data_complete_prefix_end_before": 100,
+                "data_complete_prefix_end_after": 100,
+                "frame_ready_monotonic_ns": 10,
+                "sqe_submitted_monotonic_ns": 20,
+                "cqe_observed_monotonic_ns": 30,
+                "data_complete_published_monotonic_ns": 40,
+                "hol_blocker_ticket": 100,
+                "hol_blocker_frames_ready": True,
+                "hol_blocker_digest_folded": True,
+                "hol_blocker_data_write_elapsed_ns": 2_000,
+                "reaper_recv_to_prefix_ready_ns": 600,
+                "prefix_ready_to_durable_ns": 3_000,
+            }],
+        }
+        summary = _completion_timeline_summary(timeline)
+        self.assertEqual(summary["sample_count"], 1)
+        self.assertEqual(summary["hol_blocker_count"], 1)
+        self.assertEqual(summary["hol_blocker_frames_ready_count"], 1)
+        self.assertEqual(summary["submit_to_cqe_observed_ns"]["p50"], 1_000)
+        self.assertEqual(summary["data_complete_prefix_growth_tickets"]["p50"], 0)
+        self.assertEqual(summary["hol_blocker_data_write_elapsed_ns"]["p50"], 2_000)
+
+        no_blocker_sample = {
+            key: value for key, value in timeline["samples"][0].items()
+            if not key.startswith("hol_blocker_")
+        }
+        no_blocker_summary = _completion_timeline_summary({
+            **timeline, "samples": [no_blocker_sample],
+        })
+        self.assertEqual(no_blocker_summary["hol_blocker_count"], 0)
+        self.assertEqual(no_blocker_summary["hol_blocker_frames_ready_count"], 0)
+        self.assertEqual(no_blocker_summary["hol_blocker_digest_folded_count"], 0)
+        self.assertEqual(no_blocker_summary["hol_blocker_data_write_elapsed_ns"]["count"], 0)
+
+        for invalid in (
+            None,
+            {**timeline, "dropped_samples": 1},
+            {**timeline, "samples": [{**timeline["samples"][0], "request_id": 129}]},
+            {**timeline, "samples": [{**timeline["samples"][0], "data_complete_lock_wait_cpu_ns": True}]},
+            {**timeline, "samples": [{**timeline["samples"][0], "hol_blocker_frames_ready": None}]},
+        ):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                _completion_timeline_summary(invalid)
+
+    def test_v8_cpu_attribution_failed_launch_writes_partial_summary_and_zero_started(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            results_dir = Path(temporary) / "results"
+            binary = Path(temporary) / "write-perf"
+            binary.write_bytes(b"fake benchmark executable")
+            binary_sha256 = hashlib.sha256(binary.read_bytes()).hexdigest()
+            args = SimpleNamespace(
+                binary=binary,
+                results_dir=results_dir,
+                db_root=Path(temporary) / "databases",
+                safe_deadline_epoch=9_999_999_999,
+                commit="a" * 40,
+                binary_sha256=binary_sha256,
+                machine_type="c4-standard-16-lssd",
+                ssd_count=2,
+                ssd_gib=750,
+                writers=V8_POINT_CPU_ATTRIBUTION_WRITERS,
+            )
+            with patch.object(
+                cpu_attribution_runner,
+                "_run_one",
+                side_effect=TimeoutError("stopping before launch"),
+            ):
+                exit_code = run_cpu_attribution_suite(args)
+
+            summary = json.loads((results_dir / "summary.json").read_text(encoding="utf-8"))
+            remote_exit = json.loads((results_dir / "remote-exit.json").read_text(encoding="utf-8"))
+            self.assertEqual(exit_code, 1)
+            self.assertFalse(summary["complete"])
+            self.assertFalse(summary["results_complete"])
+            self.assertEqual(summary["runs_completed"], 0)
+            self.assertEqual(remote_exit, {"failed": True, "runs_started": 0})
+            self.assertTrue((results_dir / "summary.tsv").is_file())
+
+    def test_v8_cpu_attribution_failed_run_uses_real_summarizer_and_counts_launch(self) -> None:
+        for failed_exit_code in (75, 65):
+            with self.subTest(exit_code=failed_exit_code), tempfile.TemporaryDirectory() as temporary:
+                results_dir = Path(temporary) / "results"
+                binary = Path(temporary) / "write-perf"
+                binary.write_bytes(b"fake benchmark executable")
+                binary_sha256 = hashlib.sha256(binary.read_bytes()).hexdigest()
+                args = SimpleNamespace(
+                    binary=binary,
+                    results_dir=results_dir,
+                    db_root=Path(temporary) / "databases",
+                    safe_deadline_epoch=9_999_999_999,
+                    commit="a" * 40,
+                    binary_sha256=binary_sha256,
+                    machine_type="c4-standard-16-lssd",
+                    ssd_count=2,
+                    ssd_gib=750,
+                    writers=V8_POINT_CPU_ATTRIBUTION_WRITERS,
+                )
+                scheduled = build_v8_point_cpu_attribution_schedule()[0]
+
+                def failed_run(**kwargs):
+                    kwargs["on_launch"]()
+                    return {**kwargs["row"], "exit_code": failed_exit_code}
+
+                with patch.object(cpu_attribution_runner, "_run_one", side_effect=failed_run):
+                    exit_code = run_cpu_attribution_suite(args)
+
+                summary = json.loads((results_dir / "summary.json").read_text(encoding="utf-8"))
+                remote_exit = json.loads((results_dir / "remote-exit.json").read_text(encoding="utf-8"))
+                self.assertEqual(exit_code, 1)
+                self.assertFalse(summary["complete"])
+                self.assertFalse(summary["results_complete"])
+                self.assertEqual(summary["runs_completed"], 1)
+                self.assertEqual(summary["results"][0]["arm"], scheduled["arm"])
+                self.assertEqual(summary["results"][0]["exit_code"], failed_exit_code)
+                self.assertEqual(remote_exit, {"failed": True, "runs_started": 1})
+
+    def test_v8_cpu_attribution_success_writes_complete_remote_exit_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            results_dir = Path(temporary) / "results"
+            binary = Path(temporary) / "write-perf"
+            binary.write_bytes(b"fake benchmark executable")
+            binary_sha256 = hashlib.sha256(binary.read_bytes()).hexdigest()
+            args = SimpleNamespace(
+                binary=binary,
+                results_dir=results_dir,
+                db_root=Path(temporary) / "databases",
+                safe_deadline_epoch=9_999_999_999,
+                commit="a" * 40,
+                binary_sha256=binary_sha256,
+                machine_type="c4-standard-16-lssd",
+                ssd_count=2,
+                ssd_gib=750,
+                writers=V8_POINT_CPU_ATTRIBUTION_WRITERS,
+            )
+
+            def successful_run(**kwargs):
+                kwargs["on_launch"]()
+                row = kwargs["row"]
+                return {
+                    **row,
+                    "ops": row["num"],
+                    "exit_code": 0,
+                    "wal_cpu_attribution_valid": True,
+                }
+
+            with patch.object(cpu_attribution_runner, "_run_one", side_effect=successful_run):
+                exit_code = run_cpu_attribution_suite(args)
+
+            summary = json.loads((results_dir / "summary.json").read_text(encoding="utf-8"))
+            remote_exit = json.loads((results_dir / "remote-exit.json").read_text(encoding="utf-8"))
+            planned = len(build_v8_point_cpu_attribution_schedule())
+            self.assertEqual(exit_code, 0)
+            self.assertTrue(summary["complete"])
+            self.assertTrue(summary["results_complete"])
+            self.assertEqual(summary["runs_completed"], planned)
+            self.assertEqual(remote_exit, {"failed": False, "runs_started": planned})
+
+    def test_v8_cpu_attribution_accepts_retried_admission_barrier_sample(self) -> None:
+        sequence = list(range(
+            V8_POINT_CPU_ATTRIBUTION_SAMPLE_EVERY,
+            V8_POINT_CPU_ATTRIBUTION_NUM + 1,
+            V8_POINT_CPU_ATTRIBUTION_SAMPLE_EVERY,
+        ))
+        producer_samples = []
+        for sample_sequence in sequence:
+            sample = {
+                "sample_sequence": sample_sequence,
+                "wal_version": 7,
+                "entry_count": 1,
+                "completed": sample_sequence != sequence[0],
+                **{field: 10 for field in cpu_attribution_runner.PRODUCER_PHASE_FIELDS},
+            }
+            if sample["completed"]:
+                sample.update({"ticket": sample_sequence, "commit_ts": sample_sequence})
+            producer_samples.append(sample)
+
+        completion_handoff_samples = [
+            {
+                "group_id": ticket,
+                "ticket_start": ticket,
+                "ticket_end": ticket + 1,
+                "worker_tid": 42,
+                "request_id": ticket,
+                "request_start": ticket,
+                "request_end": ticket + 1,
+                "sampled_ticket": ticket,
+                "frame_ready_to_submit_request_ns": 5,
+                "submit_request_to_worker_queue_ns": 6,
+                "worker_queue_to_worker_accept_ns": 7,
+                "worker_accept_to_sqe_submit_ns": 8,
+                "submit_to_cqe_observed_ns": 10,
+                "cqe_observed_to_group_finished_ns": 20,
+                "group_finished_to_result_send_start_ns": 30,
+                "result_send_start_to_receiver_ns": 40,
+                "receiver_to_data_complete_publish_ns": 9,
+                "data_complete_prefix_end_before": ticket,
+                "data_complete_prefix_end_after": ticket + 1,
+                "frame_ready_monotonic_ns": ticket + 1,
+                "sqe_submitted_monotonic_ns": ticket + 2,
+                "cqe_observed_monotonic_ns": ticket + 3,
+                "data_complete_published_monotonic_ns": ticket + 4,
+                "hol_blocker_ticket": None,
+                "publication_phases": {
+                    "v7_durability_state_lock_wait_wall_ns": 1,
+                    "v7_durability_state_lock_wait_cpu_ns": 1,
+                    "v7_durability_state_lock_hold_wall_ns": 1,
+                    "v7_durability_state_lock_hold_cpu_ns": 1,
+                    "v7_group_registration_wall_ns": 1,
+                    "v7_group_registration_cpu_ns": 1,
+                    "v7_written_frontier_advance_wall_ns": 1,
+                    "v7_written_frontier_advance_cpu_ns": 1,
+                },
+            }
+            for ticket in range(
+                0,
+                V8_POINT_CPU_ATTRIBUTION_NUM,
+                cpu_attribution_runner.V8_COMPLETION_TIMELINE_SAMPLE_EVERY,
+            )
+        ]
+
+        record = {
+            "params": {
+                "num": V8_POINT_CPU_ATTRIBUTION_NUM,
+                "threads": 16,
+                "value_size": 1024,
+                "wal_format_version": 7,
+                "wal_io_mode": "parallel",
+            },
+            "result": {
+                "ops": V8_POINT_CPU_ATTRIBUTION_NUM,
+                "ops_per_sec": 20_000,
+                "process_cpu_user_ms": 1_000,
+                "process_cpu_system_ms": 100,
+                "wal_pipeline": {
+                    "sync_count": 1,
+                    "sync_observations": [{
+                        "captured_target": 2,
+                        "decision_ticket_start": 1,
+                        "written_frontier_start": 1,
+                        "written_frontier_end": 2,
+                        "admitted_ticket_count": 2,
+                        "frames_ready_prefix_tickets": 2,
+                        "data_complete_prefix_tickets": 1,
+                        "durability_ready_prefix_tickets": 1,
+                        "next_ticket_present": True,
+                        "next_ticket_frames_ready": True,
+                        "next_ticket_data_complete": False,
+                        "sync_decision_monotonic_ns": 100,
+                        "data_hol_blocker_ticket": 2,
+                        "data_hol_blocker_frames_ready": True,
+                        "data_hol_blocker_digest_folded": None,
+                        "data_hol_blocker_data_write_elapsed_ns": None,
+                        "succeeded": True,
+                    }],
+                    "completion_handoff_timeline": {
+                        "sample_every": cpu_attribution_runner.V8_COMPLETION_TIMELINE_SAMPLE_EVERY,
+                        "dropped_samples": 0,
+                        "samples": completion_handoff_samples,
+                    },
+                    "wal_cpu_attribution": {
+                        "sample_every": V8_POINT_CPU_ATTRIBUTION_SAMPLE_EVERY,
+                        "operations_seen": V8_POINT_CPU_ATTRIBUTION_NUM + 1,
+                        "selected_producer_samples": len(producer_samples),
+                        "dropped_producer_samples": 0,
+                        "dropped_thread_samples": 0,
+                        "thread_cpu_time_supported": True,
+                        "producer_samples": producer_samples,
+                        "thread_samples": [
+                            {
+                                "role": role,
+                                "sample_sequence": 64,
+                                "work_items": 1,
+                                "thread_cpu_ns": 10,
+                                "wall_ns": 10,
+                                "completed": True,
+                            }
+                            for role in (
+                                "io_worker_completion_processing",
+                                "v7_durability_coordinator",
+                            )
+                        ],
+                    },
+                },
+            },
+            "latency": {"p50_ms": 1, "p95_ms": 2, "p99_ms": 3},
+        }
+        row = {"writer": 16, "arm": "v7_parallel"}
+
+        validated = cpu_attribution_runner._validate_record(record, row)
+
+        self.assertEqual(validated["wal_cpu_attribution_retry_attempts"], 1)
+        self.assertEqual(
+            validated["completion_handoff_timeline_summary"]["sample_count"],
+            len(completion_handoff_samples),
+        )
+        producer_summary = cpu_attribution_runner._producer_phase_summary([{
+            **validated, "arm": "v7_parallel",
+        }])
+        self.assertEqual(
+            producer_summary["v7_parallel"]["producer_total_cpu_ns"]["count"],
+            len(sequence) - 1,
+        )
+
+    def test_completion_handoff_timeline_requires_matched_complete_samples(self) -> None:
+        valid = {
+            "sample_every": cpu_attribution_runner.V8_COMPLETION_TIMELINE_SAMPLE_EVERY,
+            "dropped_samples": 0,
+            "samples": [{
+                "group_id": 7,
+                "ticket_start": 120,
+                "ticket_end": 130,
+                "worker_tid": 42,
+                "request_id": 128,
+                "request_start": 120,
+                "request_end": 131,
+                "sampled_ticket": 128,
+                "frame_ready_monotonic_ns": 10,
+                "sqe_submitted_monotonic_ns": 20,
+                "cqe_observed_monotonic_ns": 30,
+                "data_complete_published_monotonic_ns": 40,
+                "frame_ready_to_submit_request_ns": 5,
+                "submit_request_to_worker_queue_ns": 6,
+                "worker_queue_to_worker_accept_ns": 7,
+                "worker_accept_to_sqe_submit_ns": 8,
+                "submit_to_cqe_observed_ns": 10,
+                "cqe_observed_to_group_finished_ns": 20,
+                "group_finished_to_result_send_start_ns": 30,
+                "result_send_start_to_receiver_ns": 40,
+                "receiver_to_data_complete_publish_ns": 9,
+                "data_complete_prefix_end_before": 120,
+                "data_complete_prefix_end_after": 130,
+                "hol_blocker_ticket": 130,
+            }],
+        }
+        summary = _completion_handoff_timeline_summary(valid)
+        self.assertEqual(summary["sample_count"], 1)
+        self.assertEqual(summary["result_send_start_to_receiver_ns"]["p50"], 40)
+        self.assertEqual(summary["frame_ready_to_submit_request_ns"]["p50"], 5)
+        self.assertEqual(summary["unique_sampled_ticket_count"], 1)
+        no_blocker_sample = {
+            key: value for key, value in valid["samples"][0].items()
+            if key != "hol_blocker_ticket"
+        }
+        no_blocker_summary = _completion_handoff_timeline_summary({
+            **valid, "samples": [no_blocker_sample],
+        })
+        self.assertEqual(no_blocker_summary["hol_blocker_count"], 0)
+        with self.assertRaises(ValueError):
+            _completion_handoff_timeline_summary(valid, expected_operations=100_000)
+
+        invalid_timelines = (
+            None,
+            {**valid, "sample_every": 64},
+            {**valid, "dropped_samples": 1},
+            {**valid, "samples": []},
+            {**valid, "samples": [{**valid["samples"][0], "sampled_ticket": 127}]},
+            {**valid, "samples": [valid["samples"][0], valid["samples"][0]]},
+            {**valid, "samples": [{**valid["samples"][0], "ticket_end": 120}]},
+            {**valid, "samples": [{**valid["samples"][0], "receiver_to_data_complete_publish_ns": None}]},
+            {**valid, "samples": [{**valid["samples"][0], "data_complete_prefix_end_after": 119}]},
+            {**valid, "samples": [{**valid["samples"][0], "result_send_start_to_receiver_ns": -1}]},
+        )
+        for timeline in invalid_timelines:
+            with self.subTest(timeline=timeline), self.assertRaises(ValueError):
+                _completion_handoff_timeline_summary(timeline)
+
+    def test_same_ticket_hol_join_classifies_stage_at_sync_snapshot(self) -> None:
+        observation = {
+            "data_hol_blocker_ticket": 32,
+            "sync_decision_monotonic_ns": 25,
+            "decision_ticket_start": 16,
+            "data_complete_prefix_tickets": 16,
+        }
+        timeline = {
+            "samples": [{
+                "sampled_ticket": 32,
+                "frame_ready_monotonic_ns": 10,
+                "sqe_submitted_monotonic_ns": 20,
+                "cqe_observed_monotonic_ns": 30,
+                "data_complete_published_monotonic_ns": 40,
+            }],
+        }
+
+        summary = cpu_attribution_runner._same_ticket_hol_summary([observation], timeline)
+
+        self.assertEqual(summary["matched_blocker_decision_count"], 1)
+        self.assertEqual(summary["stage_at_sync_decision"]["sqe_submitted_waiting_for_cqe"], 1)
+        self.assertEqual(summary["frame_ready_age_at_decision_ns"]["p50"], 15)
+
+    def test_v8_cpu_attribution_validates_digest_schema(self) -> None:
+        # The digest is serialized beside wal_pipeline inside result, not at the JSON record root.
+        digest = {field: 7 for field in cpu_attribution_runner.V8_DIGEST_COUNTER_FIELDS}
+        digest["cpu_timing_sample_rate"] = cpu_attribution_runner.V8_DIGEST_CPU_SAMPLE_RATE
+        self.assertEqual(
+            cpu_attribution_runner._extract_v8_digest({"wal_v8_digest": digest}, 8),
+            digest,
+        )
+        self.assertIsNone(cpu_attribution_runner._extract_v8_digest({}, 7))
+
+        invalid_results = (
+            None,
+            [],
+            {"payload_hash_cpu_ns": 7},
+            {**digest, "payload_hash_cpu_ns": True},
+            {**digest, "ordered_link_hash_cpu_ns": -1},
+            {**digest, "cpu_timing_sample_rate": 32},
+        )
+        for invalid_digest in invalid_results:
+            with self.subTest(invalid_digest=invalid_digest), self.assertRaises(ValueError):
+                cpu_attribution_runner._extract_v8_digest(
+                    {"wal_v8_digest": invalid_digest}, 8,
+                )
+
+        with self.assertRaisesRegex(ValueError, "missing fields"):
+            cpu_attribution_runner._digest_summary([{"v8_digest": {"payload_hash_cpu_ns": 7}}])
+
+        summary = cpu_attribution_runner._digest_summary([{"v8_digest": digest}])
+        self.assertEqual(summary["payload_hash_cpu_ns_per_sampled_ticket"], 1)
 
     def test_v8_mutex_diagnostic_schedule_and_validation_are_counterbalanced(self) -> None:
         schedule = build_v8_mutex_diagnostic_schedule()
@@ -2172,7 +2977,7 @@ print('[hotpath] diagnostic report follows')
                 patch.object(BENCH, "wait_for_verified_host_keys", side_effect=make_known_hosts),
                 patch.object(BENCH.subprocess, "run", side_effect=fake_keygen),
                 patch.object(BENCH, "ssh_command", return_value=success),
-                patch.object(BENCH, "scp_to_vm", return_value=success),
+                patch.object(BENCH, "stream_file_to_vm", return_value=success),
                 patch.object(BENCH, "collect_artifacts", side_effect=collect),
                 patch.object(BENCH.os, "fsync", side_effect=fsync),
                 patch.object(BENCH, "cleanup_gcp_resources", return_value=([], {}, False)) as cleanup,
@@ -2250,7 +3055,7 @@ print('[hotpath] diagnostic report follows')
                 patch.object(BENCH, "wait_for_verified_host_keys", side_effect=wait_for_host_keys),
                 patch.object(BENCH.subprocess, "run", side_effect=fake_keygen),
                 patch.object(BENCH, "ssh_command", side_effect=ssh),
-                patch.object(BENCH, "scp_to_vm", return_value=successful_ssh),
+                patch.object(BENCH, "stream_file_to_vm", return_value=successful_ssh),
                 patch.object(BENCH, "collect_artifacts", side_effect=fail_collection),
                 patch.object(BENCH, "cleanup_gcp_resources", return_value=([], {}, False)) as cleanup,
             ):
@@ -2298,7 +3103,7 @@ print('[hotpath] diagnostic report follows')
                 patch.object(BENCH, "wait_for_verified_host_keys", side_effect=wait_for_host_keys),
                 patch.object(BENCH.subprocess, "run", side_effect=fake_keygen),
                 patch.object(BENCH, "ssh_command", side_effect=ssh),
-                patch.object(BENCH, "scp_to_vm", return_value=successful_ssh),
+                patch.object(BENCH, "stream_file_to_vm", return_value=successful_ssh),
                 patch.object(BENCH, "collect_artifacts", side_effect=fail_collection),
                 patch.object(BENCH, "retained_vm_reconnect_instructions", side_effect=OSError("disk full")),
                 patch.object(BENCH, "cleanup_gcp_resources", return_value=([], {}, False)) as cleanup,
@@ -2488,13 +3293,16 @@ print('[hotpath] diagnostic report follows')
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             results = root / "remote" / "results"
-            run_dir = results / "w16-point-v8_parallel"
+            run_dir = results / "r1-w16-point-v8_parallel"
             run_dir.mkdir(parents=True)
             for name in (
                 "profile-schedule.tsv", "rust-toolchain.txt", "write-perf.sha256", "perf-version.txt",
             ):
                 (results / name).write_text("fixture\n", encoding="utf-8")
-            for name in ("stderr.log", "timeline.json", "perf.data", "perf-report.txt"):
+            for name in (
+                "stderr.log", "timeline.json", "perf.data", "perf-report.txt", "sync-observations.json",
+                "completion-timeline.json", "completion-handoff-timeline.json",
+            ):
                 (run_dir / name).write_bytes(b"capture")
             (run_dir / "ignored.db").write_bytes(b"should not be bundled")
 
@@ -2502,7 +3310,7 @@ print('[hotpath] diagnostic report follows')
             result = self._run_remote_bundle(command, results, root)
             self.assertEqual(result.returncode, 0, result.stderr)
             metadata = self._archive_metadata(result.stdout)
-            self.assertEqual(metadata["ARCHIVE_FILES"], "8")
+            self.assertEqual(metadata["ARCHIVE_FILES"], "11")
             archive = Path(metadata["ARCHIVE_PATH"])
             self.assertEqual(archive.parent, root / "remote-tmp")
             with tarfile.open(archive, "r:gz") as bundle:
@@ -2510,8 +3318,11 @@ print('[hotpath] diagnostic report follows')
             for name in (
                 "results/profile-schedule.tsv", "results/rust-toolchain.txt",
                 "results/write-perf.sha256", "results/perf-version.txt",
-                "results/w16-point-v8_parallel/stderr.log", "results/w16-point-v8_parallel/timeline.json",
-                "results/w16-point-v8_parallel/perf.data", "results/w16-point-v8_parallel/perf-report.txt",
+                "results/r1-w16-point-v8_parallel/stderr.log", "results/r1-w16-point-v8_parallel/timeline.json",
+                "results/r1-w16-point-v8_parallel/perf.data", "results/r1-w16-point-v8_parallel/perf-report.txt",
+                "results/r1-w16-point-v8_parallel/sync-observations.json",
+                "results/r1-w16-point-v8_parallel/completion-timeline.json",
+                "results/r1-w16-point-v8_parallel/completion-handoff-timeline.json",
             ):
                 self.assertIn(name, names)
             self.assertFalse(any(name.endswith("ignored.db") for name in names))
@@ -2520,6 +3331,12 @@ print('[hotpath] diagnostic report follows')
             rejected = self._run_remote_bundle(too_small, results, root)
             self.assertNotEqual(rejected.returncode, 0)
             self.assertIn("exceeds 1 byte limit", rejected.stderr)
+
+    def test_remote_cpu_attribution_runner_receives_requested_repetitions(self) -> None:
+        remote_script = Path(BENCH.__file__).with_name("gcp-free-trial-wal-bench-remote.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('--repetitions "$BENCH_REPETITIONS"', remote_script)
 
     def test_collection_retries_and_preserves_partial_bundle_for_recovery(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -2542,11 +3359,11 @@ print('[hotpath] diagnostic report follows')
                 archives[metadata["ARCHIVE_PATH"]] = Path(metadata["ARCHIVE_PATH"])
                 return packed
 
-            def scp(_ip, remote, destination, _key, _known_hosts, *, recursive=False, timeout):
+            def transfer(_ip, remote, destination, _key, _known_hosts, *, recursive=False, timeout):
                 nonlocal calls
                 self.assertFalse(recursive)
                 self.assertEqual(events[-1], "audit")
-                events.append("scp")
+                events.append("ssh-stream")
                 if remote.endswith(".tar.gz"):
                     calls += 1
                     if calls == 1:
@@ -2558,7 +3375,7 @@ print('[hotpath] diagnostic report follows')
 
             with (
                 patch.object(BENCH, "ssh_command", side_effect=pack),
-                patch.object(BENCH, "scp_from_vm", side_effect=scp),
+                patch.object(BENCH, "stream_file_from_vm", side_effect=transfer),
                 patch.object(BENCH.time, "sleep"),
             ):
                 result = BENCH.collect_artifacts(
@@ -2573,7 +3390,7 @@ print('[hotpath] diagnostic report follows')
             self.assertEqual(calls, 2)
             self.assertEqual(
                 events,
-                ["audit", "ssh", "audit", "scp", "audit", "ssh", "audit", "scp", "audit", "scp"],
+                ["audit", "ssh", "audit", "ssh-stream", "audit", "ssh", "audit", "ssh-stream", "audit", "ssh-stream"],
             )
 
     def test_collection_rejects_complete_summary_with_missing_run_metadata(self) -> None:
@@ -2588,7 +3405,7 @@ print('[hotpath] diagnostic report follows')
                 archives[metadata["ARCHIVE_PATH"]] = Path(metadata["ARCHIVE_PATH"])
                 return packed
 
-            def scp(_ip, remote, destination, _key, _known_hosts, *, recursive=False, timeout):
+            def transfer(_ip, remote, destination, _key, _known_hosts, *, recursive=False, timeout):
                 self.assertFalse(recursive)
                 if remote in archives:
                     shutil.copyfile(archives[remote], destination)
@@ -2598,7 +3415,7 @@ print('[hotpath] diagnostic report follows')
 
             with (
                 patch.object(BENCH, "ssh_command", side_effect=pack),
-                patch.object(BENCH, "scp_from_vm", side_effect=scp),
+                patch.object(BENCH, "stream_file_from_vm", side_effect=transfer),
                 patch.object(BENCH.time, "sleep"),
             ):
                 result = BENCH.collect_artifacts(
@@ -2648,7 +3465,7 @@ print('[hotpath] diagnostic report follows')
                 archives[metadata["ARCHIVE_PATH"]] = Path(metadata["ARCHIVE_PATH"])
                 return packed
 
-            def scp(_ip, remote, destination, _key, _known_hosts, *, recursive=False, timeout):
+            def transfer(_ip, remote, destination, _key, _known_hosts, *, recursive=False, timeout):
                 self.assertFalse(recursive)
                 if remote in archives:
                     shutil.copyfile(archives[remote], destination)
@@ -2658,7 +3475,7 @@ print('[hotpath] diagnostic report follows')
 
             with (
                 patch.object(BENCH, "ssh_command", side_effect=pack),
-                patch.object(BENCH, "scp_from_vm", side_effect=scp),
+                patch.object(BENCH, "stream_file_from_vm", side_effect=transfer),
                 patch.object(BENCH.time, "sleep"),
             ):
                 result = BENCH.collect_artifacts(
@@ -2701,6 +3518,24 @@ print('[hotpath] diagnostic report follows')
             self.assertFalse(mismatched_exit["verified"])
             self.assertTrue(any("remote exit run count does not match the plan" in error
                                 for error in mismatched_exit["errors"]))
+
+    def test_run_directory_validation_accepts_w_and_r_ids_and_reports_missing_and_extra(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            results = Path(temp)
+            expected_ids = {
+                "w16-point-r1-v7_parallel",
+                "r1-w8-point-v7_parallel",
+            }
+            for run_id in expected_ids:
+                (results / run_id).mkdir()
+
+            self.assertEqual(BENCH._run_directory_delta(results, expected_ids), ([], []))
+
+            (results / "r1-w8-point-v7_parallel").rmdir()
+            (results / "r2-w16-point-v8_candidate").mkdir()
+            missing, unexpected = BENCH._run_directory_delta(results, expected_ids)
+            self.assertEqual(missing, ["r1-w8-point-v7_parallel"])
+            self.assertEqual(unexpected, ["r2-w16-point-v8_candidate"])
 
     def test_result_verifier_accepts_csv_string_exit_code_in_summary(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -2774,7 +3609,7 @@ print('[hotpath] diagnostic report follows')
                 archives[metadata["ARCHIVE_PATH"]] = Path(metadata["ARCHIVE_PATH"])
                 return packed
 
-            def scp(_ip, remote, destination, _key, _known_hosts, *, recursive=False, timeout):
+            def transfer(_ip, remote, destination, _key, _known_hosts, *, recursive=False, timeout):
                 if remote in archives:
                     shutil.copyfile(archives[remote], destination)
                     with destination.open("ab") as stream:
@@ -2785,7 +3620,7 @@ print('[hotpath] diagnostic report follows')
 
             with (
                 patch.object(BENCH, "ssh_command", side_effect=pack),
-                patch.object(BENCH, "scp_from_vm", side_effect=scp),
+                patch.object(BENCH, "stream_file_from_vm", side_effect=transfer),
                 patch.object(BENCH.time, "sleep"),
             ):
                 result = BENCH.collect_artifacts(
@@ -2805,7 +3640,7 @@ print('[hotpath] diagnostic report follows')
             key.write_text("private", encoding="utf-8")
             known_hosts.write_text("host-key", encoding="utf-8")
 
-            def scp(_ip, remote, destination, _key, _known_hosts, *, recursive=False, timeout):
+            def transfer(_ip, remote, destination, _key, _known_hosts, *, recursive=False, timeout):
                 self.assertFalse(recursive)
                 self.assertEqual(remote, "/var/log/gcp-free-trial-wal-bench.log")
                 destination.write_text(
@@ -2819,7 +3654,7 @@ print('[hotpath] diagnostic report follows')
                     "ssh_command",
                     return_value=subprocess.CompletedProcess([], 1, "", "Local SSD setup failed"),
                 ),
-                patch.object(BENCH, "scp_from_vm", side_effect=scp),
+                patch.object(BENCH, "stream_file_from_vm", side_effect=transfer),
                 patch.object(BENCH.time, "sleep"),
             ):
                 result = BENCH.collect_artifacts("192.0.2.1", key, known_hosts, root, before_connect=lambda: None)
@@ -2849,8 +3684,8 @@ print('[hotpath] diagnostic report follows')
                     archives[metadata["ARCHIVE_PATH"]] = Path(metadata["ARCHIVE_PATH"])
                     return result
 
-                def scp(_ip, remote, destination, _key, _known_hosts, *, recursive=False, timeout):
-                    events.append("scp")
+                def transfer(_ip, remote, destination, _key, _known_hosts, *, recursive=False, timeout):
+                    events.append("ssh-stream")
                     self.assertFalse(recursive)
                     if remote in archives:
                         shutil.copyfile(archives[remote], destination)
@@ -2860,7 +3695,7 @@ print('[hotpath] diagnostic report follows')
 
                 with (
                     patch.object(BENCH, "ssh_command", side_effect=pack),
-                    patch.object(BENCH, "scp_from_vm", side_effect=scp),
+                    patch.object(BENCH, "stream_file_from_vm", side_effect=transfer),
                 ):
                     with self.assertRaisesRegex(BENCH.BenchError, "SSH firewall policy changed"):
                         BENCH.collect_artifacts(

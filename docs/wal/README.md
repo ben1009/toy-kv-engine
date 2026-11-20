@@ -79,6 +79,13 @@ the retained and rejected experiments.
 
 ## Benchmarks and qualification
 
+- [V8 Point ticket lookup A/B on GCP](benchmarks/rfc-026-v8-ticket-index-gcp-20261120.md)
+- [V7/V8 Point Frame Finish to DATA submission on GCP](benchmarks/rfc-026-v8-frame-finish-gcp-20261120.md)
+- [V7/V8 Point worker notifications on GCP](benchmarks/rfc-026-v7-v8-worker-notifications-gcp-20261120.md)
+- [V8 Point 3 μs DATA Group Join on GCP](benchmarks/rfc-026-v8-point-short-group-join-gcp-20261120.md)
+- [V7/V8 cumulative thread CPU on GCP](benchmarks/rfc-026-v7-v8-thread-role-cpu-gcp-20261120.md)
+- [V7/V8 cumulative writer-stage CPU on GCP](benchmarks/rfc-026-v7-v8-writer-stage-cpu-gcp-20261120.md)
+- [V7/V8 completion and durability CPU diagnosis on GCP](benchmarks/rfc-026-v7-v8-completion-durability-cpu-gcp-20261120.md)
 - [GCP Free Trial WAL benchmark runner](benchmarks/gcp-free-trial-wal-bench.md)
 - [RFC 026 GCP V8 point sync diagnostic, 2026-11-10](benchmarks/rfc-026-v8-point-sync-gcp-20261110.md)
 - [RFC 026 V8 FRONTIER I/O A/B on GCP, 2026-11-11](benchmarks/rfc-026-v8-frontier-io-ab-gcp-20261111.md)
@@ -107,6 +114,9 @@ the retained and rejected experiments.
 - [RFC 026 V8 Point retirement credit batching A/B on GCP, 2026-11-17](benchmarks/rfc-026-v8-point-retirement-credit-batching-gcp-20261117.md)
 - [RFC 026 V8 Lookahead extent-policy scan diagnostic on GCP, 2026-11-18](benchmarks/rfc-026-v8-lookahead-policy-scan-gcp-20261118.md)
 - [RFC 026 V8 extent-policy Vec A/B on GCP, 2026-11-18](benchmarks/rfc-026-v8-extent-policy-vec-ab-gcp-20261118.md)
+- [RFC 026 V7/V8 Point Producer critical-path diagnosis on GCP, 2026-11-19](benchmarks/rfc-026-v7-v8-point-producer-critical-path-gcp-20261119.md)
+- [RFC 026 V7/V8 Point DATA submission and HOL timeline rerun on GCP, 2026-11-19](benchmarks/rfc-026-v7-v8-point-data-completion-hol-rerun-gcp-20261119.md)
+- [RFC 026 V7/V8 Point same-ticket DATA HOL diagnosis on GCP, 2026-11-20](benchmarks/rfc-026-v7-v8-point-hol-ticket-gcp-20261120.md)
 - [RFC 026 V8 Point DATA group join experiment on GCP, 2026-11-17](benchmarks/rfc-026-v8-point-data-group-gcp-20261117.md)
 - [RFC 026 V8 batched durable-guard check GCP A/B, 2026-11-15](benchmarks/rfc-026-v8-durable-guard-check-gcp-20261115.md)
 - [RFC 026 full WAL matrix rerun on GCP, 2026-11-15](benchmarks/rfc-026-v8-durable-guard-full-matrix-gcp-20261115.md)
@@ -243,6 +253,7 @@ experiments. Each report records its own outcome and measurement limits.
 - [Context switches and worker retirement, 2026-10-04](experiments/rfc-024-context-switch-and-worker-retirement-20261004.md)
 - [RFC 026 Point borrowed-input experiment — no stable gain, 2026-11-18](experiments/rfc-026-point-borrowed-input-gcp-20261118.md)
 - [RFC 026 V8 Point single-frame direct encoding GCP qualification — below throughput gate, 2026-11-18](experiments/rfc-026-point-direct-frame-v1-20261118.md)
+- [RFC 026 V7/V8 Point admission and sync diagnostic — sequencer wait is real but not demonstrably saturated, 2026-11-19](experiments/rfc-026-v8-point-admission-sync-diagnostic-20261119.md)
 - [Deferred task work with native completion waiting](experiments/rfc-024-deferred-ring-wait-20261003.md)
 - [Extent preparation for large batches](experiments/rfc-024-large-batch-preallocation-20261004.md)
 - [Native forced-async kernel dispatch, 2026-10-06](experiments/rfc-024-native-async-kernel-dispatch-20261006.md)

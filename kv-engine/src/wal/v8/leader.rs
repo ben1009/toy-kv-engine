@@ -2437,6 +2437,8 @@ struct WalV8ParallelFrontier {
 struct PendingV8DataWrite {
     file_offset: u64,
     buffer: WalV8DataBuffer,
+    #[cfg(feature = "bench")]
+    frame_ready_at: Option<Instant>,
 }
 
 /// V8 accounts DATA frame buffers per admitted ticket, so completed buffers
@@ -2570,11 +2572,31 @@ impl WalV8ParallelIo {
         let completion_thread = thread::Builder::new()
             .name("wal-v8-completion-reaper".to_owned())
             .spawn(move || {
+                #[cfg(feature = "bench")]
+                let mut completion_timeline_enabled = None;
                 while let Ok(result) = completions.recv() {
                     #[cfg(feature = "bench")]
-                    let timeline = completion_progress
-                        .take_completion_timeline(result.group_id, Instant::now());
-                    if let Err(error) = {
+                    let timeline_enabled = *completion_timeline_enabled.get_or_insert_with(|| {
+                        completion_progress.completion_timeline_sample_every() > 0
+                    });
+                    #[cfg(feature = "bench")]
+                    let reaper_recv_at = timeline_enabled.then(Instant::now);
+                    #[cfg(feature = "bench")]
+                    let mut cpu_sample = {
+                        let profile = completion_progress.profile();
+                        let work_items = result.tickets.end.saturating_sub(result.tickets.start);
+                        profile.as_ref().and_then(|profile| {
+                            profile.begin_wal_cpu_thread_sample(
+                                crate::mem_table::WalCpuThreadRole::V8CompletionReaper,
+                                work_items,
+                            )
+                        })
+                    };
+                    #[cfg(feature = "bench")]
+                    let timeline = reaper_recv_at.and_then(|received_at| {
+                        completion_progress.take_completion_timeline(result.group_id, received_at)
+                    });
+                    let reap_result = {
                         #[cfg(feature = "bench")]
                         {
                             reap_v8_group_result(&completion_coordinator, result, timeline)
@@ -2583,7 +2605,14 @@ impl WalV8ParallelIo {
                         {
                             reap_v8_group_result(&completion_coordinator, result)
                         }
-                    } {
+                    };
+                    #[cfg(feature = "bench")]
+                    if let Some(sample) = cpu_sample.as_mut()
+                        && reap_result.is_ok()
+                    {
+                        sample.mark_completed();
+                    }
+                    if let Err(error) = reap_result {
                         log::error!("v8 WAL completion reaper failed: {error:#}");
                         completion_coordinator.poison();
                     }
@@ -2746,11 +2775,19 @@ impl WalV8ParallelIo {
         }
     }
 
-    fn publish_data(&self, ticket: u64, file_offset: u64, buffer: WalV8DataBuffer) -> Result<()> {
+    fn publish_data(
+        &self,
+        ticket: u64,
+        file_offset: u64,
+        buffer: WalV8DataBuffer,
+        frame_ready_at: Option<Instant>,
+    ) -> Result<()> {
         let allocation_end = file_offset
             .checked_add(u64::try_from(buffer.len())?)
             .context("v8 worker DATA allocation end overflows")?;
         self.request_extent_preparation_through(allocation_end)?;
+        #[cfg(not(feature = "bench"))]
+        let _ = frame_ready_at;
 
         let mut submission = self.submission.lock();
         ensure!(
@@ -2764,7 +2801,9 @@ impl WalV8ParallelIo {
                     ticket,
                     PendingV8DataWrite {
                         file_offset,
-                        buffer
+                        buffer,
+                        #[cfg(feature = "bench")]
+                        frame_ready_at,
                     }
                 )
                 .is_none(),
@@ -3036,11 +3075,13 @@ impl WalV8ParallelIo {
                     .context("v8 DATA source-credit range overflows")?;
                 // The driver transfers credit for FRONTIER gaps separately.
                 self.consume_extent_source_credit(pending.file_offset, write_end)?;
-                writes.push(WriteBuffer::new(
-                    pending.buffer,
-                    pending.file_offset,
-                    write_len,
-                ));
+                let write = WriteBuffer::new(pending.buffer, pending.file_offset, write_len);
+                #[cfg(feature = "bench")]
+                let write = match pending.frame_ready_at {
+                    Some(frame_ready_at) => write.with_ticket_timeline(*ticket, frame_ready_at),
+                    None => write,
+                };
+                writes.push(write);
             }
 
             let group = WriteGroup::new_with_frontiers(
@@ -3093,7 +3134,7 @@ fn reap_v8_group_result(
     coordinator: &WalV8ParallelCoordinator,
     result: GroupWriteResult,
     #[cfg(feature = "bench")] timeline: Option<
-        crate::wal::parallel_worker::WalV8GroupCompletionTimeline,
+        crate::wal::parallel_worker::WalWorkerGroupCompletionTimeline,
     >,
 ) -> Result<()> {
     if let Some(error) = result.error {
@@ -3104,13 +3145,11 @@ fn reap_v8_group_result(
     crate::chaos::failpoint::wal_crash_point("wal_v8.parallel.after_data_write");
 
     #[cfg(feature = "bench")]
-    if let Some(timeline) = timeline {
-        coordinator.record_data_completion_timeline(timeline)?;
-    }
+    let completion = coordinator.mark_data_group_complete_with_timeline(result.tickets, timeline);
+    #[cfg(not(feature = "bench"))]
+    let completion = coordinator.mark_data_group_complete(result.tickets);
 
-    coordinator
-        .mark_data_group_complete(result.tickets)
-        .context("publish v8 DATA worker group completion")
+    completion.context("publish v8 DATA worker group completion")
 }
 
 impl Drop for WalV8ParallelIo {
@@ -3178,6 +3217,18 @@ pub(crate) struct WalV8FrameJob<'a> {
     profile: Option<Arc<crate::mem_table::WriteProfile>>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct WalV8ProducerCpuPhases {
+    pub(crate) logical_encode_wall_ns: u64,
+    pub(crate) logical_encode_cpu_ns: u64,
+    pub(crate) digest_ready_wall_ns: u64,
+    pub(crate) digest_ready_cpu_ns: u64,
+    pub(crate) frame_encode_wall_ns: u64,
+    pub(crate) frame_encode_cpu_ns: u64,
+    pub(crate) frames_ready_submit_wall_ns: u64,
+    pub(crate) frames_ready_submit_cpu_ns: u64,
+}
+
 impl WalV8FrameJob<'_> {
     pub(crate) fn assignment(&self) -> WalV8BatchAssignment {
         self.assignment
@@ -3188,22 +3239,47 @@ impl WalV8FrameJob<'_> {
     }
 
     pub(crate) fn finish(self) -> Result<digest::WalV8DigestMetrics> {
+        self.finish_with_point_direct_frame(Self::point_direct_frame_enabled())
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn finish_with_cpu_attribution(
+        self,
+    ) -> Result<(digest::WalV8DigestMetrics, WalV8ProducerCpuPhases)> {
+        let mut phases = WalV8ProducerCpuPhases::default();
+        let metrics = self.finish_with_point_direct_frame_and_phases(
+            Self::point_direct_frame_enabled(),
+            Some(&mut phases),
+        )?;
+        Ok((metrics, phases))
+    }
+
+    fn finish_with_point_direct_frame(
+        self,
+        direct_point_enabled: bool,
+    ) -> Result<digest::WalV8DigestMetrics> {
+        self.finish_with_point_direct_frame_and_phases(direct_point_enabled, None)
+    }
+
+    fn point_direct_frame_enabled() -> bool {
         #[cfg(feature = "bench")]
-        let direct_point_enabled = {
+        {
             static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
             *ENABLED.get_or_init(|| {
                 std::env::var("TOYKV_BENCH_V8_POINT_DIRECT_FRAME").as_deref() == Ok("1")
             })
-        };
+        }
         #[cfg(not(feature = "bench"))]
-        let direct_point_enabled = false;
-
-        self.finish_with_point_direct_frame(direct_point_enabled)
+        {
+            false
+        }
     }
 
-    fn finish_with_point_direct_frame(
+    fn finish_with_point_direct_frame_and_phases(
         mut self,
         direct_point_enabled: bool,
+        #[cfg(feature = "bench")] mut phases: Option<&mut WalV8ProducerCpuPhases>,
+        #[cfg(not(feature = "bench"))] _phases: Option<&mut ()>,
     ) -> Result<digest::WalV8DigestMetrics> {
         let admitted = self
             .admitted
@@ -3222,11 +3298,23 @@ impl WalV8FrameJob<'_> {
         } else {
             None
         };
+        #[cfg(feature = "bench")]
+        let encode_started = phases
+            .as_ref()
+            .map(|_| (Instant::now(), digest::thread_cpu_time_ns()));
         let encode_result = if let Some(buffer) = early_buffer.as_mut() {
             admitted.encode_point_single_frame_logical_into(buffer.as_mut_slice())
         } else {
             admitted.encode()
         };
+        #[cfg(feature = "bench")]
+        if let (Some(phases), Some((wall_started, cpu_started))) =
+            (phases.as_deref_mut(), encode_started)
+        {
+            phases.logical_encode_wall_ns =
+                wall_started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+            phases.logical_encode_cpu_ns = digest::thread_cpu_time_ns().saturating_sub(cpu_started);
+        }
         let mut encoded = match encode_result {
             Ok(encoded) => encoded,
             Err(error) => {
@@ -3234,11 +3322,23 @@ impl WalV8FrameJob<'_> {
                 return Err(error);
             }
         };
+        #[cfg(feature = "bench")]
+        let digest_started = phases
+            .as_ref()
+            .map(|_| (Instant::now(), digest::thread_cpu_time_ns()));
         let digest_ready = encoded.digest_ready()?;
         #[cfg(feature = "bench")]
         let ordered_link_hash_cpu_ns = self.coordinator.mark_digest_ready_with_cpu(digest_ready)?;
         #[cfg(not(feature = "bench"))]
         self.coordinator.mark_digest_ready(digest_ready)?;
+        #[cfg(feature = "bench")]
+        if let (Some(phases), Some((wall_started, cpu_started))) =
+            (phases.as_deref_mut(), digest_started)
+        {
+            phases.digest_ready_wall_ns =
+                wall_started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+            phases.digest_ready_cpu_ns = digest::thread_cpu_time_ns().saturating_sub(cpu_started);
+        }
         #[cfg(feature = "bench")]
         let metrics = {
             let mut metrics = encoded.digest_metrics();
@@ -3256,6 +3356,10 @@ impl WalV8FrameJob<'_> {
                     .initialize(),
             )
         };
+        #[cfg(feature = "bench")]
+        let frame_encode_started = phases
+            .as_ref()
+            .map(|_| (Instant::now(), digest::thread_cpu_time_ns()));
         if direct_point {
             if let Err(error) = encoded.finish_point_frame_in_place(data_buffer.as_mut_slice()) {
                 self.coordinator.poison();
@@ -3276,8 +3380,33 @@ impl WalV8FrameJob<'_> {
             "v8 DATA materializer returned an unexpected frame length"
         );
         data_buffer.set_len(data_len);
+        #[cfg(feature = "bench")]
+        if let (Some(phases), Some((wall_started, cpu_started))) =
+            (phases.as_deref_mut(), frame_encode_started)
+        {
+            phases.frame_encode_wall_ns =
+                wall_started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+            phases.frame_encode_cpu_ns = digest::thread_cpu_time_ns().saturating_sub(cpu_started);
+        }
+        #[cfg(feature = "bench")]
+        let frames_ready_started = phases
+            .as_ref()
+            .map(|_| (Instant::now(), digest::thread_cpu_time_ns()));
+        #[cfg(feature = "bench")]
+        let frame_ready_at = {
+            let sample_every = self.profile.as_ref().map_or(0, |profile| {
+                profile.wal_v8_completion_timeline_sample_every()
+            });
+            self.coordinator.mark_frames_ready_with_timeline_sample(
+                self.assignment.segment_ticket,
+                sample_every > 0 && self.assignment.segment_ticket.is_multiple_of(sample_every),
+            )?
+        };
+        #[cfg(not(feature = "bench"))]
         self.coordinator
             .mark_frames_ready(self.assignment.segment_ticket)?;
+        #[cfg(not(feature = "bench"))]
+        let frame_ready_at = None;
         #[cfg(feature = "bench")]
         if self
             .profile
@@ -3293,12 +3422,23 @@ impl WalV8FrameJob<'_> {
             self.coordinator.poison();
             anyhow::bail!("v8 Parallel ticket already owns a producer guard");
         }
-        let write_result =
-            self.io
-                .publish_data(ticket, self.assignment.first_data_offset, data_buffer);
+        let write_result = self.io.publish_data(
+            ticket,
+            self.assignment.first_data_offset,
+            data_buffer,
+            frame_ready_at,
+        );
         if let Err(error) = write_result {
             self.coordinator.poison();
             return Err(error).context("submit v8 Parallel DATA frames");
+        }
+
+        #[cfg(feature = "bench")]
+        if let (Some(phases), Some((wall_started, cpu_started))) = (phases, frames_ready_started) {
+            phases.frames_ready_submit_wall_ns =
+                wall_started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+            phases.frames_ready_submit_cpu_ns =
+                digest::thread_cpu_time_ns().saturating_sub(cpu_started);
         }
 
         #[cfg(feature = "bench")]
@@ -4224,6 +4364,7 @@ impl WalV8LeaderWriter {
             if profile.wal_sync_diagnostics_enabled() {
                 profile.record_wal_sync_observation(crate::mem_table::WalSyncObservation {
                     captured_target: ticket_end,
+                    decision_ticket_start: Some(self.frontier.ticket_end),
                     written_frontier_start: self.frontier.ticket_end,
                     written_frontier_end: ticket_end,
                     groups_completed: producer_completions.len() as u64,
@@ -4647,6 +4788,13 @@ impl WalV8ParallelWriter {
             let mut coalescing_wall_ns = 0_u64;
             #[cfg(feature = "bench")]
             let mut coalescing_cpu_ns = 0_u64;
+            #[cfg(feature = "bench")]
+            let mut snapshot = if diagnostics_enabled {
+                self.coordinator.frontier_ready_snapshot_with_monotonic_ns()
+            } else {
+                self.coordinator.frontier_ready_snapshot()
+            };
+            #[cfg(not(feature = "bench"))]
             let mut snapshot = self.coordinator.frontier_ready_snapshot();
             #[cfg(feature = "bench")]
             let has_ready_prefix = !snapshot.ready_prefix.is_empty();
@@ -4721,7 +4869,18 @@ impl WalV8ParallelWriter {
                 }
                 #[cfg(not(feature = "bench"))]
                 let _ = waited;
-                snapshot = self.coordinator.frontier_ready_snapshot();
+                #[cfg(feature = "bench")]
+                {
+                    snapshot = if diagnostics_enabled {
+                        self.coordinator.frontier_ready_snapshot_with_monotonic_ns()
+                    } else {
+                        self.coordinator.frontier_ready_snapshot()
+                    };
+                }
+                #[cfg(not(feature = "bench"))]
+                {
+                    snapshot = self.coordinator.frontier_ready_snapshot();
+                }
                 #[cfg(feature = "bench")]
                 if diagnostics_enabled {
                     let ready_tickets_after_coalescing = snapshot.ready_prefix.len() as u64;
@@ -4739,11 +4898,20 @@ impl WalV8ParallelWriter {
                 }
             }
             #[cfg(feature = "bench")]
-            let frontier_observation = diagnostics_enabled.then_some((
-                snapshot.admitted_ticket_count as u64,
-                snapshot.reserved_preparation_bytes,
-                snapshot.next_not_ready,
-            ));
+            let frontier_observation = diagnostics_enabled.then(|| {
+                (
+                    snapshot.admitted_ticket_count as u64,
+                    snapshot.reserved_preparation_bytes,
+                    snapshot.frames_ready_prefix_count as u64,
+                    snapshot.data_complete_prefix_count as u64,
+                    snapshot.ready_prefix.len() as u64,
+                    snapshot.next_not_ready,
+                    snapshot
+                        .snapshot_monotonic_ns
+                        .expect("diagnostic frontier snapshots capture their lock timestamp"),
+                    snapshot.data_hol_blocker,
+                )
+            });
             let ready = snapshot.ready_prefix;
 
             if ready.is_empty() {
@@ -4898,14 +5066,35 @@ impl WalV8ParallelWriter {
                 profile.record_wal_sync(groups);
                 profile.record_wal_fdatasync_ns(duration_ns);
                 if diagnostics_enabled {
-                    let (admitted_ticket_count, v8_preparation_reserved_bytes, next_ticket) =
-                        frontier_observation
-                            .expect("detailed v8 sync diagnostics capture a frontier snapshot");
+                    let (
+                        admitted_ticket_count,
+                        v8_preparation_reserved_bytes,
+                        frames_ready_prefix_tickets,
+                        data_complete_prefix_tickets,
+                        durability_ready_prefix_tickets,
+                        next_ticket,
+                        sync_decision_monotonic_ns,
+                        data_hol_blocker,
+                    ) = frontier_observation
+                        .expect("detailed v8 sync diagnostics capture a frontier snapshot");
                     profile.record_wal_sync_observation(crate::mem_table::WalSyncObservation {
                         captured_target: frontier_ticket_end,
+                        decision_ticket_start: Some(first_ticket),
+                        sync_decision_monotonic_ns: Some(sync_decision_monotonic_ns),
                         written_frontier_start: first_ticket,
                         written_frontier_end: frontier_ticket_end,
                         admitted_ticket_count,
+                        frames_ready_prefix_tickets: Some(frames_ready_prefix_tickets),
+                        data_complete_prefix_tickets: Some(data_complete_prefix_tickets),
+                        data_hol_blocker_ticket: data_hol_blocker
+                            .map(|ticket| ticket.assignment.segment_ticket),
+                        data_hol_blocker_frames_ready: data_hol_blocker
+                            .map(|ticket| ticket.frames_ready),
+                        data_hol_blocker_digest_folded: data_hol_blocker
+                            .map(|ticket| ticket.prefix_digest_after.is_some()),
+                        data_hol_blocker_data_write_elapsed_ns: data_hol_blocker
+                            .and_then(|ticket| ticket.data_write_elapsed_ns),
+                        durability_ready_prefix_tickets: Some(durability_ready_prefix_tickets),
                         v8_preparation_reserved_bytes,
                         next_ticket_present: next_ticket.is_some(),
                         next_ticket_frames_ready: next_ticket

@@ -459,6 +459,7 @@ impl WalV7LeaderWriter {
                 if profile.wal_sync_diagnostics_enabled() {
                     profile.record_wal_sync_observation(crate::mem_table::WalSyncObservation {
                         captured_target: ticket_end,
+                        decision_ticket_start: Some(previous_cursor.frontier.ticket_end),
                         written_frontier_start: previous_cursor.frontier.ticket_end,
                         written_frontier_end: ticket_end,
                         groups_covered: 1,

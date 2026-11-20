@@ -39,6 +39,8 @@ use crossbeam_queue::ArrayQueue;
 use parking_lot::{Condvar, Mutex, MutexGuard};
 use sha2::{Digest, Sha256};
 
+#[cfg(feature = "bench")]
+use super::parallel_worker::WalCompletionPublicationDetails;
 use super::{
     BUFFER_POOL_BUF_SIZE, BUFFER_POOL_CAPACITY, DirectBuf, MAX_WAL_FILE_SIZE, PREALLOC_BLOCK,
     parallel_worker::{
@@ -590,6 +592,8 @@ struct AdmittedBatch {
     ticket: u64,
     file_offset: u64,
     aligned_len: usize,
+    #[cfg(feature = "bench")]
+    frame_ready_at: Option<Instant>,
     v7_framed: bool,
     v7_allocation: Option<WalV7DataAllocation>,
     v7_input: Option<WalV7AdmittedInput>,
@@ -639,6 +643,13 @@ impl WalV7FrameJob {
                 .take()
                 .context("v7 producer job lost its logical input")?;
             frame_v7_batch(&mut batch, &input)?;
+            #[cfg(feature = "bench")]
+            if batch.frame_ready_at.is_none() {
+                let sample_every = self.inner.sync_progress.completion_timeline_sample_every();
+                if sample_every > 0 && batch.ticket.is_multiple_of(sample_every) {
+                    batch.frame_ready_at = Some(Instant::now());
+                }
+            }
             batch.v7_input = Some(input);
             batch.v7_framed = true;
             let mut admission = self.inner.admission.lock();
@@ -1643,6 +1654,8 @@ impl ParallelWalRuntime {
                 ticket,
                 file_offset: first_data_offset,
                 aligned_len: frame_bytes,
+                #[cfg(feature = "bench")]
+                frame_ready_at: None,
                 v7_framed: false,
                 v7_allocation: Some(allocation),
                 v7_input: Some(WalV7AdmittedInput {
@@ -1777,6 +1790,8 @@ impl ParallelWalRuntime {
             ticket,
             file_offset,
             aligned_len,
+            #[cfg(feature = "bench")]
+            frame_ready_at: None,
             v7_framed: false,
             v7_allocation: None,
             v7_input: None,
@@ -2254,11 +2269,17 @@ fn pack_admitted_groups(
                     .as_mut()
                     .context("v7 packer has no recovered logical prefix")?;
                 if hash_after_submit {
+                    #[cfg(feature = "bench")]
+                    let timeline_sample_every =
+                        inner.sync_progress.completion_timeline_sample_every();
+                    #[cfg(not(feature = "bench"))]
+                    let timeline_sample_every = 0;
                     frame_v7_batches_before_hash(
                         v7_batches,
                         prefix.last_commit_ts,
                         &mut packed.writes,
                         v7_hash_inputs,
+                        timeline_sample_every,
                     )?;
                     let mut admission = inner.admission.lock();
                     ensure!(
@@ -2266,7 +2287,17 @@ fn pack_admitted_groups(
                         "v7 packer already has a pending digest"
                     );
                 } else {
-                    materialize_v7_batches(v7_batches, prefix, &mut packed.writes)?;
+                    #[cfg(feature = "bench")]
+                    let timeline_sample_every =
+                        inner.sync_progress.completion_timeline_sample_every();
+                    #[cfg(not(feature = "bench"))]
+                    let timeline_sample_every = 0;
+                    materialize_v7_batches(
+                        v7_batches,
+                        prefix,
+                        &mut packed.writes,
+                        timeline_sample_every,
+                    )?;
                     publish_v7_prefix(inner, expected_ticket, prefix)?;
                 }
 
@@ -2567,7 +2598,13 @@ fn frame_v7_batch(batch: &mut AdmittedBatch, input: &WalV7AdmittedInput) -> Resu
     Ok(())
 }
 
-fn materialize_v7_batch(batch: &mut AdmittedBatch, prefix: &mut WalV7PrefixMetadata) -> Result<()> {
+fn materialize_v7_batch(
+    batch: &mut AdmittedBatch,
+    prefix: &mut WalV7PrefixMetadata,
+    timeline_sample_every: u64,
+) -> Result<()> {
+    #[cfg(not(feature = "bench"))]
+    let _ = timeline_sample_every;
     let input = batch
         .v7_input
         .take()
@@ -2577,6 +2614,13 @@ fn materialize_v7_batch(batch: &mut AdmittedBatch, prefix: &mut WalV7PrefixMetad
         "v7 packer commit timestamp does not advance"
     );
     frame_v7_batch(batch, &input)?;
+    #[cfg(feature = "bench")]
+    if batch.frame_ready_at.is_none()
+        && timeline_sample_every > 0
+        && batch.ticket.is_multiple_of(timeline_sample_every)
+    {
+        batch.frame_ready_at = Some(Instant::now());
+    }
     prefix.logical_hasher.update(input.logical_batch.as_bytes());
     prefix.last_commit_ts = input.commit_ts;
 
@@ -2591,7 +2635,10 @@ fn frame_v7_batches_before_hash(
     mut last_commit_ts: u64,
     writes: &mut WriteGroupBuffers<ParallelBuffer>,
     hash_inputs: &mut Vec<WalV7AdmittedInput>,
+    timeline_sample_every: u64,
 ) -> Result<()> {
+    #[cfg(not(feature = "bench"))]
+    let _ = timeline_sample_every;
     for mut batch in batches.drain(..) {
         let input = batch
             .v7_input
@@ -2603,12 +2650,18 @@ fn frame_v7_batches_before_hash(
         );
         last_commit_ts = input.commit_ts;
         frame_v7_batch(&mut batch, &input)?;
+        #[cfg(feature = "bench")]
+        if timeline_sample_every > 0 && batch.ticket.is_multiple_of(timeline_sample_every) {
+            batch.frame_ready_at = Some(Instant::now());
+        }
         hash_inputs.push(input);
-        writes.push(WriteBuffer::new(
-            batch.buffer,
-            batch.file_offset,
-            batch.aligned_len,
-        ));
+        let write = WriteBuffer::new(batch.buffer, batch.file_offset, batch.aligned_len);
+        #[cfg(feature = "bench")]
+        let write = match batch.frame_ready_at {
+            Some(frame_ready_at) => write.with_ticket_timeline(batch.ticket, frame_ready_at),
+            None => write,
+        };
+        writes.push(write);
     }
 
     Ok(())
@@ -2651,14 +2704,17 @@ fn materialize_v7_batches(
     batches: &mut Vec<AdmittedBatch>,
     prefix: &mut WalV7PrefixMetadata,
     writes: &mut WriteGroupBuffers<ParallelBuffer>,
+    timeline_sample_every: u64,
 ) -> Result<()> {
     for mut batch in batches.drain(..) {
-        materialize_v7_batch(&mut batch, prefix)?;
-        writes.push(WriteBuffer::new(
-            batch.buffer,
-            batch.file_offset,
-            batch.aligned_len,
-        ));
+        materialize_v7_batch(&mut batch, prefix, timeline_sample_every)?;
+        let write = WriteBuffer::new(batch.buffer, batch.file_offset, batch.aligned_len);
+        #[cfg(feature = "bench")]
+        let write = match batch.frame_ready_at {
+            Some(frame_ready_at) => write.with_ticket_timeline(batch.ticket, frame_ready_at),
+            None => write,
+        };
+        writes.push(write);
     }
 
     Ok(())
@@ -2731,21 +2787,61 @@ fn run_sync_coordinator(
 ) -> Result<()> {
     let mut last_sync_latency = None;
     let v7_layout = inner.admission.lock().v7_allocator.is_some();
+    #[cfg(feature = "bench")]
+    let mut completion_timeline_enabled = None;
 
     while let Ok(result) = completions.recv() {
+        #[cfg(feature = "bench")]
+        let timeline_enabled = *completion_timeline_enabled
+            .get_or_insert_with(|| inner.sync_progress.completion_timeline_sample_every() > 0);
+        #[cfg(not(feature = "bench"))]
+        let timeline_enabled = false;
+        #[cfg(feature = "bench")]
+        let result_recv_at = timeline_enabled.then(Instant::now);
+        #[cfg(feature = "bench")]
+        if let Some(received_at) = result_recv_at {
+            record_completion_handoff_received(&inner, &result, received_at);
+        }
+        #[cfg(feature = "bench")]
+        let mut cpu_sample = {
+            let profile = inner.sync_progress.profile();
+            profile.as_ref().and_then(|profile| {
+                profile.begin_wal_cpu_thread_sample(
+                    crate::mem_table::WalCpuThreadRole::V7DurabilityCoordinator,
+                    0,
+                )
+            })
+        };
         process_group_result(&inner, result);
         #[cfg(all(test, feature = "chaos-testing"))]
         crate::chaos::failpoint::before_parallel_wal_result_drain();
-        drain_ready_results(&inner, &completions);
+        drain_ready_results(&inner, &completions, timeline_enabled);
         let large_batch_wave = v7_layout
             && last_sync_latency.is_some_and(|latency| latency >= SYNC_COALESCE_MIN_SYNC)
             && inner.durability.state.lock().large_batch_wave;
         let coalesce_wait = sync_coalesce_wait(last_sync_latency, v7_layout, large_batch_wave);
         if let Some(wait) = coalesce_wait {
-            coalesce_before_capture(&inner, &completions, wait, v7_layout);
+            coalesce_before_capture(&inner, &completions, wait, v7_layout, timeline_enabled);
         }
-        if let Some(latency) = synchronize_written_prefix(&sync_file, &inner)? {
-            last_sync_latency = Some(latency);
+        let sync_result = synchronize_written_prefix(&sync_file, &inner);
+        #[cfg(feature = "bench")]
+        if let Some(sample) = cpu_sample.as_mut() {
+            match sync_result.as_ref() {
+                Ok(Some(sync)) => {
+                    sample.set_work_items(sync.tickets_covered);
+                    if sync.succeeded {
+                        sample.mark_completed();
+                    }
+                }
+                // A coordinator iteration that finds no eligible written
+                // prefix is still a successfully completed sample. It simply
+                // covered no durable tickets in this iteration.
+                Ok(None) => sample.mark_completed(),
+                Err(_) => {}
+            }
+        }
+        if let Some(sync) = sync_result? {
+            last_sync_latency = Some(sync.latency);
         }
     }
 
@@ -2762,6 +2858,7 @@ fn coalesce_before_capture(
     completions: &Receiver<GroupWriteResult>,
     wait: Duration,
     v7_layout: bool,
+    completion_timeline_enabled: bool,
 ) {
     if v7_layout {
         let target = {
@@ -2782,11 +2879,11 @@ fn coalesce_before_capture(
             }
         }
     }
-    coalesce_admitted_prefix(inner, completions, wait);
+    coalesce_admitted_prefix(inner, completions, wait, completion_timeline_enabled);
     // Coalescing may return at its captured admission cutoff while later
     // results are queued. Bound this drain to its initial length so new
     // completions cannot extend the optional window indefinitely.
-    drain_results_at_capture(inner, completions);
+    drain_results_at_capture(inner, completions, completion_timeline_enabled);
 }
 
 fn sync_coalesce_wait(
@@ -2811,7 +2908,11 @@ fn coalesce_admitted_prefix(
     inner: &RuntimeInner,
     completions: &Receiver<GroupWriteResult>,
     wait: Duration,
+    completion_timeline_enabled: bool,
 ) {
+    #[cfg(not(feature = "bench"))]
+    let _ = completion_timeline_enabled;
+
     {
         let state = inner.durability.state.lock();
         if state.poison_ticket.is_some() || state.written_frontier <= state.durable_frontier {
@@ -2849,6 +2950,11 @@ fn coalesce_admitted_prefix(
         let wait_started = profile.as_ref().map(|_| Instant::now());
         let result = completions.recv_timeout(remaining);
         #[cfg(feature = "bench")]
+        if completion_timeline_enabled && let Ok(group_result) = &result {
+            let received_at = Instant::now();
+            record_completion_handoff_received(inner, group_result, received_at);
+        }
+        #[cfg(feature = "bench")]
         if let (Some(profile), Some(started)) = (profile, wait_started) {
             profile.record_wal_sync_coalesce_wait(
                 started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
@@ -2874,26 +2980,82 @@ fn has_pending_v7_preparations(admission: &AdmissionState, durable: u64) -> bool
             })
 }
 
-fn drain_results_at_capture(inner: &RuntimeInner, completions: &Receiver<GroupWriteResult>) {
+fn drain_results_at_capture(
+    inner: &RuntimeInner,
+    completions: &Receiver<GroupWriteResult>,
+    completion_timeline_enabled: bool,
+) {
+    #[cfg(not(feature = "bench"))]
+    let _ = completion_timeline_enabled;
     for _ in 0..completions.len() {
         let Ok(result) = completions.try_recv() else {
             break;
         };
+        #[cfg(feature = "bench")]
+        if completion_timeline_enabled {
+            let received_at = Instant::now();
+            record_completion_handoff_received(inner, &result, received_at);
+        }
         process_group_result(inner, result);
     }
 }
 
-fn drain_ready_results(inner: &RuntimeInner, completions: &Receiver<GroupWriteResult>) {
+fn drain_ready_results(
+    inner: &RuntimeInner,
+    completions: &Receiver<GroupWriteResult>,
+    completion_timeline_enabled: bool,
+) {
+    #[cfg(not(feature = "bench"))]
+    let _ = completion_timeline_enabled;
     while let Ok(result) = completions.try_recv() {
+        #[cfg(feature = "bench")]
+        if completion_timeline_enabled {
+            let received_at = Instant::now();
+            record_completion_handoff_received(inner, &result, received_at);
+        }
         process_group_result(inner, result);
     }
+}
+
+#[cfg(feature = "bench")]
+fn record_completion_handoff_received(
+    inner: &RuntimeInner,
+    result: &GroupWriteResult,
+    received_at: Instant,
+) {
+    inner
+        .sync_progress
+        .mark_completion_timeline_received(result.group_id, received_at);
 }
 
 fn process_group_result(inner: &RuntimeInner, result: GroupWriteResult) {
     #[cfg(feature = "chaos-testing")]
     let result_end = result.tickets.end;
+    #[cfg(feature = "bench")]
+    let result_group_id = result.group_id;
+    #[cfg(feature = "bench")]
+    let timeline_sampled = inner.sync_progress.has_completion_timeline(result.group_id);
     let failed = result.error.is_some();
+    #[cfg(feature = "bench")]
+    let state_lock_wait_started_at = timeline_sampled.then(Instant::now);
+    #[cfg(feature = "bench")]
+    let state_lock_wait_started_cpu =
+        timeline_sampled.then(crate::wal::v8::digest::thread_cpu_time_ns);
     let mut state = inner.durability.state.lock();
+    #[cfg(feature = "bench")]
+    let state_lock_acquired_at = timeline_sampled.then(Instant::now);
+    #[cfg(feature = "bench")]
+    let state_lock_acquired_cpu = timeline_sampled.then(crate::wal::v8::digest::thread_cpu_time_ns);
+    #[cfg(feature = "bench")]
+    let data_complete_prefix_end_before = timeline_sampled.then_some(state.written_frontier);
+    #[cfg(feature = "bench")]
+    let mut data_complete_published_at = None;
+    #[cfg(feature = "bench")]
+    let mut data_complete_published_monotonic_ns = None;
+    #[cfg(feature = "bench")]
+    let mut v7_group_registration_wall_ns = None;
+    #[cfg(feature = "bench")]
+    let mut v7_group_registration_cpu_ns = None;
     #[cfg(feature = "chaos-testing")]
     let out_of_order_completion =
         result.error.is_none() && result.tickets.start > state.written_frontier;
@@ -2924,10 +3086,35 @@ fn process_group_result(inner: &RuntimeInner, result: GroupWriteResult) {
             .retain(|ticket, _| *ticket < poison_ticket);
         inner.buffer_budget.close();
     } else {
+        #[cfg(feature = "bench")]
+        let registration_started_at = timeline_sampled.then(Instant::now);
+        #[cfg(feature = "bench")]
+        let registration_started_cpu =
+            timeline_sampled.then(crate::wal::v8::digest::thread_cpu_time_ns);
         let previous = state.completed.insert(result.tickets.start, result);
         debug_assert!(previous.is_none(), "WAL group completion is unique");
+        #[cfg(feature = "bench")]
+        if timeline_sampled {
+            let registration_finished_at = Instant::now();
+            let registration_finished_cpu = crate::wal::v8::digest::thread_cpu_time_ns();
+            v7_group_registration_wall_ns = Some(completion_phase_duration_ns(
+                registration_started_at,
+                Some(registration_finished_at),
+            ));
+            v7_group_registration_cpu_ns = Some(completion_phase_cpu_ns(
+                registration_started_cpu,
+                Some(registration_finished_cpu),
+            ));
+            data_complete_published_at = Some(Instant::now());
+            data_complete_published_monotonic_ns = Some(crate::mem_table::benchmark_monotonic_ns());
+        }
     }
 
+    #[cfg(feature = "bench")]
+    let frontier_advance_started_at = timeline_sampled.then(Instant::now);
+    #[cfg(feature = "bench")]
+    let frontier_advance_started_cpu =
+        timeline_sampled.then(crate::wal::v8::digest::thread_cpu_time_ns);
     loop {
         let frontier = state.written_frontier;
         let Some(completed) = state.completed.remove(&frontier) else {
@@ -2945,12 +3132,31 @@ fn process_group_result(inner: &RuntimeInner, result: GroupWriteResult) {
             && (state.written_frontier == state.durable_frontier || state.large_batch_wave);
         state.written_frontier = completed.tickets.end;
     }
+    #[cfg(feature = "bench")]
+    let v7_written_frontier_advance_wall_ns = timeline_sampled
+        .then(|| completion_phase_duration_ns(frontier_advance_started_at, Some(Instant::now())));
+    #[cfg(feature = "bench")]
+    let v7_written_frontier_advance_cpu_ns = timeline_sampled.then(|| {
+        completion_phase_cpu_ns(
+            frontier_advance_started_cpu,
+            Some(crate::wal::v8::digest::thread_cpu_time_ns()),
+        )
+    });
     debug_assert!(state.durable_frontier <= state.written_frontier);
     if let Some(poison) = state.poison_ticket {
         debug_assert!(state.durable_frontier <= poison);
     }
     debug_assert!(state.written_frontier <= inner.admission.lock().next_ticket);
     debug_assert!(state.durable_frontier <= state.written_frontier);
+    #[cfg(feature = "bench")]
+    let data_complete_prefix_end_after = timeline_sampled.then_some(state.written_frontier);
+    #[cfg(feature = "bench")]
+    let hol_blocker_ticket = if timeline_sampled && !failed {
+        let admitted_end = inner.admission.lock().next_ticket;
+        (state.written_frontier < admitted_end).then_some(state.written_frontier)
+    } else {
+        None
+    };
     #[cfg(feature = "chaos-testing")]
     let later_group_remains_outside_prefix = state.written_frontier < result_end;
     // A successful write CQE only advances the written frontier. Durability
@@ -2959,12 +3165,83 @@ fn process_group_result(inner: &RuntimeInner, result: GroupWriteResult) {
         inner.durability.notify_change();
         inner.v7_frames_ready.notify_all();
     }
+    #[cfg(feature = "bench")]
+    let state_lock_hold_finished_at = timeline_sampled.then(Instant::now);
+    #[cfg(feature = "bench")]
+    let state_lock_hold_finished_cpu =
+        timeline_sampled.then(crate::wal::v8::digest::thread_cpu_time_ns);
     drop(state);
+
+    #[cfg(feature = "bench")]
+    if timeline_sampled {
+        if let Some(published_at) = data_complete_published_at {
+            let publication_phases = crate::mem_table::WalCompletionPublicationPhases {
+                v7_durability_state_lock_wait_wall_ns: Some(completion_phase_duration_ns(
+                    state_lock_wait_started_at,
+                    state_lock_acquired_at,
+                )),
+                v7_durability_state_lock_wait_cpu_ns: Some(completion_phase_cpu_ns(
+                    state_lock_wait_started_cpu,
+                    state_lock_acquired_cpu,
+                )),
+                v7_group_registration_wall_ns,
+                v7_group_registration_cpu_ns,
+                v7_written_frontier_advance_wall_ns,
+                v7_written_frontier_advance_cpu_ns,
+                v7_durability_state_lock_hold_wall_ns: Some(completion_phase_duration_ns(
+                    state_lock_acquired_at,
+                    state_lock_hold_finished_at,
+                )),
+                v7_durability_state_lock_hold_cpu_ns: Some(completion_phase_cpu_ns(
+                    state_lock_acquired_cpu,
+                    state_lock_hold_finished_cpu,
+                )),
+                ..Default::default()
+            };
+            if let Some(timeline) = inner.sync_progress.finish_completion_timeline(
+                result_group_id,
+                WalCompletionPublicationDetails {
+                    published_at,
+                    published_monotonic_ns: data_complete_published_monotonic_ns,
+                    prefix_end_before: data_complete_prefix_end_before.unwrap_or_default(),
+                    prefix_end_after: data_complete_prefix_end_after.unwrap_or_default(),
+                    hol_blocker_ticket,
+                    phases: publication_phases,
+                },
+            ) {
+                inner
+                    .sync_progress
+                    .record_completion_handoff_timeline(&timeline);
+            }
+        } else {
+            inner
+                .sync_progress
+                .discard_completion_timeline(result_group_id);
+        }
+    }
 
     #[cfg(feature = "chaos-testing")]
     if out_of_order_completion && later_group_remains_outside_prefix {
         crate::chaos::failpoint::wal_crash_point("parallel_wal.later_group_completed_first");
     }
+}
+
+#[cfg(feature = "bench")]
+fn completion_phase_duration_ns(start: Option<Instant>, end: Option<Instant>) -> u64 {
+    end.zip(start)
+        .map(|(end, start)| {
+            end.saturating_duration_since(start)
+                .as_nanos()
+                .min(u64::MAX as u128) as u64
+        })
+        .unwrap_or_default()
+}
+
+#[cfg(feature = "bench")]
+fn completion_phase_cpu_ns(start: Option<u64>, end: Option<u64>) -> u64 {
+    end.zip(start)
+        .map(|(end, start)| end.saturating_sub(start))
+        .unwrap_or_default()
 }
 
 fn terminalize_unresolved_prefix(inner: &RuntimeInner) {
@@ -3291,23 +3568,75 @@ fn validate_sync_diagnostics_transition(
     Ok(())
 }
 
-fn synchronize_written_prefix(sync_file: &File, inner: &RuntimeInner) -> Result<Option<Duration>> {
-    let (target, durable, poison_ticket) = {
+#[derive(Clone, Copy, Debug)]
+struct WrittenPrefixSync {
+    latency: Duration,
+    #[cfg(feature = "bench")]
+    tickets_covered: u64,
+    #[cfg(feature = "bench")]
+    succeeded: bool,
+}
+
+fn synchronize_written_prefix(
+    sync_file: &File,
+    inner: &RuntimeInner,
+) -> Result<Option<WrittenPrefixSync>> {
+    #[cfg(feature = "bench")]
+    let sync_diagnostics_enabled = inner
+        .sync_progress
+        .profile()
+        .is_some_and(|profile| profile.wal_sync_diagnostics_enabled());
+    #[cfg(feature = "bench")]
+    let mut sync_decision_monotonic_ns = None;
+    let (target, durable, poison_ticket, _written_frontier) = {
         let state = inner.durability.state.lock();
         let target = state
             .poison_ticket
             .map_or(state.written_frontier, |poison| {
                 state.written_frontier.min(poison)
             });
+        #[cfg(feature = "bench")]
+        if sync_diagnostics_enabled && target > state.durable_frontier {
+            sync_decision_monotonic_ns = Some(crate::mem_table::benchmark_monotonic_ns());
+        }
         #[cfg(all(test, feature = "chaos-testing"))]
         if state.poison_ticket.is_some() && target > state.durable_frontier {
             crate::chaos::failpoint::note_parallel_wal_sync_with_poison();
         }
-        (target, state.durable_frontier, state.poison_ticket)
+        (
+            target,
+            state.durable_frontier,
+            state.poison_ticket,
+            state.written_frontier,
+        )
     };
     if target <= durable {
         return Ok(None);
     }
+
+    #[cfg(feature = "bench")]
+    let sync_decision_snapshot = sync_diagnostics_enabled.then(|| {
+        let admission = inner.admission.lock();
+        let admitted_ticket_end = admission.next_ticket;
+        let frames_ready_ticket_end = admission.v7_ready_ticket.min(admitted_ticket_end);
+        let data_hol_blocker_ticket =
+            (_written_frontier < admitted_ticket_end).then_some(_written_frontier);
+        let data_hol_blocker_frames_ready = data_hol_blocker_ticket.map(|ticket| {
+            admission.v7_ready_ticket > ticket || admission.v7_ready_batches.contains_key(&ticket)
+        });
+        (
+            admitted_ticket_end.saturating_sub(durable),
+            frames_ready_ticket_end.saturating_sub(durable),
+            _written_frontier.saturating_sub(durable),
+            admitted_ticket_end > target,
+            frames_ready_ticket_end > target,
+            _written_frontier > target,
+            sync_decision_monotonic_ns
+                .expect("enabled sync diagnostics capture a frontier lock timestamp"),
+            data_hol_blocker_ticket,
+            data_hol_blocker_frames_ready,
+        )
+    });
 
     let frontier_cycle = if inner.admission.lock().v7_allocator.is_some() {
         let cycle = append_v7_frontier(sync_file, inner, target, durable, poison_ticket)?;
@@ -3360,22 +3689,41 @@ fn synchronize_written_prefix(sync_file: &File, inner: &RuntimeInner) -> Result<
         profile.record_wal_sync(_sync_end.groups_covered);
         profile.record_wal_fdatasync_ns(duration_ns);
         if profile.wal_sync_diagnostics_enabled() {
+            let (
+                admitted_ticket_count,
+                frames_ready_prefix_tickets,
+                data_complete_prefix_tickets,
+                next_ticket_present,
+                next_ticket_frames_ready,
+                next_ticket_data_complete,
+                sync_decision_monotonic_ns,
+                data_hol_blocker_ticket,
+                data_hol_blocker_frames_ready,
+            ) = sync_decision_snapshot
+                .expect("enabled sync diagnostics capture a V7 Parallel decision snapshot");
             profile.record_wal_sync_observation(crate::mem_table::WalSyncObservation {
                 captured_target: target,
+                decision_ticket_start: Some(durable),
+                sync_decision_monotonic_ns: Some(sync_decision_monotonic_ns),
                 written_frontier_start: _sync_end.written_frontier_start,
                 written_frontier_end: _sync_end.written_frontier_end,
-                admitted_ticket_count: 0,
+                admitted_ticket_count,
+                frames_ready_prefix_tickets: Some(frames_ready_prefix_tickets),
+                data_complete_prefix_tickets: Some(data_complete_prefix_tickets),
+                data_hol_blocker_ticket,
+                data_hol_blocker_frames_ready,
+                durability_ready_prefix_tickets: Some(target.saturating_sub(durable)),
                 v8_preparation_reserved_bytes: 0,
-                next_ticket_present: false,
-                next_ticket_frames_ready: false,
+                next_ticket_present,
+                next_ticket_frames_ready,
                 next_ticket_digest_folded: false,
-                next_ticket_data_complete: false,
+                next_ticket_data_complete,
                 next_ticket_data_write_elapsed_ns: None,
                 write_sqes_submitted: _sync_end.write_sqes_submitted,
                 write_cqes_completed: _sync_end.write_cqes_completed,
                 groups_completed: _sync_end.groups_completed,
                 groups_covered: _sync_end.groups_covered,
-                tickets_covered: None,
+                tickets_covered: Some(target.saturating_sub(durable)),
                 frontier_write_ns: 0,
                 data_completion_to_frontier_start_ns: None,
                 duration_ns,
@@ -3420,13 +3768,25 @@ fn synchronize_written_prefix(sync_file: &File, inner: &RuntimeInner) -> Result<
         drop(state);
         inner.sync_progress.mark_durable(acknowledged);
 
-        return Ok(Some(sync_latency));
+        return Ok(Some(WrittenPrefixSync {
+            latency: sync_latency,
+            #[cfg(feature = "bench")]
+            tickets_covered: acknowledged.saturating_sub(durable),
+            #[cfg(feature = "bench")]
+            succeeded: true,
+        }));
     };
 
     let message = format!("fdatasync failed: {error}");
     if let Some(cycle) = frontier_cycle {
         poison_v7_runtime(inner, Some(cycle.reservation), durable, message);
-        return Ok(Some(sync_latency));
+        return Ok(Some(WrittenPrefixSync {
+            latency: sync_latency,
+            #[cfg(feature = "bench")]
+            tickets_covered: target.saturating_sub(durable),
+            #[cfg(feature = "bench")]
+            succeeded: false,
+        }));
     }
     let mut state = inner.durability.state.lock();
     let poison = state.durable_frontier;
@@ -3446,7 +3806,13 @@ fn synchronize_written_prefix(sync_file: &File, inner: &RuntimeInner) -> Result<
     // batch into the still-open admission queue.
     inner.durability.notify_change();
 
-    Ok(Some(sync_latency))
+    Ok(Some(WrittenPrefixSync {
+        latency: sync_latency,
+        #[cfg(feature = "bench")]
+        tickets_covered: target.saturating_sub(durable),
+        #[cfg(feature = "bench")]
+        succeeded: false,
+    }))
 }
 
 fn fdatasync_file(sync_file: &File) -> io::Result<()> {
@@ -5789,7 +6155,7 @@ mod tests {
             .v7_prefix
             .as_mut()
             .expect("v7 fixture has a recovered hash");
-        super::materialize_v7_batch(&mut batch, prefix)?;
+        super::materialize_v7_batch(&mut batch, prefix, 0)?;
         inner
             .admission
             .lock()
@@ -6050,6 +6416,7 @@ mod tests {
             &runtime.inner,
             &completions,
             std::time::Duration::from_millis(1),
+            false,
         );
         {
             let state = runtime.inner.durability.state.lock();
@@ -6117,7 +6484,13 @@ mod tests {
         // F(T=1) follows D0,D1,D2. T=2 cannot retain that marker without
         // retaining excluded D2. Even with its CQE queued, skip this optional
         // window and leave the result for the next coordinator iteration.
-        super::coalesce_before_capture(&runtime.inner, &completions, Duration::from_secs(1), true);
+        super::coalesce_before_capture(
+            &runtime.inner,
+            &completions,
+            Duration::from_secs(1),
+            true,
+            false,
+        );
         assert_eq!(completions.len(), 1);
         assert!(!runtime.is_poisoned());
         let tail = runtime.logical_length();
@@ -6139,7 +6512,13 @@ mod tests {
         let admitted = take_test_ready_v7_batch(&runtime.inner);
         let last = prepare_test_v7_data(&runtime.inner, &mut packer, admitted)?;
         sender.send(finish_test_v7_data(&runtime.inner, last, None)?)?;
-        super::coalesce_before_capture(&runtime.inner, &completions, Duration::from_secs(1), true);
+        super::coalesce_before_capture(
+            &runtime.inner,
+            &completions,
+            Duration::from_secs(1),
+            true,
+            false,
+        );
         assert!(completions.is_empty());
         {
             let state = runtime.inner.durability.state.lock();
@@ -7635,6 +8014,8 @@ mod tests {
             ticket,
             file_offset,
             aligned_len,
+            #[cfg(feature = "bench")]
+            frame_ready_at: None,
             v7_framed: false,
             v7_allocation: None,
             v7_input: None,
@@ -7663,6 +8044,8 @@ mod tests {
             ticket,
             file_offset: range.start,
             aligned_len,
+            #[cfg(feature = "bench")]
+            frame_ready_at: None,
             v7_framed: false,
             v7_allocation: Some(allocation),
             v7_input: Some(super::WalV7AdmittedInput {
@@ -7870,7 +8253,8 @@ mod tests {
         assert_eq!(first_group.allocation_start, DATA_START);
         assert_eq!(first_group.reserved_end, DATA_START + FRAME);
         assert!(first_group.frontier_offsets.is_empty());
-        super::materialize_v7_batches(&mut pending, &mut prefix, &mut first_group.writes).unwrap();
+        super::materialize_v7_batches(&mut pending, &mut prefix, &mut first_group.writes, 0)
+            .unwrap();
         super::WriteGroup::new_with_frontiers(
             first_group.first_ticket..first_group.next_ticket,
             first_group.writes,
@@ -7891,7 +8275,8 @@ mod tests {
         assert_eq!(second_group.allocation_start, DATA_START + FRAME);
         assert_eq!(second_group.reserved_end, DATA_START + 4 * FRAME);
         assert_eq!(second_group.frontier_offsets, [DATA_START + FRAME]);
-        super::materialize_v7_batches(&mut pending, &mut prefix, &mut second_group.writes).unwrap();
+        super::materialize_v7_batches(&mut pending, &mut prefix, &mut second_group.writes, 0)
+            .unwrap();
         super::WriteGroup::new_with_frontiers(
             second_group.first_ticket..second_group.next_ticket,
             second_group.writes,

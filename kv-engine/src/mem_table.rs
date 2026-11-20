@@ -274,10 +274,15 @@ pub struct WriteProfile {
     /// Enables opt-in V8 ordering HOL diagnostics for benchmark runs.
     #[cfg(feature = "bench")]
     wal_hol_diagnostics_enabled: AtomicBool,
-    /// Sample one request per N io_uring user_data values for V8 completion timing.
-    /// Zero disables the timeline without adding timestamps to worker groups.
+    /// Sample one request per N io_uring user_data values for worker completion
+    /// handoff timing. Zero disables the timeline without adding timestamps to worker groups.
     #[cfg(feature = "bench")]
     wal_v8_completion_timeline_sample_every: AtomicU64,
+    /// Bounded worker-result handoff samples shared by V7 and V8 Parallel.
+    #[cfg(feature = "bench")]
+    wal_completion_handoff_timeline: Mutex<Vec<WalCompletionHandoffObservation>>,
+    #[cfg(feature = "bench")]
+    wal_completion_handoff_timeline_dropped_samples: AtomicU64,
     /// Bounded samples spanning DATA submission through durable publication.
     #[cfg(feature = "bench")]
     wal_v8_completion_timeline: Mutex<Vec<WalV8CompletionTimelineObservation>>,
@@ -287,6 +292,24 @@ pub struct WriteProfile {
     /// phase and follower timestamps.
     #[cfg(feature = "bench")]
     wal_v8_durability_sample_every: AtomicU64,
+    /// Interval for sampled Point ticket CPU attribution. Zero disables all
+    /// attribution clocks and observations.
+    #[cfg(feature = "bench")]
+    wal_cpu_attribution_sample_every: AtomicU64,
+    #[cfg(feature = "bench")]
+    wal_cpu_attribution_sequence: AtomicU64,
+    #[cfg(feature = "bench")]
+    wal_cpu_attribution_selected_samples: AtomicU64,
+    #[cfg(feature = "bench")]
+    wal_cpu_attribution_dropped_samples: AtomicU64,
+    #[cfg(feature = "bench")]
+    wal_cpu_attribution_observations: Mutex<Vec<WalCpuAttributionObservation>>,
+    #[cfg(feature = "bench")]
+    wal_cpu_thread_sample_sequences: [AtomicU64; 3],
+    #[cfg(feature = "bench")]
+    wal_cpu_thread_observations: Mutex<Vec<WalCpuThreadObservation>>,
+    #[cfg(feature = "bench")]
+    wal_cpu_thread_dropped_samples: AtomicU64,
     #[cfg(feature = "bench")]
     wal_v8_durability_driver_attempt_count: AtomicU64,
     #[cfg(feature = "bench")]
@@ -331,16 +354,40 @@ pub struct WriteProfile {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct WalSyncObservation {
     pub captured_target: u64,
+    /// Durable ticket frontier at the moment the next durability target was selected.
+    /// Prefix counts below are measured from this exclusive ticket boundary.
+    pub decision_ticket_start: Option<u64>,
+    /// CLOCK_MONOTONIC timestamp for the sync-selection snapshot.
+    pub sync_decision_monotonic_ns: Option<u64>,
     pub written_frontier_start: u64,
     pub written_frontier_end: u64,
-    /// Number of unresolved tickets admitted when a v8 FRONTIER decision was
-    /// made. Other WAL formats leave this at zero.
+    /// Number of unresolved tickets admitted when a v7/v8 parallel durability
+    /// group was selected. Other WAL formats leave this at zero.
     pub admitted_ticket_count: u64,
+    /// Contiguous admitted prefix with producer frames ready at sync selection,
+    /// measured from `decision_ticket_start`. `None` means this path does not
+    /// expose the prefix snapshot.
+    pub frames_ready_prefix_tickets: Option<u64>,
+    /// Contiguous admitted prefix whose DATA I/O had completed at sync
+    /// selection, measured from `decision_ticket_start`.
+    pub data_complete_prefix_tickets: Option<u64>,
+    /// First admitted ticket outside the contiguous DATA-complete prefix at
+    /// this decision snapshot. This is the ticket whose completion can extend
+    /// the observed DATA prefix.
+    pub data_hol_blocker_ticket: Option<u64>,
+    pub data_hol_blocker_frames_ready: Option<bool>,
+    pub data_hol_blocker_digest_folded: Option<bool>,
+    pub data_hol_blocker_data_write_elapsed_ns: Option<u64>,
+    /// Contiguous prefix eligible for the selected durability operation,
+    /// measured from `decision_ticket_start`.
+    pub durability_ready_prefix_tickets: Option<u64>,
     /// Bytes held by v8 preflight reservations that have not finished encoding.
     pub v8_preparation_reserved_bytes: u64,
-    /// Whether there is an admitted ticket beyond the candidate v8 prefix.
+    /// Whether there is an admitted ticket beyond the selected v7/v8 group.
     pub next_ticket_present: bool,
-    /// Readiness of the first admitted ticket beyond the candidate v8 prefix.
+    /// Whether the first admitted ticket beyond the selected group has a
+    /// completed producer frame. For v7 this means it is queued in `pending`;
+    /// for v8 it is the ticket's `frames_ready` state.
     pub next_ticket_frames_ready: bool,
     pub next_ticket_digest_folded: bool,
     pub next_ticket_data_complete: bool,
@@ -396,8 +443,96 @@ pub struct WalV8CompletionTimelineObservation {
     pub cqe_observed_to_group_finished_ns: u64,
     pub group_finished_to_result_send_start_ns: u64,
     pub result_send_start_to_reaper_recv_ns: u64,
+    pub reaper_recv_to_data_complete_publish_ns: u64,
+    pub data_complete_lock_wait_wall_ns: u64,
+    pub data_complete_lock_wait_cpu_ns: u64,
+    pub data_complete_lock_hold_wall_ns: u64,
+    pub data_complete_lock_hold_cpu_ns: u64,
+    pub data_complete_prefix_end_before: u64,
+    pub data_complete_prefix_end_after: u64,
+    pub hol_blocker_ticket: Option<u64>,
+    pub hol_blocker_frames_ready: Option<bool>,
+    pub hol_blocker_digest_folded: Option<bool>,
+    pub hol_blocker_data_write_elapsed_ns: Option<u64>,
     pub reaper_recv_to_prefix_ready_ns: u64,
     pub prefix_ready_to_durable_ns: u64,
+}
+
+/// One sampled worker completion handoff, with identical boundaries for V7
+/// and V8 Parallel. Durations are nanoseconds; receiver time is captured as
+/// the first operation after the completion channel receive returns.
+#[cfg(feature = "bench")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WalCompletionHandoffObservation {
+    pub group_id: u64,
+    pub ticket_start: u64,
+    pub ticket_end: u64,
+    pub worker_tid: Option<u64>,
+    pub request_id: u64,
+    pub request_start: u64,
+    pub request_end: u64,
+    pub sampled_ticket: Option<u64>,
+    /// CLOCK_MONOTONIC timestamp when the sampled ticket's frame became ready.
+    pub frame_ready_monotonic_ns: Option<u64>,
+    /// CLOCK_MONOTONIC timestamps for the sampled request's SQE, CQE, and
+    /// DATA-complete publication. These share a clock with sync decisions.
+    pub sqe_submitted_monotonic_ns: Option<u64>,
+    pub cqe_observed_monotonic_ns: Option<u64>,
+    pub data_complete_published_monotonic_ns: Option<u64>,
+    pub frame_ready_to_submit_request_ns: Option<u64>,
+    pub submit_request_to_worker_queue_ns: Option<u64>,
+    pub worker_queue_to_worker_accept_ns: Option<u64>,
+    pub worker_accept_to_sqe_submit_ns: Option<u64>,
+    pub submit_to_cqe_observed_ns: u64,
+    pub cqe_observed_to_group_finished_ns: u64,
+    pub group_finished_to_result_send_start_ns: u64,
+    pub result_send_start_to_receiver_ns: u64,
+    pub receiver_to_data_complete_publish_ns: Option<u64>,
+    pub data_complete_prefix_end_before: Option<u64>,
+    pub data_complete_prefix_end_after: Option<u64>,
+    pub hol_blocker_ticket: Option<u64>,
+    pub publication_phases: Option<WalCompletionPublicationPhases>,
+}
+
+/// Sampled lock and state-publication phases for one successful DATA group.
+/// V7 and V8 use different completion representations, so format-specific
+/// operations remain separately named instead of being presented as directly
+/// equivalent work.
+#[cfg(feature = "bench")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WalCompletionPublicationPhases {
+    pub v7_durability_state_lock_wait_wall_ns: Option<u64>,
+    pub v7_durability_state_lock_wait_cpu_ns: Option<u64>,
+    pub v8_coordinator_state_lock_wait_wall_ns: Option<u64>,
+    pub v8_coordinator_state_lock_wait_cpu_ns: Option<u64>,
+    /// V7 inserts a completed group into its ordered completion map.
+    pub v7_group_registration_wall_ns: Option<u64>,
+    pub v7_group_registration_cpu_ns: Option<u64>,
+    /// V8 locates the first ticket in its admitted ticket vector.
+    pub v8_ticket_lookup_wall_ns: Option<u64>,
+    pub v8_ticket_lookup_cpu_ns: Option<u64>,
+    pub v8_ticket_lookup_entries_scanned: Option<u64>,
+    /// V8 checks the requested range, frame readiness, and duplicate state.
+    pub v8_ticket_validation_wall_ns: Option<u64>,
+    pub v8_ticket_validation_cpu_ns: Option<u64>,
+    /// V8 marks the group's ticket states data-complete.
+    pub v8_data_complete_mark_wall_ns: Option<u64>,
+    pub v8_data_complete_mark_cpu_ns: Option<u64>,
+    /// V7 advances the contiguous written frontier through completed groups.
+    pub v7_written_frontier_advance_wall_ns: Option<u64>,
+    pub v7_written_frontier_advance_cpu_ns: Option<u64>,
+    /// V8's benchmark-only prefix/HOL bookkeeping; this is not a WAL frontier.
+    pub v8_prefix_diagnostic_wall_ns: Option<u64>,
+    pub v8_prefix_diagnostic_cpu_ns: Option<u64>,
+    /// V8 signals its state and durability condition variables after marking.
+    pub v8_notification_wall_ns: Option<u64>,
+    pub v8_notification_cpu_ns: Option<u64>,
+    /// Number of V8 notify calls made (not the number of threads woken).
+    pub v8_notification_calls: Option<u64>,
+    pub v7_durability_state_lock_hold_wall_ns: Option<u64>,
+    pub v7_durability_state_lock_hold_cpu_ns: Option<u64>,
+    pub v8_coordinator_state_lock_hold_wall_ns: Option<u64>,
+    pub v8_coordinator_state_lock_hold_cpu_ns: Option<u64>,
 }
 
 /// One sampled, actual V8 durability advance. Wall and thread CPU durations
@@ -477,6 +612,135 @@ pub struct WalV8AckObservation {
     pub wal_return_to_put_return_ns: u64,
 }
 
+/// Sampled CPU attribution for one Point WAL ticket. Durations are captured
+/// on the producer thread and do not include time spent by other threads.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct WalCpuAttributionObservation {
+    pub sample_sequence: u64,
+    pub wal_version: u8,
+    pub commit_ts: Option<u64>,
+    pub ticket: Option<u64>,
+    pub entry_count: u64,
+    pub input_build_wall_ns: u64,
+    pub input_build_cpu_ns: u64,
+    pub preflight_wall_ns: u64,
+    pub preflight_cpu_ns: u64,
+    pub sequencer_wait_wall_ns: u64,
+    pub sequencer_wait_cpu_ns: u64,
+    pub commit_setup_wall_ns: u64,
+    pub commit_setup_cpu_ns: u64,
+    pub admission_wall_ns: u64,
+    pub admission_cpu_ns: u64,
+    pub frame_finish_wall_ns: u64,
+    pub frame_finish_cpu_ns: u64,
+    pub v8_logical_encode_wall_ns: u64,
+    pub v8_logical_encode_cpu_ns: u64,
+    pub v8_digest_ready_wall_ns: u64,
+    pub v8_digest_ready_cpu_ns: u64,
+    pub v8_frame_encode_wall_ns: u64,
+    pub v8_frame_encode_cpu_ns: u64,
+    pub v8_frames_ready_submit_wall_ns: u64,
+    pub v8_frames_ready_submit_cpu_ns: u64,
+    pub producer_total_wall_ns: u64,
+    pub producer_total_cpu_ns: u64,
+    pub completed: bool,
+}
+
+#[cfg(feature = "bench")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(usize)]
+pub(crate) enum WalCpuThreadRole {
+    IoWorkerCompletionProcessing = 0,
+    V8CompletionReaper = 1,
+    V7DurabilityCoordinator = 2,
+}
+
+#[cfg(feature = "bench")]
+impl WalCpuThreadRole {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::IoWorkerCompletionProcessing => "io_worker_completion_processing",
+            Self::V8CompletionReaper => "v8_completion_reaper",
+            Self::V7DurabilityCoordinator => "v7_durability_coordinator",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct WalCpuThreadObservation {
+    pub sample_sequence: u64,
+    pub role: &'static str,
+    pub thread_cpu_ns: u64,
+    pub wall_ns: u64,
+    pub work_items: u64,
+    pub completed: bool,
+}
+
+/// One sampled producer operation. Dropping the guard records both successful
+/// and incomplete samples, so an error cannot silently remove a selected
+/// sample from the report.
+#[cfg(feature = "bench")]
+pub(crate) struct WalCpuAttributionSample<'a> {
+    profile: &'a WriteProfile,
+    pub(crate) observation: WalCpuAttributionObservation,
+    #[cfg(feature = "bench")]
+    wall_started: Instant,
+    #[cfg(feature = "bench")]
+    cpu_started: u64,
+}
+
+#[cfg(feature = "bench")]
+impl WalCpuAttributionSample<'_> {
+    pub(crate) fn mark_completed(&mut self) {
+        self.observation.completed = true;
+    }
+}
+
+#[cfg(feature = "bench")]
+impl Drop for WalCpuAttributionSample<'_> {
+    fn drop(&mut self) {
+        #[cfg(feature = "bench")]
+        {
+            self.observation.producer_total_wall_ns =
+                self.wall_started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+            self.observation.producer_total_cpu_ns =
+                crate::wal::v8::digest::thread_cpu_time_ns().saturating_sub(self.cpu_started);
+            self.profile.record_wal_cpu_attribution(self.observation);
+        }
+    }
+}
+
+#[cfg(feature = "bench")]
+pub(crate) struct WalCpuThreadSample {
+    profile: Arc<WriteProfile>,
+    observation: WalCpuThreadObservation,
+    wall_started: Instant,
+    cpu_started: u64,
+}
+
+#[cfg(feature = "bench")]
+impl WalCpuThreadSample {
+    pub(crate) fn set_work_items(&mut self, work_items: u64) {
+        self.observation.work_items = work_items;
+    }
+
+    pub(crate) fn mark_completed(&mut self) {
+        self.observation.completed = true;
+    }
+}
+
+#[cfg(feature = "bench")]
+impl Drop for WalCpuThreadSample {
+    fn drop(&mut self) {
+        self.observation.wall_ns =
+            self.wall_started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+        self.observation.thread_cpu_ns =
+            crate::wal::v8::digest::thread_cpu_time_ns().saturating_sub(self.cpu_started);
+        self.profile
+            .record_wal_cpu_thread_observation(self.observation);
+    }
+}
+
 /// One event in a bounded Point-write ordering trace.
 #[cfg(feature = "bench")]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -540,7 +804,7 @@ impl CommitOrderTraceState {
 }
 
 #[cfg(all(feature = "bench", target_os = "linux"))]
-fn benchmark_monotonic_ns() -> u64 {
+pub(crate) fn benchmark_monotonic_ns() -> u64 {
     let mut timestamp = std::mem::MaybeUninit::<libc::timespec>::uninit();
     // SAFETY: `timestamp` points to writable storage for `clock_gettime`.
     if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, timestamp.as_mut_ptr()) } != 0 {
@@ -561,7 +825,7 @@ fn benchmark_thread_id() -> u64 {
 }
 
 #[cfg(all(feature = "bench", not(target_os = "linux")))]
-fn benchmark_monotonic_ns() -> u64 {
+pub(crate) fn benchmark_monotonic_ns() -> u64 {
     0
 }
 
@@ -902,8 +1166,21 @@ impl WriteProfile {
         self.wal_v8_completion_timeline_dropped_samples.store(0, o);
         #[cfg(feature = "bench")]
         {
+            self.wal_completion_handoff_timeline.lock().clear();
+            self.wal_completion_handoff_timeline_dropped_samples
+                .store(0, o);
             self.wal_v8_completion_timeline_sample_every.store(0, o);
             self.wal_v8_durability_sample_every.store(0, o);
+            self.wal_cpu_attribution_sample_every.store(0, o);
+            self.wal_cpu_attribution_sequence.store(0, o);
+            self.wal_cpu_attribution_selected_samples.store(0, o);
+            self.wal_cpu_attribution_dropped_samples.store(0, o);
+            self.wal_cpu_attribution_observations.lock().clear();
+            for sequence in &self.wal_cpu_thread_sample_sequences {
+                sequence.store(0, o);
+            }
+            self.wal_cpu_thread_observations.lock().clear();
+            self.wal_cpu_thread_dropped_samples.store(0, o);
             self.wal_v8_durability_driver_attempt_count.store(0, o);
             self.wal_v8_durability_empty_driver_attempt_count
                 .store(0, o);
@@ -1160,9 +1437,166 @@ impl WriteProfile {
     }
 
     #[cfg(feature = "bench")]
+    pub(crate) fn record_wal_completion_handoff_timeline(
+        &self,
+        observation: WalCompletionHandoffObservation,
+    ) {
+        const MAX_SAMPLES: usize = 4096;
+        let mut samples = self.wal_completion_handoff_timeline.lock();
+        if samples.len() < MAX_SAMPLES {
+            samples.push(observation);
+        } else {
+            self.wal_completion_handoff_timeline_dropped_samples
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn wal_completion_handoff_timeline_observations(
+        &self,
+    ) -> Vec<WalCompletionHandoffObservation> {
+        self.wal_completion_handoff_timeline.lock().clone()
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn wal_completion_handoff_timeline_dropped_samples(&self) -> u64 {
+        self.wal_completion_handoff_timeline_dropped_samples
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(feature = "bench")]
     pub(crate) fn set_wal_v8_durability_sample_every(&self, every: u64) {
         self.wal_v8_durability_sample_every
             .store(every, std::sync::atomic::Ordering::Release);
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn set_wal_cpu_attribution_sample_every(&self, every: u64) {
+        self.wal_cpu_attribution_sample_every
+            .store(every, std::sync::atomic::Ordering::Release);
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn wal_cpu_attribution_sample_every(&self) -> u64 {
+        self.wal_cpu_attribution_sample_every
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn begin_wal_cpu_attribution_sample(
+        &self,
+        wal_version: u8,
+        entry_count: u64,
+    ) -> Option<WalCpuAttributionSample<'_>> {
+        let every = self.wal_cpu_attribution_sample_every();
+        if every == 0 {
+            return None;
+        }
+        let sequence = self
+            .wal_cpu_attribution_sequence
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .saturating_add(1);
+        if !sequence.is_multiple_of(every) {
+            return None;
+        }
+        self.wal_cpu_attribution_selected_samples
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        Some(WalCpuAttributionSample {
+            profile: self,
+            observation: WalCpuAttributionObservation {
+                sample_sequence: sequence,
+                wal_version,
+                entry_count,
+                ..WalCpuAttributionObservation::default()
+            },
+            wall_started: Instant::now(),
+            cpu_started: crate::wal::v8::digest::thread_cpu_time_ns(),
+        })
+    }
+
+    #[cfg(feature = "bench")]
+    fn record_wal_cpu_attribution(&self, observation: WalCpuAttributionObservation) {
+        const MAX_SAMPLES: usize = 4096;
+        let mut samples = self.wal_cpu_attribution_observations.lock();
+        if samples.len() < MAX_SAMPLES {
+            samples.push(observation);
+        } else {
+            self.wal_cpu_attribution_dropped_samples
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn wal_cpu_attribution_observations(&self) -> Vec<WalCpuAttributionObservation> {
+        self.wal_cpu_attribution_observations.lock().clone()
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn wal_cpu_attribution_counts(&self) -> (u64, u64, u64) {
+        (
+            self.wal_cpu_attribution_sequence
+                .load(std::sync::atomic::Ordering::Relaxed),
+            self.wal_cpu_attribution_selected_samples
+                .load(std::sync::atomic::Ordering::Relaxed),
+            self.wal_cpu_attribution_dropped_samples
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn next_wal_cpu_thread_sample(&self, role: WalCpuThreadRole) -> Option<u64> {
+        let every = self.wal_cpu_attribution_sample_every();
+        if every == 0 {
+            return None;
+        }
+        let sequence = self.wal_cpu_thread_sample_sequences[role as usize]
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .saturating_add(1);
+        sequence.is_multiple_of(every).then_some(sequence)
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn begin_wal_cpu_thread_sample(
+        self: &Arc<Self>,
+        role: WalCpuThreadRole,
+        work_items: u64,
+    ) -> Option<WalCpuThreadSample> {
+        let sample_sequence = self.next_wal_cpu_thread_sample(role)?;
+        Some(WalCpuThreadSample {
+            profile: Arc::clone(self),
+            observation: WalCpuThreadObservation {
+                sample_sequence,
+                role: role.as_str(),
+                work_items,
+                ..WalCpuThreadObservation::default()
+            },
+            wall_started: Instant::now(),
+            cpu_started: crate::wal::v8::digest::thread_cpu_time_ns(),
+        })
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn record_wal_cpu_thread_observation(&self, observation: WalCpuThreadObservation) {
+        const MAX_SAMPLES: usize = 16_384;
+        let mut samples = self.wal_cpu_thread_observations.lock();
+        if samples.len() < MAX_SAMPLES {
+            samples.push(observation);
+        } else {
+            self.wal_cpu_thread_dropped_samples
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn wal_cpu_thread_observations(&self) -> Vec<WalCpuThreadObservation> {
+        self.wal_cpu_thread_observations.lock().clone()
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn wal_cpu_thread_dropped_samples(&self) -> u64 {
+        self.wal_cpu_thread_dropped_samples
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     #[cfg(feature = "bench")]
@@ -3574,16 +4008,24 @@ impl MemTable {
     pub(crate) fn finish_v8_frame_job(
         &self,
         frame_job: crate::wal::v8::leader::WalV8FrameJob<'_>,
-    ) -> Result<()> {
+        cpu_attribution_sampled: bool,
+    ) -> Result<Option<crate::wal::v8::leader::WalV8ProducerCpuPhases>> {
         #[cfg(feature = "bench")]
         let started = Instant::now();
+        #[cfg(feature = "bench")]
+        let (digest_metrics, phases) = if cpu_attribution_sampled {
+            let (metrics, phases) = frame_job.finish_with_cpu_attribution()?;
+            (metrics, Some(phases))
+        } else {
+            (frame_job.finish()?, None)
+        };
+        #[cfg(not(feature = "bench"))]
         let digest_metrics = frame_job.finish()?;
         #[cfg(feature = "bench")]
         {
-            self.write_profile
-                .load()
-                .record_wal_v8_digest_metrics(digest_metrics);
-            self.write_profile.load().wal_write_ns.fetch_add(
+            let profile = self.write_profile.load();
+            profile.record_wal_v8_digest_metrics(digest_metrics);
+            profile.wal_write_ns.fetch_add(
                 started.elapsed().as_nanos() as u64,
                 std::sync::atomic::Ordering::Relaxed,
             );
@@ -3591,7 +4033,13 @@ impl MemTable {
         #[cfg(not(feature = "bench"))]
         let _ = digest_metrics;
 
-        Ok(())
+        #[cfg(feature = "bench")]
+        return Ok(phases);
+        #[cfg(not(feature = "bench"))]
+        {
+            let _ = cpu_attribution_sampled;
+            Ok(None)
+        }
     }
 
     /// Prepare a v7 Parallel point batch before entering the MVCC sequencer.
@@ -5216,6 +5664,8 @@ mod tests {
     use bytes::Bytes;
 
     use super::MemTable;
+    #[cfg(feature = "bench")]
+    use super::WriteProfile;
     use crate::{
         mvcc::{BatchEntryKind, LsmMvccInner},
         pitr::{
@@ -5243,6 +5693,31 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     use crate::wal::v7::install::recover_sealing_active_with_limits;
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn wal_cpu_attribution_samples_every_nth_operation_and_keeps_failures() {
+        let profile = WriteProfile::default();
+        profile.set_wal_cpu_attribution_sample_every(2);
+
+        assert!(profile.begin_wal_cpu_attribution_sample(8, 1).is_none());
+        let mut completed = profile
+            .begin_wal_cpu_attribution_sample(8, 1)
+            .expect("second operation is sampled");
+        completed.mark_completed();
+        drop(completed);
+
+        assert!(profile.begin_wal_cpu_attribution_sample(7, 1).is_none());
+        drop(profile.begin_wal_cpu_attribution_sample(7, 1));
+
+        assert_eq!(profile.wal_cpu_attribution_counts(), (4, 2, 0));
+        let samples = profile.wal_cpu_attribution_observations();
+        assert_eq!(samples.len(), 2);
+        assert_eq!(samples[0].wal_version, 8);
+        assert!(samples[0].completed);
+        assert_eq!(samples[1].wal_version, 7);
+        assert!(!samples[1].completed);
+    }
 
     #[cfg(target_os = "linux")]
     use crate::wal::v7::admission::{WalV7ResourceCharge, WalV7RetainedResources};

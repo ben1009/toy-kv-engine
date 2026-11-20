@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-if [[ $# -ne 11 ]]; then
-    echo "usage: $0 <commit> <num> <project> <zone> <instance> <safe-deadline-epoch> <machine-type> <writers-csv> <suite> <source-patch-sha256> <baseline-commit>" >&2
+if [[ $# -lt 11 || $# -gt 12 ]]; then
+    echo "usage: $0 <commit> <num> <project> <zone> <instance> <safe-deadline-epoch> <machine-type> <writers-csv> <suite> <source-patch-sha256> <baseline-commit> [repetitions]" >&2
     exit 64
 fi
 
@@ -17,6 +17,11 @@ WRITERS_CSV="$8"
 SUITE="$9"
 SOURCE_PATCH_SHA256="${10}"
 BASELINE_COMMIT="${11}"
+REPETITIONS="${12:-1}"
+if [[ ! "$REPETITIONS" =~ ^[1-9][0-9]*$ ]]; then
+    echo "repetitions must be a positive integer: $REPETITIONS" >&2
+    exit 64
+fi
 
 case "$MACHINE_TYPE" in
     c4-standard-8-lssd) SSD_COUNT=1; SSD_TOTAL_GIB=375 ;;
@@ -44,7 +49,7 @@ if [[ "$SUITE" != "batch64" && "$SUITE" != "rfc026-full" \
     && "$SUITE" != "v8-small-ticket-profile" && "$SUITE" != "commit-order-trace" \
     && "$SUITE" != "v8-point-lookahead" && "$SUITE" != "v8-mutex-diagnostic" \
     && "$SUITE" != "v8-point-borrowed-input" && "$SUITE" != "v8-point-direct-frame" \
-    && "$SUITE" != "v8-extent-policy-storage" ]]; then
+    && "$SUITE" != "v8-extent-policy-storage" && "$SUITE" != "v8-point-cpu-attribution" ]]; then
     echo "unsupported benchmark suite: $SUITE" >&2
     exit 64
 fi
@@ -85,6 +90,12 @@ if [[ "$SUITE" == "v8-extent-policy-storage" ]] \
     && { [[ "$NUM" != "100000" ]] || [[ "$MACHINE_TYPE" != "c4-standard-16-lssd" ]] \
         || [[ "$WRITERS_CSV" != "8,16" ]]; }; then
     echo "v8-extent-policy-storage requires c4-standard-16-lssd, writers 8,16, and 100000 operations" >&2
+    exit 64
+fi
+if [[ "$SUITE" == "v8-point-cpu-attribution" ]] \
+    && { [[ "$NUM" != "100000" ]] || [[ "$MACHINE_TYPE" != "c4-standard-16-lssd" ]] \
+        || { [[ "$WRITERS_CSV" != "1,4,8,16" ]] && [[ "$WRITERS_CSV" != "8,16" ]]; }; }; then
+    echo "v8-point-cpu-attribution requires c4-standard-16-lssd, writers 8,16 or 1,4,8,16, and 100000 operations" >&2
     exit 64
 fi
 if [[ ! "$SAFE_DEADLINE_EPOCH" =~ ^[0-9]+$ ]] || (( SAFE_DEADLINE_EPOCH < 1 )); then
@@ -231,11 +242,13 @@ runuser -u bench -- env \
     BENCH_SUITE="$SUITE" \
     BENCH_SOURCE_PATCH_SHA256="$SOURCE_PATCH_SHA256" \
     BENCH_BASELINE_COMMIT="$BASELINE_COMMIT" \
+    BENCH_REPETITIONS="${REPETITIONS:-1}" \
     BENCH_BOOT_LOG="$BOOT_LOG" \
     bash -s <<'BENCH_USER_SCRIPT'
 set -Eeuo pipefail
 
 source "$HOME/.cargo/env" 2>/dev/null || true
+BENCH_REPETITIONS="${BENCH_REPETITIONS:-1}"
 if ! command -v rustup >/dev/null 2>&1; then
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
 fi
@@ -362,7 +375,31 @@ if [[ "$BENCH_SUITE" == "v8-point-direct-frame" ]]; then
         --binary-sha256 "$BINARY_SHA256" \
         --machine-type "$BENCH_MACHINE_TYPE" \
         --ssd-count "$BENCH_SSD_COUNT" \
-        --ssd-gib "$BENCH_SSD_TOTAL_GIB"
+        --ssd-gib "$BENCH_SSD_TOTAL_GIB" \
+        --repetitions "$BENCH_REPETITIONS"
+    exit $?
+fi
+
+if [[ "$BENCH_SUITE" == "v8-point-cpu-attribution" ]]; then
+    if [[ ! -r /tmp/gcp-v8-point-cpu-attribution-runner.py ]]; then
+        echo "Point CPU attribution runner was not uploaded" >&2
+        exit 1
+    fi
+    cp /tmp/gcp-v8-point-cpu-attribution-runner.py "$REPO/scripts/gcp_v8_point_cpu_attribution_runner.py"
+    echo "WAL_BENCHMARK_STARTED $(date --iso-8601=seconds)" | tee -a "$BENCH_BOOT_LOG"
+    PYTHONPATH="$REPO/scripts${PYTHONPATH:+:$PYTHONPATH}" \
+        python3 "$REPO/scripts/gcp_v8_point_cpu_attribution_runner.py" \
+        --binary "$BINARY" \
+        --results-dir "$BENCH_RESULTS" \
+        --db-root "$BENCH_WORK/databases" \
+        --writers "$BENCH_WRITERS" \
+        --safe-deadline-epoch "$BENCH_SAFE_DEADLINE_EPOCH" \
+        --commit "$ACTUAL_COMMIT" \
+        --binary-sha256 "$BINARY_SHA256" \
+        --machine-type "$BENCH_MACHINE_TYPE" \
+        --ssd-count "$BENCH_SSD_COUNT" \
+        --ssd-gib "$BENCH_SSD_TOTAL_GIB" \
+        --repetitions "$BENCH_REPETITIONS"
     exit $?
 fi
 

@@ -14,6 +14,7 @@ import binascii
 import csv
 from collections.abc import Callable
 from datetime import datetime, timezone
+import http.client
 import ipaddress
 import json
 import math
@@ -29,6 +30,7 @@ import sys
 import tempfile
 import time
 from typing import Any
+import urllib.request
 import uuid
 
 from gcp_wal_matrix import (
@@ -47,6 +49,9 @@ from gcp_wal_matrix import (
     V8_MUTEX_DIAGNOSTIC_NUM,
     V8_MUTEX_DIAGNOSTIC_SAMPLE_EVERY,
     V8_MUTEX_DIAGNOSTIC_WRITERS,
+    V8_POINT_CPU_ATTRIBUTION_NUM,
+    V8_POINT_CPU_ATTRIBUTION_SAMPLE_EVERY,
+    V8_POINT_CPU_ATTRIBUTION_WRITERS,
     build_commit_order_trace_plan,
     build_commit_order_trace_schedule,
     build_batch64_schedule,
@@ -61,6 +66,8 @@ from gcp_wal_matrix import (
     build_v8_extent_policy_storage_schedule,
     build_v8_mutex_diagnostic_plan,
     build_v8_mutex_diagnostic_schedule,
+    build_v8_point_cpu_attribution_plan,
+    build_v8_point_cpu_attribution_schedule,
     build_rfc026_schedule,
     validate_commit_order_trace_rows,
     validate_point_lookahead_rows,
@@ -68,6 +75,7 @@ from gcp_wal_matrix import (
     validate_point_direct_frame_rows,
     validate_v8_extent_policy_storage_rows,
     validate_v8_mutex_diagnostic_rows,
+    validate_v8_point_cpu_attribution_rows,
     validate_writer_counts,
 )
 from gcp_commit_order_trace_runner import analyze_trace
@@ -83,6 +91,7 @@ PROFILE_RUNNER = Path(__file__).with_name("gcp_wal_profile_runner.py")
 COMMIT_ORDER_TRACE_RUNNER = Path(__file__).with_name("gcp_commit_order_trace_runner.py")
 POINT_LOOKAHEAD_RUNNER = Path(__file__).with_name("gcp_v8_point_lookahead_runner.py")
 V8_MUTEX_DIAGNOSTIC_RUNNER = Path(__file__).with_name("gcp_v8_mutex_diagnostic_runner.py")
+V8_POINT_CPU_ATTRIBUTION_RUNNER = Path(__file__).with_name("gcp_v8_point_cpu_attribution_runner.py")
 POINT_BORROWED_INPUT_RUNNER = Path(__file__).with_name("gcp_v8_point_borrowed_input_runner.py")
 POINT_DIRECT_FRAME_RUNNER = Path(__file__).with_name("gcp_v8_point_direct_frame_runner.py")
 V8_EXTENT_POLICY_STORAGE_RUNNER = Path(__file__).with_name("gcp_v8_extent_policy_storage_runner.py")
@@ -90,6 +99,9 @@ REPO_URL = "https://github.com/ben1009/toy-kv-engine.git"
 MAX_RUNTIME_MINUTES = 180
 MIN_RUNTIME_MINUTES = 60
 MAX_ARTIFACT_BUNDLE_BYTES = 512 * 1024 * 1024
+SSH_READY_TIMEOUT_SECONDS = 120
+SSH_READY_POLL_INTERVAL_SECONDS = 5
+SSH_PROBE_TIMEOUT_SECONDS = 12
 
 REMOTE_ARCHIVE_SCRIPT = r'''
 import hashlib
@@ -106,6 +118,7 @@ root_names = {
     "summary.json", "summary.tsv", "comparison.tsv", "benchmark-plan.json",
     "rfc026-schedule.tsv", "profile-schedule.tsv", "commit-order-trace-schedule.tsv",
     "point-lookahead-schedule.tsv", "v8-mutex-diagnostic-schedule.tsv",
+    "v8-point-cpu-attribution-schedule.tsv",
     "point-borrowed-input-schedule.tsv",
     "point-direct-frame-schedule.tsv",
     "extent-policy-storage-schedule.tsv",
@@ -119,10 +132,13 @@ run_names = {
     "result.json", "run-metadata.json", "environment.txt", "start_utc.txt", "end_utc.txt",
     "start_epoch.txt", "command.sh", "stderr.log", "timeline.json", "perf.data",
     "perf-report.txt", "perf-record.log", "perf-command.sh", "validation-error.txt",
+    "sync-observations.json", "completion-timeline.json", "completion-handoff-timeline.json",
 }
 selected = [path for path in root.iterdir() if path.is_file() and path.name in root_names]
-for run_dir in sorted(root.glob("w*")):
-    if run_dir.is_dir():
+for run_dir in sorted(root.iterdir()):
+    if run_dir.is_dir() and any(
+        path.is_file() and path.name in run_names for path in run_dir.iterdir()
+    ):
         selected.extend(path for path in run_dir.iterdir() if path.is_file() and path.name in run_names)
 
 descriptor, archive_name = tempfile.mkstemp(prefix="gcp-wal-bench-results-", suffix=".tar.gz")
@@ -162,6 +178,42 @@ def _build_remote_archive_command(
 
 class BenchError(RuntimeError):
     """Raised for a failed preflight or benchmark orchestration step."""
+
+
+PUBLIC_IPV4_LOOKUP_URL = "https://api.ipify.org"
+
+
+def resolve_ssh_source_range(source_range: str | None) -> str | None:
+    """Resolve `auto` to the caller's current public IPv4 /32, failing closed."""
+    if source_range is None or source_range.strip().lower() != "auto":
+        return source_range
+
+    request = urllib.request.Request(PUBLIC_IPV4_LOOKUP_URL, headers={"Accept": "text/plain"})
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            address_text = response.read(128).decode("ascii").strip()
+        address = ipaddress.ip_address(address_text)
+    except (OSError, http.client.HTTPException, UnicodeError, ValueError) as error:
+        raise BenchError(
+            "could not resolve the current public IPv4 address; no cloud resources were created"
+        ) from error
+
+    if address.version != 4 or not address.is_global or address.is_multicast:
+        raise BenchError(
+            "the public IP lookup did not return a globally routable IPv4 address; no cloud resources were created"
+        )
+    return f"{address}/32"
+
+
+def validate_ssh_egress(source_range: str) -> None:
+    """Reject a stale source range before provisioning any cloud resources."""
+    current_range = resolve_ssh_source_range("auto")
+    if ipaddress.ip_interface(current_range).ip not in ipaddress.ip_network(source_range):
+        raise BenchError(
+            "the current public IPv4 is outside --ssh-source-range; "
+            "refresh the SSH CIDR or use --ssh-source-range auto. "
+            "No cloud resources were created"
+        )
 
 
 def _is_transient_gcloud_error(detail: str) -> bool:
@@ -1073,6 +1125,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                         help="C4 Local SSD shape (defaults to 8-vCPU for benchmark suites)")
     parser.add_argument("--writers", type=int, nargs="+", choices=(1, 2, 4, 8, 16),
                         help="Writer counts to run (defaults depend on the selected suite)")
+    parser.add_argument("--repetitions", type=int, default=1,
+                        help="Repeated cells for the V7/V8 CPU attribution diagnostic suite")
     suite_group = parser.add_mutually_exclusive_group()
     suite_group.add_argument("--full-rfc026-matrix", action="store_true",
                              help="Run point/batch8/batch16/batch64 across V4/V7/V8 parallel and V8 Leader")
@@ -1084,6 +1138,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                              help="Compare V8 1 MiB fallocate vs Point-only lookahead, with batch guardrails")
     suite_group.add_argument("--v8-mutex-diagnostic", action="store_true",
                              help="Run five paired V7/V8 Point runs with sampled hot-mutex diagnostics")
+    suite_group.add_argument("--v8-point-cpu-attribution", action="store_true",
+                             help="Attribute sampled V7/V8 Point producer and WAL-thread CPU at 1/4/8/16 writers")
     suite_group.add_argument("--v8-point-borrowed-input-ab", action="store_true",
                              help="Compare V8 Point owned vs borrowed preparation with Batch16/64 guardrails")
     suite_group.add_argument("--v8-point-direct-frame-ab", action="store_true",
@@ -1095,7 +1151,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                         help="SHA-256 of the exact source patch used for a commit-order trace run")
     parser.add_argument("--network", help="Existing VPC to use (default: default)")
     parser.add_argument("--subnet", help="Subnetwork name for custom-mode VPCs (must be in the requested region)")
-    parser.add_argument("--ssh-source-range", help="Restricted IPv4 CIDR allowed to SSH to this ephemeral VM")
+    parser.add_argument(
+        "--ssh-source-range",
+        help=(
+            "Restricted IPv4 CIDR allowed to SSH to this ephemeral VM; use `auto` to resolve the current public IPv4 /32 "
+            "through api.ipify.org"
+        ),
+    )
     parser.add_argument("--results-dir", type=Path, help="Local directory for preflight and collected artifacts")
     parser.add_argument("--num", type=int, help="Writes per run (default depends on the selected suite)")
     parser.add_argument("--max-runtime-minutes", type=int, default=180,
@@ -1111,18 +1173,33 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument("--confirm-free-trial", action="store_true",
                         help="Attest that Billing Overview says Free Trial and you will not upgrade to Paid")
+    parser.add_argument(
+        "--skip-ssh-egress-check", action="store_true",
+        help="Use a manually verified SSH source CIDR when the HTTPS lookup cannot verify that route",
+    )
     args = parser.parse_args(argv)
+    if args.repetitions <= 0:
+        parser.error("--repetitions must be a positive integer")
+    if args.repetitions != 1 and not args.v8_point_cpu_attribution:
+        parser.error("--repetitions is only configurable with --v8-point-cpu-attribution")
+    args.ssh_source_auto = (args.ssh_source_range or "").strip().lower() == "auto"
+    try:
+        args.ssh_source_range = resolve_ssh_source_range(args.ssh_source_range)
+    except BenchError as error:
+        parser.error(str(error))
     if args.num is None:
         args.num = (
             POINT_DIRECT_FRAME_NUM if args.v8_point_direct_frame_ab else
             V8_EXTENT_POLICY_STORAGE_NUM if args.v8_extent_policy_storage_ab else
             POINT_BORROWED_INPUT_NUM if args.v8_point_borrowed_input_ab else
             V8_MUTEX_DIAGNOSTIC_NUM if args.v8_mutex_diagnostic else
+            V8_POINT_CPU_ATTRIBUTION_NUM if args.v8_point_cpu_attribution else
             COMMIT_ORDER_TRACE_NUM if args.commit_order_trace else 750_000
         )
     if args.machine_type is None:
         args.machine_type = "c4-standard-16-lssd" if (
             args.commit_order_trace or args.v8_point_lookahead_ab or args.v8_mutex_diagnostic
+            or args.v8_point_cpu_attribution
             or args.v8_point_borrowed_input_ab or args.v8_point_direct_frame_ab
             or args.v8_extent_policy_storage_ab
         ) else MACHINE_TYPE
@@ -1132,6 +1209,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             args.writers = (COMMIT_ORDER_TRACE_WRITERS,)
         elif args.v8_mutex_diagnostic:
             args.writers = V8_MUTEX_DIAGNOSTIC_WRITERS
+        elif args.v8_point_cpu_attribution:
+            args.writers = V8_POINT_CPU_ATTRIBUTION_WRITERS
         elif args.v8_point_lookahead_ab:
             args.writers = (POINT_LOOKAHEAD_WRITERS,)
         elif args.v8_point_borrowed_input_ab:
@@ -1154,6 +1233,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error("--v8-mutex-diagnostic requires exactly 16 writers")
     if args.v8_mutex_diagnostic and args.machine_type != "c4-standard-16-lssd":
         parser.error("--v8-mutex-diagnostic requires c4-standard-16-lssd")
+    if args.v8_point_cpu_attribution and not set(args.writers).issubset(V8_POINT_CPU_ATTRIBUTION_WRITERS):
+        parser.error(f"--v8-point-cpu-attribution writers must be selected from {V8_POINT_CPU_ATTRIBUTION_WRITERS}")
+    if args.v8_point_cpu_attribution and args.machine_type != "c4-standard-16-lssd":
+        parser.error("--v8-point-cpu-attribution requires c4-standard-16-lssd")
     if args.v8_point_lookahead_ab and args.writers != (POINT_LOOKAHEAD_WRITERS,):
         parser.error("--v8-point-lookahead-ab requires exactly 16 writers")
     if args.v8_point_lookahead_ab and args.machine_type != "c4-standard-16-lssd":
@@ -1184,6 +1267,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error(f"--v8-extent-policy-storage-ab uses a fixed {V8_EXTENT_POLICY_STORAGE_NUM}-put workload")
     if args.v8_mutex_diagnostic and args.num != V8_MUTEX_DIAGNOSTIC_NUM:
         parser.error(f"--v8-mutex-diagnostic uses a fixed {V8_MUTEX_DIAGNOSTIC_NUM}-put workload")
+    if args.v8_point_cpu_attribution and args.num != V8_POINT_CPU_ATTRIBUTION_NUM:
+        parser.error(f"--v8-point-cpu-attribution uses a fixed {V8_POINT_CPU_ATTRIBUTION_NUM}-put workload")
     if args.commit_order_trace and args.num != COMMIT_ORDER_TRACE_NUM:
         parser.error(f"--commit-order-trace uses a fixed {COMMIT_ORDER_TRACE_NUM}-put workload")
     if args.commit_order_trace and (
@@ -1321,6 +1406,8 @@ def _run_identifier(row: dict[str, Any], suite: str) -> str:
         )
     if suite == "v8-mutex-diagnostic":
         return f"w{row['writer']}-{row['workload']}-r{row['repetition']}-{row['arm']}"
+    if suite == "v8-point-cpu-attribution":
+        return f"r{row['repetition']}-w{row['writer']}-point-{row['arm']}"
     raise ValueError(f"unsupported benchmark suite: {suite!r}")
 
 
@@ -1345,6 +1432,8 @@ def _summary_row_identifier(row: dict[str, Any], suite: str) -> str:
         )
     if suite == "v8-mutex-diagnostic":
         return f"w{int(row['writer'])}-{row['workload']}-r{int(row['repetition'])}-{row['arm']}"
+    if suite == "v8-point-cpu-attribution":
+        return f"r{int(row['repetition'])}-w{int(row['writer'])}-point-{row['arm']}"
     raise ValueError(f"unsupported benchmark suite: {suite!r}")
 
 
@@ -1393,7 +1482,19 @@ def _expected_run_metadata(row: dict[str, Any], suite: str) -> dict[str, Any]:
         }
     if suite == "v8-mutex-diagnostic":
         return {key: row[key] for key in ("writer", "workload", "repetition", "arm", "bench", "num", "sample_every")}
+    if suite == "v8-point-cpu-attribution":
+        return {key: row[key] for key in ("writer", "workload", "repetition", "arm", "bench", "num", "sample_every")}
     raise ValueError(f"unsupported benchmark suite: {suite!r}")
+
+
+def _run_directory_delta(results: Path, expected_run_ids: set[str]) -> tuple[list[str], list[str]]:
+    """Return missing and unexpected run directories across the supported ID prefixes."""
+    actual_run_ids = {
+        path.name
+        for path in results.iterdir()
+        if path.is_dir() and path.name.startswith(("w", "r"))
+    }
+    return sorted(expected_run_ids - actual_run_ids), sorted(actual_run_ids - expected_run_ids)
 
 
 def _verify_result_set(results: Path) -> dict[str, Any]:
@@ -1626,6 +1727,38 @@ def _verify_result_set(results: Path) -> dict[str, Any]:
                     errors.append("mutex diagnostic source commit does not match the plan")
                 if summary.get("binary_sha256") != binary_sha:
                     errors.append("mutex diagnostic binary checksum does not match the summary")
+            elif suite == "v8-point-cpu-attribution":
+                suite_writers = plan.get("writers", V8_POINT_CPU_ATTRIBUTION_WRITERS)
+                suite_repetitions = plan.get("repetitions_per_cell", 1)
+                schedule = build_v8_point_cpu_attribution_schedule(suite_writers, suite_repetitions)
+                try:
+                    recorded_commit = (results / "commit.txt").read_text(encoding="utf-8").strip()
+                    binary_sha = (results / "write-perf.sha256").read_text(encoding="utf-8").strip()
+                except OSError as error:
+                    recorded_commit = binary_sha = ""
+                    errors.append(f"CPU attribution source/binary identity is missing: {error}")
+                if not re.fullmatch(r"[0-9a-f]{40}", recorded_commit) or plan.get("commit") != recorded_commit:
+                    errors.append("CPU attribution plan source commit does not match commit.txt")
+                if not re.fullmatch(r"[0-9a-f]{64}", binary_sha) or plan.get("binary_sha256") != binary_sha:
+                    errors.append("CPU attribution binary checksum does not match the plan")
+                expected_plan = build_v8_point_cpu_attribution_plan(
+                    machine_type=plan.get("machine_type", ""),
+                    machine_spec={
+                        "vcpus": plan.get("vcpus", 0), "ssd_count": plan.get("local_ssd_count", 0),
+                        "ssd_gib": plan.get("local_ssd_total_gib", 0),
+                    },
+                    commit=recorded_commit,
+                    binary_sha256=binary_sha,
+                    writers=suite_writers,
+                    repetitions=suite_repetitions,
+                )
+                for key, value in expected_plan.items():
+                    if plan.get(key) != value:
+                        errors.append(f"CPU attribution plan field {key} does not match the fixed suite")
+                if summary.get("suite") != suite or summary.get("diagnostic_only") is not True:
+                    errors.append("CPU attribution summary metadata is invalid")
+                if summary.get("source_commit") != recorded_commit or summary.get("binary_sha256") != binary_sha:
+                    errors.append("CPU attribution summary source/binary identity does not match the plan")
             else:
                 raise ValueError(f"unsupported benchmark plan suite: {suite!r}")
             planned = plan.get("runs_planned")
@@ -1658,10 +1791,8 @@ def _verify_result_set(results: Path) -> dict[str, Any]:
             if run_id in expected:
                 errors.append(f"duplicate run identifier in schedule: {run_id}")
             expected[run_id] = _expected_run_metadata(row, suite)
-        actual_directories = {path.name for path in results.glob("w*") if path.is_dir()}
-        if actual_directories != set(expected):
-            missing = sorted(set(expected) - actual_directories)
-            unexpected = sorted(actual_directories - set(expected))
+        missing, unexpected = _run_directory_delta(results, set(expected))
+        if missing or unexpected:
             errors.append(f"run directories do not match schedule (missing={missing}, unexpected={unexpected})")
 
         summary_rows = summary.get("results")
@@ -2090,6 +2221,31 @@ def _verify_result_set(results: Path) -> dict[str, Any]:
                             raise ValueError("WAL I/O metadata changed during the run")
                     except (KeyError, AttributeError, TypeError, ValueError) as error:
                         errors.append(f"run {run_id} mutex diagnostic result is invalid: {error}")
+                elif suite == "v8-point-cpu-attribution" and isinstance(record, dict):
+                    try:
+                        from gcp_v8_point_cpu_attribution_runner import _validate_record
+
+                        identity = expected[run_id]
+                        validated = _validate_record(record, identity)
+                        if metadata.get("wal_cpu_attribution") != validated.get("wal_cpu_attribution"):
+                            raise ValueError("run metadata attribution payload differs from result.json")
+                        if metadata.get("v8_durability_diagnostics") != validated.get("v8_durability_diagnostics"):
+                            raise ValueError("run metadata V8 durability payload differs from result.json")
+                        summary_row = summary_by_id.get(run_id)
+                        if summary_row is None or summary_row != metadata:
+                            raise ValueError("summary row differs from the per-run metadata")
+                        expected_env = (
+                            "TOYKV_BENCH_V8_EXTENT_PREP=sliding-point-lookahead\n"
+                            "TOYKV_BENCH_V8_EXTENT_PREP_BYTES=1048576\n"
+                            "TOYKV_WAL_V8_FRONTIER_MODE=direct\n"
+                        )
+                        env_text = (run_dir / "environment.txt").read_text(encoding="utf-8")
+                        if identity["arm"] == "v8_point_lookahead_direct" and env_text != expected_env:
+                            raise ValueError("V8 extent/FRONTIER environment differs from the plan")
+                        if identity["arm"] == "v7_parallel" and env_text != "<V7 defaults>\n":
+                            raise ValueError("V7 unexpectedly has V8-only environment overrides")
+                    except (KeyError, AttributeError, OSError, TypeError, ValueError) as error:
+                        errors.append(f"run {run_id} CPU attribution result is invalid: {error}")
             except (OSError, json.JSONDecodeError, ValueError) as error:
                 errors.append(f"run {run_id} metadata is invalid: {error}")
 
@@ -2121,6 +2277,14 @@ def _verify_result_set(results: Path) -> dict[str, Any]:
             validation = validate_v8_mutex_diagnostic_rows(summary.get("results", []))
             if validation != summary.get("matrix_validation"):
                 errors.append("mutex diagnostic matrix validation does not match its per-run results")
+        elif suite == "v8-point-cpu-attribution":
+            validation = validate_v8_point_cpu_attribution_rows(
+                summary.get("results", []),
+                plan.get("writers", V8_POINT_CPU_ATTRIBUTION_WRITERS),
+                plan.get("repetitions_per_cell", 1),
+            )
+            if validation != summary.get("matrix_validation"):
+                errors.append("CPU attribution matrix validation does not match its per-run results")
     except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError, csv.Error) as error:
         errors.append(f"result metadata is invalid: {error}")
         planned = 0
@@ -2202,7 +2366,7 @@ def collect_artifacts(
             before_connect()
             phase = "transfer"
             archive_path = staging / "results.tar.gz"
-            transfer = scp_from_vm(
+            transfer = stream_file_from_vm(
                 ip, remote_archive_path, archive_path, key, known_hosts,
                 timeout=120,
             )
@@ -2276,7 +2440,7 @@ def collect_artifacts(
     boot_log_collected = False
     try:
         before_connect()
-        boot_log = scp_from_vm(
+        boot_log = stream_file_from_vm(
             ip, "/var/log/gcp-free-trial-wal-bench.log", boot_log_destination,
             key, known_hosts, timeout=30,
         )
@@ -2405,48 +2569,129 @@ def wait_for_verified_host_keys(
     raise BenchError("The VM did not publish verifiable SSH host keys through GCP guest attributes")
 
 
-def ssh_command(
-    key: Path, known_hosts: Path, ip: str, remote_command: str, timeout: int
-) -> subprocess.CompletedProcess[str]:
-    command = [
+def ssh_command_argv(key: Path, known_hosts: Path, ip: str, remote_command: str) -> list[str]:
+    return [
         "ssh", "-i", str(key), "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes",
         "-o", "StrictHostKeyChecking=yes", "-o", f"UserKnownHostsFile={known_hosts}",
         "-o", "GlobalKnownHostsFile=/dev/null", "-o", "ConnectTimeout=8", "-o", "ServerAliveInterval=30",
         "-o", "ServerAliveCountMax=3", f"bench@{ip}", remote_command,
     ]
+
+
+def ssh_command(
+    key: Path, known_hosts: Path, ip: str, remote_command: str, timeout: int
+) -> subprocess.CompletedProcess[str]:
+    command = ssh_command_argv(key, known_hosts, ip, remote_command)
     # Local argv is not shell-evaluated; dynamic remote arguments are built with shlex.join.
     # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
     return subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                           timeout=timeout, check=False, shell=False)
 
 
-def scp_from_vm(
+def wait_for_ssh_ready(
+    probe: Callable[[int], subprocess.CompletedProcess[str]],
+    *,
+    timeout_seconds: int = SSH_READY_TIMEOUT_SECONDS,
+    poll_interval_seconds: int = SSH_READY_POLL_INTERVAL_SECONDS,
+) -> None:
+    """Wait briefly for SSH after opening ingress; never consume the VM lifetime retrying."""
+    if timeout_seconds <= 0:
+        raise ValueError("timeout_seconds must be positive")
+    if poll_interval_seconds <= 0:
+        raise ValueError("poll_interval_seconds must be positive")
+
+    deadline = time.monotonic() + timeout_seconds
+    last_error = "no SSH probe completed"
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        probe_timeout = max(1, min(SSH_PROBE_TIMEOUT_SECONDS, math.ceil(remaining)))
+        result = probe(probe_timeout)
+        if result.returncode == 0:
+            return
+        last_error = (result.stderr or result.stdout or f"probe exited {result.returncode}").strip()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(poll_interval_seconds, remaining))
+
+    raise BenchError(
+        f"SSH did not become ready within {timeout_seconds} seconds after the restricted ingress rule "
+        f"was audited; last probe: {last_error}"
+    )
+
+
+def stream_file_from_vm(
     ip: str, remote_path: str, destination: Path, key: Path, known_hosts: Path,
-    *, recursive: bool = False, timeout: int,
+    *, timeout: int,
 ) -> subprocess.CompletedProcess[str]:
-    command = ["scp", "-i", str(key), "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes",
-               "-o", "StrictHostKeyChecking=yes", "-o", f"UserKnownHostsFile={known_hosts}",
-               "-o", "GlobalKnownHostsFile=/dev/null", "-o", "ConnectTimeout=8"]
-    if recursive:
-        command.append("-r")
-    command.extend((f"bench@{ip}:{remote_path}", str(destination)))
-    # SCP receives separate argv items and does not pass them through a local shell.
-    # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
-    return subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                          timeout=timeout, check=False, shell=False)
+    # Use the already-verified SSH command channel instead of SCP/SFTP, which
+    # can be closed by the GCE guest during file transfer. Quote the remote path
+    # because ssh passes the remote command through the guest's shell.
+    command = ssh_command_argv(key, known_hosts, ip, f"cat -- {shlex.quote(remote_path)}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with destination.open("wb") as output:
+        # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
+        result = subprocess.run(command, text=True, stdout=output, stderr=subprocess.PIPE,
+                                timeout=timeout, check=False, shell=False)
+    if result.returncode:
+        destination.unlink(missing_ok=True)
+    return result
 
 
-def scp_to_vm(
-    ip: str, local_path: Path, remote_path: str, key: Path, known_hosts: Path, timeout: int
+def stream_file_to_vm(
+    ip: str, local_path: Path, remote_path: str, key: Path, known_hosts: Path, timeout: int,
+    *, before_attempt: Callable[[], None] | None = None, max_attempts: int = 4,
 ) -> subprocess.CompletedProcess[str]:
-    command = ["scp", "-i", str(key), "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes",
-               "-o", "StrictHostKeyChecking=yes", "-o", f"UserKnownHostsFile={known_hosts}",
-               "-o", "GlobalKnownHostsFile=/dev/null", "-o", "ConnectTimeout=8",
-               str(local_path), f"bench@{ip}:{remote_path}"]
-    # SCP receives separate argv items and does not pass them through a local shell.
-    # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
-    return subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                          timeout=timeout, check=False, shell=False)
+    """Upload through SSH, retrying only transient transport disconnects.
+
+    A successful readiness probe does not guarantee that the following upload
+    connection remains open. Reopen the local file for each attempt so a retry
+    replaces any partial remote file. Callers audit policy before the first
+    attempt; the callback re-audits before each retry.
+    """
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be at least one")
+    command = ssh_command_argv(
+        key, known_hosts, ip, f"umask 077 && cat > {shlex.quote(remote_path)}"
+    )
+    retryable_transport_errors = (
+        "connection closed by ",
+        "connection reset by ",
+        "connection refused",
+        "connection timed out",
+        "operation timed out",
+        "connection aborted",
+        "broken pipe",
+        "ssh_exchange_identification:",
+        "kex_exchange_identification:",
+    )
+    retry_notes: list[str] = []
+    for attempt in range(max_attempts):
+        if attempt > 0 and before_attempt is not None:
+            before_attempt()
+        with local_path.open("rb") as source:
+            # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
+            result = subprocess.run(
+                command, text=True, stdin=source, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                timeout=timeout, check=False, shell=False,
+            )
+        error_text = result.stderr.lower()
+        retryable = result.returncode != 0 and any(
+            marker in error_text for marker in retryable_transport_errors
+        )
+        if not retryable or attempt + 1 == max_attempts:
+            if retry_notes:
+                result.stderr = "\n".join([*retry_notes, result.stderr]).strip()
+            return result
+        delay = 2 ** attempt
+        retry_notes.append(
+            f"SSH upload attempt {attempt + 1}/{max_attempts} hit a transient transport error; "
+            f"retrying in {delay}s: {result.stderr.strip()}"
+        )
+        time.sleep(delay)
+    raise AssertionError("unreachable")
 
 
 def append_local_log(path: Path, text: str) -> None:
@@ -2463,10 +2708,11 @@ def provision_and_run(
     trace_suite = getattr(args, "commit_order_trace", False)
     point_lookahead_suite = getattr(args, "v8_point_lookahead_ab", False)
     mutex_diagnostic_suite = getattr(args, "v8_mutex_diagnostic", False)
+    cpu_attribution_suite = getattr(args, "v8_point_cpu_attribution", False)
     point_borrowed_input_suite = getattr(args, "v8_point_borrowed_input_ab", False)
     point_direct_frame_suite = getattr(args, "v8_point_direct_frame_ab", False)
     extent_policy_storage_suite = getattr(args, "v8_extent_policy_storage_ab", False)
-    missing_tools = [tool for tool in ("ssh", "scp", "ssh-keygen") if not shutil.which(tool)]
+    missing_tools = [tool for tool in ("ssh", "ssh-keygen") if not shutil.which(tool)]
     if missing_tools:
         raise BenchError("Required local tools are missing: " + ", ".join(missing_tools))
     create_help = gcloud.run(["beta", "compute", "instances", "create", "--help"])
@@ -2657,85 +2903,93 @@ def provision_and_run(
                 "--rules=tcp:22", f"--source-ranges={args.ssh_source_range}", f"--target-tags={tag}",
                 "--description=Temporary restricted SSH for disposable WAL benchmark VM",
             ], timeout=180)
-            while time.monotonic() < deadline:
-                # Recheck immediately before each new connection so a changed
-                # effective policy fails closed before this runner opens SSH.
-                audit_ssh_firewall_rules(
-                    gcloud, args.project, args.network, network_region, tag, args.ssh_source_range
+
+            def upload_to_vm(local_path: Path, remote_path: str) -> subprocess.CompletedProcess[str]:
+                def audit_before_retry() -> None:
+                    audit_ssh_firewall_rules(
+                        gcloud, args.project, args.network, network_region, tag, args.ssh_source_range
+                    )
+
+                # Audit before the first upload as well as before every retry.
+                audit_before_retry()
+                return stream_file_to_vm(
+                    ip, local_path, remote_path, key, known_hosts, timeout=120,
+                    before_attempt=audit_before_retry,
                 )
-                probe = ssh_command(key, known_hosts, ip, "true", timeout=12)
+
+            # Verify the effective policy after creating the one-shot ingress
+            # rule, then keep readiness retries bounded. Repeating the three
+            # firewall inventory APIs for every failed SSH probe obscures a
+            # broken SSH handshake and can spend most of the VM lifetime idle.
+            audit_ssh_firewall_rules(
+                gcloud, args.project, args.network, network_region, tag, args.ssh_source_range
+            )
+
+            def probe_ssh(timeout: int) -> subprocess.CompletedProcess[str]:
+                probe = ssh_command(key, known_hosts, ip, "true", timeout=timeout)
                 append_local_log(key_log, probe.stdout + probe.stderr)
-                if probe.returncode == 0:
-                    connected = True
-                    break
-                time.sleep(10)
-            if not connected:
-                raise BenchError("SSH did not become ready before timeout")
+                return probe
+
+            ssh_ready_timeout = min(
+                SSH_READY_TIMEOUT_SECONDS,
+                max(1, math.floor(deadline - time.monotonic())),
+            )
+            wait_for_ssh_ready(probe_ssh, timeout_seconds=ssh_ready_timeout)
+            connected = True
 
             remote_script = RUNNERS
-            audit_ssh_firewall_rules(
-                gcloud, args.project, args.network, network_region, tag, args.ssh_source_range
-            )
-            scp_result = scp_to_vm(ip, remote_script, "/tmp/run-wal-bench.sh", key, known_hosts, timeout=120)
-            append_local_log(key_log, scp_result.stdout + scp_result.stderr)
-            if scp_result.returncode:
-                raise BenchError(f"Could not copy remote runner: {scp_result.stderr.strip()}")
+            upload_result = upload_to_vm(remote_script, "/tmp/run-wal-bench.sh")
+            append_local_log(key_log, upload_result.stdout + upload_result.stderr)
+            if upload_result.returncode:
+                raise BenchError(f"Could not copy remote runner: {upload_result.stderr.strip()}")
             if not MATRIX_MODULE.is_file():
                 raise BenchError(f"Benchmark matrix module is not present in this checkout: {MATRIX_MODULE}")
-            audit_ssh_firewall_rules(
-                gcloud, args.project, args.network, network_region, tag, args.ssh_source_range
-            )
-            matrix_copy = scp_to_vm(
-                ip, MATRIX_MODULE, "/tmp/gcp_wal_matrix.py", key, known_hosts, timeout=120
-            )
+            matrix_copy = upload_to_vm(MATRIX_MODULE, "/tmp/gcp_wal_matrix.py")
             append_local_log(key_log, matrix_copy.stdout + matrix_copy.stderr)
             if matrix_copy.returncode:
                 raise BenchError(f"Could not copy benchmark matrix module: {matrix_copy.stderr.strip()}")
             if profile_suite:
                 if not PROFILE_RUNNER.is_file():
                     raise BenchError(f"Profiling helper is not present in this checkout: {PROFILE_RUNNER}")
-                profile_copy = scp_to_vm(
-                    ip, PROFILE_RUNNER, "/tmp/gcp-wal-profile-runner.py", key, known_hosts, timeout=120
-                )
+                profile_copy = upload_to_vm(PROFILE_RUNNER, "/tmp/gcp-wal-profile-runner.py")
                 append_local_log(key_log, profile_copy.stdout + profile_copy.stderr)
                 if profile_copy.returncode:
                     raise BenchError(f"Could not copy profile runner: {profile_copy.stderr.strip()}")
             if trace_suite:
                 if not COMMIT_ORDER_TRACE_RUNNER.is_file():
                     raise BenchError(f"Commit-order trace runner is not present in this checkout: {COMMIT_ORDER_TRACE_RUNNER}")
-                trace_copy = scp_to_vm(
-                    ip, COMMIT_ORDER_TRACE_RUNNER, "/tmp/gcp-commit-order-trace-runner.py",
-                    key, known_hosts, timeout=120,
-                )
+                trace_copy = upload_to_vm(COMMIT_ORDER_TRACE_RUNNER, "/tmp/gcp-commit-order-trace-runner.py")
                 append_local_log(key_log, trace_copy.stdout + trace_copy.stderr)
                 if trace_copy.returncode:
                     raise BenchError(f"Could not copy commit-order trace runner: {trace_copy.stderr.strip()}")
             if point_lookahead_suite:
                 if not POINT_LOOKAHEAD_RUNNER.is_file():
                     raise BenchError(f"Point lookahead runner is not present in this checkout: {POINT_LOOKAHEAD_RUNNER}")
-                point_copy = scp_to_vm(
-                    ip, POINT_LOOKAHEAD_RUNNER, "/tmp/gcp-v8-point-lookahead-runner.py", key, known_hosts,
-                    timeout=120,
-                )
+                point_copy = upload_to_vm(POINT_LOOKAHEAD_RUNNER, "/tmp/gcp-v8-point-lookahead-runner.py")
                 append_local_log(key_log, point_copy.stdout + point_copy.stderr)
                 if point_copy.returncode:
                     raise BenchError(f"Could not copy Point lookahead runner: {point_copy.stderr.strip()}")
             if mutex_diagnostic_suite:
                 if not V8_MUTEX_DIAGNOSTIC_RUNNER.is_file():
                     raise BenchError(f"Mutex diagnostic helper is not present in this checkout: {V8_MUTEX_DIAGNOSTIC_RUNNER}")
-                mutex_copy = scp_to_vm(
-                    ip, V8_MUTEX_DIAGNOSTIC_RUNNER, "/tmp/gcp-v8-mutex-diagnostic-runner.py",
-                    key, known_hosts, timeout=120,
-                )
+                mutex_copy = upload_to_vm(V8_MUTEX_DIAGNOSTIC_RUNNER, "/tmp/gcp-v8-mutex-diagnostic-runner.py")
                 append_local_log(key_log, mutex_copy.stdout + mutex_copy.stderr)
                 if mutex_copy.returncode:
                     raise BenchError(f"Could not copy mutex diagnostic runner: {mutex_copy.stderr.strip()}")
+            if cpu_attribution_suite:
+                if not V8_POINT_CPU_ATTRIBUTION_RUNNER.is_file():
+                    raise BenchError(f"Point CPU attribution helper is missing: {V8_POINT_CPU_ATTRIBUTION_RUNNER}")
+                cpu_copy = upload_to_vm(
+                    V8_POINT_CPU_ATTRIBUTION_RUNNER, "/tmp/gcp-v8-point-cpu-attribution-runner.py"
+                )
+                append_local_log(key_log, cpu_copy.stdout + cpu_copy.stderr)
+                if cpu_copy.returncode:
+                    raise BenchError(f"Could not copy CPU attribution helper: {cpu_copy.stderr.strip()}")
             if point_borrowed_input_suite:
                 if not POINT_BORROWED_INPUT_RUNNER.is_file():
                     raise BenchError(f"Borrowed-input helper is missing: {POINT_BORROWED_INPUT_RUNNER}")
-                borrowed_copy = scp_to_vm(
-                    ip, POINT_BORROWED_INPUT_RUNNER, "/tmp/gcp-v8-point-borrowed-input-runner.py",
-                    key, known_hosts, timeout=120,
+                borrowed_copy = upload_to_vm(
+                    POINT_BORROWED_INPUT_RUNNER, "/tmp/gcp-v8-point-borrowed-input-runner.py"
                 )
                 append_local_log(key_log, borrowed_copy.stdout + borrowed_copy.stderr)
                 if borrowed_copy.returncode:
@@ -2743,19 +2997,15 @@ def provision_and_run(
             if point_direct_frame_suite:
                 if not POINT_DIRECT_FRAME_RUNNER.is_file():
                     raise BenchError(f"Direct-frame helper is missing: {POINT_DIRECT_FRAME_RUNNER}")
-                direct_copy = scp_to_vm(
-                    ip, POINT_DIRECT_FRAME_RUNNER, "/tmp/gcp-v8-point-direct-frame-runner.py",
-                    key, known_hosts, timeout=120,
-                )
+                direct_copy = upload_to_vm(POINT_DIRECT_FRAME_RUNNER, "/tmp/gcp-v8-point-direct-frame-runner.py")
                 append_local_log(key_log, direct_copy.stdout + direct_copy.stderr)
                 if direct_copy.returncode:
                     raise BenchError(f"Could not copy direct-frame helper: {direct_copy.stderr.strip()}")
             if extent_policy_storage_suite:
                 if not V8_EXTENT_POLICY_STORAGE_RUNNER.is_file():
                     raise BenchError(f"Extent-policy storage runner is missing: {V8_EXTENT_POLICY_STORAGE_RUNNER}")
-                storage_copy = scp_to_vm(
-                    ip, V8_EXTENT_POLICY_STORAGE_RUNNER, "/tmp/gcp-v8-extent-policy-storage-runner.py",
-                    key, known_hosts, timeout=120,
+                storage_copy = upload_to_vm(
+                    V8_EXTENT_POLICY_STORAGE_RUNNER, "/tmp/gcp-v8-extent-policy-storage-runner.py"
                 )
                 append_local_log(key_log, storage_copy.stdout + storage_copy.stderr)
                 if storage_copy.returncode:
@@ -2771,8 +3021,10 @@ def provision_and_run(
                         "v8-point-direct-frame" if point_direct_frame_suite else (
                             "v8-point-borrowed-input" if point_borrowed_input_suite else (
                             "v8-mutex-diagnostic" if mutex_diagnostic_suite else (
+                                "v8-point-cpu-attribution" if cpu_attribution_suite else (
                                 "v8-point-lookahead" if point_lookahead_suite else (
                                     "rfc026-full" if args.full_rfc026_matrix else "batch64"
+                                )
                                 )
                             )
                             )
@@ -2782,6 +3034,7 @@ def provision_and_run(
                 ),
                 args.source_patch_sha256 or "-",
                 getattr(args, "baseline_commit", "").lower() if getattr(args, "baseline_commit", None) else "-",
+                str(getattr(args, "repetitions", 1)),
             ])
             remaining = max(30, int(deadline - time.monotonic()))
             try:
@@ -2830,9 +3083,14 @@ def provision_and_run(
                             persist_lifecycle()
                             if not lifecycle["results_verified"]:
                                 return_code = 1
-                                lifecycle["cleanup"].append(
-                                    "result set is incomplete or unverified; preserving the VM and network for recovery"
-                                )
+                                if should_retain_vm(args, return_code, lifecycle):
+                                    lifecycle["cleanup"].append(
+                                        "result set is incomplete or unverified; preserving the VM and network for recovery"
+                                    )
+                                else:
+                                    lifecycle["cleanup"].append(
+                                        "benchmark did not start and remote execution is certain; cleaning up failed setup"
+                                    )
                                 persist_lifecycle()
                             elif not collection.get("bootstrap_log"):
                                 lifecycle["cleanup"].append("bootstrap log could not be collected; benchmark results are local")
@@ -2924,6 +3182,8 @@ def main(argv: list[str] | None = None) -> int:
     gcloud = Gcloud(args.project, results_dir / "gcloud-commands.jsonl")
 
     try:
+        if args.ssh_source_range and not (args.ssh_source_auto or args.skip_ssh_egress_check):
+            validate_ssh_egress(args.ssh_source_range)
         report = preflight(
             gcloud, args.project, args.zone, args.network, args.subnet, args.machine_type,
         )
@@ -2964,6 +3224,15 @@ def main(argv: list[str] | None = None) -> int:
                 machine_type=args.machine_type,
                 machine_spec=MACHINE_SPECS[args.machine_type],
                 commit=args.commit.lower(),
+            )
+        elif args.v8_point_cpu_attribution:
+            report["benchmark_suite"] = "v8-point-cpu-attribution"
+            report["benchmark_plan"] = build_v8_point_cpu_attribution_plan(
+                machine_type=args.machine_type,
+                machine_spec=MACHINE_SPECS[args.machine_type],
+                commit=args.commit.lower(),
+                writers=args.writers,
+                repetitions=args.repetitions,
             )
         elif args.v8_point_borrowed_input_ab:
             report["benchmark_suite"] = "v8-point-borrowed-input"

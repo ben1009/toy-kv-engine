@@ -82,7 +82,7 @@ single public IP as `/32` is preferred). The runner audits project firewall
 rules and global and regional effective firewall policies before creating the
 VM or firewall rule. It refuses to proceed if an applicable SSH allow rule
 permits a broader source, and repeats the audit immediately before opening each
-SSH/SCP connection. This requires `compute.firewalls.list`,
+SSH command or streamed-file connection. This requires `compute.firewalls.list`,
 `compute.networks.getEffectiveFirewalls`, and
 `compute.networks.getRegionEffectiveFirewalls`; default networks with a
 target-all `0.0.0.0/0` SSH rule must be narrowed or replaced with an isolated
@@ -91,6 +91,17 @@ with firewall-policy permissions could change the effective policy after a
 check. Do not run while another actor is changing firewall policy; use a
 dedicated network or an enforced policy when concurrent policy changes cannot
 be ruled out.
+
+For the active Free Trial benchmark project, the default VPC's broad SSH allow
+rule is a known, recurring condition. Do not use or modify that shared VPC rule,
+and do not repeat this known finding as a per-run failure. Start WAL benchmark
+runs on a temporary isolated VPC and regional subnet provisioned with
+Terraform, including the default internet-egress route. Keep its Terraform state
+outside the repository. After creation, audit the isolated network's effective
+firewall policy, then run the benchmark runner's `--preflight-only` with the
+same network, subnet, machine, runtime, and cost arguments as the real run.
+Only the runner's temporary SSH rule should admit inbound SSH, restricted to
+the supplied source CIDR (prefer `/32`).
 The VM blocks project-wide SSH keys, has no service account, and receives a
 temporary firewall rule targeted only at its unique network tag; the rule is
 removed during teardown. The VM has a server-side maximum runtime (default 180
@@ -136,7 +147,7 @@ The project must already
 have `compute.googleapis.com` and `cloudquotas.googleapis.com` enabled. The
 runner uses `gcloud beta compute instances create` to set a server-enforced
 delete deadline; its preflight checks that the installed CLI exposes the
-required flags. Local `ssh`, `scp`, and `ssh-keygen` are also required for a
+required flags. Local `ssh` and `ssh-keygen` are also required for a
 full run. Use an existing VPC network with outbound internet access and
 permissions to create/delete a VM and temporary firewall rule. For a
 custom-mode VPC, pass `--subnet SUBNETWORK_NAME`; preflight verifies that the
@@ -176,18 +187,32 @@ python3 scripts/gcp-free-trial-wal-bench.py \
 ```
 
 After confirming the Free Trial status in Billing Overview and choosing your
-current public IPv4 CIDR, run the benchmark:
+current public IPv4 CIDR, run the benchmark. `--ssh-source-range auto` resolves
+the current public IPv4 as a `/32` through `https://api.ipify.org`; this sends
+the caller's public IP to that lookup service. The HTTPS lookup and SSH
+connection must use the same public IPv4 egress address. If they use different
+routes (for example, HTTPS goes through a proxy while SSH connects directly),
+verify the SSH client's egress separately and pass its current CIDR with
+`--skip-ssh-egress-check`. For explicit CIDRs, preflight and launch otherwise use
+the same public IPv4 lookup and stop before VM creation on a mismatch. Use the
+skip flag with a freshly verified explicit CIDR if the lookup is unavailable or
+you do not want to send your public IP to the lookup service:
 
 ```bash
 python3 scripts/gcp-free-trial-wal-bench.py \
   --project YOUR_PROJECT_ID \
   --zone us-central1-a \
   --commit 0123456789abcdef0123456789abcdef01234567 \
-  --ssh-source-range 203.0.113.10/32 \
+  --ssh-source-range auto \
   --estimated-hourly-cost-usd YOUR_CURRENT_ESTIMATE \
   --max-estimated-spend-usd YOUR_SPEND_CEILING \
   --confirm-free-trial
 ```
+
+Each invocation reserves its results directory. If you pass `--results-dir`
+to a standalone `--preflight-only` invocation and then to the real run, use two
+different directories. Omitting the option lets the runner choose a fresh
+timestamped directory each time.
 
 To run the full counterbalanced RFC 026 matrix on a 16-vCPU machine with the
 16-writer case included:
@@ -301,7 +326,7 @@ sets the VM auto-delete deadline. The runner exits before creating resources
 when quota or machine support cannot be verified.
 
 The runner enables guest attributes and obtains the VM's SSH host keys from
-the Compute Engine API before connecting. SSH and SCP use strict host-key
+the Compute Engine API before connecting. SSH commands and file streams use strict host-key
 checking against that API response. The runner polls guest attributes at a
 bounded rate. See [guest attributes and SSH
 host-key verification](https://docs.cloud.google.com/compute/docs/metadata/manage-guest-attributes).
