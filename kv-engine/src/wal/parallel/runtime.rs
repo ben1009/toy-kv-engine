@@ -39,11 +39,13 @@ use crossbeam_queue::ArrayQueue;
 use parking_lot::{Condvar, Mutex, MutexGuard};
 use sha2::{Digest, Sha256};
 
+#[cfg(feature = "bench")]
+use super::parallel_worker::WalCompletionPublicationDetails;
 use super::{
     BUFFER_POOL_BUF_SIZE, BUFFER_POOL_CAPACITY, DirectBuf, MAX_WAL_FILE_SIZE, PREALLOC_BLOCK,
     parallel_worker::{
-        GroupWriteResult, IoWorker, IoWorkerClient, WalCompletionPublicationDetails,
-        WalSyncProgress, WorkerBuffer, WriteBuffer, WriteGroup, WriteGroupBuffers,
+        GroupWriteResult, IoWorker, IoWorkerClient, WalSyncProgress, WorkerBuffer, WriteBuffer,
+        WriteGroup, WriteGroupBuffers,
     },
 };
 
