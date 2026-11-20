@@ -132,8 +132,10 @@ run_names = {
     "sync-observations.json", "completion-timeline.json", "completion-handoff-timeline.json",
 }
 selected = [path for path in root.iterdir() if path.is_file() and path.name in root_names]
-for run_dir in sorted(root.glob("w*")):
-    if run_dir.is_dir():
+for run_dir in sorted(root.iterdir()):
+    if run_dir.is_dir() and any(
+        path.is_file() and path.name in run_names for path in run_dir.iterdir()
+    ):
         selected.extend(path for path in run_dir.iterdir() if path.is_file() and path.name in run_names)
 
 descriptor, archive_name = tempfile.mkstemp(prefix="gcp-wal-bench-results-", suffix=".tar.gz")
@@ -1386,7 +1388,7 @@ def _run_identifier(row: dict[str, Any], suite: str) -> str:
     if suite == "v8-mutex-diagnostic":
         return f"w{row['writer']}-{row['workload']}-r{row['repetition']}-{row['arm']}"
     if suite == "v8-point-cpu-attribution":
-        return f"w{row['writer']}-{row['workload']}-{row['arm']}"
+        return f"r{row['repetition']}-w{row['writer']}-point-{row['arm']}"
     raise ValueError(f"unsupported benchmark suite: {suite!r}")
 
 
@@ -1412,7 +1414,7 @@ def _summary_row_identifier(row: dict[str, Any], suite: str) -> str:
     if suite == "v8-mutex-diagnostic":
         return f"w{int(row['writer'])}-{row['workload']}-r{int(row['repetition'])}-{row['arm']}"
     if suite == "v8-point-cpu-attribution":
-        return f"w{int(row['writer'])}-{row['workload']}-{row['arm']}"
+        return f"r{int(row['repetition'])}-w{int(row['writer'])}-point-{row['arm']}"
     raise ValueError(f"unsupported benchmark suite: {suite!r}")
 
 

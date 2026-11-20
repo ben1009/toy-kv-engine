@@ -398,7 +398,8 @@ if [[ "$BENCH_SUITE" == "v8-point-cpu-attribution" ]]; then
         --binary-sha256 "$BINARY_SHA256" \
         --machine-type "$BENCH_MACHINE_TYPE" \
         --ssd-count "$BENCH_SSD_COUNT" \
-        --ssd-gib "$BENCH_SSD_TOTAL_GIB"
+        --ssd-gib "$BENCH_SSD_TOTAL_GIB" \
+        --repetitions "$BENCH_REPETITIONS"
     exit $?
 fi
 

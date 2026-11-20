@@ -580,6 +580,10 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
         self.assertEqual(len(repeated_schedule), 12)
         self.assertEqual({row["repetition"] for row in repeated_schedule}, {1, 2, 3})
         self.assertEqual(len({cpu_attribution_run_id(row) for row in repeated_schedule}), 12)
+        for row in repeated_schedule:
+            expected_run_id = f"r{row['repetition']}-w{row['writer']}-point-{row['arm']}"
+            self.assertEqual(BENCH._run_identifier(row, "v8-point-cpu-attribution"), expected_run_id)
+            self.assertEqual(BENCH._summary_row_identifier(row, "v8-point-cpu-attribution"), expected_run_id)
         repeated_rows = [{
             "writer": row["writer"], "workload": row["workload"], "repetition": row["repetition"],
             "arm": row["arm"], "ops": row["num"], "sample_every": row["sample_every"],
@@ -3163,7 +3167,7 @@ print('[hotpath] diagnostic report follows')
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             results = root / "remote" / "results"
-            run_dir = results / "w16-point-v8_parallel"
+            run_dir = results / "r1-w16-point-v8_parallel"
             run_dir.mkdir(parents=True)
             for name in (
                 "profile-schedule.tsv", "rust-toolchain.txt", "write-perf.sha256", "perf-version.txt",
@@ -3188,11 +3192,11 @@ print('[hotpath] diagnostic report follows')
             for name in (
                 "results/profile-schedule.tsv", "results/rust-toolchain.txt",
                 "results/write-perf.sha256", "results/perf-version.txt",
-                "results/w16-point-v8_parallel/stderr.log", "results/w16-point-v8_parallel/timeline.json",
-                "results/w16-point-v8_parallel/perf.data", "results/w16-point-v8_parallel/perf-report.txt",
-                "results/w16-point-v8_parallel/sync-observations.json",
-                "results/w16-point-v8_parallel/completion-timeline.json",
-                "results/w16-point-v8_parallel/completion-handoff-timeline.json",
+                "results/r1-w16-point-v8_parallel/stderr.log", "results/r1-w16-point-v8_parallel/timeline.json",
+                "results/r1-w16-point-v8_parallel/perf.data", "results/r1-w16-point-v8_parallel/perf-report.txt",
+                "results/r1-w16-point-v8_parallel/sync-observations.json",
+                "results/r1-w16-point-v8_parallel/completion-timeline.json",
+                "results/r1-w16-point-v8_parallel/completion-handoff-timeline.json",
             ):
                 self.assertIn(name, names)
             self.assertFalse(any(name.endswith("ignored.db") for name in names))
@@ -3201,6 +3205,12 @@ print('[hotpath] diagnostic report follows')
             rejected = self._run_remote_bundle(too_small, results, root)
             self.assertNotEqual(rejected.returncode, 0)
             self.assertIn("exceeds 1 byte limit", rejected.stderr)
+
+    def test_remote_cpu_attribution_runner_receives_requested_repetitions(self) -> None:
+        remote_script = Path(BENCH.__file__).with_name("gcp-free-trial-wal-bench-remote.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('--repetitions "$BENCH_REPETITIONS"', remote_script)
 
     def test_collection_retries_and_preserves_partial_bundle_for_recovery(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
