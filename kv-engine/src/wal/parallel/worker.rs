@@ -161,6 +161,17 @@ struct WalSyncProgressState {
 
 #[cfg(feature = "bench")]
 #[derive(Clone, Debug)]
+pub(crate) struct WalCompletionPublicationDetails {
+    pub(crate) published_at: Instant,
+    pub(crate) published_monotonic_ns: Option<u64>,
+    pub(crate) prefix_end_before: u64,
+    pub(crate) prefix_end_after: u64,
+    pub(crate) hol_blocker_ticket: Option<u64>,
+    pub(crate) phases: crate::mem_table::WalCompletionPublicationPhases,
+}
+
+#[cfg(feature = "bench")]
+#[derive(Clone, Debug)]
 pub(crate) struct WalWorkerGroupCompletionTimeline {
     pub(crate) group_id: u64,
     pub(crate) ticket_start: u64,
@@ -292,20 +303,15 @@ impl WalSyncProgress {
     pub(crate) fn finish_completion_timeline(
         &self,
         group_id: u64,
-        data_complete_published_at: Instant,
-        data_complete_published_monotonic_ns: Option<u64>,
-        prefix_end_before: u64,
-        prefix_end_after: u64,
-        hol_blocker_ticket: Option<u64>,
-        publication_phases: crate::mem_table::WalCompletionPublicationPhases,
+        publication: WalCompletionPublicationDetails,
     ) -> Option<WalWorkerGroupCompletionTimeline> {
         let mut timeline = self.state.lock().completion_timelines.remove(&group_id)?;
-        timeline.data_complete_published_at = Some(data_complete_published_at);
-        timeline.data_complete_published_monotonic_ns = data_complete_published_monotonic_ns;
-        timeline.data_complete_prefix_end_before = Some(prefix_end_before);
-        timeline.data_complete_prefix_end_after = Some(prefix_end_after);
-        timeline.hol_blocker_ticket = hol_blocker_ticket;
-        timeline.publication_phases = Some(publication_phases);
+        timeline.data_complete_published_at = Some(publication.published_at);
+        timeline.data_complete_published_monotonic_ns = publication.published_monotonic_ns;
+        timeline.data_complete_prefix_end_before = Some(publication.prefix_end_before);
+        timeline.data_complete_prefix_end_after = Some(publication.prefix_end_after);
+        timeline.hol_blocker_ticket = publication.hol_blocker_ticket;
+        timeline.publication_phases = Some(publication.phases);
         Some(timeline)
     }
 

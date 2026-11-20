@@ -42,8 +42,8 @@ use sha2::{Digest, Sha256};
 use super::{
     BUFFER_POOL_BUF_SIZE, BUFFER_POOL_CAPACITY, DirectBuf, MAX_WAL_FILE_SIZE, PREALLOC_BLOCK,
     parallel_worker::{
-        GroupWriteResult, IoWorker, IoWorkerClient, WalSyncProgress, WorkerBuffer, WriteBuffer,
-        WriteGroup, WriteGroupBuffers,
+        GroupWriteResult, IoWorker, IoWorkerClient, WalCompletionPublicationDetails,
+        WalSyncProgress, WorkerBuffer, WriteBuffer, WriteGroup, WriteGroupBuffers,
     },
 };
 
@@ -3198,12 +3198,14 @@ fn process_group_result(inner: &RuntimeInner, result: GroupWriteResult) {
             };
             if let Some(timeline) = inner.sync_progress.finish_completion_timeline(
                 result_group_id,
-                published_at,
-                data_complete_published_monotonic_ns,
-                data_complete_prefix_end_before.unwrap_or_default(),
-                data_complete_prefix_end_after.unwrap_or_default(),
-                hol_blocker_ticket,
-                publication_phases,
+                WalCompletionPublicationDetails {
+                    published_at,
+                    published_monotonic_ns: data_complete_published_monotonic_ns,
+                    prefix_end_before: data_complete_prefix_end_before.unwrap_or_default(),
+                    prefix_end_after: data_complete_prefix_end_after.unwrap_or_default(),
+                    hol_blocker_ticket,
+                    phases: publication_phases,
+                },
             ) {
                 inner
                     .sync_progress
