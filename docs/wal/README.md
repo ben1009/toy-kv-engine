@@ -84,6 +84,7 @@ the retained and rejected experiments.
 - [V8 Point 3 μs DATA Group Join on GCP](benchmarks/rfc-026-v8-point-short-group-join-gcp-20261120.md)
 - [V7/V8 cumulative thread CPU on GCP](benchmarks/rfc-026-v7-v8-thread-role-cpu-gcp-20261120.md)
 - [V7/V8 cumulative writer-stage CPU on GCP](benchmarks/rfc-026-v7-v8-writer-stage-cpu-gcp-20261120.md)
+- [V7/V8 completion and durability CPU diagnosis on GCP](benchmarks/rfc-026-v7-v8-completion-durability-cpu-gcp-20261120.md)
 - [GCP Free Trial WAL benchmark runner](benchmarks/gcp-free-trial-wal-bench.md)
 - [RFC 026 GCP V8 point sync diagnostic, 2026-11-10](benchmarks/rfc-026-v8-point-sync-gcp-20261110.md)
 - [RFC 026 V8 FRONTIER I/O A/B on GCP, 2026-11-11](benchmarks/rfc-026-v8-frontier-io-ab-gcp-20261111.md)
