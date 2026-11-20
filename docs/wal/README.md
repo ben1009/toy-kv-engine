@@ -109,6 +109,7 @@ the retained and rejected experiments.
 - [RFC 026 V8 extent-policy Vec A/B on GCP, 2026-11-18](benchmarks/rfc-026-v8-extent-policy-vec-ab-gcp-20261118.md)
 - [RFC 026 V7/V8 Point Producer critical-path diagnosis on GCP, 2026-11-19](benchmarks/rfc-026-v7-v8-point-producer-critical-path-gcp-20261119.md)
 - [RFC 026 V7/V8 Point DATA submission and HOL timeline rerun on GCP, 2026-11-19](benchmarks/rfc-026-v7-v8-point-data-completion-hol-rerun-gcp-20261119.md)
+- [RFC 026 V7/V8 Point same-ticket DATA HOL diagnosis on GCP, 2026-11-20](benchmarks/rfc-026-v7-v8-point-hol-ticket-gcp-20261120.md)
 - [RFC 026 V8 Point DATA group join experiment on GCP, 2026-11-17](benchmarks/rfc-026-v8-point-data-group-gcp-20261117.md)
 - [RFC 026 V8 batched durable-guard check GCP A/B, 2026-11-15](benchmarks/rfc-026-v8-durable-guard-check-gcp-20261115.md)
 - [RFC 026 full WAL matrix rerun on GCP, 2026-11-15](benchmarks/rfc-026-v8-durable-guard-full-matrix-gcp-20261115.md)
