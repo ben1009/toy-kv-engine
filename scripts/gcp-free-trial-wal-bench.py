@@ -205,6 +205,17 @@ def resolve_ssh_source_range(source_range: str | None) -> str | None:
     return f"{address}/32"
 
 
+def validate_ssh_egress(source_range: str) -> None:
+    """Reject a stale source range before provisioning any cloud resources."""
+    current_range = resolve_ssh_source_range("auto")
+    if ipaddress.ip_interface(current_range).ip not in ipaddress.ip_network(source_range):
+        raise BenchError(
+            "the current public IPv4 is outside --ssh-source-range; "
+            "refresh the SSH CIDR or use --ssh-source-range auto. "
+            "No cloud resources were created"
+        )
+
+
 def _is_transient_gcloud_error(detail: str) -> bool:
     lowered = detail.lower()
     transient_markers = (
@@ -1162,11 +1173,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument("--confirm-free-trial", action="store_true",
                         help="Attest that Billing Overview says Free Trial and you will not upgrade to Paid")
+    parser.add_argument(
+        "--skip-ssh-egress-check", action="store_true",
+        help="Use a manually verified SSH source CIDR when the HTTPS lookup cannot verify that route",
+    )
     args = parser.parse_args(argv)
     if args.repetitions <= 0:
         parser.error("--repetitions must be a positive integer")
     if args.repetitions != 1 and not args.v8_point_cpu_attribution:
         parser.error("--repetitions is only configurable with --v8-point-cpu-attribution")
+    args.ssh_source_auto = (args.ssh_source_range or "").strip().lower() == "auto"
     try:
         args.ssh_source_range = resolve_ssh_source_range(args.ssh_source_range)
     except BenchError as error:
@@ -3166,6 +3182,8 @@ def main(argv: list[str] | None = None) -> int:
     gcloud = Gcloud(args.project, results_dir / "gcloud-commands.jsonl")
 
     try:
+        if args.ssh_source_range and not (args.ssh_source_auto or args.skip_ssh_egress_check):
+            validate_ssh_egress(args.ssh_source_range)
         report = preflight(
             gcloud, args.project, args.zone, args.network, args.subnet, args.machine_type,
         )

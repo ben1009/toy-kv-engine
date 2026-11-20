@@ -192,8 +192,11 @@ the current public IPv4 as a `/32` through `https://api.ipify.org`; this sends
 the caller's public IP to that lookup service. The HTTPS lookup and SSH
 connection must use the same public IPv4 egress address. If they use different
 routes (for example, HTTPS goes through a proxy while SSH connects directly),
-pass the SSH client's egress CIDR explicitly instead of using `auto`. Use an
-explicit CIDR if the lookup is not permitted or available:
+verify the SSH client's egress separately and pass its current CIDR with
+`--skip-ssh-egress-check`. For explicit CIDRs, preflight and launch otherwise use
+the same public IPv4 lookup and stop before VM creation on a mismatch. Use the
+skip flag with a freshly verified explicit CIDR if the lookup is unavailable or
+you do not want to send your public IP to the lookup service:
 
 ```bash
 python3 scripts/gcp-free-trial-wal-bench.py \

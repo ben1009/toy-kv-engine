@@ -352,6 +352,24 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
         self.assertEqual(now[0], 5)
         sleep_mock.assert_called_once_with(5)
 
+    def test_stale_ssh_source_stops_before_cloud_preflight(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as temp,
+            patch.object(BENCH.urllib.request, "urlopen", return_value=BytesIO(b"8.8.8.8")),
+            patch.object(BENCH, "preflight") as preflight,
+        ):
+            results = Path(temp) / "results"
+            code = BENCH.main([
+                "--project", "project", "--zone", "us-central1-a", "--commit", "a" * 40,
+                "--ssh-source-range", "9.9.9.9/32", "--preflight-only",
+                "--results-dir", str(results),
+            ])
+            self.assertEqual(code, 2)
+            preflight.assert_not_called()
+            failure = json.loads((results / "preflight-failure.json").read_text())
+            self.assertIn("outside --ssh-source-range", failure["error"])
+            self.assertFalse(failure["vm_created"])
+
     def test_auto_ssh_source_range_resolves_current_public_ipv4_as_host_rule(self) -> None:
         with patch.object(BENCH.urllib.request, "urlopen", return_value=BytesIO(b"8.8.8.8\n")) as lookup:
             args = BENCH.parse_args([
