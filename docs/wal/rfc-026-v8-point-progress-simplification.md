@@ -4,13 +4,13 @@
 | --- | --- |
 | Status | **Revised after self-review — design only; no runtime change** |
 | Date | 2026-11-21 |
-| Base | PR #558, commit 14df402b |
+| Base | `main` at `58c79208` (squash merge of PR #558); source audit originally pinned to `14df402b` |
 | Applies to | V8 Parallel Point Put; V7 and V8 Leader unaffected |
 | Parent | [RFC 026](../../rfcs/026-composable-wal-prefix-digest.md) and [implementation plan](rfc-026-implementation-plan.md) |
 
 ## 1. Decision requested
 
-Prototype **two independent, bounded architecture candidates**, in order:
+Evaluate **two independent, bounded candidates**; P0 is an optional screen, while P1 is the architecture candidate:
 
 1. **P0 — Optional small Point-ready fusion screen:** for a qualifying one-frame Point, atomically publish batch digest and materialized-frame readiness under one coordinator lock. Keep DATA completion independent. This is *not* the architecture redesign and may lose early digest-fold overlap; do not spend a GCP campaign on it without an encouraging short local A/B.
 2. **P1 — Independent dedicated V8 durability owner:** keep the existing independent Completion Reaper and io_uring worker; move writer-elected FRONTIER/fdatasync driving into a separate V8 durability thread. Writers publish a desired ticket end and wait for the durable watermark. P1 is the **architecture candidate** and has an independent benchmark gate.
@@ -22,14 +22,14 @@ Do **not** make P1 contingent on P0 winning or losing. P1 needs a completed conc
 - **No combined Reaper + fdatasync thread.** A syncing thread cannot drain DATA completions, creating completion backlog and potentially a progress cycle. P1 keeps the current Reaper distinct.
 - **No assumption that ready fusion is free.** P0 delays a previously earlier digest-ready notification; that can reduce overlap and create HOL even if one lock/notification is saved.
 - **No wakeup-only design.** P1 must publish its requested durable ticket end under the coordinator mutex and sleep on a predicate/generation protocol that cannot miss a late DATA completion or digest fold.
-- **No broad PR diff.** The parent attribution PR #558 was squash-merged while this PR was stacked on it. The RFC branch must be restacked onto current `main` before review.
+- **Clean PR diff restored.** PR #558 was squash-merged while this RFC was stacked on it. The branch has been restacked onto current `main`; PR #559 now changes only this RFC and its README link.
 - **No coarse p99 gate.** Sample Point latency at least once per 10 Puts for a meaningful, still approximate tail comparison. Avoid overinterpreting Batch64 p99.
 
 The purpose is to test whether fewer synchronization transitions, rather than faster ticket lookup or extra DATA batching, improve the Point critical path. **Neither candidate is assumed to win.**
 
 ## 2. Source audit: today's Point path
 
-At the pinned base commit:
+At the original audited source revision (`14df402b`, whose changes have since been squash-merged into `main`):
 
 | Operation | Implementation | Responsibility |
 | --- | --- | --- |
