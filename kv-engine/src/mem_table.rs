@@ -491,6 +491,48 @@ pub struct WalCompletionHandoffObservation {
     pub data_complete_prefix_end_before: Option<u64>,
     pub data_complete_prefix_end_after: Option<u64>,
     pub hol_blocker_ticket: Option<u64>,
+    pub publication_phases: Option<WalCompletionPublicationPhases>,
+}
+
+/// Sampled lock and state-publication phases for one successful DATA group.
+/// V7 and V8 use different completion representations, so format-specific
+/// operations remain separately named instead of being presented as directly
+/// equivalent work.
+#[cfg(feature = "bench")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WalCompletionPublicationPhases {
+    pub v7_durability_state_lock_wait_wall_ns: Option<u64>,
+    pub v7_durability_state_lock_wait_cpu_ns: Option<u64>,
+    pub v8_coordinator_state_lock_wait_wall_ns: Option<u64>,
+    pub v8_coordinator_state_lock_wait_cpu_ns: Option<u64>,
+    /// V7 inserts a completed group into its ordered completion map.
+    pub v7_group_registration_wall_ns: Option<u64>,
+    pub v7_group_registration_cpu_ns: Option<u64>,
+    /// V8 locates the first ticket in its admitted ticket vector.
+    pub v8_ticket_lookup_wall_ns: Option<u64>,
+    pub v8_ticket_lookup_cpu_ns: Option<u64>,
+    pub v8_ticket_lookup_entries_scanned: Option<u64>,
+    /// V8 checks the requested range, frame readiness, and duplicate state.
+    pub v8_ticket_validation_wall_ns: Option<u64>,
+    pub v8_ticket_validation_cpu_ns: Option<u64>,
+    /// V8 marks the group's ticket states data-complete.
+    pub v8_data_complete_mark_wall_ns: Option<u64>,
+    pub v8_data_complete_mark_cpu_ns: Option<u64>,
+    /// V7 advances the contiguous written frontier through completed groups.
+    pub v7_written_frontier_advance_wall_ns: Option<u64>,
+    pub v7_written_frontier_advance_cpu_ns: Option<u64>,
+    /// V8's benchmark-only prefix/HOL bookkeeping; this is not a WAL frontier.
+    pub v8_prefix_diagnostic_wall_ns: Option<u64>,
+    pub v8_prefix_diagnostic_cpu_ns: Option<u64>,
+    /// V8 signals its state and durability condition variables after marking.
+    pub v8_notification_wall_ns: Option<u64>,
+    pub v8_notification_cpu_ns: Option<u64>,
+    /// Number of V8 notify calls made (not the number of threads woken).
+    pub v8_notification_calls: Option<u64>,
+    pub v7_durability_state_lock_hold_wall_ns: Option<u64>,
+    pub v7_durability_state_lock_hold_cpu_ns: Option<u64>,
+    pub v8_coordinator_state_lock_hold_wall_ns: Option<u64>,
+    pub v8_coordinator_state_lock_hold_cpu_ns: Option<u64>,
 }
 
 /// One sampled, actual V8 durability advance. Wall and thread CPU durations

@@ -95,6 +95,7 @@ from gcp_v8_point_cpu_attribution_runner import (
     _build_command as build_cpu_attribution_command,
     _completion_handoff_timeline_summary,
     _completion_timeline_summary,
+    _run_id as cpu_attribution_run_id,
     _validate_v8_durability_phase_samples,
     run_suite as run_cpu_attribution_suite,
 )
@@ -525,6 +526,26 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
         self.assertTrue(validate_v8_point_cpu_attribution_rows(rows)["complete"])
         self.assertFalse(validate_v8_point_cpu_attribution_rows(rows[:-1])["complete"])
 
+        repeated_schedule = build_v8_point_cpu_attribution_schedule((8, 16), repetitions=3)
+        self.assertEqual(len(repeated_schedule), 12)
+        self.assertEqual({row["repetition"] for row in repeated_schedule}, {1, 2, 3})
+        self.assertEqual(len({cpu_attribution_run_id(row) for row in repeated_schedule}), 12)
+        repeated_rows = [{
+            "writer": row["writer"], "workload": row["workload"], "repetition": row["repetition"],
+            "arm": row["arm"], "ops": row["num"], "sample_every": row["sample_every"],
+            "exit_code": 0, "wal_cpu_attribution_valid": True,
+        } for row in repeated_schedule]
+        self.assertTrue(validate_v8_point_cpu_attribution_rows(repeated_rows, (8, 16), 3)["complete"])
+        repeated_plan = build_v8_point_cpu_attribution_plan(
+            machine_type="c4-standard-16-lssd",
+            machine_spec=BENCH.MACHINE_SPECS["c4-standard-16-lssd"],
+            writers=(8, 16),
+            repetitions=3,
+        )
+        self.assertEqual(repeated_plan["runs_planned"], 12)
+        with self.assertRaises(ValueError):
+            build_v8_point_cpu_attribution_schedule((8, 16), repetitions=0)
+
     def test_v8_durability_phase_validation_matches_serialized_schema(self) -> None:
         # Rust phase records are emitted only after completed advances and use integer timing/count fields.
         phase = {field: 10 for field in cpu_attribution_runner.V8_DURABILITY_FIELDS}
@@ -808,6 +829,16 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
                 "cqe_observed_monotonic_ns": ticket + 3,
                 "data_complete_published_monotonic_ns": ticket + 4,
                 "hol_blocker_ticket": None,
+                "publication_phases": {
+                    "v7_durability_state_lock_wait_wall_ns": 1,
+                    "v7_durability_state_lock_wait_cpu_ns": 1,
+                    "v7_durability_state_lock_hold_wall_ns": 1,
+                    "v7_durability_state_lock_hold_cpu_ns": 1,
+                    "v7_group_registration_wall_ns": 1,
+                    "v7_group_registration_cpu_ns": 1,
+                    "v7_written_frontier_advance_wall_ns": 1,
+                    "v7_written_frontier_advance_cpu_ns": 1,
+                },
             }
             for ticket in range(
                 0,

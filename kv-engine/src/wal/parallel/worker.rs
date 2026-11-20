@@ -188,6 +188,7 @@ pub(crate) struct WalWorkerGroupCompletionTimeline {
     pub(crate) data_complete_prefix_end_before: Option<u64>,
     pub(crate) data_complete_prefix_end_after: Option<u64>,
     pub(crate) hol_blocker_ticket: Option<u64>,
+    pub(crate) publication_phases: Option<crate::mem_table::WalCompletionPublicationPhases>,
 }
 
 #[cfg(feature = "bench")]
@@ -296,6 +297,7 @@ impl WalSyncProgress {
         prefix_end_before: u64,
         prefix_end_after: u64,
         hol_blocker_ticket: Option<u64>,
+        publication_phases: crate::mem_table::WalCompletionPublicationPhases,
     ) -> Option<WalWorkerGroupCompletionTimeline> {
         let mut timeline = self.state.lock().completion_timelines.remove(&group_id)?;
         timeline.data_complete_published_at = Some(data_complete_published_at);
@@ -303,6 +305,7 @@ impl WalSyncProgress {
         timeline.data_complete_prefix_end_before = Some(prefix_end_before);
         timeline.data_complete_prefix_end_after = Some(prefix_end_after);
         timeline.hol_blocker_ticket = hol_blocker_ticket;
+        timeline.publication_phases = Some(publication_phases);
         Some(timeline)
     }
 
@@ -381,6 +384,7 @@ impl WalSyncProgress {
             data_complete_prefix_end_before: timeline.data_complete_prefix_end_before,
             data_complete_prefix_end_after: timeline.data_complete_prefix_end_after,
             hol_blocker_ticket: timeline.hol_blocker_ticket,
+            publication_phases: Some(timeline.publication_phases?),
         })
     }
 
@@ -1711,6 +1715,7 @@ impl<B: WorkerBuffer> WorkerCore<B> {
                         data_complete_prefix_end_before: None,
                         data_complete_prefix_end_after: None,
                         hol_blocker_ticket: None,
+                        publication_phases: None,
                     },
                 )));
             }

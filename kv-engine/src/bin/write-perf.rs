@@ -1275,6 +1275,70 @@ struct WalCompletionHandoffTimelineRecord {
     data_complete_prefix_end_after: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     hol_blocker_ticket: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    publication_phases: Option<WalCompletionPublicationPhasesRecord>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
+struct WalCompletionPublicationPhasesRecord {
+    v7_durability_state_lock_wait_wall_ns: Option<u64>,
+    v7_durability_state_lock_wait_cpu_ns: Option<u64>,
+    v8_coordinator_state_lock_wait_wall_ns: Option<u64>,
+    v8_coordinator_state_lock_wait_cpu_ns: Option<u64>,
+    v7_group_registration_wall_ns: Option<u64>,
+    v7_group_registration_cpu_ns: Option<u64>,
+    v8_ticket_lookup_wall_ns: Option<u64>,
+    v8_ticket_lookup_cpu_ns: Option<u64>,
+    v8_ticket_lookup_entries_scanned: Option<u64>,
+    v8_ticket_validation_wall_ns: Option<u64>,
+    v8_ticket_validation_cpu_ns: Option<u64>,
+    v8_data_complete_mark_wall_ns: Option<u64>,
+    v8_data_complete_mark_cpu_ns: Option<u64>,
+    v7_written_frontier_advance_wall_ns: Option<u64>,
+    v7_written_frontier_advance_cpu_ns: Option<u64>,
+    v8_prefix_diagnostic_wall_ns: Option<u64>,
+    v8_prefix_diagnostic_cpu_ns: Option<u64>,
+    v8_notification_wall_ns: Option<u64>,
+    v8_notification_cpu_ns: Option<u64>,
+    v8_notification_calls: Option<u64>,
+    v7_durability_state_lock_hold_wall_ns: Option<u64>,
+    v7_durability_state_lock_hold_cpu_ns: Option<u64>,
+    v8_coordinator_state_lock_hold_wall_ns: Option<u64>,
+    v8_coordinator_state_lock_hold_cpu_ns: Option<u64>,
+}
+
+#[cfg(feature = "bench")]
+impl From<kv_engine_wrapper::mem_table::WalCompletionPublicationPhases>
+    for WalCompletionPublicationPhasesRecord
+{
+    fn from(phases: kv_engine_wrapper::mem_table::WalCompletionPublicationPhases) -> Self {
+        Self {
+            v7_durability_state_lock_wait_wall_ns: phases.v7_durability_state_lock_wait_wall_ns,
+            v7_durability_state_lock_wait_cpu_ns: phases.v7_durability_state_lock_wait_cpu_ns,
+            v8_coordinator_state_lock_wait_wall_ns: phases.v8_coordinator_state_lock_wait_wall_ns,
+            v8_coordinator_state_lock_wait_cpu_ns: phases.v8_coordinator_state_lock_wait_cpu_ns,
+            v7_group_registration_wall_ns: phases.v7_group_registration_wall_ns,
+            v7_group_registration_cpu_ns: phases.v7_group_registration_cpu_ns,
+            v8_ticket_lookup_wall_ns: phases.v8_ticket_lookup_wall_ns,
+            v8_ticket_lookup_cpu_ns: phases.v8_ticket_lookup_cpu_ns,
+            v8_ticket_lookup_entries_scanned: phases.v8_ticket_lookup_entries_scanned,
+            v8_ticket_validation_wall_ns: phases.v8_ticket_validation_wall_ns,
+            v8_ticket_validation_cpu_ns: phases.v8_ticket_validation_cpu_ns,
+            v8_data_complete_mark_wall_ns: phases.v8_data_complete_mark_wall_ns,
+            v8_data_complete_mark_cpu_ns: phases.v8_data_complete_mark_cpu_ns,
+            v7_written_frontier_advance_wall_ns: phases.v7_written_frontier_advance_wall_ns,
+            v7_written_frontier_advance_cpu_ns: phases.v7_written_frontier_advance_cpu_ns,
+            v8_prefix_diagnostic_wall_ns: phases.v8_prefix_diagnostic_wall_ns,
+            v8_prefix_diagnostic_cpu_ns: phases.v8_prefix_diagnostic_cpu_ns,
+            v8_notification_wall_ns: phases.v8_notification_wall_ns,
+            v8_notification_cpu_ns: phases.v8_notification_cpu_ns,
+            v8_notification_calls: phases.v8_notification_calls,
+            v7_durability_state_lock_hold_wall_ns: phases.v7_durability_state_lock_hold_wall_ns,
+            v7_durability_state_lock_hold_cpu_ns: phases.v7_durability_state_lock_hold_cpu_ns,
+            v8_coordinator_state_lock_hold_wall_ns: phases.v8_coordinator_state_lock_hold_wall_ns,
+            v8_coordinator_state_lock_hold_cpu_ns: phases.v8_coordinator_state_lock_hold_cpu_ns,
+        }
+    }
 }
 
 #[cfg(feature = "bench")]
@@ -1308,6 +1372,7 @@ impl From<kv_engine_wrapper::mem_table::WalCompletionHandoffObservation>
             data_complete_prefix_end_before: observation.data_complete_prefix_end_before,
             data_complete_prefix_end_after: observation.data_complete_prefix_end_after,
             hol_blocker_ticket: observation.hol_blocker_ticket,
+            publication_phases: observation.publication_phases.map(Into::into),
         }
     }
 }

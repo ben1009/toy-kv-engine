@@ -60,7 +60,7 @@ V8_COMPLETION_TIMELINE_SAMPLE_EVERY = 32
 
 
 def _run_id(row: dict[str, Any]) -> str:
-    return f"w{row['writer']}-point-{row['arm']}"
+    return f"r{row['repetition']}-w{row['writer']}-point-{row['arm']}"
 
 
 def _build_command(binary: Path, row: dict[str, Any], db_root: Path) -> list[str]:
@@ -329,6 +329,8 @@ def _completion_timeline_summary(timeline: Any) -> dict[str, Any]:
 def _completion_handoff_timeline_summary(
     timeline: Any,
     expected_operations: int | None = None,
+    wal_version: int | None = None,
+    require_publication_phases: bool = False,
 ) -> dict[str, Any]:
     if not isinstance(timeline, dict):
         raise ValueError("parallel completion handoff timeline is missing or is not an object")
@@ -353,6 +355,7 @@ def _completion_handoff_timeline_summary(
         "receiver_to_data_complete_publish_ns",
     )
     sampled_tickets: set[int] = set()
+    publication_phases: list[dict[str, Any]] = []
     for index, sample in enumerate(samples):
         if not isinstance(sample, dict):
             raise ValueError(f"completion handoff sample {index} is not an object")
@@ -389,12 +392,112 @@ def _completion_handoff_timeline_summary(
         blocker_ticket = sample.get("hol_blocker_ticket")
         if blocker_ticket is not None and not _valid_nonnegative_int(blocker_ticket):
             raise ValueError(f"completion handoff sample {index} has an invalid HOL blocker ticket")
+        phases = sample.get("publication_phases")
+        if phases is None:
+            if require_publication_phases:
+                raise ValueError(f"completion handoff sample {index} lacks publication phase metrics")
+            continue
+        if not isinstance(phases, dict):
+            raise ValueError(f"completion handoff sample {index} has malformed publication phase metrics")
+        required_phase_ints = (
+            "v7_durability_state_lock_wait_wall_ns", "v7_durability_state_lock_wait_cpu_ns",
+            "v7_durability_state_lock_hold_wall_ns", "v7_durability_state_lock_hold_cpu_ns",
+            "v8_coordinator_state_lock_wait_wall_ns", "v8_coordinator_state_lock_wait_cpu_ns",
+            "v8_coordinator_state_lock_hold_wall_ns", "v8_coordinator_state_lock_hold_cpu_ns",
+        )
+        if any(
+            phases.get(field) is not None and not _valid_nonnegative_int(phases[field])
+            for field in required_phase_ints
+        ):
+            raise ValueError(f"completion handoff sample {index} has invalid publication lock metrics")
+        optional_phase_ints = (
+            "v7_group_registration_wall_ns", "v7_group_registration_cpu_ns",
+            "v8_ticket_lookup_wall_ns", "v8_ticket_lookup_cpu_ns", "v8_ticket_lookup_entries_scanned",
+            "v8_ticket_validation_wall_ns", "v8_ticket_validation_cpu_ns",
+            "v8_data_complete_mark_wall_ns", "v8_data_complete_mark_cpu_ns",
+            "v7_written_frontier_advance_wall_ns", "v7_written_frontier_advance_cpu_ns",
+            "v8_prefix_diagnostic_wall_ns", "v8_prefix_diagnostic_cpu_ns",
+            "v8_notification_wall_ns", "v8_notification_cpu_ns", "v8_notification_calls",
+        )
+        if any(
+            phases.get(field) is not None and not _valid_nonnegative_int(phases[field])
+            for field in optional_phase_ints
+        ):
+            raise ValueError(f"completion handoff sample {index} has invalid format-specific publication metrics")
+        if require_publication_phases and wal_version == 7 and any(
+            not _valid_nonnegative_int(phases.get(field))
+            for field in (
+                "v7_durability_state_lock_wait_wall_ns", "v7_durability_state_lock_wait_cpu_ns",
+                "v7_durability_state_lock_hold_wall_ns", "v7_durability_state_lock_hold_cpu_ns",
+                "v7_group_registration_wall_ns", "v7_group_registration_cpu_ns",
+                "v7_written_frontier_advance_wall_ns", "v7_written_frontier_advance_cpu_ns",
+            )
+        ):
+            raise ValueError(f"V7 completion handoff sample {index} lacks coordinator phase metrics")
+        if require_publication_phases and wal_version == 8 and any(
+            not _valid_nonnegative_int(phases.get(field))
+            for field in (
+                "v8_coordinator_state_lock_wait_wall_ns", "v8_coordinator_state_lock_wait_cpu_ns",
+                "v8_coordinator_state_lock_hold_wall_ns", "v8_coordinator_state_lock_hold_cpu_ns",
+                "v8_ticket_lookup_wall_ns", "v8_ticket_lookup_cpu_ns", "v8_ticket_lookup_entries_scanned",
+                "v8_ticket_validation_wall_ns", "v8_ticket_validation_cpu_ns",
+                "v8_data_complete_mark_wall_ns", "v8_data_complete_mark_cpu_ns",
+                "v8_prefix_diagnostic_wall_ns", "v8_prefix_diagnostic_cpu_ns",
+                "v8_notification_wall_ns", "v8_notification_cpu_ns", "v8_notification_calls",
+            )
+        ):
+            raise ValueError(f"V8 completion handoff sample {index} lacks coordinator phase metrics")
+        if wal_version == 8 and phases.get("v8_notification_calls") not in (None, 2):
+            raise ValueError(f"V8 completion handoff sample {index} reports an unexpected notification call count")
+        publication_phases.append(phases)
     if expected_operations is not None:
         expected_tickets = set(
             range(0, expected_operations, V8_COMPLETION_TIMELINE_SAMPLE_EVERY)
         )
         if sampled_tickets != expected_tickets:
             raise ValueError("completion handoff samples do not cover every planned ticket sample")
+    phase_duration_fields = (
+        "v7_durability_state_lock_wait_wall_ns", "v7_durability_state_lock_wait_cpu_ns",
+        "v7_durability_state_lock_hold_wall_ns", "v7_durability_state_lock_hold_cpu_ns",
+        "v8_coordinator_state_lock_wait_wall_ns", "v8_coordinator_state_lock_wait_cpu_ns",
+        "v8_coordinator_state_lock_hold_wall_ns", "v8_coordinator_state_lock_hold_cpu_ns",
+        "v7_group_registration_wall_ns", "v7_group_registration_cpu_ns",
+        "v8_ticket_lookup_wall_ns", "v8_ticket_lookup_cpu_ns",
+        "v8_ticket_validation_wall_ns", "v8_ticket_validation_cpu_ns",
+        "v8_data_complete_mark_wall_ns", "v8_data_complete_mark_cpu_ns",
+        "v7_written_frontier_advance_wall_ns", "v7_written_frontier_advance_cpu_ns",
+        "v8_prefix_diagnostic_wall_ns", "v8_prefix_diagnostic_cpu_ns",
+        "v8_notification_wall_ns", "v8_notification_cpu_ns",
+    )
+    publication_summary = None
+    if publication_phases:
+        publication_summary = {
+            **{
+                field: _distribution([
+                    float(phases[field]) for phases in publication_phases if phases.get(field) is not None
+                ])
+                for field in phase_duration_fields
+            },
+            "v8_ticket_lookup_entries_scanned": _distribution([
+                float(phases["v8_ticket_lookup_entries_scanned"])
+                for phases in publication_phases
+                if phases.get("v8_ticket_lookup_entries_scanned") is not None
+            ]),
+            "v8_notification_calls": _distribution([
+                float(phases["v8_notification_calls"])
+                for phases in publication_phases if phases.get("v8_notification_calls") is not None
+            ]),
+            "sample_count": len(publication_phases),
+            "unit_note": (
+        "All reported phase durations are nanoseconds. The V7 durability-state lock and V8 coordinator-state lock "
+        "are different locks. V7 group "
+                "registration/frontier advance and V8 ticket lookup/validation/data-complete marking are "
+                "format-specific operations, not equivalent work. V8 prefix diagnostics are bench-only and "
+                "include diagnostic scans; notification_calls counts notify invocations, not threads woken. "
+        "Phase timers are sampled and add timing overhead; lock hold intervals include sampled diagnostic "
+        "bookkeeping performed while the corresponding lock is held."
+            ),
+        }
     return {
         "sample_every": V8_COMPLETION_TIMELINE_SAMPLE_EVERY,
         "sample_count": len(samples),
@@ -405,6 +508,7 @@ def _completion_handoff_timeline_summary(
             float(sample["data_complete_prefix_end_after"] - sample["data_complete_prefix_end_before"])
             for sample in samples
         ]),
+        "publication_phases": publication_summary,
     }
 
 
@@ -586,6 +690,8 @@ def _validate_record(record: dict[str, Any], row: dict[str, Any]) -> dict[str, A
     completion_handoff_timeline = _completion_handoff_timeline_summary(
         pipeline.get("completion_handoff_timeline"),
         int(result["ops"]),
+        wal_version=version,
+        require_publication_phases=True,
     )
     same_ticket_hol = _same_ticket_hol_summary(
         pipeline.get("sync_observations"),
@@ -781,6 +887,7 @@ def _run_one(
             exit_code = 65
             (run_dir / "validation-error.txt").write_text(f"invalid benchmark result: {error}\n", encoding="utf-8")
     metadata = {
+        "run_id": run_id,
         **{key: row[key] for key in ("writer", "workload", "repetition", "arm", "bench", "num", "sample_every")},
         "exit_code": int(exit_code), **values, "duration_seconds": duration,
     }
@@ -789,28 +896,49 @@ def _run_one(
     return metadata
 
 
-def _summarize(rows: list[dict[str, Any]], planned: int, writers: tuple[int, ...]) -> dict[str, Any]:
-    validation = validate_v8_point_cpu_attribution_rows(rows, writers)
+def _summarize(
+    rows: list[dict[str, Any]], planned: int, writers: tuple[int, ...], repetitions: int = 1,
+) -> dict[str, Any]:
+    validation = validate_v8_point_cpu_attribution_rows(rows, writers, repetitions)
     by_writer: dict[str, Any] = {}
     for writer in writers:
         by_writer[str(writer)] = {}
         for arm in ("v7_parallel", "v8_point_lookahead_direct"):
-            run = next((row for row in rows if row.get("writer") == writer and row.get("arm") == arm), None)
-            if run is None:
+            arm_runs = [row for row in rows if row.get("writer") == writer and row.get("arm") == arm]
+            if not arm_runs:
                 by_writer[str(writer)][arm] = None
                 continue
+            def metric_values(field: str) -> list[float]:
+                return [
+                    float(value)
+                    for run in arm_runs
+                    if isinstance((value := run.get(field)), (int, float)) and math.isfinite(float(value))
+                ]
+
             by_writer[str(writer)][arm] = {
-                **{key: run.get(key) for key in (
-                    "puts_per_second", "process_cpu_us_per_put", "sync_count", "p50_ms", "p95_ms", "p99_ms",
-                )},
-                "producer_cpu_ns": _producer_phase_summary([run]).get(arm),
-                "thread_roles": _thread_role_summary([run]),
-                "durability_advance_cpu_ns": _durability_summary([run]),
-                "digest_cpu": _digest_summary([run]),
-                "sync_decisions": run.get("wal_sync_decision_summary"),
-                "data_completion_timeline": run.get("v8_completion_timeline_summary"),
-                "completion_handoff_timeline": run.get("completion_handoff_timeline_summary"),
-                "same_ticket_hol": run.get("same_ticket_hol_summary"),
+                "run_count": len(arm_runs),
+                "metric_run_count": sum("puts_per_second" in run for run in arm_runs),
+                "puts_per_second": _distribution(metric_values("puts_per_second")),
+                "process_cpu_us_per_put": _distribution(metric_values("process_cpu_us_per_put")),
+                "sync_count": _distribution(metric_values("sync_count")),
+                **{
+                    field: _distribution(metric_values(field))
+                    for field in ("p50_ms", "p95_ms", "p99_ms")
+                },
+                "producer_cpu_ns_by_run": [
+                    _producer_phase_summary([run]).get(arm) for run in arm_runs
+                ],
+                "thread_roles": _thread_role_summary(arm_runs),
+                "durability_advance_cpu_ns": _durability_summary(arm_runs),
+                "digest_cpu": _digest_summary(arm_runs),
+                "sync_decisions_by_run": [run.get("wal_sync_decision_summary") for run in arm_runs],
+                "data_completion_timeline_by_run": [
+                    run.get("v8_completion_timeline_summary") for run in arm_runs
+                ],
+                "completion_handoff_timeline_by_run": [
+                    run.get("completion_handoff_timeline_summary") for run in arm_runs
+                ],
+                "same_ticket_hol_by_run": [run.get("same_ticket_hol_summary") for run in arm_runs],
             }
     return {
         "suite": "v8-point-cpu-attribution",
@@ -819,6 +947,7 @@ def _summarize(rows: list[dict[str, Any]], planned: int, writers: tuple[int, ...
         "runs_completed": len(rows),
         "runs_planned": planned,
         "writers": list(writers),
+        "repetitions_per_cell": repetitions,
         "sample_every": V8_POINT_CPU_ATTRIBUTION_SAMPLE_EVERY,
         "results": rows,
         "by_writer": by_writer,
@@ -834,6 +963,7 @@ def _summarize(rows: list[dict[str, Any]], planned: int, writers: tuple[int, ...
 
 
 def run_suite(args: Any) -> int:
+    repetitions = getattr(args, "repetitions", 1)
     args.results_dir.mkdir(parents=True, exist_ok=True)
     args.db_root.mkdir(parents=True, exist_ok=True)
     if not isinstance(args.commit, str) or len(args.commit) != 40 or any(
@@ -849,13 +979,14 @@ def run_suite(args: Any) -> int:
     (args.results_dir / "commit.txt").write_text(args.commit + "\n", encoding="utf-8")
     (args.results_dir / "write-perf.sha256").write_text(args.binary_sha256 + "\n", encoding="utf-8")
     writers = tuple(args.writers)
-    schedule = build_v8_point_cpu_attribution_schedule(writers)
+    schedule = build_v8_point_cpu_attribution_schedule(writers, repetitions)
     machine_spec = {
         "vcpus": int(args.machine_type.split("-")[2]), "ssd_count": args.ssd_count, "ssd_gib": args.ssd_gib,
     }
     plan = build_v8_point_cpu_attribution_plan(
         machine_type=args.machine_type, machine_spec=machine_spec,
         commit=args.commit, binary_sha256=args.binary_sha256, writers=writers,
+        repetitions=repetitions,
     )
     (args.results_dir / "benchmark-plan.json").write_text(json.dumps(plan, indent=2) + "\n", encoding="utf-8")
     with (args.results_dir / "v8-point-cpu-attribution-schedule.tsv").open("w", encoding="utf-8", newline="") as stream:
@@ -885,13 +1016,13 @@ def run_suite(args: Any) -> int:
             failed = True
             break
 
-    summary = _summarize(rows, len(schedule), writers)
+    summary = _summarize(rows, len(schedule), writers, repetitions)
     summary["source_commit"] = args.commit
     summary["binary_sha256"] = args.binary_sha256
     summary["results_complete"] = summary["complete"] and not failed
     (args.results_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     with (args.results_dir / "summary.tsv").open("w", encoding="utf-8", newline="") as stream:
-        fields = ("writer", "arm", "exit_code", "ops", "puts_per_second", "process_cpu_us_per_put",
+        fields = ("run_id", "writer", "repetition", "arm", "exit_code", "ops", "puts_per_second", "process_cpu_us_per_put",
                   "sync_count", "duration_seconds")
         writer = csv.DictWriter(stream, fieldnames=fields, delimiter="\t", lineterminator="\n")
         writer.writeheader()
@@ -917,7 +1048,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--ssd-count", type=int, required=True)
     parser.add_argument("--ssd-gib", type=int, required=True)
     parser.add_argument("--writers", required=True, help="Comma-separated writer counts from 1,4,8,16")
+    parser.add_argument("--repetitions", type=int, default=1)
     args = parser.parse_args(argv)
+    if args.repetitions <= 0:
+        parser.error("--repetitions must be a positive integer")
     try:
         args.writers = validate_writer_counts(int(value) for value in args.writers.split(","))
     except ValueError as error:

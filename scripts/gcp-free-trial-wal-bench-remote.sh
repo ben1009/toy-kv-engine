@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-if [[ $# -ne 11 ]]; then
-    echo "usage: $0 <commit> <num> <project> <zone> <instance> <safe-deadline-epoch> <machine-type> <writers-csv> <suite> <source-patch-sha256> <baseline-commit>" >&2
+if [[ $# -lt 11 || $# -gt 12 ]]; then
+    echo "usage: $0 <commit> <num> <project> <zone> <instance> <safe-deadline-epoch> <machine-type> <writers-csv> <suite> <source-patch-sha256> <baseline-commit> [repetitions]" >&2
     exit 64
 fi
 
@@ -17,6 +17,11 @@ WRITERS_CSV="$8"
 SUITE="$9"
 SOURCE_PATCH_SHA256="${10}"
 BASELINE_COMMIT="${11}"
+REPETITIONS="${12:-1}"
+if [[ ! "$REPETITIONS" =~ ^[1-9][0-9]*$ ]]; then
+    echo "repetitions must be a positive integer: $REPETITIONS" >&2
+    exit 64
+fi
 
 case "$MACHINE_TYPE" in
     c4-standard-8-lssd) SSD_COUNT=1; SSD_TOTAL_GIB=375 ;;
@@ -237,11 +242,13 @@ runuser -u bench -- env \
     BENCH_SUITE="$SUITE" \
     BENCH_SOURCE_PATCH_SHA256="$SOURCE_PATCH_SHA256" \
     BENCH_BASELINE_COMMIT="$BASELINE_COMMIT" \
+    BENCH_REPETITIONS="${REPETITIONS:-1}" \
     BENCH_BOOT_LOG="$BOOT_LOG" \
     bash -s <<'BENCH_USER_SCRIPT'
 set -Eeuo pipefail
 
 source "$HOME/.cargo/env" 2>/dev/null || true
+BENCH_REPETITIONS="${BENCH_REPETITIONS:-1}"
 if ! command -v rustup >/dev/null 2>&1; then
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
 fi
@@ -368,7 +375,8 @@ if [[ "$BENCH_SUITE" == "v8-point-direct-frame" ]]; then
         --binary-sha256 "$BINARY_SHA256" \
         --machine-type "$BENCH_MACHINE_TYPE" \
         --ssd-count "$BENCH_SSD_COUNT" \
-        --ssd-gib "$BENCH_SSD_TOTAL_GIB"
+        --ssd-gib "$BENCH_SSD_TOTAL_GIB" \
+        --repetitions "$BENCH_REPETITIONS"
     exit $?
 fi
 

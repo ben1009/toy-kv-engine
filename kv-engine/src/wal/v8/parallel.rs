@@ -1029,6 +1029,28 @@ impl WalV8ParallelCoordinator {
         let lock_acquired_at = timeline_sampled.then(Instant::now);
         #[cfg(feature = "bench")]
         let lock_acquired_cpu = timeline_sampled.then(crate::wal::v8::digest::thread_cpu_time_ns);
+        #[cfg(feature = "bench")]
+        let mut v8_ticket_lookup_wall_ns = None;
+        #[cfg(feature = "bench")]
+        let mut v8_ticket_lookup_cpu_ns = None;
+        #[cfg(feature = "bench")]
+        let mut v8_ticket_lookup_entries_scanned = None;
+        #[cfg(feature = "bench")]
+        let mut v8_ticket_validation_wall_ns = None;
+        #[cfg(feature = "bench")]
+        let mut v8_ticket_validation_cpu_ns = None;
+        #[cfg(feature = "bench")]
+        let mut v8_data_complete_mark_wall_ns = None;
+        #[cfg(feature = "bench")]
+        let mut v8_data_complete_mark_cpu_ns = None;
+        #[cfg(feature = "bench")]
+        let mut v8_prefix_diagnostic_wall_ns = None;
+        #[cfg(feature = "bench")]
+        let mut v8_prefix_diagnostic_cpu_ns = None;
+        #[cfg(feature = "bench")]
+        let mut v8_notification_wall_ns = None;
+        #[cfg(feature = "bench")]
+        let mut v8_notification_cpu_ns = None;
 
         #[cfg(feature = "bench")]
         if let Some(group) = timeline {
@@ -1096,6 +1118,11 @@ impl WalV8ParallelCoordinator {
             poison_locked(&self.inner, &mut state);
             anyhow::bail!("v8 DATA completion group is empty")
         }
+        #[cfg(feature = "bench")]
+        let ticket_lookup_started_at = timeline_sampled.then(Instant::now);
+        #[cfg(feature = "bench")]
+        let ticket_lookup_started_cpu =
+            timeline_sampled.then(crate::wal::v8::digest::thread_cpu_time_ns);
         let Some(start_index) = state
             .tickets
             .iter()
@@ -1104,6 +1131,23 @@ impl WalV8ParallelCoordinator {
             poison_locked(&self.inner, &mut state);
             anyhow::bail!("v8 DATA-completion group names an unknown ticket")
         };
+        #[cfg(feature = "bench")]
+        if timeline_sampled {
+            v8_ticket_lookup_wall_ns = Some(
+                completion_timeline_duration_ns(ticket_lookup_started_at, Some(Instant::now()))
+                    .unwrap_or_default(),
+            );
+            v8_ticket_lookup_cpu_ns = Some(
+                crate::wal::v8::digest::thread_cpu_time_ns()
+                    .saturating_sub(ticket_lookup_started_cpu.unwrap_or_default()),
+            );
+            v8_ticket_lookup_entries_scanned = Some(start_index.saturating_add(1) as u64);
+        }
+        #[cfg(feature = "bench")]
+        let ticket_validation_started_at = timeline_sampled.then(Instant::now);
+        #[cfg(feature = "bench")]
+        let ticket_validation_started_cpu =
+            timeline_sampled.then(crate::wal::v8::digest::thread_cpu_time_ns);
         let Some(end_index) = start_index.checked_add(ticket_count) else {
             poison_locked(&self.inner, &mut state);
             anyhow::bail!("v8 DATA-completion group index overflows")
@@ -1143,11 +1187,27 @@ impl WalV8ParallelCoordinator {
             poison_locked(&self.inner, &mut state);
             anyhow::bail!("v8 DATA-completion group partially duplicates prior completion")
         }
+        #[cfg(feature = "bench")]
+        if timeline_sampled {
+            v8_ticket_validation_wall_ns = Some(
+                completion_timeline_duration_ns(ticket_validation_started_at, Some(Instant::now()))
+                    .unwrap_or_default(),
+            );
+            v8_ticket_validation_cpu_ns = Some(
+                crate::wal::v8::digest::thread_cpu_time_ns()
+                    .saturating_sub(ticket_validation_started_cpu.unwrap_or_default()),
+            );
+        }
 
         #[cfg(feature = "bench")]
         let data_complete_prefix_end_before =
             timeline_sampled.then(|| data_complete_prefix_end(&state));
 
+        #[cfg(feature = "bench")]
+        let data_complete_mark_started_at = timeline_sampled.then(Instant::now);
+        #[cfg(feature = "bench")]
+        let data_complete_mark_started_cpu =
+            timeline_sampled.then(crate::wal::v8::digest::thread_cpu_time_ns);
         #[cfg(feature = "bench")]
         let data_completed_at = self
             .inner
@@ -1166,7 +1226,26 @@ impl WalV8ParallelCoordinator {
                 entry.data_completed_at = data_completed_at;
             }
         }
+        #[cfg(feature = "bench")]
+        if timeline_sampled {
+            v8_data_complete_mark_wall_ns = Some(
+                completion_timeline_duration_ns(
+                    data_complete_mark_started_at,
+                    Some(Instant::now()),
+                )
+                .unwrap_or_default(),
+            );
+            v8_data_complete_mark_cpu_ns = Some(
+                crate::wal::v8::digest::thread_cpu_time_ns()
+                    .saturating_sub(data_complete_mark_started_cpu.unwrap_or_default()),
+            );
+        }
 
+        #[cfg(feature = "bench")]
+        let prefix_diagnostic_started_at = timeline_sampled.then(Instant::now);
+        #[cfg(feature = "bench")]
+        let prefix_diagnostic_started_cpu =
+            timeline_sampled.then(crate::wal::v8::digest::thread_cpu_time_ns);
         #[cfg(feature = "bench")]
         let data_complete_published_at = timeline_sampled.then(Instant::now);
         #[cfg(feature = "bench")]
@@ -1203,13 +1282,40 @@ impl WalV8ParallelCoordinator {
         refresh_data_completion_order_hol(&self.inner, &mut state);
         #[cfg(feature = "bench")]
         advance_completion_timeline_prefix(&mut state);
+        #[cfg(feature = "bench")]
+        if timeline_sampled {
+            v8_prefix_diagnostic_wall_ns = Some(
+                completion_timeline_duration_ns(prefix_diagnostic_started_at, Some(Instant::now()))
+                    .unwrap_or_default(),
+            );
+            v8_prefix_diagnostic_cpu_ns = Some(
+                crate::wal::v8::digest::thread_cpu_time_ns()
+                    .saturating_sub(prefix_diagnostic_started_cpu.unwrap_or_default()),
+            );
+        }
+        #[cfg(feature = "bench")]
+        let notification_started_at = timeline_sampled.then(Instant::now);
+        #[cfg(feature = "bench")]
+        let notification_started_cpu =
+            timeline_sampled.then(crate::wal::v8::digest::thread_cpu_time_ns);
         signal_change(&self.inner, &mut state);
         signal_durability_progress(&self.inner, &mut state);
+        #[cfg(feature = "bench")]
+        if timeline_sampled {
+            v8_notification_wall_ns = Some(
+                completion_timeline_duration_ns(notification_started_at, Some(Instant::now()))
+                    .unwrap_or_default(),
+            );
+            v8_notification_cpu_ns = Some(
+                crate::wal::v8::digest::thread_cpu_time_ns()
+                    .saturating_sub(notification_started_cpu.unwrap_or_default()),
+            );
+        }
 
         #[cfg(feature = "bench")]
         if timeline_sampled {
-            let lock_released_at = Instant::now();
-            let lock_released_cpu = crate::wal::v8::digest::thread_cpu_time_ns();
+            let lock_hold_snapshot_at = Instant::now();
+            let lock_hold_snapshot_cpu = crate::wal::v8::digest::thread_cpu_time_ns();
             let lock_wait_wall_ns =
                 completion_timeline_duration_ns(lock_wait_started, lock_acquired_at)
                     .unwrap_or_default();
@@ -1217,11 +1323,6 @@ impl WalV8ParallelCoordinator {
                 .zip(lock_wait_cpu_started)
                 .map(|(end, start)| end.saturating_sub(start))
                 .unwrap_or_default();
-            let lock_hold_wall_ns =
-                completion_timeline_duration_ns(lock_acquired_at, Some(lock_released_at))
-                    .unwrap_or_default();
-            let lock_hold_cpu_ns =
-                lock_released_cpu.saturating_sub(lock_acquired_cpu.unwrap_or_default());
             let ticket_end = tickets.end;
             let pending = state
                 .completion_timeline_samples
@@ -1230,8 +1331,12 @@ impl WalV8ParallelCoordinator {
             let reaper_recv_at = pending.group.reaper_recv_at;
             pending.data_complete_lock_wait_wall_ns = Some(lock_wait_wall_ns);
             pending.data_complete_lock_wait_cpu_ns = Some(lock_wait_cpu_ns);
-            pending.data_complete_lock_hold_wall_ns = Some(lock_hold_wall_ns);
-            pending.data_complete_lock_hold_cpu_ns = Some(lock_hold_cpu_ns);
+            pending.data_complete_lock_hold_wall_ns = Some(
+                completion_timeline_duration_ns(lock_acquired_at, Some(lock_hold_snapshot_at))
+                    .unwrap_or_default(),
+            );
+            pending.data_complete_lock_hold_cpu_ns =
+                Some(lock_hold_snapshot_cpu.saturating_sub(lock_acquired_cpu.unwrap_or_default()));
             pending.data_complete_prefix_end_before = data_complete_prefix_end_before;
             pending.data_complete_prefix_end_after = data_complete_prefix_end_after;
             if let Some(published_at) = data_complete_published_at {
@@ -1251,6 +1356,12 @@ impl WalV8ParallelCoordinator {
         }
 
         #[cfg(feature = "bench")]
+        let lock_hold_finished_at = timeline_sampled.then(Instant::now);
+        #[cfg(feature = "bench")]
+        let lock_hold_finished_cpu =
+            timeline_sampled.then(crate::wal::v8::digest::thread_cpu_time_ns);
+
+        #[cfg(feature = "bench")]
         if let Some(timeline) = handoff_timeline.as_mut() {
             timeline.data_complete_published_at = data_complete_published_at;
             timeline.data_complete_published_monotonic_ns = data_complete_published_monotonic_ns;
@@ -1260,6 +1371,42 @@ impl WalV8ParallelCoordinator {
         }
 
         drop(state);
+        #[cfg(feature = "bench")]
+        if let (Some(timeline), true) = (handoff_timeline.as_mut(), timeline_sampled) {
+            timeline.publication_phases = Some(crate::mem_table::WalCompletionPublicationPhases {
+                v8_coordinator_state_lock_wait_wall_ns: Some(
+                    completion_timeline_duration_ns(lock_wait_started, lock_acquired_at)
+                        .unwrap_or_default(),
+                ),
+                v8_coordinator_state_lock_wait_cpu_ns: Some(
+                    lock_acquired_cpu
+                        .unwrap_or_default()
+                        .saturating_sub(lock_wait_cpu_started.unwrap_or_default()),
+                ),
+                v8_ticket_lookup_wall_ns,
+                v8_ticket_lookup_cpu_ns,
+                v8_ticket_lookup_entries_scanned,
+                v8_ticket_validation_wall_ns,
+                v8_ticket_validation_cpu_ns,
+                v8_data_complete_mark_wall_ns,
+                v8_data_complete_mark_cpu_ns,
+                v8_prefix_diagnostic_wall_ns,
+                v8_prefix_diagnostic_cpu_ns,
+                v8_notification_wall_ns,
+                v8_notification_cpu_ns,
+                v8_notification_calls: Some(2),
+                v8_coordinator_state_lock_hold_wall_ns: Some(
+                    completion_timeline_duration_ns(lock_acquired_at, lock_hold_finished_at)
+                        .unwrap_or_default(),
+                ),
+                v8_coordinator_state_lock_hold_cpu_ns: Some(
+                    lock_hold_finished_cpu
+                        .unwrap_or_default()
+                        .saturating_sub(lock_acquired_cpu.unwrap_or_default()),
+                ),
+                ..Default::default()
+            });
+        }
 
         #[cfg(feature = "bench")]
         if let (Some(profile), Some(timeline)) = (self.inner.profile.load_full(), handoff_timeline)

@@ -1109,6 +1109,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                         help="C4 Local SSD shape (defaults to 8-vCPU for benchmark suites)")
     parser.add_argument("--writers", type=int, nargs="+", choices=(1, 2, 4, 8, 16),
                         help="Writer counts to run (defaults depend on the selected suite)")
+    parser.add_argument("--repetitions", type=int, default=1,
+                        help="Repeated cells for the V7/V8 CPU attribution diagnostic suite")
     suite_group = parser.add_mutually_exclusive_group()
     suite_group.add_argument("--full-rfc026-matrix", action="store_true",
                              help="Run point/batch8/batch16/batch64 across V4/V7/V8 parallel and V8 Leader")
@@ -1156,6 +1158,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--confirm-free-trial", action="store_true",
                         help="Attest that Billing Overview says Free Trial and you will not upgrade to Paid")
     args = parser.parse_args(argv)
+    if args.repetitions <= 0:
+        parser.error("--repetitions must be a positive integer")
+    if args.repetitions != 1 and not args.v8_point_cpu_attribution:
+        parser.error("--repetitions is only configurable with --v8-point-cpu-attribution")
     try:
         args.ssh_source_range = resolve_ssh_source_range(args.ssh_source_range)
     except BenchError as error:
@@ -1692,7 +1698,8 @@ def _verify_result_set(results: Path) -> dict[str, Any]:
                     errors.append("mutex diagnostic binary checksum does not match the summary")
             elif suite == "v8-point-cpu-attribution":
                 suite_writers = plan.get("writers", V8_POINT_CPU_ATTRIBUTION_WRITERS)
-                schedule = build_v8_point_cpu_attribution_schedule(suite_writers)
+                suite_repetitions = plan.get("repetitions_per_cell", 1)
+                schedule = build_v8_point_cpu_attribution_schedule(suite_writers, suite_repetitions)
                 try:
                     recorded_commit = (results / "commit.txt").read_text(encoding="utf-8").strip()
                     binary_sha = (results / "write-perf.sha256").read_text(encoding="utf-8").strip()
@@ -1712,6 +1719,7 @@ def _verify_result_set(results: Path) -> dict[str, Any]:
                     commit=recorded_commit,
                     binary_sha256=binary_sha,
                     writers=suite_writers,
+                    repetitions=suite_repetitions,
                 )
                 for key, value in expected_plan.items():
                     if plan.get(key) != value:
@@ -2242,7 +2250,9 @@ def _verify_result_set(results: Path) -> dict[str, Any]:
                 errors.append("mutex diagnostic matrix validation does not match its per-run results")
         elif suite == "v8-point-cpu-attribution":
             validation = validate_v8_point_cpu_attribution_rows(
-                summary.get("results", []), plan.get("writers", V8_POINT_CPU_ATTRIBUTION_WRITERS)
+                summary.get("results", []),
+                plan.get("writers", V8_POINT_CPU_ATTRIBUTION_WRITERS),
+                plan.get("repetitions_per_cell", 1),
             )
             if validation != summary.get("matrix_validation"):
                 errors.append("CPU attribution matrix validation does not match its per-run results")
@@ -2920,6 +2930,7 @@ def provision_and_run(
                 ),
                 args.source_patch_sha256 or "-",
                 getattr(args, "baseline_commit", "").lower() if getattr(args, "baseline_commit", None) else "-",
+                str(getattr(args, "repetitions", 1)),
             ])
             remaining = max(30, int(deadline - time.monotonic()))
             try:
@@ -3110,6 +3121,7 @@ def main(argv: list[str] | None = None) -> int:
                 machine_spec=MACHINE_SPECS[args.machine_type],
                 commit=args.commit.lower(),
                 writers=args.writers,
+                repetitions=args.repetitions,
             )
         elif args.v8_point_borrowed_input_ab:
             report["benchmark_suite"] = "v8-point-borrowed-input"

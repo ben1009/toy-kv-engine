@@ -3034,13 +3034,26 @@ fn process_group_result(inner: &RuntimeInner, result: GroupWriteResult) {
     #[cfg(feature = "bench")]
     let timeline_sampled = inner.sync_progress.has_completion_timeline(result.group_id);
     let failed = result.error.is_some();
+    #[cfg(feature = "bench")]
+    let state_lock_wait_started_at = timeline_sampled.then(Instant::now);
+    #[cfg(feature = "bench")]
+    let state_lock_wait_started_cpu =
+        timeline_sampled.then(crate::wal::v8::digest::thread_cpu_time_ns);
     let mut state = inner.durability.state.lock();
+    #[cfg(feature = "bench")]
+    let state_lock_acquired_at = timeline_sampled.then(Instant::now);
+    #[cfg(feature = "bench")]
+    let state_lock_acquired_cpu = timeline_sampled.then(crate::wal::v8::digest::thread_cpu_time_ns);
     #[cfg(feature = "bench")]
     let data_complete_prefix_end_before = timeline_sampled.then_some(state.written_frontier);
     #[cfg(feature = "bench")]
     let mut data_complete_published_at = None;
     #[cfg(feature = "bench")]
     let mut data_complete_published_monotonic_ns = None;
+    #[cfg(feature = "bench")]
+    let mut v7_group_registration_wall_ns = None;
+    #[cfg(feature = "bench")]
+    let mut v7_group_registration_cpu_ns = None;
     #[cfg(feature = "chaos-testing")]
     let out_of_order_completion =
         result.error.is_none() && result.tickets.start > state.written_frontier;
@@ -3071,15 +3084,35 @@ fn process_group_result(inner: &RuntimeInner, result: GroupWriteResult) {
             .retain(|ticket, _| *ticket < poison_ticket);
         inner.buffer_budget.close();
     } else {
+        #[cfg(feature = "bench")]
+        let registration_started_at = timeline_sampled.then(Instant::now);
+        #[cfg(feature = "bench")]
+        let registration_started_cpu =
+            timeline_sampled.then(crate::wal::v8::digest::thread_cpu_time_ns);
         let previous = state.completed.insert(result.tickets.start, result);
         debug_assert!(previous.is_none(), "WAL group completion is unique");
         #[cfg(feature = "bench")]
         if timeline_sampled {
+            let registration_finished_at = Instant::now();
+            let registration_finished_cpu = crate::wal::v8::digest::thread_cpu_time_ns();
+            v7_group_registration_wall_ns = Some(completion_phase_duration_ns(
+                registration_started_at,
+                Some(registration_finished_at),
+            ));
+            v7_group_registration_cpu_ns = Some(completion_phase_cpu_ns(
+                registration_started_cpu,
+                Some(registration_finished_cpu),
+            ));
             data_complete_published_at = Some(Instant::now());
             data_complete_published_monotonic_ns = Some(crate::mem_table::benchmark_monotonic_ns());
         }
     }
 
+    #[cfg(feature = "bench")]
+    let frontier_advance_started_at = timeline_sampled.then(Instant::now);
+    #[cfg(feature = "bench")]
+    let frontier_advance_started_cpu =
+        timeline_sampled.then(crate::wal::v8::digest::thread_cpu_time_ns);
     loop {
         let frontier = state.written_frontier;
         let Some(completed) = state.completed.remove(&frontier) else {
@@ -3097,6 +3130,16 @@ fn process_group_result(inner: &RuntimeInner, result: GroupWriteResult) {
             && (state.written_frontier == state.durable_frontier || state.large_batch_wave);
         state.written_frontier = completed.tickets.end;
     }
+    #[cfg(feature = "bench")]
+    let v7_written_frontier_advance_wall_ns = timeline_sampled
+        .then(|| completion_phase_duration_ns(frontier_advance_started_at, Some(Instant::now())));
+    #[cfg(feature = "bench")]
+    let v7_written_frontier_advance_cpu_ns = timeline_sampled.then(|| {
+        completion_phase_cpu_ns(
+            frontier_advance_started_cpu,
+            Some(crate::wal::v8::digest::thread_cpu_time_ns()),
+        )
+    });
     debug_assert!(state.durable_frontier <= state.written_frontier);
     if let Some(poison) = state.poison_ticket {
         debug_assert!(state.durable_frontier <= poison);
@@ -3120,11 +3163,39 @@ fn process_group_result(inner: &RuntimeInner, result: GroupWriteResult) {
         inner.durability.notify_change();
         inner.v7_frames_ready.notify_all();
     }
+    #[cfg(feature = "bench")]
+    let state_lock_hold_finished_at = timeline_sampled.then(Instant::now);
+    #[cfg(feature = "bench")]
+    let state_lock_hold_finished_cpu =
+        timeline_sampled.then(crate::wal::v8::digest::thread_cpu_time_ns);
     drop(state);
 
     #[cfg(feature = "bench")]
     if timeline_sampled {
         if let Some(published_at) = data_complete_published_at {
+            let publication_phases = crate::mem_table::WalCompletionPublicationPhases {
+                v7_durability_state_lock_wait_wall_ns: Some(completion_phase_duration_ns(
+                    state_lock_wait_started_at,
+                    state_lock_acquired_at,
+                )),
+                v7_durability_state_lock_wait_cpu_ns: Some(completion_phase_cpu_ns(
+                    state_lock_wait_started_cpu,
+                    state_lock_acquired_cpu,
+                )),
+                v7_group_registration_wall_ns,
+                v7_group_registration_cpu_ns,
+                v7_written_frontier_advance_wall_ns,
+                v7_written_frontier_advance_cpu_ns,
+                v7_durability_state_lock_hold_wall_ns: Some(completion_phase_duration_ns(
+                    state_lock_acquired_at,
+                    state_lock_hold_finished_at,
+                )),
+                v7_durability_state_lock_hold_cpu_ns: Some(completion_phase_cpu_ns(
+                    state_lock_acquired_cpu,
+                    state_lock_hold_finished_cpu,
+                )),
+                ..Default::default()
+            };
             if let Some(timeline) = inner.sync_progress.finish_completion_timeline(
                 result_group_id,
                 published_at,
@@ -3132,6 +3203,7 @@ fn process_group_result(inner: &RuntimeInner, result: GroupWriteResult) {
                 data_complete_prefix_end_before.unwrap_or_default(),
                 data_complete_prefix_end_after.unwrap_or_default(),
                 hol_blocker_ticket,
+                publication_phases,
             ) {
                 inner
                     .sync_progress
@@ -3148,6 +3220,24 @@ fn process_group_result(inner: &RuntimeInner, result: GroupWriteResult) {
     if out_of_order_completion && later_group_remains_outside_prefix {
         crate::chaos::failpoint::wal_crash_point("parallel_wal.later_group_completed_first");
     }
+}
+
+#[cfg(feature = "bench")]
+fn completion_phase_duration_ns(start: Option<Instant>, end: Option<Instant>) -> u64 {
+    end.zip(start)
+        .map(|(end, start)| {
+            end.saturating_duration_since(start)
+                .as_nanos()
+                .min(u64::MAX as u128) as u64
+        })
+        .unwrap_or_default()
+}
+
+#[cfg(feature = "bench")]
+fn completion_phase_cpu_ns(start: Option<u64>, end: Option<u64>) -> u64 {
+    end.zip(start)
+        .map(|(end, start)| end.saturating_sub(start))
+        .unwrap_or_default()
 }
 
 fn terminalize_unresolved_prefix(inner: &RuntimeInner) {
