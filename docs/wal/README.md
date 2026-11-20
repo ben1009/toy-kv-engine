@@ -79,6 +79,7 @@ the retained and rejected experiments.
 
 ## Benchmarks and qualification
 
+- [V8 Point ticket lookup A/B on GCP](benchmarks/rfc-026-v8-ticket-index-gcp-20261120.md)
 - [V7/V8 Point Frame Finish to DATA submission on GCP](benchmarks/rfc-026-v8-frame-finish-gcp-20261120.md)
 - [V7/V8 Point worker notifications on GCP](benchmarks/rfc-026-v7-v8-worker-notifications-gcp-20261120.md)
 - [V8 Point 3 μs DATA Group Join on GCP](benchmarks/rfc-026-v8-point-short-group-join-gcp-20261120.md)
