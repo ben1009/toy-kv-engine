@@ -2580,17 +2580,57 @@ def stream_file_from_vm(
 
 
 def stream_file_to_vm(
-    ip: str, local_path: Path, remote_path: str, key: Path, known_hosts: Path, timeout: int
+    ip: str, local_path: Path, remote_path: str, key: Path, known_hosts: Path, timeout: int,
+    *, before_attempt: Callable[[], None] | None = None, max_attempts: int = 4,
 ) -> subprocess.CompletedProcess[str]:
-    # Stream bytes over ordinary SSH stdin; do not rely on the guest SCP/SFTP
-    # server. Keep the remote file private while writing it.
+    """Upload through SSH, retrying only transient transport disconnects.
+
+    A successful readiness probe does not guarantee that the following upload
+    connection remains open. Reopen the local file for each attempt so a retry
+    replaces any partial remote file. Callers audit policy before the first
+    attempt; the callback re-audits before each retry.
+    """
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be at least one")
     command = ssh_command_argv(
         key, known_hosts, ip, f"umask 077 && cat > {shlex.quote(remote_path)}"
     )
-    with local_path.open("rb") as source:
-        # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
-        return subprocess.run(command, text=True, stdin=source, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                              timeout=timeout, check=False, shell=False)
+    retryable_transport_errors = (
+        "connection closed by ",
+        "connection reset by ",
+        "connection refused",
+        "connection timed out",
+        "operation timed out",
+        "connection aborted",
+        "broken pipe",
+        "ssh_exchange_identification:",
+        "kex_exchange_identification:",
+    )
+    retry_notes: list[str] = []
+    for attempt in range(max_attempts):
+        if attempt > 0 and before_attempt is not None:
+            before_attempt()
+        with local_path.open("rb") as source:
+            # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
+            result = subprocess.run(
+                command, text=True, stdin=source, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                timeout=timeout, check=False, shell=False,
+            )
+        error_text = result.stderr.lower()
+        retryable = result.returncode != 0 and any(
+            marker in error_text for marker in retryable_transport_errors
+        )
+        if not retryable or attempt + 1 == max_attempts:
+            if retry_notes:
+                result.stderr = "\n".join([*retry_notes, result.stderr]).strip()
+            return result
+        delay = 2 ** attempt
+        retry_notes.append(
+            f"SSH upload attempt {attempt + 1}/{max_attempts} hit a transient transport error; "
+            f"retrying in {delay}s: {result.stderr.strip()}"
+        )
+        time.sleep(delay)
+    raise AssertionError("unreachable")
 
 
 def append_local_log(path: Path, text: str) -> None:
@@ -2802,6 +2842,20 @@ def provision_and_run(
                 "--rules=tcp:22", f"--source-ranges={args.ssh_source_range}", f"--target-tags={tag}",
                 "--description=Temporary restricted SSH for disposable WAL benchmark VM",
             ], timeout=180)
+
+            def upload_to_vm(local_path: Path, remote_path: str) -> subprocess.CompletedProcess[str]:
+                def audit_before_retry() -> None:
+                    audit_ssh_firewall_rules(
+                        gcloud, args.project, args.network, network_region, tag, args.ssh_source_range
+                    )
+
+                # Audit before the first upload as well as before every retry.
+                audit_before_retry()
+                return stream_file_to_vm(
+                    ip, local_path, remote_path, key, known_hosts, timeout=120,
+                    before_attempt=audit_before_retry,
+                )
+
             while time.monotonic() < deadline:
                 # Recheck immediately before each new connection so a changed
                 # effective policy fails closed before this runner opens SSH.
@@ -2818,71 +2872,49 @@ def provision_and_run(
                 raise BenchError("SSH did not become ready before timeout")
 
             remote_script = RUNNERS
-            audit_ssh_firewall_rules(
-                gcloud, args.project, args.network, network_region, tag, args.ssh_source_range
-            )
-            upload_result = stream_file_to_vm(
-                ip, remote_script, "/tmp/run-wal-bench.sh", key, known_hosts, timeout=120
-            )
+            upload_result = upload_to_vm(remote_script, "/tmp/run-wal-bench.sh")
             append_local_log(key_log, upload_result.stdout + upload_result.stderr)
             if upload_result.returncode:
                 raise BenchError(f"Could not copy remote runner: {upload_result.stderr.strip()}")
             if not MATRIX_MODULE.is_file():
                 raise BenchError(f"Benchmark matrix module is not present in this checkout: {MATRIX_MODULE}")
-            audit_ssh_firewall_rules(
-                gcloud, args.project, args.network, network_region, tag, args.ssh_source_range
-            )
-            matrix_copy = stream_file_to_vm(
-                ip, MATRIX_MODULE, "/tmp/gcp_wal_matrix.py", key, known_hosts, timeout=120
-            )
+            matrix_copy = upload_to_vm(MATRIX_MODULE, "/tmp/gcp_wal_matrix.py")
             append_local_log(key_log, matrix_copy.stdout + matrix_copy.stderr)
             if matrix_copy.returncode:
                 raise BenchError(f"Could not copy benchmark matrix module: {matrix_copy.stderr.strip()}")
             if profile_suite:
                 if not PROFILE_RUNNER.is_file():
                     raise BenchError(f"Profiling helper is not present in this checkout: {PROFILE_RUNNER}")
-                profile_copy = stream_file_to_vm(
-                    ip, PROFILE_RUNNER, "/tmp/gcp-wal-profile-runner.py", key, known_hosts, timeout=120
-                )
+                profile_copy = upload_to_vm(PROFILE_RUNNER, "/tmp/gcp-wal-profile-runner.py")
                 append_local_log(key_log, profile_copy.stdout + profile_copy.stderr)
                 if profile_copy.returncode:
                     raise BenchError(f"Could not copy profile runner: {profile_copy.stderr.strip()}")
             if trace_suite:
                 if not COMMIT_ORDER_TRACE_RUNNER.is_file():
                     raise BenchError(f"Commit-order trace runner is not present in this checkout: {COMMIT_ORDER_TRACE_RUNNER}")
-                trace_copy = stream_file_to_vm(
-                    ip, COMMIT_ORDER_TRACE_RUNNER, "/tmp/gcp-commit-order-trace-runner.py",
-                    key, known_hosts, timeout=120,
-                )
+                trace_copy = upload_to_vm(COMMIT_ORDER_TRACE_RUNNER, "/tmp/gcp-commit-order-trace-runner.py")
                 append_local_log(key_log, trace_copy.stdout + trace_copy.stderr)
                 if trace_copy.returncode:
                     raise BenchError(f"Could not copy commit-order trace runner: {trace_copy.stderr.strip()}")
             if point_lookahead_suite:
                 if not POINT_LOOKAHEAD_RUNNER.is_file():
                     raise BenchError(f"Point lookahead runner is not present in this checkout: {POINT_LOOKAHEAD_RUNNER}")
-                point_copy = stream_file_to_vm(
-                    ip, POINT_LOOKAHEAD_RUNNER, "/tmp/gcp-v8-point-lookahead-runner.py", key, known_hosts,
-                    timeout=120,
-                )
+                point_copy = upload_to_vm(POINT_LOOKAHEAD_RUNNER, "/tmp/gcp-v8-point-lookahead-runner.py")
                 append_local_log(key_log, point_copy.stdout + point_copy.stderr)
                 if point_copy.returncode:
                     raise BenchError(f"Could not copy Point lookahead runner: {point_copy.stderr.strip()}")
             if mutex_diagnostic_suite:
                 if not V8_MUTEX_DIAGNOSTIC_RUNNER.is_file():
                     raise BenchError(f"Mutex diagnostic helper is not present in this checkout: {V8_MUTEX_DIAGNOSTIC_RUNNER}")
-                mutex_copy = stream_file_to_vm(
-                    ip, V8_MUTEX_DIAGNOSTIC_RUNNER, "/tmp/gcp-v8-mutex-diagnostic-runner.py",
-                    key, known_hosts, timeout=120,
-                )
+                mutex_copy = upload_to_vm(V8_MUTEX_DIAGNOSTIC_RUNNER, "/tmp/gcp-v8-mutex-diagnostic-runner.py")
                 append_local_log(key_log, mutex_copy.stdout + mutex_copy.stderr)
                 if mutex_copy.returncode:
                     raise BenchError(f"Could not copy mutex diagnostic runner: {mutex_copy.stderr.strip()}")
             if cpu_attribution_suite:
                 if not V8_POINT_CPU_ATTRIBUTION_RUNNER.is_file():
                     raise BenchError(f"Point CPU attribution helper is missing: {V8_POINT_CPU_ATTRIBUTION_RUNNER}")
-                cpu_copy = stream_file_to_vm(
-                    ip, V8_POINT_CPU_ATTRIBUTION_RUNNER, "/tmp/gcp-v8-point-cpu-attribution-runner.py",
-                    key, known_hosts, timeout=120,
+                cpu_copy = upload_to_vm(
+                    V8_POINT_CPU_ATTRIBUTION_RUNNER, "/tmp/gcp-v8-point-cpu-attribution-runner.py"
                 )
                 append_local_log(key_log, cpu_copy.stdout + cpu_copy.stderr)
                 if cpu_copy.returncode:
@@ -2890,9 +2922,8 @@ def provision_and_run(
             if point_borrowed_input_suite:
                 if not POINT_BORROWED_INPUT_RUNNER.is_file():
                     raise BenchError(f"Borrowed-input helper is missing: {POINT_BORROWED_INPUT_RUNNER}")
-                borrowed_copy = stream_file_to_vm(
-                    ip, POINT_BORROWED_INPUT_RUNNER, "/tmp/gcp-v8-point-borrowed-input-runner.py",
-                    key, known_hosts, timeout=120,
+                borrowed_copy = upload_to_vm(
+                    POINT_BORROWED_INPUT_RUNNER, "/tmp/gcp-v8-point-borrowed-input-runner.py"
                 )
                 append_local_log(key_log, borrowed_copy.stdout + borrowed_copy.stderr)
                 if borrowed_copy.returncode:
@@ -2900,19 +2931,15 @@ def provision_and_run(
             if point_direct_frame_suite:
                 if not POINT_DIRECT_FRAME_RUNNER.is_file():
                     raise BenchError(f"Direct-frame helper is missing: {POINT_DIRECT_FRAME_RUNNER}")
-                direct_copy = stream_file_to_vm(
-                    ip, POINT_DIRECT_FRAME_RUNNER, "/tmp/gcp-v8-point-direct-frame-runner.py",
-                    key, known_hosts, timeout=120,
-                )
+                direct_copy = upload_to_vm(POINT_DIRECT_FRAME_RUNNER, "/tmp/gcp-v8-point-direct-frame-runner.py")
                 append_local_log(key_log, direct_copy.stdout + direct_copy.stderr)
                 if direct_copy.returncode:
                     raise BenchError(f"Could not copy direct-frame helper: {direct_copy.stderr.strip()}")
             if extent_policy_storage_suite:
                 if not V8_EXTENT_POLICY_STORAGE_RUNNER.is_file():
                     raise BenchError(f"Extent-policy storage runner is missing: {V8_EXTENT_POLICY_STORAGE_RUNNER}")
-                storage_copy = stream_file_to_vm(
-                    ip, V8_EXTENT_POLICY_STORAGE_RUNNER, "/tmp/gcp-v8-extent-policy-storage-runner.py",
-                    key, known_hosts, timeout=120,
+                storage_copy = upload_to_vm(
+                    V8_EXTENT_POLICY_STORAGE_RUNNER, "/tmp/gcp-v8-extent-policy-storage-runner.py"
                 )
                 append_local_log(key_log, storage_copy.stdout + storage_copy.stderr)
                 if storage_copy.returncode:

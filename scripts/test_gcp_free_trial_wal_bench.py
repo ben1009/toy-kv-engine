@@ -19,7 +19,7 @@ import tarfile
 import time
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from gcp_wal_matrix import (
     COMMIT_ORDER_TRACE_NUM,
@@ -133,6 +133,62 @@ class SshStreamTransferTests(unittest.TestCase):
         self.assertEqual(command[-1], "umask 077 && cat > '/tmp/runner with space.sh'")
         self.assertIn("StrictHostKeyChecking=yes", command)
         self.assertIn("GlobalKnownHostsFile=/dev/null", command)
+
+    def test_upload_retries_transient_disconnect_and_reaudits_before_reconnect(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            local = Path(temporary) / "runner.sh"
+            payload = b"runner bytes"
+            local.write_bytes(payload)
+            order: list[str] = []
+            results = [
+                subprocess.CompletedProcess([], 255, "", "Connection closed by 192.0.2.10 port 22"),
+                subprocess.CompletedProcess([], 0, "", ""),
+            ]
+
+            def run(command, **kwargs):
+                order.append("ssh")
+                self.assertEqual(kwargs["stdin"].read(), payload)
+                return results.pop(0)
+
+            def audit_before_retry() -> None:
+                order.append("audit")
+
+            with (
+                patch.object(BENCH.subprocess, "run", side_effect=run),
+                patch.object(BENCH.time, "sleep") as sleep,
+            ):
+                # The caller audits before attempt one; the callback is used
+                # for each reconnect after a transient transport failure.
+                order.append("audit")
+                result = BENCH.stream_file_to_vm(
+                    "192.0.2.10", local, "/tmp/runner.sh", Path("/tmp/key"),
+                    Path("/tmp/known-hosts"), timeout=30, before_attempt=audit_before_retry,
+                )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(order, ["audit", "ssh", "audit", "ssh"])
+        self.assertIn("transient transport error", result.stderr)
+        sleep.assert_called_once_with(1)
+
+    def test_upload_does_not_retry_authentication_failures(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            local = Path(temporary) / "runner.sh"
+            local.write_bytes(b"runner bytes")
+            before_retry = Mock()
+            failure = subprocess.CompletedProcess([], 255, "", "Permission denied (publickey)")
+            with (
+                patch.object(BENCH.subprocess, "run", return_value=failure) as run,
+                patch.object(BENCH.time, "sleep") as sleep,
+            ):
+                result = BENCH.stream_file_to_vm(
+                    "192.0.2.10", local, "/tmp/runner.sh", Path("/tmp/key"),
+                    Path("/tmp/known-hosts"), timeout=30, before_attempt=before_retry,
+                )
+
+        self.assertEqual(result.returncode, 255)
+        run.assert_called_once()
+        before_retry.assert_not_called()
+        sleep.assert_not_called()
 
     def test_download_streams_binary_file_to_destination(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
