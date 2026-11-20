@@ -36,7 +36,7 @@ At 16 writers, the V8 producer-total p50 is 29.65 μs vs 8.93 μs for V7. V8 fra
 
 - `summary.json`: complete, 12/12 planned runs completed.
 - `remote-exit.json`: failed=false, runs_started=12.
-- Every planned run directory has successful `result.json` and matching `run-metadata.json`; suite validator passed when its run-folder glob was corrected from `w*` to `r*` in a temporary copy.
-- The checked-in validator currently searches `w*`, so it falsely reports all `r...` run directories missing for this suite. No repository files were changed in this run.
+- Every planned run directory has successful `result.json` and matching `run-metadata.json`; suite validation passed after correcting the run-folder glob from `w*` to `r*` in a temporary copy.
+- At the time of this run, the checked-in validator searched only `w*`, falsely reporting all `r...` run directories missing. A follow-up fix now recognizes both run-ID prefixes.
 - Archive: `results.tar.gz`, 34941017 bytes; SHA-256 verified against remote metadata and sidecar: `179fda7194db8f5a75cb17c74b52c229fbce34b8d664b0125c11fa7312825c27`.
 - Temporary VM, both benchmark SSH firewall rules, isolated VPC, subnet and route have been deleted and verified absent. Terraform state is empty.

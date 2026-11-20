@@ -3449,6 +3449,24 @@ print('[hotpath] diagnostic report follows')
             self.assertTrue(any("remote exit run count does not match the plan" in error
                                 for error in mismatched_exit["errors"]))
 
+    def test_run_directory_validation_accepts_w_and_r_ids_and_reports_missing_and_extra(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            results = Path(temp)
+            expected_ids = {
+                "w16-point-r1-v7_parallel",
+                "r1-w8-point-v7_parallel",
+            }
+            for run_id in expected_ids:
+                (results / run_id).mkdir()
+
+            self.assertEqual(BENCH._run_directory_delta(results, expected_ids), ([], []))
+
+            (results / "r1-w8-point-v7_parallel").rmdir()
+            (results / "r2-w16-point-v8_candidate").mkdir()
+            missing, unexpected = BENCH._run_directory_delta(results, expected_ids)
+            self.assertEqual(missing, ["r1-w8-point-v7_parallel"])
+            self.assertEqual(unexpected, ["r2-w16-point-v8_candidate"])
+
     def test_result_verifier_accepts_csv_string_exit_code_in_summary(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             results = self._make_result_bundle(Path(temp), complete=True)

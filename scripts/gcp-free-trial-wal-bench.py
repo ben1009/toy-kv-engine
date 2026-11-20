@@ -1468,6 +1468,16 @@ def _expected_run_metadata(row: dict[str, Any], suite: str) -> dict[str, Any]:
     raise ValueError(f"unsupported benchmark suite: {suite!r}")
 
 
+def _run_directory_delta(results: Path, expected_run_ids: set[str]) -> tuple[list[str], list[str]]:
+    """Return missing and unexpected run directories across the supported ID prefixes."""
+    actual_run_ids = {
+        path.name
+        for path in results.iterdir()
+        if path.is_dir() and path.name.startswith(("w", "r"))
+    }
+    return sorted(expected_run_ids - actual_run_ids), sorted(actual_run_ids - expected_run_ids)
+
+
 def _verify_result_set(results: Path) -> dict[str, Any]:
     """Validate suite metadata and one successful result/metadata pair per planned run."""
     import json
@@ -1762,10 +1772,8 @@ def _verify_result_set(results: Path) -> dict[str, Any]:
             if run_id in expected:
                 errors.append(f"duplicate run identifier in schedule: {run_id}")
             expected[run_id] = _expected_run_metadata(row, suite)
-        actual_directories = {path.name for path in results.glob("w*") if path.is_dir()}
-        if actual_directories != set(expected):
-            missing = sorted(set(expected) - actual_directories)
-            unexpected = sorted(actual_directories - set(expected))
+        missing, unexpected = _run_directory_delta(results, set(expected))
+        if missing or unexpected:
             errors.append(f"run directories do not match schedule (missing={missing}, unexpected={unexpected})")
 
         summary_rows = summary.get("results")
