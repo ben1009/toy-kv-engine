@@ -2,23 +2,23 @@
 
 | Field | Value |
 | --- | --- |
-| Status | **Fifth review: A0 quota-pressure fallback contract clarified; design only** |
+| Status | **Historical alternatives; Fast Lane is the primary >=10% performance proposal** |
 | Date | 2026-11-21 |
 | Base | `main` at `58c79208` (squash merge of PR #558); source audit originally pinned to `14df402b` |
 | Applies to | V8 Parallel Point Put first; any writer-wide durability-owner experiment also affects V8 batches. V7 and V8 Leader unchanged |
 | Parent | [RFC 026](../../rfcs/026-composable-wal-prefix-digest.md) and [implementation plan](rfc-026-implementation-plan.md) |
 
-## 1. Decision requested — reviewed implementation priority
+## 1. Prior optimization candidates — superseded by Fast Lane
 
-The design still addresses the V8 Parallel Point gap. **Do not treat moving the durability driver to a background thread as the current implementation priority.** The source and existing diagnostics give stronger justification for reducing the work serialized by MVCC `write_lock`.
+**Current direction:** The larger-impact structural design and benchmark gate are in [V8 Point Fast Lane](rfc-026-v8-point-fast-lane.md). It targets repeated Coordinator-lock ready/completion publications with safe per-ticket slots and a single ordered prefix fold; see that proposal for implementation. This document retains **A0/P0/P1 as historical or optional alternatives**, not a recommendation to implement A0 first. Moving the durability driver alone remains deferred; pre-admission resource moves have small sampled scope and substantial quota/rotation risk.
 
-Ordered work, with at most two measured source-level candidates:
+Previously reviewed candidates, retained for context (not an active execution order):
 
-1. **A0 — Conditional pre-admission reservation/buffer preparation (first candidate only after safety review):** V7 has a working pre-sequencer reserved-buffer precedent. For V8, first prove that the SourceSpoolLimit lookahead-tail reclaim path and the bounded credit semantics remain correct when speculative writers reserve before the sequencer. Move only the safe fast-path ticket-independent work; keep timestamp/ticket order, physical allocation and WAL publication under `write_lock`. If the safety proof needs a new quota/fairness protocol, **reject A0 before coding**. See Section 2.1.
-2. **P0 — Optional Point-ready fusion (second candidate only if justified):** combine one-frame Point digest/frame readiness under one coordinator lock. This removes a transition but delays the early digest fold. Test locally before considering GCP.
+1. **A0 — Conditional pre-admission reservation/buffer preparation (not prioritized for the large-win goal):** V7 has a working pre-sequencer reserved-buffer precedent. For V8, first prove that the SourceSpoolLimit lookahead-tail reclaim path and the bounded credit semantics remain correct when speculative writers reserve before the sequencer. Move only the safe fast-path ticket-independent work; keep timestamp/ticket order, physical allocation and WAL publication under `write_lock`. If the safety proof needs a new quota/fairness protocol, **reject A0 before coding**. See Section 2.1.
+2. **P0 — Optional Point-ready fusion (low expected gain):** combine one-frame Point digest/frame readiness under one coordinator lock. This removes a transition but delays the early digest fold. Test locally before considering GCP.
 3. **P1 — Dedicated V8 durability owner (deferred design, not approved prototype):** retain the existing Completion Reaper and move writer-elected sync to a distinct durability thread only if measured evidence can tie the current election/driver handoff to Point critical-path throughput or tail latency. No such causal demonstration is established by the existing role CPU data. Section 4 preserves concurrency/lifecycle design constraints for future consideration.
 
-**Stop rule:** No further open-ended attribution campaign. Try A0 as one small correctness-preserving patch, with local screening followed by a five-pair GCP A/B only if promising. P0 may consume the second bounded candidate. Do not implement P1 as an automatic fallback after A0/P0 fail; require a new, explicit design/performance decision.
+**Current execution gate:** Do not launch A0, P0, or P1 by default. Review and implement only the [Fast Lane F0](rfc-026-v8-point-fast-lane.md) prototype if its slot-lifetime and wakeup safety proof passes. A0 is no longer the next code task. The historical tests and fallback details below remain useful if the smaller alternatives are reconsidered.
 
 ### Reviewed design issues retained
 
@@ -246,4 +246,4 @@ If A0 and the optional P0 both fail, retain the current V8 implementation, docum
 - How should P1 detect a disappearing IoWorker while no DATA completion is forthcoming, without a polling-only liveness dependency? Define worker-exit/error signaling and joining explicitly.
 - Does adding a new thread materially increase runnable contention or process CPU on 8-physical-core/16-vCPU GCP C4? This is a performance gate, not assumed free.
 
-This RFC is deliberately performance-conservative: A0 addresses the **measured serial admission region**; P0 is optional; P1 is deferred because relocating durability work is not presently a causal explanation for the throughput gap. No runtime code or benchmark qualification is part of this RFC.
+This document archives the smaller candidates and their safety gates. The large-impact proposal is [V8 Point Fast Lane](rfc-026-v8-point-fast-lane.md). No runtime code, production default or benchmark qualification is changed by either RFC.
