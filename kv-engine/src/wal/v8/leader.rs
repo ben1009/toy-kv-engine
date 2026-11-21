@@ -2835,7 +2835,9 @@ impl WalV8ParallelIo {
     ) -> Result<bool> {
         let deadline = Instant::now() + budget;
         let mut waited = false;
-        while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+        while !snapshot.closed
+            && let Some(remaining) = deadline.checked_duration_since(Instant::now())
+        {
             waited = true;
             let signaled = self.wait_for_progress(remaining)?;
             *snapshot = self.advance_and_snapshot(driver, capture_monotonic_ns)?;
@@ -5284,6 +5286,9 @@ impl WalV8ParallelWriter {
                         anyhow::bail!("v8 Parallel WAL closed before the ticket became durable");
                     }
                 } else {
+                    if snapshot.closed {
+                        anyhow::bail!("v8 Parallel WAL closed before the ticket became durable");
+                    }
                     let _ = self.io.wait_for_progress(Duration::from_secs(1))?;
                     if self.coordinator.is_poisoned() {
                         anyhow::bail!("v8 Parallel WAL was poisoned while waiting for durability");
@@ -9378,6 +9383,75 @@ mod tests {
         )?;
         assert_eq!(recovered.active_boundary.ticket_end, 1);
         assert_eq!(replayed_batches(&path, &recovered)?, [input]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn progress_ring_clean_close_drains_ready_tickets_without_waiting_for_unready_ones()
+    -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("progress-ring-clean-close.wal");
+        let installed = install_empty(&path, header())?;
+        let writer = match open_parallel_with_progress_mode(&path, &installed, true) {
+            Ok(writer) => writer,
+            Err(error) if is_io_uring_unavailable_error(&error) => {
+                eprintln!("skipping test (io_uring unavailable): {error:#}");
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+
+        let (reaped_tx, reaped_rx) = mpsc::sync_channel(1);
+        writer.io.set_completion_reap_hook(Arc::new(move |event| {
+            if matches!(event, WalV8CompletionReapTestEvent::AfterReap) {
+                let _ = reaped_tx.try_send(());
+            }
+        }));
+
+        // Establish a sync latency so the next partially ready prefix would
+        // normally be eligible for coalescing.
+        let first = batch(10);
+        writer.append_prepared_batch(
+            writer.preflight_batch(&first, LIVE_WAL_V5_LIMITS)?,
+            first.commit_ts,
+            first.recorded_at,
+        )?;
+        reaped_rx
+            .recv_timeout(Duration::from_secs(5))
+            .context("first DATA group was not reaped")?;
+
+        let ready = batch(20);
+        let ready_job = writer.admit_prepared_batch(
+            writer.preflight_batch(&ready, LIVE_WAL_V5_LIMITS)?,
+            ready.commit_ts,
+            ready.recorded_at,
+        )?;
+        let ready_ticket = ready_job.assignment().segment_ticket;
+        let unready = batch(30);
+        let unready_job = writer.admit_prepared_batch(
+            writer.preflight_batch(&unready, LIVE_WAL_V5_LIMITS)?,
+            unready.commit_ts,
+            unready.recorded_at,
+        )?;
+        ready_job.finish()?;
+        reaped_rx
+            .recv_timeout(Duration::from_secs(5))
+            .context("ready DATA group was not reaped")?;
+
+        writer.io.set_progress_wait_hook(Arc::new(|event| {
+            assert!(
+                !matches!(event, WalV8ProgressWaitTestEvent::BeforeWait),
+                "closed progress ring attempted to park"
+            );
+        }));
+        writer.coordinator.close();
+        writer.wait_durable(ready_ticket)?;
+        assert_eq!(writer.active_boundaries()?.1.ticket_end, ready_ticket + 1);
+        let error = writer
+            .wait_durable(unready_job.assignment().segment_ticket)
+            .expect_err("unready ticket must fail after close");
+        assert!(format!("{error:#}").contains("WAL closed before the ticket became durable"));
 
         Ok(())
     }

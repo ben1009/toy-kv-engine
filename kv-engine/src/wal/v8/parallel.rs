@@ -684,6 +684,7 @@ impl WalV8TicketProgress {
 pub(crate) struct WalV8FrontierReadySnapshot {
     pub(crate) ready_prefix: Vec<WalV8TicketProgress>,
     pub(crate) admitted_ticket_count: usize,
+    pub(crate) closed: bool,
     #[cfg(feature = "bench")]
     pub(crate) frames_ready_prefix_count: usize,
     #[cfg(feature = "bench")]
@@ -3042,6 +3043,7 @@ fn empty_frontier_ready_snapshot() -> WalV8FrontierReadySnapshot {
     WalV8FrontierReadySnapshot {
         ready_prefix: Vec::new(),
         admitted_ticket_count: 0,
+        closed: false,
         #[cfg(feature = "bench")]
         frames_ready_prefix_count: 0,
         #[cfg(feature = "bench")]
@@ -3065,6 +3067,7 @@ fn frontier_ready_snapshot_locked(
     #[cfg(not(feature = "bench"))]
     let _ = capture_monotonic_ns;
     let mut snapshot = empty_frontier_ready_snapshot();
+    snapshot.closed = state.closed;
     if state.poisoned {
         return Ok(snapshot);
     }
