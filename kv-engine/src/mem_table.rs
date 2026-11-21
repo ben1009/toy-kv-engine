@@ -253,6 +253,12 @@ pub struct WriteProfile {
     pub wal_commit_max_buffers: AtomicU64,
     /// Maximum aligned bytes submitted by one WAL commit group.
     pub wal_commit_max_bytes: AtomicU64,
+    /// DATA worker-group ticket-count buckets for benchmark reporting.
+    pub wal_worker_group_size_one_ticket: AtomicU64,
+    pub wal_worker_group_size_two_tickets: AtomicU64,
+    pub wal_worker_group_size_three_to_four_tickets: AtomicU64,
+    pub wal_worker_group_size_five_to_eight_tickets: AtomicU64,
+    pub wal_worker_group_size_nine_or_more_tickets: AtomicU64,
     /// Number of successfully written embedded v7 FRONTIER frames.
     pub wal_frontier_writes: AtomicU64,
     /// Aligned bytes written for embedded v7 FRONTIER frames.
@@ -1257,6 +1263,11 @@ impl WriteProfile {
         self.wal_commit_bytes.store(0, o);
         self.wal_commit_max_buffers.store(0, o);
         self.wal_commit_max_bytes.store(0, o);
+        self.wal_worker_group_size_one_ticket.store(0, o);
+        self.wal_worker_group_size_two_tickets.store(0, o);
+        self.wal_worker_group_size_three_to_four_tickets.store(0, o);
+        self.wal_worker_group_size_five_to_eight_tickets.store(0, o);
+        self.wal_worker_group_size_nine_or_more_tickets.store(0, o);
         self.wal_frontier_writes.store(0, o);
         self.wal_frontier_bytes.store(0, o);
         self.wal_frontier_write_ns.store(0, o);
@@ -1336,6 +1347,18 @@ impl WriteProfile {
             wal_commit_bytes: self.wal_commit_bytes.load(o),
             wal_commit_max_buffers: self.wal_commit_max_buffers.load(o),
             wal_commit_max_bytes: self.wal_commit_max_bytes.load(o),
+            wal_worker_group_size_one_ticket: self.wal_worker_group_size_one_ticket.load(o),
+            wal_worker_group_size_two_tickets: self.wal_worker_group_size_two_tickets.load(o),
+            wal_worker_group_size_three_to_four_tickets: self
+                .wal_worker_group_size_three_to_four_tickets
+                .load(o),
+            wal_worker_group_size_five_to_eight_tickets: self
+                .wal_worker_group_size_five_to_eight_tickets
+                .load(o),
+            wal_worker_group_size_nine_or_more_tickets: self
+                .wal_worker_group_size_nine_or_more_tickets
+                .load(o),
+            wal_worker_group_size_histogram_enabled: self.wal_worker_group_size_histogram_enabled(),
             wal_frontier_writes: self.wal_frontier_writes.load(o),
             wal_frontier_bytes: self.wal_frontier_bytes.load(o),
             wal_frontier_write_ns: self.wal_frontier_write_ns.load(o),
@@ -1391,6 +1414,33 @@ impl WriteProfile {
         self.wal_commit_bytes.fetch_add(bytes, o);
         self.wal_commit_max_buffers.fetch_max(buffers, o);
         self.wal_commit_max_bytes.fetch_max(bytes, o);
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn record_wal_worker_group(&self, ticket_count: u64) {
+        let counter = match ticket_count {
+            0 => return,
+            1 => &self.wal_worker_group_size_one_ticket,
+            2 => &self.wal_worker_group_size_two_tickets,
+            3..=4 => &self.wal_worker_group_size_three_to_four_tickets,
+            5..=8 => &self.wal_worker_group_size_five_to_eight_tickets,
+            _ => &self.wal_worker_group_size_nine_or_more_tickets,
+        };
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn wal_worker_group_size_histogram_enabled(&self) -> bool {
+        #[cfg(feature = "bench")]
+        {
+            static ENABLED: OnceLock<bool> = OnceLock::new();
+            *ENABLED.get_or_init(|| {
+                std::env::var_os("TOYKV_BENCH_WAL_WORKER_GROUP_HISTOGRAM")
+                    .and_then(|value| value.into_string().ok())
+                    .is_some_and(|value| value == "1")
+            })
+        }
+        #[cfg(not(feature = "bench"))]
+        false
     }
 
     #[cfg(feature = "bench")]
@@ -2179,6 +2229,12 @@ pub struct WriteProfileSnapshot {
     pub wal_commit_bytes: u64,
     pub wal_commit_max_buffers: u64,
     pub wal_commit_max_bytes: u64,
+    pub wal_worker_group_size_one_ticket: u64,
+    pub wal_worker_group_size_two_tickets: u64,
+    pub wal_worker_group_size_three_to_four_tickets: u64,
+    pub wal_worker_group_size_five_to_eight_tickets: u64,
+    pub wal_worker_group_size_nine_or_more_tickets: u64,
+    pub wal_worker_group_size_histogram_enabled: bool,
     pub wal_frontier_writes: u64,
     pub wal_frontier_bytes: u64,
     pub wal_frontier_write_ns: u64,
@@ -2346,6 +2402,22 @@ impl WriteProfileSnapshot {
                 .saturating_sub(before.wal_commit_bytes),
             wal_commit_max_buffers: self.wal_commit_max_buffers,
             wal_commit_max_bytes: self.wal_commit_max_bytes,
+            wal_worker_group_size_one_ticket: self
+                .wal_worker_group_size_one_ticket
+                .saturating_sub(before.wal_worker_group_size_one_ticket),
+            wal_worker_group_size_two_tickets: self
+                .wal_worker_group_size_two_tickets
+                .saturating_sub(before.wal_worker_group_size_two_tickets),
+            wal_worker_group_size_three_to_four_tickets: self
+                .wal_worker_group_size_three_to_four_tickets
+                .saturating_sub(before.wal_worker_group_size_three_to_four_tickets),
+            wal_worker_group_size_five_to_eight_tickets: self
+                .wal_worker_group_size_five_to_eight_tickets
+                .saturating_sub(before.wal_worker_group_size_five_to_eight_tickets),
+            wal_worker_group_size_nine_or_more_tickets: self
+                .wal_worker_group_size_nine_or_more_tickets
+                .saturating_sub(before.wal_worker_group_size_nine_or_more_tickets),
+            wal_worker_group_size_histogram_enabled: self.wal_worker_group_size_histogram_enabled,
             wal_frontier_writes: self
                 .wal_frontier_writes
                 .saturating_sub(before.wal_frontier_writes),

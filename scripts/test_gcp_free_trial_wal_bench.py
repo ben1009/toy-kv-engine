@@ -32,6 +32,8 @@ from gcp_wal_matrix import (
     POINT_BORROWED_INPUT_WRITERS,
     POINT_DIRECT_FRAME_NUM,
     POINT_DIRECT_FRAME_WRITERS,
+    POINT_PROGRESS_RING_NUM,
+    POINT_PROGRESS_RING_WRITERS,
     V8_EXTENT_POLICY_STORAGE_NUM,
     V8_EXTENT_POLICY_STORAGE_WRITERS,
     V8_MUTEX_DIAGNOSTIC_NUM,
@@ -50,6 +52,8 @@ from gcp_wal_matrix import (
     build_point_borrowed_input_schedule,
     build_point_direct_frame_plan,
     build_point_direct_frame_schedule,
+    build_point_progress_ring_plan,
+    build_point_progress_ring_schedule,
     build_v8_extent_policy_storage_plan,
     build_v8_extent_policy_storage_schedule,
     build_v8_mutex_diagnostic_plan,
@@ -62,6 +66,7 @@ from gcp_wal_matrix import (
     validate_point_lookahead_rows,
     validate_point_borrowed_input_rows,
     validate_point_direct_frame_rows,
+    validate_point_progress_ring_rows,
     validate_v8_extent_policy_storage_rows,
     validate_v8_mutex_diagnostic_rows,
     validate_v8_point_cpu_attribution_rows,
@@ -91,6 +96,7 @@ from gcp_v8_mutex_diagnostic_runner import (
 )
 from gcp_v8_point_borrowed_input_runner import _summary_fields
 import gcp_v8_point_cpu_attribution_runner as cpu_attribution_runner
+import gcp_v8_point_progress_ring_runner as progress_ring_runner
 from gcp_v8_point_cpu_attribution_runner import (
     _build_command as build_cpu_attribution_command,
     _completion_handoff_timeline_summary,
@@ -297,6 +303,355 @@ def fake_keygen(command, **_kwargs):
     key.write_text("private-key", encoding="utf-8")
     key.with_suffix(".pub").write_text("public-key", encoding="utf-8")
     return subprocess.CompletedProcess(command, 0, "", "")
+
+
+class PointProgressRingQualificationTests(unittest.TestCase):
+    @staticmethod
+    def _raw_record(row: dict[str, object]) -> dict[str, object]:
+        ring_enabled = bool(row["progress_ring_enabled"])
+        start_preparation = {
+            "mode": "sliding-point-lookahead",
+            "window_bytes": POINT_LOOKAHEAD_WINDOW_BYTES,
+            "extent_policy_storage": "vec",
+            "extent_policy_scan_diagnostics_enabled": False,
+            "initialized_bytes": 0,
+        }
+        end_preparation = {
+            **start_preparation,
+            "initialized_bytes": POINT_LOOKAHEAD_WINDOW_BYTES if row["workload"] == "point" else 0,
+        }
+        handles = {
+            "data": {"o_direct": True, "device": 8, "inode": 101},
+            "frontier": {"o_direct": True, "device": 8, "inode": 101},
+            "sync": {"o_direct": False, "device": 8, "inode": 101},
+        }
+        start = {
+            **handles,
+            "progress_ring_enabled": ring_enabled,
+            "sliding_extent_preparation": start_preparation,
+        }
+        end = {
+            **handles,
+            "progress_ring_enabled": ring_enabled,
+            "sliding_extent_preparation": end_preparation,
+        }
+        point = row["workload"] == "point"
+        speed = 100_000.0
+        if ring_enabled and row["writer"] in (8, 16) and point:
+            speed *= 1.06
+        elif ring_enabled and row["writer"] == 1 and point:
+            speed *= 0.99
+        elif ring_enabled and row["workload"] == "batch64":
+            speed *= 0.995
+        result = {
+            "ops": POINT_PROGRESS_RING_NUM,
+            "ops_per_sec": speed,
+            "process_cpu_user_ms": 6000.0,
+            "process_cpu_system_ms": 1000.0,
+            "wal_pipeline": {
+                "wal_io_stable": True,
+                "wal_io_start": start,
+                "wal_io_end": end,
+                "sync_count": 1000,
+            },
+            "wal_v8_digest": {
+                "cpu_timing_sample_rate": 64,
+                "ordered_link_hash_cpu_ns": 200_000,
+                "cpu_timing_sampled_tickets": 1563,
+            },
+        }
+        record: dict[str, object] = {
+            "params": {
+                "num": POINT_PROGRESS_RING_NUM,
+                "threads": row["writer"],
+                "value_size": 1024,
+                "batch_size": row["batch_size"],
+                "wal_format_version": 8,
+                "wal_io_mode": "parallel",
+            },
+            "result": result,
+        }
+        if point:
+            record["latency"] = {
+                "sample_every": 10,
+                "samples": POINT_PROGRESS_RING_NUM // 10,
+                "unsampled_completed_operations": POINT_PROGRESS_RING_NUM - POINT_PROGRESS_RING_NUM // 10,
+                "p50_ms": 0.35,
+                "p95_ms": 0.70,
+                "p99_ms": 1.0,
+            }
+        return record
+
+    @classmethod
+    def _make_fixture(cls, root: Path) -> Path:
+        results = root / "results"
+        results.mkdir()
+        commit = "a" * 40
+        binary_sha = "b" * 64
+        schedule = build_point_progress_ring_schedule(POINT_PROGRESS_RING_WRITERS)
+        plan = build_point_progress_ring_plan(
+            writers=POINT_PROGRESS_RING_WRITERS,
+            machine_type="c4-standard-16-lssd",
+            machine_spec=BENCH.MACHINE_SPECS["c4-standard-16-lssd"],
+            commit=commit,
+            binary_sha256=binary_sha,
+        )
+        (results / "benchmark-plan.json").write_text(json.dumps(plan), encoding="utf-8")
+        (results / "commit.txt").write_text(commit + "\n", encoding="utf-8")
+        (results / "write-perf.sha256").write_text(binary_sha + "\n", encoding="utf-8")
+        with (results / "point-progress-ring-schedule.tsv").open("w", encoding="utf-8", newline="") as stream:
+            writer = csv.DictWriter(stream, fieldnames=schedule[0].keys(), delimiter="\t", lineterminator="\n")
+            writer.writeheader()
+            writer.writerows({**row, "batch_size": row["batch_size"] or "none"} for row in schedule)
+
+        rows = []
+        for row in schedule:
+            run_id = progress_ring_runner._run_id(row)
+            run_dir = results / run_id
+            run_dir.mkdir()
+            raw = cls._raw_record(row)
+            metadata = {
+                **row,
+                "source_commit": commit,
+                "binary_sha256": binary_sha,
+                "exit_code": 0,
+                "duration_seconds": 5.0,
+                **progress_ring_runner._validate_record(raw, row),
+            }
+            (run_dir / "result.json").write_text(json.dumps(raw), encoding="utf-8")
+            (run_dir / "run-metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
+            (run_dir / "environment.txt").write_text(
+                progress_ring_runner._expected_environment_text(bool(row["progress_ring_enabled"])),
+                encoding="utf-8",
+            )
+            rows.append(metadata)
+        summary = progress_ring_runner._summary(rows, POINT_PROGRESS_RING_WRITERS, len(schedule))
+        summary.update({"source_commit": commit, "binary_sha256": binary_sha})
+        (results / "summary.json").write_text(json.dumps(summary), encoding="utf-8")
+        (results / "remote-exit.json").write_text(
+            json.dumps({"failed": False, "runs_started": len(schedule)}), encoding="utf-8",
+        )
+        with (results / "summary.tsv").open("w", encoding="utf-8", newline="") as stream:
+            fields = progress_ring_runner._summary_fields(schedule)
+            writer = csv.DictWriter(stream, fieldnames=fields, delimiter="\t", lineterminator="\n")
+            writer.writeheader()
+            for row in rows:
+                writer.writerow({
+                    key: json.dumps(value, sort_keys=True) if isinstance(value, dict) else value
+                    for key, value in row.items()
+                })
+        return results
+
+    def test_environment_uses_supported_ordered_data_submit_mode(self) -> None:
+        for enabled in (False, True):
+            environment = progress_ring_runner._environment(enabled)
+            self.assertEqual(environment["TOYKV_BENCH_V8_DATA_SUBMIT_ORDER"], "ordered")
+            self.assertEqual(
+                environment["TOYKV_BENCH_V8_POINT_PROGRESS_RING"],
+                "1" if enabled else "0",
+            )
+
+    def test_verifier_accepts_legacy_plan_label_only_with_ordered_run_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            results = self._make_fixture(Path(temporary))
+            plan_path = results / "benchmark-plan.json"
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            plan["data_submit_order"] = "ticket_prefix"
+            plan_path.write_text(json.dumps(plan), encoding="utf-8")
+            self.assertTrue(progress_ring_runner.verify_results_directory(results)["verified"])
+
+            first = build_point_progress_ring_schedule(POINT_PROGRESS_RING_WRITERS)[0]
+            run_id = progress_ring_runner._run_id(first)
+            environment_path = results / run_id / "environment.txt"
+            environment_path.write_text(
+                environment_path.read_text(encoding="utf-8").replace(
+                    "TOYKV_BENCH_V8_DATA_SUBMIT_ORDER=ordered",
+                    "TOYKV_BENCH_V8_DATA_SUBMIT_ORDER=ready",
+                ),
+                encoding="utf-8",
+            )
+            verification = progress_ring_runner.verify_results_directory(results)
+            self.assertFalse(verification["verified"])
+            self.assertTrue(any("environment" in error for error in verification["errors"]))
+
+    def test_schedule_and_cli_are_fixed_counterbalanced_and_note_local_screen_waiver(self) -> None:
+        schedule = build_point_progress_ring_schedule(POINT_PROGRESS_RING_WRITERS)
+        self.assertEqual(len(schedule), 40)
+        self.assertEqual({row["workload"] for row in schedule}, {"point", "batch64"})
+        for writer in POINT_PROGRESS_RING_WRITERS:
+            for repetition in range(1, 6):
+                arms = [row["arm"] for row in schedule
+                        if row["writer"] == writer and row["workload"] == "point"
+                        and row["repetition"] == repetition]
+                self.assertEqual(arms, ["eager", "progress_ring"] if repetition % 2 else ["progress_ring", "eager"])
+        plan = build_point_progress_ring_plan(
+            writers=POINT_PROGRESS_RING_WRITERS,
+            machine_type="c4-standard-16-lssd",
+            machine_spec=BENCH.MACHINE_SPECS["c4-standard-16-lssd"],
+            commit="a" * 40,
+        )
+        self.assertEqual(plan["runs_planned"], 40)
+        self.assertEqual(plan["data_submit_order"], "ordered")
+        self.assertEqual(plan["local_screen"]["status"], "skipped_by_user")
+        args = BENCH.parse_args([
+            "--project", "test-project", "--zone", "us-east1-b", "--commit", "a" * 40,
+            "--network", "walbench-isolated", "--subnet", "walbench-subnet",
+            "--ssh-source-range", "192.0.2.10/32",
+            "--max-runtime-minutes", "60", "--estimated-hourly-cost-usd", "1.5",
+            "--max-estimated-spend-usd", "2",
+            "--v8-point-progress-ring-ab", "--preflight-only",
+        ])
+        self.assertEqual(args.writers, POINT_PROGRESS_RING_WRITERS)
+        self.assertEqual(args.num, POINT_PROGRESS_RING_NUM)
+        self.assertEqual(args.machine_type, "c4-standard-16-lssd")
+        with self.assertRaises(SystemExit):
+            BENCH.parse_args([
+                "--project", "test-project", "--zone", "us-east1-b", "--commit", "a" * 40,
+                "--writers", "16", "--v8-point-progress-ring-ab", "--preflight-only",
+            ])
+
+    def test_progress_ring_requires_isolated_network_subnet_and_ssh_cidr(self) -> None:
+        base = [
+            "--project", "test-project", "--zone", "us-east1-b", "--commit", "a" * 40,
+            "--max-runtime-minutes", "60", "--estimated-hourly-cost-usd", "1.5",
+            "--max-estimated-spend-usd", "2",
+            "--v8-point-progress-ring-ab", "--preflight-only",
+        ]
+        invalid_arguments = (
+            base,
+            [*base, "--network", "default", "--subnet", "default", "--ssh-source-range", "192.0.2.10/32"],
+            [*base, "--network", "walbench-isolated", "--ssh-source-range", "192.0.2.10/32"],
+            [*base, "--network", "walbench-isolated", "--subnet", "walbench-subnet"],
+        )
+        for arguments in invalid_arguments:
+            with self.subTest(arguments=arguments), self.assertRaises(SystemExit):
+                BENCH.parse_args(arguments)
+
+    def test_progress_ring_preflight_audits_isolated_ingress(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            results = Path(temporary) / "preflight"
+            with (
+                patch.object(BENCH, "Gcloud", return_value=Mock()),
+                patch.object(BENCH, "preflight", return_value={"zone": "us-east1-b"}),
+                patch.object(BENCH, "audit_ssh_firewall_rules") as audit,
+            ):
+                status = BENCH.main([
+                    "--project", "test-project", "--zone", "us-east1-b", "--commit", "a" * 40,
+                    "--network", "walbench-isolated", "--subnet", "walbench-subnet",
+                    "--ssh-source-range", "192.0.2.10/32", "--skip-ssh-egress-check",
+                    "--max-runtime-minutes", "60", "--estimated-hourly-cost-usd", "1.5",
+                    "--max-estimated-spend-usd", "2", "--v8-point-progress-ring-ab",
+                    "--preflight-only", "--results-dir", str(results),
+                ])
+            self.assertEqual(status, 0)
+            audit.assert_called_once_with(
+                unittest.mock.ANY,
+                "test-project",
+                "walbench-isolated",
+                "us-east1",
+                BENCH.POINT_PROGRESS_RING_VM_TAG,
+                "192.0.2.10/32",
+            )
+
+    def test_archive_round_trip_verifies_all_40_raw_runs_and_summaries(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            results = self._make_fixture(root)
+            temp_root = root / "archive-tmp"
+            temp_root.mkdir()
+            command = BENCH._build_remote_archive_command(root=str(results), max_bytes=64 * 1024 * 1024)
+            completed = subprocess.run(
+                ["bash", "-euc", command], capture_output=True, text=True, check=False,
+                env={**os.environ, "TMPDIR": str(temp_root)},
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            archive_values = self._archive_output(completed.stdout)
+            archive = Path(archive_values["ARCHIVE_PATH"])
+            archive_copy = root / "bundle.tar.gz"
+            shutil.copyfile(archive, archive_copy)
+            self.assertEqual(self._sha256(archive_copy), archive_values["ARCHIVE_SHA256"])
+            extracted = root / "extracted"
+            extracted.mkdir()
+            with tarfile.open(archive_copy, "r:gz") as bundle:
+                bundle.extractall(extracted)
+            unpacked = extracted / "results"
+            self.assertTrue((unpacked / "point-progress-ring-schedule.tsv").is_file())
+            self.assertEqual(progress_ring_runner.verify_results_directory(unpacked)["verified"], True)
+
+    def test_verifier_rejects_missing_extra_bad_samples_and_scores_not_matching_raw(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            results = self._make_fixture(root)
+            self.assertTrue(progress_ring_runner.verify_results_directory(results)["verified"])
+
+            first = build_point_progress_ring_schedule(POINT_PROGRESS_RING_WRITERS)[0]
+            run_id = progress_ring_runner._run_id(first)
+            (results / run_id / "run-metadata.json").unlink()
+            rejected = progress_ring_runner.verify_results_directory(results)
+            self.assertFalse(rejected["verified"])
+            # Each independent corruption case starts with a fresh fixture.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            results = self._make_fixture(root)
+            extra = results / "r99-w16-extra"
+            extra.mkdir()
+            self.assertFalse(progress_ring_runner.verify_results_directory(results)["verified"])
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            results = self._make_fixture(root)
+            point = next(row for row in build_point_progress_ring_schedule(POINT_PROGRESS_RING_WRITERS)
+                         if row["workload"] == "point")
+            raw_path = results / progress_ring_runner._run_id(point) / "result.json"
+            raw = json.loads(raw_path.read_text(encoding="utf-8"))
+            raw["result"]["wal_pipeline"]["worker_group_sizes"] = {"one_ticket": 1}
+            raw_path.write_text(json.dumps(raw), encoding="utf-8")
+            self.assertFalse(progress_ring_runner.verify_results_directory(results)["verified"])
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            results = self._make_fixture(root)
+            point = next(row for row in build_point_progress_ring_schedule(POINT_PROGRESS_RING_WRITERS)
+                         if row["workload"] == "point")
+            raw_path = results / progress_ring_runner._run_id(point) / "result.json"
+            raw = json.loads(raw_path.read_text(encoding="utf-8"))
+            raw["latency"]["samples"] -= 1
+            raw_path.write_text(json.dumps(raw), encoding="utf-8")
+            self.assertFalse(progress_ring_runner.verify_results_directory(results)["verified"])
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            results = self._make_fixture(root)
+            schedule = build_point_progress_ring_schedule(POINT_PROGRESS_RING_WRITERS)
+            rows = json.loads((results / "summary.json").read_text(encoding="utf-8"))["results"]
+            first = rows[0]
+            run_id = progress_ring_runner._run_id(first)
+            first["puts_per_second"] *= 2
+            (results / run_id / "run-metadata.json").write_text(json.dumps(first), encoding="utf-8")
+            summary = json.loads((results / "summary.json").read_text(encoding="utf-8"))
+            summary["results"] = rows
+            recomputed = progress_ring_runner._summary(rows, POINT_PROGRESS_RING_WRITERS, len(schedule))
+            summary.update({key: recomputed[key] for key in (
+                "complete", "runs_started", "runs_completed", "runs_planned", "writers", "workloads",
+                "arms", "matrix_validation", "comparison", "comparison_by_cell", "qualification_gates",
+            )})
+            (results / "summary.json").write_text(json.dumps(summary), encoding="utf-8")
+            summary_tsv = results / "summary.tsv"
+            with summary_tsv.open(encoding="utf-8", newline="") as stream:
+                tsv_rows = list(csv.DictReader(stream, delimiter="\t"))
+                fieldnames = tuple(tsv_rows[0])
+            tsv_row = next(row for row in tsv_rows if row["run_index"] == str(first["run_index"]))
+            tsv_row["puts_per_second"] = str(first["puts_per_second"])
+            with summary_tsv.open("w", encoding="utf-8", newline="") as stream:
+                writer = csv.DictWriter(stream, fieldnames=fieldnames, delimiter="\t", lineterminator="\n")
+                writer.writeheader()
+                writer.writerows(tsv_rows)
+            self.assertFalse(progress_ring_runner.verify_results_directory(results)["verified"])
+
+    @staticmethod
+    def _archive_output(output: str) -> dict[str, str]:
+        return dict(line.split("=", 1) for line in output.splitlines() if "=" in line)
+
+    @staticmethod
+    def _sha256(path: Path) -> str:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 class GcpFreeTrialWalBenchTests(unittest.TestCase):

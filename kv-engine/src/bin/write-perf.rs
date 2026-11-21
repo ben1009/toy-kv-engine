@@ -1180,6 +1180,8 @@ struct WalPipelineRecord {
     commit_buffers: u64,
     commit_bytes: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
+    worker_group_sizes: Option<WalWorkerGroupSizesRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     v8_data_submit_order: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     v8_point_direct_frame_enabled: Option<bool>,
@@ -1235,6 +1237,15 @@ struct WalPipelineRecord {
     wal_io_end: Option<WalIoDiagnosticsRecord>,
     #[serde(skip_serializing_if = "Option::is_none")]
     wal_io_stable: Option<bool>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+struct WalWorkerGroupSizesRecord {
+    one_ticket: u64,
+    two_tickets: u64,
+    three_to_four_tickets: u64,
+    five_to_eight_tickets: u64,
+    nine_or_more_tickets: u64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
@@ -2241,6 +2252,16 @@ fn wal_pipeline_record(
         commit_solo_groups: profile.wal_commit_solo_groups,
         commit_buffers: profile.wal_commit_buffers,
         commit_bytes: profile.wal_commit_bytes,
+        worker_group_sizes: (wal_run_info.format_version == 8
+            && wal_run_info.io_mode == "parallel"
+            && profile.wal_worker_group_size_histogram_enabled)
+            .then(|| WalWorkerGroupSizesRecord {
+                one_ticket: profile.wal_worker_group_size_one_ticket,
+                two_tickets: profile.wal_worker_group_size_two_tickets,
+                three_to_four_tickets: profile.wal_worker_group_size_three_to_four_tickets,
+                five_to_eight_tickets: profile.wal_worker_group_size_five_to_eight_tickets,
+                nine_or_more_tickets: profile.wal_worker_group_size_nine_or_more_tickets,
+            }),
         v8_data_submit_order: (wal_run_info.format_version == 8
             && wal_run_info.io_mode == "parallel")
             .then(

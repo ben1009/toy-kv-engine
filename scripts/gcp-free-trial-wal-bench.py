@@ -44,6 +44,8 @@ from gcp_wal_matrix import (
     POINT_BORROWED_INPUT_WRITERS,
     POINT_DIRECT_FRAME_NUM,
     POINT_DIRECT_FRAME_WRITERS,
+    POINT_PROGRESS_RING_NUM,
+    POINT_PROGRESS_RING_WRITERS,
     V8_EXTENT_POLICY_STORAGE_NUM,
     V8_EXTENT_POLICY_STORAGE_WRITERS,
     V8_MUTEX_DIAGNOSTIC_NUM,
@@ -62,6 +64,7 @@ from gcp_wal_matrix import (
     build_point_borrowed_input_schedule,
     build_point_direct_frame_plan,
     build_point_direct_frame_schedule,
+    build_point_progress_ring_plan,
     build_v8_extent_policy_storage_plan,
     build_v8_extent_policy_storage_schedule,
     build_v8_mutex_diagnostic_plan,
@@ -73,12 +76,14 @@ from gcp_wal_matrix import (
     validate_point_lookahead_rows,
     validate_point_borrowed_input_rows,
     validate_point_direct_frame_rows,
+    validate_point_progress_ring_rows,
     validate_v8_extent_policy_storage_rows,
     validate_v8_mutex_diagnostic_rows,
     validate_v8_point_cpu_attribution_rows,
     validate_writer_counts,
 )
 from gcp_commit_order_trace_runner import analyze_trace
+from gcp_v8_point_progress_ring_runner import verify_results_directory as verify_progress_ring_results
 MACHINE_TYPE = "c4-standard-8-lssd"
 MACHINE_SPECS = {
     "c4-standard-8-lssd": {"vcpus": 8, "ssd_count": 1, "ssd_gb": 375, "ssd_gib": 375},
@@ -94,6 +99,8 @@ V8_MUTEX_DIAGNOSTIC_RUNNER = Path(__file__).with_name("gcp_v8_mutex_diagnostic_r
 V8_POINT_CPU_ATTRIBUTION_RUNNER = Path(__file__).with_name("gcp_v8_point_cpu_attribution_runner.py")
 POINT_BORROWED_INPUT_RUNNER = Path(__file__).with_name("gcp_v8_point_borrowed_input_runner.py")
 POINT_DIRECT_FRAME_RUNNER = Path(__file__).with_name("gcp_v8_point_direct_frame_runner.py")
+POINT_PROGRESS_RING_RUNNER = Path(__file__).with_name("gcp_v8_point_progress_ring_runner.py")
+POINT_PROGRESS_RING_VM_TAG = "walbench-point-progress-ring"
 V8_EXTENT_POLICY_STORAGE_RUNNER = Path(__file__).with_name("gcp_v8_extent_policy_storage_runner.py")
 REPO_URL = "https://github.com/ben1009/toy-kv-engine.git"
 MAX_RUNTIME_MINUTES = 180
@@ -121,6 +128,7 @@ root_names = {
     "v8-point-cpu-attribution-schedule.tsv",
     "point-borrowed-input-schedule.tsv",
     "point-direct-frame-schedule.tsv",
+    "point-progress-ring-schedule.tsv",
     "extent-policy-storage-schedule.tsv",
     "commit-order-trace-analysis.json", "commit.txt", "remote-exit.json",
     "finished_utc.txt", "remote-finished-utc.txt", "remote-status.txt", "host.txt",
@@ -1144,13 +1152,15 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                              help="Compare V8 Point owned vs borrowed preparation with Batch16/64 guardrails")
     suite_group.add_argument("--v8-point-direct-frame-ab", action="store_true",
                              help="Compare V8 Point direct-frame encoding with the existing path and Batch guardrails")
+    suite_group.add_argument("--v8-point-progress-ring-ab", action="store_true",
+                             help="Qualify V8 Point progress-ring waits with same-binary Point/Batch guardrails")
     suite_group.add_argument("--v8-extent-policy-storage-ab", action="store_true",
                              help="Compare V8 BTreeMap and Vec extent-policy storage with Point/Batch guardrails")
     parser.add_argument("--baseline-commit", help="Full source commit used as the borrowed-input A/B baseline")
     parser.add_argument("--source-patch-sha256",
                         help="SHA-256 of the exact source patch used for a commit-order trace run")
-    parser.add_argument("--network", help="Existing VPC to use (default: default)")
-    parser.add_argument("--subnet", help="Subnetwork name for custom-mode VPCs (must be in the requested region)")
+    parser.add_argument("--network", help="VPC network (legacy suites default to default; progress-ring requires isolated VPC)")
+    parser.add_argument("--subnet", help="Subnetwork name in the requested region")
     parser.add_argument(
         "--ssh-source-range",
         help=(
@@ -1178,6 +1188,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Use a manually verified SSH source CIDR when the HTTPS lookup cannot verify that route",
     )
     args = parser.parse_args(argv)
+    explicit_network = args.network is not None
     if args.repetitions <= 0:
         parser.error("--repetitions must be a positive integer")
     if args.repetitions != 1 and not args.v8_point_cpu_attribution:
@@ -1187,8 +1198,19 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         args.ssh_source_range = resolve_ssh_source_range(args.ssh_source_range)
     except BenchError as error:
         parser.error(str(error))
+    if args.v8_point_progress_ring_ab:
+        network_name = (args.network or "").rstrip("/").rsplit("/", 1)[-1].lower()
+        if not explicit_network or not network_name:
+            parser.error("--v8-point-progress-ring-ab requires an explicit isolated --network")
+        if network_name == "default":
+            parser.error("--v8-point-progress-ring-ab cannot use the default VPC")
+        if not args.subnet:
+            parser.error("--v8-point-progress-ring-ab requires an explicit isolated --subnet")
+        if not args.ssh_source_range:
+            parser.error("--v8-point-progress-ring-ab requires --ssh-source-range, including for preflight")
     if args.num is None:
         args.num = (
+            POINT_PROGRESS_RING_NUM if args.v8_point_progress_ring_ab else
             POINT_DIRECT_FRAME_NUM if args.v8_point_direct_frame_ab else
             V8_EXTENT_POLICY_STORAGE_NUM if args.v8_extent_policy_storage_ab else
             POINT_BORROWED_INPUT_NUM if args.v8_point_borrowed_input_ab else
@@ -1202,6 +1224,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             or args.v8_point_cpu_attribution
             or args.v8_point_borrowed_input_ab or args.v8_point_direct_frame_ab
             or args.v8_extent_policy_storage_ab
+            or args.v8_point_progress_ring_ab
         ) else MACHINE_TYPE
     args.network = args.network or "default"
     if args.writers is None:
@@ -1219,6 +1242,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             args.writers = POINT_DIRECT_FRAME_WRITERS
         elif args.v8_extent_policy_storage_ab:
             args.writers = V8_EXTENT_POLICY_STORAGE_WRITERS
+        elif args.v8_point_progress_ring_ab:
+            args.writers = POINT_PROGRESS_RING_WRITERS
         elif args.v8_small_ticket_profile:
             args.writers = (1, 8, 16)
         else:
@@ -1253,6 +1278,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error(f"--v8-extent-policy-storage-ab requires writers {V8_EXTENT_POLICY_STORAGE_WRITERS}")
     if args.v8_extent_policy_storage_ab and args.machine_type != "c4-standard-16-lssd":
         parser.error("--v8-extent-policy-storage-ab requires c4-standard-16-lssd")
+    if args.v8_point_progress_ring_ab and args.writers != POINT_PROGRESS_RING_WRITERS:
+        parser.error(f"--v8-point-progress-ring-ab requires writers {POINT_PROGRESS_RING_WRITERS}")
+    if args.v8_point_progress_ring_ab and args.machine_type != "c4-standard-16-lssd":
+        parser.error("--v8-point-progress-ring-ab requires c4-standard-16-lssd")
     if not re.fullmatch(r"[0-9a-fA-F]{40}", args.commit):
         parser.error("--commit must be a full 40-character SHA")
     if args.num < 64:
@@ -1265,6 +1294,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error(f"--v8-point-direct-frame-ab uses a fixed {POINT_DIRECT_FRAME_NUM}-put workload")
     if args.v8_extent_policy_storage_ab and args.num != V8_EXTENT_POLICY_STORAGE_NUM:
         parser.error(f"--v8-extent-policy-storage-ab uses a fixed {V8_EXTENT_POLICY_STORAGE_NUM}-put workload")
+    if args.v8_point_progress_ring_ab and args.num != POINT_PROGRESS_RING_NUM:
+        parser.error(f"--v8-point-progress-ring-ab uses a fixed {POINT_PROGRESS_RING_NUM}-put workload")
     if args.v8_mutex_diagnostic and args.num != V8_MUTEX_DIAGNOSTIC_NUM:
         parser.error(f"--v8-mutex-diagnostic uses a fixed {V8_MUTEX_DIAGNOSTIC_NUM}-put workload")
     if args.v8_point_cpu_attribution and args.num != V8_POINT_CPU_ATTRIBUTION_NUM:
@@ -1303,6 +1334,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                 f"estimated maximum spend ${estimated_spend:.2f} exceeds "
                 f"--max-estimated-spend-usd ${args.max_estimated_spend_usd:.2f}"
             )
+    if args.v8_point_progress_ring_ab:
+        if args.max_runtime_minutes != 60:
+            parser.error("--v8-point-progress-ring-ab requires --max-runtime-minutes 60")
+        if args.max_estimated_spend_usd is None:
+            parser.error("--v8-point-progress-ring-ab requires cost guard arguments, including for preflight")
+        if args.max_estimated_spend_usd > 2:
+            parser.error("--v8-point-progress-ring-ab cannot exceed the authorized $2 estimated-spend ceiling")
     if not args.preflight_only:
         if not args.confirm_free_trial:
             parser.error("VM creation requires --confirm-free-trial after manually checking Billing Overview")
@@ -1390,6 +1428,8 @@ def gcloud_base(project: str, zone: str) -> list[str]:
 
 
 def _run_identifier(row: dict[str, Any], suite: str) -> str:
+    if suite == "v8-point-progress-ring":
+        return f"r{row['repetition']}-w{row['writer']}-{row['workload']}-{row['arm']}"
     if suite == "v8-small-ticket-profile":
         return f"w{row['writer']}-{row['workload']}-{row['arm']}"
     if suite == "rfc026-full":
@@ -1412,6 +1452,8 @@ def _run_identifier(row: dict[str, Any], suite: str) -> str:
 
 
 def _summary_row_identifier(row: dict[str, Any], suite: str) -> str:
+    if suite == "v8-point-progress-ring":
+        return f"r{int(row['repetition'])}-w{int(row['writer'])}-{row['workload']}-{row['arm']}"
     if suite == "v8-small-ticket-profile":
         return f"w{int(row['writer'])}-{row['workload']}-{row['arm']}"
     if suite == "rfc026-full":
@@ -1438,6 +1480,15 @@ def _summary_row_identifier(row: dict[str, Any], suite: str) -> str:
 
 
 def _expected_run_metadata(row: dict[str, Any], suite: str) -> dict[str, Any]:
+    if suite == "v8-point-progress-ring":
+        return {
+            key: row[key] for key in (
+                "run_index", "writer", "workload", "repetition", "arm", "bench",
+                "batch_entries", "batch_size", "num", "sample_every", "extent_mode",
+                "extent_window_bytes", "frontier_mode", "scan_diagnostics_enabled",
+                "progress_ring_enabled",
+            )
+        }
     if suite == "v8-small-ticket-profile":
         return {key: row[key] for key in ("writer", "workload", "arm", "perf_capture")}
     if suite == "rfc026-full":
@@ -1508,6 +1559,8 @@ def _verify_result_set(results: Path) -> dict[str, Any]:
         if not isinstance(summary, dict) or not isinstance(remote_exit, dict):
             raise ValueError("summary and remote exit metadata must be JSON objects")
         suite = summary.get("suite")
+        if suite == "v8-point-progress-ring":
+            return verify_progress_ring_results(results)
         if suite == "v8-small-ticket-profile":
             with (results / "profile-schedule.tsv").open(encoding="utf-8", newline="") as stream:
                 schedule_rows = list(csv.DictReader(stream, delimiter="\t"))
@@ -2711,6 +2764,7 @@ def provision_and_run(
     cpu_attribution_suite = getattr(args, "v8_point_cpu_attribution", False)
     point_borrowed_input_suite = getattr(args, "v8_point_borrowed_input_ab", False)
     point_direct_frame_suite = getattr(args, "v8_point_direct_frame_ab", False)
+    point_progress_ring_suite = getattr(args, "v8_point_progress_ring_ab", False)
     extent_policy_storage_suite = getattr(args, "v8_extent_policy_storage_ab", False)
     missing_tools = [tool for tool in ("ssh", "ssh-keygen") if not shutil.which(tool)]
     if missing_tools:
@@ -2725,13 +2779,14 @@ def provision_and_run(
     suffix = uuid.uuid4().hex[:8]
     stamp = datetime.now(timezone.utc).strftime("%y%m%d-%H%M%S")
     instance = f"walbench-{stamp}-{suffix}"
-    tag = f"walbench-{suffix}"
+    tag = POINT_PROGRESS_RING_VM_TAG if point_progress_ring_suite else f"walbench-{suffix}"
     firewall = f"walbench-ssh-{suffix}"
     key_log = results_dir / "ssh.log"
     ssh_log = results_dir / "remote-session.log"
     lifecycle = {"project": args.project, "zone": args.zone,
                  "instance": instance, "firewall": firewall, "created": False, "firewall_created": False,
                  "network": args.network, "subnet": args.subnet,
+                 "network_tag": tag,
                  "benchmark_attempted": False, "benchmark_started": False,
                  "remote_execution_uncertain": False, "collected": False,
                  "summary_complete": False, "results_verified": False,
@@ -3001,6 +3056,15 @@ def provision_and_run(
                 append_local_log(key_log, direct_copy.stdout + direct_copy.stderr)
                 if direct_copy.returncode:
                     raise BenchError(f"Could not copy direct-frame helper: {direct_copy.stderr.strip()}")
+            if point_progress_ring_suite:
+                if not POINT_PROGRESS_RING_RUNNER.is_file():
+                    raise BenchError(f"Progress-ring helper is missing: {POINT_PROGRESS_RING_RUNNER}")
+                progress_ring_copy = upload_to_vm(
+                    POINT_PROGRESS_RING_RUNNER, "/tmp/gcp-v8-point-progress-ring-runner.py"
+                )
+                append_local_log(key_log, progress_ring_copy.stdout + progress_ring_copy.stderr)
+                if progress_ring_copy.returncode:
+                    raise BenchError(f"Could not copy progress-ring helper: {progress_ring_copy.stderr.strip()}")
             if extent_policy_storage_suite:
                 if not V8_EXTENT_POLICY_STORAGE_RUNNER.is_file():
                     raise BenchError(f"Extent-policy storage runner is missing: {V8_EXTENT_POLICY_STORAGE_RUNNER}")
@@ -3012,26 +3076,29 @@ def provision_and_run(
                     raise BenchError(f"Could not copy extent-policy storage helper: {storage_copy.stderr.strip()}")
 
             safe_deadline_epoch = int(deadline_epoch - 600)
+            if profile_suite:
+                remote_suite = "v8-small-ticket-profile"
+            elif trace_suite:
+                remote_suite = "commit-order-trace"
+            elif extent_policy_storage_suite:
+                remote_suite = "v8-extent-policy-storage"
+            elif point_progress_ring_suite:
+                remote_suite = "v8-point-progress-ring"
+            elif point_direct_frame_suite:
+                remote_suite = "v8-point-direct-frame"
+            elif point_borrowed_input_suite:
+                remote_suite = "v8-point-borrowed-input"
+            elif mutex_diagnostic_suite:
+                remote_suite = "v8-mutex-diagnostic"
+            elif cpu_attribution_suite:
+                remote_suite = "v8-point-cpu-attribution"
+            elif point_lookahead_suite:
+                remote_suite = "v8-point-lookahead"
+            else:
+                remote_suite = "rfc026-full" if args.full_rfc026_matrix else "batch64"
             remote_command = "sudo -n bash /tmp/run-wal-bench.sh " + shlex.join([
                 args.commit.lower(), str(args.num), args.project, args.zone, instance, str(safe_deadline_epoch),
-                args.machine_type, ",".join(str(writer) for writer in args.writers),
-                "v8-small-ticket-profile" if profile_suite else (
-                    "commit-order-trace" if trace_suite else (
-                        "v8-extent-policy-storage" if extent_policy_storage_suite else (
-                        "v8-point-direct-frame" if point_direct_frame_suite else (
-                            "v8-point-borrowed-input" if point_borrowed_input_suite else (
-                            "v8-mutex-diagnostic" if mutex_diagnostic_suite else (
-                                "v8-point-cpu-attribution" if cpu_attribution_suite else (
-                                "v8-point-lookahead" if point_lookahead_suite else (
-                                    "rfc026-full" if args.full_rfc026_matrix else "batch64"
-                                )
-                                )
-                            )
-                            )
-                            )
-                        )
-                    )
-                ),
+                args.machine_type, ",".join(str(writer) for writer in args.writers), remote_suite,
                 args.source_patch_sha256 or "-",
                 getattr(args, "baseline_commit", "").lower() if getattr(args, "baseline_commit", None) else "-",
                 str(getattr(args, "repetitions", 1)),
@@ -3187,6 +3254,23 @@ def main(argv: list[str] | None = None) -> int:
         report = preflight(
             gcloud, args.project, args.zone, args.network, args.subnet, args.machine_type,
         )
+        if args.v8_point_progress_ring_ab:
+            region = zone_region(args.zone)
+            audit_ssh_firewall_rules(
+                gcloud,
+                args.project,
+                args.network,
+                region,
+                POINT_PROGRESS_RING_VM_TAG,
+                args.ssh_source_range,
+            )
+            report["isolated_network_audit"] = {
+                "network": args.network,
+                "subnet": args.subnet,
+                "vm_tag": POINT_PROGRESS_RING_VM_TAG,
+                "ssh_source_range": args.ssh_source_range,
+                "effective_ingress_audited": True,
+            }
         report["benchmark_commit"] = args.commit.lower()
         report["writer_counts"] = list(args.writers)
         if args.v8_small_ticket_profile:
@@ -3247,6 +3331,14 @@ def main(argv: list[str] | None = None) -> int:
         elif args.v8_point_direct_frame_ab:
             report["benchmark_suite"] = "v8-point-direct-frame"
             report["benchmark_plan"] = build_point_direct_frame_plan(
+                writers=args.writers,
+                machine_type=args.machine_type,
+                machine_spec=MACHINE_SPECS[args.machine_type],
+                commit=args.commit.lower(),
+            )
+        elif args.v8_point_progress_ring_ab:
+            report["benchmark_suite"] = "v8-point-progress-ring"
+            report["benchmark_plan"] = build_point_progress_ring_plan(
                 writers=args.writers,
                 machine_type=args.machine_type,
                 machine_spec=MACHINE_SPECS[args.machine_type],
