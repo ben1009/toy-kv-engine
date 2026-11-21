@@ -2,7 +2,7 @@
 
 | Field | Value |
 | --- | --- |
-| Status | F0 design proposal. Prototype, runtime tests and A/B pending. |
+| Status | F0 prototype implemented; GCP performance gates failed and the candidate is stopped. Not promoted. |
 | Date | 2026-11-21 |
 | Scope | V8 Parallel only; Point throughput target, shared Point/Batch correctness |
 | Base | [PR #558 squash commit](https://github.com/ben1009/toy-kv-engine/commit/58c79208a760bbb9cdeb02341107eb49c2a0ae7f) |
@@ -174,14 +174,15 @@ The throughput target is +10% Point16 under the same gates. If F0 fails the loca
 
 ## 9. Implementation status
 
-The proposal specifies F0.1 as an isolated ring prototype. The integrated
-runtime experiment requires the ownership, wakeup and crash tests in Section 7.
-Section 8 defines when to advance from local testing to GCP and what constitutes
-a passing A/B.
+F0.1–F0.4 were implemented and passed their correctness review before the
+qualification run. F0.5 completed its 40-run GCP matrix, but Point8 and Point16
+failed the throughput promotion gates. The candidate is stopped and is not
+qualified for production promotion. See the
+[GCP qualification report](../docs/wal/benchmarks/rfc-027-v8-point-progress-ring-gcp-20261121.md).
 
 ## Appendix A. Historical alternatives — not part of the implementation plan
 
-This appendix consolidates the former progress-simplification RFC. F0 (Sections 3–8) is the **only active candidate**; neither A0 nor P0 is a prerequisite or fallback, and P1 requires an independently approved experiment. The [archived full analysis at commit 01c6c6e8](https://github.com/ben1009/toy-kv-engine/blob/01c6c6e87317d8e00379b5e1ca67c63fe0d52a5b/docs/wal/rfc-026-v8-point-progress-simplification.md) preserves the earlier detailed review history, not an alternative implementation specification.
+This appendix consolidates the former progress-simplification RFC. F0 (Sections 3–8) was the sole candidate and is now stopped after the failed qualification; neither A0 nor P0 is a fallback, and P1 requires an independently approved experiment. The [archived full analysis at commit 01c6c6e8](https://github.com/ben1009/toy-kv-engine/blob/01c6c6e87317d8e00379b5e1ca67c63fe0d52a5b/docs/wal/rfc-026-v8-point-progress-simplification.md) preserves the earlier detailed review history, not an alternative implementation specification.
 
 | Historical candidate | Decision and rationale |
 | --- | --- |

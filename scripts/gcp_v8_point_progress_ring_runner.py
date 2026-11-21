@@ -476,6 +476,11 @@ def verify_results_directory(results: Path) -> dict[str, Any]:
             binary_sha256=binary_sha,
         )
         for key, value in expected_plan.items():
+            # Older F0.5 archives called the ordered policy "ticket_prefix".
+            # Keep that descriptive alias readable, but still verify every
+            # run's captured environment against the actual supported value.
+            if key == "data_submit_order" and plan.get(key) == "ticket_prefix" and value == "ordered":
+                continue
             if plan.get(key) != value:
                 errors.append(f"plan field {key} differs from fixed F0.5 suite")
         if len(commit) != 40 or any(char not in "0123456789abcdef" for char in commit):

@@ -451,6 +451,29 @@ class PointProgressRingQualificationTests(unittest.TestCase):
                 "1" if enabled else "0",
             )
 
+    def test_verifier_accepts_legacy_plan_label_only_with_ordered_run_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            results = self._make_fixture(Path(temporary))
+            plan_path = results / "benchmark-plan.json"
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            plan["data_submit_order"] = "ticket_prefix"
+            plan_path.write_text(json.dumps(plan), encoding="utf-8")
+            self.assertTrue(progress_ring_runner.verify_results_directory(results)["verified"])
+
+            first = build_point_progress_ring_schedule(POINT_PROGRESS_RING_WRITERS)[0]
+            run_id = progress_ring_runner._run_id(first)
+            environment_path = results / run_id / "environment.txt"
+            environment_path.write_text(
+                environment_path.read_text(encoding="utf-8").replace(
+                    "TOYKV_BENCH_V8_DATA_SUBMIT_ORDER=ordered",
+                    "TOYKV_BENCH_V8_DATA_SUBMIT_ORDER=ready",
+                ),
+                encoding="utf-8",
+            )
+            verification = progress_ring_runner.verify_results_directory(results)
+            self.assertFalse(verification["verified"])
+            self.assertTrue(any("environment" in error for error in verification["errors"]))
+
     def test_schedule_and_cli_are_fixed_counterbalanced_and_note_local_screen_waiver(self) -> None:
         schedule = build_point_progress_ring_schedule(POINT_PROGRESS_RING_WRITERS)
         self.assertEqual(len(schedule), 40)
@@ -468,6 +491,7 @@ class PointProgressRingQualificationTests(unittest.TestCase):
             commit="a" * 40,
         )
         self.assertEqual(plan["runs_planned"], 40)
+        self.assertEqual(plan["data_submit_order"], "ordered")
         self.assertEqual(plan["local_screen"]["status"], "skipped_by_user")
         args = BENCH.parse_args([
             "--project", "test-project", "--zone", "us-east1-b", "--commit", "a" * 40,

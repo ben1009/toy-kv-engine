@@ -27,7 +27,8 @@ and do not define the current writer selection.
 - [RFC 024: Parallel WAL Implementation Plan](wal/rfc-024-parallel-wal-implementation-plan.md)
 - [RFC 025 Implementation Plan: Parallel WAL with Embedded Frontiers and One Sync](wal/rfc-025-parallel-wal-embedded-frontiers-implementation-plan.md)
 - [RFC 026 Implementation Plan: Composable WAL Prefix Digests](wal/rfc-026-implementation-plan.md)
-- [V8 Point Progress Ring proposal](../rfcs/027-v8-point-progress-ring.md)
+- [V8 Point Progress Ring (F0 stopped after GCP qualification)](../rfcs/027-v8-point-progress-ring.md)
+- [RFC 027 V8 Point Progress Ring GCP qualification, 2026-11-21](wal/benchmarks/rfc-027-v8-point-progress-ring-gcp-20261121.md)
 
 ## Benchmark reports
 

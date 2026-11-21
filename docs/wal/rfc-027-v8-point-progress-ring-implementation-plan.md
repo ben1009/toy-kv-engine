@@ -306,3 +306,16 @@ unstable; record that screen as skipped and use the cloud matrix as the performa
 evidence. Stop F0 if any promotion gate fails. Passing the gates qualifies the
 opt-in implementation for review. Changing the
 production default requires a separate decision.
+
+## F0.5 qualification outcome (2026-11-21)
+
+The local SSD screen was skipped at the user's direction. The GCP matrix
+completed and verified 40/40 planned runs. It failed the Point throughput
+promotion gate: Point8 was −5.05% (0/5 wins) and Point16 was +1.92% (4/5
+wins), versus the required +5% paired median and at least 4/5 wins for both.
+Point8/16 p99 and the Point1/Batch64 throughput guardrails passed, but every
+gate is required. Per the stop rule, F0 is stopped and is not qualified for
+promotion or production enablement. The mode remains off by default.
+
+See the [GCP qualification report](benchmarks/rfc-027-v8-point-progress-ring-gcp-20261121.md)
+for the complete score, archive verification and run provenance.

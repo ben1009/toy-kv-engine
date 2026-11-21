@@ -549,7 +549,7 @@ def build_point_progress_ring_plan(
         "point_frontier_credit_batch_enabled": False,
         "extent_policy_storage": "vec",
         "extent_policy_scan_diagnostics_enabled": False,
-        "data_submit_order": "ticket_prefix",
+        "data_submit_order": "ordered",
         "latency_sample_every": 10,
         "hash_cpu_sample_every": 64,
         "worker_group_histogram": "disabled for score runs; opt-in diagnostics only",

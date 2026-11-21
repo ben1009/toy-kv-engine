@@ -61,12 +61,14 @@ the adoption notes above define current selection. The
 [benchmark overview](benchmarks/rfc-024-parallel-wal-benchmark.md) connects
 the retained and rejected experiments.
 
-## V8 Point performance proposal
+## RFC 027 qualification result
 
-The [V8 Point Progress Ring](../../rfcs/027-v8-point-progress-ring.md) proposes moving
-producer readiness to a bounded ring and having the elected driver apply
-queued completions in batches. The plan starts with an isolated prototype,
-followed by correctness tests and paired Point and Batch64 benchmarks.
+The [V8 Point Progress Ring](../../rfcs/027-v8-point-progress-ring.md) proposed
+moving producer readiness to a bounded ring and having the elected driver apply
+queued completions in batches. Its bench-only F0 prototype failed the Point8
+and Point16 throughput gates and was stopped; it is not qualified for production.
+See the [GCP qualification report](benchmarks/rfc-027-v8-point-progress-ring-gcp-20261121.md)
+and [implementation plan](rfc-027-v8-point-progress-ring-implementation-plan.md).
 
 ## Implementation and adoption
 
@@ -259,6 +261,7 @@ experiments. Each report records its own outcome and measurement limits.
 - [Context switches and worker retirement, 2026-10-04](experiments/rfc-024-context-switch-and-worker-retirement-20261004.md)
 - [RFC 026 Point borrowed-input experiment — no stable gain, 2026-11-18](experiments/rfc-026-point-borrowed-input-gcp-20261118.md)
 - [RFC 026 V8 Point single-frame direct encoding GCP qualification — below throughput gate, 2026-11-18](experiments/rfc-026-point-direct-frame-v1-20261118.md)
+- [RFC 027 V8 Point Progress Ring GCP qualification — promotion gates failed, 2026-11-21](benchmarks/rfc-027-v8-point-progress-ring-gcp-20261121.md)
 - [RFC 026 V7/V8 Point admission and sync diagnostic — sequencer wait is real but not demonstrably saturated, 2026-11-19](experiments/rfc-026-v8-point-admission-sync-diagnostic-20261119.md)
 - [Deferred task work with native completion waiting](experiments/rfc-024-deferred-ring-wait-20261003.md)
 - [Extent preparation for large batches](experiments/rfc-024-large-batch-preallocation-20261004.md)
