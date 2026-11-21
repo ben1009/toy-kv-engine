@@ -873,6 +873,19 @@ impl WriteProfile {
     pub const MAX_COMMIT_ORDER_TRACE_RECORDS: u64 = 16_384;
 
     #[cfg(feature = "bench")]
+    pub(crate) fn validate_v8_progress_ring_compatibility(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.wal_v8_completion_timeline_sample_every() == 0,
+            "V8 completion timeline diagnostics are not supported with the progress ring"
+        );
+        anyhow::ensure!(
+            self.wal_v8_durability_sample_every() == 0,
+            "V8 durability phase diagnostics are not supported with the progress ring"
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "bench")]
     pub(crate) fn configure_commit_order_trace(&self, limit: u64) {
         self.commit_order_trace_accepting
             .store(false, std::sync::atomic::Ordering::Release);
@@ -5204,12 +5217,18 @@ impl MemTable {
 
     /// Replace the write profile with a shared instance (e.g., from LsmStorageInner).
     /// This allows profiling to accumulate across memtable freezes.
-    pub fn set_write_profile(&self, profile: Arc<WriteProfile>) {
-        self.write_profile.store(Arc::clone(&profile));
-
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the profile enables V8 diagnostics that are not
+    /// supported by the attached progress-ring writer.
+    pub fn set_write_profile(&self, profile: Arc<WriteProfile>) -> Result<()> {
         if let Some(wal) = &self.wal {
-            wal.set_write_profile(profile);
+            wal.set_write_profile(Arc::clone(&profile))?;
         }
+        self.write_profile.store(profile);
+
+        Ok(())
     }
 
     #[cfg(feature = "bench")]

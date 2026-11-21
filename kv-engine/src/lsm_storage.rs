@@ -5766,7 +5766,7 @@ impl KvEngine {
             recovered_commit_ts == 0,
             "sealed legacy migration successor unexpectedly contains committed batches"
         );
-        successor.set_write_profile(self.inner.write_profile.clone());
+        successor.set_write_profile(self.inner.write_profile.clone())?;
 
         // Lock order is segment manager, engine manifest, then Active memtable.
         let mut segments = self.pitr_segments.lock();
@@ -15320,7 +15320,7 @@ impl LsmStorageInner {
             .state
             .load()
             .memtable
-            .set_write_profile(storage.write_profile.clone());
+            .set_write_profile(storage.write_profile.clone())?;
         storage
             .mvcc
             .as_ref()
@@ -20520,7 +20520,7 @@ impl LsmStorageInner {
         } else {
             mem_table::MemTable::create(sst_id, vlog_enabled)
         };
-        mem_table.set_write_profile(self.write_profile.clone());
+        mem_table.set_write_profile(self.write_profile.clone())?;
         // Which segment the record below may name is decided by the WAL's own
         // name, not by the segment this freeze minted: a successor written to a
         // legacy-named file is recovered as a legacy WAL, and a record claiming a
@@ -20575,7 +20575,7 @@ impl LsmStorageInner {
             memtable
                 .configure_pitr_wal_limits(config.max_segment_bytes, config.max_unarchived_bytes)?;
         }
-        memtable.set_write_profile(self.write_profile.clone());
+        memtable.set_write_profile(self.write_profile.clone())?;
         let active_guard = self.active_memtable_lock.write();
         self.sync_dir()?;
         self.manifest
@@ -20855,7 +20855,7 @@ impl LsmStorageInner {
         }
         // The v7 runtime enforces the physical segment limit, and its shared
         // ledger enforces the persisted unarchived and source-spool budgets.
-        memtable.set_write_profile(self.write_profile.clone());
+        memtable.set_write_profile(self.write_profile.clone())?;
         let owner = memtable
             .wal_v7_reservation_owner()
             .ok_or_else(|| anyhow!("new v7 PITR successor has no reservation owner"))?;
@@ -21111,7 +21111,7 @@ impl LsmStorageInner {
                 ))
             },
         )?;
-        memtable.set_write_profile(self.write_profile.clone());
+        memtable.set_write_profile(self.write_profile.clone())?;
         self.sync_dir()?;
         self.manifest
             .as_ref()
@@ -21243,7 +21243,7 @@ impl LsmStorageInner {
             self.path_of_wal(sst_id),
             self.wal_io_mode,
         )?;
-        memtable.set_write_profile(self.write_profile.clone());
+        memtable.set_write_profile(self.write_profile.clone())?;
         let active_guard = self.active_memtable_lock.write();
         self.sync_dir()?;
         self.manifest
@@ -44027,7 +44027,7 @@ mod tests {
                         },
                     },
                 )?;
-                memtable.set_write_profile(engine.inner.write_profile.clone());
+                memtable.set_write_profile(engine.inner.write_profile.clone())?;
                 let state_lock = engine.inner.state_lock.lock();
                 let active_guard = engine.inner.active_memtable_lock.write();
                 engine

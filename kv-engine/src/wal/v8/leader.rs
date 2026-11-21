@@ -4750,7 +4750,14 @@ impl WalV8ParallelWriter {
     }
 
     #[cfg(feature = "bench")]
-    pub(crate) fn set_write_profile(&self, profile: Arc<crate::mem_table::WriteProfile>) {
+    pub(crate) fn set_write_profile(
+        &self,
+        profile: Arc<crate::mem_table::WriteProfile>,
+    ) -> Result<()> {
+        if self.progress_ring_enabled() {
+            profile.validate_v8_progress_ring_compatibility()?;
+        }
+
         self.io.set_profile(Arc::clone(&profile));
         self.coordinator
             .set_hol_diagnostics_profile(Arc::clone(&profile));
@@ -4759,6 +4766,8 @@ impl WalV8ParallelWriter {
                 .set_data_completion_timestamps_enabled(profile.wal_sync_diagnostics_enabled());
         }
         self.profile.store(Some(profile));
+
+        Ok(())
     }
 
     #[cfg(feature = "bench")]
@@ -7047,7 +7056,7 @@ mod tests {
         let parallel_installed = install_empty(&parallel_path, header())?;
         let parallel_profile = Arc::new(crate::mem_table::WriteProfile::default());
         let parallel = open_writer(&parallel_path, &parallel_installed)?.into_parallel()?;
-        parallel.set_write_profile(Arc::clone(&parallel_profile));
+        parallel.set_write_profile(Arc::clone(&parallel_profile))?;
         let first_batch = batch(10);
         let second_batch = batch(20);
         let first = parallel.preflight_batch(&first_batch, LIVE_WAL_V5_LIMITS)?;
@@ -7378,7 +7387,7 @@ mod tests {
 
         let writer = open_writer(&path, &installed)?.into_parallel()?;
         let profile = Arc::new(crate::mem_table::WriteProfile::default());
-        writer.set_write_profile(Arc::clone(&profile));
+        writer.set_write_profile(Arc::clone(&profile))?;
         writer.set_wal_sync_diagnostics_enabled(&profile, true)?;
 
         let next = batch(20);
@@ -7403,6 +7412,45 @@ mod tests {
             .expect_err("diagnostics re-enable after a new ticket must be rejected");
         assert!(error.to_string().contains("before the first WAL ticket"));
         assert!(!profile.wal_sync_diagnostics_enabled());
+
+        Ok(())
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn progress_ring_rejects_unsupported_diagnostics_when_profile_is_attached() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("progress-ring-profile-v8.wal");
+        let installed = install_empty(&path, header())?;
+        let writer = match open_parallel_with_progress_mode(&path, &installed, true) {
+            Ok(writer) => writer,
+            Err(error) if is_io_uring_unavailable_error(&error) => {
+                eprintln!("skipping test (io_uring unavailable): {error:#}");
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        let wal = crate::wal::Wal::from_v8_parallel(writer, &installed)?;
+
+        let timeline_profile = Arc::new(crate::mem_table::WriteProfile::default());
+        timeline_profile.set_wal_v8_completion_timeline_sample_every(1);
+        let error = wal
+            .set_write_profile(Arc::clone(&timeline_profile))
+            .expect_err("ring writer must reject a preconfigured completion timeline");
+        assert!(
+            error
+                .to_string()
+                .contains("completion timeline diagnostics")
+        );
+
+        let durability_profile = Arc::new(crate::mem_table::WriteProfile::default());
+        durability_profile.set_wal_v8_durability_sample_every(1);
+        let error = wal
+            .set_write_profile(Arc::clone(&durability_profile))
+            .expect_err("ring writer must reject preconfigured durability sampling");
+        assert!(error.to_string().contains("durability phase diagnostics"));
+
+        wal.set_write_profile(Arc::new(crate::mem_table::WriteProfile::default()))?;
 
         Ok(())
     }
@@ -8451,7 +8499,7 @@ mod tests {
         #[cfg(feature = "bench")]
         let profile = Arc::new(crate::mem_table::WriteProfile::default());
         #[cfg(feature = "bench")]
-        writer.set_write_profile(Arc::clone(&profile));
+        writer.set_write_profile(Arc::clone(&profile))?;
         let first = multi_frame_batch(10);
         let second = batch(20);
         let third = batch(30);

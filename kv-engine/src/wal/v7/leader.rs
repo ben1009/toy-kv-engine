@@ -1114,7 +1114,7 @@ mod tests {
         let wal = Wal::from_v7_leader(writer)?;
         let profile = Arc::new(crate::mem_table::WriteProfile::default());
         profile.set_wal_sync_diagnostics_enabled(true);
-        wal.set_write_profile(Arc::clone(&profile));
+        wal.set_write_profile(Arc::clone(&profile))?;
 
         let first = batch(10, 100, 4);
         assert_eq!(wal.put_v5_batch(&first, LIVE_WAL_V5_LIMITS, None)?, 0);

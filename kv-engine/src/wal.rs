@@ -1997,7 +1997,19 @@ impl Wal {
         }
     }
 
-    pub(crate) fn set_write_profile(&self, profile: Arc<crate::mem_table::WriteProfile>) {
+    pub(crate) fn set_write_profile(
+        &self,
+        profile: Arc<crate::mem_table::WriteProfile>,
+    ) -> Result<()> {
+        #[cfg(feature = "bench")]
+        if self
+            .v8_parallel
+            .as_ref()
+            .is_some_and(|writer| writer.progress_ring_enabled())
+        {
+            profile.validate_v8_progress_ring_compatibility()?;
+        }
+
         if let Some(runtime) = &self.parallel_runtime {
             runtime.set_write_profile(Arc::clone(&profile));
         }
@@ -2012,8 +2024,10 @@ impl Wal {
 
         #[cfg(feature = "bench")]
         if let Some(writer) = &self.v8_parallel {
-            writer.set_write_profile(Arc::clone(&profile));
+            writer.set_write_profile(Arc::clone(&profile))?;
         }
+
+        Ok(())
     }
 
     #[cfg(feature = "bench")]

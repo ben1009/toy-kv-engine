@@ -5739,7 +5739,7 @@ fn run_memtable_publish_workload(
     {
         memtable.set_write_profile(Arc::new(
             kv_engine_wrapper::mem_table::WriteProfile::default(),
-        ));
+        ))?;
     }
 
     let num_keys = cfg.num;
