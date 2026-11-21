@@ -4115,7 +4115,7 @@ mod tests {
     }
 
     #[test]
-    fn progress_ring_close_and_poison_wake_token_waiters() -> Result<()> {
+    fn progress_ring_close_and_poison_leave_persistent_wake_tokens() -> Result<()> {
         for poison in [false, true] {
             let coordinator = coordinator_with_progress_ring(1, 0)?;
             let receiver = coordinator
@@ -4124,6 +4124,8 @@ mod tests {
             let waiting_coordinator = coordinator.clone();
             let (ready_tx, ready_rx) = std::sync::mpsc::channel();
             let waiter = std::thread::spawn(move || {
+                // The parent may signal before this receive parks. The
+                // capacity-one token must preserve that wake until consumed.
                 ready_tx.send(()).expect("parent remains connected");
                 wait_for_progress_token(&receiver, Duration::from_secs(5))
             });

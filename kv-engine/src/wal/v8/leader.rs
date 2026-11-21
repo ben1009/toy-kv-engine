@@ -9073,9 +9073,9 @@ mod tests {
             [first_batch, second_batch, third_batch]
         );
 
-        // A segment successor gets a fresh pipeline with the same selected
-        // experiment mode; no ring or token is carried across incarnations.
-        let successor_header = WalV8Header {
+        // A separately constructed fresh segment gets a new pipeline when
+        // that mode is selected. This checks writer construction, not rotation.
+        let fresh_segment_header = WalV8Header {
             segment_id: crate::pitr::SegmentId(wal_header.segment_id.0 + 1),
             predecessor: crate::pitr::ChainAnchor::Segment(crate::pitr::SegmentAnchor {
                 segment_id: wal_header.segment_id,
@@ -9085,11 +9085,11 @@ mod tests {
             incarnation: [0x55; 16],
             ..wal_header
         };
-        let successor_path = directory.path().join("progress-ring-successor-v8.wal");
-        let successor_installed = install_empty(&successor_path, successor_header)?;
-        let successor_writer =
-            open_parallel_with_progress_mode(&successor_path, &successor_installed, true)?;
-        assert!(successor_writer.progress_ring_enabled());
+        let fresh_segment_path = directory.path().join("progress-ring-fresh-segment-v8.wal");
+        let fresh_segment_installed = install_empty(&fresh_segment_path, fresh_segment_header)?;
+        let fresh_segment_writer =
+            open_parallel_with_progress_mode(&fresh_segment_path, &fresh_segment_installed, true)?;
+        assert!(fresh_segment_writer.progress_ring_enabled());
 
         Ok(())
     }
