@@ -10182,10 +10182,10 @@ impl KvEngine {
         );
         let _active_memtable = self.inner.active_memtable_lock.read();
         self.inner
-            .write_profile
-            .set_wal_v8_completion_timeline_sample_every(sample_every.unwrap_or_default());
-
-        Ok(())
+            .state
+            .load()
+            .memtable
+            .set_wal_v8_completion_timeline_sample_every(sample_every.unwrap_or_default())
     }
 
     #[cfg(feature = "bench")]
@@ -10235,10 +10235,10 @@ impl KvEngine {
         );
         let _active_memtable = self.inner.active_memtable_lock.read();
         self.inner
-            .write_profile
-            .set_wal_v8_durability_sample_every(sample_every.unwrap_or_default());
-
-        Ok(())
+            .state
+            .load()
+            .memtable
+            .set_wal_v8_durability_sample_every(sample_every.unwrap_or_default())
     }
 
     #[cfg(feature = "bench")]

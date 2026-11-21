@@ -158,6 +158,8 @@ pub struct WalIoDiagnostics {
     pub sync: WalIoHandleMetadata,
     pub extent_preparation: Option<WalExtentPreparationDiagnostics>,
     pub sliding_extent_preparation: Option<WalV8SlidingExtentPreparationDiagnostics>,
+    /// Whether this opened V8 Parallel writer uses RFC 027's progress ring.
+    pub progress_ring_enabled: bool,
 }
 
 /// Benchmark-only V8 WAL extent preparation performed before timed writes.
@@ -2059,6 +2061,13 @@ impl Wal {
 
             Ok(())
         }
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn v8_progress_ring_enabled(&self) -> bool {
+        self.v8_parallel
+            .as_ref()
+            .is_some_and(v8::leader::WalV8ParallelWriter::progress_ring_enabled)
     }
 
     pub(crate) fn pitr_rotation_needed(&self) -> bool {

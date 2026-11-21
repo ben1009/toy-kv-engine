@@ -5237,6 +5237,40 @@ impl MemTable {
         }
     }
 
+    #[cfg(feature = "bench")]
+    pub(crate) fn set_wal_v8_completion_timeline_sample_every(&self, every: u64) -> Result<()> {
+        if every > 0
+            && let Some(wal) = &self.wal
+        {
+            anyhow::ensure!(
+                !wal.v8_progress_ring_enabled(),
+                "V8 completion timeline diagnostics are not supported with the progress ring"
+            );
+        }
+
+        self.write_profile
+            .load_full()
+            .set_wal_v8_completion_timeline_sample_every(every);
+        Ok(())
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn set_wal_v8_durability_sample_every(&self, every: u64) -> Result<()> {
+        if every > 0
+            && let Some(wal) = &self.wal
+        {
+            anyhow::ensure!(
+                !wal.v8_progress_ring_enabled(),
+                "V8 durability phase diagnostics are not supported with the progress ring"
+            );
+        }
+
+        self.write_profile
+            .load_full()
+            .set_wal_v8_durability_sample_every(every);
+        Ok(())
+    }
+
     /// Write a range tombstone into the memtable.
     ///
     /// Convenience wrapper around [`Self::put_range_tombstone_batch`] for a single entry.

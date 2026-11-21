@@ -1857,6 +1857,7 @@ struct WalIoDiagnosticsRecord {
     sync: WalIoHandleRecord,
     extent_preparation: Option<WalExtentPreparationRecord>,
     sliding_extent_preparation: Option<WalV8SlidingExtentPreparationRecord>,
+    progress_ring_enabled: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -1977,6 +1978,7 @@ impl From<WalIoDiagnostics> for WalIoDiagnosticsRecord {
             sync: diagnostics.sync.into(),
             extent_preparation: diagnostics.extent_preparation.map(Into::into),
             sliding_extent_preparation: diagnostics.sliding_extent_preparation.map(Into::into),
+            progress_ring_enabled: diagnostics.progress_ring_enabled,
         }
     }
 }
@@ -1997,6 +1999,7 @@ impl WalIoDiagnosticsRecord {
             && self.frontier == other.frontier
             && self.sync == other.sync
             && self.extent_preparation == other.extent_preparation
+            && self.progress_ring_enabled == other.progress_ring_enabled
             && sliding_configuration_stable
     }
 }
@@ -12683,6 +12686,7 @@ mod tests {
                         },
                         extent_preparation: None,
                         sliding_extent_preparation: None,
+                        progress_ring_enabled: false,
                     }),
                     wal_io_end: cfg!(feature = "bench").then_some(WalIoDiagnosticsRecord {
                         data: WalIoHandleRecord {
@@ -12702,6 +12706,7 @@ mod tests {
                         },
                         extent_preparation: None,
                         sliding_extent_preparation: None,
+                        progress_ring_enabled: false,
                     }),
                     wal_io_stable: cfg!(feature = "bench").then_some(true),
                     ..WalPipelineRecord::default()
