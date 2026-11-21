@@ -38,6 +38,29 @@ The goal is fewer **shared coordinator mutex entries per Point**, not fewer sysc
 
 **Do not alter the V8 physical record format, fixed 4-KiB DATA/FRONTIER frame, digest algorithm, admission-before-encoding rule, physical offsets, crash recovery or ACK requirement.**
 
+### Blocking code-review findings: one authority and one wake path
+
+The merged V8 implementation's `CoordinatorState.tickets: VecDeque<TicketState>` stores `frames_ready`, `digest_ready`, `data_complete` and `prefix_digest_after`. `frontier_ready_snapshot`, `reserve_frontier_with` and `publish_durable_frontier` all validate those fields under the same Coordinator lock. **Copying status into separate atomics without changing these readers is incorrect; copying status back under that lock on every producer/Reaper publication erases the intended gain.**
+
+**Required representation decision before F0.1:** make the stable TicketSlot **the sole owner** of published raw digest, frame-ready and group-complete state. Keep only ordered prefix digest (`prefix_digest_after`), ticket assignment, reservation credit and durable-frontier ownership in `CoordinatorState`, since the elected driver advances these under its serializing mutex. Replace every `TicketState::is_frontier_ready` and prefix/snapshot/FRONTIER validation path with one common accessor that consults that immutable slot/group status plus the authoritative folded digest. Never maintain a second, independently mutable `frames_ready` or `data_complete` bit in the Coordinator.
+
+Current `mark_digest_ready_with_cpu` also **folds predecessor digests immediately in the producer thread**, before the producer frames the DATA. F0 changes this scheduling: the elected driver must perform the same ordered fold before reserving FRONTIER, including a full contiguous digest prefix that extends beyond the current DATA-ready prefix. Account for possible extra digest HOL latency and changed CPU role; the design does **not** simply eliminate hash work.
+
+**The notification change is a second implementation blocker:** both `coalesce_frontier_ready` and `wait_for_durability_change` currently park on `CoordinatorInner.durability_changed` after inspecting coordinator-locked readiness predicates. A fast-mode slot publisher cannot continue relying on those waits unchanged. Route *both* waits through one event-epoch + persistent-token protocol, keeping `durable_published` for followers and the Coordinator lock for close/poison. An atomic event epoch alone or an unguarded Condvar notify is insufficient. If preserving adaptive coalescing requires the old per-Point locked notifier, reject F0 before the benchmark.
+
+### Reaper handle handoff is not free
+
+The actual worker output is `parallel/worker.rs::GroupWriteResult { group_id, tickets, write_count, write_bytes, error }`; it **does not contain an owned CompletionGroup handle**. Today the reaper thread receives only that result and a clone of `WalV8ParallelCoordinator` (see `WalV8ParallelIo::spawn` / `reap_v8_group_result`).
+
+Before claiming that Reaper completion can bypass the Coordinator lock, the prototype must choose one concrete no-serialization lookup:
+
+- Have `submit_group_locked` install an immutable shared group descriptor for its entire ticket range in stable per-ticket slots **before** calling `client.submit_group`; the Reaper obtains that group through an Acquire-read of the bounded slot table using `result.tickets.start`, checks the full ticket interval, incarnation, buffer count and group completion generation, then Release-marks the group complete.
+- Or extend the generic worker completion protocol to carry an opaque group descriptor end-to-end, with documented impact on V7/other worker clients. Do **not** pretend that is limited to `v8/parallel.rs` and `v8/leader.rs`.
+
+A separate mutex-protected `group_id -> CompletionGroup` map on each single-Ticket result is **not an accepted F0 fast path** unless measurements show it is materially cheaper than the removed Coordinator lock. The worker assigns `group_id` on enqueue, so a pre-submission descriptor cannot validate a group ID that does not yet exist; use a validated ticket interval + segment incarnation for the attachment and check worker-issued identity at completion where available.
+
+The slot/range table must not be retired while any producer, submitted worker group or delayed result can still reference it. On duplicate, unknown, retired-generation or conflicting group results, preserve existing fail-stop behavior. Publication of one group marker remains atomic for the entire WriteGroup.
+
 ### Slot identity and lifetime
 
 On ordered admission under the existing MVCC sequencer, reserve a stable, bounded `TicketSlot` for each assigned ticket:
@@ -82,7 +105,7 @@ Check these exact interleavings deterministically: (1) DATA CQE arrives while th
 
 ### F0 wakeup integration with current writer-elected driver
 
-The existing `drive_frontier_through` calls `frontier_ready_snapshot()` and waits in `wait_for_durability_change()` when no ready prefix exists; its `coalesce_frontier_ready()` path also relies on coordinator-locked notifications. **Simply replacing producers' `signal_change/signal_durability_progress` with atomic flags would introduce a lost-wakeup risk**, since the current Condvar predicate would no longer be updated under its mutex.
+The existing `drive_frontier_through` calls `frontier_ready_snapshot()` and waits in `wait_for_durability_change()` when no ready prefix exists; its `coalesce_frontier_ready()` path also relies on coordinator-locked notifications. **Fast mode must replace both readiness wait sites, not run a parallel signal channel beside the unmodified Condvar.** **Simply replacing producers' `signal_change/signal_durability_progress` with atomic flags would introduce a lost-wakeup risk**, since the current Condvar predicate would no longer be updated under its mutex.
 
 F0 must implement *one* explicit progress notification protocol rather than a new per-event blocking lock:
 
