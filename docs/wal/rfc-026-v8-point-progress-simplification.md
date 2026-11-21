@@ -10,7 +10,7 @@
 
 ## 1. Prior optimization candidates — superseded by Fast Lane
 
-**Current direction:** The larger-impact structural design and benchmark gate are in [V8 Point Fast Lane](rfc-026-v8-point-fast-lane.md). It targets repeated Coordinator-lock ready/completion publications with safe per-ticket slots and a single ordered prefix fold; see that proposal for implementation. This document retains **A0/P0/P1 as historical or optional alternatives**, not a recommendation to implement A0 first. Moving the durability driver alone remains deferred; pre-admission resource moves have small sampled scope and substantial quota/rotation risk.
+**Current direction:** The larger-impact structural design and benchmark gate are in [V8 Point Fast Lane](rfc-026-v8-point-fast-lane.md). It now proposes a PolarDB-inspired **preallocated Ticket Progress Ring**, a bounded Reaper-to-owner completion-event queue, and a single ordered prefix advance, avoiding per-Point `Arc<TicketSlot>` allocation and a shared completion-group registry. The new RFC contains its correctness and A/B stop gates. This document retains **A0/P0/P1 as historical or optional alternatives**, not a recommendation to implement A0 first. Moving the durability driver alone remains deferred; pre-admission resource moves have small sampled scope and substantial quota/rotation risk.
 
 Previously reviewed candidates, retained for context (not an active execution order):
 
@@ -18,7 +18,7 @@ Previously reviewed candidates, retained for context (not an active execution or
 2. **P0 — Optional Point-ready fusion (low expected gain):** combine one-frame Point digest/frame readiness under one coordinator lock. This removes a transition but delays the early digest fold. Test locally before considering GCP.
 3. **P1 — Dedicated V8 durability owner (deferred design, not approved prototype):** retain the existing Completion Reaper and move writer-elected sync to a distinct durability thread only if measured evidence can tie the current election/driver handoff to Point critical-path throughput or tail latency. No such causal demonstration is established by the existing role CPU data. Section 4 preserves concurrency/lifecycle design constraints for future consideration.
 
-**Current execution gate:** Do not launch A0, P0, or P1 by default. Review and implement only the [Fast Lane F0](rfc-026-v8-point-fast-lane.md) prototype if its slot-lifetime and wakeup safety proof passes. A0 is no longer the next code task. The historical tests and fallback details below remain useful if the smaller alternatives are reconsidered.
+**Current execution gate:** Do not launch A0, P0, or P1 by default. Consider only the [Fast Lane F0 Progress Ring](rfc-026-v8-point-fast-lane.md) prototype after its single-source-of-truth, group-event queue capacity and epoch/token wakeup proofs pass; the former per-Ticket Arc/CompletionGroup design is superseded. A0 is no longer the next code task. The historical tests and fallback details below remain useful if the smaller alternatives are reconsidered.
 
 ### Reviewed design issues retained
 
