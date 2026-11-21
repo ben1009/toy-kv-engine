@@ -10171,6 +10171,7 @@ impl KvEngine {
     /// Enable benchmark-only V8 ordering head-of-line diagnostics.
     pub fn set_wal_hol_diagnostics_enabled(&self, enabled: bool) -> Result<()> {
         let _operation_guard = self.pitr_operation_lock.lock();
+        let _barrier_guard = self.pitr_barrier_lock.lock();
         let _active_memtable = self.inner.active_memtable_lock.read();
 
         self.inner
@@ -10192,6 +10193,7 @@ impl KvEngine {
             "completion timeline sample interval must be greater than zero"
         );
         let _operation_guard = self.pitr_operation_lock.lock();
+        let _barrier_guard = self.pitr_barrier_lock.lock();
         let _active_memtable = self.inner.active_memtable_lock.read();
         self.inner
             .state
@@ -10246,6 +10248,7 @@ impl KvEngine {
             "durability phase sample interval must be greater than zero"
         );
         let _operation_guard = self.pitr_operation_lock.lock();
+        let _barrier_guard = self.pitr_barrier_lock.lock();
         let _active_memtable = self.inner.active_memtable_lock.read();
         self.inner
             .state

@@ -217,6 +217,7 @@ impl WalRunInfo {
     }
 }
 
+#[cfg(any(feature = "bench", test))]
 fn effective_wal_v8_durability_sample_every(
     explicit_sample_every: Option<u64>,
     cpu_attribution_sample_every: Option<u64>,
