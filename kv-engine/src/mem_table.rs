@@ -403,7 +403,8 @@ pub struct WalSyncObservation {
     pub tickets_covered: Option<u64>,
     /// Time spent writing the V8 FRONTIER frame before fdatasync.
     pub frontier_write_ns: u64,
-    /// Time from the latest covered DATA completion to FRONTIER write start.
+    /// Time from observing the latest covered DATA completion to FRONTIER write start.
+    /// V8 Parallel observes the completion when its Reaper receives the result.
     pub data_completion_to_frontier_start_ns: Option<u64>,
     /// V8 FRONTIER coalescing budget selected when this advance was eligible.
     pub coalescing_budget_us: Option<u64>,

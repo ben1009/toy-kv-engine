@@ -2664,11 +2664,15 @@ impl WalV8ParallelIo {
                 let mut completion_timeline_enabled = None;
                 while let Ok(result) = completions.recv() {
                     #[cfg(feature = "bench")]
+                    let completion_observed_at =
+                        completion_coordinator.capture_data_completion_time();
+                    #[cfg(feature = "bench")]
                     let timeline_enabled = *completion_timeline_enabled.get_or_insert_with(|| {
                         completion_progress.completion_timeline_sample_every() > 0
                     });
                     #[cfg(feature = "bench")]
-                    let reaper_recv_at = timeline_enabled.then(Instant::now);
+                    let reaper_recv_at = timeline_enabled
+                        .then(|| completion_observed_at.unwrap_or_else(Instant::now));
                     #[cfg(feature = "bench")]
                     let mut cpu_sample = {
                         let profile = completion_progress.profile();
@@ -2695,6 +2699,7 @@ impl WalV8ParallelIo {
                                 &completion_coordinator,
                                 result,
                                 completion_event_sender_for_thread.as_ref(),
+                                completion_observed_at,
                                 timeline,
                             )
                         }
@@ -3364,6 +3369,7 @@ fn reap_v8_group_result(
     coordinator: &WalV8ParallelCoordinator,
     result: GroupWriteResult,
     completion_event_sender: Option<&Sender<WalV8CompletedGroupEvent>>,
+    #[cfg(feature = "bench")] completion_observed_at: Option<Instant>,
     #[cfg(feature = "bench")] timeline: Option<
         crate::wal::parallel_worker::WalWorkerGroupCompletionTimeline,
     >,
@@ -3376,13 +3382,18 @@ fn reap_v8_group_result(
     crate::chaos::failpoint::wal_crash_point("wal_v8.parallel.after_data_write");
 
     if let Some(sender) = completion_event_sender {
+        #[cfg(feature = "bench")]
+        ensure!(
+            timeline.is_none(),
+            "v8 progress-ring completion timeline is not supported"
+        );
         let event = WalV8CompletedGroupEvent {
             group_id: result.group_id,
             tickets: result.tickets,
             write_count: result.write_count,
             write_bytes: result.write_bytes,
             #[cfg(feature = "bench")]
-            timeline,
+            completion_observed_at,
         };
         sender.try_send(event).map_err(|error| {
             coordinator.poison();
@@ -3393,7 +3404,11 @@ fn reap_v8_group_result(
     }
 
     #[cfg(feature = "bench")]
-    let completion = coordinator.mark_data_group_complete_with_timeline(result.tickets, timeline);
+    let completion = coordinator.mark_data_group_complete_with_timeline(
+        result.tickets,
+        completion_observed_at,
+        timeline,
+    );
     #[cfg(not(feature = "bench"))]
     let completion = coordinator.mark_data_group_complete(result.tickets);
 
@@ -5082,7 +5097,8 @@ impl WalV8ParallelWriter {
             let driver_wall_started = phase_sample_candidate.map(|_| Instant::now());
             #[cfg(feature = "bench")]
             let driver_cpu_started = phase_sample_candidate.map(|_| digest::thread_cpu_time_ns());
-            let observed_generation = self.coordinator.durability_generation();
+            let eager_observed_generation =
+                (!progress_ring_enabled).then(|| self.coordinator.durability_generation());
             let mut previous = self.frontier.lock();
             #[cfg(feature = "bench")]
             let frontier_lock_wait_ns = frontier_lock_wait_started
@@ -5257,17 +5273,7 @@ impl WalV8ParallelWriter {
                         .record_wal_v8_durability_empty_driver_attempt();
                 }
                 drop(previous);
-                if progress_ring_enabled {
-                    let _ = self.io.wait_for_progress(Duration::from_secs(1))?;
-                    if self.coordinator.is_poisoned() {
-                        anyhow::bail!("v8 Parallel WAL was poisoned while waiting for durability");
-                    }
-                    if self.coordinator.is_closed()
-                        && self.coordinator.durable_ticket_end() < ticket_end
-                    {
-                        anyhow::bail!("v8 Parallel WAL closed before the ticket became durable");
-                    }
-                } else {
+                if let Some(observed_generation) = eager_observed_generation {
                     let wake = self
                         .coordinator
                         .wait_for_durability_change(observed_generation, Duration::from_secs(1));
@@ -5275,6 +5281,16 @@ impl WalV8ParallelWriter {
                         anyhow::bail!("v8 Parallel WAL was poisoned while waiting for durability");
                     }
                     if wake.closed && self.coordinator.durable_ticket_end() < ticket_end {
+                        anyhow::bail!("v8 Parallel WAL closed before the ticket became durable");
+                    }
+                } else {
+                    let _ = self.io.wait_for_progress(Duration::from_secs(1))?;
+                    if self.coordinator.is_poisoned() {
+                        anyhow::bail!("v8 Parallel WAL was poisoned while waiting for durability");
+                    }
+                    if self.coordinator.is_closed()
+                        && self.coordinator.durable_ticket_end() < ticket_end
+                    {
                         anyhow::bail!("v8 Parallel WAL closed before the ticket became durable");
                     }
                 }
