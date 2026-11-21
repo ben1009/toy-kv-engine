@@ -2522,6 +2522,29 @@ struct WalV8DataSubmitHol {
     max_successors: u64,
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum WalV8ProgressWaitTestEvent {
+    BeforeWait,
+    AfterWait(WalV8ProgressTokenWait),
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum WalV8CompletionReapTestEvent {
+    BeforeReap,
+    AfterReap,
+}
+
+#[cfg(test)]
+type WalV8ProgressWaitHook = Arc<dyn Fn(WalV8ProgressWaitTestEvent) + Send + Sync>;
+
+#[cfg(test)]
+type WalV8CompletionReapHook = Arc<dyn Fn(WalV8CompletionReapTestEvent) + Send + Sync>;
+
+#[cfg(test)]
+type WalV8SharedCompletionReapHook = Arc<Mutex<Option<WalV8CompletionReapHook>>>;
+
 fn benchmark_submits_any_ready_ticket() -> Result<bool> {
     #[cfg(feature = "bench")]
     {
@@ -2566,6 +2589,10 @@ struct WalV8ParallelIo {
     extent_preparation: Option<Arc<WalV8SlidingExtentPreparation>>,
     completion_events: Option<Receiver<WalV8CompletedGroupEvent>>,
     completion_batch: Mutex<Vec<WalV8CompletedGroupEvent>>,
+    #[cfg(test)]
+    progress_wait_hook: Mutex<Option<WalV8ProgressWaitHook>>,
+    #[cfg(test)]
+    completion_reap_hook: WalV8SharedCompletionReapHook,
     progress_tokens: Option<Receiver<()>>,
     shutdown_started: Arc<AtomicBool>,
     completion_thread: Mutex<Option<thread::JoinHandle<()>>>,
@@ -2616,6 +2643,10 @@ impl WalV8ParallelIo {
         let completion_coordinator = coordinator.clone();
         let completion_shutdown_started = Arc::clone(&shutdown_started);
         let completion_event_sender_for_thread = completion_event_sender;
+        #[cfg(test)]
+        let completion_reap_hook: WalV8SharedCompletionReapHook = Arc::new(Mutex::new(None));
+        #[cfg(test)]
+        let completion_reap_hook_for_thread = Arc::clone(&completion_reap_hook);
         let completion_thread = thread::Builder::new()
             .name("wal-v8-completion-reaper".to_owned())
             .spawn(move || {
@@ -2647,6 +2678,10 @@ impl WalV8ParallelIo {
                     let timeline = reaper_recv_at.and_then(|received_at| {
                         completion_progress.take_completion_timeline(result.group_id, received_at)
                     });
+                    #[cfg(test)]
+                    if let Some(hook) = completion_reap_hook_for_thread.lock().clone() {
+                        hook(WalV8CompletionReapTestEvent::BeforeReap);
+                    }
                     let reap_result = {
                         #[cfg(feature = "bench")]
                         {
@@ -2666,6 +2701,12 @@ impl WalV8ParallelIo {
                             )
                         }
                     };
+                    #[cfg(test)]
+                    if reap_result.is_ok()
+                        && let Some(hook) = completion_reap_hook_for_thread.lock().clone()
+                    {
+                        hook(WalV8CompletionReapTestEvent::AfterReap);
+                    }
                     #[cfg(feature = "bench")]
                     if let Some(sample) = cpu_sample.as_mut()
                         && reap_result.is_ok()
@@ -2711,6 +2752,10 @@ impl WalV8ParallelIo {
             extent_preparation,
             completion_events,
             completion_batch: Mutex::new(completion_batch),
+            #[cfg(test)]
+            progress_wait_hook: Mutex::new(None),
+            #[cfg(test)]
+            completion_reap_hook,
             progress_tokens,
             shutdown_started,
             completion_thread: Mutex::new(Some(completion_thread)),
@@ -2774,7 +2819,22 @@ impl WalV8ParallelIo {
         let Some(tokens) = &self.progress_tokens else {
             anyhow::bail!("v8 progress wait requested while the ring is disabled");
         };
-        match wait_for_progress_token(tokens, timeout) {
+        #[cfg(test)]
+        {
+            let hook = self.progress_wait_hook.lock().clone();
+            if let Some(hook) = hook {
+                hook(WalV8ProgressWaitTestEvent::BeforeWait);
+            }
+        }
+        let result = wait_for_progress_token(tokens, timeout);
+        #[cfg(test)]
+        {
+            let hook = self.progress_wait_hook.lock().clone();
+            if let Some(hook) = hook {
+                hook(WalV8ProgressWaitTestEvent::AfterWait(result));
+            }
+        }
+        match result {
             WalV8ProgressTokenWait::Signaled => Ok(true),
             WalV8ProgressTokenWait::TimedOut => Ok(false),
             WalV8ProgressTokenWait::Disconnected => {
@@ -2785,6 +2845,16 @@ impl WalV8ParallelIo {
                 Ok(false)
             }
         }
+    }
+
+    #[cfg(test)]
+    fn set_progress_wait_hook(&self, hook: WalV8ProgressWaitHook) {
+        *self.progress_wait_hook.lock() = Some(hook);
+    }
+
+    #[cfg(test)]
+    fn set_completion_reap_hook(&self, hook: WalV8CompletionReapHook) {
+        *self.completion_reap_hook.lock() = Some(hook);
     }
 
     fn ensure_extent_prepared_through(&self, required_end: u64) -> Result<()> {
@@ -8969,6 +9039,184 @@ mod tests {
             .open(path)?;
         open_writer(path, installed)?
             .into_parallel_with_worker_file_and_progress_ring(worker_file, enabled)
+    }
+
+    #[test]
+    fn progress_ring_driver_scan_to_park_observes_late_data_completion() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("progress-ring-scan-to-park-v8.wal");
+        let header = header();
+        let installed = install_empty(&path, header)?;
+        let writer = match open_parallel_with_progress_mode(&path, &installed, true) {
+            Ok(writer) => Arc::new(writer),
+            Err(error) if is_io_uring_unavailable_error(&error) => {
+                eprintln!("skipping test (io_uring unavailable): {error:#}");
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+
+        let (first_wait_entered_tx, first_wait_entered_rx) = crossbeam_channel::bounded(1);
+        let (second_wait_entered_tx, second_wait_entered_rx) = crossbeam_channel::bounded(1);
+        let (release_first_wait_tx, release_first_wait_rx) = crossbeam_channel::bounded(1);
+        let (release_second_wait_tx, release_second_wait_rx) = crossbeam_channel::bounded(1);
+        let (wait_result_tx, wait_result_rx) = crossbeam_channel::bounded(4);
+        let first_wait = Arc::new(AtomicBool::new(false));
+        let second_wait = Arc::new(AtomicBool::new(false));
+        writer.io.set_progress_wait_hook(Arc::new({
+            let first_wait = Arc::clone(&first_wait);
+            let second_wait = Arc::clone(&second_wait);
+            move |event| match event {
+                WalV8ProgressWaitTestEvent::BeforeWait
+                    if !first_wait.swap(true, Ordering::AcqRel) =>
+                {
+                    let _ = first_wait_entered_tx.send(());
+                    let _ = release_first_wait_rx.recv_timeout(Duration::from_secs(5));
+                }
+                WalV8ProgressWaitTestEvent::BeforeWait
+                    if !second_wait.swap(true, Ordering::AcqRel) =>
+                {
+                    let _ = second_wait_entered_tx.send(());
+                    let _ = release_second_wait_rx.recv_timeout(Duration::from_secs(5));
+                }
+                WalV8ProgressWaitTestEvent::AfterWait(result) => {
+                    let _ = wait_result_tx.send(result);
+                }
+                WalV8ProgressWaitTestEvent::BeforeWait => {}
+            }
+        }));
+
+        let (completion_received_tx, completion_received_rx) = crossbeam_channel::bounded(1);
+        let (completion_published_tx, completion_published_rx) = crossbeam_channel::bounded(1);
+        let (release_completion_before_tx, release_completion_before_rx) =
+            crossbeam_channel::bounded(1);
+        let (release_completion_after_tx, release_completion_after_rx) =
+            crossbeam_channel::bounded(1);
+        writer
+            .io
+            .set_completion_reap_hook(Arc::new(move |event| match event {
+                WalV8CompletionReapTestEvent::BeforeReap => {
+                    let _ = completion_received_tx.send(());
+                    let _ = release_completion_before_rx.recv_timeout(Duration::from_secs(5));
+                }
+                WalV8CompletionReapTestEvent::AfterReap => {
+                    let _ = completion_published_tx.send(());
+                    let _ = release_completion_after_rx.recv_timeout(Duration::from_secs(5));
+                }
+            }));
+
+        struct ProgressRingRaceCleanup {
+            coordinator: WalV8ParallelCoordinator,
+            releases: Vec<Option<crossbeam_channel::Sender<()>>>,
+            armed: bool,
+        }
+        impl ProgressRingRaceCleanup {
+            fn release(&mut self, index: usize) {
+                if let Some(sender) = self.releases[index].take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+        impl Drop for ProgressRingRaceCleanup {
+            fn drop(&mut self) {
+                for sender in &mut self.releases {
+                    if let Some(sender) = sender.take() {
+                        let _ = sender.send(());
+                    }
+                }
+                if self.armed {
+                    self.coordinator.poison();
+                }
+            }
+        }
+
+        let input = batch(10);
+        let prepared = writer.preflight_batch(&input, LIVE_WAL_V5_LIMITS)?;
+        let job = writer.admit_prepared_batch(prepared, input.commit_ts, input.recorded_at)?;
+        let ticket = job.assignment().segment_ticket;
+        let (driver_result_tx, driver_result_rx) = mpsc::channel();
+
+        thread::scope(|scope| -> Result<()> {
+            let mut cleanup = ProgressRingRaceCleanup {
+                coordinator: writer.coordinator.clone(),
+                releases: vec![
+                    Some(release_first_wait_tx),
+                    Some(release_second_wait_tx),
+                    Some(release_completion_before_tx),
+                    Some(release_completion_after_tx),
+                ],
+                armed: true,
+            };
+            let driver_writer = Arc::clone(&writer);
+            let driver = scope.spawn(move || {
+                let _ = driver_result_tx.send(driver_writer.advance_frontier_through(ticket));
+            });
+
+            first_wait_entered_rx
+                .recv_timeout(Duration::from_secs(5))
+                .context("durability driver did not reach its first post-scan wait")?;
+
+            // The first readiness scan has completed. Finish and submit DATA,
+            // then pause the reaper after CQE receipt but before it queues the
+            // completion event. This lets readiness wake the driver without
+            // allowing DATA-complete publication to race ahead of its next scan.
+            job.finish()?;
+            completion_received_rx
+                .recv_timeout(Duration::from_secs(5))
+                .context("completion reaper did not receive the DATA result")?;
+            cleanup.release(0);
+
+            // The driver consumed the readiness token, rescanned while the
+            // completion event queue was still empty, and is now paused before
+            // parking with the ticket still DATA-incomplete.
+            second_wait_entered_rx
+                .recv_timeout(Duration::from_secs(5))
+                .context("durability driver did not reach the DATA-incomplete wait")?;
+            cleanup.release(2);
+            completion_published_rx
+                .recv_timeout(Duration::from_secs(5))
+                .context("completion reaper did not queue and signal the DATA result")?;
+            cleanup.release(1);
+            cleanup.release(3);
+
+            let first_wait_result = wait_result_rx
+                .recv_timeout(Duration::from_secs(5))
+                .context("driver's readiness wait did not return")?;
+            let second_wait_result = wait_result_rx
+                .recv_timeout(Duration::from_secs(5))
+                .context("driver's completion wait did not return")?;
+            assert_eq!(first_wait_result, WalV8ProgressTokenWait::Signaled);
+            assert_eq!(
+                second_wait_result,
+                WalV8ProgressTokenWait::Signaled,
+                "late DATA-completion publication must wake the driver without timeout polling"
+            );
+
+            let driver_result = driver_result_rx
+                .recv_timeout(Duration::from_secs(5))
+                .context("durability driver did not observe the late completion")?;
+            driver
+                .join()
+                .map_err(|_| anyhow::anyhow!("durability driver panicked"))?;
+            driver_result?;
+            cleanup.armed = false;
+
+            assert_eq!(writer.active_boundaries()?.1.ticket_end, ticket + 1);
+            Ok(())
+        })?;
+
+        drop(writer);
+        let recovered = super::super::install::recover_and_install_active(
+            &path,
+            &[installed.active_boundary],
+            header.predecessor,
+            LIVE_WAL_V5_LIMITS,
+            MAX_WAL_FILE_SIZE,
+        )?;
+        assert_eq!(recovered.active_boundary.ticket_end, 1);
+        assert_eq!(replayed_batches(&path, &recovered)?, [input]);
+
+        Ok(())
     }
 
     #[test]
