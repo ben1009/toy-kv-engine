@@ -6,7 +6,7 @@
 | Date | 2026-11-21 |
 | Scope | V8 Parallel only; Point throughput target, shared Point/Batch correctness |
 | Base | main following merged PR #558; supersedes the per-Ticket Arc/CompletionGroup proposal in the previous draft of this RFC |
-| Parent | [RFC 026](../../rfcs/026-composable-wal-prefix-digest.md), [prior small-candidate decision record](rfc-026-v8-point-progress-simplification.md) |
+| Parent | [RFC 026](../../rfcs/026-composable-wal-prefix-digest.md), [implementation plan](rfc-026-implementation-plan.md) |
 | Target | >=10% uninstrumented Point16 gain without Point8 or p99 regression; not an expected/verified result |
 
 ## 1. Motivation and prior evidence
@@ -165,3 +165,32 @@ Only if promising, run **five counterbalanced, uninstrumented paired GCP repetit
 **Primary proposal is now PolarDB-inspired bounded Progress Ring + batched Reaper events + elected-owner Advance.** The previous per-Ticket `Arc` and shared `CompletionGroup` pointer scheme is rejected as the default implementation, because it creates per-request ownership overhead and a new Group lookup contract.
 
 This is a design-only Draft. It does not claim the PolarDB reported TPS uplift applies to V8 and it makes **no Rust runtime or production-default changes**. F0.1 isolated state-machine implementation is now specified. Runtime enablement requires the deterministic correctness tests above; no performance claim until A/B.
+
+## Appendix A. Historical alternatives — not part of the implementation plan
+
+This appendix consolidates the former progress-simplification RFC. F0 (Sections 3–8) is the **only active candidate**; neither A0 nor P0 is a prerequisite or fallback, and P1 requires an independently approved experiment. The [archived full analysis at commit 01c6c6e8](https://github.com/ben1009/toy-kv-engine/blob/01c6c6e87317d8e00379b5e1ca67c63fe0d52a5b/docs/wal/rfc-026-v8-point-progress-simplification.md) preserves the earlier detailed review history, not an alternative implementation specification.
+
+| Historical candidate | Decision and rationale |
+| --- | --- |
+| A0: move resource reservation and aligned buffer allocation before MVCC sequencer | Deferred. Sampled CPU medians ~0.90us + ~0.48us at Point16 are not an upper bound on removable wall time and do not establish a large gain. V7 has an owned pre-reservation precedent, but V8 source-spool reclamation has different safety requirements. |
+| P0: fuse digest/frame readiness in one Coordinator transaction | Superseded by F0. One fewer lock entry, but delays eager ordered digest folding; benefit unproven. |
+| P1: dedicated durability owner | Deferred. Adds a thread and per-request handoff; does not remove existing coordination work by itself. Consider only as separately reviewed F1 after F0 demonstrates value. |
+| Timed 3us DATA-group join | Rejected: ~31% fewer groups, Point16 -3.13%. |
+| O(1) deque lookup alone | Rejected and reverted: Point16 +0.21%, Point8 -0.81%. |
+| Inline completion on io_uring worker | Not selected: reduced CPU in some measurements, worsened concurrent Point tail latency. |
+
+### Safety conclusions to preserve
+
+- A0, if separately reconsidered, must keep all four quota-pressure classes (`LogicalWalLimit`, `SourceSpoolLimit`, `BufferMemoryLimit`, `SealIndexLimit`) on the original serialized fallback path. Never perform speculative `set_len`/sync ahead of ordered admission, or wait under MVCC `write_lock` for another unadmitted producer's reservation. Preserve exact reservation ownership, `mark_admitted` transition, clean pre-ticket timestamp retirement vs poisoned uncertain write, and `RotationRequired` mapping. These constraints do not authorize an A0 implementation in F0.
+- P0 does not eliminate the need for ordered digest folding, and its conditional late-digest progress wake cannot be dropped. Preserve admission before encoding, producer guard registration before DATA submit, and existing durable publication.
+- If F1 is ever separately approved, retain independently runnable Reaper and io_uring worker during fdatasync. Use a monotonic requested durable cutoff, explicit ownership and stop/join protocol, and outer poison-on-unexpected-exit guard. Do not give a background thread an Arc of a writer owning its own JoinHandle. Never hold Coordinator/submission/frontier locks while joining. No new thread is authorized by F0.
+- Preserve the existing distinction between `Wal::sync()` / public `Wal::close()` (V8 sync barriers, not admission fences), externally fenced PITR rotation/seal, and final owner teardown. A closed Coordinator is not an unconditional drain guarantee: current drive logic can abort if its target remains undurable.
+- Existing separated admission/readiness/follower notifications and published-cursor follower fast path are part of the baseline; do not undo retained changes while implementing F0.
+
+### Prior measurements and reproducibility
+
+- [Point producer critical path](benchmarks/rfc-026-v7-v8-point-producer-critical-path-gcp-20261119.md) and [admission breakdown](benchmarks/rfc-026-v8-point-admission-sequencer-gcp-20261119.md): instrumented V8 Point16 MVCC `write_lock` p50 wait ~44.5us vs V7 ~0.36us; hold ~8–10us. Wait time is not directly recoverable CPU or throughput.
+- [Per-role CPU](benchmarks/rfc-026-v7-v8-thread-role-cpu-gcp-20261120.md): Writer/packer +8.42us, completion/durability +6.79us, I/O worker +2.86us per Put; role scopes differ. [Writer stage CPU](benchmarks/rfc-026-v7-v8-writer-stage-cpu-gcp-20261120.md): frame-readiness/submission +3.39us/Put, asymmetric scopes.
+- [Timed group join](benchmarks/rfc-026-v8-point-short-group-join-gcp-20261120.md), [ticket lookup](benchmarks/rfc-026-v8-ticket-index-gcp-20261120.md), [notification separation](benchmarks/rfc-026-v8-notification-rerun-20261102.md), [inline completion](benchmarks/rfc-026-v8-worker-dispatch-20261102.md).
+
+For F0, follow Section 8, **not** the historical A0/P0 promotion threshold. Preserve the November 20 GCP profile: 16 vCPU C4, two Local SSDs ext4 RAID0, release with bench feature, Direct FRONTIER, 1 MiB Point lookahead and dynamic coalescing. Same binary and flags except F0, no scored detailed instrumentation, record executable SHA-256 and exact source/environment, exclude warm-up, sample Point latency identically (every tenth operation), report paired deltas and p50/p95/p99. Include Point1 and Batch64 throughput guards (no systematic >2% loss) and do not infer Batch64 p99 from too few samples.
