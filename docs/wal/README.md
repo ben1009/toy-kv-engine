@@ -69,6 +69,7 @@ the retained and rejected experiments.
 - [Parallel WAL Implementation Plan](rfc-024-parallel-wal-implementation-plan.md)
 - [RFC 025 Implementation Plan: Parallel WAL with Embedded Frontiers and One Sync](rfc-025-parallel-wal-embedded-frontiers-implementation-plan.md)
 - [RFC 026 Implementation Plan: Composable WAL Prefix Digests](rfc-026-implementation-plan.md)
+- [Proposed RFC 026 follow-up: V8 Point Fast Lane (structural optimization)](rfc-026-v8-point-fast-lane.md)
 - [Proposed RFC 026 follow-up: V8 Point Progress Simplification](rfc-026-v8-point-progress-simplification.md)
 - [Native async point-write integration](rfc-024-native-async-integration-20261005.md)
 - [Retire frozen parallel WAL runtimes](rfc-024-frozen-wal-retirement.md)
