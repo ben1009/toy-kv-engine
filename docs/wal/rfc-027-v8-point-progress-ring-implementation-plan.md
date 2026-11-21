@@ -1,11 +1,11 @@
 # V8 Point Progress Ring implementation plan
 
-Implement F0 from the RFC 026 follow-up, introduced in PR #559. Point16 currently runs at
+Implement F0 from RFC 027, which builds on RFC 026 and was introduced in draft form by PR #559. Point16 currently runs at
 about 41–42k puts/s on V8 versus 48–49k on V7 in paired GCP runs. F0 tests
 whether publishing readiness to individual ticket cells and applying completed
 DATA groups in batches can reduce shared Coordinator work. The Point16 target
 is +10% over V8. The promotion gates below also cover Point8, Point1 and Batch64.
-[Point Progress Ring proposal at `13fa6764`](../../rfcs/026-v8-point-fast-lane.md)
+[RFC 027: V8 Point Progress Ring](../../rfcs/027-v8-point-progress-ring.md)
 
 Use one mode for all Point and Batch tickets in a V8 Parallel writer. The
 experiment is off by default and selected at writer construction in bench
@@ -297,7 +297,7 @@ Use throughput for Batch64's promotion check.
 | Point8 and Point16 throughput | At least +5% paired median and at least four wins out of five for each workload |
 | Point8 and Point16 p99 | At most +5% paired median regression for each workload |
 | Point1 and Batch64 throughput | At least −2% paired median for each workload |
-| Correctness | All RFC Section 7 checks pass with F0 enabled |
+| Correctness | All RFC 027 Section 7 checks pass with F0 enabled |
 
 Record the result and stop F0 if the local screen or any promotion gate fails.
 Passing the gates qualifies the opt-in implementation for review. Changing the

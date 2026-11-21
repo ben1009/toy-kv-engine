@@ -1,4 +1,4 @@
-# RFC 026 Follow-up: V8 Point Progress Ring (PolarDB-Inspired Fast Lane)
+# RFC 027: V8 Point Progress Ring (PolarDB-Inspired Fast Lane)
 
 | Field | Value |
 | --- | --- |
@@ -6,7 +6,7 @@
 | Date | 2026-11-21 |
 | Scope | V8 Parallel only; Point throughput target, shared Point/Batch correctness |
 | Base | [PR #558 squash commit](https://github.com/ben1009/toy-kv-engine/commit/58c79208a760bbb9cdeb02341107eb49c2a0ae7f) |
-| Parent | [RFC 026](026-composable-wal-prefix-digest.md), [RFC 026 implementation plan](../docs/wal/rfc-026-implementation-plan.md), [Progress Ring implementation plan](../docs/wal/rfc-026-v8-point-progress-ring-implementation-plan.md) |
+| Parent | [RFC 026](026-composable-wal-prefix-digest.md), [RFC 026 implementation plan](../docs/wal/rfc-026-implementation-plan.md), [Progress Ring implementation plan](../docs/wal/rfc-027-v8-point-progress-ring-implementation-plan.md) |
 | Target | >=10% Point16 throughput gain in scored runs that meet the Section 8 promotion gates |
 
 ## 1. Motivation and prior evidence

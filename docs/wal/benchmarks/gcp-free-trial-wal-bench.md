@@ -343,7 +343,7 @@ at both `result.wal_pipeline.wal_io_start` and `result.wal_pipeline.wal_io_end`.
 Capture CPU attribution, sync diagnostics, and completion timelines in separate
 runs from the scores.
 
-The [V8 Point Progress Ring plan](../../../rfcs/026-v8-point-fast-lane.md#8-performance-gates-and-stop-rules)
+The [V8 Point Progress Ring plan](../../../rfcs/027-v8-point-progress-ring.md#8-performance-gates-and-stop-rules)
 describes the candidate's proposed Point1, Point8, Point16 and Batch64 test
 after prototype and recovery verification.
 
