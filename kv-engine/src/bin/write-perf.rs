@@ -217,6 +217,21 @@ impl WalRunInfo {
     }
 }
 
+fn effective_wal_v8_durability_sample_every(
+    explicit_sample_every: Option<u64>,
+    cpu_attribution_sample_every: Option<u64>,
+    wal_run_info: WalRunInfo,
+    progress_ring_enabled: bool,
+) -> Option<u64> {
+    explicit_sample_every.or_else(|| {
+        (wal_run_info.format_version == 8
+            && wal_run_info.io_mode == "parallel"
+            && !progress_ring_enabled)
+            .then_some(cpu_attribution_sample_every)
+            .flatten()
+    })
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "write-perf")]
 struct Args {
@@ -5218,12 +5233,14 @@ fn run_wal_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
     #[cfg(feature = "bench")]
     {
         engine.set_wal_cpu_attribution_sample_every(cfg.wal_cpu_attribution_sample_every)?;
-        engine.set_wal_v8_durability_sample_every(cfg.wal_v8_durability_sample_every.or_else(
-            || {
-                (wal_run_info.format_version == 8 && wal_run_info.io_mode == "parallel")
-                    .then_some(cfg.wal_cpu_attribution_sample_every)
-                    .flatten()
-            },
+        let progress_ring_enabled = engine
+            .benchmark_wal_io_diagnostics()
+            .is_some_and(|diagnostics| diagnostics.progress_ring_enabled);
+        engine.set_wal_v8_durability_sample_every(effective_wal_v8_durability_sample_every(
+            cfg.wal_v8_durability_sample_every,
+            cfg.wal_cpu_attribution_sample_every,
+            wal_run_info,
+            progress_ring_enabled,
         ))?;
     }
     #[cfg(all(feature = "bench", target_os = "linux"))]
@@ -5448,12 +5465,14 @@ fn run_wal_batch_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>
                 .then_some(cfg.wal_completion_timeline_sample_every.unwrap_or(128)),
         )?;
         engine.set_wal_cpu_attribution_sample_every(cfg.wal_cpu_attribution_sample_every)?;
-        engine.set_wal_v8_durability_sample_every(cfg.wal_v8_durability_sample_every.or_else(
-            || {
-                (wal_run_info.format_version == 8 && wal_run_info.io_mode == "parallel")
-                    .then_some(cfg.wal_cpu_attribution_sample_every)
-                    .flatten()
-            },
+        let progress_ring_enabled = engine
+            .benchmark_wal_io_diagnostics()
+            .is_some_and(|diagnostics| diagnostics.progress_ring_enabled);
+        engine.set_wal_v8_durability_sample_every(effective_wal_v8_durability_sample_every(
+            cfg.wal_v8_durability_sample_every,
+            cfg.wal_cpu_attribution_sample_every,
+            wal_run_info,
+            progress_ring_enabled,
         ))?;
     }
     #[cfg(feature = "bench")]
@@ -10569,6 +10588,40 @@ fn validate_v8_extent_preparation(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn progress_ring_suppresses_only_implicit_durability_sampling() {
+        let v8_parallel = WalRunInfo {
+            format_version: 8,
+            io_mode: "parallel",
+        };
+        assert_eq!(
+            effective_wal_v8_durability_sample_every(None, Some(128), v8_parallel, true),
+            None,
+            "CPU attribution alone must not implicitly request unsupported ring sampling"
+        );
+        assert_eq!(
+            effective_wal_v8_durability_sample_every(None, Some(128), v8_parallel, false),
+            Some(128)
+        );
+        assert_eq!(
+            effective_wal_v8_durability_sample_every(Some(64), Some(128), v8_parallel, true),
+            Some(64),
+            "an explicitly requested interval must still reach the unsupported-mode validator"
+        );
+        assert_eq!(
+            effective_wal_v8_durability_sample_every(
+                None,
+                Some(128),
+                WalRunInfo {
+                    format_version: 7,
+                    io_mode: "parallel",
+                },
+                false,
+            ),
+            None
+        );
+    }
 
     #[cfg(feature = "bench")]
     #[test]

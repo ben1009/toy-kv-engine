@@ -347,17 +347,23 @@ const WAL_V8_EXTENT_PREPARATION_CHUNK_BYTES: usize = 128 * 1024;
 
 #[cfg(feature = "bench")]
 fn progress_ring_enabled_from_value(value: Option<&OsStr>) -> Result<bool> {
-    match value.and_then(OsStr::to_str) {
-        None | Some("0") => Ok(false),
+    let Some(value) = value else {
+        return Ok(false);
+    };
+    match value.to_str() {
+        Some("0") => Ok(false),
         Some("1") => Ok(true),
         Some(value) => {
             anyhow::bail!("invalid {WAL_V8_POINT_PROGRESS_RING_ENV} {value:?}; expected `0` or `1`")
         }
+        None => anyhow::bail!(
+            "{WAL_V8_POINT_PROGRESS_RING_ENV} is not valid UTF-8; expected `0` or `1`"
+        ),
     }
 }
 
 #[cfg(feature = "bench")]
-fn progress_ring_enabled_from_environment() -> Result<bool> {
+pub(crate) fn progress_ring_enabled_from_environment() -> Result<bool> {
     progress_ring_enabled_from_value(std::env::var_os(WAL_V8_POINT_PROGRESS_RING_ENV).as_deref())
 }
 
@@ -3968,6 +3974,18 @@ impl WalV8LeaderWriter {
             .coordinator
             .with_progress_ring_mode(self.header, progress_ring_enabled)?;
         #[cfg(feature = "bench")]
+        let profile = self.profile.load_full();
+        #[cfg(feature = "bench")]
+        if let Some(profile) = &profile {
+            if progress_ring_enabled {
+                profile.validate_v8_progress_ring_compatibility()?;
+            }
+            self.coordinator
+                .set_hol_diagnostics_profile(Arc::clone(profile));
+            self.coordinator
+                .set_data_completion_timestamps_enabled(profile.wal_sync_diagnostics_enabled());
+        }
+        #[cfg(feature = "bench")]
         let mut io_diagnostics = self.io_diagnostics;
         #[cfg(feature = "bench")]
         let coalesce_budget_override_us = coalesce_budget_override_from_environment()?;
@@ -4140,7 +4158,7 @@ impl WalV8LeaderWriter {
             extent_preparation,
         )?;
         #[cfg(feature = "bench")]
-        if let Some(profile) = self.profile.load_full() {
+        if let Some(profile) = profile {
             io.set_profile(profile);
         }
 
@@ -6865,6 +6883,15 @@ mod tests {
         assert!(progress_ring_enabled_from_value(Some(OsStr::new("true"))).is_err());
     }
 
+    #[cfg(all(feature = "bench", unix))]
+    #[test]
+    fn progress_ring_experiment_switch_rejects_non_utf8_values() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let non_utf8 = OsStr::from_bytes(b"\xff");
+        assert!(progress_ring_enabled_from_value(Some(non_utf8)).is_err());
+    }
+
     fn header() -> WalV8Header {
         let archive_epoch_id = ArchiveEpochId([0x22; 16]);
 
@@ -7412,6 +7439,37 @@ mod tests {
             .expect_err("diagnostics re-enable after a new ticket must be rejected");
         assert!(error.to_string().contains("before the first WAL ticket"));
         assert!(!profile.wal_sync_diagnostics_enabled());
+
+        Ok(())
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn progress_ring_rejects_incompatible_profile_inherited_from_leader() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory
+            .path()
+            .join("progress-ring-inherited-profile-v8.wal");
+        let installed = install_empty(&path, header())?;
+        let leader = open_writer(&path, &installed)?;
+        let profile = Arc::new(crate::mem_table::WriteProfile::default());
+        profile.set_wal_hol_diagnostics_enabled(true);
+        leader.set_write_profile(Arc::clone(&profile));
+
+        let worker_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_DIRECT)
+            .open(&path)?;
+        let error = match leader.into_parallel_with_worker_file_and_progress_ring(worker_file, true)
+        {
+            Ok(writer) => {
+                drop(writer);
+                anyhow::bail!("parallel conversion accepted an incompatible inherited profile")
+            }
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("V8 HOL diagnostics"));
 
         Ok(())
     }

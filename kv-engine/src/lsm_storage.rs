@@ -4412,6 +4412,11 @@ impl KvEngine {
         {
             return Ok(false);
         }
+        #[cfg(feature = "bench")]
+        if self.inner.options.pitr_writer_format == crate::pitr::api::PitrWriterFormat::V8 {
+            self.inner
+                .validate_v8_progress_ring_profile_compatibility()?;
+        }
         self.inner
             .mvcc
             .as_ref()
@@ -9209,6 +9214,11 @@ impl KvEngine {
             "PITR requires WAL to be enabled"
         );
         options.validate()?;
+        #[cfg(feature = "bench")]
+        if self.inner.options.pitr_writer_format == crate::pitr::api::PitrWriterFormat::V8 {
+            self.inner
+                .validate_v8_progress_ring_profile_compatibility()?;
+        }
         let requested_config = options.persisted_config()?;
         self.assess_new_pitr_enable_capacity(&requested_config)?;
         let request = match self.prepare_pitr_enable_request(&options) {
@@ -11536,6 +11546,18 @@ impl LsmStorageInner {
     pub(crate) fn next_sst_id(&self) -> usize {
         self.next_sst_id
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[cfg(feature = "bench")]
+    fn validate_v8_progress_ring_profile_compatibility(&self) -> Result<()> {
+        if self.wal_io_mode == crate::wal::WalIoMode::Parallel
+            && crate::wal::v8::leader::progress_ring_enabled_from_environment()?
+        {
+            self.write_profile
+                .validate_v8_progress_ring_compatibility()?;
+        }
+
+        Ok(())
     }
 
     pub(crate) fn current_sst_id(&self) -> usize {
@@ -20894,6 +20916,8 @@ impl LsmStorageInner {
     ) -> Result<Arc<crate::wal::v8::resource::WalV8ReservationOwner>> {
         use crate::pitr::manifest::{ObligationState, PitrWalFormat};
 
+        #[cfg(feature = "bench")]
+        self.validate_v8_progress_ring_profile_compatibility()?;
         ensure!(self.options.enable_wal, "PITR successor requires WAL");
         self.ensure_memtable_rotation_runtime_healthy()?;
         let state = self.pitr_state.lock().clone();
@@ -20963,6 +20987,8 @@ impl LsmStorageInner {
             .checked_add(1)
             .ok_or_else(|| anyhow!("PITR segment ID exhausted"))?;
         let active_guard = self.active_memtable_lock.write();
+        #[cfg(feature = "bench")]
+        self.validate_v8_progress_ring_profile_compatibility()?;
         self.manifest
             .as_ref()
             .ok_or_else(|| anyhow!("manifest is not initialized"))?

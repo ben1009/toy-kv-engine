@@ -812,39 +812,44 @@ impl WalV8ParallelCoordinator {
     }
 
     pub(crate) fn publish_progress_digest(&self, digest: WalV8DigestReady) -> Result<bool> {
+        let mut state = self.inner.state.lock();
+        ensure!(!state.poisoned, "v8 Parallel coordinator is poisoned");
         let Some(progress_ring) = &self.inner.progress_ring else {
             anyhow::bail!("v8 per-ticket progress ring is disabled");
         };
-        match progress_ring.publish_digest(digest) {
-            Ok(changed) => {
-                if changed {
-                    self.signal_progress_token();
-                }
-                Ok(changed)
-            }
+        let changed = match progress_ring.publish_digest(digest) {
+            Ok(changed) => changed,
             Err(error) => {
-                self.poison();
-                Err(error).context("publish v8 progress ring digest")
+                poison_locked(&self.inner, &mut state);
+                return Err(error).context("publish v8 progress ring digest");
             }
+        };
+        drop(state);
+        if changed {
+            self.signal_progress_token();
         }
+        Ok(changed)
     }
 
     pub(crate) fn publish_progress_frames_ready(&self, ticket: u64) -> Result<bool> {
+        let mut state = self.inner.state.lock();
+        ensure!(!state.poisoned, "v8 Parallel coordinator is poisoned");
         let Some(progress_ring) = &self.inner.progress_ring else {
             anyhow::bail!("v8 per-ticket progress ring is disabled");
         };
-        match progress_ring.mark_frames_ready(self.inner.segment_incarnation, ticket) {
-            Ok(changed) => {
-                if changed {
-                    self.signal_progress_token();
-                }
-                Ok(changed)
-            }
+        let changed = match progress_ring.mark_frames_ready(self.inner.segment_incarnation, ticket)
+        {
+            Ok(changed) => changed,
             Err(error) => {
-                self.poison();
-                Err(error).context("publish v8 progress ring frame readiness")
+                poison_locked(&self.inner, &mut state);
+                return Err(error).context("publish v8 progress ring frame readiness");
             }
+        };
+        drop(state);
+        if changed {
+            self.signal_progress_token();
         }
+        Ok(changed)
     }
 
     pub(crate) fn is_active_durability_driver(&self, driver: &WalV8DurabilityDriver) -> bool {
@@ -3958,6 +3963,49 @@ mod tests {
             .expect("test enables progress ring");
         assert_eq!(ring.snapshot(5)?.identity.unwrap().ticket, 5);
         assert_eq!(ring.snapshot(6)?.identity.unwrap().ticket, 6);
+
+        Ok(())
+    }
+
+    #[test]
+    fn progress_ring_readiness_rejects_events_after_poison_without_mutating_ticket() -> Result<()> {
+        let coordinator = coordinator_with_progress_ring(1, 0)?;
+        let input = batch(10);
+        let encoded = admit(&input, &coordinator)?.encode()?;
+        let digest = encoded.digest_ready()?;
+        let ring = coordinator
+            .inner
+            .progress_ring
+            .as_ref()
+            .expect("test enables progress ring");
+        let before = ring.snapshot(0)?;
+
+        coordinator.poison();
+        assert!(coordinator.publish_progress_digest(digest).is_err());
+        assert!(coordinator.publish_progress_frames_ready(0).is_err());
+        assert_eq!(ring.snapshot(0)?, before);
+
+        Ok(())
+    }
+
+    #[test]
+    fn progress_ring_readiness_can_drain_admitted_ticket_after_close() -> Result<()> {
+        let coordinator = coordinator_with_progress_ring(1, 0)?;
+        let input = batch(10);
+        let encoded = admit(&input, &coordinator)?.encode()?;
+        let digest = encoded.digest_ready()?;
+
+        coordinator.close();
+        assert!(coordinator.publish_progress_digest(digest)?);
+        assert!(coordinator.publish_progress_frames_ready(0)?);
+        let payload = coordinator
+            .inner
+            .progress_ring
+            .as_ref()
+            .expect("test enables progress ring")
+            .snapshot(0)?;
+        assert_eq!(payload.digest_ready, Some(digest));
+        assert!(payload.frames_ready);
 
         Ok(())
     }
