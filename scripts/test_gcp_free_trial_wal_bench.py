@@ -442,6 +442,15 @@ class PointProgressRingQualificationTests(unittest.TestCase):
                 })
         return results
 
+    def test_environment_uses_supported_ordered_data_submit_mode(self) -> None:
+        for enabled in (False, True):
+            environment = progress_ring_runner._environment(enabled)
+            self.assertEqual(environment["TOYKV_BENCH_V8_DATA_SUBMIT_ORDER"], "ordered")
+            self.assertEqual(
+                environment["TOYKV_BENCH_V8_POINT_PROGRESS_RING"],
+                "1" if enabled else "0",
+            )
+
     def test_schedule_and_cli_are_fixed_counterbalanced_and_note_local_screen_waiver(self) -> None:
         schedule = build_point_progress_ring_schedule(POINT_PROGRESS_RING_WRITERS)
         self.assertEqual(len(schedule), 40)
