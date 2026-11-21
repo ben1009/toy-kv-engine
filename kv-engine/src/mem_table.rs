@@ -2006,12 +2006,17 @@ impl WriteProfile {
             .fetch_add(metrics.payload_hash_cpu_ns, o);
         self.wal_v8_header_batch_hash_cpu_ns
             .fetch_add(metrics.header_batch_hash_cpu_ns, o);
-        self.wal_v8_ordered_link_hash_cpu_ns
-            .fetch_add(metrics.ordered_link_hash_cpu_ns, o);
+        self.record_wal_v8_ordered_link_hash_cpu_ns(metrics.ordered_link_hash_cpu_ns);
         self.wal_v8_post_encode_hash_reread_bytes
             .fetch_add(metrics.post_encode_hash_reread_bytes, o);
         self.wal_v8_cpu_timing_sampled_tickets
             .fetch_add(metrics.cpu_timing_sampled_tickets, o);
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn record_wal_v8_ordered_link_hash_cpu_ns(&self, nanos: u64) {
+        self.wal_v8_ordered_link_hash_cpu_ns
+            .fetch_add(nanos, std::sync::atomic::Ordering::Relaxed);
     }
 
     #[cfg(feature = "bench")]

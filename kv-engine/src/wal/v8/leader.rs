@@ -2774,7 +2774,7 @@ impl WalV8ParallelIo {
         capture_monotonic_ns: bool,
     ) -> Result<WalV8FrontierReadySnapshot> {
         ensure!(
-            self.coordinator.is_active_durability_driver(driver),
+            self.coordinator.owns_durability_driver(driver),
             "v8 progress scan is not owned by the active durability driver"
         );
         let Some(receiver) = &self.completion_events else {
@@ -2819,6 +2819,29 @@ impl WalV8ParallelIo {
                 .advance_and_snapshot(driver, &batch, capture_monotonic_ns)?;
         batch.clear();
         Ok(snapshot)
+    }
+
+    fn coalesce_progress_ring(
+        &self,
+        driver: &WalV8DurabilityDriver,
+        snapshot: &mut WalV8FrontierReadySnapshot,
+        budget: Duration,
+        capture_monotonic_ns: bool,
+    ) -> Result<bool> {
+        let deadline = Instant::now() + budget;
+        let mut waited = false;
+        while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+            waited = true;
+            let signaled = self.wait_for_progress(remaining)?;
+            *snapshot = self.advance_and_snapshot(driver, capture_monotonic_ns)?;
+            if !signaled
+                || snapshot.ready_prefix.is_empty()
+                || snapshot.ready_prefix.len() >= snapshot.admitted_ticket_count
+            {
+                break;
+            }
+        }
+        Ok(waited)
     }
 
     fn wait_for_progress(&self, timeout: Duration) -> Result<bool> {
@@ -5032,10 +5055,8 @@ impl WalV8ParallelWriter {
         ticket_end: u64,
         driver: &WalV8DurabilityDriver,
     ) -> Result<()> {
+        let progress_ring_enabled = self.coordinator.progress_ring_enabled();
         loop {
-            if self.coordinator.progress_ring_enabled() {
-                let _ = self.io.advance_and_snapshot(driver, false)?;
-            }
             if self.coordinator.is_poisoned() {
                 anyhow::bail!("v8 Parallel WAL is poisoned");
             }
@@ -5084,7 +5105,7 @@ impl WalV8ParallelWriter {
             #[cfg(feature = "bench")]
             let mut coalescing_cpu_ns = 0_u64;
             #[cfg(feature = "bench")]
-            let mut snapshot = if self.coordinator.progress_ring_enabled() {
+            let mut snapshot = if progress_ring_enabled {
                 self.io.advance_and_snapshot(driver, diagnostics_enabled)?
             } else if diagnostics_enabled {
                 self.coordinator.frontier_ready_snapshot_with_monotonic_ns()
@@ -5092,7 +5113,7 @@ impl WalV8ParallelWriter {
                 self.coordinator.frontier_ready_snapshot()
             };
             #[cfg(not(feature = "bench"))]
-            let mut snapshot = if self.coordinator.progress_ring_enabled() {
+            let mut snapshot = if progress_ring_enabled {
                 self.io.advance_and_snapshot(driver, false)?
             } else {
                 self.coordinator.frontier_ready_snapshot()
@@ -5142,26 +5163,13 @@ impl WalV8ParallelWriter {
                 #[cfg(feature = "bench")]
                 let phase_cpu_started = phase_sample_id.map(|_| digest::thread_cpu_time_ns());
                 #[cfg(feature = "bench")]
-                let waited = if self.coordinator.progress_ring_enabled() {
-                    let deadline = Instant::now() + budget;
-                    let mut waited = false;
-                    while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
-                        waited = true;
-                        if !self.io.wait_for_progress(remaining)? {
-                            break;
-                        }
-                        #[cfg(feature = "bench")]
-                        let capture = diagnostics_enabled;
-                        #[cfg(not(feature = "bench"))]
-                        let capture = false;
-                        snapshot = self.io.advance_and_snapshot(driver, capture)?;
-                        if snapshot.ready_prefix.is_empty()
-                            || snapshot.ready_prefix.len() >= snapshot.admitted_ticket_count
-                        {
-                            break;
-                        }
-                    }
-                    waited
+                let waited = if progress_ring_enabled {
+                    self.io.coalesce_progress_ring(
+                        driver,
+                        &mut snapshot,
+                        budget,
+                        diagnostics_enabled,
+                    )?
                 } else if phase_sample_id.is_some() {
                     let observation = self.coordinator.coalesce_frontier_ready_sampled(budget);
                     let waited = observation.waited;
@@ -5171,7 +5179,12 @@ impl WalV8ParallelWriter {
                     self.coordinator.coalesce_frontier_ready(budget)
                 };
                 #[cfg(not(feature = "bench"))]
-                let waited = self.coordinator.coalesce_frontier_ready(budget);
+                let waited = if progress_ring_enabled {
+                    self.io
+                        .coalesce_progress_ring(driver, &mut snapshot, budget, false)?
+                } else {
+                    self.coordinator.coalesce_frontier_ready(budget)
+                };
                 #[cfg(feature = "bench")]
                 {
                     coalescing_wall_ns = phase_started
@@ -5191,22 +5204,16 @@ impl WalV8ParallelWriter {
                 #[cfg(not(feature = "bench"))]
                 let _ = waited;
                 #[cfg(feature = "bench")]
-                {
-                    snapshot = if self.coordinator.progress_ring_enabled() {
-                        self.io.advance_and_snapshot(driver, diagnostics_enabled)?
-                    } else if diagnostics_enabled {
+                if !progress_ring_enabled {
+                    snapshot = if diagnostics_enabled {
                         self.coordinator.frontier_ready_snapshot_with_monotonic_ns()
                     } else {
                         self.coordinator.frontier_ready_snapshot()
                     };
                 }
                 #[cfg(not(feature = "bench"))]
-                {
-                    snapshot = if self.coordinator.progress_ring_enabled() {
-                        self.io.advance_and_snapshot(driver, false)?
-                    } else {
-                        self.coordinator.frontier_ready_snapshot()
-                    };
+                if !progress_ring_enabled {
+                    snapshot = self.coordinator.frontier_ready_snapshot();
                 }
                 #[cfg(feature = "bench")]
                 if diagnostics_enabled {
@@ -5250,7 +5257,7 @@ impl WalV8ParallelWriter {
                         .record_wal_v8_durability_empty_driver_attempt();
                 }
                 drop(previous);
-                if self.coordinator.progress_ring_enabled() {
+                if progress_ring_enabled {
                     let _ = self.io.wait_for_progress(Duration::from_secs(1))?;
                     if self.coordinator.is_poisoned() {
                         anyhow::bail!("v8 Parallel WAL was poisoned while waiting for durability");
@@ -7082,7 +7089,10 @@ mod tests {
         let parallel_path = directory.path().join("parallel-v8.wal");
         let parallel_installed = install_empty(&parallel_path, header())?;
         let parallel_profile = Arc::new(crate::mem_table::WriteProfile::default());
-        let parallel = open_writer(&parallel_path, &parallel_installed)?.into_parallel()?;
+        let parallel_leader = open_writer(&parallel_path, &parallel_installed)?;
+        let worker_file = parallel_leader.write_file.try_clone()?;
+        let parallel =
+            parallel_leader.into_parallel_with_worker_file_and_progress_ring(worker_file, false)?;
         parallel.set_write_profile(Arc::clone(&parallel_profile))?;
         let first_batch = batch(10);
         let second_batch = batch(20);
@@ -7201,6 +7211,13 @@ mod tests {
             #[cfg(not(feature = "bench"))]
             let writer = open_writer(wal_path, &installed)?.into_parallel()?;
             #[cfg(feature = "bench")]
+            assert_eq!(
+                writer.progress_ring_enabled(),
+                std::env::var_os(WAL_V8_POINT_PROGRESS_RING_ENV).as_deref()
+                    == Some(OsStr::new("1")),
+                "child writer must use the requested progress mode"
+            );
+            #[cfg(feature = "bench")]
             let value = if std::env::var_os(EXTENT_PREPARATION_ENV).as_deref()
                 == Some(OsStr::new("sliding-initialize"))
             {
@@ -7240,7 +7257,19 @@ mod tests {
 
         for frontier_mode in frontier_modes {
             for extent_preparation_mode in extent_preparation_modes {
-                for (crash_point, expected_min_ticket_end, expected_max_ticket_end) in CRASH_POINTS
+                let mut cases = CRASH_POINTS
+                    .map(|(point, min, max)| (false, point, min, max))
+                    .to_vec();
+                if cfg!(feature = "bench")
+                    && matches!(
+                        (frontier_mode, extent_preparation_mode),
+                        ("buffered", "none") | ("direct", "sliding-point-lookahead")
+                    )
+                {
+                    cases.extend(CRASH_POINTS.map(|(point, min, max)| (true, point, min, max)));
+                }
+                for (ring_enabled, crash_point, expected_min_ticket_end, expected_max_ticket_end) in
+                    cases
                 {
                     let directory = tempfile::tempdir_in(&parent)?;
                     let wal_path = directory.path().join("active-v8.wal");
@@ -7274,6 +7303,11 @@ mod tests {
                         .stdout(Stdio::null())
                         .stderr(Stdio::inherit());
                     #[cfg(feature = "bench")]
+                    child.env(
+                        WAL_V8_POINT_PROGRESS_RING_ENV,
+                        if ring_enabled { "1" } else { "0" },
+                    );
+                    #[cfg(feature = "bench")]
                     if extent_preparation_mode != "none" {
                         child
                             .env(EXTENT_PREPARATION_ENV, extent_preparation_mode)
@@ -7290,14 +7324,14 @@ mod tests {
                         }
                         if let Some(status) = child.try_wait()? {
                             anyhow::bail!(
-                                "V8 writer child exited before reaching {crash_point} in {frontier_mode}/{extent_preparation_mode} mode: {status}"
+                                "V8 writer child exited before reaching {crash_point} in {frontier_mode}/{extent_preparation_mode} mode (ring={ring_enabled}): {status}"
                             );
                         }
                         if Instant::now() >= deadline {
                             let _ = child.kill();
                             let _ = child.wait();
                             anyhow::bail!(
-                                "V8 writer child did not reach {crash_point} in {frontier_mode}/{extent_preparation_mode} mode"
+                                "V8 writer child did not reach {crash_point} in {frontier_mode}/{extent_preparation_mode} mode (ring={ring_enabled})"
                             );
                         }
                         thread::sleep(Duration::from_millis(10));

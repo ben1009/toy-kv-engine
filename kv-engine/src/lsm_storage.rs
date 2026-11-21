@@ -10168,17 +10168,65 @@ impl KvEngine {
     }
 
     #[cfg(feature = "bench")]
+    fn configure_v8_wal_diagnostic(
+        &self,
+        enabling: bool,
+        diagnostic: &str,
+        configure: impl FnOnce(&mem_table::MemTable) -> Result<()>,
+    ) -> Result<()> {
+        let _operation_guard = self.pitr_operation_lock.lock();
+        #[cfg(target_os = "linux")]
+        let _barrier_guard = self.pitr_barrier_lock.lock();
+        #[cfg(target_os = "linux")]
+        if enabling {
+            ensure!(
+                !self.has_pending_v8_progress_ring_successor()?,
+                "V8 {diagnostic} diagnostics are not supported with the pending progress-ring successor"
+            );
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = (enabling, diagnostic);
+        let _active_memtable = self.inner.active_memtable_lock.read();
+        configure(&self.inner.state.load().memtable)
+    }
+
+    #[cfg(all(feature = "bench", target_os = "linux"))]
+    fn has_pending_v8_progress_ring_successor(&self) -> Result<bool> {
+        use crate::pitr::manifest::{ObligationState, PitrWalFormat};
+
+        let active = self.inner.state.load();
+        if self.inner.wal_io_mode != crate::wal::WalIoMode::Parallel
+            || !active.memtable.uses_v7_wal()
+        {
+            return Ok(false);
+        }
+        let Some(source_segment_id) = LsmStorageInner::pitr_segment_of(&active.memtable) else {
+            return Ok(false);
+        };
+        // An interrupted handoff can leave the V7 memtable installed after
+        // the manifest has committed to a V8 successor.
+        let state = self.pitr_manifest_state.lock();
+        let pending = unsupported_v7_to_v8_migration_source(&state) == Some(source_segment_id)
+            || state
+                .obligations
+                .get(&source_segment_id)
+                .is_some_and(|obligation| {
+                    obligation.state == ObligationState::Sealed
+                        && state.active_boundary.is_some_and(|boundary| {
+                            boundary.segment_id == obligation.successor_segment_id
+                                && boundary.wal_format == PitrWalFormat::V8
+                        })
+                });
+
+        Ok(pending && crate::wal::v8::leader::progress_ring_enabled_from_environment()?)
+    }
+
+    #[cfg(feature = "bench")]
     /// Enable benchmark-only V8 ordering head-of-line diagnostics.
     pub fn set_wal_hol_diagnostics_enabled(&self, enabled: bool) -> Result<()> {
-        let _operation_guard = self.pitr_operation_lock.lock();
-        let _barrier_guard = self.pitr_barrier_lock.lock();
-        let _active_memtable = self.inner.active_memtable_lock.read();
-
-        self.inner
-            .state
-            .load()
-            .memtable
-            .set_wal_hol_diagnostics_enabled(enabled)
+        self.configure_v8_wal_diagnostic(enabled, "HOL", |memtable| {
+            memtable.set_wal_hol_diagnostics_enabled(enabled)
+        })
     }
 
     #[cfg(feature = "bench")]
@@ -10192,14 +10240,14 @@ impl KvEngine {
             sample_every.is_none_or(|every| every > 0),
             "completion timeline sample interval must be greater than zero"
         );
-        let _operation_guard = self.pitr_operation_lock.lock();
-        let _barrier_guard = self.pitr_barrier_lock.lock();
-        let _active_memtable = self.inner.active_memtable_lock.read();
-        self.inner
-            .state
-            .load()
-            .memtable
-            .set_wal_v8_completion_timeline_sample_every(sample_every.unwrap_or_default())
+        self.configure_v8_wal_diagnostic(
+            sample_every.is_some(),
+            "completion timeline",
+            |memtable| {
+                memtable
+                    .set_wal_v8_completion_timeline_sample_every(sample_every.unwrap_or_default())
+            },
+        )
     }
 
     #[cfg(feature = "bench")]
@@ -10247,14 +10295,9 @@ impl KvEngine {
             sample_every.is_none_or(|every| every > 0),
             "durability phase sample interval must be greater than zero"
         );
-        let _operation_guard = self.pitr_operation_lock.lock();
-        let _barrier_guard = self.pitr_barrier_lock.lock();
-        let _active_memtable = self.inner.active_memtable_lock.read();
-        self.inner
-            .state
-            .load()
-            .memtable
-            .set_wal_v8_durability_sample_every(sample_every.unwrap_or_default())
+        self.configure_v8_wal_diagnostic(sample_every.is_some(), "durability phase", |memtable| {
+            memtable.set_wal_v8_durability_sample_every(sample_every.unwrap_or_default())
+        })
     }
 
     #[cfg(feature = "bench")]
@@ -22778,6 +22821,105 @@ mod tests {
         recovered.close()?;
 
         Ok(())
+    }
+
+    #[cfg(all(target_os = "linux", feature = "bench", feature = "chaos-testing"))]
+    #[test]
+    fn failpoint_v8_progress_ring_rejects_diagnostics_during_v7_handoff() -> anyhow::Result<()> {
+        use anyhow::{Context, ensure};
+
+        use crate::{pitr::manifest::ObligationState, wal::WalIoMode};
+
+        const CHILD_ENV: &str = "TOYKV_TEST_PROGRESS_RING_PENDING_HANDOFF_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let output = std::process::Command::new(std::env::current_exe()?)
+                .args([
+                    "--exact",
+                    "lsm_storage::tests::failpoint_v8_progress_ring_rejects_diagnostics_during_v7_handoff",
+                    "--nocapture",
+                ])
+                .env(CHILD_ENV, "1")
+                .env("TOYKV_BENCH_V8_POINT_PROGRESS_RING", "1")
+                .output()?;
+            ensure!(
+                output.status.success(),
+                "child test failed: stdout={}, stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return Ok(());
+        }
+
+        let _scenario = crate::chaos::failpoint::FailScenario::setup();
+        let directory = tempdir()?;
+        let database = directory.path().join("db");
+        let repository = directory.path().join("repository");
+        let options = v7_recovery_test_database(directory.path())?;
+        let engine = KvEngine::open_with_wal_io_mode(&database, options, WalIoMode::Parallel)?;
+        suspend_pitr_maintenance_for_test(&engine);
+        let source = engine
+            .pitr_manifest_state
+            .lock()
+            .active_segment_id
+            .context("missing V7 source in migration fixture")?;
+        engine
+            .inner
+            .mvcc
+            .as_ref()
+            .context("migration fixture requires MVCC")?
+            .stop_commit_admission_and_capture()?;
+        let guards = engine.lock_v8_compatibility_publication();
+        let intent = engine
+            .publish_pitr_v8_migration_intent(&guards)?
+            .context("v8 migration fixture deferred")?;
+        drop(intent);
+        drop(guards);
+
+        let verify_diagnostics = || -> anyhow::Result<()> {
+            assert!(engine.inner.state.load().memtable.uses_v7_wal());
+            for attempt in [
+                engine.set_wal_hol_diagnostics_enabled(true),
+                engine.set_wal_v8_completion_timeline_sample_every(Some(1)),
+                engine.set_wal_v8_durability_sample_every(Some(1)),
+            ] {
+                let error = attempt.expect_err("pending ring successor must reject this setting");
+                assert!(format!("{error:#}").contains("pending progress-ring successor"));
+            }
+            engine
+                .inner
+                .write_profile
+                .validate_v8_progress_ring_compatibility()?;
+            engine.set_wal_hol_diagnostics_enabled(false)?;
+            engine.set_wal_v8_completion_timeline_sample_every(None)?;
+            engine.set_wal_v8_durability_sample_every(None)?;
+            Ok(())
+        };
+        assert_eq!(
+            engine.pitr_manifest_state.lock().obligations[&source].state,
+            ObligationState::Sealing
+        );
+        verify_diagnostics()?;
+
+        fail::cfg("pitr.v7_before_successor_install", "return").map_err(anyhow::Error::msg)?;
+        let interrupted = engine.resume_pitr(&repository);
+        fail::remove("pitr.v7_before_successor_install");
+        let error = interrupted.expect_err("resume must stop just after SegmentSealed");
+        assert!(format!("{error:#}").contains("injected v7 failure before successor installation"));
+        assert_eq!(
+            engine.pitr_manifest_state.lock().obligations[&source].state,
+            ObligationState::Sealed
+        );
+        verify_diagnostics()?;
+
+        engine.resume_pitr(&repository)?;
+        assert!(
+            engine
+                .benchmark_wal_io_diagnostics()
+                .is_some_and(|diagnostics| diagnostics.progress_ring_enabled)
+        );
+        engine.put(b"after-v8-migration", b"durable")?;
+        engine.sync()?;
+        engine.close()
     }
 
     #[cfg(all(target_os = "linux", feature = "chaos-testing"))]
