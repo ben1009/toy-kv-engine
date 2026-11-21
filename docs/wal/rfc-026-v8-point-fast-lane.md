@@ -22,6 +22,18 @@ Other failed approaches:
 
 The structural target is the repeated **shared-coordinator state publication** after admission. Today the producer acquires the Coordinator mutex to publish digest readiness and again to publish frame readiness; after I/O, the Completion Reaper acquires the same Coordinator mutex to mark DATA completion. Each publication validates/searches tickets and may notify waiters. The driver acquires the Coordinator to fold the prefix, reserve and publish a FRONTIER. This design makes concurrent Point progress contend with serial ticket admission on the same state mutex.
 
+## Exact batching objective: batch **coordination**, not Point DATA
+
+A Point remains one API operation with one ordered commit timestamp and ticket. The design does not require callers to form a logical KV batch and does not delay a one-frame DATA write in order to pack a larger `WriteGroup`. Historical 3-us grouping reduced worker groups by about 31% while hurting Point16 throughput by 3.13%, so no timed DATA join belongs in F0.
+
+The real control-plane target is:
+
+- **Current:** one Coordinator lock acquisition for each producer digest-ready event, another for frame-ready, and another for each Reaper DATA-completion group, plus frontiers and admission.
+- **F0:** producer and Reaper publish state in stable ticket/group storage without acquiring that Coordinator lock; the **existing elected durability driver**, not a new thread, drains a contiguous ready prefix in ticket order and updates the folded digest and frontier-eligible prefix in a **single bounded scan**. It may cover many ready tickets without waiting for additional arrivals.
+- **Unchanged:** ordered admission, immediate Point DATA submit, MAX_GROUP_TICKETS and byte-window limits, io_uring worker, separate reaper, adaptive FRONTIER coalescing, `fdatasync`, durable ACK, recovery and mixed Point/Batch ticket order.
+
+The goal is fewer **shared coordinator mutex entries per Point**, not fewer syscalls via artificial data-group waiting. Reduced CPU/Put or worker notifications alone is not sufficient to accept the architecture; require a throughput and p99 gain.
+
 ## Candidate F0: bounded lock-light ticket progress slots
 
 **Do not alter the V8 physical record format, fixed 4-KiB DATA/FRONTIER frame, digest algorithm, admission-before-encoding rule, physical offsets, crash recovery or ACK requirement.**
@@ -68,6 +80,21 @@ The producer's `DIGEST_READY` and `FRAMES_READY` bits are independent of I/O gro
 
 Check these exact interleavings deterministically: (1) DATA CQE arrives while the last group member is being registered; (2) a group covers tickets N..N+K and the scanner is simultaneously reading the head; (3) group error after other groups complete out of order; (4) an identical completion is repeated versus a conflicting partial completion; (5) durable retirement releases group handles only after the published watermark covers the whole included prefix. A per-ticket `fetch_or(DATA_CQE)` loop without a group-level release barrier is **not an acceptable F0 prototype**.
 
+### F0 wakeup integration with current writer-elected driver
+
+The existing `drive_frontier_through` calls `frontier_ready_snapshot()` and waits in `wait_for_durability_change()` when no ready prefix exists; its `coalesce_frontier_ready()` path also relies on coordinator-locked notifications. **Simply replacing producers' `signal_change/signal_durability_progress` with atomic flags would introduce a lost-wakeup risk**, since the current Condvar predicate would no longer be updated under its mutex.
+
+F0 must implement *one* explicit progress notification protocol rather than a new per-event blocking lock:
+
+1. Publish slot fields with Release ordering, then notify using a bounded persistent token (e.g., nonblocking `try_send` into a capacity-one channel). A full channel means progress is already pending, not dropped; the token must remain observable until an elected driver drains and rescans.
+2. The elected driver scans and folds all currently contiguous digests, derives the DATA-complete/frame-ready prefix, then checks for the token **after** its scan before parking. Handle a token published between scan and park and one published during coalescing. Do not block a writer on token capacity. It must keep all current poison/closed/durable watermark checks.
+3. Integrate with existing adaptive coalescing rather than adding another timeout or new DATA join. This needs one authoritative logic path for the driver when digest-ready or DATA-complete arrives late.
+4. **Do not add a new progress thread in F0.** The elected writer remains the only one that folds/reserves FRONTIER. Followers continue waiting for the durable-published cutoff; poison and shutdown must continue waking them using the existing authoritative state.
+
+Before implementation, specify a small state-machine proof for: notification arrives before initial scan, between scan/park, between coalescing snapshot/recheck, DATA CQE before a missing digest, and newly admitted ticket after the driver has parked. If no safe integration is possible without effectively restoring a shared lock on every Point event, reject F0 rather than adding a polling loop.
+
+For the prototype, use a **whole-WAL-instance off-by-default mode switch** so Batch and Point ticket streams never use incompatible status backends within the same Segment. The initial performance target is Point8/16, but mixed Point/Batch and Batch64 are mandatory correctness/regression guards. A whole-WAL mode is not a promise that Batch throughput improves.
+
 ## Optional F1 only after F0 wins: dedicated progress owner
 
 If F0 demonstrates a real reduction in CPU and shared-state contention but writer-driven progress still holds Point latency back, **independently** evaluate moving only the ordered fold/FRONTIER drive to a dedicated owner. Keep the independent Completion Reaper alive while sync blocks. The progress owner then combines coalesced ready-event handling with durability publication; it does not own or drain io_uring CQEs.
@@ -94,6 +121,16 @@ F1 must preserve the existing dynamic coalescing/sync policy and current `Wal::c
 6. **No lost progress:** a readiness event arriving between a driver's last scan and its wait cannot be missed. Poison/close/worker exit must also wake followers.
 7. **Durable and crash semantics:** immutable predecessor digest, FRONTIER offset and reservation credit must match the existing code. Preserve all crash cuts, failpoints, old-reader compatibility, Active normalization, PITR seal/rotation and restart.
 8. **Batch/mixed usage:** first benchmark F0 under an explicitly chosen, off-by-default, **Point-only mode**. This is NOT production-ready until mixed Point+Batch tickets use the same safe slot protocol or switch to the unchanged path with proven lifetime/ordering equivalence. Do not silently change Batch's semantics.
+
+## Smallest implementation order
+
+**PR-F0.1 — safe state representation only:** Introduce a bounded, incarnation-checked TicketSlot/CompletionGroup representation and baseline parity tests. Keep the old coordinator publications for this first patch so wire format, resource ownership and diagnostics are unchanged. Measure any new Arc/allocation/cache-line cost; do not introduce unsafe slot reuse or per-Ticket heap allocation into the final design without demonstrating it is affordable.
+
+**PR-F0.2 — remove hot-path publications:** Once F0.1 is correct, route `mark_digest_ready`, `mark_frames_ready` and group CQE completion through the stable slot/group handles. Refactor `fold_ready_digests` and the current `frontier_ready_snapshot` to drain all contiguous ready entries once under the existing owner's serialized control. Leave `reserve_frontier_with` and `publish_durable_frontier` behind the existing Coordinator lock. Keep the Reaper independent and preserve multi-ticket group atomicity.
+
+**PR-F0.3 — wakeup correctness and performance A/B:** Wire the durable-progress event to the existing elected driver's readiness/coalescing wait. Add deterministic missed-wakeup, mixed-mode, out-of-order, poison, crash-cut, retirement/reuse and close tests. Only after those pass perform a small local screen, then five counterbalanced no-tracing GCP pairs. The benchmark must report at least Coordinator acquisitions/Put (a separate diagnostic run), process CPU/Put, worker groups/Put, Puts/Sync, Point8/16 throughput and p99, Point1 and Batch64 regressions.
+
+Never change logical API batching, DATA join wait, queue depth, I/O worker notification, durability scheduler and readiness state backend in the same experiment. F0 does not earn promotion by lowering mutex count alone.
 
 ## Performance experiment and stop
 
