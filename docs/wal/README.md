@@ -48,19 +48,25 @@ ticket, and bounded durability coalescing combines completed prefixes into
 FRONTIER/sync cycles.
 
 Preparation, durability progress and durable publication use separate
-notifications. One durability driver forms frontiers; followers wait for
-publication and read the published cursor without taking the physical FRONTIER
-mutex. These changes are retained; the
-[notification rerun](benchmarks/rfc-026-v8-notification-rerun-20261102.md)
-records their evidence and limits. The
-[implementation plan](rfc-026-implementation-plan.md) describes the other
-implemented paths.
+notifications. One driver forms FRONTIERs. The WAL's published cursor path
+lets a durable follower return without taking the physical FRONTIER mutex.
+The direct writer append path takes that mutex to construct commit metadata.
+See the [notification rerun](benchmarks/rfc-026-v8-notification-rerun-20261102.md)
+for the evidence and the [implementation plan](rfc-026-implementation-plan.md)
+for the current runtime.
 
 Dated filenames identify individual measurements and follow-ups. Their defaults,
 candidate decisions and validation counts describe the measured revision;
 the adoption notes above define current selection. The
 [benchmark overview](benchmarks/rfc-024-parallel-wal-benchmark.md) connects
 the retained and rejected experiments.
+
+## V8 Point performance proposal
+
+The [V8 Point Progress Ring](rfc-026-v8-point-fast-lane.md) proposes moving
+producer readiness to a bounded ring and having the elected driver apply
+queued completions in batches. The plan starts with an isolated prototype,
+followed by correctness tests and paired Point and Batch64 benchmarks.
 
 ## Implementation and adoption
 
@@ -69,7 +75,6 @@ the retained and rejected experiments.
 - [Parallel WAL Implementation Plan](rfc-024-parallel-wal-implementation-plan.md)
 - [RFC 025 Implementation Plan: Parallel WAL with Embedded Frontiers and One Sync](rfc-025-parallel-wal-embedded-frontiers-implementation-plan.md)
 - [RFC 026 Implementation Plan: Composable WAL Prefix Digests](rfc-026-implementation-plan.md)
-- [Proposed RFC 026 follow-up: V8 Point Progress Ring (PolarDB-inspired)](rfc-026-v8-point-fast-lane.md)
 - [Native async point-write integration](rfc-024-native-async-integration-20261005.md)
 - [Retire frozen parallel WAL runtimes](rfc-024-frozen-wal-retirement.md)
 

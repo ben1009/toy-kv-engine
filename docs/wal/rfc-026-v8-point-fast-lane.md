@@ -2,10 +2,10 @@
 
 | Field | Value |
 | --- | --- |
-| Status | **Reviewed design; concrete F0 prototype contract; implementation/tests pending** |
+| Status | F0 design proposal. Prototype, runtime tests and A/B pending. |
 | Date | 2026-11-21 |
 | Scope | V8 Parallel only; Point throughput target, shared Point/Batch correctness |
-| Base | main following merged PR #558; supersedes the per-Ticket Arc/CompletionGroup proposal in the previous draft of this RFC |
+| Base | [PR #558 squash commit](https://github.com/ben1009/toy-kv-engine/commit/58c79208a760bbb9cdeb02341107eb49c2a0ae7f) |
 | Parent | [RFC 026](../../rfcs/026-composable-wal-prefix-digest.md), [implementation plan](rfc-026-implementation-plan.md) |
 | Target | >=10% Point16 throughput gain in scored runs that meet the Section 8 promotion gates |
 
@@ -157,7 +157,7 @@ After deterministic correctness tests, screen Point8 and Point16 locally with bo
 
 Run five counterbalanced pairs per workload on one `c4-standard-16-lssd` with two Local SSDs in ext4 RAID0. Score Point1, Point8, Point16 and Batch64. Run Batch64 at 16 writers. Use 100,000 logical Puts and 1 KiB values. Build once in release mode with `bench`, use Direct FRONTIER, 1 MiB Point-only Lookahead and dynamic coalescing, and vary only the F0 flag. Exclude warm-up and use `--latency-sample-every 10` for each Point arm.
 
-Set `TOYKV_BENCH_V8_EXTENT_POLICY_SCAN_DIAGNOSTICS=0` in both arms. The bench build enables these counters when the variable is absent. Reject a scored result unless `sliding_extent_preparation.extent_policy_scan_diagnostics_enabled` is `false` in both `wal_io_start` and `wal_io_end`. Keep CPU attribution, sync diagnostics, completion timelines and `perf` off for scoring. Use separate diagnostic runs for role CPU, owner lock hold time, per-wake drain counts and ring occupancy.
+Set `TOYKV_BENCH_V8_EXTENT_POLICY_SCAN_DIAGNOSTICS=0` in both arms. The bench build enables these counters when the variable is absent. Reject a scored result unless `sliding_extent_preparation.extent_policy_scan_diagnostics_enabled` is `false` in both `wal_io_start` and `wal_io_end`. Keep CPU attribution, sync diagnostics, completion timelines and `perf` off for scoring. Use separate diagnostic runs for role CPU, owner lock hold time, per-wake drain counts and ring occupancy. See the [GCP benchmark runbook](benchmarks/gcp-free-trial-wal-bench.md#scoring-v8-point-candidates) for scoring setup and artifact validation.
 
 Archive raw results, the source revision and executable hash, the configuration and each pair. Report throughput, CPU/Put, Puts/Sync, DATA Groups/Put and Point p50/p95/p99. Use Batch64 throughput for its guard. Keep paired percentages as the median of the five within-pair changes, calculated as `(F0 / baseline - 1) × 100`.
 
@@ -172,11 +172,12 @@ Promote F0 only when all of these conditions hold.
 
 The throughput target is +10% Point16 under the same gates. If F0 fails the local screen or the promotion criteria, record the result and stop the candidate. A dedicated Advance/Flush owner belongs to a separate F1 proposal after F0 has passed.
 
-## 9. Review disposition
+## 9. Implementation status
 
-**Primary proposal is now PolarDB-inspired bounded Progress Ring + batched Reaper events + elected-owner Advance.** The previous per-Ticket `Arc` and shared `CompletionGroup` pointer scheme is rejected as the default implementation, because it creates per-request ownership overhead and a new Group lookup contract.
-
-This is a design-only Draft. It does not claim the PolarDB reported TPS uplift applies to V8 and it makes **no Rust runtime or production-default changes**. F0.1 isolated state-machine implementation is now specified. Runtime enablement requires the deterministic correctness tests above; no performance claim until A/B.
+The proposal specifies F0.1 as an isolated ring prototype. The integrated
+runtime experiment requires the ownership, wakeup and crash tests in Section 7.
+Section 8 defines when to advance from local testing to GCP and what constitutes
+a passing A/B.
 
 ## Appendix A. Historical alternatives — not part of the implementation plan
 

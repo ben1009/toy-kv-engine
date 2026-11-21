@@ -16,14 +16,23 @@ V4/V7/V8 implementations and defaults measured in each report.
 
 ## Current V8 evidence
 
-The [notification retention and rerun](rfc-026-v8-notification-rerun-20261102.md)
-records the retained notification separation, single durability driver and
-published-cursor combination. The
-[held-out calibration report](rfc-026-v8-calibrated-states-20261103.md) is the
-latest storage-state assessment: no path class passed the frozen calibration
-gate, so it reports no qualified V8/V7 ratio. Historical best scores are
-descriptive results for their source, CPU mask and device state; they do not
-establish current parity.
+The [notification rerun](rfc-026-v8-notification-rerun-20261102.md) records
+separate notifications, one durability driver and the published cursor path.
+The [November 3 held-out calibration](rfc-026-v8-calibrated-states-20261103.md)
+found that every path class missed its storage-state gate, leaving the V8/V7
+ratio unqualified.
+
+With the per-stage timers off, the [November 20 writer-stage controls](rfc-026-v7-v8-writer-stage-cpu-gcp-20261120.md)
+recorded median Point16 throughput of 48.88k Puts/s for V7 and 41.34k Puts/s for
+V8 with Direct FRONTIER and 1 MiB Point Lookahead. Those controls still counted
+aggregate thread CPU at work boundaries. The [3 μs DATA group join](rfc-026-v8-point-short-group-join-gcp-20261120.md)
+reduced worker submissions but lost 3.13% paired Point16 throughput. The
+[O(1) ticket lookup](rfc-026-v8-ticket-index-gcp-20261120.md) gained 0.21% at
+Point16 and lost 0.81% at Point8. Both candidates were reverted.
+
+The [V8 Point Progress Ring proposal](../rfc-026-v8-point-fast-lane.md)
+defines a coordination experiment with its own correctness, throughput and
+tail latency gates. F0 measurement is pending.
 
 ## V4 Leader/Parallel direct comparisons
 

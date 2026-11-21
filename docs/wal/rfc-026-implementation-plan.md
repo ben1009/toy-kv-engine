@@ -318,11 +318,11 @@ head stranded. The [DATA-group screen](benchmarks/rfc-026-v8-admitted-data-group
 records correctness coverage, rejected policies, and the remaining performance
 uncertainty. Its retained binary is not yet qualified against v7 or v4.
 
-Preparation/admission, durability progress and durable publication have
-separate notification streams. A single durability driver owns FRONTIER
-formation; followers await durable publication and use the coordinator's
-published cursor instead of reacquiring the physical FRONTIER mutex. The
-[notification retention and rerun](benchmarks/rfc-026-v8-notification-rerun-20261102.md)
+Preparation and admission, durability progress, and durable publication have
+separate notification streams. One driver owns FRONTIER formation. The WAL's
+published cursor path lets followers return without taking the physical
+FRONTIER mutex. Direct writer append callers take that mutex to construct
+commit metadata. The [notification rerun](benchmarks/rfc-026-v8-notification-rerun-20261102.md)
 records the retained combination and its measurement limits. Affinity and
 allocator probes remain diagnostic experiments.
 
@@ -330,3 +330,11 @@ Each slice must leave existing v2-v7 reads, writes, recovery and digest
 interpretation unchanged. The non-performance workspace and historical-reader
 test gates have passed. The performance matrix remains open after the documented
 default-adoption decision; adoption does not establish V4/V7 parity.
+
+## Proposed V8 Point performance work
+
+The [V8 Point Progress Ring](rfc-026-v8-point-fast-lane.md) defines a staged
+prototype for V8 Parallel. The first slice tests cell reuse and digest
+validation in isolation. The integrated experiment requires whole-group
+completion, wakeup, poison, mixed workload, and crash and recovery tests
+before the paired A/B. The proposal records the throughput and latency gates.
