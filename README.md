@@ -475,7 +475,7 @@ requires both p95 and p99 to pass, and allows at most 5% regression per metric.
 - [024: Dedicated WAL I/O Pipeline](rfcs/024-dedicated-wal-pipeline.md)
 - [025: Parallel WAL with Embedded Frontiers and One Sync (implemented V7 compatibility format)](rfcs/025-parallel-wal-embedded-frontiers.md)
 - [026: Composable WAL Prefix Digests (implemented; default for new PITR WALs)](rfcs/026-composable-wal-prefix-digest.md)
-- [RFC 026 follow-up: V8 Point Progress Ring proposal](docs/wal/rfc-026-v8-point-fast-lane.md)
+- [RFC 027: V8 Point Progress Ring](rfcs/027-v8-point-progress-ring.md)
 
 ## License
 

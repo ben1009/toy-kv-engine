@@ -333,7 +333,7 @@ default-adoption decision; adoption does not establish V4/V7 parity.
 
 ## Proposed V8 Point performance work
 
-The [V8 Point Progress Ring](rfc-026-v8-point-fast-lane.md) defines a staged
+The [V8 Point Progress Ring](../../rfcs/027-v8-point-progress-ring.md) defines a staged
 prototype for V8 Parallel. The first slice tests cell reuse and digest
 validation in isolation. The integrated experiment requires whole-group
 completion, wakeup, poison, mixed workload, and crash and recovery tests

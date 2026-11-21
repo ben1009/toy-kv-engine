@@ -32,7 +32,7 @@ the repository root examples, tests, benchmarks, and RFCs.
   Parallel normally uses `O_DIRECT`, with buffered worker I/O on filesystems
   that reject direct I/O. Both paths publish durability after the same single
   WAL sync. The V8 performance matrix remains unqualified. See the
-  [V8 Point Progress Ring proposal](../docs/wal/rfc-026-v8-point-fast-lane.md)
+  [V8 Point Progress Ring proposal](../rfcs/027-v8-point-progress-ring.md)
   for the next coordination experiment and its validation gates.
 - `src/vlog/` contains value-separation storage, indexing, and GC.
 - `src/tests/` contains in-crate test coverage for MVCC, compaction,
