@@ -10170,6 +10170,7 @@ impl KvEngine {
     #[cfg(feature = "bench")]
     /// Enable benchmark-only V8 ordering head-of-line diagnostics.
     pub fn set_wal_hol_diagnostics_enabled(&self, enabled: bool) -> Result<()> {
+        let _operation_guard = self.pitr_operation_lock.lock();
         let _active_memtable = self.inner.active_memtable_lock.read();
 
         self.inner
@@ -10190,6 +10191,7 @@ impl KvEngine {
             sample_every.is_none_or(|every| every > 0),
             "completion timeline sample interval must be greater than zero"
         );
+        let _operation_guard = self.pitr_operation_lock.lock();
         let _active_memtable = self.inner.active_memtable_lock.read();
         self.inner
             .state
@@ -10243,6 +10245,7 @@ impl KvEngine {
             sample_every.is_none_or(|every| every > 0),
             "durability phase sample interval must be greater than zero"
         );
+        let _operation_guard = self.pitr_operation_lock.lock();
         let _active_memtable = self.inner.active_memtable_lock.read();
         self.inner
             .state
@@ -40053,6 +40056,71 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    #[cfg(all(target_os = "linux", feature = "bench"))]
+    #[test]
+    fn v8_progress_ring_rejects_inherited_completion_timeline_before_pitr_enable() {
+        const CHILD_ENV: &str = "TOYKV_TEST_PROGRESS_RING_INHERITED_PROFILE_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg(
+                    "lsm_storage::tests::v8_progress_ring_rejects_inherited_completion_timeline_before_pitr_enable",
+                )
+                .arg("--nocapture")
+                .env(CHILD_ENV, "1")
+                .env("TOYKV_BENCH_V8_POINT_PROGRESS_RING", "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "child test failed: stdout={}, stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let dir = tempdir().unwrap();
+        let repository = dir.path().join("repository");
+        let engine = KvEngine::open(
+            dir.path().join("db"),
+            LsmStorageOptions {
+                enable_wal: true,
+                ..LsmStorageOptions::default_for_test()
+            },
+        )
+        .unwrap();
+        engine
+            .set_wal_v8_completion_timeline_sample_every(Some(1))
+            .unwrap();
+
+        let error = engine
+            .enable_pitr(crate::pitr::api::PitrOptions {
+                repository: repository.clone(),
+                config: crate::pitr::api::PersistedPitrConfig {
+                    archive_interval: std::time::Duration::from_secs(3600),
+                    max_segment_bytes: 1 << 20,
+                    max_unarchived_bytes: 4 << 20,
+                    max_source_spool_bytes: 16 << 20,
+                },
+                runtime: crate::pitr::api::PitrRuntimeOptions::default(),
+            })
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("completion timeline diagnostics are not supported"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(
+            engine.pitr_manifest_state.lock().mode,
+            crate::pitr::manifest::PitrMode::Disabled
+        );
+        assert!(!repository.exists());
+        assert!(!engine.inner.state.load().memtable.uses_v8_wal());
+
+        engine.put(b"still-writable", b"value").unwrap();
+        engine.close().unwrap();
     }
 
     #[cfg(target_os = "linux")]
