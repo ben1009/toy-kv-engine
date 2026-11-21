@@ -18,7 +18,11 @@ use std::{
         fs::{FileExt, MetadataExt},
         io::AsRawFd,
     },
-    sync::{Arc, mpsc},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -28,6 +32,7 @@ use std::os::unix::fs::OpenOptionsExt;
 
 use crate::wal::mutex_diagnostics::{self, MutexLockKind};
 use anyhow::{Context, Result, ensure};
+use crossbeam_channel::{Receiver, Sender};
 use crossbeam_queue::ArrayQueue;
 use parking_lot::{Condvar, Mutex};
 use sha2::{Digest, Sha256};
@@ -63,8 +68,10 @@ use super::{
     digest,
     install::WalV8InstalledRecovery,
     parallel::{
+        WalV8CompletedGroupEvent, WalV8DurabilityDriver, WalV8FrontierReadySnapshot,
         WalV8ParallelAdmissionGuard, WalV8ParallelConfig, WalV8ParallelCoordinator,
-        WalV8PreparationReservation,
+        WalV8PreparationReservation, WalV8ProgressTokenWait, consume_progress_token_before_scan,
+        wait_for_progress_token,
     },
     prepare::{
         AdmittedWalV8Batch, EncodedWalV8Batch, PreparedWalV8Batch, WalV8AdmissionPlan,
@@ -334,7 +341,31 @@ const WAL_V8_EXTENT_PREPARATION_ENV: &str = "TOYKV_BENCH_V8_EXTENT_PREP";
 const WAL_V8_EXTENT_PREPARATION_BYTES_ENV: &str = "TOYKV_BENCH_V8_EXTENT_PREP_BYTES";
 #[cfg(feature = "bench")]
 const WAL_V8_POINT_FRONTIER_CREDIT_BATCH_ENV: &str = "TOYKV_BENCH_V8_POINT_FRONTIER_CREDIT_BATCH";
+#[cfg(feature = "bench")]
+const WAL_V8_POINT_PROGRESS_RING_ENV: &str = "TOYKV_BENCH_V8_POINT_PROGRESS_RING";
 const WAL_V8_EXTENT_PREPARATION_CHUNK_BYTES: usize = 128 * 1024;
+
+#[cfg(feature = "bench")]
+fn progress_ring_enabled_from_value(value: Option<&OsStr>) -> Result<bool> {
+    let Some(value) = value else {
+        return Ok(false);
+    };
+    match value.to_str() {
+        Some("0") => Ok(false),
+        Some("1") => Ok(true),
+        Some(value) => {
+            anyhow::bail!("invalid {WAL_V8_POINT_PROGRESS_RING_ENV} {value:?}; expected `0` or `1`")
+        }
+        None => anyhow::bail!(
+            "{WAL_V8_POINT_PROGRESS_RING_ENV} is not valid UTF-8; expected `0` or `1`"
+        ),
+    }
+}
+
+#[cfg(feature = "bench")]
+pub(crate) fn progress_ring_enabled_from_environment() -> Result<bool> {
+    progress_ring_enabled_from_value(std::env::var_os(WAL_V8_POINT_PROGRESS_RING_ENV).as_deref())
+}
 
 #[cfg(feature = "bench")]
 impl WalExtentPreparationMode {
@@ -2497,6 +2528,29 @@ struct WalV8DataSubmitHol {
     max_successors: u64,
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum WalV8ProgressWaitTestEvent {
+    BeforeWait,
+    AfterWait(WalV8ProgressTokenWait),
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum WalV8CompletionReapTestEvent {
+    BeforeReap,
+    AfterReap,
+}
+
+#[cfg(test)]
+type WalV8ProgressWaitHook = Arc<dyn Fn(WalV8ProgressWaitTestEvent) + Send + Sync>;
+
+#[cfg(test)]
+type WalV8CompletionReapHook = Arc<dyn Fn(WalV8CompletionReapTestEvent) + Send + Sync>;
+
+#[cfg(test)]
+type WalV8SharedCompletionReapHook = Arc<Mutex<Option<WalV8CompletionReapHook>>>;
+
 fn benchmark_submits_any_ready_ticket() -> Result<bool> {
     #[cfg(feature = "bench")]
     {
@@ -2539,6 +2593,14 @@ struct WalV8ParallelIo {
     extent_preallocator: Option<Arc<WalV8ExtentPreallocator>>,
     #[cfg(feature = "bench")]
     extent_preparation: Option<Arc<WalV8SlidingExtentPreparation>>,
+    completion_events: Option<Receiver<WalV8CompletedGroupEvent>>,
+    completion_batch: Mutex<Vec<WalV8CompletedGroupEvent>>,
+    #[cfg(test)]
+    progress_wait_hook: Mutex<Option<WalV8ProgressWaitHook>>,
+    #[cfg(test)]
+    completion_reap_hook: WalV8SharedCompletionReapHook,
+    progress_tokens: Option<Receiver<()>>,
+    shutdown_started: Arc<AtomicBool>,
     completion_thread: Mutex<Option<thread::JoinHandle<()>>>,
 }
 
@@ -2550,6 +2612,22 @@ impl WalV8ParallelIo {
         extent_preallocator: Option<Arc<WalV8ExtentPreallocator>>,
         #[cfg(feature = "bench")] extent_preparation: Option<Arc<WalV8SlidingExtentPreparation>>,
     ) -> Result<Arc<Self>> {
+        let (completion_event_sender, completion_events) = if coordinator.progress_ring_enabled() {
+            let capacity = coordinator.completion_queue_capacity();
+            ensure!(capacity > 0, "v8 completion event queue capacity is empty");
+            let (sender, receiver) = crossbeam_channel::bounded(capacity);
+            (Some(sender), Some(receiver))
+        } else {
+            (None, None)
+        };
+        let progress_tokens = coordinator.take_progress_token_receiver()?;
+        let mut completion_batch = Vec::new();
+        if completion_events.is_some() {
+            completion_batch
+                .try_reserve_exact(coordinator.completion_queue_capacity())
+                .context("reserve v8 completion event drain buffer")?;
+        }
+        let shutdown_started = Arc::new(AtomicBool::new(false));
         let submit_any_ready_ticket = benchmark_submits_any_ready_ticket()?;
         let worker_file = Arc::new(worker_file);
         let buffer_pool = Arc::new(ArrayQueue::<WalV8DataBuffer>::new(1));
@@ -2569,18 +2647,32 @@ impl WalV8ParallelIo {
         #[cfg(feature = "bench")]
         let completion_progress = Arc::clone(&progress);
         let completion_coordinator = coordinator.clone();
+        let completion_shutdown_started = Arc::clone(&shutdown_started);
+        let completion_event_sender_for_thread = completion_event_sender;
+        #[cfg(test)]
+        let completion_reap_hook: WalV8SharedCompletionReapHook = Arc::new(Mutex::new(None));
+        #[cfg(test)]
+        let completion_reap_hook_for_thread = Arc::clone(&completion_reap_hook);
         let completion_thread = thread::Builder::new()
             .name("wal-v8-completion-reaper".to_owned())
             .spawn(move || {
+                let _exit_guard = WalV8CompletionReaperExitGuard {
+                    coordinator: completion_coordinator.clone(),
+                    shutdown_started: completion_shutdown_started,
+                };
                 #[cfg(feature = "bench")]
                 let mut completion_timeline_enabled = None;
                 while let Ok(result) = completions.recv() {
+                    #[cfg(feature = "bench")]
+                    let completion_observed_at =
+                        completion_coordinator.capture_data_completion_time();
                     #[cfg(feature = "bench")]
                     let timeline_enabled = *completion_timeline_enabled.get_or_insert_with(|| {
                         completion_progress.completion_timeline_sample_every() > 0
                     });
                     #[cfg(feature = "bench")]
-                    let reaper_recv_at = timeline_enabled.then(Instant::now);
+                    let reaper_recv_at = timeline_enabled
+                        .then(|| completion_observed_at.unwrap_or_else(Instant::now));
                     #[cfg(feature = "bench")]
                     let mut cpu_sample = {
                         let profile = completion_progress.profile();
@@ -2596,16 +2688,36 @@ impl WalV8ParallelIo {
                     let timeline = reaper_recv_at.and_then(|received_at| {
                         completion_progress.take_completion_timeline(result.group_id, received_at)
                     });
+                    #[cfg(test)]
+                    if let Some(hook) = completion_reap_hook_for_thread.lock().clone() {
+                        hook(WalV8CompletionReapTestEvent::BeforeReap);
+                    }
                     let reap_result = {
                         #[cfg(feature = "bench")]
                         {
-                            reap_v8_group_result(&completion_coordinator, result, timeline)
+                            reap_v8_group_result(
+                                &completion_coordinator,
+                                result,
+                                completion_event_sender_for_thread.as_ref(),
+                                completion_observed_at,
+                                timeline,
+                            )
                         }
                         #[cfg(not(feature = "bench"))]
                         {
-                            reap_v8_group_result(&completion_coordinator, result)
+                            reap_v8_group_result(
+                                &completion_coordinator,
+                                result,
+                                completion_event_sender_for_thread.as_ref(),
+                            )
                         }
                     };
+                    #[cfg(test)]
+                    if reap_result.is_ok()
+                        && let Some(hook) = completion_reap_hook_for_thread.lock().clone()
+                    {
+                        hook(WalV8CompletionReapTestEvent::AfterReap);
+                    }
                     #[cfg(feature = "bench")]
                     if let Some(sample) = cpu_sample.as_mut()
                         && reap_result.is_ok()
@@ -2617,9 +2729,6 @@ impl WalV8ParallelIo {
                         completion_coordinator.poison();
                     }
                 }
-                // A worker that disappears without a normal group result must
-                // wake every waiter rather than leave an admitted ticket stuck.
-                completion_coordinator.poison();
             })
             .context("failed to spawn v8 WAL completion reaper")?;
 
@@ -2652,8 +2761,136 @@ impl WalV8ParallelIo {
             extent_preallocator,
             #[cfg(feature = "bench")]
             extent_preparation,
+            completion_events,
+            completion_batch: Mutex::new(completion_batch),
+            #[cfg(test)]
+            progress_wait_hook: Mutex::new(None),
+            #[cfg(test)]
+            completion_reap_hook,
+            progress_tokens,
+            shutdown_started,
             completion_thread: Mutex::new(Some(completion_thread)),
         }))
+    }
+
+    fn advance_and_snapshot(
+        &self,
+        driver: &WalV8DurabilityDriver,
+        capture_monotonic_ns: bool,
+    ) -> Result<WalV8FrontierReadySnapshot> {
+        ensure!(
+            self.coordinator.owns_durability_driver(driver),
+            "v8 progress scan is not owned by the active durability driver"
+        );
+        let Some(receiver) = &self.completion_events else {
+            return Ok(if capture_monotonic_ns {
+                #[cfg(feature = "bench")]
+                {
+                    self.coordinator.frontier_ready_snapshot_with_monotonic_ns()
+                }
+                #[cfg(not(feature = "bench"))]
+                {
+                    self.coordinator.frontier_ready_snapshot()
+                }
+            } else {
+                self.coordinator.frontier_ready_snapshot()
+            });
+        };
+
+        // The capacity-one token is persistent: consuming it before scanning
+        // means a publisher racing after the scan leaves another token for the
+        // subsequent park.
+        if let Some(tokens) = &self.progress_tokens {
+            consume_progress_token_before_scan(tokens);
+        }
+
+        let mut batch = self.completion_batch.lock();
+        batch.clear();
+        for _ in 0..self.coordinator.completion_queue_capacity() {
+            match receiver.try_recv() {
+                Ok(event) => batch.push(event),
+                Err(crossbeam_channel::TryRecvError::Empty) => break,
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    if !self.shutdown_started.load(Ordering::Acquire) {
+                        self.coordinator.poison();
+                        anyhow::bail!("v8 DATA completion queue disconnected before teardown");
+                    }
+                    break;
+                }
+            }
+        }
+        let snapshot =
+            self.coordinator
+                .advance_and_snapshot(driver, &batch, capture_monotonic_ns)?;
+        batch.clear();
+        Ok(snapshot)
+    }
+
+    fn coalesce_progress_ring(
+        &self,
+        driver: &WalV8DurabilityDriver,
+        snapshot: &mut WalV8FrontierReadySnapshot,
+        budget: Duration,
+        capture_monotonic_ns: bool,
+    ) -> Result<bool> {
+        let deadline = Instant::now() + budget;
+        let mut waited = false;
+        while !snapshot.closed
+            && let Some(remaining) = deadline.checked_duration_since(Instant::now())
+        {
+            waited = true;
+            let signaled = self.wait_for_progress(remaining)?;
+            *snapshot = self.advance_and_snapshot(driver, capture_monotonic_ns)?;
+            if !signaled
+                || snapshot.ready_prefix.is_empty()
+                || snapshot.ready_prefix.len() >= snapshot.admitted_ticket_count
+            {
+                break;
+            }
+        }
+        Ok(waited)
+    }
+
+    fn wait_for_progress(&self, timeout: Duration) -> Result<bool> {
+        let Some(tokens) = &self.progress_tokens else {
+            anyhow::bail!("v8 progress wait requested while the ring is disabled");
+        };
+        #[cfg(test)]
+        {
+            let hook = self.progress_wait_hook.lock().clone();
+            if let Some(hook) = hook {
+                hook(WalV8ProgressWaitTestEvent::BeforeWait);
+            }
+        }
+        let result = wait_for_progress_token(tokens, timeout);
+        #[cfg(test)]
+        {
+            let hook = self.progress_wait_hook.lock().clone();
+            if let Some(hook) = hook {
+                hook(WalV8ProgressWaitTestEvent::AfterWait(result));
+            }
+        }
+        match result {
+            WalV8ProgressTokenWait::Signaled => Ok(true),
+            WalV8ProgressTokenWait::TimedOut => Ok(false),
+            WalV8ProgressTokenWait::Disconnected => {
+                if !self.shutdown_started.load(Ordering::Acquire) {
+                    self.coordinator.poison();
+                    anyhow::bail!("v8 progress token channel disconnected before teardown");
+                }
+                Ok(false)
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn set_progress_wait_hook(&self, hook: WalV8ProgressWaitHook) {
+        *self.progress_wait_hook.lock() = Some(hook);
+    }
+
+    #[cfg(test)]
+    fn set_completion_reap_hook(&self, hook: WalV8CompletionReapHook) {
+        *self.completion_reap_hook.lock() = Some(hook);
     }
 
     fn ensure_extent_prepared_through(&self, required_end: u64) -> Result<()> {
@@ -3133,6 +3370,8 @@ impl Drop for WalV8DataPackingGuard<'_> {
 fn reap_v8_group_result(
     coordinator: &WalV8ParallelCoordinator,
     result: GroupWriteResult,
+    completion_event_sender: Option<&Sender<WalV8CompletedGroupEvent>>,
+    #[cfg(feature = "bench")] completion_observed_at: Option<Instant>,
     #[cfg(feature = "bench")] timeline: Option<
         crate::wal::parallel_worker::WalWorkerGroupCompletionTimeline,
     >,
@@ -3144,16 +3383,56 @@ fn reap_v8_group_result(
     #[cfg(feature = "chaos-testing")]
     crate::chaos::failpoint::wal_crash_point("wal_v8.parallel.after_data_write");
 
+    if let Some(sender) = completion_event_sender {
+        #[cfg(feature = "bench")]
+        ensure!(
+            timeline.is_none(),
+            "v8 progress-ring completion timeline is not supported"
+        );
+        let event = WalV8CompletedGroupEvent {
+            group_id: result.group_id,
+            tickets: result.tickets,
+            write_count: result.write_count,
+            write_bytes: result.write_bytes,
+            #[cfg(feature = "bench")]
+            completion_observed_at,
+        };
+        sender.try_send(event).map_err(|error| {
+            coordinator.poison();
+            anyhow::anyhow!("v8 DATA completion event queue overflow or disconnect: {error}")
+        })?;
+        coordinator.notify_completion_queued();
+        return Ok(());
+    }
+
     #[cfg(feature = "bench")]
-    let completion = coordinator.mark_data_group_complete_with_timeline(result.tickets, timeline);
+    let completion = coordinator.mark_data_group_complete_with_timeline(
+        result.tickets,
+        completion_observed_at,
+        timeline,
+    );
     #[cfg(not(feature = "bench"))]
     let completion = coordinator.mark_data_group_complete(result.tickets);
 
     completion.context("publish v8 DATA worker group completion")
 }
 
+struct WalV8CompletionReaperExitGuard {
+    coordinator: WalV8ParallelCoordinator,
+    shutdown_started: Arc<AtomicBool>,
+}
+
+impl Drop for WalV8CompletionReaperExitGuard {
+    fn drop(&mut self) {
+        if !self.shutdown_started.load(Ordering::Acquire) {
+            self.coordinator.poison();
+        }
+    }
+}
+
 impl Drop for WalV8ParallelIo {
     fn drop(&mut self) {
+        self.shutdown_started.store(true, Ordering::Release);
         if let Some(worker) = self.worker.get_mut().take()
             && let Err(error) = worker.close()
         {
@@ -3612,6 +3891,7 @@ impl WalV8LeaderWriter {
                 max_inflight_tickets: MAX_PARALLEL_INFLIGHT_TICKETS,
                 max_inflight_bytes: max_file_size,
                 max_file_size,
+                progress_ring_enabled: false,
             },
         )?;
         ensure!(
@@ -3628,6 +3908,7 @@ impl WalV8LeaderWriter {
             sync: WalIoHandleMetadata::from_file(&sync_file)?,
             extent_preparation: None,
             sliding_extent_preparation: None,
+            progress_ring_enabled: false,
         };
 
         Ok(Self {
@@ -3705,6 +3986,19 @@ impl WalV8LeaderWriter {
         self,
         worker_file: File,
     ) -> Result<WalV8ParallelWriter> {
+        #[cfg(feature = "bench")]
+        let progress_ring_enabled = progress_ring_enabled_from_environment()?;
+        #[cfg(not(feature = "bench"))]
+        let progress_ring_enabled = false;
+
+        self.into_parallel_with_worker_file_and_progress_ring(worker_file, progress_ring_enabled)
+    }
+
+    fn into_parallel_with_worker_file_and_progress_ring(
+        mut self,
+        worker_file: File,
+        progress_ring_enabled: bool,
+    ) -> Result<WalV8ParallelWriter> {
         validate_positional_write_handle(&worker_file)
             .context("validate v8 WAL I/O worker handle")?;
         let worker_metadata = worker_file
@@ -3716,6 +4010,21 @@ impl WalV8LeaderWriter {
                 && worker_metadata.len() >= self.coordinator.last_frontier_end(),
             "v8 WAL I/O worker handle does not refer to the installed Active inode"
         );
+        self.coordinator = self
+            .coordinator
+            .with_progress_ring_mode(self.header, progress_ring_enabled)?;
+        #[cfg(feature = "bench")]
+        let profile = self.profile.load_full();
+        #[cfg(feature = "bench")]
+        if let Some(profile) = &profile {
+            if progress_ring_enabled {
+                profile.validate_v8_progress_ring_compatibility()?;
+            }
+            self.coordinator
+                .set_hol_diagnostics_profile(Arc::clone(profile));
+            self.coordinator
+                .set_data_completion_timestamps_enabled(profile.wal_sync_diagnostics_enabled());
+        }
         #[cfg(feature = "bench")]
         let mut io_diagnostics = self.io_diagnostics;
         #[cfg(feature = "bench")]
@@ -3725,6 +4034,7 @@ impl WalV8LeaderWriter {
         #[cfg(feature = "bench")]
         {
             io_diagnostics.data = WalIoHandleMetadata::from_file(&worker_file)?;
+            io_diagnostics.progress_ring_enabled = progress_ring_enabled;
         }
         #[cfg(feature = "bench")]
         let (extent_preallocator, extent_preparation) =
@@ -3888,7 +4198,7 @@ impl WalV8LeaderWriter {
             extent_preparation,
         )?;
         #[cfg(feature = "bench")]
-        if let Some(profile) = self.profile.load_full() {
+        if let Some(profile) = profile {
             io.set_profile(profile);
         }
 
@@ -4484,16 +4794,28 @@ impl WalV8LeaderWriter {
 }
 
 impl WalV8ParallelWriter {
+    pub(crate) fn progress_ring_enabled(&self) -> bool {
+        self.coordinator.progress_ring_enabled()
+    }
+
     #[cfg(feature = "bench")]
     pub(crate) fn io_diagnostics(&self) -> WalIoDiagnostics {
         let mut diagnostics = self.io_diagnostics;
         diagnostics.sliding_extent_preparation = self.io.extent_preparation_diagnostics();
+        diagnostics.progress_ring_enabled = self.coordinator.progress_ring_enabled();
 
         diagnostics
     }
 
     #[cfg(feature = "bench")]
-    pub(crate) fn set_write_profile(&self, profile: Arc<crate::mem_table::WriteProfile>) {
+    pub(crate) fn set_write_profile(
+        &self,
+        profile: Arc<crate::mem_table::WriteProfile>,
+    ) -> Result<()> {
+        if self.progress_ring_enabled() {
+            profile.validate_v8_progress_ring_compatibility()?;
+        }
+
         self.io.set_profile(Arc::clone(&profile));
         self.coordinator
             .set_hol_diagnostics_profile(Arc::clone(&profile));
@@ -4502,6 +4824,8 @@ impl WalV8ParallelWriter {
                 .set_data_completion_timestamps_enabled(profile.wal_sync_diagnostics_enabled());
         }
         self.profile.store(Some(profile));
+
+        Ok(())
     }
 
     #[cfg(feature = "bench")]
@@ -4531,6 +4855,10 @@ impl WalV8ParallelWriter {
         profile: &crate::mem_table::WriteProfile,
         enabled: bool,
     ) -> Result<()> {
+        ensure!(
+            !enabled || !self.coordinator.progress_ring_enabled(),
+            "V8 HOL diagnostics are not supported with the progress ring"
+        );
         self.coordinator.with_next_ticket(|next_ticket| {
             ensure!(
                 !enabled
@@ -4731,7 +5059,7 @@ impl WalV8ParallelWriter {
         let Some(mut driver) = self.coordinator.acquire_durability_driver(ticket_end)? else {
             return Ok(());
         };
-        let result = self.drive_frontier_through(ticket_end);
+        let result = self.drive_frontier_through(ticket_end, &driver);
         if result.is_ok() {
             driver.complete();
         }
@@ -4739,7 +5067,12 @@ impl WalV8ParallelWriter {
         result
     }
 
-    fn drive_frontier_through(&self, ticket_end: u64) -> Result<()> {
+    fn drive_frontier_through(
+        &self,
+        ticket_end: u64,
+        driver: &WalV8DurabilityDriver,
+    ) -> Result<()> {
+        let progress_ring_enabled = self.coordinator.progress_ring_enabled();
         loop {
             if self.coordinator.is_poisoned() {
                 anyhow::bail!("v8 Parallel WAL is poisoned");
@@ -4766,7 +5099,8 @@ impl WalV8ParallelWriter {
             let driver_wall_started = phase_sample_candidate.map(|_| Instant::now());
             #[cfg(feature = "bench")]
             let driver_cpu_started = phase_sample_candidate.map(|_| digest::thread_cpu_time_ns());
-            let observed_generation = self.coordinator.durability_generation();
+            let eager_observed_generation =
+                (!progress_ring_enabled).then(|| self.coordinator.durability_generation());
             let mut previous = self.frontier.lock();
             #[cfg(feature = "bench")]
             let frontier_lock_wait_ns = frontier_lock_wait_started
@@ -4789,13 +5123,19 @@ impl WalV8ParallelWriter {
             #[cfg(feature = "bench")]
             let mut coalescing_cpu_ns = 0_u64;
             #[cfg(feature = "bench")]
-            let mut snapshot = if diagnostics_enabled {
+            let mut snapshot = if progress_ring_enabled {
+                self.io.advance_and_snapshot(driver, diagnostics_enabled)?
+            } else if diagnostics_enabled {
                 self.coordinator.frontier_ready_snapshot_with_monotonic_ns()
             } else {
                 self.coordinator.frontier_ready_snapshot()
             };
             #[cfg(not(feature = "bench"))]
-            let mut snapshot = self.coordinator.frontier_ready_snapshot();
+            let mut snapshot = if progress_ring_enabled {
+                self.io.advance_and_snapshot(driver, false)?
+            } else {
+                self.coordinator.frontier_ready_snapshot()
+            };
             #[cfg(feature = "bench")]
             let has_ready_prefix = !snapshot.ready_prefix.is_empty();
             #[cfg(feature = "bench")]
@@ -4841,7 +5181,14 @@ impl WalV8ParallelWriter {
                 #[cfg(feature = "bench")]
                 let phase_cpu_started = phase_sample_id.map(|_| digest::thread_cpu_time_ns());
                 #[cfg(feature = "bench")]
-                let waited = if phase_sample_id.is_some() {
+                let waited = if progress_ring_enabled {
+                    self.io.coalesce_progress_ring(
+                        driver,
+                        &mut snapshot,
+                        budget,
+                        diagnostics_enabled,
+                    )?
+                } else if phase_sample_id.is_some() {
                     let observation = self.coordinator.coalesce_frontier_ready_sampled(budget);
                     let waited = observation.waited;
                     coalescing_detail = Some(observation);
@@ -4850,7 +5197,12 @@ impl WalV8ParallelWriter {
                     self.coordinator.coalesce_frontier_ready(budget)
                 };
                 #[cfg(not(feature = "bench"))]
-                let waited = self.coordinator.coalesce_frontier_ready(budget);
+                let waited = if progress_ring_enabled {
+                    self.io
+                        .coalesce_progress_ring(driver, &mut snapshot, budget, false)?
+                } else {
+                    self.coordinator.coalesce_frontier_ready(budget)
+                };
                 #[cfg(feature = "bench")]
                 {
                     coalescing_wall_ns = phase_started
@@ -4870,7 +5222,7 @@ impl WalV8ParallelWriter {
                 #[cfg(not(feature = "bench"))]
                 let _ = waited;
                 #[cfg(feature = "bench")]
-                {
+                if !progress_ring_enabled {
                     snapshot = if diagnostics_enabled {
                         self.coordinator.frontier_ready_snapshot_with_monotonic_ns()
                     } else {
@@ -4878,7 +5230,7 @@ impl WalV8ParallelWriter {
                     };
                 }
                 #[cfg(not(feature = "bench"))]
-                {
+                if !progress_ring_enabled {
                     snapshot = self.coordinator.frontier_ready_snapshot();
                 }
                 #[cfg(feature = "bench")]
@@ -4923,14 +5275,29 @@ impl WalV8ParallelWriter {
                         .record_wal_v8_durability_empty_driver_attempt();
                 }
                 drop(previous);
-                let wake = self
-                    .coordinator
-                    .wait_for_durability_change(observed_generation, Duration::from_secs(1));
-                if wake.poisoned {
-                    anyhow::bail!("v8 Parallel WAL was poisoned while waiting for durability");
-                }
-                if wake.closed && self.coordinator.durable_ticket_end() < ticket_end {
-                    anyhow::bail!("v8 Parallel WAL closed before the ticket became durable");
+                if let Some(observed_generation) = eager_observed_generation {
+                    let wake = self
+                        .coordinator
+                        .wait_for_durability_change(observed_generation, Duration::from_secs(1));
+                    if wake.poisoned {
+                        anyhow::bail!("v8 Parallel WAL was poisoned while waiting for durability");
+                    }
+                    if wake.closed && self.coordinator.durable_ticket_end() < ticket_end {
+                        anyhow::bail!("v8 Parallel WAL closed before the ticket became durable");
+                    }
+                } else {
+                    if snapshot.closed {
+                        anyhow::bail!("v8 Parallel WAL closed before the ticket became durable");
+                    }
+                    let _ = self.io.wait_for_progress(Duration::from_secs(1))?;
+                    if self.coordinator.is_poisoned() {
+                        anyhow::bail!("v8 Parallel WAL was poisoned while waiting for durability");
+                    }
+                    if self.coordinator.is_closed()
+                        && self.coordinator.durable_ticket_end() < ticket_end
+                    {
+                        anyhow::bail!("v8 Parallel WAL closed before the ticket became durable");
+                    }
                 }
                 continue;
             }
@@ -6535,6 +6902,24 @@ mod tests {
         assert!(wal_v8_extent_lookahead_from_value(Some(OsStr::new("yes"))).is_err());
     }
 
+    #[cfg(feature = "bench")]
+    #[test]
+    fn progress_ring_experiment_switch_is_explicitly_opt_in() {
+        assert!(!progress_ring_enabled_from_value(None).unwrap());
+        assert!(!progress_ring_enabled_from_value(Some(OsStr::new("0"))).unwrap());
+        assert!(progress_ring_enabled_from_value(Some(OsStr::new("1"))).unwrap());
+        assert!(progress_ring_enabled_from_value(Some(OsStr::new("true"))).is_err());
+    }
+
+    #[cfg(all(feature = "bench", unix))]
+    #[test]
+    fn progress_ring_experiment_switch_rejects_non_utf8_values() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let non_utf8 = OsStr::from_bytes(b"\xff");
+        assert!(progress_ring_enabled_from_value(Some(non_utf8)).is_err());
+    }
+
     fn header() -> WalV8Header {
         let archive_epoch_id = ArchiveEpochId([0x22; 16]);
 
@@ -6725,8 +7110,11 @@ mod tests {
         let parallel_path = directory.path().join("parallel-v8.wal");
         let parallel_installed = install_empty(&parallel_path, header())?;
         let parallel_profile = Arc::new(crate::mem_table::WriteProfile::default());
-        let parallel = open_writer(&parallel_path, &parallel_installed)?.into_parallel()?;
-        parallel.set_write_profile(Arc::clone(&parallel_profile));
+        let parallel_leader = open_writer(&parallel_path, &parallel_installed)?;
+        let worker_file = parallel_leader.write_file.try_clone()?;
+        let parallel =
+            parallel_leader.into_parallel_with_worker_file_and_progress_ring(worker_file, false)?;
+        parallel.set_write_profile(Arc::clone(&parallel_profile))?;
         let first_batch = batch(10);
         let second_batch = batch(20);
         let first = parallel.preflight_batch(&first_batch, LIVE_WAL_V5_LIMITS)?;
@@ -6844,6 +7232,13 @@ mod tests {
             #[cfg(not(feature = "bench"))]
             let writer = open_writer(wal_path, &installed)?.into_parallel()?;
             #[cfg(feature = "bench")]
+            assert_eq!(
+                writer.progress_ring_enabled(),
+                std::env::var_os(WAL_V8_POINT_PROGRESS_RING_ENV).as_deref()
+                    == Some(OsStr::new("1")),
+                "child writer must use the requested progress mode"
+            );
+            #[cfg(feature = "bench")]
             let value = if std::env::var_os(EXTENT_PREPARATION_ENV).as_deref()
                 == Some(OsStr::new("sliding-initialize"))
             {
@@ -6883,7 +7278,19 @@ mod tests {
 
         for frontier_mode in frontier_modes {
             for extent_preparation_mode in extent_preparation_modes {
-                for (crash_point, expected_min_ticket_end, expected_max_ticket_end) in CRASH_POINTS
+                let mut cases = CRASH_POINTS
+                    .map(|(point, min, max)| (false, point, min, max))
+                    .to_vec();
+                if cfg!(feature = "bench")
+                    && matches!(
+                        (frontier_mode, extent_preparation_mode),
+                        ("buffered", "none") | ("direct", "sliding-point-lookahead")
+                    )
+                {
+                    cases.extend(CRASH_POINTS.map(|(point, min, max)| (true, point, min, max)));
+                }
+                for (ring_enabled, crash_point, expected_min_ticket_end, expected_max_ticket_end) in
+                    cases
                 {
                     let directory = tempfile::tempdir_in(&parent)?;
                     let wal_path = directory.path().join("active-v8.wal");
@@ -6917,6 +7324,11 @@ mod tests {
                         .stdout(Stdio::null())
                         .stderr(Stdio::inherit());
                     #[cfg(feature = "bench")]
+                    child.env(
+                        WAL_V8_POINT_PROGRESS_RING_ENV,
+                        if ring_enabled { "1" } else { "0" },
+                    );
+                    #[cfg(feature = "bench")]
                     if extent_preparation_mode != "none" {
                         child
                             .env(EXTENT_PREPARATION_ENV, extent_preparation_mode)
@@ -6933,14 +7345,14 @@ mod tests {
                         }
                         if let Some(status) = child.try_wait()? {
                             anyhow::bail!(
-                                "V8 writer child exited before reaching {crash_point} in {frontier_mode}/{extent_preparation_mode} mode: {status}"
+                                "V8 writer child exited before reaching {crash_point} in {frontier_mode}/{extent_preparation_mode} mode (ring={ring_enabled}): {status}"
                             );
                         }
                         if Instant::now() >= deadline {
                             let _ = child.kill();
                             let _ = child.wait();
                             anyhow::bail!(
-                                "V8 writer child did not reach {crash_point} in {frontier_mode}/{extent_preparation_mode} mode"
+                                "V8 writer child did not reach {crash_point} in {frontier_mode}/{extent_preparation_mode} mode (ring={ring_enabled})"
                             );
                         }
                         thread::sleep(Duration::from_millis(10));
@@ -7057,7 +7469,7 @@ mod tests {
 
         let writer = open_writer(&path, &installed)?.into_parallel()?;
         let profile = Arc::new(crate::mem_table::WriteProfile::default());
-        writer.set_write_profile(Arc::clone(&profile));
+        writer.set_write_profile(Arc::clone(&profile))?;
         writer.set_wal_sync_diagnostics_enabled(&profile, true)?;
 
         let next = batch(20);
@@ -7082,6 +7494,83 @@ mod tests {
             .expect_err("diagnostics re-enable after a new ticket must be rejected");
         assert!(error.to_string().contains("before the first WAL ticket"));
         assert!(!profile.wal_sync_diagnostics_enabled());
+
+        Ok(())
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn progress_ring_rejects_incompatible_profile_inherited_from_leader() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory
+            .path()
+            .join("progress-ring-inherited-profile-v8.wal");
+        let installed = install_empty(&path, header())?;
+        let leader = open_writer(&path, &installed)?;
+        let profile = Arc::new(crate::mem_table::WriteProfile::default());
+        profile.set_wal_hol_diagnostics_enabled(true);
+        leader.set_write_profile(Arc::clone(&profile));
+
+        let worker_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_DIRECT)
+            .open(&path)?;
+        let error = match leader.into_parallel_with_worker_file_and_progress_ring(worker_file, true)
+        {
+            Ok(writer) => {
+                drop(writer);
+                anyhow::bail!("parallel conversion accepted an incompatible inherited profile")
+            }
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("V8 HOL diagnostics"));
+
+        Ok(())
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn progress_ring_rejects_unsupported_diagnostics_when_profile_is_attached() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("progress-ring-profile-v8.wal");
+        let installed = install_empty(&path, header())?;
+        let writer = match open_parallel_with_progress_mode(&path, &installed, true) {
+            Ok(writer) => writer,
+            Err(error) if is_io_uring_unavailable_error(&error) => {
+                eprintln!("skipping test (io_uring unavailable): {error:#}");
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        let wal = crate::wal::Wal::from_v8_parallel(writer, &installed)?;
+
+        let hol_profile = Arc::new(crate::mem_table::WriteProfile::default());
+        hol_profile.set_wal_hol_diagnostics_enabled(true);
+        let error = wal
+            .set_write_profile(Arc::clone(&hol_profile))
+            .expect_err("ring writer must reject preconfigured HOL diagnostics");
+        assert!(error.to_string().contains("V8 HOL diagnostics"));
+
+        let timeline_profile = Arc::new(crate::mem_table::WriteProfile::default());
+        timeline_profile.set_wal_v8_completion_timeline_sample_every(1);
+        let error = wal
+            .set_write_profile(Arc::clone(&timeline_profile))
+            .expect_err("ring writer must reject a preconfigured completion timeline");
+        assert!(
+            error
+                .to_string()
+                .contains("completion timeline diagnostics")
+        );
+
+        let durability_profile = Arc::new(crate::mem_table::WriteProfile::default());
+        durability_profile.set_wal_v8_durability_sample_every(1);
+        let error = wal
+            .set_write_profile(Arc::clone(&durability_profile))
+            .expect_err("ring writer must reject preconfigured durability sampling");
+        assert!(error.to_string().contains("durability phase diagnostics"));
+
+        wal.set_write_profile(Arc::new(crate::mem_table::WriteProfile::default()))?;
 
         Ok(())
     }
@@ -8130,7 +8619,7 @@ mod tests {
         #[cfg(feature = "bench")]
         let profile = Arc::new(crate::mem_table::WriteProfile::default());
         #[cfg(feature = "bench")]
-        writer.set_write_profile(Arc::clone(&profile));
+        writer.set_write_profile(Arc::clone(&profile))?;
         let first = multi_frame_batch(10);
         let second = batch(20);
         let third = batch(30);
@@ -8702,6 +9191,390 @@ mod tests {
             replayed_batches(&path, &recovered)?,
             [first_batch, second_batch]
         );
+
+        Ok(())
+    }
+
+    fn open_parallel_with_progress_mode(
+        path: &Path,
+        installed: &WalV8InstalledRecovery,
+        enabled: bool,
+    ) -> Result<WalV8ParallelWriter> {
+        let worker_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_DIRECT)
+            .open(path)?;
+        open_writer(path, installed)?
+            .into_parallel_with_worker_file_and_progress_ring(worker_file, enabled)
+    }
+
+    #[test]
+    fn progress_ring_driver_scan_to_park_observes_late_data_completion() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("progress-ring-scan-to-park-v8.wal");
+        let header = header();
+        let installed = install_empty(&path, header)?;
+        let writer = match open_parallel_with_progress_mode(&path, &installed, true) {
+            Ok(writer) => Arc::new(writer),
+            Err(error) if is_io_uring_unavailable_error(&error) => {
+                eprintln!("skipping test (io_uring unavailable): {error:#}");
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+
+        let (first_wait_entered_tx, first_wait_entered_rx) = crossbeam_channel::bounded(1);
+        let (second_wait_entered_tx, second_wait_entered_rx) = crossbeam_channel::bounded(1);
+        let (release_first_wait_tx, release_first_wait_rx) = crossbeam_channel::bounded(1);
+        let (release_second_wait_tx, release_second_wait_rx) = crossbeam_channel::bounded(1);
+        let (wait_result_tx, wait_result_rx) = crossbeam_channel::bounded(4);
+        let first_wait = Arc::new(AtomicBool::new(false));
+        let second_wait = Arc::new(AtomicBool::new(false));
+        writer.io.set_progress_wait_hook(Arc::new({
+            let first_wait = Arc::clone(&first_wait);
+            let second_wait = Arc::clone(&second_wait);
+            move |event| match event {
+                WalV8ProgressWaitTestEvent::BeforeWait
+                    if !first_wait.swap(true, Ordering::AcqRel) =>
+                {
+                    let _ = first_wait_entered_tx.send(());
+                    let _ = release_first_wait_rx.recv_timeout(Duration::from_secs(5));
+                }
+                WalV8ProgressWaitTestEvent::BeforeWait
+                    if !second_wait.swap(true, Ordering::AcqRel) =>
+                {
+                    let _ = second_wait_entered_tx.send(());
+                    let _ = release_second_wait_rx.recv_timeout(Duration::from_secs(5));
+                }
+                WalV8ProgressWaitTestEvent::AfterWait(result) => {
+                    let _ = wait_result_tx.send(result);
+                }
+                WalV8ProgressWaitTestEvent::BeforeWait => {}
+            }
+        }));
+
+        let (completion_received_tx, completion_received_rx) = crossbeam_channel::bounded(1);
+        let (completion_published_tx, completion_published_rx) = crossbeam_channel::bounded(1);
+        let (release_completion_before_tx, release_completion_before_rx) =
+            crossbeam_channel::bounded(1);
+        let (release_completion_after_tx, release_completion_after_rx) =
+            crossbeam_channel::bounded(1);
+        writer
+            .io
+            .set_completion_reap_hook(Arc::new(move |event| match event {
+                WalV8CompletionReapTestEvent::BeforeReap => {
+                    let _ = completion_received_tx.send(());
+                    let _ = release_completion_before_rx.recv_timeout(Duration::from_secs(5));
+                }
+                WalV8CompletionReapTestEvent::AfterReap => {
+                    let _ = completion_published_tx.send(());
+                    let _ = release_completion_after_rx.recv_timeout(Duration::from_secs(5));
+                }
+            }));
+
+        struct ProgressRingRaceCleanup {
+            coordinator: WalV8ParallelCoordinator,
+            releases: Vec<Option<crossbeam_channel::Sender<()>>>,
+            armed: bool,
+        }
+        impl ProgressRingRaceCleanup {
+            fn release(&mut self, index: usize) {
+                if let Some(sender) = self.releases[index].take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+        impl Drop for ProgressRingRaceCleanup {
+            fn drop(&mut self) {
+                for sender in &mut self.releases {
+                    if let Some(sender) = sender.take() {
+                        let _ = sender.send(());
+                    }
+                }
+                if self.armed {
+                    self.coordinator.poison();
+                }
+            }
+        }
+
+        let input = batch(10);
+        let prepared = writer.preflight_batch(&input, LIVE_WAL_V5_LIMITS)?;
+        let job = writer.admit_prepared_batch(prepared, input.commit_ts, input.recorded_at)?;
+        let ticket = job.assignment().segment_ticket;
+        let (driver_result_tx, driver_result_rx) = mpsc::channel();
+
+        thread::scope(|scope| -> Result<()> {
+            let mut cleanup = ProgressRingRaceCleanup {
+                coordinator: writer.coordinator.clone(),
+                releases: vec![
+                    Some(release_first_wait_tx),
+                    Some(release_second_wait_tx),
+                    Some(release_completion_before_tx),
+                    Some(release_completion_after_tx),
+                ],
+                armed: true,
+            };
+            let driver_writer = Arc::clone(&writer);
+            let driver = scope.spawn(move || {
+                let _ = driver_result_tx.send(driver_writer.advance_frontier_through(ticket));
+            });
+
+            first_wait_entered_rx
+                .recv_timeout(Duration::from_secs(5))
+                .context("durability driver did not reach its first post-scan wait")?;
+
+            // The first readiness scan has completed. Finish and submit DATA,
+            // then pause the reaper after CQE receipt but before it queues the
+            // completion event. This lets readiness wake the driver without
+            // allowing DATA-complete publication to race ahead of its next scan.
+            job.finish()?;
+            completion_received_rx
+                .recv_timeout(Duration::from_secs(5))
+                .context("completion reaper did not receive the DATA result")?;
+            cleanup.release(0);
+
+            // The driver consumed the readiness token, rescanned while the
+            // completion event queue was still empty, and is now paused before
+            // parking with the ticket still DATA-incomplete.
+            second_wait_entered_rx
+                .recv_timeout(Duration::from_secs(5))
+                .context("durability driver did not reach the DATA-incomplete wait")?;
+            cleanup.release(2);
+            completion_published_rx
+                .recv_timeout(Duration::from_secs(5))
+                .context("completion reaper did not queue and signal the DATA result")?;
+            cleanup.release(1);
+            cleanup.release(3);
+
+            let first_wait_result = wait_result_rx
+                .recv_timeout(Duration::from_secs(5))
+                .context("driver's readiness wait did not return")?;
+            let second_wait_result = wait_result_rx
+                .recv_timeout(Duration::from_secs(5))
+                .context("driver's completion wait did not return")?;
+            assert_eq!(first_wait_result, WalV8ProgressTokenWait::Signaled);
+            assert_eq!(
+                second_wait_result,
+                WalV8ProgressTokenWait::Signaled,
+                "late DATA-completion publication must wake the driver without timeout polling"
+            );
+
+            let driver_result = driver_result_rx
+                .recv_timeout(Duration::from_secs(5))
+                .context("durability driver did not observe the late completion")?;
+            driver
+                .join()
+                .map_err(|_| anyhow::anyhow!("durability driver panicked"))?;
+            driver_result?;
+            cleanup.armed = false;
+
+            assert_eq!(writer.active_boundaries()?.1.ticket_end, ticket + 1);
+            Ok(())
+        })?;
+
+        drop(writer);
+        let recovered = super::super::install::recover_and_install_active(
+            &path,
+            &[installed.active_boundary],
+            header.predecessor,
+            LIVE_WAL_V5_LIMITS,
+            MAX_WAL_FILE_SIZE,
+        )?;
+        assert_eq!(recovered.active_boundary.ticket_end, 1);
+        assert_eq!(replayed_batches(&path, &recovered)?, [input]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn progress_ring_clean_close_drains_ready_tickets_without_waiting_for_unready_ones()
+    -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("progress-ring-clean-close.wal");
+        let installed = install_empty(&path, header())?;
+        let writer = match open_parallel_with_progress_mode(&path, &installed, true) {
+            Ok(writer) => writer,
+            Err(error) if is_io_uring_unavailable_error(&error) => {
+                eprintln!("skipping test (io_uring unavailable): {error:#}");
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+
+        let (reaped_tx, reaped_rx) = mpsc::sync_channel(1);
+        writer.io.set_completion_reap_hook(Arc::new(move |event| {
+            if matches!(event, WalV8CompletionReapTestEvent::AfterReap) {
+                let _ = reaped_tx.try_send(());
+            }
+        }));
+
+        // Establish a sync latency so the next partially ready prefix would
+        // normally be eligible for coalescing.
+        let first = batch(10);
+        writer.append_prepared_batch(
+            writer.preflight_batch(&first, LIVE_WAL_V5_LIMITS)?,
+            first.commit_ts,
+            first.recorded_at,
+        )?;
+        reaped_rx
+            .recv_timeout(Duration::from_secs(5))
+            .context("first DATA group was not reaped")?;
+
+        let ready = batch(20);
+        let ready_job = writer.admit_prepared_batch(
+            writer.preflight_batch(&ready, LIVE_WAL_V5_LIMITS)?,
+            ready.commit_ts,
+            ready.recorded_at,
+        )?;
+        let ready_ticket = ready_job.assignment().segment_ticket;
+        let unready = batch(30);
+        let unready_job = writer.admit_prepared_batch(
+            writer.preflight_batch(&unready, LIVE_WAL_V5_LIMITS)?,
+            unready.commit_ts,
+            unready.recorded_at,
+        )?;
+        ready_job.finish()?;
+        reaped_rx
+            .recv_timeout(Duration::from_secs(5))
+            .context("ready DATA group was not reaped")?;
+
+        writer.io.set_progress_wait_hook(Arc::new(|event| {
+            assert!(
+                !matches!(event, WalV8ProgressWaitTestEvent::BeforeWait),
+                "closed progress ring attempted to park"
+            );
+        }));
+        writer.coordinator.close();
+        writer.wait_durable(ready_ticket)?;
+        assert_eq!(writer.active_boundaries()?.1.ticket_end, ready_ticket + 1);
+        let error = writer
+            .wait_durable(unready_job.assignment().segment_ticket)
+            .expect_err("unready ticket must fail after close");
+        assert!(format!("{error:#}").contains("WAL closed before the ticket became durable"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn v8_progress_ring_parallel_write_reopen_and_recovery() -> Result<()> {
+        let parent = Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/wal-v8-tests");
+        std::fs::create_dir_all(&parent)?;
+        let directory = tempfile::tempdir_in(parent)?;
+        let path = directory.path().join("progress-ring-active-v8.wal");
+        let wal_header = header();
+        let installed = install_empty(&path, wal_header)?;
+        let writer = match open_parallel_with_progress_mode(&path, &installed, false) {
+            Ok(writer) => writer,
+            Err(error) if is_io_uring_unavailable_error(&error) => {
+                eprintln!("skipping test (io_uring unavailable): {error:#}");
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        assert!(!writer.progress_ring_enabled());
+
+        let first_batch = batch(10);
+        writer.append_prepared_batch(
+            writer.preflight_batch(&first_batch, LIVE_WAL_V5_LIMITS)?,
+            first_batch.commit_ts,
+            first_batch.recorded_at,
+        )?;
+
+        let (_, first_boundary) = writer.active_boundaries()?;
+        assert_eq!(first_boundary.ticket_end, 1);
+        drop(writer);
+
+        let ring_recovered = super::super::install::recover_and_install_active(
+            &path,
+            &[first_boundary],
+            wal_header.predecessor,
+            LIVE_WAL_V5_LIMITS,
+            MAX_WAL_FILE_SIZE,
+        )?;
+        assert_eq!(ring_recovered.next_ticket, 1);
+        assert_eq!(
+            replayed_batches(&path, &ring_recovered)?,
+            std::slice::from_ref(&first_batch)
+        );
+
+        // Reopen the nonempty Active image in ring mode. Its new ring starts
+        // at the recovered absolute ticket and digest boundary.
+        let ring_writer = open_parallel_with_progress_mode(&path, &ring_recovered, true)?;
+        assert!(ring_writer.progress_ring_enabled());
+        assert_eq!(
+            ring_writer.coordinator.durable_ticket_end(),
+            ring_recovered.active_boundary.ticket_end
+        );
+        assert_eq!(
+            ring_writer.coordinator.durable_prefix_digest(),
+            ring_recovered.active_boundary.prefix_digest
+        );
+        let second_batch = batch(20);
+        ring_writer.append_prepared_batch(
+            ring_writer.preflight_batch(&second_batch, LIVE_WAL_V5_LIMITS)?,
+            second_batch.commit_ts,
+            second_batch.recorded_at,
+        )?;
+        let (_, second_boundary) = ring_writer.active_boundaries()?;
+        assert_eq!(second_boundary.ticket_end, 2);
+        drop(ring_writer);
+
+        // A subsequent same-segment reopen can select eager publication
+        // again while preserving the recovered durable prefix.
+        let eager_recovered = super::super::install::recover_and_install_active(
+            &path,
+            &[second_boundary],
+            wal_header.predecessor,
+            LIVE_WAL_V5_LIMITS,
+            MAX_WAL_FILE_SIZE,
+        )?;
+        assert_eq!(eager_recovered.next_ticket, 2);
+        assert_eq!(
+            replayed_batches(&path, &eager_recovered)?,
+            [first_batch.clone(), second_batch.clone()]
+        );
+        let eager_writer = open_parallel_with_progress_mode(&path, &eager_recovered, false)?;
+        assert!(!eager_writer.progress_ring_enabled());
+        let third_batch = batch(30);
+        eager_writer.append_prepared_batch(
+            eager_writer.preflight_batch(&third_batch, LIVE_WAL_V5_LIMITS)?,
+            third_batch.commit_ts,
+            third_batch.recorded_at,
+        )?;
+        let (_, third_boundary) = eager_writer.active_boundaries()?;
+        assert_eq!(third_boundary.ticket_end, 3);
+        drop(eager_writer);
+
+        let final_recovered = super::super::install::recover_and_install_active(
+            &path,
+            &[third_boundary],
+            wal_header.predecessor,
+            LIVE_WAL_V5_LIMITS,
+            MAX_WAL_FILE_SIZE,
+        )?;
+        assert_eq!(
+            replayed_batches(&path, &final_recovered)?,
+            [first_batch, second_batch, third_batch]
+        );
+
+        // A separately constructed fresh segment gets a new pipeline when
+        // that mode is selected. This checks writer construction, not rotation.
+        let fresh_segment_header = WalV8Header {
+            segment_id: crate::pitr::SegmentId(wal_header.segment_id.0 + 1),
+            predecessor: crate::pitr::ChainAnchor::Segment(crate::pitr::SegmentAnchor {
+                segment_id: wal_header.segment_id,
+                wal_digest: [0x77; 32],
+                seal_digest: [0x88; 32],
+            }),
+            incarnation: [0x55; 16],
+            ..wal_header
+        };
+        let fresh_segment_path = directory.path().join("progress-ring-fresh-segment-v8.wal");
+        let fresh_segment_installed = install_empty(&fresh_segment_path, fresh_segment_header)?;
+        let fresh_segment_writer =
+            open_parallel_with_progress_mode(&fresh_segment_path, &fresh_segment_installed, true)?;
+        assert!(fresh_segment_writer.progress_ring_enabled());
 
         Ok(())
     }

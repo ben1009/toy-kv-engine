@@ -403,7 +403,8 @@ pub struct WalSyncObservation {
     pub tickets_covered: Option<u64>,
     /// Time spent writing the V8 FRONTIER frame before fdatasync.
     pub frontier_write_ns: u64,
-    /// Time from the latest covered DATA completion to FRONTIER write start.
+    /// Time from observing the latest covered DATA completion to FRONTIER write start.
+    /// V8 Parallel observes the completion when its Reaper receives the result.
     pub data_completion_to_frontier_start_ns: Option<u64>,
     /// V8 FRONTIER coalescing budget selected when this advance was eligible.
     pub coalescing_budget_us: Option<u64>,
@@ -871,6 +872,23 @@ pub struct WalV8FollowerWaitObservation {
 impl WriteProfile {
     /// Hard limit for opt-in commit-order trace records retained by a benchmark run.
     pub const MAX_COMMIT_ORDER_TRACE_RECORDS: u64 = 16_384;
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn validate_v8_progress_ring_compatibility(&self) -> Result<()> {
+        anyhow::ensure!(
+            !self.wal_hol_diagnostics_enabled(),
+            "V8 HOL diagnostics are not supported with the progress ring"
+        );
+        anyhow::ensure!(
+            self.wal_v8_completion_timeline_sample_every() == 0,
+            "V8 completion timeline diagnostics are not supported with the progress ring"
+        );
+        anyhow::ensure!(
+            self.wal_v8_durability_sample_every() == 0,
+            "V8 durability phase diagnostics are not supported with the progress ring"
+        );
+        Ok(())
+    }
 
     #[cfg(feature = "bench")]
     pub(crate) fn configure_commit_order_trace(&self, limit: u64) {
@@ -1989,12 +2007,17 @@ impl WriteProfile {
             .fetch_add(metrics.payload_hash_cpu_ns, o);
         self.wal_v8_header_batch_hash_cpu_ns
             .fetch_add(metrics.header_batch_hash_cpu_ns, o);
-        self.wal_v8_ordered_link_hash_cpu_ns
-            .fetch_add(metrics.ordered_link_hash_cpu_ns, o);
+        self.record_wal_v8_ordered_link_hash_cpu_ns(metrics.ordered_link_hash_cpu_ns);
         self.wal_v8_post_encode_hash_reread_bytes
             .fetch_add(metrics.post_encode_hash_reread_bytes, o);
         self.wal_v8_cpu_timing_sampled_tickets
             .fetch_add(metrics.cpu_timing_sampled_tickets, o);
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn record_wal_v8_ordered_link_hash_cpu_ns(&self, nanos: u64) {
+        self.wal_v8_ordered_link_hash_cpu_ns
+            .fetch_add(nanos, std::sync::atomic::Ordering::Relaxed);
     }
 
     #[cfg(feature = "bench")]
@@ -5204,12 +5227,18 @@ impl MemTable {
 
     /// Replace the write profile with a shared instance (e.g., from LsmStorageInner).
     /// This allows profiling to accumulate across memtable freezes.
-    pub fn set_write_profile(&self, profile: Arc<WriteProfile>) {
-        self.write_profile.store(Arc::clone(&profile));
-
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the profile enables V8 diagnostics that are not
+    /// supported by the attached progress-ring writer.
+    pub fn set_write_profile(&self, profile: Arc<WriteProfile>) -> Result<()> {
         if let Some(wal) = &self.wal {
-            wal.set_write_profile(profile);
+            wal.set_write_profile(Arc::clone(&profile))?;
         }
+        self.write_profile.store(profile);
+
+        Ok(())
     }
 
     #[cfg(feature = "bench")]
@@ -5235,6 +5264,40 @@ impl MemTable {
 
             Ok(())
         }
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn set_wal_v8_completion_timeline_sample_every(&self, every: u64) -> Result<()> {
+        if every > 0
+            && let Some(wal) = &self.wal
+        {
+            anyhow::ensure!(
+                !wal.v8_progress_ring_enabled(),
+                "V8 completion timeline diagnostics are not supported with the progress ring"
+            );
+        }
+
+        self.write_profile
+            .load_full()
+            .set_wal_v8_completion_timeline_sample_every(every);
+        Ok(())
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn set_wal_v8_durability_sample_every(&self, every: u64) -> Result<()> {
+        if every > 0
+            && let Some(wal) = &self.wal
+        {
+            anyhow::ensure!(
+                !wal.v8_progress_ring_enabled(),
+                "V8 durability phase diagnostics are not supported with the progress ring"
+            );
+        }
+
+        self.write_profile
+            .load_full()
+            .set_wal_v8_durability_sample_every(every);
+        Ok(())
     }
 
     /// Write a range tombstone into the memtable.

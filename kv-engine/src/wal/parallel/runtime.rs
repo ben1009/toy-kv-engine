@@ -4181,7 +4181,7 @@ mod tests {
         };
         let profile = Arc::new(crate::mem_table::WriteProfile::default());
         profile.set_wal_sync_diagnostics_enabled(true);
-        wal.set_write_profile(Arc::clone(&profile));
+        wal.set_write_profile(Arc::clone(&profile))?;
 
         let (ticket, _) = wal.put_v7_batch_with_index(&v7_test_batch(1, 16), LIVE_WAL_V5_LIMITS)?;
         wal.submit_and_commit(ticket)?;
@@ -4734,7 +4734,7 @@ mod tests {
         let profile = {
             let profile = Arc::new(crate::mem_table::WriteProfile::default());
             profile.set_wal_sync_diagnostics_enabled(true);
-            wal.set_write_profile(Arc::clone(&profile));
+            wal.set_write_profile(Arc::clone(&profile))?;
             profile
         };
         let runtime = wal.parallel_runtime.as_ref().unwrap();
@@ -4856,7 +4856,7 @@ mod tests {
         let profile = {
             let profile = Arc::new(crate::mem_table::WriteProfile::default());
             profile.set_wal_sync_diagnostics_enabled(true);
-            wal.set_write_profile(Arc::clone(&profile));
+            wal.set_write_profile(Arc::clone(&profile))?;
             profile
         };
         let runtime = wal.parallel_runtime.as_ref().unwrap();
@@ -4908,7 +4908,7 @@ mod tests {
         let profile = {
             let profile = Arc::new(crate::mem_table::WriteProfile::default());
             profile.set_wal_sync_diagnostics_enabled(true);
-            wal.set_write_profile(Arc::clone(&profile));
+            wal.set_write_profile(Arc::clone(&profile))?;
             profile
         };
         let runtime = wal.parallel_runtime.as_ref().unwrap();
@@ -4996,7 +4996,7 @@ mod tests {
         let profile = {
             let profile = Arc::new(crate::mem_table::WriteProfile::default());
             profile.set_wal_sync_diagnostics_enabled(true);
-            wal.set_write_profile(Arc::clone(&profile));
+            wal.set_write_profile(Arc::clone(&profile))?;
             profile
         };
         let runtime = wal.parallel_runtime.as_ref().unwrap();
@@ -5075,7 +5075,7 @@ mod tests {
         let profile = {
             let profile = Arc::new(crate::mem_table::WriteProfile::default());
             profile.set_wal_sync_diagnostics_enabled(true);
-            wal.set_write_profile(Arc::clone(&profile));
+            wal.set_write_profile(Arc::clone(&profile))?;
             profile
         };
         let runtime = wal.parallel_runtime.as_ref().unwrap();

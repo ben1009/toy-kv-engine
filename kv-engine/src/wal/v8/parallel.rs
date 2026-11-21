@@ -10,7 +10,7 @@ use std::{
     ops::Range,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -19,7 +19,8 @@ use std::{
 use std::collections::BTreeMap;
 
 use anyhow::{Context, Result, ensure};
-use parking_lot::{Condvar, Mutex};
+use crossbeam_channel::{Receiver, Sender};
+use parking_lot::{Condvar, Mutex, MutexGuard};
 
 use crate::{pitr::RecordedAt, wal::MAX_WAL_FILE_SIZE};
 
@@ -36,6 +37,32 @@ use super::{
 
 const DATA_START: u64 = (WAL_V8_HEADER_LEN + WAL_V8_FRAME_LEN) as u64;
 const FRAME_LEN_U64: u64 = WAL_V8_FRAME_LEN as u64;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WalV8ProgressTokenWait {
+    Signaled,
+    TimedOut,
+    Disconnected,
+}
+
+/// Consume a pending wake before scanning the ring and completion queue.
+/// Publications racing after this receive leave a token for the next park.
+pub(crate) fn consume_progress_token_before_scan(receiver: &Receiver<()>) {
+    let _ = receiver.try_recv();
+}
+
+pub(crate) fn wait_for_progress_token(
+    receiver: &Receiver<()>,
+    timeout: Duration,
+) -> WalV8ProgressTokenWait {
+    match receiver.recv_timeout(timeout) {
+        Ok(()) => WalV8ProgressTokenWait::Signaled,
+        Err(crossbeam_channel::RecvTimeoutError::Timeout) => WalV8ProgressTokenWait::TimedOut,
+        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+            WalV8ProgressTokenWait::Disconnected
+        }
+    }
+}
 
 /// Configuration for a v8 Parallel admission window resumed from recovery.
 #[derive(Clone, Copy, Debug)]
@@ -56,6 +83,9 @@ pub(crate) struct WalV8ParallelConfig {
     pub(crate) max_inflight_bytes: u64,
     /// Configured limit for this Active WAL image.
     pub(crate) max_file_size: u64,
+    /// Allocate the experimental per-ticket progress ring for this WAL.
+    /// Runtime selection remains opt-in and is wired before Parallel attachment.
+    pub(crate) progress_ring_enabled: bool,
 }
 
 #[derive(Clone)]
@@ -91,6 +121,249 @@ struct CoordinatorInner {
     max_inflight_tickets: usize,
     max_inflight_bytes: u64,
     max_file_size: u64,
+    progress_ring: Option<TicketProgressRing>,
+    progress_token_sender: Option<Sender<()>>,
+    progress_token_receiver: Mutex<Option<Receiver<()>>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TicketCellIdentity {
+    segment_incarnation: [u8; 16],
+    ticket: u64,
+}
+
+struct TicketProgressRing {
+    segment_incarnation: [u8; 16],
+    cells: Box<[TicketProgressCell]>,
+    /// Set only by the Coordinator's terminal poison transition.
+    poisoned: AtomicBool,
+}
+
+struct TicketProgressCell {
+    payload: Mutex<TicketProgressPayload>,
+}
+
+impl Default for TicketProgressCell {
+    fn default() -> Self {
+        Self {
+            payload: Mutex::new(TicketProgressPayload::default()),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct TicketProgressPayload {
+    identity: Option<TicketCellIdentity>,
+    logical_batch_bytes: Option<u64>,
+    digest_ready: Option<WalV8DigestReady>,
+    frames_ready: bool,
+}
+
+/// Successful completion of one physical DATA worker group. The containing
+/// queue is private to a single Parallel writer instance.
+#[derive(Clone, Debug)]
+pub(crate) struct WalV8CompletedGroupEvent {
+    pub(crate) group_id: u64,
+    pub(crate) tickets: Range<u64>,
+    pub(crate) write_count: u64,
+    pub(crate) write_bytes: u64,
+    #[cfg(feature = "bench")]
+    pub(crate) completion_observed_at: Option<Instant>,
+}
+
+impl TicketProgressRing {
+    fn new(capacity: usize, segment_incarnation: [u8; 16]) -> Result<Self> {
+        ensure!(capacity > 0, "v8 progress ring capacity must be nonempty");
+        let mut cells = Vec::new();
+        cells
+            .try_reserve_exact(capacity)
+            .context("reserve v8 progress ring cells")?;
+        cells.resize_with(capacity, TicketProgressCell::default);
+
+        Ok(Self {
+            segment_incarnation,
+            cells: cells.into_boxed_slice(),
+            poisoned: AtomicBool::new(false),
+        })
+    }
+
+    fn cell(&self, ticket: u64) -> Result<&TicketProgressCell> {
+        let capacity =
+            u64::try_from(self.cells.len()).context("v8 progress ring capacity exceeds u64")?;
+        let index =
+            usize::try_from(ticket % capacity).context("v8 progress ring index exceeds usize")?;
+        self.cells
+            .get(index)
+            .context("v8 progress ring index is outside its capacity")
+    }
+
+    fn ensure_free(&self, ticket: u64) -> Result<()> {
+        let payload = self.cell(ticket)?.payload.lock();
+        ensure!(
+            *payload == TicketProgressPayload::default(),
+            "v8 progress ring slot is still occupied"
+        );
+        Ok(())
+    }
+
+    fn initialize(
+        &self,
+        assignment: WalV8BatchAssignment,
+        logical_batch_bytes: usize,
+    ) -> Result<()> {
+        ensure!(
+            assignment.segment_incarnation == self.segment_incarnation,
+            "v8 progress ring assignment belongs to another segment"
+        );
+        let logical_batch_bytes =
+            u64::try_from(logical_batch_bytes).context("v8 logical batch size exceeds u64")?;
+        let mut payload = self.cell(assignment.segment_ticket)?.payload.lock();
+        ensure!(
+            *payload == TicketProgressPayload::default(),
+            "v8 progress ring slot is still occupied"
+        );
+        payload.identity = Some(TicketCellIdentity {
+            segment_incarnation: assignment.segment_incarnation,
+            ticket: assignment.segment_ticket,
+        });
+        payload.logical_batch_bytes = Some(logical_batch_bytes);
+        Ok(())
+    }
+
+    fn publish_digest(&self, digest: WalV8DigestReady) -> Result<bool> {
+        let mut payload = self.cell(digest.segment_ticket)?.payload.lock();
+        ensure!(
+            !self.poisoned.load(Ordering::Acquire),
+            "v8 Parallel coordinator is poisoned"
+        );
+        ensure!(
+            digest.segment_incarnation == self.segment_incarnation
+                && payload.identity
+                    == Some(TicketCellIdentity {
+                        segment_incarnation: digest.segment_incarnation,
+                        ticket: digest.segment_ticket,
+                    }),
+            "v8 progress ring digest names a stale or foreign ticket"
+        );
+        ensure!(
+            payload.logical_batch_bytes == Some(digest.logical_batch_bytes),
+            "v8 progress ring digest length differs from its admitted ticket"
+        );
+        match payload.digest_ready {
+            Some(existing) if existing == digest => Ok(false),
+            Some(_) => anyhow::bail!("conflicting v8 progress ring digest"),
+            None => {
+                payload.digest_ready = Some(digest);
+                Ok(true)
+            }
+        }
+    }
+
+    fn mark_frames_ready(&self, segment_incarnation: [u8; 16], ticket: u64) -> Result<bool> {
+        let mut payload = self.cell(ticket)?.payload.lock();
+        ensure!(
+            !self.poisoned.load(Ordering::Acquire),
+            "v8 Parallel coordinator is poisoned"
+        );
+        ensure!(
+            segment_incarnation == self.segment_incarnation
+                && payload.identity
+                    == Some(TicketCellIdentity {
+                        segment_incarnation,
+                        ticket,
+                    }),
+            "v8 progress ring frame-ready event names a stale or foreign ticket"
+        );
+        if payload.frames_ready {
+            return Ok(false);
+        }
+        payload.frames_ready = true;
+        Ok(true)
+    }
+
+    fn validate_data_completion(&self, segment_incarnation: [u8; 16], ticket: u64) -> Result<()> {
+        let payload = self.cell(ticket)?.payload.lock();
+        ensure!(
+            segment_incarnation == self.segment_incarnation
+                && payload.identity
+                    == Some(TicketCellIdentity {
+                        segment_incarnation,
+                        ticket,
+                    })
+                && payload.frames_ready,
+            "v8 DATA completion names a stale or frame-unready ticket"
+        );
+        Ok(())
+    }
+
+    fn read(&self, segment_incarnation: [u8; 16], ticket: u64) -> Result<TicketProgressPayload> {
+        let payload = *self.cell(ticket)?.payload.lock();
+        ensure!(
+            segment_incarnation == self.segment_incarnation
+                && payload.identity
+                    == Some(TicketCellIdentity {
+                        segment_incarnation,
+                        ticket,
+                    }),
+            "v8 progress ring read names a stale or foreign ticket"
+        );
+        Ok(payload)
+    }
+
+    fn retire_prefix(&self, ticket_start: u64, ticket_end: u64) -> Result<()> {
+        let ticket_count = ticket_end
+            .checked_sub(ticket_start)
+            .context("v8 progress ring retirement range moves backwards")?;
+        ensure!(
+            ticket_count > 0,
+            "v8 progress ring retirement range is empty"
+        );
+        let ticket_count = usize::try_from(ticket_count)
+            .context("v8 progress ring retirement range exceeds usize")?;
+        ensure!(
+            ticket_count <= self.cells.len(),
+            "v8 progress ring retirement exceeds its capacity"
+        );
+
+        let mut payloads: Vec<MutexGuard<'_, TicketProgressPayload>> = Vec::new();
+        payloads
+            .try_reserve_exact(ticket_count)
+            .context("reserve v8 progress ring retirement locks")?;
+        for ticket in ticket_start..ticket_end {
+            payloads.push(self.cell(ticket)?.payload.lock());
+        }
+
+        for (offset, payload) in payloads.iter().enumerate() {
+            let ticket = ticket_start
+                .checked_add(u64::try_from(offset)?)
+                .context("v8 progress ring retirement ticket overflows")?;
+            ensure!(
+                payload.identity
+                    == Some(TicketCellIdentity {
+                        segment_incarnation: self.segment_incarnation,
+                        ticket,
+                    })
+                    && payload.logical_batch_bytes.is_some()
+                    && payload.frames_ready
+                    && payload.digest_ready.is_some_and(|digest| {
+                        digest.segment_incarnation == self.segment_incarnation
+                            && digest.segment_ticket == ticket
+                            && Some(digest.logical_batch_bytes) == payload.logical_batch_bytes
+                    }),
+                "v8 progress ring durable prefix contains an incomplete ticket"
+            );
+        }
+
+        for payload in &mut payloads {
+            **payload = TicketProgressPayload::default();
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn snapshot(&self, ticket: u64) -> Result<TicketProgressPayload> {
+        self.read(self.segment_incarnation, ticket)
+    }
 }
 
 struct CoordinatorState {
@@ -200,6 +473,167 @@ struct TicketState {
     data_completion_hol_started_at: Option<Instant>,
 }
 
+#[derive(Default)]
+struct WalV8DataGroupCompletionMetrics {
+    changed: bool,
+    #[cfg(feature = "bench")]
+    ticket_lookup_wall_ns: Option<u64>,
+    #[cfg(feature = "bench")]
+    ticket_lookup_cpu_ns: Option<u64>,
+    #[cfg(feature = "bench")]
+    ticket_lookup_entries_scanned: Option<u64>,
+    #[cfg(feature = "bench")]
+    ticket_validation_wall_ns: Option<u64>,
+    #[cfg(feature = "bench")]
+    ticket_validation_cpu_ns: Option<u64>,
+    #[cfg(feature = "bench")]
+    mark_wall_ns: Option<u64>,
+    #[cfg(feature = "bench")]
+    mark_cpu_ns: Option<u64>,
+    #[cfg(feature = "bench")]
+    prefix_end_before: Option<u64>,
+}
+
+/// Validate and apply one worker completion while the caller holds the
+/// Coordinator state lock. The complete range is checked before any ticket is
+/// marked so FRONTIER formation cannot observe a partial worker group.
+#[inline]
+fn apply_data_group_completion_locked(
+    inner: &CoordinatorInner,
+    state: &mut CoordinatorState,
+    tickets: &Range<u64>,
+    #[cfg(feature = "bench")] timeline_sampled: bool,
+    #[cfg(feature = "bench")] data_completed_at: Option<Instant>,
+) -> Result<WalV8DataGroupCompletionMetrics> {
+    ensure!(!state.poisoned, "v8 Parallel coordinator is poisoned");
+    let ticket_count = tickets
+        .end
+        .checked_sub(tickets.start)
+        .context("v8 DATA completion group has an invalid ticket range")?;
+    let ticket_count = usize::try_from(ticket_count)
+        .context("v8 DATA completion group exceeds addressable tickets")?;
+    ensure!(ticket_count > 0, "v8 DATA completion group is empty");
+
+    #[cfg(feature = "bench")]
+    let ticket_lookup_started_at = timeline_sampled.then(Instant::now);
+    #[cfg(feature = "bench")]
+    let ticket_lookup_started_cpu =
+        timeline_sampled.then(crate::wal::v8::digest::thread_cpu_time_ns);
+    let start_index = state
+        .tickets
+        .iter()
+        .position(|entry| entry.assignment.segment_ticket == tickets.start)
+        .context("v8 DATA-completion group names an unknown ticket")?;
+    let mut metrics = WalV8DataGroupCompletionMetrics::default();
+    #[cfg(feature = "bench")]
+    if timeline_sampled {
+        metrics.ticket_lookup_wall_ns = Some(
+            completion_timeline_duration_ns(ticket_lookup_started_at, Some(Instant::now()))
+                .unwrap_or_default(),
+        );
+        metrics.ticket_lookup_cpu_ns = Some(
+            crate::wal::v8::digest::thread_cpu_time_ns()
+                .saturating_sub(ticket_lookup_started_cpu.unwrap_or_default()),
+        );
+        metrics.ticket_lookup_entries_scanned = Some(start_index.saturating_add(1) as u64);
+    }
+
+    #[cfg(feature = "bench")]
+    let ticket_validation_started_at = timeline_sampled.then(Instant::now);
+    #[cfg(feature = "bench")]
+    let ticket_validation_started_cpu =
+        timeline_sampled.then(crate::wal::v8::digest::thread_cpu_time_ns);
+    let end_index = start_index
+        .checked_add(ticket_count)
+        .context("v8 DATA-completion group index overflows")?;
+    ensure!(
+        end_index <= state.tickets.len(),
+        "v8 DATA-completion group extends past admitted tickets"
+    );
+
+    let mut all_complete = true;
+    for (offset, entry) in state
+        .tickets
+        .iter()
+        .skip(start_index)
+        .take(ticket_count)
+        .enumerate()
+    {
+        let expected_ticket = tickets
+            .start
+            .checked_add(u64::try_from(offset)?)
+            .context("v8 DATA-completion ticket overflows")?;
+        ensure!(
+            entry.assignment.segment_ticket == expected_ticket
+                && ticket_frames_ready(inner, entry)?,
+            "v8 DATA-completion group does not match ready admitted tickets"
+        );
+        all_complete &= entry.data_complete;
+    }
+    ensure!(
+        all_complete
+            || !state
+                .tickets
+                .iter()
+                .skip(start_index)
+                .take(ticket_count)
+                .any(|entry| entry.data_complete),
+        "v8 DATA-completion group partially duplicates prior completion"
+    );
+    #[cfg(feature = "bench")]
+    if timeline_sampled {
+        metrics.ticket_validation_wall_ns = Some(
+            completion_timeline_duration_ns(ticket_validation_started_at, Some(Instant::now()))
+                .unwrap_or_default(),
+        );
+        metrics.ticket_validation_cpu_ns = Some(
+            crate::wal::v8::digest::thread_cpu_time_ns()
+                .saturating_sub(ticket_validation_started_cpu.unwrap_or_default()),
+        );
+    }
+
+    if all_complete {
+        return Ok(metrics);
+    }
+
+    #[cfg(feature = "bench")]
+    if timeline_sampled {
+        metrics.prefix_end_before = Some(data_complete_prefix_end(state));
+    }
+    #[cfg(feature = "bench")]
+    let mark_started_at = timeline_sampled.then(Instant::now);
+    #[cfg(feature = "bench")]
+    let mark_started_cpu = timeline_sampled.then(crate::wal::v8::digest::thread_cpu_time_ns);
+    for entry in state
+        .tickets
+        .iter_mut()
+        .skip(start_index)
+        .take(ticket_count)
+    {
+        entry.data_complete = true;
+        #[cfg(feature = "bench")]
+        {
+            entry.data_completed_at = data_completed_at;
+        }
+    }
+    metrics.changed = true;
+    #[cfg(feature = "bench")]
+    {
+        if timeline_sampled {
+            metrics.mark_wall_ns = Some(
+                completion_timeline_duration_ns(mark_started_at, Some(Instant::now()))
+                    .unwrap_or_default(),
+            );
+            metrics.mark_cpu_ns = Some(
+                crate::wal::v8::digest::thread_cpu_time_ns()
+                    .saturating_sub(mark_started_cpu.unwrap_or_default()),
+            );
+        }
+    }
+
+    Ok(metrics)
+}
+
 #[cfg(feature = "bench")]
 struct PendingCompletionTimeline {
     group: crate::wal::parallel_worker::WalWorkerGroupCompletionTimeline,
@@ -235,11 +669,22 @@ pub(crate) struct WalV8TicketProgress {
     pub(crate) data_completed_at: Option<Instant>,
 }
 
-/// Atomic view of the durability decision point. `next_not_ready` is the
-/// first admitted ticket beyond the prefix that can be covered by a FRONTIER.
+impl WalV8TicketProgress {
+    fn is_frontier_ready(&self) -> bool {
+        self.frames_ready
+            && self.digest_ready.is_some()
+            && self.prefix_digest_after.is_some()
+            && self.data_complete
+    }
+}
+
+/// View of the durability decision point. `next_not_ready` is the first
+/// admitted ticket beyond the ready prefix. Ring snapshots collect blocker
+/// and readiness details only when a diagnostic timestamp is requested.
 pub(crate) struct WalV8FrontierReadySnapshot {
     pub(crate) ready_prefix: Vec<WalV8TicketProgress>,
     pub(crate) admitted_ticket_count: usize,
+    pub(crate) closed: bool,
     #[cfg(feature = "bench")]
     pub(crate) frames_ready_prefix_count: usize,
     #[cfg(feature = "bench")]
@@ -309,6 +754,127 @@ impl WalV8DurablePrefixCheck {
 }
 
 impl WalV8ParallelCoordinator {
+    pub(crate) fn progress_ring_enabled(&self) -> bool {
+        self.inner.progress_ring.is_some()
+    }
+
+    /// Build a fresh coordinator with the requested readiness backend before
+    /// the writer is attached to the parallel pipeline. Reconfiguration is
+    /// only valid while the recovered writer has no admitted work.
+    pub(crate) fn with_progress_ring_mode(
+        &self,
+        header: WalV8Header,
+        enabled: bool,
+    ) -> Result<Self> {
+        if self.progress_ring_enabled() == enabled {
+            return Ok(self.clone());
+        }
+
+        let state = self.inner.state.lock();
+        ensure!(
+            state.tickets.is_empty()
+                && state.next_ticket == state.durable_ticket_end
+                && state.reserved_bytes == 0
+                && state.reserved_preparation_bytes == 0
+                && state.pending_frontier.is_none()
+                && !state.durability_driver_active
+                && !state.closed
+                && !state.poisoned,
+            "v8 progress mode must be selected before Parallel admission"
+        );
+        ensure!(
+            state.next_data_offset == state.last_frontier_end,
+            "v8 progress mode requires a clean recovered frontier"
+        );
+
+        Self::new(
+            header,
+            WalV8ParallelConfig {
+                next_ticket: state.next_ticket,
+                next_data_offset: state.next_data_offset,
+                last_commit_ts: state.last_commit_ts,
+                last_recorded_at: state.last_recorded_at,
+                durable_prefix_digest: state.durable_prefix_digest,
+                max_inflight_tickets: self.inner.max_inflight_tickets,
+                max_inflight_bytes: self.inner.max_inflight_bytes,
+                max_file_size: self.inner.max_file_size,
+                progress_ring_enabled: enabled,
+            },
+        )
+    }
+
+    pub(crate) fn completion_queue_capacity(&self) -> usize {
+        self.inner.max_inflight_tickets
+    }
+
+    pub(crate) fn take_progress_token_receiver(&self) -> Result<Option<Receiver<()>>> {
+        let Some(receiver) = self.inner.progress_token_receiver.lock().take() else {
+            if self.progress_ring_enabled() {
+                anyhow::bail!("v8 progress token receiver was already taken");
+            }
+            return Ok(None);
+        };
+        Ok(Some(receiver))
+    }
+
+    /// Nonblocking persistent wake token for F0 readiness. A full capacity-one
+    /// channel already represents pending progress.
+    pub(crate) fn signal_progress_token(&self) {
+        if let Some(sender) = &self.inner.progress_token_sender {
+            let _ = sender.try_send(());
+        }
+    }
+
+    pub(crate) fn publish_progress_digest(&self, digest: WalV8DigestReady) -> Result<bool> {
+        let Some(progress_ring) = &self.inner.progress_ring else {
+            anyhow::bail!("v8 per-ticket progress ring is disabled");
+        };
+        let changed = match progress_ring.publish_digest(digest) {
+            Ok(changed) => changed,
+            Err(error) => {
+                self.poison();
+                return Err(error).context("publish v8 progress ring digest");
+            }
+        };
+        if changed {
+            self.signal_progress_token();
+        }
+        Ok(changed)
+    }
+
+    pub(crate) fn publish_progress_frames_ready(&self, ticket: u64) -> Result<bool> {
+        let Some(progress_ring) = &self.inner.progress_ring else {
+            anyhow::bail!("v8 per-ticket progress ring is disabled");
+        };
+        // Buffer insertion wakes the submitter. The owner cannot use this
+        // frame until the Reaper enqueues its DATA completion.
+        match progress_ring.mark_frames_ready(self.inner.segment_incarnation, ticket) {
+            Ok(changed) => Ok(changed),
+            Err(error) => {
+                self.poison();
+                Err(error).context("publish v8 progress ring frame readiness")
+            }
+        }
+    }
+
+    pub(crate) fn owns_durability_driver(&self, driver: &WalV8DurabilityDriver) -> bool {
+        // The guard keeps ownership until it is dropped.
+        Arc::ptr_eq(&self.inner, &driver.coordinator.inner)
+    }
+
+    /// Wake the elected durability driver after a completion has been placed
+    /// in its private queue. The queue itself is the source of truth.
+    pub(crate) fn notify_completion_queued(&self) {
+        if self.progress_ring_enabled() {
+            self.signal_progress_token();
+            return;
+        }
+        let mut state = self.inner.state.lock();
+        if !state.poisoned {
+            signal_durability_progress(&self.inner, &mut state);
+        }
+    }
+
     /// Create a bounded ticket coordinator positioned at a recovered Active
     /// image. Source-spool capacity is managed by the caller; preparation
     /// indexes are charged against this coordinator's shared byte window.
@@ -361,6 +927,16 @@ impl WalV8ParallelCoordinator {
         tickets
             .try_reserve_exact(config.max_inflight_tickets)
             .context("reserve v8 Parallel ticket slots")?;
+        let progress_ring = config
+            .progress_ring_enabled
+            .then(|| TicketProgressRing::new(config.max_inflight_tickets, header.incarnation))
+            .transpose()?;
+        let (progress_token_sender, progress_token_receiver) = if progress_ring.is_some() {
+            let (sender, receiver) = crossbeam_channel::bounded(1);
+            (Some(sender), Some(receiver))
+        } else {
+            (None, None)
+        };
 
         Ok(Self {
             inner: Arc::new(CoordinatorInner {
@@ -422,6 +998,9 @@ impl WalV8ParallelCoordinator {
                 max_inflight_tickets: config.max_inflight_tickets,
                 max_inflight_bytes: config.max_inflight_bytes,
                 max_file_size: config.max_file_size,
+                progress_ring,
+                progress_token_sender,
+                progress_token_receiver: Mutex::new(progress_token_receiver),
             }),
         })
     }
@@ -429,13 +1008,19 @@ impl WalV8ParallelCoordinator {
     /// Return all admitted tickets, including producers that have not finished
     /// encoding. This is the group-visibility source for the Parallel packer.
     pub(crate) fn admitted_window(&self) -> Vec<WalV8TicketProgress> {
-        self.inner
-            .state
-            .lock()
+        let mut state = self.inner.state.lock();
+        match state
             .tickets
             .iter()
-            .map(TicketState::progress)
-            .collect()
+            .map(|ticket| ticket_progress(&self.inner, ticket))
+            .collect::<Result<Vec<_>>>()
+        {
+            Ok(progress) => progress,
+            Err(_) => {
+                poison_locked(&self.inner, &mut state);
+                Vec::new()
+            }
+        }
     }
 
     pub(crate) fn data_group_window(
@@ -473,6 +1058,14 @@ impl WalV8ParallelCoordinator {
     }
 
     #[cfg(feature = "bench")]
+    pub(crate) fn capture_data_completion_time(&self) -> Option<Instant> {
+        self.inner
+            .data_completion_timestamps_enabled
+            .load(Ordering::Acquire)
+            .then(Instant::now)
+    }
+
+    #[cfg(feature = "bench")]
     pub(crate) fn set_hol_diagnostics_profile(&self, profile: Arc<crate::mem_table::WriteProfile>) {
         let enabled = profile.wal_hol_diagnostics_enabled();
         self.inner.profile.store(Some(profile));
@@ -490,33 +1083,43 @@ impl WalV8ParallelCoordinator {
 
     /// Return the contiguous head prefix whose DATA frames are ready to submit.
     pub(crate) fn frame_ready_prefix(&self) -> Vec<WalV8TicketProgress> {
-        let state = self.inner.state.lock();
+        let mut state = self.inner.state.lock();
         if state.poisoned {
             return Vec::new();
         }
-
-        state
-            .tickets
-            .iter()
-            .take_while(|ticket| ticket.frames_ready)
-            .map(TicketState::progress)
-            .collect()
+        let mut prefix = Vec::new();
+        for ticket in &state.tickets {
+            match ticket_progress(&self.inner, ticket) {
+                Ok(progress) if progress.frames_ready => prefix.push(progress),
+                Ok(_) => break,
+                Err(_) => {
+                    poison_locked(&self.inner, &mut state);
+                    return Vec::new();
+                }
+            }
+        }
+        prefix
     }
 
     /// Return the contiguous head prefix whose frames, ordered digest fold,
     /// and DATA completion are ready for an embedded FRONTIER.
     pub(crate) fn frontier_ready_prefix(&self) -> Vec<WalV8TicketProgress> {
-        let state = self.inner.state.lock();
+        let mut state = self.inner.state.lock();
         if state.poisoned {
             return Vec::new();
         }
-
-        state
-            .tickets
-            .iter()
-            .take_while(|ticket| ticket.is_frontier_ready())
-            .map(TicketState::progress)
-            .collect()
+        let mut prefix = Vec::new();
+        for ticket in &state.tickets {
+            match ticket_progress(&self.inner, ticket) {
+                Ok(progress) if progress.is_frontier_ready() => prefix.push(progress),
+                Ok(_) => break,
+                Err(_) => {
+                    poison_locked(&self.inner, &mut state);
+                    return Vec::new();
+                }
+            }
+        }
+        prefix
     }
 
     /// Give already-admitted successors one bounded opportunity to join a
@@ -704,73 +1307,94 @@ impl WalV8ParallelCoordinator {
         #[cfg(not(feature = "bench"))]
         let _ = capture_monotonic_ns;
 
-        let state = self.inner.state.lock();
-        if state.poisoned {
-            return WalV8FrontierReadySnapshot {
-                ready_prefix: Vec::new(),
-                admitted_ticket_count: 0,
-                #[cfg(feature = "bench")]
-                frames_ready_prefix_count: 0,
-                #[cfg(feature = "bench")]
-                data_complete_prefix_count: 0,
-                #[cfg(feature = "bench")]
-                reserved_preparation_bytes: 0,
-                #[cfg(feature = "bench")]
-                next_not_ready: None,
-                #[cfg(feature = "bench")]
-                data_hol_blocker: None,
-                #[cfg(feature = "bench")]
-                snapshot_monotonic_ns: None,
-            };
-        }
-        let mut ready_prefix = Vec::new();
-        for ticket in &state.tickets {
-            if !ticket.is_frontier_ready() {
-                break;
+        let mut state = self.inner.state.lock();
+        match frontier_ready_snapshot_locked(&self.inner, &state, capture_monotonic_ns) {
+            Ok(snapshot) => snapshot,
+            Err(_) => {
+                poison_locked(&self.inner, &mut state);
+                empty_frontier_ready_snapshot()
             }
-            ready_prefix.push(ticket.progress());
+        }
+    }
+
+    /// Apply queued DATA completions and fold producer digests before taking a
+    /// single owner-consistent readiness snapshot. Only the active durability
+    /// driver may consume the completion queue or advance the ordered digest.
+    pub(crate) fn advance_and_snapshot(
+        &self,
+        driver: &WalV8DurabilityDriver,
+        events: &[WalV8CompletedGroupEvent],
+        capture_monotonic_ns: bool,
+    ) -> Result<WalV8FrontierReadySnapshot> {
+        ensure!(
+            self.inner.progress_ring.is_some(),
+            "v8 progress-ring advance requested while disabled"
+        );
+        ensure!(
+            self.owns_durability_driver(driver),
+            "v8 progress-ring advance belongs to another durability driver"
+        );
+        #[cfg(not(feature = "bench"))]
+        let _ = capture_monotonic_ns;
+
+        let mut state = self.inner.state.lock();
+        ensure!(
+            state.durability_driver_active,
+            "v8 progress-ring advance has no active durability driver"
+        );
+        ensure!(!state.poisoned, "v8 Parallel coordinator is poisoned");
+
+        for event in events {
+            let applied = apply_data_group_completion_locked(
+                &self.inner,
+                &mut state,
+                &event.tickets,
+                #[cfg(feature = "bench")]
+                false,
+                #[cfg(feature = "bench")]
+                event.completion_observed_at,
+            );
+            if let Err(error) = applied {
+                poison_locked(&self.inner, &mut state);
+                return Err(error).with_context(|| {
+                    format!(
+                        "apply v8 DATA completion group {} ({} tickets, {} writes, {} bytes)",
+                        event.group_id,
+                        event.tickets.end.saturating_sub(event.tickets.start),
+                        event.write_count,
+                        event.write_bytes
+                    )
+                });
+            }
+        }
+
+        #[cfg(feature = "bench")]
+        let fold_cpu_before = state.ordered_link_hash_cpu_ns;
+        if let Err(error) = fold_ready_digests(&self.inner, &mut state, None) {
+            poison_locked(&self.inner, &mut state);
+            return Err(error).context("fold v8 progress-ring digests");
         }
         #[cfg(feature = "bench")]
-        let frames_ready_prefix_count = state
-            .tickets
-            .iter()
-            .take_while(|ticket| ticket.frames_ready)
-            .count();
-        #[cfg(feature = "bench")]
-        let data_complete_prefix_count = state
-            .tickets
-            .iter()
-            .take_while(|ticket| ticket.data_complete)
-            .count();
-        #[cfg(feature = "bench")]
-        let data_hol_blocker = state
-            .tickets
-            .get(data_complete_prefix_count)
-            .map(TicketState::progress);
-        #[cfg(feature = "bench")]
-        let next_not_ready = state
-            .tickets
-            .get(ready_prefix.len())
-            .map(TicketState::progress);
-        #[cfg(feature = "bench")]
-        let snapshot_monotonic_ns =
-            capture_monotonic_ns.then(crate::mem_table::benchmark_monotonic_ns);
+        {
+            let fold_cpu_ns = state
+                .ordered_link_hash_cpu_ns
+                .saturating_sub(fold_cpu_before);
+            if fold_cpu_ns != 0
+                && let Some(profile) = self.inner.profile.load().as_ref()
+            {
+                profile.record_wal_v8_ordered_link_hash_cpu_ns(fold_cpu_ns);
+            }
+        }
 
-        WalV8FrontierReadySnapshot {
-            ready_prefix,
-            admitted_ticket_count: state.tickets.len(),
-            #[cfg(feature = "bench")]
-            frames_ready_prefix_count,
-            #[cfg(feature = "bench")]
-            data_complete_prefix_count,
-            #[cfg(feature = "bench")]
-            reserved_preparation_bytes: state.reserved_preparation_bytes,
-            #[cfg(feature = "bench")]
-            next_not_ready,
-            #[cfg(feature = "bench")]
-            data_hol_blocker,
-            #[cfg(feature = "bench")]
-            snapshot_monotonic_ns,
+        // Applying progress does not free admission capacity. The owner
+        // already has the progress token, and durable publication wakes
+        // admission and ACK waiters.
+        match frontier_ready_snapshot_locked(&self.inner, &state, capture_monotonic_ns) {
+            Ok(snapshot) => Ok(snapshot),
+            Err(error) => {
+                poison_locked(&self.inner, &mut state);
+                Err(error).context("snapshot v8 progress-ring readiness")
+            }
         }
     }
 
@@ -793,6 +1417,19 @@ impl WalV8ParallelCoordinator {
         ticket: u64,
         sample_timeline: bool,
     ) -> Result<Option<Instant>> {
+        if self.inner.progress_ring.is_some() {
+            let changed = self.publish_progress_frames_ready(ticket)?;
+            #[cfg(feature = "bench")]
+            let frame_ready_at = (changed && sample_timeline).then(Instant::now);
+            #[cfg(not(feature = "bench"))]
+            let frame_ready_at = {
+                let _ = sample_timeline;
+                let _ = changed;
+                None
+            };
+            return Ok(frame_ready_at);
+        }
+
         let mut state = self.inner.state.lock();
         ensure!(!state.poisoned, "v8 Parallel coordinator is poisoned");
         let Some(index) = state
@@ -838,7 +1475,14 @@ impl WalV8ParallelCoordinator {
             poison_locked(&self.inner, &mut state);
             anyhow::bail!("v8 DATA-write start event names an unknown ticket")
         };
-        if !state.tickets[index].frames_ready
+        let frames_ready = match ticket_frames_ready(&self.inner, &state.tickets[index]) {
+            Ok(frames_ready) => frames_ready,
+            Err(error) => {
+                poison_locked(&self.inner, &mut state);
+                return Err(error).context("validate v8 DATA-write frame readiness");
+            }
+        };
+        if !frames_ready
             || state.tickets[index].data_complete
             || state.tickets[index].data_write_started_at.is_some()
         {
@@ -859,6 +1503,11 @@ impl WalV8ParallelCoordinator {
     /// Publish a producer digest and return the ordered-link CPU time spent
     /// folding digests that became contiguous because of this event.
     pub(crate) fn mark_digest_ready_with_cpu(&self, digest: WalV8DigestReady) -> Result<u64> {
+        if self.inner.progress_ring.is_some() {
+            self.publish_progress_digest(digest)?;
+            return Ok(0);
+        }
+
         let mut state = self.inner.state.lock();
         ensure!(!state.poisoned, "v8 Parallel coordinator is poisoned");
         let Some(index) = state
@@ -916,7 +1565,7 @@ impl WalV8ParallelCoordinator {
                 None
             }
         };
-        if let Err(error) = fold_ready_digests(&mut state, hol_profile.as_deref()) {
+        if let Err(error) = fold_ready_digests(&self.inner, &mut state, hol_profile.as_deref()) {
             poison_locked(&self.inner, &mut state);
             return Err(error);
         }
@@ -958,7 +1607,18 @@ impl WalV8ParallelCoordinator {
             poison_locked(&self.inner, &mut state);
             anyhow::bail!("v8 DATA-complete event names an unknown ticket")
         };
-        if !state.tickets[index].frames_ready {
+        let frames_ready = if let Some(progress_ring) = &self.inner.progress_ring {
+            match progress_ring.validate_data_completion(self.inner.segment_incarnation, ticket) {
+                Ok(()) => true,
+                Err(error) => {
+                    poison_locked(&self.inner, &mut state);
+                    return Err(error).context("validate v8 DATA completion readiness");
+                }
+            }
+        } else {
+            state.tickets[index].frames_ready
+        };
+        if !frames_ready {
             poison_locked(&self.inner, &mut state);
             anyhow::bail!("v8 DATA completed before its frames were published ready");
         }
@@ -989,7 +1649,7 @@ impl WalV8ParallelCoordinator {
     pub(crate) fn mark_data_group_complete(&self, tickets: Range<u64>) -> Result<()> {
         #[cfg(feature = "bench")]
         {
-            self.mark_data_group_complete_inner(tickets, None)
+            self.mark_data_group_complete_inner(tickets, self.capture_data_completion_time(), None)
         }
         #[cfg(not(feature = "bench"))]
         {
@@ -1001,15 +1661,17 @@ impl WalV8ParallelCoordinator {
     pub(crate) fn mark_data_group_complete_with_timeline(
         &self,
         tickets: Range<u64>,
+        completion_observed_at: Option<Instant>,
         timeline: Option<crate::wal::parallel_worker::WalWorkerGroupCompletionTimeline>,
     ) -> Result<()> {
-        self.mark_data_group_complete_inner(tickets, timeline)
+        self.mark_data_group_complete_inner(tickets, completion_observed_at, timeline)
     }
 
     #[inline(always)]
     fn mark_data_group_complete_inner(
         &self,
         tickets: Range<u64>,
+        #[cfg(feature = "bench")] completion_observed_at: Option<Instant>,
         #[cfg(feature = "bench")] timeline: Option<
             crate::wal::parallel_worker::WalWorkerGroupCompletionTimeline,
         >,
@@ -1029,20 +1691,6 @@ impl WalV8ParallelCoordinator {
         let lock_acquired_at = timeline_sampled.then(Instant::now);
         #[cfg(feature = "bench")]
         let lock_acquired_cpu = timeline_sampled.then(crate::wal::v8::digest::thread_cpu_time_ns);
-        #[cfg(feature = "bench")]
-        let mut v8_ticket_lookup_wall_ns = None;
-        #[cfg(feature = "bench")]
-        let mut v8_ticket_lookup_cpu_ns = None;
-        #[cfg(feature = "bench")]
-        let mut v8_ticket_lookup_entries_scanned = None;
-        #[cfg(feature = "bench")]
-        let mut v8_ticket_validation_wall_ns = None;
-        #[cfg(feature = "bench")]
-        let mut v8_ticket_validation_cpu_ns = None;
-        #[cfg(feature = "bench")]
-        let mut v8_data_complete_mark_wall_ns = None;
-        #[cfg(feature = "bench")]
-        let mut v8_data_complete_mark_cpu_ns = None;
         #[cfg(feature = "bench")]
         let mut v8_prefix_diagnostic_wall_ns = None;
         #[cfg(feature = "bench")]
@@ -1105,140 +1753,23 @@ impl WalV8ParallelCoordinator {
             advance_completion_timeline_prefix(&mut state);
         }
 
-        ensure!(!state.poisoned, "v8 Parallel coordinator is poisoned");
-        let Some(ticket_count) = tickets.end.checked_sub(tickets.start) else {
-            poison_locked(&self.inner, &mut state);
-            anyhow::bail!("v8 DATA completion group has an invalid ticket range")
-        };
-        let Ok(ticket_count) = usize::try_from(ticket_count) else {
-            poison_locked(&self.inner, &mut state);
-            anyhow::bail!("v8 DATA completion group exceeds addressable tickets")
-        };
-        if ticket_count == 0 {
-            poison_locked(&self.inner, &mut state);
-            anyhow::bail!("v8 DATA completion group is empty")
-        }
-        #[cfg(feature = "bench")]
-        let ticket_lookup_started_at = timeline_sampled.then(Instant::now);
-        #[cfg(feature = "bench")]
-        let ticket_lookup_started_cpu =
-            timeline_sampled.then(crate::wal::v8::digest::thread_cpu_time_ns);
-        let Some(start_index) = state
-            .tickets
-            .iter()
-            .position(|entry| entry.assignment.segment_ticket == tickets.start)
-        else {
-            poison_locked(&self.inner, &mut state);
-            anyhow::bail!("v8 DATA-completion group names an unknown ticket")
-        };
-        #[cfg(feature = "bench")]
-        if timeline_sampled {
-            v8_ticket_lookup_wall_ns = Some(
-                completion_timeline_duration_ns(ticket_lookup_started_at, Some(Instant::now()))
-                    .unwrap_or_default(),
-            );
-            v8_ticket_lookup_cpu_ns = Some(
-                crate::wal::v8::digest::thread_cpu_time_ns()
-                    .saturating_sub(ticket_lookup_started_cpu.unwrap_or_default()),
-            );
-            v8_ticket_lookup_entries_scanned = Some(start_index.saturating_add(1) as u64);
-        }
-        #[cfg(feature = "bench")]
-        let ticket_validation_started_at = timeline_sampled.then(Instant::now);
-        #[cfg(feature = "bench")]
-        let ticket_validation_started_cpu =
-            timeline_sampled.then(crate::wal::v8::digest::thread_cpu_time_ns);
-        let Some(end_index) = start_index.checked_add(ticket_count) else {
-            poison_locked(&self.inner, &mut state);
-            anyhow::bail!("v8 DATA-completion group index overflows")
-        };
-        if end_index > state.tickets.len() {
-            poison_locked(&self.inner, &mut state);
-            anyhow::bail!("v8 DATA-completion group extends past admitted tickets")
-        }
-        let mut all_complete = true;
-        for (offset, entry) in state
-            .tickets
-            .iter()
-            .skip(start_index)
-            .take(ticket_count)
-            .enumerate()
-        {
-            let expected_ticket = tickets
-                .start
-                .checked_add(u64::try_from(offset)?)
-                .context("v8 DATA-completion ticket overflows")?;
-            if entry.assignment.segment_ticket != expected_ticket || !entry.frames_ready {
-                poison_locked(&self.inner, &mut state);
-                anyhow::bail!("v8 DATA-completion group does not match ready admitted tickets")
-            }
-            all_complete &= entry.data_complete;
-        }
-        if all_complete {
-            return Ok(());
-        }
-        if state
-            .tickets
-            .iter()
-            .skip(start_index)
-            .take(ticket_count)
-            .any(|entry| entry.data_complete)
-        {
-            poison_locked(&self.inner, &mut state);
-            anyhow::bail!("v8 DATA-completion group partially duplicates prior completion")
-        }
-        #[cfg(feature = "bench")]
-        if timeline_sampled {
-            v8_ticket_validation_wall_ns = Some(
-                completion_timeline_duration_ns(ticket_validation_started_at, Some(Instant::now()))
-                    .unwrap_or_default(),
-            );
-            v8_ticket_validation_cpu_ns = Some(
-                crate::wal::v8::digest::thread_cpu_time_ns()
-                    .saturating_sub(ticket_validation_started_cpu.unwrap_or_default()),
-            );
-        }
-
-        #[cfg(feature = "bench")]
-        let data_complete_prefix_end_before =
-            timeline_sampled.then(|| data_complete_prefix_end(&state));
-
-        #[cfg(feature = "bench")]
-        let data_complete_mark_started_at = timeline_sampled.then(Instant::now);
-        #[cfg(feature = "bench")]
-        let data_complete_mark_started_cpu =
-            timeline_sampled.then(crate::wal::v8::digest::thread_cpu_time_ns);
-        #[cfg(feature = "bench")]
-        let data_completed_at = self
-            .inner
-            .data_completion_timestamps_enabled
-            .load(Ordering::Acquire)
-            .then(Instant::now);
-        for entry in state
-            .tickets
-            .iter_mut()
-            .skip(start_index)
-            .take(ticket_count)
-        {
-            entry.data_complete = true;
+        let applied = match apply_data_group_completion_locked(
+            &self.inner,
+            &mut state,
+            &tickets,
             #[cfg(feature = "bench")]
-            {
-                entry.data_completed_at = data_completed_at;
+            timeline_sampled,
+            #[cfg(feature = "bench")]
+            completion_observed_at,
+        ) {
+            Ok(applied) => applied,
+            Err(error) => {
+                poison_locked(&self.inner, &mut state);
+                return Err(error);
             }
-        }
-        #[cfg(feature = "bench")]
-        if timeline_sampled {
-            v8_data_complete_mark_wall_ns = Some(
-                completion_timeline_duration_ns(
-                    data_complete_mark_started_at,
-                    Some(Instant::now()),
-                )
-                .unwrap_or_default(),
-            );
-            v8_data_complete_mark_cpu_ns = Some(
-                crate::wal::v8::digest::thread_cpu_time_ns()
-                    .saturating_sub(data_complete_mark_started_cpu.unwrap_or_default()),
-            );
+        };
+        if !applied.changed {
+            return Ok(());
         }
 
         #[cfg(feature = "bench")]
@@ -1337,7 +1868,7 @@ impl WalV8ParallelCoordinator {
             );
             pending.data_complete_lock_hold_cpu_ns =
                 Some(lock_hold_snapshot_cpu.saturating_sub(lock_acquired_cpu.unwrap_or_default()));
-            pending.data_complete_prefix_end_before = data_complete_prefix_end_before;
+            pending.data_complete_prefix_end_before = applied.prefix_end_before;
             pending.data_complete_prefix_end_after = data_complete_prefix_end_after;
             if let Some(published_at) = data_complete_published_at {
                 pending.reaper_recv_to_data_complete_publish_ns = Some(
@@ -1365,7 +1896,7 @@ impl WalV8ParallelCoordinator {
         if let Some(timeline) = handoff_timeline.as_mut() {
             timeline.data_complete_published_at = data_complete_published_at;
             timeline.data_complete_published_monotonic_ns = data_complete_published_monotonic_ns;
-            timeline.data_complete_prefix_end_before = data_complete_prefix_end_before;
+            timeline.data_complete_prefix_end_before = applied.prefix_end_before;
             timeline.data_complete_prefix_end_after = data_complete_prefix_end_after;
             timeline.hol_blocker_ticket = hol_blocker.flatten().map(|(ticket, _, _, _)| ticket);
         }
@@ -1383,13 +1914,13 @@ impl WalV8ParallelCoordinator {
                         .unwrap_or_default()
                         .saturating_sub(lock_wait_cpu_started.unwrap_or_default()),
                 ),
-                v8_ticket_lookup_wall_ns,
-                v8_ticket_lookup_cpu_ns,
-                v8_ticket_lookup_entries_scanned,
-                v8_ticket_validation_wall_ns,
-                v8_ticket_validation_cpu_ns,
-                v8_data_complete_mark_wall_ns,
-                v8_data_complete_mark_cpu_ns,
+                v8_ticket_lookup_wall_ns: applied.ticket_lookup_wall_ns,
+                v8_ticket_lookup_cpu_ns: applied.ticket_lookup_cpu_ns,
+                v8_ticket_lookup_entries_scanned: applied.ticket_lookup_entries_scanned,
+                v8_ticket_validation_wall_ns: applied.ticket_validation_wall_ns,
+                v8_ticket_validation_cpu_ns: applied.ticket_validation_cpu_ns,
+                v8_data_complete_mark_wall_ns: applied.mark_wall_ns,
+                v8_data_complete_mark_cpu_ns: applied.mark_cpu_ns,
                 v8_prefix_diagnostic_wall_ns,
                 v8_prefix_diagnostic_cpu_ns,
                 v8_notification_wall_ns,
@@ -1446,11 +1977,17 @@ impl WalV8ParallelCoordinator {
             ticket_end > state.durable_ticket_end,
             "v8 FRONTIER does not advance the durable ticket boundary"
         );
-        let ready = state
-            .tickets
-            .iter()
-            .take_while(|entry| entry.is_frontier_ready())
-            .count();
+        let mut ready = 0;
+        for entry in &state.tickets {
+            match ticket_is_frontier_ready(&self.inner, entry) {
+                Ok(true) => ready += 1,
+                Ok(false) => break,
+                Err(error) => {
+                    poison_locked(&self.inner, &mut state);
+                    return Err(error).context("validate v8 FRONTIER readiness");
+                }
+            }
+        }
         let ticket_count = usize::try_from(ticket_end - state.durable_ticket_end)
             .context("v8 FRONTIER ticket count exceeds usize")?;
         ensure!(
@@ -1549,21 +2086,32 @@ impl WalV8ParallelCoordinator {
             poison_locked(&self.inner, &mut state);
             anyhow::bail!("v8 durable FRONTIER end overflows");
         };
-        let valid_ticket_prefix = ticket_count > 0
-            && ticket_count <= state.tickets.len()
-            && state
-                .tickets
-                .iter()
-                .take(ticket_count)
-                .enumerate()
-                .all(|(index, entry)| {
-                    u64::try_from(index)
-                        .ok()
-                        .and_then(|index| state.durable_ticket_end.checked_add(index))
-                        .is_some_and(|ticket| {
-                            entry.assignment.segment_ticket == ticket && entry.is_frontier_ready()
-                        })
-                });
+        let valid_ticket_prefix = (|| -> Result<bool> {
+            if ticket_count == 0 || ticket_count > state.tickets.len() {
+                return Ok(false);
+            }
+            for (index, entry) in state.tickets.iter().take(ticket_count).enumerate() {
+                let Some(expected_ticket) = u64::try_from(index)
+                    .ok()
+                    .and_then(|index| state.durable_ticket_end.checked_add(index))
+                else {
+                    return Ok(false);
+                };
+                if entry.assignment.segment_ticket != expected_ticket
+                    || !ticket_is_frontier_ready(&self.inner, entry)?
+                {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        })();
+        let valid_ticket_prefix = match valid_ticket_prefix {
+            Ok(valid) => valid,
+            Err(error) => {
+                poison_locked(&self.inner, &mut state);
+                return Err(error).context("validate v8 durable FRONTIER ticket readiness");
+            }
+        };
         let Some(prefix_reserved_bytes) = state
             .tickets
             .iter()
@@ -1585,6 +2133,13 @@ impl WalV8ParallelCoordinator {
         {
             poison_locked(&self.inner, &mut state);
             anyhow::bail!("v8 durable FRONTIER covers an invalid ticket prefix");
+        }
+        if let Some(progress_ring) = &self.inner.progress_ring
+            && let Err(error) =
+                progress_ring.retire_prefix(state.durable_ticket_end, reservation.ticket_end)
+        {
+            poison_locked(&self.inner, &mut state);
+            return Err(error).context("retire v8 progress ring durable prefix");
         }
         for _ in 0..ticket_count {
             state.tickets.pop_front();
@@ -1790,6 +2345,8 @@ impl WalV8ParallelCoordinator {
             record_durable_notification_for_waiters(&mut state);
             self.inner.durable_published.notify_all();
         }
+        drop(state);
+        self.signal_progress_token();
     }
 
     /// Poison the admission window after an uncertain write, marker, or sync.
@@ -1800,6 +2357,10 @@ impl WalV8ParallelCoordinator {
 
     pub(crate) fn is_poisoned(&self) -> bool {
         self.inner.state.lock().poisoned
+    }
+
+    pub(crate) fn is_closed(&self) -> bool {
+        self.inner.state.lock().closed
     }
 
     #[cfg(feature = "bench")]
@@ -2271,10 +2832,24 @@ impl WalV8AdmissionPublisher for WalV8ParallelCoordinator {
             initial_prefix_digest: self.inner.initial_prefix_digest,
         };
 
+        if let Some(progress_ring) = &self.inner.progress_ring
+            && let Err(error) = progress_ring.ensure_free(ticket)
+        {
+            poison_locked(&self.inner, &mut state);
+            return Err(error).context("check v8 progress ring admission slot");
+        }
+
         // Register physical-range ownership before publishing the assigned
         // ticket. Extent preparation can otherwise race ahead and initialize
         // a range whose DATA strategy has not yet been made visible.
         register(assignment)?;
+
+        if let Some(progress_ring) = &self.inner.progress_ring
+            && let Err(error) = progress_ring.initialize(assignment, plan.logical_batch_bytes)
+        {
+            poison_locked(&self.inner, &mut state);
+            return Err(error).context("initialize v8 progress ring admission slot");
+        }
 
         state.tickets.push_back(TicketState {
             assignment,
@@ -2437,9 +3012,149 @@ impl TicketState {
     }
 }
 
+fn ticket_progress(inner: &CoordinatorInner, ticket: &TicketState) -> Result<WalV8TicketProgress> {
+    let mut progress = ticket.progress();
+    if let Some(ring) = &inner.progress_ring {
+        let cell = ring.read(inner.segment_incarnation, ticket.assignment.segment_ticket)?;
+        ensure!(
+            cell.logical_batch_bytes == Some(u64::try_from(ticket.plan.logical_batch_bytes)?),
+            "v8 progress ring payload differs from its admitted ticket"
+        );
+        progress.frames_ready = cell.frames_ready;
+        progress.digest_ready = cell.digest_ready;
+    }
+    Ok(progress)
+}
+
+fn ticket_frames_ready(inner: &CoordinatorInner, ticket: &TicketState) -> Result<bool> {
+    if let Some(ring) = &inner.progress_ring {
+        return Ok(ring
+            .read(inner.segment_incarnation, ticket.assignment.segment_ticket)?
+            .frames_ready);
+    }
+    Ok(ticket.frames_ready)
+}
+
+fn ticket_is_frontier_ready(inner: &CoordinatorInner, ticket: &TicketState) -> Result<bool> {
+    Ok(ticket_progress(inner, ticket)?.is_frontier_ready())
+}
+
+fn empty_frontier_ready_snapshot() -> WalV8FrontierReadySnapshot {
+    WalV8FrontierReadySnapshot {
+        ready_prefix: Vec::new(),
+        admitted_ticket_count: 0,
+        closed: false,
+        #[cfg(feature = "bench")]
+        frames_ready_prefix_count: 0,
+        #[cfg(feature = "bench")]
+        data_complete_prefix_count: 0,
+        #[cfg(feature = "bench")]
+        reserved_preparation_bytes: 0,
+        #[cfg(feature = "bench")]
+        next_not_ready: None,
+        #[cfg(feature = "bench")]
+        data_hol_blocker: None,
+        #[cfg(feature = "bench")]
+        snapshot_monotonic_ns: None,
+    }
+}
+
+fn frontier_ready_snapshot_locked(
+    inner: &CoordinatorInner,
+    state: &CoordinatorState,
+    capture_monotonic_ns: bool,
+) -> Result<WalV8FrontierReadySnapshot> {
+    #[cfg(not(feature = "bench"))]
+    let _ = capture_monotonic_ns;
+    let mut snapshot = empty_frontier_ready_snapshot();
+    snapshot.closed = state.closed;
+    if state.poisoned {
+        return Ok(snapshot);
+    }
+    snapshot.admitted_ticket_count = state.tickets.len();
+    if inner.progress_ring.is_none() {
+        snapshot.ready_prefix = state
+            .tickets
+            .iter()
+            .take_while(|ticket| ticket.is_frontier_ready())
+            .map(TicketState::progress)
+            .collect();
+        #[cfg(feature = "bench")]
+        {
+            snapshot.frames_ready_prefix_count = state
+                .tickets
+                .iter()
+                .take_while(|ticket| ticket.frames_ready)
+                .count();
+            snapshot.data_complete_prefix_count = state
+                .tickets
+                .iter()
+                .take_while(|ticket| ticket.data_complete)
+                .count();
+            snapshot.next_not_ready = state
+                .tickets
+                .get(snapshot.ready_prefix.len())
+                .map(TicketState::progress);
+            snapshot.data_hol_blocker = state
+                .tickets
+                .get(snapshot.data_complete_prefix_count)
+                .map(TicketState::progress);
+        }
+    } else {
+        for (index, ticket) in state.tickets.iter().enumerate() {
+            // Producers can publish readiness while the Coordinator lock is
+            // held. Reuse this view for both the counts and blocker fields.
+            let progress = ticket_progress(inner, ticket)?;
+            if snapshot.ready_prefix.len() == index {
+                if progress.is_frontier_ready() {
+                    snapshot.ready_prefix.push(progress);
+                } else {
+                    #[cfg(not(feature = "bench"))]
+                    break;
+                    #[cfg(feature = "bench")]
+                    if capture_monotonic_ns {
+                        snapshot.next_not_ready = Some(progress);
+                    } else {
+                        break;
+                    }
+                }
+            }
+            #[cfg(feature = "bench")]
+            if capture_monotonic_ns {
+                if snapshot.frames_ready_prefix_count == index && progress.frames_ready {
+                    snapshot.frames_ready_prefix_count += 1;
+                }
+                if snapshot.data_complete_prefix_count == index {
+                    if progress.data_complete {
+                        snapshot.data_complete_prefix_count += 1;
+                    } else {
+                        snapshot.data_hol_blocker = Some(progress);
+                    }
+                }
+            }
+            #[cfg(feature = "bench")]
+            if snapshot.frames_ready_prefix_count <= index
+                && snapshot.data_hol_blocker.is_some()
+                && snapshot.next_not_ready.is_some()
+            {
+                break;
+            }
+        }
+    }
+    #[cfg(feature = "bench")]
+    {
+        snapshot.reserved_preparation_bytes = state.reserved_preparation_bytes;
+        snapshot.snapshot_monotonic_ns =
+            capture_monotonic_ns.then(crate::mem_table::benchmark_monotonic_ns);
+    }
+
+    Ok(snapshot)
+}
+
 /// Fold producer digests in strict ticket order, even when later producers
 /// finish hashing first. The fold is bounded by the admitted ticket window.
 fn fold_ready_digests(
+    inner: &CoordinatorInner,
     state: &mut CoordinatorState,
     hol_profile: Option<&crate::mem_table::WriteProfile>,
 ) -> Result<()> {
@@ -2457,7 +3172,13 @@ fn fold_ready_digests(
         let Some(ticket) = state.tickets.get(index) else {
             break;
         };
-        let Some(batch_digest) = ticket.digest_ready else {
+        let batch_digest = if let Some(ring) = &inner.progress_ring {
+            ring.read(inner.segment_incarnation, ticket.assignment.segment_ticket)?
+                .digest_ready
+        } else {
+            ticket.digest_ready
+        };
+        let Some(batch_digest) = batch_digest else {
             break;
         };
         ensure!(
@@ -2639,6 +3360,12 @@ fn record_durable_notification_for_waiters(state: &mut CoordinatorState) {
 fn poison_locked(inner: &CoordinatorInner, state: &mut CoordinatorState) {
     if !state.poisoned {
         state.poisoned = true;
+        if let Some(ring) = &inner.progress_ring {
+            ring.poisoned.store(true, Ordering::Release);
+        }
+        if let Some(sender) = &inner.progress_token_sender {
+            let _ = sender.try_send(());
+        }
         signal_change(inner, state);
         signal_durability_progress(inner, state);
         #[cfg(feature = "bench")]
@@ -2652,7 +3379,7 @@ mod tests {
     use super::*;
     use crate::{
         pitr::{ArchiveEpochId, ChainAnchor, SegmentId, TimelineId, WalBatch, WalEntry},
-        wal::v8::prepare::PreparedWalV8Batch,
+        wal::v8::prepare::{PreparedWalV8Batch, WalV8WriteClass},
     };
 
     fn header() -> WalV8Header {
@@ -2692,6 +3419,40 @@ mod tests {
                 max_inflight_tickets,
                 max_inflight_bytes,
                 max_file_size,
+                progress_ring_enabled: false,
+            },
+        )
+    }
+
+    fn coordinator_with_progress_ring(
+        capacity: usize,
+        next_ticket: u64,
+    ) -> Result<WalV8ParallelCoordinator> {
+        let wal_header = header();
+        let durable_prefix_digest = if next_ticket == 0 {
+            wal_header.initial_prefix_digest()?
+        } else {
+            [0xa7; 32]
+        };
+        let next_data_offset = DATA_START
+            .checked_add(next_ticket.saturating_sub(1).saturating_mul(FRAME_LEN_U64))
+            .context("test progress ring DATA offset overflows")?;
+
+        WalV8ParallelCoordinator::new(
+            wal_header,
+            WalV8ParallelConfig {
+                next_ticket,
+                next_data_offset,
+                last_commit_ts: next_ticket.saturating_mul(10),
+                last_recorded_at: (next_ticket > 0).then_some(RecordedAt {
+                    secs: i64::try_from(next_ticket.saturating_mul(10)).unwrap_or(i64::MAX),
+                    nanos: 17,
+                }),
+                durable_prefix_digest,
+                max_inflight_tickets: capacity,
+                max_inflight_bytes: 64 * 1024 * 1024,
+                max_file_size: MAX_WAL_FILE_SIZE,
+                progress_ring_enabled: true,
             },
         )
     }
@@ -2788,6 +3549,25 @@ mod tests {
             .admit(coordinator)
     }
 
+    fn admission_plan(batch: &WalBatch) -> Result<WalV8AdmissionPlan> {
+        let prepared = PreparedWalV8Batch::<()>::preflight(
+            batch,
+            crate::pitr::LIVE_WAL_V5_LIMITS,
+            |_| Ok(()),
+        )?;
+
+        Ok(WalV8AdmissionPlan {
+            commit_ts: batch.commit_ts,
+            recorded_at: batch.recorded_at,
+            write_class: WalV8WriteClass::Batch,
+            logical_batch_bytes: prepared.logical_batch_bytes(),
+            #[cfg(feature = "bench")]
+            operation_count: u32::try_from(batch.entries.len())?,
+            fragment_count: prepared.fragment_count(),
+            frame_buffer_bytes: prepared.frame_buffer_bytes(),
+        })
+    }
+
     fn mark_producer_ready(
         encoded: &mut super::super::prepare::EncodedWalV8Batch<WalV8ParallelAdmissionGuard>,
         coordinator: &WalV8ParallelCoordinator,
@@ -2805,6 +3585,839 @@ mod tests {
         if mark_data_complete {
             coordinator.mark_data_complete(assignment.segment_ticket)?;
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn progress_ring_registration_failure_leaves_slot_free_for_same_ticket_retry() -> Result<()> {
+        let coordinator = coordinator_with_progress_ring(1, 0)?;
+        let batch = batch(10);
+        let plan = admission_plan(&batch)?;
+
+        let failed = coordinator.admit_and_publish_with(plan, |_| {
+            anyhow::bail!("simulated extent registration failure")
+        });
+        assert!(failed.is_err());
+        assert!(!coordinator.is_poisoned());
+        assert_eq!(coordinator.admitted_ticket_end(), 0);
+        assert_eq!(coordinator.inner.state.lock().next_ticket, 0);
+        coordinator
+            .inner
+            .progress_ring
+            .as_ref()
+            .expect("test enables progress ring")
+            .ensure_free(0)?;
+
+        let (assignment, _guard) = coordinator.admit_and_publish_with(plan, |_| Ok(()))?;
+        assert_eq!(assignment.segment_ticket, 0);
+        assert_eq!(coordinator.admitted_ticket_end(), 1);
+        assert_eq!(
+            coordinator
+                .inner
+                .progress_ring
+                .as_ref()
+                .expect("test enables progress ring")
+                .snapshot(0)?
+                .identity,
+            Some(TicketCellIdentity {
+                segment_incarnation: header().incarnation,
+                ticket: 0,
+            })
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn progress_ring_reuses_single_slot_only_after_durable_publication() -> Result<()> {
+        let coordinator = coordinator_with_progress_ring(1, 0)?;
+        let first_batch = batch(10);
+        let mut first = admit(&first_batch, &coordinator)?.encode()?;
+        mark_producer_ready(&mut first, &coordinator, true)?;
+        assert!(
+            coordinator
+                .inner
+                .progress_ring
+                .as_ref()
+                .expect("test enables progress ring")
+                .ensure_free(1)
+                .is_err()
+        );
+
+        let mut driver = coordinator
+            .acquire_durability_driver(1)?
+            .context("test driver was not elected")?;
+        coordinator.advance_and_snapshot(&driver, &[], false)?;
+        let first_frontier = coordinator.reserve_frontier(1)?;
+        coordinator.publish_durable_frontier(first_frontier)?;
+        driver.complete();
+        first.disarm_after_durable();
+        coordinator
+            .inner
+            .progress_ring
+            .as_ref()
+            .expect("test enables progress ring")
+            .ensure_free(0)?;
+
+        let second_batch = batch(20);
+        let second = admit(&second_batch, &coordinator)?;
+        assert_eq!(second.assignment().segment_ticket, 1);
+        assert_eq!(
+            coordinator
+                .inner
+                .progress_ring
+                .as_ref()
+                .expect("test enables progress ring")
+                .snapshot(1)?
+                .identity,
+            Some(TicketCellIdentity {
+                segment_incarnation: header().incarnation,
+                ticket: 1,
+            })
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn progress_ring_reuses_capacity_two_slots_by_absolute_ticket() -> Result<()> {
+        let coordinator = coordinator_with_progress_ring(2, 0)?;
+        let first_batch = batch(10);
+        let second_batch = batch(20);
+        let mut first = admit(&first_batch, &coordinator)?.encode()?;
+        let mut second = admit(&second_batch, &coordinator)?.encode()?;
+        mark_producer_ready(&mut first, &coordinator, true)?;
+        mark_producer_ready(&mut second, &coordinator, true)?;
+
+        let mut driver = coordinator
+            .acquire_durability_driver(2)?
+            .context("test driver was not elected")?;
+        coordinator.advance_and_snapshot(&driver, &[], false)?;
+        let frontier = coordinator.reserve_frontier(2)?;
+        coordinator.publish_durable_frontier(frontier)?;
+        driver.complete();
+        first.disarm_after_durable();
+        second.disarm_after_durable();
+
+        let third_batch = batch(30);
+        let fourth_batch = batch(40);
+        let third = admit(&third_batch, &coordinator)?;
+        let fourth = admit(&fourth_batch, &coordinator)?;
+        assert_eq!(third.assignment().segment_ticket, 2);
+        assert_eq!(fourth.assignment().segment_ticket, 3);
+
+        let ring = coordinator
+            .inner
+            .progress_ring
+            .as_ref()
+            .expect("test enables progress ring");
+        assert_eq!(ring.snapshot(2)?.identity.unwrap().ticket, 2);
+        assert_eq!(ring.snapshot(3)?.identity.unwrap().ticket, 3);
+
+        Ok(())
+    }
+
+    #[test]
+    fn progress_ring_maps_nonzero_recovered_ticket_to_its_absolute_slot() -> Result<()> {
+        let coordinator = coordinator_with_progress_ring(2, 5)?;
+        let recovered_batch = batch(60);
+        let recovered = admit(&recovered_batch, &coordinator)?;
+        assert_eq!(recovered.assignment().segment_ticket, 5);
+
+        let next_batch = batch(70);
+        let next = admit(&next_batch, &coordinator)?;
+        assert_eq!(next.assignment().segment_ticket, 6);
+
+        let ring = coordinator
+            .inner
+            .progress_ring
+            .as_ref()
+            .expect("test enables progress ring");
+        assert_eq!(ring.snapshot(5)?.identity.unwrap().ticket, 5);
+        assert_eq!(ring.snapshot(6)?.identity.unwrap().ticket, 6);
+
+        Ok(())
+    }
+
+    #[test]
+    fn progress_ring_readiness_publishes_without_the_coordinator_lock() -> Result<()> {
+        let coordinator = coordinator_with_progress_ring(1, 0)?;
+        let input = batch(10);
+        let encoded = admit(&input, &coordinator)?.encode()?;
+        let digest = encoded.digest_ready()?;
+        let tokens = coordinator
+            .take_progress_token_receiver()?
+            .context("missing progress token receiver")?;
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+
+        std::thread::scope(|scope| {
+            let state = coordinator.inner.state.lock();
+            scope.spawn(|| {
+                let result = (|| {
+                    assert!(coordinator.publish_progress_frames_ready(0)?);
+                    assert!(
+                        tokens.is_empty(),
+                        "frame readiness alone must not wake the owner"
+                    );
+                    assert!(coordinator.publish_progress_digest(digest)?);
+                    assert_eq!(tokens.try_recv(), Ok(()));
+                    Ok(())
+                })();
+                let _ = result_tx.send(result);
+            });
+            let result = result_rx.recv_timeout(Duration::from_secs(2));
+            drop(state);
+
+            result.context("ring publication waited for the Coordinator mutex")?
+        })
+    }
+
+    #[test]
+    fn progress_ring_readiness_rejects_events_after_poison_without_mutating_ticket() -> Result<()> {
+        let coordinator = coordinator_with_progress_ring(1, 0)?;
+        let input = batch(10);
+        let encoded = admit(&input, &coordinator)?.encode()?;
+        let digest = encoded.digest_ready()?;
+        let ring = coordinator
+            .inner
+            .progress_ring
+            .as_ref()
+            .expect("test enables progress ring");
+        let before = ring.snapshot(0)?;
+
+        coordinator.poison();
+        assert!(coordinator.publish_progress_digest(digest).is_err());
+        assert!(coordinator.publish_progress_frames_ready(0).is_err());
+        assert_eq!(ring.snapshot(0)?, before);
+
+        Ok(())
+    }
+
+    #[test]
+    fn progress_ring_readiness_can_drain_admitted_ticket_after_close() -> Result<()> {
+        let coordinator = coordinator_with_progress_ring(1, 0)?;
+        let input = batch(10);
+        let encoded = admit(&input, &coordinator)?.encode()?;
+        let digest = encoded.digest_ready()?;
+
+        coordinator.close();
+        assert!(coordinator.publish_progress_digest(digest)?);
+        assert!(coordinator.publish_progress_frames_ready(0)?);
+        let payload = coordinator
+            .inner
+            .progress_ring
+            .as_ref()
+            .expect("test enables progress ring")
+            .snapshot(0)?;
+        assert_eq!(payload.digest_ready, Some(digest));
+        assert!(payload.frames_ready);
+
+        Ok(())
+    }
+
+    #[test]
+    fn progress_ring_late_digest_wakes_after_consumed_data_token_and_scan() -> Result<()> {
+        let coordinator = coordinator_with_progress_ring(1, 0)?;
+        let receiver = coordinator
+            .take_progress_token_receiver()?
+            .context("missing progress token")?;
+        let input = batch(10);
+        let mut encoded = admit(&input, &coordinator)?.encode()?;
+        let digest = encoded.digest_ready()?;
+        coordinator.publish_progress_frames_ready(0)?;
+
+        let mut driver = coordinator
+            .acquire_durability_driver(1)?
+            .context("missing durability driver")?;
+
+        // Observe the missing digest before the DATA completion arrives.
+        consume_progress_token_before_scan(&receiver);
+        assert!(
+            coordinator
+                .advance_and_snapshot(&driver, &[], false)?
+                .ready_prefix
+                .is_empty()
+        );
+        assert_eq!(coordinator.inner.state.lock().folded_ticket_end, 0);
+
+        // A DATA completion is queued and its only token is consumed. The
+        // owner applies the completion but still cannot advance without the
+        // digest. No later DATA event will arrive to wake it.
+        let (completion_tx, completion_rx) = crossbeam_channel::bounded(1);
+        completion_tx.send(WalV8CompletedGroupEvent {
+            group_id: 1,
+            tickets: 0..1,
+            write_count: 1,
+            write_bytes: u64::try_from(WAL_V8_FRAME_LEN)?,
+            #[cfg(feature = "bench")]
+            completion_observed_at: None,
+        })?;
+        coordinator.notify_completion_queued();
+        consume_progress_token_before_scan(&receiver);
+        let event = [completion_rx.try_recv()?];
+        assert!(
+            coordinator
+                .advance_and_snapshot(&driver, &event, false)?
+                .ready_prefix
+                .is_empty()
+        );
+        assert!(coordinator.inner.state.lock().tickets[0].data_complete);
+
+        // Publish after the scan and before the driver parks. The persistent
+        // token must carry this wake into the subsequent receive.
+        coordinator.publish_progress_digest(digest)?;
+        assert_eq!(
+            wait_for_progress_token(&receiver, Duration::from_secs(1)),
+            WalV8ProgressTokenWait::Signaled
+        );
+        consume_progress_token_before_scan(&receiver);
+        assert_eq!(
+            coordinator
+                .advance_and_snapshot(&driver, &[], false)?
+                .ready_prefix
+                .len(),
+            1
+        );
+        assert_eq!(coordinator.inner.state.lock().folded_ticket_end, 1);
+
+        let frontier = coordinator.reserve_frontier(1)?;
+        coordinator.publish_durable_frontier(frontier)?;
+        driver.complete();
+        encoded.disarm_after_durable();
+
+        Ok(())
+    }
+
+    #[test]
+    fn progress_ring_handoff_scans_completion_queued_after_previous_scan() -> Result<()> {
+        let coordinator = coordinator_with_progress_ring(2, 0)?;
+        let first_input = batch(10);
+        let second_input = batch(20);
+        let mut first = admit(&first_input, &coordinator)?.encode()?;
+        let mut second = admit(&second_input, &coordinator)?.encode()?;
+        for encoded in [&first, &second] {
+            coordinator.mark_digest_ready(encoded.digest_ready()?)?;
+            coordinator.publish_progress_frames_ready(encoded.assignment().segment_ticket)?;
+        }
+
+        let tokens = coordinator
+            .take_progress_token_receiver()?
+            .context("missing progress token")?;
+        let (completion_tx, completion_rx) = crossbeam_channel::bounded(2);
+        let first_event = WalV8CompletedGroupEvent {
+            group_id: 1,
+            tickets: 0..1,
+            write_count: 1,
+            write_bytes: u64::try_from(WAL_V8_FRAME_LEN)?,
+            #[cfg(feature = "bench")]
+            completion_observed_at: None,
+        };
+        completion_tx.send(first_event)?;
+        coordinator.notify_completion_queued();
+
+        let mut first_driver = coordinator
+            .acquire_durability_driver(1)?
+            .context("missing first durability driver")?;
+        consume_progress_token_before_scan(&tokens);
+        let first_event = [completion_rx.try_recv()?];
+        assert_eq!(
+            coordinator
+                .advance_and_snapshot(&first_driver, &first_event, false)?
+                .ready_prefix
+                .len(),
+            1
+        );
+        let frontier = coordinator.reserve_frontier(1)?;
+        coordinator.publish_durable_frontier(frontier)?;
+        first.disarm_after_durable();
+        first_driver.complete();
+
+        // This completion arrives after the previous owner's final scan but
+        // before its handoff. The queued event and pending token must be seen
+        // by the next owner without another publication.
+        completion_tx.send(WalV8CompletedGroupEvent {
+            group_id: 2,
+            tickets: 1..2,
+            write_count: 1,
+            write_bytes: u64::try_from(WAL_V8_FRAME_LEN)?,
+            #[cfg(feature = "bench")]
+            completion_observed_at: None,
+        })?;
+        coordinator.notify_completion_queued();
+        drop(first_driver);
+
+        let mut second_driver = coordinator
+            .acquire_durability_driver(2)?
+            .context("missing handed-off durability driver")?;
+        consume_progress_token_before_scan(&tokens);
+        let second_event = [completion_rx.try_recv()?];
+        assert_eq!(
+            coordinator
+                .advance_and_snapshot(&second_driver, &second_event, false)?
+                .ready_prefix
+                .len(),
+            1
+        );
+        let frontier = coordinator.reserve_frontier(2)?;
+        coordinator.publish_durable_frontier(frontier)?;
+        second.disarm_after_durable();
+        second_driver.complete();
+
+        Ok(())
+    }
+
+    #[test]
+    fn progress_ring_close_and_poison_leave_persistent_wake_tokens() -> Result<()> {
+        for poison in [false, true] {
+            let coordinator = coordinator_with_progress_ring(1, 0)?;
+            let receiver = coordinator
+                .take_progress_token_receiver()?
+                .context("missing progress token")?;
+            let waiting_coordinator = coordinator.clone();
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+            let waiter = std::thread::spawn(move || {
+                // The parent may signal before this receive parks. The
+                // capacity-one token must preserve that wake until consumed.
+                ready_tx.send(()).expect("parent remains connected");
+                wait_for_progress_token(&receiver, Duration::from_secs(5))
+            });
+            ready_rx.recv_timeout(Duration::from_secs(1))?;
+
+            if poison {
+                waiting_coordinator.poison();
+            } else {
+                waiting_coordinator.close();
+            }
+
+            assert_eq!(
+                waiter.join().expect("progress-token waiter panicked"),
+                WalV8ProgressTokenWait::Signaled
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn progress_ring_concurrent_publishers_coalesce_to_one_persistent_token() -> Result<()> {
+        const PUBLISHERS: usize = 8;
+        let coordinator = coordinator_with_progress_ring(1, 0)?;
+        let receiver = coordinator
+            .take_progress_token_receiver()?
+            .context("missing progress token")?;
+        let start = Arc::new(std::sync::Barrier::new(PUBLISHERS + 1));
+
+        std::thread::scope(|scope| {
+            for _ in 0..PUBLISHERS {
+                let coordinator = coordinator.clone();
+                let start = Arc::clone(&start);
+                scope.spawn(move || {
+                    start.wait();
+                    for _ in 0..32 {
+                        coordinator.signal_progress_token();
+                    }
+                });
+            }
+            start.wait();
+        });
+
+        assert_eq!(
+            wait_for_progress_token(&receiver, Duration::from_secs(1)),
+            WalV8ProgressTokenWait::Signaled
+        );
+        assert_eq!(
+            wait_for_progress_token(&receiver, Duration::from_millis(10)),
+            WalV8ProgressTokenWait::TimedOut
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn progress_ring_rejects_bad_digest_length_without_mutating_cell() -> Result<()> {
+        let coordinator = coordinator_with_progress_ring(2, 0)?;
+        let point_batch = batch(10);
+        let encoded = admit(&point_batch, &coordinator)?.encode()?;
+        let mut digest = encoded.digest_ready()?;
+        digest.logical_batch_bytes = digest.logical_batch_bytes.saturating_add(1);
+        let before = coordinator
+            .inner
+            .progress_ring
+            .as_ref()
+            .expect("test enables progress ring")
+            .snapshot(0)?;
+
+        let progress_ring = coordinator
+            .inner
+            .progress_ring
+            .as_ref()
+            .expect("test enables progress ring");
+        assert!(progress_ring.publish_digest(digest).is_err());
+        assert_eq!(progress_ring.snapshot(0)?, before);
+        assert!(coordinator.mark_digest_ready(digest).is_err());
+        assert!(coordinator.is_poisoned());
+        assert_eq!(
+            coordinator
+                .inner
+                .progress_ring
+                .as_ref()
+                .expect("test enables progress ring")
+                .snapshot(0)?,
+            before
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn progress_ring_rejects_foreign_incarnation_without_mutating_cell() -> Result<()> {
+        let coordinator = coordinator_with_progress_ring(2, 0)?;
+        let point_batch = batch(10);
+        let encoded = admit(&point_batch, &coordinator)?.encode()?;
+        let mut digest = encoded.digest_ready()?;
+        digest.segment_incarnation[0] ^= 0xff;
+        let before = coordinator
+            .inner
+            .progress_ring
+            .as_ref()
+            .expect("test enables progress ring")
+            .snapshot(0)?;
+
+        let progress_ring = coordinator
+            .inner
+            .progress_ring
+            .as_ref()
+            .expect("test enables progress ring");
+        assert!(progress_ring.publish_digest(digest).is_err());
+        assert_eq!(progress_ring.snapshot(0)?, before);
+        assert!(coordinator.mark_digest_ready(digest).is_err());
+        assert!(coordinator.is_poisoned());
+        assert_eq!(
+            coordinator
+                .inner
+                .progress_ring
+                .as_ref()
+                .expect("test enables progress ring")
+                .snapshot(0)?,
+            before
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn progress_ring_accepts_identical_digest_retry_after_fold() -> Result<()> {
+        let coordinator = coordinator_with_progress_ring(1, 0)?;
+        let point_batch = batch(10);
+        let encoded = admit(&point_batch, &coordinator)?.encode()?;
+        let digest = encoded.digest_ready()?;
+
+        coordinator.mark_digest_ready(digest)?;
+        let mut driver = coordinator
+            .acquire_durability_driver(1)?
+            .context("test driver was not elected")?;
+        coordinator.advance_and_snapshot(&driver, &[], false)?;
+        let folded_prefix = coordinator.inner.state.lock().folded_ticket_end;
+        assert_eq!(folded_prefix, 1);
+        coordinator.mark_digest_ready(digest)?;
+        assert_eq!(
+            coordinator.inner.state.lock().folded_ticket_end,
+            folded_prefix
+        );
+        assert_eq!(
+            coordinator
+                .inner
+                .progress_ring
+                .as_ref()
+                .expect("test enables progress ring")
+                .snapshot(0)?
+                .digest_ready,
+            Some(digest)
+        );
+        driver.complete();
+
+        Ok(())
+    }
+
+    #[test]
+    fn progress_ring_conflicting_digest_after_fold_preserves_first_value() -> Result<()> {
+        let coordinator = coordinator_with_progress_ring(1, 0)?;
+        let point_batch = batch(10);
+        let encoded = admit(&point_batch, &coordinator)?.encode()?;
+        let digest = encoded.digest_ready()?;
+        coordinator.mark_digest_ready(digest)?;
+        let before = coordinator
+            .inner
+            .progress_ring
+            .as_ref()
+            .expect("test enables progress ring")
+            .snapshot(0)?;
+        let mut conflicting = digest;
+        conflicting.batch_digest[0] ^= 0xff;
+
+        assert!(coordinator.mark_digest_ready(conflicting).is_err());
+        assert!(coordinator.is_poisoned());
+        assert_eq!(
+            coordinator
+                .inner
+                .progress_ring
+                .as_ref()
+                .expect("test enables progress ring")
+                .snapshot(0)?,
+            before
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn progress_ring_stale_digest_after_slot_reuse_does_not_change_new_ticket() -> Result<()> {
+        let coordinator = coordinator_with_progress_ring(1, 0)?;
+        let first_batch = batch(10);
+        let mut first = admit(&first_batch, &coordinator)?.encode()?;
+        let stale_digest = first.digest_ready()?;
+        mark_producer_ready(&mut first, &coordinator, true)?;
+        let mut driver = coordinator
+            .acquire_durability_driver(1)?
+            .context("test driver was not elected")?;
+        coordinator.advance_and_snapshot(&driver, &[], false)?;
+        let frontier = coordinator.reserve_frontier(1)?;
+        coordinator.publish_durable_frontier(frontier)?;
+        driver.complete();
+        first.disarm_after_durable();
+
+        let second_batch = batch(20);
+        let second = admit(&second_batch, &coordinator)?;
+        let before = coordinator
+            .inner
+            .progress_ring
+            .as_ref()
+            .expect("test enables progress ring")
+            .snapshot(1)?;
+        let progress_ring = coordinator
+            .inner
+            .progress_ring
+            .as_ref()
+            .expect("test enables progress ring");
+        assert!(
+            progress_ring
+                .mark_frames_ready(
+                    stale_digest.segment_incarnation,
+                    stale_digest.segment_ticket
+                )
+                .is_err()
+        );
+        assert_eq!(progress_ring.snapshot(1)?, before);
+        assert!(coordinator.mark_digest_ready(stale_digest).is_err());
+        assert!(coordinator.is_poisoned());
+        assert_eq!(
+            coordinator
+                .inner
+                .progress_ring
+                .as_ref()
+                .expect("test enables progress ring")
+                .snapshot(1)?,
+            before
+        );
+        drop(second);
+
+        Ok(())
+    }
+
+    #[test]
+    fn progress_ring_retires_prefix_atomically_after_validating_every_cell() -> Result<()> {
+        let coordinator = coordinator_with_progress_ring(2, 0)?;
+        let first_batch = batch(10);
+        let second_batch = batch(20);
+        let mut first = admit(&first_batch, &coordinator)?.encode()?;
+        let second = admit(&second_batch, &coordinator)?;
+        let first_digest = first.digest_ready()?;
+        coordinator.mark_digest_ready(first_digest)?;
+        let mut first_frames = vec![0; first.frame_buffer_bytes()];
+        first.encode_data_frames_into(&mut first_frames)?;
+        coordinator.mark_frames_ready(0)?;
+
+        let ring = coordinator
+            .inner
+            .progress_ring
+            .as_ref()
+            .expect("test enables progress ring");
+        let first_before = ring.snapshot(0)?;
+        let second_before = ring.snapshot(1)?;
+        assert!(ring.retire_prefix(0, 2).is_err());
+        assert_eq!(ring.snapshot(0)?, first_before);
+        assert_eq!(ring.snapshot(1)?, second_before);
+        drop(second);
+
+        Ok(())
+    }
+
+    #[test]
+    fn progress_ring_completion_batch_applies_multi_ticket_group_for_active_driver() -> Result<()> {
+        let coordinator = coordinator_with_progress_ring(2, 0)?;
+        #[cfg(feature = "bench")]
+        let profile = Arc::new(crate::mem_table::WriteProfile::default());
+        #[cfg(feature = "bench")]
+        coordinator.set_hol_diagnostics_profile(Arc::clone(&profile));
+        let first_batch = batch(10);
+        let second_batch = batch(20);
+        let mut first = admit(&first_batch, &coordinator)?.encode()?;
+        let mut second = admit(&second_batch, &coordinator)?.encode()?;
+        let first_assignment = first.assignment();
+
+        coordinator.mark_digest_ready(first.digest_ready()?)?;
+        coordinator.mark_digest_ready(second.digest_ready()?)?;
+        coordinator.mark_frames_ready(first_assignment.segment_ticket)?;
+        coordinator.mark_frames_ready(second.assignment().segment_ticket)?;
+
+        let mut driver = coordinator
+            .acquire_durability_driver(2)?
+            .context("test driver was not elected")?;
+        let change_generation = coordinator.change_generation();
+        let durability_generation = coordinator.durability_generation();
+        #[cfg(feature = "bench")]
+        let completion_observed_at = {
+            assert!(coordinator.capture_data_completion_time().is_none());
+            coordinator.set_data_completion_timestamps_enabled(true);
+            coordinator.capture_data_completion_time()
+        };
+        let events = [WalV8CompletedGroupEvent {
+            group_id: 7,
+            tickets: 0..2,
+            write_count: 2,
+            write_bytes: u64::try_from(2 * WAL_V8_FRAME_LEN)?,
+            #[cfg(feature = "bench")]
+            completion_observed_at,
+        }];
+        let snapshot =
+            coordinator.advance_and_snapshot(&driver, &events, cfg!(feature = "bench"))?;
+        assert_eq!(snapshot.ready_prefix.len(), 2);
+        assert_eq!(coordinator.change_generation(), change_generation);
+        assert_eq!(coordinator.durability_generation(), durability_generation);
+        #[cfg(feature = "bench")]
+        {
+            assert!(completion_observed_at.is_some());
+            assert!(
+                snapshot
+                    .ready_prefix
+                    .iter()
+                    .all(|ticket| ticket.data_completed_at == completion_observed_at)
+            );
+            assert_eq!(snapshot.frames_ready_prefix_count, 2);
+            assert_eq!(snapshot.data_complete_prefix_count, 2);
+            let fold_cpu_ns = coordinator.inner.state.lock().ordered_link_hash_cpu_ns;
+            assert_eq!(
+                profile.snapshot().wal_v8_ordered_link_hash_cpu_ns,
+                fold_cpu_ns
+            );
+            coordinator.advance_and_snapshot(&driver, &[], false)?;
+            let measured = profile.snapshot();
+            assert_eq!(measured.wal_v8_ordered_link_hash_cpu_ns, fold_cpu_ns);
+            assert_eq!(measured.wal_v8_cpu_timing_sampled_tickets, 0);
+        }
+
+        let reservation = coordinator.reserve_frontier(2)?;
+        coordinator.publish_durable_frontier(reservation)?;
+        driver.complete();
+        first.disarm_after_durable();
+        second.disarm_after_durable();
+
+        Ok(())
+    }
+
+    #[test]
+    fn progress_ring_completion_batch_validates_entire_group_before_mutation() -> Result<()> {
+        let coordinator = coordinator_with_progress_ring(2, 0)?;
+        let first_batch = batch(10);
+        let second_batch = batch(20);
+        let first = admit(&first_batch, &coordinator)?.encode()?;
+        let second = admit(&second_batch, &coordinator)?.encode()?;
+        let first_assignment = first.assignment();
+        coordinator.mark_digest_ready(first.digest_ready()?)?;
+        coordinator.mark_digest_ready(second.digest_ready()?)?;
+        coordinator.mark_frames_ready(first_assignment.segment_ticket)?;
+
+        #[cfg(feature = "bench")]
+        {
+            coordinator.mark_data_write_started(first_assignment.segment_ticket)?;
+            let snapshot = coordinator.frontier_ready_snapshot_with_monotonic_ns();
+            assert_eq!(snapshot.frames_ready_prefix_count, 1);
+            assert_eq!(snapshot.data_complete_prefix_count, 0);
+            let blocked = snapshot
+                .next_not_ready
+                .context("missing readiness blocker")?;
+            assert_eq!(Some(blocked), snapshot.data_hol_blocker);
+            assert!(blocked.frames_ready);
+            assert!(blocked.data_write_elapsed_ns.is_some());
+        }
+
+        let driver = coordinator
+            .acquire_durability_driver(2)?
+            .context("test driver was not elected")?;
+        let events = [WalV8CompletedGroupEvent {
+            group_id: 9,
+            tickets: 0..2,
+            write_count: 2,
+            write_bytes: u64::try_from(2 * WAL_V8_FRAME_LEN)?,
+            #[cfg(feature = "bench")]
+            completion_observed_at: None,
+        }];
+        assert!(
+            coordinator
+                .advance_and_snapshot(&driver, &events, false)
+                .is_err()
+        );
+        let state = coordinator.inner.state.lock();
+        assert!(!state.tickets[0].data_complete);
+        assert!(!state.tickets[1].data_complete);
+        drop(state);
+        assert!(coordinator.is_poisoned());
+        drop(driver);
+        drop(first);
+        drop(second);
+
+        Ok(())
+    }
+
+    #[test]
+    fn progress_ring_completion_batch_rejects_a_foreign_driver() -> Result<()> {
+        let coordinator = coordinator_with_progress_ring(1, 0)?;
+        let foreign = coordinator_with_progress_ring(1, 0)?;
+        let target_batch = batch(10);
+        let encoded = admit(&target_batch, &coordinator)?.encode()?;
+        let assignment = encoded.assignment();
+        coordinator.mark_digest_ready(encoded.digest_ready()?)?;
+        coordinator.mark_frames_ready(assignment.segment_ticket)?;
+
+        let foreign_batch = batch(10);
+        let foreign_encoded = admit(&foreign_batch, &foreign)?.encode()?;
+
+        let target_driver = coordinator
+            .acquire_durability_driver(1)?
+            .context("target test driver was not elected")?;
+        let foreign_driver = foreign
+            .acquire_durability_driver(1)?
+            .context("foreign test driver was not elected")?;
+        let events = [WalV8CompletedGroupEvent {
+            group_id: 1,
+            tickets: 0..1,
+            write_count: 1,
+            write_bytes: WAL_V8_FRAME_LEN as u64,
+            #[cfg(feature = "bench")]
+            completion_observed_at: None,
+        }];
+        assert!(
+            coordinator
+                .advance_and_snapshot(&foreign_driver, &events, false)
+                .is_err()
+        );
+        assert!(!coordinator.inner.state.lock().tickets[0].data_complete);
+        assert!(!coordinator.is_poisoned());
+
+        drop(foreign_driver);
+        drop(foreign_encoded);
+        drop(target_driver);
+        drop(encoded);
+        assert!(coordinator.is_poisoned());
 
         Ok(())
     }
@@ -3089,6 +4702,7 @@ mod tests {
                 max_inflight_tickets: 8,
                 max_inflight_bytes: 64 * 1024 * 1024,
                 max_file_size: MAX_WAL_FILE_SIZE,
+                progress_ring_enabled: false,
             },
         )?;
         let batch = batch(60);
