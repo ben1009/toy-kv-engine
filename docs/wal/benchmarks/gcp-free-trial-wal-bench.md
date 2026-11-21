@@ -331,6 +331,22 @@ checking against that API response. The runner polls guest attributes at a
 bounded rate. See [guest attributes and SSH
 host-key verification](https://docs.cloud.google.com/compute/docs/metadata/manage-guest-attributes).
 
+## Scoring V8 Point candidates
+
+For candidate A/B runs with 1 MiB Point Lookahead, use one binary and apply the
+same I/O, coalescing and latency sampling settings in both arms. Set
+`TOYKV_BENCH_V8_EXTENT_POLICY_SCAN_DIAGNOSTICS=0` in the remote `write-perf`
+environment. Bench builds enable those counters when the variable is absent.
+In each result, verify that
+`sliding_extent_preparation.extent_policy_scan_diagnostics_enabled` is `false`
+at both `result.wal_pipeline.wal_io_start` and `result.wal_pipeline.wal_io_end`.
+Capture CPU attribution, sync diagnostics, and completion timelines in separate
+runs from the scores.
+
+The [V8 Point Progress Ring plan](../rfc-026-v8-point-fast-lane.md#8-performance-gates-and-stop-rules)
+describes the candidate's proposed Point1, Point8, Point16 and Batch64 test
+after prototype and recovery verification.
+
 ## Collected artifacts
 
 The local result directory includes the preflight quota report, GCP command
