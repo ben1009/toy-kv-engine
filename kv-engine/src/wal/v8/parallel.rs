@@ -4079,7 +4079,6 @@ mod tests {
         coordinator.publish_durable_frontier(frontier)?;
         first.disarm_after_durable();
         first_driver.complete();
-        drop(first_driver);
 
         // This completion arrives after the previous owner's final scan but
         // before its handoff. The queued event and pending token must be seen
@@ -4093,6 +4092,7 @@ mod tests {
             timeline: None,
         })?;
         coordinator.notify_completion_queued();
+        drop(first_driver);
 
         let mut second_driver = coordinator
             .acquire_durability_driver(2)?
