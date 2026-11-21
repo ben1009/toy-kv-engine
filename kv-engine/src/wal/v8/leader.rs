@@ -70,7 +70,8 @@ use super::{
     parallel::{
         WalV8CompletedGroupEvent, WalV8DurabilityDriver, WalV8FrontierReadySnapshot,
         WalV8ParallelAdmissionGuard, WalV8ParallelConfig, WalV8ParallelCoordinator,
-        WalV8PreparationReservation,
+        WalV8PreparationReservation, WalV8ProgressTokenWait, consume_progress_token_before_scan,
+        wait_for_progress_token,
     },
     prepare::{
         AdmittedWalV8Batch, EncodedWalV8Batch, PreparedWalV8Batch, WalV8AdmissionPlan,
@@ -2744,7 +2745,7 @@ impl WalV8ParallelIo {
         // means a publisher racing after the scan leaves another token for the
         // subsequent park.
         if let Some(tokens) = &self.progress_tokens {
-            let _ = tokens.try_recv();
+            consume_progress_token_before_scan(tokens);
         }
 
         let mut batch = self.completion_batch.lock();
@@ -2773,10 +2774,10 @@ impl WalV8ParallelIo {
         let Some(tokens) = &self.progress_tokens else {
             anyhow::bail!("v8 progress wait requested while the ring is disabled");
         };
-        match tokens.recv_timeout(timeout) {
-            Ok(()) => Ok(true),
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => Ok(false),
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+        match wait_for_progress_token(tokens, timeout) {
+            WalV8ProgressTokenWait::Signaled => Ok(true),
+            WalV8ProgressTokenWait::TimedOut => Ok(false),
+            WalV8ProgressTokenWait::Disconnected => {
                 if !self.shutdown_started.load(Ordering::Acquire) {
                     self.coordinator.poison();
                     anyhow::bail!("v8 progress token channel disconnected before teardown");
@@ -8956,22 +8957,29 @@ mod tests {
         Ok(())
     }
 
+    fn open_parallel_with_progress_mode(
+        path: &Path,
+        installed: &WalV8InstalledRecovery,
+        enabled: bool,
+    ) -> Result<WalV8ParallelWriter> {
+        let worker_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_DIRECT)
+            .open(path)?;
+        open_writer(path, installed)?
+            .into_parallel_with_worker_file_and_progress_ring(worker_file, enabled)
+    }
+
     #[test]
-    fn v8_progress_ring_parallel_write_sync_and_recovery() -> Result<()> {
+    fn v8_progress_ring_parallel_write_reopen_and_recovery() -> Result<()> {
         let parent = Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/wal-v8-tests");
         std::fs::create_dir_all(&parent)?;
         let directory = tempfile::tempdir_in(parent)?;
         let path = directory.path().join("progress-ring-active-v8.wal");
         let wal_header = header();
         let installed = install_empty(&path, wal_header)?;
-        let worker_file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .custom_flags(libc::O_DIRECT)
-            .open(&path)?;
-        let writer = match open_writer(&path, &installed)?
-            .into_parallel_with_worker_file_and_progress_ring(worker_file, true)
-        {
+        let writer = match open_parallel_with_progress_mode(&path, &installed, false) {
             Ok(writer) => writer,
             Err(error) if is_io_uring_unavailable_error(&error) => {
                 eprintln!("skipping test (io_uring unavailable): {error:#}");
@@ -8979,29 +8987,109 @@ mod tests {
             }
             Err(error) => return Err(error),
         };
-        assert!(writer.progress_ring_enabled());
+        assert!(!writer.progress_ring_enabled());
 
-        let batches = [batch(10), batch(20)];
-        for item in &batches {
-            writer.append_prepared_batch(
-                writer.preflight_batch(item, LIVE_WAL_V5_LIMITS)?,
-                item.commit_ts,
-                item.recorded_at,
-            )?;
-        }
+        let first_batch = batch(10);
+        writer.append_prepared_batch(
+            writer.preflight_batch(&first_batch, LIVE_WAL_V5_LIMITS)?,
+            first_batch.commit_ts,
+            first_batch.recorded_at,
+        )?;
 
-        let (_, boundary) = writer.active_boundaries()?;
-        assert_eq!(boundary.ticket_end, 2);
+        let (_, first_boundary) = writer.active_boundaries()?;
+        assert_eq!(first_boundary.ticket_end, 1);
         drop(writer);
 
-        let recovered = super::super::install::recover_and_install_active(
+        let ring_recovered = super::super::install::recover_and_install_active(
             &path,
-            &[boundary],
+            &[first_boundary],
             wal_header.predecessor,
             LIVE_WAL_V5_LIMITS,
             MAX_WAL_FILE_SIZE,
         )?;
-        assert_eq!(replayed_batches(&path, &recovered)?, batches);
+        assert_eq!(ring_recovered.next_ticket, 1);
+        assert_eq!(
+            replayed_batches(&path, &ring_recovered)?,
+            std::slice::from_ref(&first_batch)
+        );
+
+        // Reopen the nonempty Active image in ring mode. Its new ring starts
+        // at the recovered absolute ticket and digest boundary.
+        let ring_writer = open_parallel_with_progress_mode(&path, &ring_recovered, true)?;
+        assert!(ring_writer.progress_ring_enabled());
+        assert_eq!(
+            ring_writer.coordinator.durable_ticket_end(),
+            ring_recovered.active_boundary.ticket_end
+        );
+        assert_eq!(
+            ring_writer.coordinator.durable_prefix_digest(),
+            ring_recovered.active_boundary.prefix_digest
+        );
+        let second_batch = batch(20);
+        ring_writer.append_prepared_batch(
+            ring_writer.preflight_batch(&second_batch, LIVE_WAL_V5_LIMITS)?,
+            second_batch.commit_ts,
+            second_batch.recorded_at,
+        )?;
+        let (_, second_boundary) = ring_writer.active_boundaries()?;
+        assert_eq!(second_boundary.ticket_end, 2);
+        drop(ring_writer);
+
+        // A subsequent same-segment reopen can select eager publication
+        // again while preserving the recovered durable prefix.
+        let eager_recovered = super::super::install::recover_and_install_active(
+            &path,
+            &[second_boundary],
+            wal_header.predecessor,
+            LIVE_WAL_V5_LIMITS,
+            MAX_WAL_FILE_SIZE,
+        )?;
+        assert_eq!(eager_recovered.next_ticket, 2);
+        assert_eq!(
+            replayed_batches(&path, &eager_recovered)?,
+            [first_batch.clone(), second_batch.clone()]
+        );
+        let eager_writer = open_parallel_with_progress_mode(&path, &eager_recovered, false)?;
+        assert!(!eager_writer.progress_ring_enabled());
+        let third_batch = batch(30);
+        eager_writer.append_prepared_batch(
+            eager_writer.preflight_batch(&third_batch, LIVE_WAL_V5_LIMITS)?,
+            third_batch.commit_ts,
+            third_batch.recorded_at,
+        )?;
+        let (_, third_boundary) = eager_writer.active_boundaries()?;
+        assert_eq!(third_boundary.ticket_end, 3);
+        drop(eager_writer);
+
+        let final_recovered = super::super::install::recover_and_install_active(
+            &path,
+            &[third_boundary],
+            wal_header.predecessor,
+            LIVE_WAL_V5_LIMITS,
+            MAX_WAL_FILE_SIZE,
+        )?;
+        assert_eq!(
+            replayed_batches(&path, &final_recovered)?,
+            [first_batch, second_batch, third_batch]
+        );
+
+        // A segment successor gets a fresh pipeline with the same selected
+        // experiment mode; no ring or token is carried across incarnations.
+        let successor_header = WalV8Header {
+            segment_id: crate::pitr::SegmentId(wal_header.segment_id.0 + 1),
+            predecessor: crate::pitr::ChainAnchor::Segment(crate::pitr::SegmentAnchor {
+                segment_id: wal_header.segment_id,
+                wal_digest: [0x77; 32],
+                seal_digest: [0x88; 32],
+            }),
+            incarnation: [0x55; 16],
+            ..wal_header
+        };
+        let successor_path = directory.path().join("progress-ring-successor-v8.wal");
+        let successor_installed = install_empty(&successor_path, successor_header)?;
+        let successor_writer =
+            open_parallel_with_progress_mode(&successor_path, &successor_installed, true)?;
+        assert!(successor_writer.progress_ring_enabled());
 
         Ok(())
     }

@@ -38,6 +38,32 @@ use super::{
 const DATA_START: u64 = (WAL_V8_HEADER_LEN + WAL_V8_FRAME_LEN) as u64;
 const FRAME_LEN_U64: u64 = WAL_V8_FRAME_LEN as u64;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WalV8ProgressTokenWait {
+    Signaled,
+    TimedOut,
+    Disconnected,
+}
+
+/// Consume a pending wake before scanning the ring and completion queue.
+/// Publications racing after this receive leave a token for the next park.
+pub(crate) fn consume_progress_token_before_scan(receiver: &Receiver<()>) {
+    let _ = receiver.try_recv();
+}
+
+pub(crate) fn wait_for_progress_token(
+    receiver: &Receiver<()>,
+    timeout: Duration,
+) -> WalV8ProgressTokenWait {
+    match receiver.recv_timeout(timeout) {
+        Ok(()) => WalV8ProgressTokenWait::Signaled,
+        Err(crossbeam_channel::RecvTimeoutError::Timeout) => WalV8ProgressTokenWait::TimedOut,
+        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+            WalV8ProgressTokenWait::Disconnected
+        }
+    }
+}
+
 /// Configuration for a v8 Parallel admission window resumed from recovery.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct WalV8ParallelConfig {
@@ -3932,6 +3958,223 @@ mod tests {
             .expect("test enables progress ring");
         assert_eq!(ring.snapshot(5)?.identity.unwrap().ticket, 5);
         assert_eq!(ring.snapshot(6)?.identity.unwrap().ticket, 6);
+
+        Ok(())
+    }
+
+    #[test]
+    fn progress_ring_late_digest_wakes_after_consumed_data_token_and_scan() -> Result<()> {
+        let coordinator = coordinator_with_progress_ring(1, 0)?;
+        let receiver = coordinator
+            .take_progress_token_receiver()?
+            .context("missing progress token")?;
+        let input = batch(10);
+        let mut encoded = admit(&input, &coordinator)?.encode()?;
+        let digest = encoded.digest_ready()?;
+        coordinator.publish_progress_frames_ready(0)?;
+
+        let mut driver = coordinator
+            .acquire_durability_driver(1)?
+            .context("missing durability driver")?;
+
+        // Consume the frame-ready token and observe the missing digest before
+        // the DATA completion arrives.
+        consume_progress_token_before_scan(&receiver);
+        assert!(
+            coordinator
+                .advance_and_snapshot(&driver, &[], false)?
+                .ready_prefix
+                .is_empty()
+        );
+        assert_eq!(coordinator.inner.state.lock().folded_ticket_end, 0);
+
+        // A DATA completion is queued and its only token is consumed. The
+        // owner applies the completion but still cannot advance without the
+        // digest. No later DATA event will arrive to wake it.
+        let (completion_tx, completion_rx) = crossbeam_channel::bounded(1);
+        completion_tx.send(WalV8CompletedGroupEvent {
+            group_id: 1,
+            tickets: 0..1,
+            write_count: 1,
+            write_bytes: u64::try_from(WAL_V8_FRAME_LEN)?,
+            #[cfg(feature = "bench")]
+            timeline: None,
+        })?;
+        coordinator.notify_completion_queued();
+        consume_progress_token_before_scan(&receiver);
+        let event = [completion_rx.try_recv()?];
+        assert!(
+            coordinator
+                .advance_and_snapshot(&driver, &event, false)?
+                .ready_prefix
+                .is_empty()
+        );
+        assert!(coordinator.inner.state.lock().tickets[0].data_complete);
+
+        // Publish after the scan and before the driver parks. The persistent
+        // token must carry this wake into the subsequent receive.
+        coordinator.publish_progress_digest(digest)?;
+        assert_eq!(
+            wait_for_progress_token(&receiver, Duration::from_secs(1)),
+            WalV8ProgressTokenWait::Signaled
+        );
+        consume_progress_token_before_scan(&receiver);
+        assert_eq!(
+            coordinator
+                .advance_and_snapshot(&driver, &[], false)?
+                .ready_prefix
+                .len(),
+            1
+        );
+        assert_eq!(coordinator.inner.state.lock().folded_ticket_end, 1);
+
+        let frontier = coordinator.reserve_frontier(1)?;
+        coordinator.publish_durable_frontier(frontier)?;
+        driver.complete();
+        encoded.disarm_after_durable();
+
+        Ok(())
+    }
+
+    #[test]
+    fn progress_ring_handoff_scans_completion_queued_after_previous_scan() -> Result<()> {
+        let coordinator = coordinator_with_progress_ring(2, 0)?;
+        let first_input = batch(10);
+        let second_input = batch(20);
+        let mut first = admit(&first_input, &coordinator)?.encode()?;
+        let mut second = admit(&second_input, &coordinator)?.encode()?;
+        for encoded in [&first, &second] {
+            coordinator.mark_digest_ready(encoded.digest_ready()?)?;
+            coordinator.publish_progress_frames_ready(encoded.assignment().segment_ticket)?;
+        }
+
+        let tokens = coordinator
+            .take_progress_token_receiver()?
+            .context("missing progress token")?;
+        let (completion_tx, completion_rx) = crossbeam_channel::bounded(2);
+        let first_event = WalV8CompletedGroupEvent {
+            group_id: 1,
+            tickets: 0..1,
+            write_count: 1,
+            write_bytes: u64::try_from(WAL_V8_FRAME_LEN)?,
+            #[cfg(feature = "bench")]
+            timeline: None,
+        };
+        completion_tx.send(first_event)?;
+        coordinator.notify_completion_queued();
+
+        let mut first_driver = coordinator
+            .acquire_durability_driver(1)?
+            .context("missing first durability driver")?;
+        consume_progress_token_before_scan(&tokens);
+        let first_event = [completion_rx.try_recv()?];
+        assert_eq!(
+            coordinator
+                .advance_and_snapshot(&first_driver, &first_event, false)?
+                .ready_prefix
+                .len(),
+            1
+        );
+        let frontier = coordinator.reserve_frontier(1)?;
+        coordinator.publish_durable_frontier(frontier)?;
+        first.disarm_after_durable();
+        first_driver.complete();
+        drop(first_driver);
+
+        // This completion arrives after the previous owner's final scan but
+        // before its handoff. The queued event and pending token must be seen
+        // by the next owner without another publication.
+        completion_tx.send(WalV8CompletedGroupEvent {
+            group_id: 2,
+            tickets: 1..2,
+            write_count: 1,
+            write_bytes: u64::try_from(WAL_V8_FRAME_LEN)?,
+            #[cfg(feature = "bench")]
+            timeline: None,
+        })?;
+        coordinator.notify_completion_queued();
+
+        let mut second_driver = coordinator
+            .acquire_durability_driver(2)?
+            .context("missing handed-off durability driver")?;
+        consume_progress_token_before_scan(&tokens);
+        let second_event = [completion_rx.try_recv()?];
+        assert_eq!(
+            coordinator
+                .advance_and_snapshot(&second_driver, &second_event, false)?
+                .ready_prefix
+                .len(),
+            1
+        );
+        let frontier = coordinator.reserve_frontier(2)?;
+        coordinator.publish_durable_frontier(frontier)?;
+        second.disarm_after_durable();
+        second_driver.complete();
+
+        Ok(())
+    }
+
+    #[test]
+    fn progress_ring_close_and_poison_wake_token_waiters() -> Result<()> {
+        for poison in [false, true] {
+            let coordinator = coordinator_with_progress_ring(1, 0)?;
+            let receiver = coordinator
+                .take_progress_token_receiver()?
+                .context("missing progress token")?;
+            let waiting_coordinator = coordinator.clone();
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+            let waiter = std::thread::spawn(move || {
+                ready_tx.send(()).expect("parent remains connected");
+                wait_for_progress_token(&receiver, Duration::from_secs(5))
+            });
+            ready_rx.recv_timeout(Duration::from_secs(1))?;
+
+            if poison {
+                waiting_coordinator.poison();
+            } else {
+                waiting_coordinator.close();
+            }
+
+            assert_eq!(
+                waiter.join().expect("progress-token waiter panicked"),
+                WalV8ProgressTokenWait::Signaled
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn progress_ring_concurrent_publishers_coalesce_to_one_persistent_token() -> Result<()> {
+        const PUBLISHERS: usize = 8;
+        let coordinator = coordinator_with_progress_ring(1, 0)?;
+        let receiver = coordinator
+            .take_progress_token_receiver()?
+            .context("missing progress token")?;
+        let start = Arc::new(std::sync::Barrier::new(PUBLISHERS + 1));
+
+        std::thread::scope(|scope| {
+            for _ in 0..PUBLISHERS {
+                let coordinator = coordinator.clone();
+                let start = Arc::clone(&start);
+                scope.spawn(move || {
+                    start.wait();
+                    for _ in 0..32 {
+                        coordinator.signal_progress_token();
+                    }
+                });
+            }
+            start.wait();
+        });
+
+        assert_eq!(
+            wait_for_progress_token(&receiver, Duration::from_secs(1)),
+            WalV8ProgressTokenWait::Signaled
+        );
+        assert_eq!(
+            wait_for_progress_token(&receiver, Duration::from_millis(10)),
+            WalV8ProgressTokenWait::TimedOut
+        );
 
         Ok(())
     }
