@@ -40,7 +40,7 @@ struct TicketSlot {
 }
 ```
 
-The slot's identity includes the full segment incarnation and absolute ticket; an old slot from a wrapped window must never alias a new admission. A straightforward safe prototype can use a fixed admission-window array of `ArcSwapOption<Arc<TicketSlot>>`-equivalent slots, or per-ticket `Arc<TicketSlot>` handles held by producer and reaper. **Do not start with unsafe slot recycling.** If lookup by ticket still requires the Coordinator mutex or copies the window on every readiness event, the candidate has failed its main objective.
+The slot's identity includes the full segment incarnation and absolute ticket; an old slot from a wrapped window must never alias a new admission. A straightforward safe prototype can use a fixed admission-window table of safely published `Arc<TicketSlot>` handles (for example an `ArcSwapOption`-style slot holder with generation checks). Producers and submission groups retain ownership as necessary; do not require the Reaper to reacquire the Coordinator mutex to map a completed ticket range. **Do not start with unsafe slot recycling.** If lookup by ticket still requires the Coordinator mutex or copies the window on every readiness event, the candidate has failed its main objective.
 
 Admission must publish the initialized slot before any producer can submit DATA for that ticket. Bounds must remain `max_inflight_tickets` and `max_inflight_bytes`; recycle only after successful durable-frontier publication *and* any required producer/worker references are gone.
 
@@ -48,8 +48,8 @@ Admission must publish the initialized slot before any producer can submit DATA 
 
 - On logical encode completion, publish the immutable digest into the ticket slot and set `DIGEST_READY` with Release ordering, preserving the current **early digest-ready** opportunity rather than delaying it until framing.
 - After the frame is wholly materialized, publish `FRAMES_READY` with Release ordering, then register the existing producer guard and submit DATA exactly as now.
-- The independent Completion Reaper validates successful CQE, group ticket range and slot incarnation, then publishes `DATA_CQE` with Release ordering to each slot. Never publish DATA completion on failed or uncertain writes.
-- The ordered prefix owner reads flags with Acquire ordering. Preserve duplicate/conflicting event rejection, poison semantics and dependency ordering: `DATA_CQE` requires `FRAMES_READY`, while digest and DATA completion may arrive in either order.
+- The independent Completion Reaper validates successful CQE, group ticket range and slot incarnation. **Crucial: retain the existing atomic GROUP completion semantics, not merely individual slot flags.** Associate every submitted `WriteGroup` with a bounded immutable ticket-range group-completion handle. The packer installs this group identity on all its member slots before submission; after successful CQE, the Reaper validates the entire range and publishes **one Release group-complete marker**. The prefix owner treats `DATA_CQE` as true for a ticket **only when its containing group's marker is published** (Acquire). This prevents observing a partially completed group. A single-ticket group naturally has the same semantics. Never publish completion on failed or uncertain writes.
+- The ordered prefix owner reads flags and group-completion markers with Acquire ordering. Preserve duplicate/conflicting event rejection, poison semantics and dependency ordering: a published DATA group completion requires all its tickets to be frame ready, while digest and DATA completion may arrive in either order. A group-completion failure poisons all tickets, not just a prefix.
 - Keep existing `WriteGroup`, io_uring worker, physical DATA layout and bounded completion channel unchanged for F0. Do not add a timed DATA group join.
 
 ### Prefix folding, signals and durability
@@ -61,6 +61,12 @@ For the first F0 prototype, **keep the existing writer-elected durability driver
 If per-slot events no longer take the coordinator mutex, the durability driver needs an explicit no-lost-wakeup mechanism. A bounded one-token progress channel (send nonblocking on status advancement; consume/drain then recheck predicates) is one possible implementation. Before coding, specify how the current elected driver and any future owner receive these events, and show that completion-before-digest, digest-before-frame, ticket-window reuse, channel closure, poison and close cannot leave all waiters asleep. Never assume `Condvar::notify_all` without the corresponding locked predicate is sufficient.
 
 **Semantics remain:** admitted Ticket -> successful DATA CQE -> contiguous digest fold + frame readiness -> verified FRONTIER write -> successful `fdatasync` -> publication of durable ticket end -> user ACK. No earlier success is allowed.
+
+### Submission/CompletionGroup ownership and race proof
+
+The producer's `DIGEST_READY` and `FRAMES_READY` bits are independent of I/O grouping. The `CompletionGroup` handle is attached only when `submit_group_locked` has selected a contiguous ticket range and validated physical FRONTIER gaps. The group identity is immutable once attached; the Reaper must not receive a successful group result before every member slot has its group identity safely published. On any post-admission error, poison and wake all followers rather than leaving a slot with an orphaned group handle.
+
+Check these exact interleavings deterministically: (1) DATA CQE arrives while the last group member is being registered; (2) a group covers tickets N..N+K and the scanner is simultaneously reading the head; (3) group error after other groups complete out of order; (4) an identical completion is repeated versus a conflicting partial completion; (5) durable retirement releases group handles only after the published watermark covers the whole included prefix. A per-ticket `fetch_or(DATA_CQE)` loop without a group-level release barrier is **not an acceptable F0 prototype**.
 
 ## Optional F1 only after F0 wins: dedicated progress owner
 
@@ -83,7 +89,7 @@ F1 must preserve the existing dynamic coalescing/sync policy and current `Wal::c
 1. **Slot reuse:** no in-flight producer, CQE, digest computation or FRONTIER retirement can access a recycled slot. Typed `Arc` or generational safety is mandatory.
 2. **Release/Acquire:** all digest bytes and complete DATA-frame construction precede their published status flags, and status reads do not see an earlier generation.
 3. **Admitted work cannot vanish:** a dropped FrameJob after admission poisons and wakes every waiter; canceling an unadmitted preparation releases its resource charge.
-4. **Data-complete identity:** a completed group may include multiple tickets and physical FRONTIER gaps. Handle each ticket with its correct segment incarnation and reject unknown/partially duplicated completions; do not confuse a CQE with durable DATA.
+4. **Atomic DATA group completion:** a completed WriteGroup may contain multiple tickets and physical FRONTIER gaps. The current `mark_data_group_complete_inner` updates the entire group atomically under a single Coordinator lock; F0 MUST preserve that observable behavior using one release-published completion-group marker and never expose partial per-ticket completion to the frontier scanner. Validate ticket range, incarnation and duplicate group result; do not confuse CQE with durability.
 5. **Ordered digest fold:** a later ready ticket cannot bypass an earlier missing digest; after an out-of-order completion, progress must occur when the missing predecessor eventually publishes.
 6. **No lost progress:** a readiness event arriving between a driver's last scan and its wait cannot be missed. Poison/close/worker exit must also wake followers.
 7. **Durable and crash semantics:** immutable predecessor digest, FRONTIER offset and reservation credit must match the existing code. Preserve all crash cuts, failpoints, old-reader compatibility, Active normalization, PITR seal/rotation and restart.
