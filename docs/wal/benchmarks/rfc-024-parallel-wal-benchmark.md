@@ -30,7 +30,7 @@ reduced worker submissions but lost 3.13% paired Point16 throughput. The
 [O(1) ticket lookup](rfc-026-v8-ticket-index-gcp-20261120.md) gained 0.21% at
 Point16 and lost 0.81% at Point8. Both candidates were reverted.
 
-The [V8 Point Progress Ring proposal](../rfc-026-v8-point-fast-lane.md)
+The [V8 Point Progress Ring proposal](../../../rfcs/026-v8-point-fast-lane.md)
 defines a coordination experiment with its own correctness, throughput and
 tail latency gates. F0 measurement is pending.
 

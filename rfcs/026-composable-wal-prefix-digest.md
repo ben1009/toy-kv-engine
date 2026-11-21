@@ -457,7 +457,7 @@ the implementation plan MUST cover at least:
   recommendation while leaving the performance matrix unqualified; see the
   adoption note in section 1.
 
-The [V8 Point Progress Ring proposal](../docs/wal/rfc-026-v8-point-fast-lane.md)
+The [V8 Point Progress Ring proposal](026-v8-point-fast-lane.md)
 sets out an experiment for in-memory coordination in V8 Parallel. It uses this
 RFC's format and durability requirements and defines its own A/B gates. Overall
 V4/V7/V8 performance qualification uses the matrix above.

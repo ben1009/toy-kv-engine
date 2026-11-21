@@ -6,7 +6,7 @@
 | Date | 2026-11-21 |
 | Scope | V8 Parallel only; Point throughput target, shared Point/Batch correctness |
 | Base | [PR #558 squash commit](https://github.com/ben1009/toy-kv-engine/commit/58c79208a760bbb9cdeb02341107eb49c2a0ae7f) |
-| Parent | [RFC 026](../../rfcs/026-composable-wal-prefix-digest.md), [implementation plan](rfc-026-implementation-plan.md) |
+| Parent | [RFC 026](026-composable-wal-prefix-digest.md), [RFC 026 implementation plan](../docs/wal/rfc-026-implementation-plan.md), [Progress Ring implementation plan](../docs/wal/rfc-026-v8-point-progress-ring-implementation-plan.md) |
 | Target | >=10% Point16 throughput gain in scored runs that meet the Section 8 promotion gates |
 
 ## 1. Motivation and prior evidence
@@ -157,7 +157,7 @@ After deterministic correctness tests, screen Point8 and Point16 locally with bo
 
 Run five counterbalanced pairs per workload on one `c4-standard-16-lssd` with two Local SSDs in ext4 RAID0. Score Point1, Point8, Point16 and Batch64. Run Batch64 at 16 writers. Use 100,000 logical Puts and 1 KiB values. Build once in release mode with `bench`, use Direct FRONTIER, 1 MiB Point-only Lookahead and dynamic coalescing, and vary only the F0 flag. Exclude warm-up and use `--latency-sample-every 10` for each Point arm.
 
-Set `TOYKV_BENCH_V8_EXTENT_POLICY_SCAN_DIAGNOSTICS=0` in both arms. The bench build enables these counters when the variable is absent. Reject a scored result unless `sliding_extent_preparation.extent_policy_scan_diagnostics_enabled` is `false` in both `wal_io_start` and `wal_io_end`. Keep CPU attribution, sync diagnostics, completion timelines and `perf` off for scoring. Use separate diagnostic runs for role CPU, owner lock hold time, per-wake drain counts and ring occupancy. See the [GCP benchmark runbook](benchmarks/gcp-free-trial-wal-bench.md#scoring-v8-point-candidates) for scoring setup and artifact validation.
+Set `TOYKV_BENCH_V8_EXTENT_POLICY_SCAN_DIAGNOSTICS=0` in both arms. The bench build enables these counters when the variable is absent. Reject a scored result unless `sliding_extent_preparation.extent_policy_scan_diagnostics_enabled` is `false` in both `wal_io_start` and `wal_io_end`. Keep CPU attribution, sync diagnostics, completion timelines and `perf` off for scoring. Use separate diagnostic runs for role CPU, owner lock hold time, per-wake drain counts and ring occupancy. See the [GCP benchmark runbook](../docs/wal/benchmarks/gcp-free-trial-wal-bench.md#scoring-v8-point-candidates) for scoring setup and artifact validation.
 
 Archive raw results, the source revision and executable hash, the configuration and each pair. Report throughput, CPU/Put, Puts/Sync, DATA Groups/Put and Point p50/p95/p99. Use Batch64 throughput for its guard. Keep paired percentages as the median of the five within-pair changes, calculated as `(F0 / baseline - 1) × 100`.
 
@@ -202,8 +202,8 @@ This appendix consolidates the former progress-simplification RFC. F0 (Sections 
 
 ### Prior measurements and reproducibility
 
-- [Point producer critical path](benchmarks/rfc-026-v7-v8-point-producer-critical-path-gcp-20261119.md) and [admission breakdown](benchmarks/rfc-026-v8-point-admission-sequencer-gcp-20261119.md): instrumented V8 Point16 MVCC `write_lock` p50 wait ~44.5us vs V7 ~0.36us; hold ~8–10us. Wait time is not directly recoverable CPU or throughput.
-- [Per-role CPU](benchmarks/rfc-026-v7-v8-thread-role-cpu-gcp-20261120.md): Writer/packer +8.42us, completion/durability +6.79us, I/O worker +2.86us per Put; role scopes differ. [Writer stage CPU](benchmarks/rfc-026-v7-v8-writer-stage-cpu-gcp-20261120.md): frame-readiness/submission +3.39us/Put, asymmetric scopes.
-- [Timed group join](benchmarks/rfc-026-v8-point-short-group-join-gcp-20261120.md), [ticket lookup](benchmarks/rfc-026-v8-ticket-index-gcp-20261120.md), [notification separation](benchmarks/rfc-026-v8-notification-rerun-20261102.md), [inline completion](benchmarks/rfc-026-v8-worker-dispatch-20261102.md).
+- [Point producer critical path](../docs/wal/benchmarks/rfc-026-v7-v8-point-producer-critical-path-gcp-20261119.md) and [admission breakdown](../docs/wal/benchmarks/rfc-026-v8-point-admission-sequencer-gcp-20261119.md): instrumented V8 Point16 MVCC `write_lock` p50 wait ~44.5us vs V7 ~0.36us; hold ~8–10us. Wait time is not directly recoverable CPU or throughput.
+- [Per-role CPU](../docs/wal/benchmarks/rfc-026-v7-v8-thread-role-cpu-gcp-20261120.md): Writer/packer +8.42us, completion/durability +6.79us, I/O worker +2.86us per Put; role scopes differ. [Writer stage CPU](../docs/wal/benchmarks/rfc-026-v7-v8-writer-stage-cpu-gcp-20261120.md): frame-readiness/submission +3.39us/Put, asymmetric scopes.
+- [Timed group join](../docs/wal/benchmarks/rfc-026-v8-point-short-group-join-gcp-20261120.md), [ticket lookup](../docs/wal/benchmarks/rfc-026-v8-ticket-index-gcp-20261120.md), [notification separation](../docs/wal/benchmarks/rfc-026-v8-notification-rerun-20261102.md), [inline completion](../docs/wal/benchmarks/rfc-026-v8-worker-dispatch-20261102.md).
 
 Section 8 defines the score configuration and promotion gates for F0.

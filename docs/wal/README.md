@@ -63,7 +63,7 @@ the retained and rejected experiments.
 
 ## V8 Point performance proposal
 
-The [V8 Point Progress Ring](rfc-026-v8-point-fast-lane.md) proposes moving
+The [V8 Point Progress Ring](../../rfcs/026-v8-point-fast-lane.md) proposes moving
 producer readiness to a bounded ring and having the elected driver apply
 queued completions in batches. The plan starts with an isolated prototype,
 followed by correctness tests and paired Point and Batch64 benchmarks.
