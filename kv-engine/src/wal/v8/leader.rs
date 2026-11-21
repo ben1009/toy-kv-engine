@@ -7432,6 +7432,13 @@ mod tests {
         };
         let wal = crate::wal::Wal::from_v8_parallel(writer, &installed)?;
 
+        let hol_profile = Arc::new(crate::mem_table::WriteProfile::default());
+        hol_profile.set_wal_hol_diagnostics_enabled(true);
+        let error = wal
+            .set_write_profile(Arc::clone(&hol_profile))
+            .expect_err("ring writer must reject preconfigured HOL diagnostics");
+        assert!(error.to_string().contains("V8 HOL diagnostics"));
+
         let timeline_profile = Arc::new(crate::mem_table::WriteProfile::default());
         timeline_profile.set_wal_v8_completion_timeline_sample_every(1);
         let error = wal

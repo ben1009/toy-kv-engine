@@ -875,6 +875,10 @@ impl WriteProfile {
     #[cfg(feature = "bench")]
     pub(crate) fn validate_v8_progress_ring_compatibility(&self) -> Result<()> {
         anyhow::ensure!(
+            !self.wal_hol_diagnostics_enabled(),
+            "V8 HOL diagnostics are not supported with the progress ring"
+        );
+        anyhow::ensure!(
             self.wal_v8_completion_timeline_sample_every() == 0,
             "V8 completion timeline diagnostics are not supported with the progress ring"
         );
