@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import Counter
 from collections.abc import Iterable, Mapping
+import math
 
 
 SUPPORTED_WRITERS = (1, 2, 4, 8, 16)
@@ -79,6 +80,20 @@ POINT_DIRECT_FRAME_ORDERS = (
     ("direct_frame_on", "direct_frame_off"),
 )
 
+POINT_PROGRESS_RING_WRITERS = (1, 8, 16)
+POINT_PROGRESS_RING_REPETITIONS = 5
+POINT_PROGRESS_RING_NUM = 100_000
+POINT_PROGRESS_RING_ARMS = ("eager", "progress_ring")
+POINT_PROGRESS_RING_ORDERS = (
+    ("eager", "progress_ring"),
+    ("progress_ring", "eager"),
+)
+POINT_PROGRESS_RING_CELLS = (
+    (1, "point", "wal_concurrent", 1, None, 10),
+    (8, "point", "wal_concurrent", 1, None, 10),
+    (16, "point", "wal_concurrent", 1, None, 10),
+    (16, "batch64", "wal_batch_concurrent", 64, 64, None),
+)
 V8_EXTENT_POLICY_STORAGE_WRITERS = (8, 16)
 V8_EXTENT_POLICY_STORAGE_REPETITIONS = 5
 V8_EXTENT_POLICY_STORAGE_NUM = 100_000
@@ -443,6 +458,166 @@ def validate_point_direct_frame_rows(
             or row.get("ops") != POINT_DIRECT_FRAME_NUM
             or row.get("point_direct_frame_enabled") != should_encode
             or row.get("direct_frame_encoded_count") != expected_hits
+        ):
+            invalid.append(row)
+
+    expected_cells = set(expected)
+    observed_cells = set(observed)
+    return {
+        "complete": not (
+            expected_cells != observed_cells or any(count != 1 for count in observed.values()) or invalid
+        ),
+        "planned": len(schedule),
+        "observed": len(rows),
+        "missing_cells": [list(cell) for cell in sorted(expected_cells - observed_cells)],
+        "unexpected_cells": [list(cell) for cell in sorted(observed_cells - expected_cells, key=str)],
+        "duplicate_cells": [list(cell) for cell, count in observed.items() if count != 1],
+        "invalid_rows": [dict(row) for row in invalid],
+    }
+
+
+def build_point_progress_ring_schedule(writers: Iterable[int]) -> list[dict[str, object]]:
+    """Build five counterbalanced eager/F0 pairs for Point and Batch64."""
+    writer_counts = validate_writer_counts(writers)
+    if writer_counts != POINT_PROGRESS_RING_WRITERS:
+        raise ValueError(f"progress-ring qualification requires writers {POINT_PROGRESS_RING_WRITERS}")
+
+    schedule: list[dict[str, object]] = []
+    for writer, workload, bench, batch_entries, batch_size, sample_every in POINT_PROGRESS_RING_CELLS:
+        if workload == "point" and writer not in writer_counts:
+            continue
+        for repetition in range(1, POINT_PROGRESS_RING_REPETITIONS + 1):
+            order = POINT_PROGRESS_RING_ORDERS[(repetition - 1) % len(POINT_PROGRESS_RING_ORDERS)]
+            for arm in order:
+                schedule.append({
+                    "run_index": len(schedule) + 1,
+                    "writer": writer,
+                    "workload": workload,
+                    "repetition": repetition,
+                    "arm": arm,
+                    "bench": bench,
+                    "batch_entries": batch_entries,
+                    "batch_size": batch_size,
+                    "num": POINT_PROGRESS_RING_NUM,
+                    "sample_every": sample_every,
+                    "extent_mode": "sliding-point-lookahead",
+                    "extent_window_bytes": POINT_LOOKAHEAD_WINDOW_BYTES,
+                    "frontier_mode": "direct",
+                    "scan_diagnostics_enabled": False,
+                    "progress_ring_enabled": arm == "progress_ring",
+                })
+    return schedule
+
+
+def build_point_progress_ring_plan(
+    *, writers: Iterable[int], machine_type: str, machine_spec: Mapping[str, int],
+    commit: str, binary_sha256: str | None = None,
+) -> dict[str, object]:
+    writer_counts = validate_writer_counts(writers)
+    schedule = build_point_progress_ring_schedule(writer_counts)
+    vcpus = int(machine_spec["vcpus"])
+    ssd_count = int(machine_spec["ssd_count"])
+    layout = "single Local SSD" if ssd_count == 1 else f"RAID0 over {ssd_count} Local SSDs"
+    plan: dict[str, object] = {
+        "suite": "v8-point-progress-ring",
+        "writers": list(writer_counts),
+        "workloads": [
+            {"writer": writer, "name": workload, "bench": bench,
+             "batch_entries": batch_entries, "batch_size": batch_size,
+             "num": POINT_PROGRESS_RING_NUM, "sample_every": sample_every}
+            for writer, workload, bench, batch_entries, batch_size, sample_every in POINT_PROGRESS_RING_CELLS
+        ],
+        "arms": list(POINT_PROGRESS_RING_ARMS),
+        "repetitions_per_cell": POINT_PROGRESS_RING_REPETITIONS,
+        "arm_orders": [list(order) for order in POINT_PROGRESS_RING_ORDERS],
+        "runs_planned": len(schedule),
+        "score_runs_planned": len(schedule),
+        "counterbalanced": True,
+        "machine_type": machine_type,
+        "vcpus": vcpus,
+        "local_ssd_count": ssd_count,
+        "local_ssd_total_gib": int(machine_spec["ssd_gib"]),
+        "runtime_protocol": f"single {vcpus}-vCPU host; {layout}; same source and binary for both arms",
+        "value_bytes": 1024,
+        "compaction": "none",
+        "commit": commit,
+        "binary_sha256": binary_sha256,
+        "extent_preparation": "sliding-point-lookahead, 1 MiB for both arms; Point-only policy keeps Batch64 on fallocate",
+        "frontier_mode": "direct",
+        "coalescing": "dynamic",
+        "point_direct_frame_enabled": False,
+        "point_frontier_credit_batch_enabled": False,
+        "extent_policy_storage": "vec",
+        "extent_policy_scan_diagnostics_enabled": False,
+        "data_submit_order": "ticket_prefix",
+        "latency_sample_every": 10,
+        "hash_cpu_sample_every": 64,
+        "worker_group_histogram": "disabled for score runs; opt-in diagnostics only",
+        "progress_ring_ab": {
+            "environment_variable": "TOYKV_BENCH_V8_POINT_PROGRESS_RING",
+            "baseline_value": "0",
+            "candidate_value": "1",
+        },
+        "local_screen": {
+            "status": "skipped_by_user",
+            "reason": "Local SSD results were excluded at the user's direction because the local SSD is unstable.",
+        },
+        "qualification_note": (
+            "Only the per-ticket progress-ring switch changes between arms. Both use the same release bench binary, "
+            "Direct FRONTIER, dynamic coalescing, 1 MiB Point lookahead, and existing digest sampling. "
+            "Point latency is sampled every 10 completed puts; Batch64 is throughput-only."
+        ),
+    }
+    if binary_sha256 is not None:
+        plan["binary_sha256"] = binary_sha256
+    return plan
+
+
+def validate_point_progress_ring_rows(
+    rows: list[Mapping[str, object]], writers: Iterable[int] = POINT_PROGRESS_RING_WRITERS,
+) -> dict[str, object]:
+    """Validate run identities, fixed work, ring mode, and Point samples."""
+    schedule = build_point_progress_ring_schedule(writers)
+    expected = {
+        (row["writer"], row["workload"], row["repetition"], row["arm"]): row for row in schedule
+    }
+    observed: dict[tuple[object, object, object, object], int] = {}
+    invalid: list[Mapping[str, object]] = []
+    for row in rows:
+        identity = tuple(row.get(key) for key in ("writer", "workload", "repetition", "arm"))
+        observed[identity] = observed.get(identity, 0) + 1
+        expected_row = expected.get(identity)
+        histogram_disabled = row.get("worker_group_sizes") is None
+        is_point = row.get("workload") == "point"
+        metrics_valid = all(
+            isinstance(row.get(key), (int, float))
+            and math.isfinite(float(row[key]))
+            and float(row[key]) > 0
+            for key in (("puts_per_second", "cpu_us_per_put", "p99_ms") if is_point
+                        else ("puts_per_second", "cpu_us_per_put"))
+        )
+        samples_valid = True
+        if is_point:
+            samples = row.get("latency_samples")
+            unsampled = row.get("latency_unsampled_operations")
+            samples_valid = (
+                row.get("latency_sample_every") == 10
+                and type(samples) is int
+                and samples == POINT_PROGRESS_RING_NUM // 10
+                and type(unsampled) is int
+                and unsampled + samples == POINT_PROGRESS_RING_NUM
+            )
+        digest_cpu = row.get("ordered_link_hash_cpu_ns")
+        if (
+            expected_row is None
+            or row.get("exit_code") != 0
+            or row.get("ops") != POINT_PROGRESS_RING_NUM
+            or row.get("progress_ring_enabled") is not bool(expected_row["progress_ring_enabled"])
+            or not histogram_disabled
+            or not metrics_valid
+            or not samples_valid
+            or type(digest_cpu) is not int
+            or digest_cpu < 0
         ):
             invalid.append(row)
 

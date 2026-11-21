@@ -537,6 +537,11 @@ impl WalSyncProgress {
         if result.error.is_none()
             && let Some(profile) = self.profile()
         {
+            if profile.wal_worker_group_size_histogram_enabled() {
+                profile.record_wal_worker_group(
+                    result.tickets.end.saturating_sub(result.tickets.start),
+                );
+            }
             if !self.suppress_commit_group_metrics.load(Ordering::Relaxed) {
                 profile.record_wal_commit_group(result.write_count, result.write_bytes);
             }

@@ -23,7 +23,7 @@ the eager Coordinator backend.
 | F0.2 Completion queue | `leader.rs::WalV8ParallelIo::spawn`, `reap_v8_group_result`, `parallel.rs::mark_data_group_complete_inner` | Whole group validation, queue capacity and reopen isolation pass in tests. |
 | F0.3 Producer publication and advance | `leader.rs::WalV8FrameJob`, `parallel.rs::fold_ready_digests`, readiness and FRONTIER accessors | An elected owner builds the same ordered digest and durable prefix as the baseline. |
 | F0.4 Driver waits and enablement | `leader.rs::drive_frontier_through`, `parallel.rs` driver acquisition and readiness waits, `mem_table.rs` Active writer open | Both waits use the token protocol. The entire mode passes the correctness matrix before scoring. |
-| F0.5 Qualification | `write-perf`, `scripts/gcp_wal_matrix.py`, the GCP launcher and archive verifier | Local screen passes, then five valid GCP pairs per workload produce a keep or stop decision. |
+| F0.5 Qualification | `write-perf`, `scripts/gcp_wal_matrix.py`, the GCP launcher and archive verifier | The user-waived local performance screen is recorded as skipped; five valid GCP pairs per workload produce a keep or stop decision. |
 
 Both the producer and Coordinator code live in the
 [V8 writer](../../kv-engine/src/wal/v8/leader.rs) and
@@ -283,9 +283,11 @@ cargo test --package kv-engine --lib --features bench,chaos-testing \
    confirm removal.
    [GCP scoring runbook](https://github.com/ben1009/toy-kv-engine/blob/13fa67640889d35e56c9476191d8276ee0e185cc/docs/wal/benchmarks/gcp-free-trial-wal-bench.md#scoring-v8-point-candidates)
 
-Report throughput, process CPU/Put, Puts/Sync, DATA Groups/Put and Point
-p50/p95/p99. Compute DATA Groups/Put as the sum of the
-`result.wal_pipeline.worker_group_sizes` buckets divided by `result.ops`.
+Report throughput, process CPU/Put, Puts/Sync and Point p50/p95/p99. Keep the
+worker-group histogram disabled during scored runs so it cannot add arm-dependent
+measurement overhead. If group-size distribution is needed for interpretation,
+collect it in a separate, explicitly diagnostic run and do not mix it into the
+qualification score.
 V8 `commit_groups` counts FRONTIER/sync cycles. Compute promotion scores
 from archived `result.json` values and require the run metadata and summary
 to agree. Match each pair by workload, writer count and repetition. Retain
@@ -299,6 +301,8 @@ Use throughput for Batch64's promotion check.
 | Point1 and Batch64 throughput | At least −2% paired median for each workload |
 | Correctness | All RFC 027 Section 7 checks pass with F0 enabled |
 
-Record the result and stop F0 if the local screen or any promotion gate fails.
-Passing the gates qualifies the opt-in implementation for review. Changing the
+The user explicitly waived local performance screening because the local SSD is
+unstable; record that screen as skipped and use the cloud matrix as the performance
+evidence. Stop F0 if any promotion gate fails. Passing the gates qualifies the
+opt-in implementation for review. Changing the
 production default requires a separate decision.
