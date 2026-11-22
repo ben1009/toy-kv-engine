@@ -183,17 +183,23 @@ microseconds; these are observed stage latencies, not additive components.
   breakdown. Cursor did not provide that breakdown, so those archived fields
   equal total coalescing time and must not be interpreted as active work. The
   phase tables above use only the valid total coalescing wall and CPU fields.
-  The sampler now emits these active fields as unavailable (`null`) when a
-  coalescing attempt lacks a wait breakdown; an advance with no coalescing
-  attempt records zero.
+  The follow-up sampler records progress-token wait, completion drain, completion
+  apply, digest fold, cursor advance, coordinator lock wait/hold, iteration
+  count, and ready tickets gained on the same low-frequency durability sample.
+  `coalescing_wait_breakdown_available` distinguishes the legacy state-lock and
+  condvar fields from Cursor's token-wait fields. New Cursor samples subtract
+  measured token wait from the total for active wall/CPU; unavailable stage
+  fields remain `null`, while a cycle without coalescing records zeros. This
+  follow-up adds instrumentation only; the GCP values in this report were not
+  rerun with it.
 - Phase p99s use only 78–101 samples and are noisy. ACK p99s use 781 samples.
   Instrumentation can perturb scheduling and latency; these are not promotion
   scores.
 - The report does not establish causality between any phase and throughput.
 
-The next diagnostic should separate Cursor coalescing into actual wait,
-active work, and mutex reacquisition without enabling detailed snapshots that
-change the fast path. If the durability cycle remains the dominant wall-time
-stage, compare its sync-I/O behavior with a matched V7 path before changing
-runtime code. Keep the current WAL protocol and production defaults unchanged
-until a repeated, uninstrumented A/B demonstrates a benefit.
+The next diagnostic run should use these fields at the same sampling interval
+for Relay and Direct at 8 and 16 writers, without enabling detailed snapshots
+that change the Cursor fast path. If the durability cycle remains the dominant
+wall-time stage, compare its sync-I/O behavior with a matched V7 path before
+changing runtime code. Keep the current WAL protocol and production defaults
+unchanged until a repeated, uninstrumented A/B demonstrates a benefit.

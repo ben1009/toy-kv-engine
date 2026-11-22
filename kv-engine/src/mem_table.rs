@@ -564,6 +564,26 @@ pub struct WalV8DurabilityPhaseObservation {
     /// Active CPU time from the detailed wait breakdown, with the same
     /// availability semantics as `coalescing_active_wall_ns`.
     pub coalescing_active_cpu_ns: Option<u64>,
+    /// Whether the legacy state-lock/condvar wait fields below are populated.
+    /// Cursor mode uses progress-token timing fields instead.
+    pub coalescing_wait_breakdown_available: bool,
+    pub coalescing_budget_us: Option<u64>,
+    pub coalescing_progress_wait_wall_ns: Option<u64>,
+    pub coalescing_progress_wait_cpu_ns: Option<u64>,
+    pub coalescing_completion_drain_wall_ns: Option<u64>,
+    pub coalescing_completion_drain_cpu_ns: Option<u64>,
+    pub coalescing_coordinator_lock_wait_wall_ns: Option<u64>,
+    pub coalescing_coordinator_lock_wait_cpu_ns: Option<u64>,
+    pub coalescing_coordinator_lock_hold_wall_ns: Option<u64>,
+    pub coalescing_coordinator_lock_hold_cpu_ns: Option<u64>,
+    pub coalescing_completion_apply_wall_ns: Option<u64>,
+    pub coalescing_completion_apply_cpu_ns: Option<u64>,
+    pub coalescing_digest_fold_wall_ns: Option<u64>,
+    pub coalescing_digest_fold_cpu_ns: Option<u64>,
+    pub coalescing_cursor_advance_wall_ns: Option<u64>,
+    pub coalescing_cursor_advance_cpu_ns: Option<u64>,
+    pub coalescing_iterations: Option<u64>,
+    pub coalescing_ready_tickets_gained: Option<u64>,
     pub coalescing_state_lock_wait_wall_ns: u64,
     pub coalescing_state_lock_wait_cpu_ns: u64,
     pub coalescing_condvar_wait_wall_ns: u64,

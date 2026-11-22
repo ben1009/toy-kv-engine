@@ -61,6 +61,8 @@ use crate::wal::{
 use crate::wal::parallel_worker::DirectGroupWriteCompletion;
 
 #[cfg(feature = "bench")]
+use super::parallel::WalV8ProgressAdvanceTiming;
+#[cfg(feature = "bench")]
 use super::parallel::{WalV8ReadyPrefix, WalV8TicketProgress};
 
 use super::{
@@ -222,6 +224,18 @@ struct WalV8FrontierResource {
     reservation: WalV7OwnedBatchReservation,
     #[cfg(feature = "bench")]
     write_class: WalV8WriteClass,
+}
+
+#[cfg(feature = "bench")]
+#[derive(Clone, Copy, Debug, Default)]
+struct WalV8CursorCoalescingTiming {
+    progress_wait_wall_ns: u64,
+    progress_wait_cpu_ns: u64,
+    completion_drain_wall_ns: u64,
+    completion_drain_cpu_ns: u64,
+    iterations: u64,
+    ready_tickets_gained: u64,
+    advance: WalV8ProgressAdvanceTiming,
 }
 
 #[cfg(feature = "bench")]
@@ -3028,6 +3042,30 @@ impl WalV8ParallelIo {
         driver: &mut WalV8DurabilityDriver,
         capture_monotonic_ns: bool,
     ) -> Result<WalV8FrontierReadySnapshot> {
+        self.advance_and_snapshot_inner(
+            driver,
+            capture_monotonic_ns,
+            #[cfg(feature = "bench")]
+            None,
+        )
+    }
+
+    #[cfg(feature = "bench")]
+    fn advance_and_snapshot_with_timing(
+        &self,
+        driver: &mut WalV8DurabilityDriver,
+        capture_monotonic_ns: bool,
+        timing: &mut WalV8CursorCoalescingTiming,
+    ) -> Result<WalV8FrontierReadySnapshot> {
+        self.advance_and_snapshot_inner(driver, capture_monotonic_ns, Some(timing))
+    }
+
+    fn advance_and_snapshot_inner(
+        &self,
+        driver: &mut WalV8DurabilityDriver,
+        capture_monotonic_ns: bool,
+        #[cfg(feature = "bench")] mut timing: Option<&mut WalV8CursorCoalescingTiming>,
+    ) -> Result<WalV8FrontierReadySnapshot> {
         ensure!(
             self.coordinator.owns_durability_driver(driver),
             "v8 progress scan is not owned by the active durability driver"
@@ -3062,6 +3100,10 @@ impl WalV8ParallelIo {
             .completion_batch
             .take()
             .context("cursor durability driver completion buffer is missing")?;
+        #[cfg(feature = "bench")]
+        let completion_drain_wall_started = timing.as_ref().map(|_| Instant::now());
+        #[cfg(feature = "bench")]
+        let completion_drain_cpu_started = timing.as_ref().map(|_| digest::thread_cpu_time_ns());
         let drain_result = if let Some(receiver) = &self.completion_events {
             self.drain_completion_events(receiver, &mut batch)
         } else {
@@ -3078,10 +3120,43 @@ impl WalV8ParallelIo {
                 anyhow::bail!("Cursor direct completion is unavailable without bench feature")
             }
         };
-        let snapshot = drain_result.and_then(|()| {
-            self.coordinator
-                .advance_and_snapshot(driver, &batch, capture_monotonic_ns)
-        });
+        #[cfg(feature = "bench")]
+        if let Some(timing) = timing.as_deref_mut() {
+            timing.completion_drain_wall_ns = timing.completion_drain_wall_ns.saturating_add(
+                completion_drain_wall_started
+                    .map(|started| started.elapsed().as_nanos().min(u64::MAX as u128) as u64)
+                    .unwrap_or_default(),
+            );
+            timing.completion_drain_cpu_ns = timing.completion_drain_cpu_ns.saturating_add(
+                completion_drain_cpu_started
+                    .map(|started| digest::thread_cpu_time_ns().saturating_sub(started))
+                    .unwrap_or_default(),
+            );
+        }
+        let snapshot = match drain_result {
+            Ok(()) => {
+                #[cfg(feature = "bench")]
+                {
+                    if let Some(timing) = timing.as_deref_mut() {
+                        self.coordinator.advance_and_snapshot_with_timing(
+                            driver,
+                            &batch,
+                            capture_monotonic_ns,
+                            &mut timing.advance,
+                        )
+                    } else {
+                        self.coordinator
+                            .advance_and_snapshot(driver, &batch, capture_monotonic_ns)
+                    }
+                }
+                #[cfg(not(feature = "bench"))]
+                {
+                    self.coordinator
+                        .advance_and_snapshot(driver, &batch, capture_monotonic_ns)
+                }
+            }
+            Err(error) => Err(error),
+        };
         batch.clear();
         driver.completion_batch = Some(batch);
         snapshot
@@ -3152,6 +3227,7 @@ impl WalV8ParallelIo {
         snapshot: &mut WalV8FrontierReadySnapshot,
         budget: Duration,
         capture_monotonic_ns: bool,
+        #[cfg(feature = "bench")] mut timing: Option<&mut WalV8CursorCoalescingTiming>,
     ) -> Result<bool> {
         let deadline = Instant::now() + budget;
         let mut waited = false;
@@ -3159,8 +3235,44 @@ impl WalV8ParallelIo {
             && let Some(remaining) = deadline.checked_duration_since(Instant::now())
         {
             waited = true;
+            #[cfg(feature = "bench")]
+            if let Some(timing) = timing.as_deref_mut() {
+                timing.iterations = timing.iterations.saturating_add(1);
+            }
+            #[cfg(feature = "bench")]
+            let wait_wall_started = timing.as_ref().map(|_| Instant::now());
+            #[cfg(feature = "bench")]
+            let wait_cpu_started = timing.as_ref().map(|_| digest::thread_cpu_time_ns());
             let signaled = self.wait_for_progress(remaining)?;
-            *snapshot = self.advance_and_snapshot(driver, capture_monotonic_ns)?;
+            #[cfg(feature = "bench")]
+            if let Some(timing) = timing.as_deref_mut() {
+                timing.progress_wait_wall_ns = timing.progress_wait_wall_ns.saturating_add(
+                    wait_wall_started
+                        .map(|started| started.elapsed().as_nanos().min(u64::MAX as u128) as u64)
+                        .unwrap_or_default(),
+                );
+                timing.progress_wait_cpu_ns = timing.progress_wait_cpu_ns.saturating_add(
+                    wait_cpu_started
+                        .map(|started| digest::thread_cpu_time_ns().saturating_sub(started))
+                        .unwrap_or_default(),
+                );
+            }
+            #[cfg(feature = "bench")]
+            let ready_before = snapshot.ready_prefix.len();
+            #[cfg(feature = "bench")]
+            if let Some(timing) = timing.as_deref_mut() {
+                *snapshot =
+                    self.advance_and_snapshot_with_timing(driver, capture_monotonic_ns, timing)?;
+            } else {
+                *snapshot = self.advance_and_snapshot(driver, capture_monotonic_ns)?;
+            }
+            #[cfg(feature = "bench")]
+            if let Some(timing) = timing.as_deref_mut() {
+                timing.ready_tickets_gained =
+                    timing.ready_tickets_gained.saturating_add(
+                        snapshot.ready_prefix.len().saturating_sub(ready_before) as u64,
+                    );
+            }
             if !signaled
                 || snapshot.ready_prefix.is_empty()
                 || snapshot.ready_prefix.len() >= snapshot.admitted_ticket_count
@@ -5560,6 +5672,8 @@ impl WalV8ParallelWriter {
             #[cfg(feature = "bench")]
             let mut coalescing_cpu_ns = 0_u64;
             #[cfg(feature = "bench")]
+            let mut coalescing_budget_us = None;
+            #[cfg(feature = "bench")]
             let mut snapshot = if progress_ring_enabled {
                 self.io.advance_and_snapshot(driver, diagnostics_enabled)?
             } else if diagnostics_enabled {
@@ -5584,6 +5698,9 @@ impl WalV8ParallelWriter {
             }
             #[cfg(feature = "bench")]
             let phase_sample_id = has_ready_prefix.then_some(phase_sample_candidate).flatten();
+            #[cfg(feature = "bench")]
+            let mut cursor_coalescing_timing = (progress_ring_enabled && phase_sample_id.is_some())
+                .then(WalV8CursorCoalescingTiming::default);
             #[cfg(feature = "bench")]
             let phase_sample_guard = phase_sample_id
                 .and_then(|_| profile.as_ref().cloned())
@@ -5614,6 +5731,7 @@ impl WalV8ParallelWriter {
                 #[cfg(feature = "bench")]
                 {
                     coalescing_attempted = true;
+                    coalescing_budget_us = Some(budget_us);
                 }
                 #[cfg(feature = "bench")]
                 let started = profile.as_ref().map(|_| Instant::now());
@@ -5628,6 +5746,7 @@ impl WalV8ParallelWriter {
                         &mut snapshot,
                         budget,
                         diagnostics_enabled,
+                        cursor_coalescing_timing.as_mut(),
                     )?
                 } else if phase_sample_id.is_some() {
                     let observation = self.coordinator.coalesce_frontier_ready_sampled(budget);
@@ -6030,22 +6149,67 @@ impl WalV8ParallelWriter {
                         coalescing_cpu_ns,
                         coalescing_active_wall_ns: coalescing_active_duration_ns(
                             coalescing_wall_ns,
-                            coalescing_detail.map(|detail| {
-                                detail
-                                    .state_lock_wait_wall_ns
-                                    .saturating_add(detail.condvar_wait_wall_ns)
-                            }),
+                            coalescing_detail
+                                .map(|detail| {
+                                    detail
+                                        .state_lock_wait_wall_ns
+                                        .saturating_add(detail.condvar_wait_wall_ns)
+                                })
+                                .or_else(|| {
+                                    cursor_coalescing_timing
+                                        .map(|timing| timing.progress_wait_wall_ns)
+                                }),
                             coalescing_attempted,
                         ),
                         coalescing_active_cpu_ns: coalescing_active_duration_ns(
                             coalescing_cpu_ns,
-                            coalescing_detail.map(|detail| {
-                                detail
-                                    .state_lock_wait_cpu_ns
-                                    .saturating_add(detail.condvar_wait_cpu_ns)
-                            }),
+                            coalescing_detail
+                                .map(|detail| {
+                                    detail
+                                        .state_lock_wait_cpu_ns
+                                        .saturating_add(detail.condvar_wait_cpu_ns)
+                                })
+                                .or_else(|| {
+                                    cursor_coalescing_timing
+                                        .map(|timing| timing.progress_wait_cpu_ns)
+                                }),
                             coalescing_attempted,
                         ),
+                        coalescing_wait_breakdown_available: !coalescing_attempted
+                            || coalescing_detail.is_some(),
+                        coalescing_budget_us,
+                        coalescing_progress_wait_wall_ns: cursor_coalescing_timing
+                            .map(|timing| timing.progress_wait_wall_ns),
+                        coalescing_progress_wait_cpu_ns: cursor_coalescing_timing
+                            .map(|timing| timing.progress_wait_cpu_ns),
+                        coalescing_completion_drain_wall_ns: cursor_coalescing_timing
+                            .map(|timing| timing.completion_drain_wall_ns),
+                        coalescing_completion_drain_cpu_ns: cursor_coalescing_timing
+                            .map(|timing| timing.completion_drain_cpu_ns),
+                        coalescing_coordinator_lock_wait_wall_ns: cursor_coalescing_timing
+                            .map(|timing| timing.advance.coordinator_lock_wait_wall_ns),
+                        coalescing_coordinator_lock_wait_cpu_ns: cursor_coalescing_timing
+                            .map(|timing| timing.advance.coordinator_lock_wait_cpu_ns),
+                        coalescing_coordinator_lock_hold_wall_ns: cursor_coalescing_timing
+                            .map(|timing| timing.advance.coordinator_lock_hold_wall_ns),
+                        coalescing_coordinator_lock_hold_cpu_ns: cursor_coalescing_timing
+                            .map(|timing| timing.advance.coordinator_lock_hold_cpu_ns),
+                        coalescing_completion_apply_wall_ns: cursor_coalescing_timing
+                            .map(|timing| timing.advance.completion_apply_wall_ns),
+                        coalescing_completion_apply_cpu_ns: cursor_coalescing_timing
+                            .map(|timing| timing.advance.completion_apply_cpu_ns),
+                        coalescing_digest_fold_wall_ns: cursor_coalescing_timing
+                            .map(|timing| timing.advance.digest_fold_wall_ns),
+                        coalescing_digest_fold_cpu_ns: cursor_coalescing_timing
+                            .map(|timing| timing.advance.digest_fold_cpu_ns),
+                        coalescing_cursor_advance_wall_ns: cursor_coalescing_timing
+                            .map(|timing| timing.advance.cursor_advance_wall_ns),
+                        coalescing_cursor_advance_cpu_ns: cursor_coalescing_timing
+                            .map(|timing| timing.advance.cursor_advance_cpu_ns),
+                        coalescing_iterations: cursor_coalescing_timing
+                            .map(|timing| timing.iterations),
+                        coalescing_ready_tickets_gained: cursor_coalescing_timing
+                            .map(|timing| timing.ready_tickets_gained),
                         coalescing_state_lock_wait_wall_ns: coalescing_detail
                             .map_or(0, |detail| detail.state_lock_wait_wall_ns),
                         coalescing_state_lock_wait_cpu_ns: coalescing_detail

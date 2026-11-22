@@ -854,6 +854,23 @@ pub(crate) struct WalV8FrontierReadySnapshot {
     pub(crate) snapshot_monotonic_ns: Option<u64>,
 }
 
+/// Optional timing breakdown for one Cursor completion drain and progress
+/// advance. The driver supplies this only for low-frequency bench samples.
+#[cfg(feature = "bench")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct WalV8ProgressAdvanceTiming {
+    pub(crate) coordinator_lock_wait_wall_ns: u64,
+    pub(crate) coordinator_lock_wait_cpu_ns: u64,
+    pub(crate) coordinator_lock_hold_wall_ns: u64,
+    pub(crate) coordinator_lock_hold_cpu_ns: u64,
+    pub(crate) completion_apply_wall_ns: u64,
+    pub(crate) completion_apply_cpu_ns: u64,
+    pub(crate) digest_fold_wall_ns: u64,
+    pub(crate) digest_fold_cpu_ns: u64,
+    pub(crate) cursor_advance_wall_ns: u64,
+    pub(crate) cursor_advance_cpu_ns: u64,
+}
+
 #[cfg(feature = "bench")]
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct WalV8CoalescingObservation {
@@ -1555,6 +1572,33 @@ impl WalV8ParallelCoordinator {
         events: &[WalV8CompletedGroupEvent],
         capture_monotonic_ns: bool,
     ) -> Result<WalV8FrontierReadySnapshot> {
+        self.advance_and_snapshot_inner(
+            driver,
+            events,
+            capture_monotonic_ns,
+            #[cfg(feature = "bench")]
+            None,
+        )
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn advance_and_snapshot_with_timing(
+        &self,
+        driver: &WalV8DurabilityDriver,
+        events: &[WalV8CompletedGroupEvent],
+        capture_monotonic_ns: bool,
+        timing: &mut WalV8ProgressAdvanceTiming,
+    ) -> Result<WalV8FrontierReadySnapshot> {
+        self.advance_and_snapshot_inner(driver, events, capture_monotonic_ns, Some(timing))
+    }
+
+    fn advance_and_snapshot_inner(
+        &self,
+        driver: &WalV8DurabilityDriver,
+        events: &[WalV8CompletedGroupEvent],
+        capture_monotonic_ns: bool,
+        #[cfg(feature = "bench")] mut timing: Option<&mut WalV8ProgressAdvanceTiming>,
+    ) -> Result<WalV8FrontierReadySnapshot> {
         ensure!(
             self.inner.progress_ring.is_some(),
             "v8 progress-ring advance requested while disabled"
@@ -1566,13 +1610,48 @@ impl WalV8ParallelCoordinator {
         #[cfg(not(feature = "bench"))]
         let _ = capture_monotonic_ns;
 
+        #[cfg(feature = "bench")]
+        let coordinator_lock_wait_wall_started = timing.as_ref().map(|_| Instant::now());
+        #[cfg(feature = "bench")]
+        let coordinator_lock_wait_cpu_started = timing
+            .as_ref()
+            .map(|_| crate::wal::v8::digest::thread_cpu_time_ns());
         let mut state = self.inner.state.lock();
+        #[cfg(feature = "bench")]
+        let coordinator_lock_hold_wall_started = timing.as_ref().map(|_| Instant::now());
+        #[cfg(feature = "bench")]
+        let coordinator_lock_hold_cpu_started = timing
+            .as_ref()
+            .map(|_| crate::wal::v8::digest::thread_cpu_time_ns());
+        #[cfg(feature = "bench")]
+        if let Some(timing) = timing.as_deref_mut() {
+            timing.coordinator_lock_wait_wall_ns =
+                timing.coordinator_lock_wait_wall_ns.saturating_add(
+                    coordinator_lock_wait_wall_started
+                        .map(|started| started.elapsed().as_nanos().min(u64::MAX as u128) as u64)
+                        .unwrap_or_default(),
+                );
+            timing.coordinator_lock_wait_cpu_ns =
+                timing.coordinator_lock_wait_cpu_ns.saturating_add(
+                    coordinator_lock_wait_cpu_started
+                        .map(|started| {
+                            crate::wal::v8::digest::thread_cpu_time_ns().saturating_sub(started)
+                        })
+                        .unwrap_or_default(),
+                );
+        }
         ensure!(
             state.durability_driver_active,
             "v8 progress-ring advance has no active durability driver"
         );
         ensure!(!state.poisoned, "v8 Parallel coordinator is poisoned");
 
+        #[cfg(feature = "bench")]
+        let completion_apply_wall_started = timing.as_ref().map(|_| Instant::now());
+        #[cfg(feature = "bench")]
+        let completion_apply_cpu_started = timing
+            .as_ref()
+            .map(|_| crate::wal::v8::digest::thread_cpu_time_ns());
         for event in events {
             let applied = apply_data_group_completion_locked(
                 &self.inner,
@@ -1596,16 +1675,74 @@ impl WalV8ParallelCoordinator {
                 });
             }
         }
+        #[cfg(feature = "bench")]
+        if let Some(timing) = timing.as_deref_mut() {
+            timing.completion_apply_wall_ns = timing.completion_apply_wall_ns.saturating_add(
+                completion_apply_wall_started
+                    .map(|started| started.elapsed().as_nanos().min(u64::MAX as u128) as u64)
+                    .unwrap_or_default(),
+            );
+            timing.completion_apply_cpu_ns = timing.completion_apply_cpu_ns.saturating_add(
+                completion_apply_cpu_started
+                    .map(|started| {
+                        crate::wal::v8::digest::thread_cpu_time_ns().saturating_sub(started)
+                    })
+                    .unwrap_or_default(),
+            );
+        }
 
         #[cfg(feature = "bench")]
         let fold_cpu_before = state.ordered_link_hash_cpu_ns;
+        #[cfg(feature = "bench")]
+        let digest_fold_wall_started = timing.as_ref().map(|_| Instant::now());
+        #[cfg(feature = "bench")]
+        let digest_fold_cpu_started = timing
+            .as_ref()
+            .map(|_| crate::wal::v8::digest::thread_cpu_time_ns());
         if let Err(error) = fold_ready_digests(&self.inner, &mut state, None) {
             poison_locked(&self.inner, &mut state);
             return Err(error).context("fold v8 progress-ring digests");
         }
+        #[cfg(feature = "bench")]
+        if let Some(timing) = timing.as_deref_mut() {
+            timing.digest_fold_wall_ns = timing.digest_fold_wall_ns.saturating_add(
+                digest_fold_wall_started
+                    .map(|started| started.elapsed().as_nanos().min(u64::MAX as u128) as u64)
+                    .unwrap_or_default(),
+            );
+            timing.digest_fold_cpu_ns = timing.digest_fold_cpu_ns.saturating_add(
+                digest_fold_cpu_started
+                    .map(|started| {
+                        crate::wal::v8::digest::thread_cpu_time_ns().saturating_sub(started)
+                    })
+                    .unwrap_or_default(),
+            );
+        }
+
+        #[cfg(feature = "bench")]
+        let cursor_advance_wall_started = timing.as_ref().map(|_| Instant::now());
+        #[cfg(feature = "bench")]
+        let cursor_advance_cpu_started = timing
+            .as_ref()
+            .map(|_| crate::wal::v8::digest::thread_cpu_time_ns());
         if let Err(error) = advance_ready_cursor(&mut state) {
             poison_locked(&self.inner, &mut state);
             return Err(error).context("advance v8 ready prefix cursor");
+        }
+        #[cfg(feature = "bench")]
+        if let Some(timing) = timing.as_deref_mut() {
+            timing.cursor_advance_wall_ns = timing.cursor_advance_wall_ns.saturating_add(
+                cursor_advance_wall_started
+                    .map(|started| started.elapsed().as_nanos().min(u64::MAX as u128) as u64)
+                    .unwrap_or_default(),
+            );
+            timing.cursor_advance_cpu_ns = timing.cursor_advance_cpu_ns.saturating_add(
+                cursor_advance_cpu_started
+                    .map(|started| {
+                        crate::wal::v8::digest::thread_cpu_time_ns().saturating_sub(started)
+                    })
+                    .unwrap_or_default(),
+            );
         }
         #[cfg(feature = "bench")]
         {
@@ -1642,6 +1779,27 @@ impl WalV8ParallelCoordinator {
                     stats.owner_scans += 1;
                     stats.scans_without_ready_progress += u64::from(!advanced);
                     stats.completion_events_drained += events.len() as u64;
+                }
+                drop(state);
+                #[cfg(feature = "bench")]
+                if let Some(timing) = timing.as_deref_mut() {
+                    timing.coordinator_lock_hold_wall_ns =
+                        timing.coordinator_lock_hold_wall_ns.saturating_add(
+                            coordinator_lock_hold_wall_started
+                                .map(|started| {
+                                    started.elapsed().as_nanos().min(u64::MAX as u128) as u64
+                                })
+                                .unwrap_or_default(),
+                        );
+                    timing.coordinator_lock_hold_cpu_ns =
+                        timing.coordinator_lock_hold_cpu_ns.saturating_add(
+                            coordinator_lock_hold_cpu_started
+                                .map(|started| {
+                                    crate::wal::v8::digest::thread_cpu_time_ns()
+                                        .saturating_sub(started)
+                                })
+                                .unwrap_or_default(),
+                        );
                 }
                 Ok(snapshot)
             }
