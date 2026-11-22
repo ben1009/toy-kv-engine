@@ -702,6 +702,17 @@ class PointProgressRingQualificationTests(unittest.TestCase):
             self.assertFalse(verification["verified"])
             self.assertTrue(any("run rows" in error for error in verification["errors"]))
 
+    def test_progress_ring_qualification_rejects_cursor_or_progress_diagnostics(self) -> None:
+        row = build_point_progress_ring_schedule(POINT_PROGRESS_RING_WRITERS)[0]
+        for field, value, error in (
+            ("progress_cursor_enabled", True, "used the cursor candidate"),
+            ("progress_diagnostics", {"owner_scans": 0}, "diagnostics must be disabled"),
+        ):
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, error):
+                raw = self._raw_record(row)
+                raw["result"]["wal_pipeline"]["wal_io_start"][field] = value
+                progress_ring_runner._validate_record(raw, row)
+
     def test_matrix_validator_rejects_boolean_exit_status(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             results = self._make_fixture(Path(temporary))

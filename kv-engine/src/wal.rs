@@ -160,6 +160,21 @@ pub struct WalIoDiagnostics {
     pub sliding_extent_preparation: Option<WalV8SlidingExtentPreparationDiagnostics>,
     /// Whether this opened V8 Parallel writer uses RFC 027's progress ring.
     pub progress_ring_enabled: bool,
+    /// Whether the ring uses the validated ready prefix cursor.
+    pub progress_cursor_enabled: bool,
+    pub progress_diagnostics: Option<WalV8ProgressDiagnostics>,
+}
+
+/// Per-writer progress observations collected with WAL sync diagnostics.
+#[cfg(feature = "bench")]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize)]
+#[doc(hidden)]
+pub struct WalV8ProgressDiagnostics {
+    pub token_attempts: u64,
+    pub token_accepts: u64,
+    pub owner_scans: u64,
+    pub scans_without_ready_progress: u64,
+    pub completion_events_drained: u64,
 }
 
 /// Benchmark-only V8 WAL extent preparation performed before timed writes.

@@ -192,14 +192,24 @@ ready. The qualification measured aggregate CPU and throughput. The cost
 each operation contributed to the CPU difference remains unmeasured.
 [Source review](https://github.com/ben1009/toy-kv-engine/pull/562#issuecomment-7071356609)
 
-The proposed follow-up would let the elected driver advance a validated
-ready prefix cursor using whole-group DATA completion and the existing
-ordered digest fold. That cursor could avoid rechecking tickets whose
-frames and completion were already validated and support retirement without
-a per-FRONTIER allocation. It would need to preserve reservation identity,
-late-digest wakeups, poison handling and recovery. If approved, the
-prototype would go through a separate RFC and PR and be compared with both
-eager mode and the stopped F0 implementation. F0 remains off by default.
+The bench candidate uses a Coordinator-owned ready prefix cursor. Whole-group
+DATA completion validates frame readiness, and the ordered digest fold confirms
+the accepted digest. The driver carries this validated cutoff across scans and
+uses it to reserve and publish a FRONTIER. Retirement validates the entire
+prefix before clearing the ring cells without allocating a guard vector.
+Admission checks and initializes the cell once after range registration. The
+elected driver owns the completion drain buffer until handoff. Digest publication
+before DATA submission relies on the completion wake. Independent digest
+publication still signals the driver.
+
+Select eager mode with `TOYKV_BENCH_V8_POINT_PROGRESS_RING=0` or by leaving it
+unset. Mode `1` selects the original ring, and mode `2` selects the cursor
+candidate. Bench output reports `progress_cursor_enabled` at both I/O snapshots.
+For diagnostics, `--wal-sync-diagnostics` reports progress token attempts,
+accepted tokens, owner scans, scans that found no new ready tickets, and drained
+completion events. The sync observations report the number of tickets covered.
+Use those diagnostics in separate runs from a scored comparison. F0 remains
+off by default after its qualification result.
 
 ## Appendix A. Historical alternatives — not part of the implementation plan
 

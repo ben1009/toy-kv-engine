@@ -57,7 +57,7 @@ use crate::wal::{
 };
 
 #[cfg(feature = "bench")]
-use super::parallel::WalV8TicketProgress;
+use super::parallel::{WalV8ReadyPrefix, WalV8TicketProgress};
 
 use super::{
     WAL_V8_HEADER_LEN,
@@ -70,8 +70,8 @@ use super::{
     parallel::{
         WalV8CompletedGroupEvent, WalV8DurabilityDriver, WalV8FrontierReadySnapshot,
         WalV8ParallelAdmissionGuard, WalV8ParallelConfig, WalV8ParallelCoordinator,
-        WalV8PreparationReservation, WalV8ProgressTokenWait, consume_progress_token_before_scan,
-        wait_for_progress_token,
+        WalV8PreparationReservation, WalV8ProgressMode, WalV8ProgressTokenWait,
+        consume_progress_token_before_scan, wait_for_progress_token,
     },
     prepare::{
         AdmittedWalV8Batch, EncodedWalV8Batch, PreparedWalV8Batch, WalV8AdmissionPlan,
@@ -346,25 +346,31 @@ const WAL_V8_POINT_PROGRESS_RING_ENV: &str = "TOYKV_BENCH_V8_POINT_PROGRESS_RING
 const WAL_V8_EXTENT_PREPARATION_CHUNK_BYTES: usize = 128 * 1024;
 
 #[cfg(feature = "bench")]
-fn progress_ring_enabled_from_value(value: Option<&OsStr>) -> Result<bool> {
+fn progress_mode_from_value(value: Option<&OsStr>) -> Result<WalV8ProgressMode> {
     let Some(value) = value else {
-        return Ok(false);
+        return Ok(WalV8ProgressMode::Eager);
     };
     match value.to_str() {
-        Some("0") => Ok(false),
-        Some("1") => Ok(true),
-        Some(value) => {
-            anyhow::bail!("invalid {WAL_V8_POINT_PROGRESS_RING_ENV} {value:?}; expected `0` or `1`")
-        }
+        Some("0") => Ok(WalV8ProgressMode::Eager),
+        Some("1") => Ok(WalV8ProgressMode::Ring),
+        Some("2") => Ok(WalV8ProgressMode::Cursor),
+        Some(value) => anyhow::bail!(
+            "invalid {WAL_V8_POINT_PROGRESS_RING_ENV} {value:?}; expected `0`, `1`, or `2`"
+        ),
         None => anyhow::bail!(
-            "{WAL_V8_POINT_PROGRESS_RING_ENV} is not valid UTF-8; expected `0` or `1`"
+            "{WAL_V8_POINT_PROGRESS_RING_ENV} is not valid UTF-8; expected `0`, `1`, or `2`"
         ),
     }
 }
 
 #[cfg(feature = "bench")]
+fn progress_mode_from_environment() -> Result<WalV8ProgressMode> {
+    progress_mode_from_value(std::env::var_os(WAL_V8_POINT_PROGRESS_RING_ENV).as_deref())
+}
+
+#[cfg(feature = "bench")]
 pub(crate) fn progress_ring_enabled_from_environment() -> Result<bool> {
-    progress_ring_enabled_from_value(std::env::var_os(WAL_V8_POINT_PROGRESS_RING_ENV).as_deref())
+    Ok(progress_mode_from_environment()?.uses_ring())
 }
 
 #[cfg(feature = "bench")]
@@ -2622,7 +2628,7 @@ impl WalV8ParallelIo {
         };
         let progress_tokens = coordinator.take_progress_token_receiver()?;
         let mut completion_batch = Vec::new();
-        if completion_events.is_some() {
+        if completion_events.is_some() && !coordinator.progress_cursor_enabled() {
             completion_batch
                 .try_reserve_exact(coordinator.completion_queue_capacity())
                 .context("reserve v8 completion event drain buffer")?;
@@ -2775,7 +2781,7 @@ impl WalV8ParallelIo {
 
     fn advance_and_snapshot(
         &self,
-        driver: &WalV8DurabilityDriver,
+        driver: &mut WalV8DurabilityDriver,
         capture_monotonic_ns: bool,
     ) -> Result<WalV8FrontierReadySnapshot> {
         ensure!(
@@ -2804,8 +2810,33 @@ impl WalV8ParallelIo {
             consume_progress_token_before_scan(tokens);
         }
 
+        if let Some(mut batch) = driver.completion_batch.take() {
+            let snapshot = self
+                .drain_completion_events(receiver, &mut batch)
+                .and_then(|()| {
+                    self.coordinator
+                        .advance_and_snapshot(driver, &batch, capture_monotonic_ns)
+                });
+            batch.clear();
+            driver.completion_batch = Some(batch);
+            return snapshot;
+        }
+
         let mut batch = self.completion_batch.lock();
         batch.clear();
+        self.drain_completion_events(receiver, &mut batch)?;
+        let snapshot = self
+            .coordinator
+            .advance_and_snapshot(driver, &batch, capture_monotonic_ns);
+        batch.clear();
+        snapshot
+    }
+
+    fn drain_completion_events(
+        &self,
+        receiver: &Receiver<WalV8CompletedGroupEvent>,
+        batch: &mut Vec<WalV8CompletedGroupEvent>,
+    ) -> Result<()> {
         for _ in 0..self.coordinator.completion_queue_capacity() {
             match receiver.try_recv() {
                 Ok(event) => batch.push(event),
@@ -2819,16 +2850,12 @@ impl WalV8ParallelIo {
                 }
             }
         }
-        let snapshot =
-            self.coordinator
-                .advance_and_snapshot(driver, &batch, capture_monotonic_ns)?;
-        batch.clear();
-        Ok(snapshot)
+        Ok(())
     }
 
     fn coalesce_progress_ring(
         &self,
-        driver: &WalV8DurabilityDriver,
+        driver: &mut WalV8DurabilityDriver,
         snapshot: &mut WalV8FrontierReadySnapshot,
         budget: Duration,
         capture_monotonic_ns: bool,
@@ -3607,9 +3634,12 @@ impl WalV8FrameJob<'_> {
             .map(|_| (Instant::now(), digest::thread_cpu_time_ns()));
         let digest_ready = encoded.digest_ready()?;
         #[cfg(feature = "bench")]
-        let ordered_link_hash_cpu_ns = self.coordinator.mark_digest_ready_with_cpu(digest_ready)?;
+        let ordered_link_hash_cpu_ns = self
+            .coordinator
+            .mark_digest_ready_before_data(digest_ready)?;
         #[cfg(not(feature = "bench"))]
-        self.coordinator.mark_digest_ready(digest_ready)?;
+        self.coordinator
+            .mark_digest_ready_before_data(digest_ready)?;
         #[cfg(feature = "bench")]
         if let (Some(phases), Some((wall_started, cpu_started))) =
             (phases.as_deref_mut(), digest_started)
@@ -3891,7 +3921,7 @@ impl WalV8LeaderWriter {
                 max_inflight_tickets: MAX_PARALLEL_INFLIGHT_TICKETS,
                 max_inflight_bytes: max_file_size,
                 max_file_size,
-                progress_ring_enabled: false,
+                progress_mode: WalV8ProgressMode::Eager,
             },
         )?;
         ensure!(
@@ -3909,6 +3939,8 @@ impl WalV8LeaderWriter {
             extent_preparation: None,
             sliding_extent_preparation: None,
             progress_ring_enabled: false,
+            progress_cursor_enabled: false,
+            progress_diagnostics: None,
         };
 
         Ok(Self {
@@ -3987,17 +4019,17 @@ impl WalV8LeaderWriter {
         worker_file: File,
     ) -> Result<WalV8ParallelWriter> {
         #[cfg(feature = "bench")]
-        let progress_ring_enabled = progress_ring_enabled_from_environment()?;
+        let progress_mode = progress_mode_from_environment()?;
         #[cfg(not(feature = "bench"))]
-        let progress_ring_enabled = false;
+        let progress_mode = WalV8ProgressMode::Eager;
 
-        self.into_parallel_with_worker_file_and_progress_ring(worker_file, progress_ring_enabled)
+        self.into_parallel_with_worker_file_and_progress_mode(worker_file, progress_mode)
     }
 
-    fn into_parallel_with_worker_file_and_progress_ring(
+    fn into_parallel_with_worker_file_and_progress_mode(
         mut self,
         worker_file: File,
-        progress_ring_enabled: bool,
+        progress_mode: WalV8ProgressMode,
     ) -> Result<WalV8ParallelWriter> {
         validate_positional_write_handle(&worker_file)
             .context("validate v8 WAL I/O worker handle")?;
@@ -4012,12 +4044,12 @@ impl WalV8LeaderWriter {
         );
         self.coordinator = self
             .coordinator
-            .with_progress_ring_mode(self.header, progress_ring_enabled)?;
+            .with_progress_mode(self.header, progress_mode)?;
         #[cfg(feature = "bench")]
         let profile = self.profile.load_full();
         #[cfg(feature = "bench")]
         if let Some(profile) = &profile {
-            if progress_ring_enabled {
+            if progress_mode.uses_ring() {
                 profile.validate_v8_progress_ring_compatibility()?;
             }
             self.coordinator
@@ -4034,7 +4066,8 @@ impl WalV8LeaderWriter {
         #[cfg(feature = "bench")]
         {
             io_diagnostics.data = WalIoHandleMetadata::from_file(&worker_file)?;
-            io_diagnostics.progress_ring_enabled = progress_ring_enabled;
+            io_diagnostics.progress_ring_enabled = progress_mode.uses_ring();
+            io_diagnostics.progress_cursor_enabled = self.coordinator.progress_cursor_enabled();
         }
         #[cfg(feature = "bench")]
         let (extent_preallocator, extent_preparation) =
@@ -4803,6 +4836,8 @@ impl WalV8ParallelWriter {
         let mut diagnostics = self.io_diagnostics;
         diagnostics.sliding_extent_preparation = self.io.extent_preparation_diagnostics();
         diagnostics.progress_ring_enabled = self.coordinator.progress_ring_enabled();
+        diagnostics.progress_cursor_enabled = self.coordinator.progress_cursor_enabled();
+        diagnostics.progress_diagnostics = self.coordinator.progress_diagnostics();
 
         diagnostics
     }
@@ -5059,7 +5094,7 @@ impl WalV8ParallelWriter {
         let Some(mut driver) = self.coordinator.acquire_durability_driver(ticket_end)? else {
             return Ok(());
         };
-        let result = self.drive_frontier_through(ticket_end, &driver);
+        let result = self.drive_frontier_through(ticket_end, &mut driver);
         if result.is_ok() {
             driver.complete();
         }
@@ -5070,7 +5105,7 @@ impl WalV8ParallelWriter {
     fn drive_frontier_through(
         &self,
         ticket_end: u64,
-        driver: &WalV8DurabilityDriver,
+        driver: &mut WalV8DurabilityDriver,
     ) -> Result<()> {
         let progress_ring_enabled = self.coordinator.progress_ring_enabled();
         loop {
@@ -5307,10 +5342,9 @@ impl WalV8ParallelWriter {
                 .checked_add(u64::try_from(ready.len())?)
                 .context("v8 Parallel frontier ticket end overflows")?;
             let last = ready
-                .last()
+                .tail()
                 .context("v8 Parallel ready prefix unexpectedly empty")?;
             let last_data_end = last
-                .assignment
                 .first_data_offset
                 .checked_add(u64::try_from(last.frame_buffer_bytes)?)
                 .context("v8 Parallel durable DATA end overflows")?;
@@ -5350,7 +5384,7 @@ impl WalV8ParallelWriter {
                     .context("v8 FRONTIER generation overflows")?,
                 ticket_end: frontier_ticket_end,
                 durable_end,
-                last_commit_ts: last.assignment.commit_ts,
+                last_commit_ts: last.commit_ts,
                 prefix_digest: reservation.prefix_digest,
                 previous_frontier_offset: previous.offset,
                 previous_frontier_digest: previous.digest,
@@ -5403,9 +5437,7 @@ impl WalV8ParallelWriter {
             let frontier_write_ns = if let (Some(profile), Some(started)) =
                 (&profile, frontier_write_started)
             {
-                let data_bytes = ready.iter().fold(0_u64, |total, progress| {
-                    total.saturating_add(progress.frame_buffer_bytes as u64)
-                });
+                let data_bytes = ready.data_bytes();
                 let groups = ready.len() as u64;
                 let frontier_write_ns = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
                 profile.record_wal_commit_group(groups, data_bytes);
@@ -5476,10 +5508,15 @@ impl WalV8ParallelWriter {
                         groups_covered: groups,
                         tickets_covered: Some(frontier_ticket_end - first_ticket),
                         frontier_write_ns: frontier_write_ns.unwrap_or(0),
-                        data_completion_to_frontier_start_ns: data_completion_to_frontier_start_ns(
-                            &ready,
-                            frontier_write_started,
-                        ),
+                        data_completion_to_frontier_start_ns: match &ready {
+                            WalV8ReadyPrefix::Tickets(tickets) => {
+                                data_completion_to_frontier_start_ns(
+                                    tickets,
+                                    frontier_write_started,
+                                )
+                            }
+                            WalV8ReadyPrefix::Cursor { .. } => None,
+                        },
                         coalescing_budget_us: coalescing_observation.map(|value| value.0),
                         coalescing_waited: coalescing_observation.map(|value| value.1),
                         coalescing_wait_ns: coalescing_observation.map(|value| value.2),
@@ -6905,10 +6942,23 @@ mod tests {
     #[cfg(feature = "bench")]
     #[test]
     fn progress_ring_experiment_switch_is_explicitly_opt_in() {
-        assert!(!progress_ring_enabled_from_value(None).unwrap());
-        assert!(!progress_ring_enabled_from_value(Some(OsStr::new("0"))).unwrap());
-        assert!(progress_ring_enabled_from_value(Some(OsStr::new("1"))).unwrap());
-        assert!(progress_ring_enabled_from_value(Some(OsStr::new("true"))).is_err());
+        assert_eq!(
+            progress_mode_from_value(None).unwrap(),
+            WalV8ProgressMode::Eager
+        );
+        assert_eq!(
+            progress_mode_from_value(Some(OsStr::new("0"))).unwrap(),
+            WalV8ProgressMode::Eager
+        );
+        assert_eq!(
+            progress_mode_from_value(Some(OsStr::new("1"))).unwrap(),
+            WalV8ProgressMode::Ring
+        );
+        assert_eq!(
+            progress_mode_from_value(Some(OsStr::new("2"))).unwrap(),
+            WalV8ProgressMode::Cursor
+        );
+        assert!(progress_mode_from_value(Some(OsStr::new("true"))).is_err());
     }
 
     #[cfg(all(feature = "bench", unix))]
@@ -6917,7 +6967,7 @@ mod tests {
         use std::os::unix::ffi::OsStrExt;
 
         let non_utf8 = OsStr::from_bytes(b"\xff");
-        assert!(progress_ring_enabled_from_value(Some(non_utf8)).is_err());
+        assert!(progress_mode_from_value(Some(non_utf8)).is_err());
     }
 
     fn header() -> WalV8Header {
@@ -7112,8 +7162,10 @@ mod tests {
         let parallel_profile = Arc::new(crate::mem_table::WriteProfile::default());
         let parallel_leader = open_writer(&parallel_path, &parallel_installed)?;
         let worker_file = parallel_leader.write_file.try_clone()?;
-        let parallel =
-            parallel_leader.into_parallel_with_worker_file_and_progress_ring(worker_file, false)?;
+        let parallel = parallel_leader.into_parallel_with_worker_file_and_progress_mode(
+            worker_file,
+            WalV8ProgressMode::Eager,
+        )?;
         parallel.set_write_profile(Arc::clone(&parallel_profile))?;
         let first_batch = batch(10);
         let second_batch = batch(20);
@@ -7232,12 +7284,19 @@ mod tests {
             #[cfg(not(feature = "bench"))]
             let writer = open_writer(wal_path, &installed)?.into_parallel()?;
             #[cfg(feature = "bench")]
-            assert_eq!(
-                writer.progress_ring_enabled(),
-                std::env::var_os(WAL_V8_POINT_PROGRESS_RING_ENV).as_deref()
-                    == Some(OsStr::new("1")),
-                "child writer must use the requested progress mode"
-            );
+            {
+                let requested = std::env::var(WAL_V8_POINT_PROGRESS_RING_ENV)?;
+                assert_eq!(
+                    writer.progress_ring_enabled(),
+                    matches!(requested.as_str(), "1" | "2"),
+                    "child writer must use the requested progress ring mode"
+                );
+                assert_eq!(
+                    writer.coordinator.progress_cursor_enabled(),
+                    requested == "2",
+                    "child writer must use the requested progress cursor mode"
+                );
+            }
             #[cfg(feature = "bench")]
             let value = if std::env::var_os(EXTENT_PREPARATION_ENV).as_deref()
                 == Some(OsStr::new("sliding-initialize"))
@@ -7279,7 +7338,7 @@ mod tests {
         for frontier_mode in frontier_modes {
             for extent_preparation_mode in extent_preparation_modes {
                 let mut cases = CRASH_POINTS
-                    .map(|(point, min, max)| (false, point, min, max))
+                    .map(|(point, min, max)| ("0", point, min, max))
                     .to_vec();
                 if cfg!(feature = "bench")
                     && matches!(
@@ -7287,10 +7346,16 @@ mod tests {
                         ("buffered", "none") | ("direct", "sliding-point-lookahead")
                     )
                 {
-                    cases.extend(CRASH_POINTS.map(|(point, min, max)| (true, point, min, max)));
+                    for mode in ["1", "2"] {
+                        cases.extend(CRASH_POINTS.map(|(point, min, max)| (mode, point, min, max)));
+                    }
                 }
-                for (ring_enabled, crash_point, expected_min_ticket_end, expected_max_ticket_end) in
-                    cases
+                for (
+                    progress_mode,
+                    crash_point,
+                    expected_min_ticket_end,
+                    expected_max_ticket_end,
+                ) in cases
                 {
                     let directory = tempfile::tempdir_in(&parent)?;
                     let wal_path = directory.path().join("active-v8.wal");
@@ -7324,10 +7389,7 @@ mod tests {
                         .stdout(Stdio::null())
                         .stderr(Stdio::inherit());
                     #[cfg(feature = "bench")]
-                    child.env(
-                        WAL_V8_POINT_PROGRESS_RING_ENV,
-                        if ring_enabled { "1" } else { "0" },
-                    );
+                    child.env(WAL_V8_POINT_PROGRESS_RING_ENV, progress_mode);
                     #[cfg(feature = "bench")]
                     if extent_preparation_mode != "none" {
                         child
@@ -7345,14 +7407,14 @@ mod tests {
                         }
                         if let Some(status) = child.try_wait()? {
                             anyhow::bail!(
-                                "V8 writer child exited before reaching {crash_point} in {frontier_mode}/{extent_preparation_mode} mode (ring={ring_enabled}): {status}"
+                                "V8 writer child exited before reaching {crash_point} in {frontier_mode}/{extent_preparation_mode} mode (progress mode={progress_mode}): {status}"
                             );
                         }
                         if Instant::now() >= deadline {
                             let _ = child.kill();
                             let _ = child.wait();
                             anyhow::bail!(
-                                "V8 writer child did not reach {crash_point} in {frontier_mode}/{extent_preparation_mode} mode (ring={ring_enabled})"
+                                "V8 writer child did not reach {crash_point} in {frontier_mode}/{extent_preparation_mode} mode (progress mode={progress_mode})"
                             );
                         }
                         thread::sleep(Duration::from_millis(10));
@@ -7516,7 +7578,8 @@ mod tests {
             .write(true)
             .custom_flags(libc::O_DIRECT)
             .open(&path)?;
-        let error = match leader.into_parallel_with_worker_file_and_progress_ring(worker_file, true)
+        let error = match leader
+            .into_parallel_with_worker_file_and_progress_mode(worker_file, WalV8ProgressMode::Ring)
         {
             Ok(writer) => {
                 drop(writer);
@@ -7535,14 +7598,15 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("progress-ring-profile-v8.wal");
         let installed = install_empty(&path, header())?;
-        let writer = match open_parallel_with_progress_mode(&path, &installed, true) {
-            Ok(writer) => writer,
-            Err(error) if is_io_uring_unavailable_error(&error) => {
-                eprintln!("skipping test (io_uring unavailable): {error:#}");
-                return Ok(());
-            }
-            Err(error) => return Err(error),
-        };
+        let writer =
+            match open_parallel_with_progress_mode(&path, &installed, WalV8ProgressMode::Ring) {
+                Ok(writer) => writer,
+                Err(error) if is_io_uring_unavailable_error(&error) => {
+                    eprintln!("skipping test (io_uring unavailable): {error:#}");
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            };
         let wal = crate::wal::Wal::from_v8_parallel(writer, &installed)?;
 
         let hol_profile = Arc::new(crate::mem_table::WriteProfile::default());
@@ -9198,7 +9262,7 @@ mod tests {
     fn open_parallel_with_progress_mode(
         path: &Path,
         installed: &WalV8InstalledRecovery,
-        enabled: bool,
+        mode: WalV8ProgressMode,
     ) -> Result<WalV8ParallelWriter> {
         let worker_file = std::fs::OpenOptions::new()
             .read(true)
@@ -9206,7 +9270,7 @@ mod tests {
             .custom_flags(libc::O_DIRECT)
             .open(path)?;
         open_writer(path, installed)?
-            .into_parallel_with_worker_file_and_progress_ring(worker_file, enabled)
+            .into_parallel_with_worker_file_and_progress_mode(worker_file, mode)
     }
 
     #[test]
@@ -9215,14 +9279,15 @@ mod tests {
         let path = directory.path().join("progress-ring-scan-to-park-v8.wal");
         let header = header();
         let installed = install_empty(&path, header)?;
-        let writer = match open_parallel_with_progress_mode(&path, &installed, true) {
-            Ok(writer) => Arc::new(writer),
-            Err(error) if is_io_uring_unavailable_error(&error) => {
-                eprintln!("skipping test (io_uring unavailable): {error:#}");
-                return Ok(());
-            }
-            Err(error) => return Err(error),
-        };
+        let writer =
+            match open_parallel_with_progress_mode(&path, &installed, WalV8ProgressMode::Ring) {
+                Ok(writer) => Arc::new(writer),
+                Err(error) if is_io_uring_unavailable_error(&error) => {
+                    eprintln!("skipping test (io_uring unavailable): {error:#}");
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            };
 
         let (first_wait_entered_tx, first_wait_entered_rx) = crossbeam_channel::bounded(1);
         let (second_wait_entered_tx, second_wait_entered_rx) = crossbeam_channel::bounded(1);
@@ -9393,14 +9458,15 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("progress-ring-clean-close.wal");
         let installed = install_empty(&path, header())?;
-        let writer = match open_parallel_with_progress_mode(&path, &installed, true) {
-            Ok(writer) => writer,
-            Err(error) if is_io_uring_unavailable_error(&error) => {
-                eprintln!("skipping test (io_uring unavailable): {error:#}");
-                return Ok(());
-            }
-            Err(error) => return Err(error),
-        };
+        let writer =
+            match open_parallel_with_progress_mode(&path, &installed, WalV8ProgressMode::Ring) {
+                Ok(writer) => writer,
+                Err(error) if is_io_uring_unavailable_error(&error) => {
+                    eprintln!("skipping test (io_uring unavailable): {error:#}");
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            };
 
         let (reaped_tx, reaped_rx) = mpsc::sync_channel(1);
         writer.io.set_completion_reap_hook(Arc::new(move |event| {
@@ -9457,6 +9523,73 @@ mod tests {
     }
 
     #[test]
+    fn v8_progress_cursor_recovers_mixed_point_and_batch_after_out_of_order_frame_readiness()
+    -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("cursor-v8.wal");
+        let header = header();
+        let installed = install_empty(&path, header)?;
+        let writer =
+            match open_parallel_with_progress_mode(&path, &installed, WalV8ProgressMode::Cursor) {
+                Ok(writer) => writer,
+                Err(error) if is_io_uring_unavailable_error(&error) => {
+                    eprintln!("skipping test (io_uring unavailable): {error:#}");
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            };
+        let point = batch(10);
+        let mut multi_put = batch(20);
+        multi_put.entries.push(crate::pitr::WalEntry::Put {
+            key: b"multi-frame".to_vec(),
+            value: vec![0x37; WAL_V8_FRAME_LEN * 2],
+        });
+        let point_job = writer.admit_prepared_batch(
+            writer.preflight_batch_with_write_class(
+                &point,
+                LIVE_WAL_V5_LIMITS,
+                WalV8WriteClass::Point,
+            )?,
+            point.commit_ts,
+            point.recorded_at,
+        )?;
+        let batch_job = writer.admit_prepared_batch(
+            writer.preflight_batch(&multi_put, LIVE_WAL_V5_LIMITS)?,
+            multi_put.commit_ts,
+            multi_put.recorded_at,
+        )?;
+        let last_ticket = batch_job.assignment().segment_ticket;
+        batch_job.finish()?;
+        assert_eq!(writer.coordinator.durable_ticket_end(), 0);
+        point_job.finish()?;
+        writer.wait_durable(last_ticket)?;
+        let (_, frontier) = writer.active_boundaries()?;
+        assert_eq!(frontier.ticket_end, 2);
+        drop(writer);
+
+        let recovered = super::super::install::recover_and_install_active(
+            &path,
+            &[frontier],
+            header.predecessor,
+            LIVE_WAL_V5_LIMITS,
+            MAX_WAL_FILE_SIZE,
+        )?;
+        assert_eq!(replayed_batches(&path, &recovered)?, [point, multi_put]);
+        let reopened =
+            open_parallel_with_progress_mode(&path, &recovered, WalV8ProgressMode::Cursor)?;
+        assert!(reopened.coordinator.progress_cursor_enabled());
+        let next = batch(30);
+        reopened.append_prepared_batch(
+            reopened.preflight_batch(&next, LIVE_WAL_V5_LIMITS)?,
+            next.commit_ts,
+            next.recorded_at,
+        )?;
+        assert_eq!(reopened.active_boundaries()?.1.ticket_end, 3);
+
+        Ok(())
+    }
+
+    #[test]
     fn v8_progress_ring_parallel_write_reopen_and_recovery() -> Result<()> {
         let parent = Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/wal-v8-tests");
         std::fs::create_dir_all(&parent)?;
@@ -9464,14 +9597,15 @@ mod tests {
         let path = directory.path().join("progress-ring-active-v8.wal");
         let wal_header = header();
         let installed = install_empty(&path, wal_header)?;
-        let writer = match open_parallel_with_progress_mode(&path, &installed, false) {
-            Ok(writer) => writer,
-            Err(error) if is_io_uring_unavailable_error(&error) => {
-                eprintln!("skipping test (io_uring unavailable): {error:#}");
-                return Ok(());
-            }
-            Err(error) => return Err(error),
-        };
+        let writer =
+            match open_parallel_with_progress_mode(&path, &installed, WalV8ProgressMode::Eager) {
+                Ok(writer) => writer,
+                Err(error) if is_io_uring_unavailable_error(&error) => {
+                    eprintln!("skipping test (io_uring unavailable): {error:#}");
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            };
         assert!(!writer.progress_ring_enabled());
 
         let first_batch = batch(10);
@@ -9500,7 +9634,8 @@ mod tests {
 
         // Reopen the nonempty Active image in ring mode. Its new ring starts
         // at the recovered absolute ticket and digest boundary.
-        let ring_writer = open_parallel_with_progress_mode(&path, &ring_recovered, true)?;
+        let ring_writer =
+            open_parallel_with_progress_mode(&path, &ring_recovered, WalV8ProgressMode::Ring)?;
         assert!(ring_writer.progress_ring_enabled());
         assert_eq!(
             ring_writer.coordinator.durable_ticket_end(),
@@ -9534,7 +9669,8 @@ mod tests {
             replayed_batches(&path, &eager_recovered)?,
             [first_batch.clone(), second_batch.clone()]
         );
-        let eager_writer = open_parallel_with_progress_mode(&path, &eager_recovered, false)?;
+        let eager_writer =
+            open_parallel_with_progress_mode(&path, &eager_recovered, WalV8ProgressMode::Eager)?;
         assert!(!eager_writer.progress_ring_enabled());
         let third_batch = batch(30);
         eager_writer.append_prepared_batch(
@@ -9572,8 +9708,11 @@ mod tests {
         };
         let fresh_segment_path = directory.path().join("progress-ring-fresh-segment-v8.wal");
         let fresh_segment_installed = install_empty(&fresh_segment_path, fresh_segment_header)?;
-        let fresh_segment_writer =
-            open_parallel_with_progress_mode(&fresh_segment_path, &fresh_segment_installed, true)?;
+        let fresh_segment_writer = open_parallel_with_progress_mode(
+            &fresh_segment_path,
+            &fresh_segment_installed,
+            WalV8ProgressMode::Ring,
+        )?;
         assert!(fresh_segment_writer.progress_ring_enabled());
 
         Ok(())

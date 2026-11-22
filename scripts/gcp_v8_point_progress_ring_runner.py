@@ -128,6 +128,10 @@ def _validate_record(record: dict[str, Any], row: dict[str, Any]) -> dict[str, A
         snapshot = _require_object(pipeline.get(boundary), f"{boundary} WAL I/O snapshot")
         if snapshot.get("progress_ring_enabled") is not bool(row["progress_ring_enabled"]):
             raise ValueError(f"{boundary} progress-ring mode differs from the planned arm")
+        if snapshot.get("progress_cursor_enabled", False) is not False:
+            raise ValueError(f"{boundary} used the cursor candidate in the original F0 matrix")
+        if snapshot.get("progress_diagnostics") is not None:
+            raise ValueError(f"{boundary} progress diagnostics must be disabled for scored runs")
         preparation = _require_object(
             snapshot.get("sliding_extent_preparation"), f"{boundary} extent preparation metadata",
         )
