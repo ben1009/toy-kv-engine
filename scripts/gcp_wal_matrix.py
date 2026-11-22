@@ -623,6 +623,9 @@ def build_point_progress_cursor_plan(
     """Build a Cursor-specific plan without changing the historical F0.5 plan schema."""
     writer_counts = validate_writer_counts(writers)
     schedule = build_point_progress_cursor_schedule(writer_counts)
+    vcpus = int(machine_spec["vcpus"])
+    ssd_count = int(machine_spec["ssd_count"])
+    layout = "single Local SSD" if ssd_count == 1 else f"RAID0 over {ssd_count} Local SSDs"
     plan = build_point_progress_ring_plan(
         writers=writer_counts,
         machine_type=machine_type,
@@ -634,8 +637,12 @@ def build_point_progress_cursor_plan(
     plan.update({
         "suite": "v8-point-progress-cursor",
         "arms": list(POINT_PROGRESS_CURSOR_ARMS),
+        "arm_orders": [list(order) for order in POINT_PROGRESS_CURSOR_ORDERS],
         "runs_planned": len(schedule),
         "score_runs_planned": len(schedule),
+        "runtime_protocol": (
+            f"single {vcpus}-vCPU host; {layout}; same source and binary for three arms"
+        ),
         "progress_ring_control": {
             "environment_variable": "TOYKV_BENCH_V8_POINT_PROGRESS_RING",
             "candidate_value": "1",

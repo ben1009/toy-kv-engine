@@ -3753,6 +3753,7 @@ fn signal_progress_token(inner: &CoordinatorInner) {
     if inner
         .data_completion_timestamps_enabled
         .load(Ordering::Relaxed)
+        || inner.progress_counters_enabled.load(Ordering::Relaxed)
     {
         inner
             .progress_token_attempts
@@ -4133,6 +4134,38 @@ mod tests {
         coordinator.publish_durable_frontier(frontier)?;
         encoded.disarm_after_durable();
         driver.complete();
+
+        Ok(())
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn lightweight_cursor_progress_counters_count_tokens_without_timestamps() -> Result<()> {
+        let coordinator = coordinator_with_progress_mode(1, 0, WalV8ProgressMode::Cursor)?;
+        coordinator.set_progress_counters_enabled(true)?;
+        assert!(
+            !coordinator
+                .inner
+                .data_completion_timestamps_enabled
+                .load(Ordering::Acquire)
+        );
+
+        let tokens = coordinator
+            .take_progress_token_receiver()?
+            .context("missing progress token")?;
+        coordinator.signal_progress_token();
+        coordinator.signal_progress_token();
+
+        assert_eq!(tokens.try_recv(), Ok(()));
+        assert!(
+            tokens.is_empty(),
+            "the second token should coalesce into the first"
+        );
+        let stats = coordinator
+            .progress_diagnostics()
+            .context("lightweight counters were not exposed")?;
+        assert_eq!(stats.token_attempts, 2);
+        assert_eq!(stats.token_accepts, 1);
 
         Ok(())
     }

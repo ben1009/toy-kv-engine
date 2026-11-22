@@ -33,6 +33,7 @@ from gcp_wal_matrix import (
     POINT_BORROWED_INPUT_WRITERS,
     POINT_DIRECT_FRAME_NUM,
     POINT_DIRECT_FRAME_WRITERS,
+    POINT_PROGRESS_CURSOR_ORDERS,
     POINT_PROGRESS_RING_NUM,
     POINT_PROGRESS_RING_WRITERS,
     V8_EXTENT_POLICY_STORAGE_NUM,
@@ -496,7 +497,12 @@ class PointProgressRingQualificationTests(unittest.TestCase):
             plan = json.loads((results / "benchmark-plan.json").read_text(encoding="utf-8"))
             self.assertEqual(plan["suite"], "v8-point-progress-cursor")
             self.assertEqual(plan["arms"], ["eager", "progress_ring", "cursor"])
+            self.assertEqual(plan["arm_orders"], [list(order) for order in POINT_PROGRESS_CURSOR_ORDERS])
             self.assertEqual(plan["runs_planned"], 60)
+            self.assertEqual(
+                plan["runtime_protocol"],
+                "single 16-vCPU host; RAID0 over 2 Local SSDs; same source and binary for three arms",
+            )
             self.assertEqual(plan["progress_cursor_ab"]["candidate_value"], "2")
             self.assertFalse(plan["progress_counters_enabled"])
             self.assertTrue(BENCH._verify_result_set(results)["verified"])
