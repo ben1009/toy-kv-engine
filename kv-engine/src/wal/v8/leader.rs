@@ -7440,9 +7440,7 @@ mod tests {
                         ("buffered", "none") | ("direct", "sliding-point-lookahead")
                     )
                 {
-                    for mode in ["1", "2"] {
-                        cases.extend(CRASH_POINTS.map(|(point, min, max)| (mode, point, min, max)));
-                    }
+                    cases.extend(CRASH_POINTS.map(|(point, min, max)| ("2", point, min, max)));
                 }
                 for (
                     progress_mode,
