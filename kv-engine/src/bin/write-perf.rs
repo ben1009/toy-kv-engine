@@ -2255,7 +2255,7 @@ fn wal_pipeline_record(
         worker_group_sizes: (wal_run_info.format_version == 8
             && wal_run_info.io_mode == "parallel"
             && profile.wal_worker_group_size_histogram_enabled)
-            .then(|| WalWorkerGroupSizesRecord {
+            .then_some(WalWorkerGroupSizesRecord {
                 one_ticket: profile.wal_worker_group_size_one_ticket,
                 two_tickets: profile.wal_worker_group_size_two_tickets,
                 three_to_four_tickets: profile.wal_worker_group_size_three_to_four_tickets,
