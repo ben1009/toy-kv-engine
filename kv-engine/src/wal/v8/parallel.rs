@@ -40,6 +40,8 @@ use super::{
 
 const DATA_START: u64 = (WAL_V8_HEADER_LEN + WAL_V8_FRAME_LEN) as u64;
 const FRAME_LEN_U64: u64 = WAL_V8_FRAME_LEN as u64;
+/// Bound both admission and the allocation-free cursor retirement snapshot.
+pub(crate) const MAX_PARALLEL_INFLIGHT_TICKETS: usize = 32;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum WalV8ProgressTokenWait {
@@ -125,6 +127,9 @@ struct CoordinatorInner {
     /// diagnostics are enabled for this WAL.
     #[cfg(feature = "bench")]
     data_completion_timestamps_enabled: std::sync::atomic::AtomicBool,
+    /// Collect cursor progress counters without enabling detailed snapshots.
+    #[cfg(feature = "bench")]
+    progress_counters_enabled: AtomicBool,
     /// Fast opt-in gate for ordering HOL instrumentation.
     #[cfg(feature = "bench")]
     hol_diagnostics_enabled: std::sync::atomic::AtomicBool,
@@ -194,6 +199,10 @@ pub(crate) struct WalV8CompletedGroupEvent {
 impl TicketProgressRing {
     fn new(capacity: usize, segment_incarnation: [u8; 16]) -> Result<Self> {
         ensure!(capacity > 0, "v8 progress ring capacity must be nonempty");
+        ensure!(
+            capacity <= MAX_PARALLEL_INFLIGHT_TICKETS,
+            "v8 progress ring capacity exceeds the bounded retirement scratch capacity"
+        );
         let mut cells = Vec::new();
         cells
             .try_reserve_exact(capacity)
@@ -349,15 +358,29 @@ impl TicketProgressRing {
             // The Coordinator lock excludes admission and reuse. Once a cell
             // validates here, producers can only repeat the accepted digest
             // or frame event. Neither operation can change the payload.
+            // Keep a bounded stack snapshot so the successful path validates
+            // and clears each cell while holding its mutex once. If a later
+            // cell is invalid, restore the already-cleared prefix before
+            // returning the error, preserving all-or-nothing retirement.
+            let mut retired_payloads =
+                [TicketProgressPayload::default(); MAX_PARALLEL_INFLIGHT_TICKETS];
             let capacity = u64::try_from(self.cells.len())?;
             let start = usize::try_from(ticket_start % capacity)?;
             let (before, after) = self.cells.split_at(start);
             let cells = || after.iter().chain(before).take(ticket_count);
-            for (ticket, cell) in (ticket_start..ticket_end).zip(cells()) {
-                self.validate_retiring_cell(ticket, &cell.payload.lock())?;
-            }
-            for cell in cells() {
-                *cell.payload.lock() = TicketProgressPayload::default();
+            for (offset, (ticket, cell)) in (ticket_start..ticket_end).zip(cells()).enumerate() {
+                let mut payload = cell.payload.lock();
+                if let Err(error) = self.validate_retiring_cell(ticket, &payload) {
+                    drop(payload);
+                    for (restore_cell, previous) in
+                        cells().take(offset).zip(retired_payloads[..offset].iter())
+                    {
+                        *restore_cell.payload.lock() = *previous;
+                    }
+                    return Err(error);
+                }
+                retired_payloads[offset] = *payload;
+                *payload = TicketProgressPayload::default();
             }
             return Ok(());
         }
@@ -949,12 +972,12 @@ impl WalV8ParallelCoordinator {
 
     #[cfg(feature = "bench")]
     pub(super) fn progress_diagnostics(&self) -> Option<WalV8ProgressDiagnostics> {
-        if !self.progress_ring_enabled()
-            || !self
-                .inner
-                .data_completion_timestamps_enabled
-                .load(Ordering::Acquire)
-        {
+        let enabled = self
+            .inner
+            .data_completion_timestamps_enabled
+            .load(Ordering::Acquire)
+            || self.inner.progress_counters_enabled.load(Ordering::Acquire);
+        if !self.progress_ring_enabled() || !enabled {
             return None;
         }
         Some(WalV8ProgressDiagnostics {
@@ -1153,6 +1176,8 @@ impl WalV8ParallelCoordinator {
                 #[cfg(feature = "bench")]
                 data_completion_timestamps_enabled: std::sync::atomic::AtomicBool::new(false),
                 #[cfg(feature = "bench")]
+                progress_counters_enabled: AtomicBool::new(false),
+                #[cfg(feature = "bench")]
                 hol_diagnostics_enabled: std::sync::atomic::AtomicBool::new(false),
                 #[cfg(feature = "bench")]
                 profile: arc_swap::ArcSwapOption::empty(),
@@ -1224,6 +1249,23 @@ impl WalV8ParallelCoordinator {
         self.inner
             .data_completion_timestamps_enabled
             .store(enabled, Ordering::Release);
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn set_progress_counters_enabled(&self, enabled: bool) -> Result<()> {
+        ensure!(
+            !enabled || self.progress_cursor_enabled(),
+            "lightweight v8 progress counters require Cursor mode"
+        );
+        let state = self.inner.state.lock();
+        ensure!(
+            state.next_ticket == state.durable_ticket_end && state.tickets.is_empty(),
+            "lightweight v8 progress counters must be configured before admission"
+        );
+        self.inner
+            .progress_counters_enabled
+            .store(enabled, Ordering::Release);
+        Ok(())
     }
 
     #[cfg(feature = "bench")]
@@ -1572,7 +1614,9 @@ impl WalV8ParallelCoordinator {
         match snapshot {
             Ok(snapshot) => {
                 #[cfg(feature = "bench")]
-                if capture_monotonic_ns {
+                if capture_monotonic_ns
+                    || self.inner.progress_counters_enabled.load(Ordering::Acquire)
+                {
                     let ready_end = state.durable_ticket_end + snapshot.ready_prefix.len() as u64;
                     let advanced = ready_end > state.last_scanned_ready_ticket_end;
                     state.last_scanned_ready_ticket_end = ready_end;
@@ -4031,6 +4075,64 @@ mod tests {
         assert_eq!(coordinator.durable_ticket_end(), 0);
         assert_eq!(ring.snapshot(0)?, first_before);
         assert_eq!(coordinator.inner.state.lock().tickets.len(), 2);
+
+        Ok(())
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn lightweight_cursor_progress_counters_keep_the_cursor_snapshot_path() -> Result<()> {
+        let coordinator = coordinator_with_progress_mode(1, 0, WalV8ProgressMode::Cursor)?;
+        coordinator.set_progress_counters_enabled(true)?;
+        assert!(
+            !coordinator
+                .inner
+                .data_completion_timestamps_enabled
+                .load(Ordering::Acquire)
+        );
+
+        let input = batch(10);
+        let mut encoded = admit(&input, &coordinator)?.encode()?;
+        coordinator.mark_digest_ready_before_data(encoded.digest_ready()?)?;
+        coordinator.mark_frames_ready(encoded.assignment().segment_ticket)?;
+        let mut driver = coordinator
+            .acquire_durability_driver(1)?
+            .context("missing durability driver")?;
+        let event = WalV8CompletedGroupEvent {
+            group_id: 1,
+            tickets: 0..1,
+            write_count: 1,
+            write_bytes: FRAME_LEN_U64,
+            completion_observed_at: None,
+        };
+
+        let snapshot = coordinator.advance_and_snapshot(&driver, &[event], false)?;
+        assert!(matches!(
+            snapshot.ready_prefix,
+            WalV8ReadyPrefix::Cursor { .. }
+        ));
+        let stats = coordinator
+            .progress_diagnostics()
+            .context("lightweight counters were not exposed")?;
+        assert_eq!(stats.owner_scans, 1);
+        assert_eq!(stats.scans_without_ready_progress, 0);
+        assert_eq!(stats.completion_events_drained, 1);
+
+        let unchanged = coordinator.advance_and_snapshot(&driver, &[], false)?;
+        assert!(matches!(
+            unchanged.ready_prefix,
+            WalV8ReadyPrefix::Cursor { .. }
+        ));
+        let stats = coordinator
+            .progress_diagnostics()
+            .context("lightweight counters disappeared")?;
+        assert_eq!(stats.owner_scans, 2);
+        assert_eq!(stats.scans_without_ready_progress, 1);
+
+        let frontier = coordinator.reserve_frontier(1)?;
+        coordinator.publish_durable_frontier(frontier)?;
+        encoded.disarm_after_durable();
+        driver.complete();
 
         Ok(())
     }

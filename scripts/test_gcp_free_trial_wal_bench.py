@@ -55,6 +55,8 @@ from gcp_wal_matrix import (
     build_point_direct_frame_schedule,
     build_point_progress_ring_plan,
     build_point_progress_ring_schedule,
+    build_point_progress_cursor_plan,
+    build_point_progress_cursor_schedule,
     build_v8_extent_policy_storage_plan,
     build_v8_extent_policy_storage_schedule,
     build_v8_mutex_diagnostic_plan,
@@ -310,6 +312,7 @@ class PointProgressRingQualificationTests(unittest.TestCase):
     @staticmethod
     def _raw_record(row: dict[str, object]) -> dict[str, object]:
         ring_enabled = bool(row["progress_ring_enabled"])
+        cursor_enabled = bool(row.get("progress_cursor_enabled", False))
         start_preparation = {
             "mode": "sliding-point-lookahead",
             "window_bytes": POINT_LOOKAHEAD_WINDOW_BYTES,
@@ -329,11 +332,13 @@ class PointProgressRingQualificationTests(unittest.TestCase):
         start = {
             **handles,
             "progress_ring_enabled": ring_enabled,
+            "progress_cursor_enabled": cursor_enabled,
             "sliding_extent_preparation": start_preparation,
         }
         end = {
             **handles,
             "progress_ring_enabled": ring_enabled,
+            "progress_cursor_enabled": cursor_enabled,
             "sliding_extent_preparation": end_preparation,
         }
         point = row["workload"] == "point"
@@ -384,13 +389,15 @@ class PointProgressRingQualificationTests(unittest.TestCase):
         return record
 
     @classmethod
-    def _make_fixture(cls, root: Path) -> Path:
+    def _make_fixture(cls, root: Path, *, cursor: bool = False) -> Path:
         results = root / "results"
         results.mkdir()
         commit = "a" * 40
         binary_sha = "b" * 64
-        schedule = build_point_progress_ring_schedule(POINT_PROGRESS_RING_WRITERS)
-        plan = build_point_progress_ring_plan(
+        schedule_builder = build_point_progress_cursor_schedule if cursor else build_point_progress_ring_schedule
+        plan_builder = build_point_progress_cursor_plan if cursor else build_point_progress_ring_plan
+        schedule = schedule_builder(POINT_PROGRESS_RING_WRITERS)
+        plan = plan_builder(
             writers=POINT_PROGRESS_RING_WRITERS,
             machine_type="c4-standard-16-lssd",
             machine_spec=BENCH.MACHINE_SPECS["c4-standard-16-lssd"],
@@ -400,7 +407,8 @@ class PointProgressRingQualificationTests(unittest.TestCase):
         (results / "benchmark-plan.json").write_text(json.dumps(plan), encoding="utf-8")
         (results / "commit.txt").write_text(commit + "\n", encoding="utf-8")
         (results / "write-perf.sha256").write_text(binary_sha + "\n", encoding="utf-8")
-        with (results / "point-progress-ring-schedule.tsv").open("w", encoding="utf-8", newline="") as stream:
+        schedule_name = "point-progress-cursor-schedule.tsv" if cursor else "point-progress-ring-schedule.tsv"
+        with (results / schedule_name).open("w", encoding="utf-8", newline="") as stream:
             writer = csv.DictWriter(stream, fieldnames=schedule[0].keys(), delimiter="\t", lineterminator="\n")
             writer.writeheader()
             writer.writerows({**row, "batch_size": row["batch_size"] or "none"} for row in schedule)
@@ -422,11 +430,17 @@ class PointProgressRingQualificationTests(unittest.TestCase):
             (run_dir / "result.json").write_text(json.dumps(raw), encoding="utf-8")
             (run_dir / "run-metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
             (run_dir / "environment.txt").write_text(
-                progress_ring_runner._expected_environment_text(bool(row["progress_ring_enabled"])),
+                progress_ring_runner._expected_environment_text(
+                    bool(row["progress_ring_enabled"]), bool(row.get("progress_cursor_enabled", False)),
+                    row.get("progress_counters_enabled"),
+                ),
                 encoding="utf-8",
             )
             rows.append(metadata)
-        summary = progress_ring_runner._summary(rows, POINT_PROGRESS_RING_WRITERS, len(schedule))
+        summary = (
+            progress_ring_runner._cursor_summary(rows, POINT_PROGRESS_RING_WRITERS, len(schedule))
+            if cursor else progress_ring_runner._summary(rows, POINT_PROGRESS_RING_WRITERS, len(schedule))
+        )
         summary.update({
             "source_commit": commit,
             "binary_sha256": binary_sha,
@@ -449,13 +463,43 @@ class PointProgressRingQualificationTests(unittest.TestCase):
         return results
 
     def test_environment_uses_supported_ordered_data_submit_mode(self) -> None:
-        for enabled in (False, True):
-            environment = progress_ring_runner._environment(enabled)
+        for ring_enabled, cursor_enabled, counters_enabled, mode in (
+            (False, False, None, "0"), (True, False, None, "1"), (True, True, False, "2"),
+        ):
+            environment = progress_ring_runner._environment(ring_enabled, cursor_enabled, counters_enabled)
             self.assertEqual(environment["TOYKV_BENCH_V8_DATA_SUBMIT_ORDER"], "ordered")
+            self.assertEqual(environment["TOYKV_BENCH_V8_POINT_PROGRESS_RING"], mode)
             self.assertEqual(
-                environment["TOYKV_BENCH_V8_POINT_PROGRESS_RING"],
-                "1" if enabled else "0",
+                environment.get("TOYKV_BENCH_V8_PROGRESS_COUNTERS"),
+                "0" if counters_enabled is False else None,
             )
+        with self.assertRaisesRegex(ValueError, "requires progress-ring mode"):
+            progress_ring_runner._environment(False, True)
+
+    def test_cursor_fixture_uses_mode_two_and_keeps_f05_verifier_separate(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            results = self._make_fixture(Path(temporary), cursor=True)
+            schedule = build_point_progress_cursor_schedule(POINT_PROGRESS_RING_WRITERS)
+            self.assertEqual(len(schedule), 60)
+            self.assertEqual(
+                {row["arm"] for row in schedule},
+                {"eager", "progress_ring", "cursor"},
+            )
+            self.assertTrue(progress_ring_runner.verify_cursor_results_directory(results)["verified"])
+            self.assertFalse(progress_ring_runner.verify_results_directory(results)["verified"])
+            candidate = next(row for row in schedule if row["arm"] == "cursor")
+            environment = (results / progress_ring_runner._run_id(candidate) / "environment.txt").read_text(
+                encoding="utf-8",
+            )
+            self.assertIn("TOYKV_BENCH_V8_POINT_PROGRESS_RING=2\n", environment)
+            self.assertIn("TOYKV_BENCH_V8_PROGRESS_COUNTERS=0\n", environment)
+            plan = json.loads((results / "benchmark-plan.json").read_text(encoding="utf-8"))
+            self.assertEqual(plan["suite"], "v8-point-progress-cursor")
+            self.assertEqual(plan["arms"], ["eager", "progress_ring", "cursor"])
+            self.assertEqual(plan["runs_planned"], 60)
+            self.assertEqual(plan["progress_cursor_ab"]["candidate_value"], "2")
+            self.assertFalse(plan["progress_counters_enabled"])
+            self.assertTrue(BENCH._verify_result_set(results)["verified"])
 
     def test_verifier_accepts_legacy_plan_label_only_with_ordered_run_environment(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -519,6 +563,13 @@ class PointProgressRingQualificationTests(unittest.TestCase):
         self.assertEqual(args.writers, POINT_PROGRESS_RING_WRITERS)
         self.assertEqual(args.num, POINT_PROGRESS_RING_NUM)
         self.assertEqual(args.machine_type, "c4-standard-16-lssd")
+        cursor_args = BENCH.parse_args([
+            *[argument for argument in valid_args if argument != "--v8-point-progress-ring-ab"],
+            "--v8-point-progress-cursor-ab",
+        ])
+        self.assertEqual(cursor_args.writers, POINT_PROGRESS_RING_WRITERS)
+        self.assertEqual(cursor_args.num, POINT_PROGRESS_RING_NUM)
+        self.assertEqual(cursor_args.machine_type, "c4-standard-16-lssd")
         stderr = StringIO()
         with redirect_stderr(stderr), self.assertRaises(SystemExit):
             BENCH.parse_args([*valid_args, "--writers", "16"])
@@ -530,6 +581,23 @@ class PointProgressRingQualificationTests(unittest.TestCase):
             "--max-runtime-minutes", "60", "--estimated-hourly-cost-usd", "1.5",
             "--max-estimated-spend-usd", "2",
             "--v8-point-progress-ring-ab", "--preflight-only",
+        ]
+        invalid_arguments = (
+            base,
+            [*base, "--network", "default", "--subnet", "default", "--ssh-source-range", "192.0.2.10/32"],
+            [*base, "--network", "walbench-isolated", "--ssh-source-range", "192.0.2.10/32"],
+            [*base, "--network", "walbench-isolated", "--subnet", "walbench-subnet"],
+        )
+        for arguments in invalid_arguments:
+            with self.subTest(arguments=arguments), self.assertRaises(SystemExit):
+                BENCH.parse_args(arguments)
+
+    def test_progress_cursor_requires_isolated_network_subnet_and_ssh_cidr(self) -> None:
+        base = [
+            "--project", "test-project", "--zone", "us-east1-b", "--commit", "a" * 40,
+            "--max-runtime-minutes", "60", "--estimated-hourly-cost-usd", "1.5",
+            "--max-estimated-spend-usd", "2",
+            "--v8-point-progress-cursor-ab", "--preflight-only",
         ]
         invalid_arguments = (
             base,
@@ -571,6 +639,35 @@ class PointProgressRingQualificationTests(unittest.TestCase):
                     self.assertTrue(audit_tags[-1].startswith(BENCH.POINT_PROGRESS_RING_VM_TAG + "-"))
             self.assertEqual(len(audit_tags), 2)
             self.assertNotEqual(audit_tags[0], audit_tags[1])
+
+    def test_cursor_preflight_audits_isolated_ingress_and_records_cursor_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            results = Path(temporary) / "preflight"
+            audit_tags = []
+
+            def audit_and_capture(*args: object) -> None:
+                audit_tags.append(args[4])
+
+            with (
+                patch.object(BENCH, "Gcloud", return_value=Mock()),
+                patch.object(BENCH, "preflight", return_value={"zone": "us-east1-b"}),
+                patch.object(BENCH, "audit_ssh_firewall_rules", side_effect=audit_and_capture),
+            ):
+                status = BENCH.main([
+                    "--project", "test-project", "--zone", "us-east1-b", "--commit", "a" * 40,
+                    "--network", "walbench-isolated", "--subnet", "walbench-subnet",
+                    "--ssh-source-range", "192.0.2.10/32", "--skip-ssh-egress-check",
+                    "--max-runtime-minutes", "60", "--estimated-hourly-cost-usd", "1.5",
+                    "--max-estimated-spend-usd", "2", "--v8-point-progress-cursor-ab",
+                    "--preflight-only", "--results-dir", str(results),
+                ])
+            self.assertEqual(status, 0)
+            self.assertEqual(len(audit_tags), 1)
+            self.assertTrue(audit_tags[0].startswith(BENCH.POINT_PROGRESS_RING_VM_TAG + "-"))
+            report = json.loads((results / "preflight.json").read_text(encoding="utf-8"))
+            self.assertEqual(report["benchmark_suite"], "v8-point-progress-cursor")
+            self.assertEqual(report["benchmark_plan"]["suite"], "v8-point-progress-cursor")
+            self.assertEqual(report["benchmark_plan"]["progress_cursor_ab"]["candidate_value"], "2")
 
     def test_archive_round_trip_verifies_all_40_raw_runs_and_summaries(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -705,7 +802,7 @@ class PointProgressRingQualificationTests(unittest.TestCase):
     def test_progress_ring_qualification_rejects_cursor_or_progress_diagnostics(self) -> None:
         row = build_point_progress_ring_schedule(POINT_PROGRESS_RING_WRITERS)[0]
         for field, value, error in (
-            ("progress_cursor_enabled", True, "used the cursor candidate"),
+            ("progress_cursor_enabled", True, "Cursor mode differs from the planned arm"),
             ("progress_diagnostics", {"owner_scans": 0}, "diagnostics must be disabled"),
         ):
             with self.subTest(field=field), self.assertRaisesRegex(ValueError, error):
@@ -771,6 +868,53 @@ class PointProgressRingQualificationTests(unittest.TestCase):
             self.assertEqual(remote_exit["runs_started"], 40)
             self.assertEqual(remote_exit["runs_attempted"], 40)
             self.assertFalse(remote_exit["failed"])
+
+    def test_run_suite_writes_separate_cursor_plan_and_schedule(self) -> None:
+        binary = Path("scripts/gcp_v8_point_progress_ring_runner.py")
+        binary_sha256 = self._sha256(binary)
+        commit = "a" * 40
+
+        def fake_run_one(**kwargs: object) -> dict[str, object]:
+            row = kwargs["row"]
+            kwargs["on_subprocess_started"]()
+            raw = self._raw_record(row)
+            return {
+                **row,
+                "source_commit": commit,
+                "binary_sha256": binary_sha256,
+                "exit_code": 0,
+                "duration_seconds": 5.0,
+                **progress_ring_runner._validate_record(raw, row),
+            }
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args = SimpleNamespace(
+                commit=commit,
+                binary=binary,
+                binary_sha256=binary_sha256,
+                machine_type="c4-standard-16-lssd",
+                ssd_count=2,
+                ssd_gib=750,
+                writers=",".join(map(str, POINT_PROGRESS_RING_WRITERS)),
+                results_dir=root / "results",
+                db_root=root / "db",
+                safe_deadline_epoch=4_000_000_000,
+                candidate_mode="cursor",
+            )
+            with patch.object(progress_ring_runner, "_run_one", side_effect=fake_run_one):
+                status = progress_ring_runner.run_suite(args)
+            self.assertEqual(status, 0)
+            self.assertTrue((args.results_dir / "point-progress-cursor-schedule.tsv").is_file())
+            self.assertFalse((args.results_dir / "point-progress-ring-schedule.tsv").exists())
+            plan = json.loads((args.results_dir / "benchmark-plan.json").read_text(encoding="utf-8"))
+            summary = json.loads((args.results_dir / "summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(plan["suite"], "v8-point-progress-cursor")
+            self.assertEqual(summary["suite"], "v8-point-progress-cursor")
+            self.assertEqual(summary["arms"], ["eager", "progress_ring", "cursor"])
+            self.assertEqual(summary["runs_planned"], 60)
+            self.assertEqual(summary["runs_started"], 60)
+            self.assertTrue(summary["complete"])
 
     def test_launch_count_does_not_include_deadline_rejected_attempt(self) -> None:
         binary = Path("scripts/gcp_v8_point_progress_ring_runner.py")

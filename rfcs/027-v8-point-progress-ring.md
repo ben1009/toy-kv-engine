@@ -205,11 +205,14 @@ publication still signals the driver.
 Select eager mode with `TOYKV_BENCH_V8_POINT_PROGRESS_RING=0` or by leaving it
 unset. Mode `1` selects the original ring, and mode `2` selects the cursor
 candidate. Bench output reports `progress_cursor_enabled` at both I/O snapshots.
-For diagnostics, `--wal-sync-diagnostics` reports progress token attempts,
-accepted tokens, owner scans, scans that found no new ready tickets, and drained
-completion events. The sync observations report the number of tickets covered.
-Use those diagnostics in separate runs from a scored comparison. F0 remains
-off by default after its qualification result.
+Set `TOYKV_BENCH_V8_PROGRESS_COUNTERS=1` with mode `2` to collect lightweight
+progress token attempts, accepted tokens, owner scans, scans that found no new
+ready tickets, and drained completion events without enabling detailed
+snapshots. This keeps the Cursor snapshot on its constant-time path. In
+contrast, `--wal-sync-diagnostics` enables detailed per-sync snapshots and
+therefore scans progress cells in Cursor mode; use it only for diagnostic runs.
+The sync observations report the number of tickets covered. F0 remains off by
+default after its qualification result.
 
 ## Appendix A. Historical alternatives — not part of the implementation plan
 

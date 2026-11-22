@@ -68,10 +68,10 @@ use super::{
     digest,
     install::WalV8InstalledRecovery,
     parallel::{
-        WalV8CompletedGroupEvent, WalV8DurabilityDriver, WalV8FrontierReadySnapshot,
-        WalV8ParallelAdmissionGuard, WalV8ParallelConfig, WalV8ParallelCoordinator,
-        WalV8PreparationReservation, WalV8ProgressMode, WalV8ProgressTokenWait,
-        consume_progress_token_before_scan, wait_for_progress_token,
+        MAX_PARALLEL_INFLIGHT_TICKETS, WalV8CompletedGroupEvent, WalV8DurabilityDriver,
+        WalV8FrontierReadySnapshot, WalV8ParallelAdmissionGuard, WalV8ParallelConfig,
+        WalV8ParallelCoordinator, WalV8PreparationReservation, WalV8ProgressMode,
+        WalV8ProgressTokenWait, consume_progress_token_before_scan, wait_for_progress_token,
     },
     prepare::{
         AdmittedWalV8Batch, EncodedWalV8Batch, PreparedWalV8Batch, WalV8AdmissionPlan,
@@ -83,9 +83,6 @@ use super::{
 const FRAME_LEN_U64: u64 = WAL_V8_FRAME_LEN as u64;
 const HEADER_LEN_U64: u64 = WAL_V8_HEADER_LEN as u64;
 const MAX_GROUP_TICKETS: usize = 8;
-// Keep enough admitted producers in flight to form larger shared FRONTIERs
-// under contention; explicit Leader groups retain their separate smaller cap.
-const MAX_PARALLEL_INFLIGHT_TICKETS: usize = 32;
 const DATA_GROUP_JOIN_BUDGET: Duration = Duration::from_micros(10);
 const WAL_V8_PRODUCTION_EXTENT_WINDOW_BYTES: u64 = 1 << 20;
 const WAL_V8_EXTENT_LOOKAHEAD_ENV: &str = "TOYKV_WAL_V8_EXTENT_LOOKAHEAD";
@@ -343,6 +340,8 @@ const WAL_V8_EXTENT_PREPARATION_BYTES_ENV: &str = "TOYKV_BENCH_V8_EXTENT_PREP_BY
 const WAL_V8_POINT_FRONTIER_CREDIT_BATCH_ENV: &str = "TOYKV_BENCH_V8_POINT_FRONTIER_CREDIT_BATCH";
 #[cfg(feature = "bench")]
 const WAL_V8_POINT_PROGRESS_RING_ENV: &str = "TOYKV_BENCH_V8_POINT_PROGRESS_RING";
+#[cfg(feature = "bench")]
+const WAL_V8_POINT_PROGRESS_COUNTERS_ENV: &str = "TOYKV_BENCH_V8_PROGRESS_COUNTERS";
 const WAL_V8_EXTENT_PREPARATION_CHUNK_BYTES: usize = 128 * 1024;
 
 #[cfg(feature = "bench")]
@@ -366,6 +365,39 @@ fn progress_mode_from_value(value: Option<&OsStr>) -> Result<WalV8ProgressMode> 
 #[cfg(feature = "bench")]
 fn progress_mode_from_environment() -> Result<WalV8ProgressMode> {
     progress_mode_from_value(std::env::var_os(WAL_V8_POINT_PROGRESS_RING_ENV).as_deref())
+}
+
+#[cfg(feature = "bench")]
+fn progress_counters_enabled_from_value(
+    value: Option<&OsStr>,
+    progress_mode: WalV8ProgressMode,
+) -> Result<bool> {
+    let enabled = match value {
+        None => false,
+        Some(value) => match value.to_str() {
+            Some("0") => false,
+            Some("1") => true,
+            Some(value) => anyhow::bail!(
+                "invalid {WAL_V8_POINT_PROGRESS_COUNTERS_ENV} {value:?}; expected `0` or `1`"
+            ),
+            None => anyhow::bail!(
+                "{WAL_V8_POINT_PROGRESS_COUNTERS_ENV} is not valid UTF-8; expected `0` or `1`"
+            ),
+        },
+    };
+    ensure!(
+        !enabled || progress_mode == WalV8ProgressMode::Cursor,
+        "{WAL_V8_POINT_PROGRESS_COUNTERS_ENV}=1 requires Cursor progress mode"
+    );
+    Ok(enabled)
+}
+
+#[cfg(feature = "bench")]
+fn progress_counters_enabled_from_environment(progress_mode: WalV8ProgressMode) -> Result<bool> {
+    progress_counters_enabled_from_value(
+        std::env::var_os(WAL_V8_POINT_PROGRESS_COUNTERS_ENV).as_deref(),
+        progress_mode,
+    )
 }
 
 #[cfg(feature = "bench")]
@@ -4046,6 +4078,10 @@ impl WalV8LeaderWriter {
             .coordinator
             .with_progress_mode(self.header, progress_mode)?;
         #[cfg(feature = "bench")]
+        self.coordinator.set_progress_counters_enabled(
+            progress_counters_enabled_from_environment(progress_mode)?,
+        )?;
+        #[cfg(feature = "bench")]
         let profile = self.profile.load_full();
         #[cfg(feature = "bench")]
         if let Some(profile) = &profile {
@@ -6959,6 +6995,31 @@ mod tests {
             WalV8ProgressMode::Cursor
         );
         assert!(progress_mode_from_value(Some(OsStr::new("true"))).is_err());
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn lightweight_progress_counters_are_opt_in_for_cursor_mode() {
+        assert!(!progress_counters_enabled_from_value(None, WalV8ProgressMode::Cursor).unwrap());
+        assert!(
+            !progress_counters_enabled_from_value(Some(OsStr::new("0")), WalV8ProgressMode::Cursor)
+                .unwrap()
+        );
+        assert!(
+            progress_counters_enabled_from_value(Some(OsStr::new("1")), WalV8ProgressMode::Cursor)
+                .unwrap()
+        );
+        assert!(
+            progress_counters_enabled_from_value(Some(OsStr::new("1")), WalV8ProgressMode::Ring)
+                .is_err()
+        );
+        assert!(
+            progress_counters_enabled_from_value(
+                Some(OsStr::new("true")),
+                WalV8ProgressMode::Cursor
+            )
+            .is_err()
+        );
     }
 
     #[cfg(all(feature = "bench", unix))]

@@ -64,6 +64,7 @@ from gcp_wal_matrix import (
     build_point_borrowed_input_schedule,
     build_point_direct_frame_plan,
     build_point_direct_frame_schedule,
+    build_point_progress_cursor_plan,
     build_point_progress_ring_plan,
     build_v8_extent_policy_storage_plan,
     build_v8_extent_policy_storage_schedule,
@@ -76,6 +77,7 @@ from gcp_wal_matrix import (
     validate_point_lookahead_rows,
     validate_point_borrowed_input_rows,
     validate_point_direct_frame_rows,
+    validate_point_progress_cursor_rows,
     validate_point_progress_ring_rows,
     validate_v8_extent_policy_storage_rows,
     validate_v8_mutex_diagnostic_rows,
@@ -84,6 +86,7 @@ from gcp_wal_matrix import (
 )
 from gcp_commit_order_trace_runner import analyze_trace
 from gcp_v8_point_progress_ring_runner import verify_results_directory as verify_progress_ring_results
+from gcp_v8_point_progress_ring_runner import verify_cursor_results_directory as verify_progress_cursor_results
 MACHINE_TYPE = "c4-standard-8-lssd"
 MACHINE_SPECS = {
     "c4-standard-8-lssd": {"vcpus": 8, "ssd_count": 1, "ssd_gb": 375, "ssd_gib": 375},
@@ -1154,6 +1157,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                              help="Compare V8 Point direct-frame encoding with the existing path and Batch guardrails")
     suite_group.add_argument("--v8-point-progress-ring-ab", action="store_true",
                              help="Qualify V8 Point progress-ring waits with same-binary Point/Batch guardrails")
+    suite_group.add_argument("--v8-point-progress-cursor-ab", action="store_true",
+                             help="Qualify V8 Point progress-cursor mode with same-binary Point/Batch guardrails")
     suite_group.add_argument("--v8-extent-policy-storage-ab", action="store_true",
                              help="Compare V8 BTreeMap and Vec extent-policy storage with Point/Batch guardrails")
     parser.add_argument("--baseline-commit", help="Full source commit used as the borrowed-input A/B baseline")
@@ -1188,6 +1193,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Use a manually verified SSH source CIDR when the HTTPS lookup cannot verify that route",
     )
     args = parser.parse_args(argv)
+    point_progress_suite = args.v8_point_progress_ring_ab or args.v8_point_progress_cursor_ab
     explicit_network = args.network is not None
     if args.repetitions <= 0:
         parser.error("--repetitions must be a positive integer")
@@ -1198,19 +1204,19 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         args.ssh_source_range = resolve_ssh_source_range(args.ssh_source_range)
     except BenchError as error:
         parser.error(str(error))
-    if args.v8_point_progress_ring_ab:
+    if point_progress_suite:
         network_name = (args.network or "").rstrip("/").rsplit("/", 1)[-1].lower()
         if not explicit_network or not network_name:
-            parser.error("--v8-point-progress-ring-ab requires an explicit isolated --network")
+            parser.error("progress-ring/cursor qualification requires an explicit isolated --network")
         if network_name == "default":
-            parser.error("--v8-point-progress-ring-ab cannot use the default VPC")
+            parser.error("progress-ring/cursor qualification cannot use the default VPC")
         if not args.subnet:
-            parser.error("--v8-point-progress-ring-ab requires an explicit isolated --subnet")
+            parser.error("progress-ring/cursor qualification requires an explicit isolated --subnet")
         if not args.ssh_source_range:
-            parser.error("--v8-point-progress-ring-ab requires --ssh-source-range, including for preflight")
+            parser.error("progress-ring/cursor qualification requires --ssh-source-range, including for preflight")
     if args.num is None:
         args.num = (
-            POINT_PROGRESS_RING_NUM if args.v8_point_progress_ring_ab else
+            POINT_PROGRESS_RING_NUM if point_progress_suite else
             POINT_DIRECT_FRAME_NUM if args.v8_point_direct_frame_ab else
             V8_EXTENT_POLICY_STORAGE_NUM if args.v8_extent_policy_storage_ab else
             POINT_BORROWED_INPUT_NUM if args.v8_point_borrowed_input_ab else
@@ -1224,7 +1230,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             or args.v8_point_cpu_attribution
             or args.v8_point_borrowed_input_ab or args.v8_point_direct_frame_ab
             or args.v8_extent_policy_storage_ab
-            or args.v8_point_progress_ring_ab
+            or point_progress_suite
         ) else MACHINE_TYPE
     args.network = args.network or "default"
     if args.writers is None:
@@ -1242,7 +1248,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             args.writers = POINT_DIRECT_FRAME_WRITERS
         elif args.v8_extent_policy_storage_ab:
             args.writers = V8_EXTENT_POLICY_STORAGE_WRITERS
-        elif args.v8_point_progress_ring_ab:
+        elif point_progress_suite:
             args.writers = POINT_PROGRESS_RING_WRITERS
         elif args.v8_small_ticket_profile:
             args.writers = (1, 8, 16)
@@ -1278,10 +1284,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error(f"--v8-extent-policy-storage-ab requires writers {V8_EXTENT_POLICY_STORAGE_WRITERS}")
     if args.v8_extent_policy_storage_ab and args.machine_type != "c4-standard-16-lssd":
         parser.error("--v8-extent-policy-storage-ab requires c4-standard-16-lssd")
-    if args.v8_point_progress_ring_ab and args.writers != POINT_PROGRESS_RING_WRITERS:
-        parser.error(f"--v8-point-progress-ring-ab requires writers {POINT_PROGRESS_RING_WRITERS}")
-    if args.v8_point_progress_ring_ab and args.machine_type != "c4-standard-16-lssd":
-        parser.error("--v8-point-progress-ring-ab requires c4-standard-16-lssd")
+    if point_progress_suite and args.writers != POINT_PROGRESS_RING_WRITERS:
+        parser.error(f"progress-ring/cursor qualification requires writers {POINT_PROGRESS_RING_WRITERS}")
+    if point_progress_suite and args.machine_type != "c4-standard-16-lssd":
+        parser.error("progress-ring/cursor qualification requires c4-standard-16-lssd")
     if not re.fullmatch(r"[0-9a-fA-F]{40}", args.commit):
         parser.error("--commit must be a full 40-character SHA")
     if args.num < 64:
@@ -1294,8 +1300,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error(f"--v8-point-direct-frame-ab uses a fixed {POINT_DIRECT_FRAME_NUM}-put workload")
     if args.v8_extent_policy_storage_ab and args.num != V8_EXTENT_POLICY_STORAGE_NUM:
         parser.error(f"--v8-extent-policy-storage-ab uses a fixed {V8_EXTENT_POLICY_STORAGE_NUM}-put workload")
-    if args.v8_point_progress_ring_ab and args.num != POINT_PROGRESS_RING_NUM:
-        parser.error(f"--v8-point-progress-ring-ab uses a fixed {POINT_PROGRESS_RING_NUM}-put workload")
+    if point_progress_suite and args.num != POINT_PROGRESS_RING_NUM:
+        parser.error(f"progress-ring/cursor qualification uses a fixed {POINT_PROGRESS_RING_NUM}-put workload")
     if args.v8_mutex_diagnostic and args.num != V8_MUTEX_DIAGNOSTIC_NUM:
         parser.error(f"--v8-mutex-diagnostic uses a fixed {V8_MUTEX_DIAGNOSTIC_NUM}-put workload")
     if args.v8_point_cpu_attribution and args.num != V8_POINT_CPU_ATTRIBUTION_NUM:
@@ -1334,13 +1340,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                 f"estimated maximum spend ${estimated_spend:.2f} exceeds "
                 f"--max-estimated-spend-usd ${args.max_estimated_spend_usd:.2f}"
             )
-    if args.v8_point_progress_ring_ab:
+    if point_progress_suite:
         if args.max_runtime_minutes != 60:
-            parser.error("--v8-point-progress-ring-ab requires --max-runtime-minutes 60")
+            parser.error("progress-ring/cursor qualification requires --max-runtime-minutes 60")
         if args.max_estimated_spend_usd is None:
-            parser.error("--v8-point-progress-ring-ab requires cost guard arguments, including for preflight")
+            parser.error("progress-ring/cursor qualification requires cost guard arguments, including for preflight")
         if args.max_estimated_spend_usd > 2:
-            parser.error("--v8-point-progress-ring-ab cannot exceed the authorized $2 estimated-spend ceiling")
+            parser.error("progress-ring/cursor qualification cannot exceed the authorized $2 estimated-spend ceiling")
     if not args.preflight_only:
         if not args.confirm_free_trial:
             parser.error("VM creation requires --confirm-free-trial after manually checking Billing Overview")
@@ -1428,7 +1434,7 @@ def gcloud_base(project: str, zone: str) -> list[str]:
 
 
 def _run_identifier(row: dict[str, Any], suite: str) -> str:
-    if suite == "v8-point-progress-ring":
+    if suite in ("v8-point-progress-ring", "v8-point-progress-cursor"):
         return f"r{row['repetition']}-w{row['writer']}-{row['workload']}-{row['arm']}"
     if suite == "v8-small-ticket-profile":
         return f"w{row['writer']}-{row['workload']}-{row['arm']}"
@@ -1452,7 +1458,7 @@ def _run_identifier(row: dict[str, Any], suite: str) -> str:
 
 
 def _summary_row_identifier(row: dict[str, Any], suite: str) -> str:
-    if suite == "v8-point-progress-ring":
+    if suite in ("v8-point-progress-ring", "v8-point-progress-cursor"):
         return f"r{int(row['repetition'])}-w{int(row['writer'])}-{row['workload']}-{row['arm']}"
     if suite == "v8-small-ticket-profile":
         return f"w{int(row['writer'])}-{row['workload']}-{row['arm']}"
@@ -1480,15 +1486,16 @@ def _summary_row_identifier(row: dict[str, Any], suite: str) -> str:
 
 
 def _expected_run_metadata(row: dict[str, Any], suite: str) -> dict[str, Any]:
-    if suite == "v8-point-progress-ring":
-        return {
-            key: row[key] for key in (
-                "run_index", "writer", "workload", "repetition", "arm", "bench",
-                "batch_entries", "batch_size", "num", "sample_every", "extent_mode",
-                "extent_window_bytes", "frontier_mode", "scan_diagnostics_enabled",
-                "progress_ring_enabled",
-            )
-        }
+    if suite in ("v8-point-progress-ring", "v8-point-progress-cursor"):
+        keys = (
+            "run_index", "writer", "workload", "repetition", "arm", "bench",
+            "batch_entries", "batch_size", "num", "sample_every", "extent_mode",
+            "extent_window_bytes", "frontier_mode", "scan_diagnostics_enabled",
+            "progress_ring_enabled",
+        )
+        if suite == "v8-point-progress-cursor":
+            keys += ("progress_cursor_enabled", "progress_counters_enabled")
+        return {key: row[key] for key in keys}
     if suite == "v8-small-ticket-profile":
         return {key: row[key] for key in ("writer", "workload", "arm", "perf_capture")}
     if suite == "rfc026-full":
@@ -1561,6 +1568,8 @@ def _verify_result_set(results: Path) -> dict[str, Any]:
         suite = summary.get("suite")
         if suite == "v8-point-progress-ring":
             return verify_progress_ring_results(results)
+        if suite == "v8-point-progress-cursor":
+            return verify_progress_cursor_results(results)
         if suite == "v8-small-ticket-profile":
             with (results / "profile-schedule.tsv").open(encoding="utf-8", newline="") as stream:
                 schedule_rows = list(csv.DictReader(stream, delimiter="\t"))
@@ -2765,6 +2774,8 @@ def provision_and_run(
     point_borrowed_input_suite = getattr(args, "v8_point_borrowed_input_ab", False)
     point_direct_frame_suite = getattr(args, "v8_point_direct_frame_ab", False)
     point_progress_ring_suite = getattr(args, "v8_point_progress_ring_ab", False)
+    point_progress_cursor_suite = getattr(args, "v8_point_progress_cursor_ab", False)
+    point_progress_suite = point_progress_ring_suite or point_progress_cursor_suite
     extent_policy_storage_suite = getattr(args, "v8_extent_policy_storage_ab", False)
     missing_tools = [tool for tool in ("ssh", "ssh-keygen") if not shutil.which(tool)]
     if missing_tools:
@@ -2779,10 +2790,10 @@ def provision_and_run(
     suffix = uuid.uuid4().hex[:8]
     stamp = datetime.now(timezone.utc).strftime("%y%m%d-%H%M%S")
     instance = f"walbench-{stamp}-{suffix}"
-    tag = getattr(args, "progress_ring_vm_tag", None) if point_progress_ring_suite else None
-    if point_progress_ring_suite and not tag:
+    tag = getattr(args, "progress_ring_vm_tag", None) if point_progress_suite else None
+    if point_progress_suite and not tag:
         tag = f"{POINT_PROGRESS_RING_VM_TAG}-{suffix}"
-    elif not point_progress_ring_suite:
+    elif not point_progress_suite:
         tag = f"walbench-{suffix}"
     firewall = f"walbench-ssh-{suffix}"
     key_log = results_dir / "ssh.log"
@@ -3060,7 +3071,7 @@ def provision_and_run(
                 append_local_log(key_log, direct_copy.stdout + direct_copy.stderr)
                 if direct_copy.returncode:
                     raise BenchError(f"Could not copy direct-frame helper: {direct_copy.stderr.strip()}")
-            if point_progress_ring_suite:
+            if point_progress_suite:
                 if not POINT_PROGRESS_RING_RUNNER.is_file():
                     raise BenchError(f"Progress-ring helper is missing: {POINT_PROGRESS_RING_RUNNER}")
                 progress_ring_copy = upload_to_vm(
@@ -3086,6 +3097,8 @@ def provision_and_run(
                 remote_suite = "commit-order-trace"
             elif extent_policy_storage_suite:
                 remote_suite = "v8-extent-policy-storage"
+            elif point_progress_cursor_suite:
+                remote_suite = "v8-point-progress-cursor"
             elif point_progress_ring_suite:
                 remote_suite = "v8-point-progress-ring"
             elif point_direct_frame_suite:
@@ -3236,7 +3249,8 @@ def provision_and_run(
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(sys.argv[1:] if argv is None else argv)
-    if args.v8_point_progress_ring_ab:
+    point_progress_suite = args.v8_point_progress_ring_ab or args.v8_point_progress_cursor_ab
+    if point_progress_suite:
         args.progress_ring_vm_tag = f"{POINT_PROGRESS_RING_VM_TAG}-{uuid.uuid4().hex[:12]}"
     if args.results_dir is None:
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -3260,7 +3274,7 @@ def main(argv: list[str] | None = None) -> int:
         report = preflight(
             gcloud, args.project, args.zone, args.network, args.subnet, args.machine_type,
         )
-        if args.v8_point_progress_ring_ab:
+        if point_progress_suite:
             region = zone_region(args.zone)
             audit_ssh_firewall_rules(
                 gcloud,
@@ -3337,6 +3351,14 @@ def main(argv: list[str] | None = None) -> int:
         elif args.v8_point_direct_frame_ab:
             report["benchmark_suite"] = "v8-point-direct-frame"
             report["benchmark_plan"] = build_point_direct_frame_plan(
+                writers=args.writers,
+                machine_type=args.machine_type,
+                machine_spec=MACHINE_SPECS[args.machine_type],
+                commit=args.commit.lower(),
+            )
+        elif args.v8_point_progress_cursor_ab:
+            report["benchmark_suite"] = "v8-point-progress-cursor"
+            report["benchmark_plan"] = build_point_progress_cursor_plan(
                 writers=args.writers,
                 machine_type=args.machine_type,
                 machine_spec=MACHINE_SPECS[args.machine_type],

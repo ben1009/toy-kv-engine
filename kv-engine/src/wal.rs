@@ -165,7 +165,8 @@ pub struct WalIoDiagnostics {
     pub progress_diagnostics: Option<WalV8ProgressDiagnostics>,
 }
 
-/// Per-writer progress observations collected with WAL sync diagnostics.
+/// Per-writer progress observations collected with lightweight counters or
+/// detailed WAL sync diagnostics.
 #[cfg(feature = "bench")]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize)]
 #[doc(hidden)]

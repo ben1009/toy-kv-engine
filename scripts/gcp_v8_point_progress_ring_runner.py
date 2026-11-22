@@ -22,8 +22,11 @@ from gcp_wal_matrix import (
     POINT_LOOKAHEAD_WINDOW_BYTES,
     POINT_PROGRESS_RING_NUM,
     POINT_PROGRESS_RING_WRITERS,
+    build_point_progress_cursor_plan,
+    build_point_progress_cursor_schedule,
     build_point_progress_ring_plan,
     build_point_progress_ring_schedule,
+    validate_point_progress_cursor_rows,
     validate_point_progress_ring_rows,
 )
 
@@ -65,7 +68,7 @@ def _run_id(row: dict[str, Any]) -> str:
 
 
 def _summary_fields(schedule: list[dict[str, Any]]) -> tuple[str, ...]:
-    return (
+    fields = (
         *schedule[0].keys(), "source_commit", "binary_sha256", "exit_code", "ops",
         "puts_per_second", "cpu_seconds", "cpu_us_per_put", "p50_ms", "p95_ms", "p99_ms",
         "latency_sample_every", "latency_samples", "latency_unsampled_operations", "sync_count",
@@ -74,23 +77,42 @@ def _summary_fields(schedule: list[dict[str, Any]]) -> tuple[str, ...]:
         "progress_ring_start", "progress_ring_end", "extent_scan_diagnostics_start",
         "extent_scan_diagnostics_end", "initialized_bytes", "duration_seconds",
     )
+    if any("progress_cursor_enabled" in row for row in schedule):
+        fields += ("progress_cursor_start", "progress_cursor_end")
+    return fields
 
 
-def _environment(progress_ring_enabled: bool) -> dict[str, str]:
+def _environment(
+    progress_ring_enabled: bool,
+    progress_cursor_enabled: bool = False,
+    progress_counters_enabled: bool | None = None,
+) -> dict[str, str]:
     # An allowlist makes the candidate switch the only inherited experiment variable.
-    return {
+    if progress_cursor_enabled and not progress_ring_enabled:
+        raise ValueError("Cursor mode requires progress-ring mode")
+    progress_mode = "2" if progress_cursor_enabled else "1" if progress_ring_enabled else "0"
+    environment = {
         "PATH": os.environ.get("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"),
         "HOME": os.environ.get("HOME", "/home/bench"),
         "TMPDIR": os.environ.get("TMPDIR", "/tmp"),
         "LC_ALL": "C",
         **FIXED_ENVIRONMENT,
-        "TOYKV_BENCH_V8_POINT_PROGRESS_RING": "1" if progress_ring_enabled else "0",
+        "TOYKV_BENCH_V8_POINT_PROGRESS_RING": progress_mode,
     }
+    if progress_counters_enabled is not None:
+        environment["TOYKV_BENCH_V8_PROGRESS_COUNTERS"] = "1" if progress_counters_enabled else "0"
+    return environment
 
 
-def _expected_environment_text(progress_ring_enabled: bool) -> str:
+def _expected_environment_text(
+    progress_ring_enabled: bool,
+    progress_cursor_enabled: bool = False,
+    progress_counters_enabled: bool | None = None,
+) -> str:
     controlled = {
-        key: value for key, value in _environment(progress_ring_enabled).items()
+        key: value for key, value in _environment(
+            progress_ring_enabled, progress_cursor_enabled, progress_counters_enabled,
+        ).items()
         if key not in ("PATH", "HOME", "TMPDIR", "LC_ALL")
     }
     controlled.update({key: "<unset>" for key in UNSET_EXPERIMENT_VARIABLES})
@@ -123,13 +145,14 @@ def _validate_record(record: dict[str, Any], row: dict[str, Any]) -> dict[str, A
     pipeline = _require_object(result.get("wal_pipeline"), "WAL pipeline metadata")
     if pipeline.get("wal_io_stable") is not True:
         raise ValueError("WAL I/O metadata changed during the run")
+    expected_cursor_enabled = bool(row.get("progress_cursor_enabled", False))
     io_by_boundary: dict[str, dict[str, Any]] = {}
     for boundary in ("wal_io_start", "wal_io_end"):
         snapshot = _require_object(pipeline.get(boundary), f"{boundary} WAL I/O snapshot")
         if snapshot.get("progress_ring_enabled") is not bool(row["progress_ring_enabled"]):
             raise ValueError(f"{boundary} progress-ring mode differs from the planned arm")
-        if snapshot.get("progress_cursor_enabled", False) is not False:
-            raise ValueError(f"{boundary} used the cursor candidate in the original F0 matrix")
+        if snapshot.get("progress_cursor_enabled", False) is not expected_cursor_enabled:
+            raise ValueError(f"{boundary} Cursor mode differs from the planned arm")
         if snapshot.get("progress_diagnostics") is not None:
             raise ValueError(f"{boundary} progress diagnostics must be disabled for scored runs")
         preparation = _require_object(
@@ -208,7 +231,7 @@ def _validate_record(record: dict[str, Any], row: dict[str, Any]) -> dict[str, A
     if type(initialized) is not int or initialized < 0 or (initialized > 0) is not is_point:
         raise ValueError("Lookahead initialization differs from the Point/Batch plan")
 
-    return {
+    metrics = {
         "ops": int(result["ops"]),
         "puts_per_second": ops_per_second,
         "cpu_seconds": cpu_ms / 1000,
@@ -229,6 +252,10 @@ def _validate_record(record: dict[str, Any], row: dict[str, Any]) -> dict[str, A
         "extent_scan_diagnostics_end": end_prep["extent_policy_scan_diagnostics_enabled"],
         "initialized_bytes": initialized,
     }
+    if "progress_cursor_enabled" in row:
+        metrics["progress_cursor_start"] = pipeline["wal_io_start"]["progress_cursor_enabled"]
+        metrics["progress_cursor_end"] = pipeline["wal_io_end"]["progress_cursor_enabled"]
+    return metrics
 
 
 def _run_one(
@@ -249,10 +276,18 @@ def _run_one(
         command.extend(("--latency-sample-every", str(row["sample_every"])))
     else:
         command.extend(("--wal-batch-size", str(row["batch_entries"])))
-    environment = _environment(bool(row["progress_ring_enabled"]))
+    environment = _environment(
+        bool(row["progress_ring_enabled"]),
+        bool(row.get("progress_cursor_enabled", False)),
+        row.get("progress_counters_enabled"),
+    )
     (run_dir / "command.sh").write_text(shlex.join(command) + "\n", encoding="utf-8")
     (run_dir / "environment.txt").write_text(
-        _expected_environment_text(bool(row["progress_ring_enabled"])), encoding="utf-8",
+        _expected_environment_text(
+            bool(row["progress_ring_enabled"]),
+            bool(row.get("progress_cursor_enabled", False)),
+            row.get("progress_counters_enabled"),
+        ), encoding="utf-8",
     )
     (run_dir / "start_utc.txt").write_text(datetime.now(timezone.utc).isoformat() + "\n", encoding="utf-8")
     if int(time.time()) + RUN_TIMEOUT_SECONDS + 330 >= safe_deadline_epoch:
@@ -409,6 +444,84 @@ def _summary(rows: list[dict[str, Any]], writers: tuple[int, ...], planned: int)
     }
 
 
+def _cursor_summary(rows: list[dict[str, Any]], writers: tuple[int, ...], planned: int) -> dict[str, Any]:
+    """Summarize Eager/Ring/Cursor comparisons without changing the F0.5 summary."""
+    eager_ring_rows = [row for row in rows if row.get("arm") != "cursor"]
+    eager_cursor_rows = [
+        {
+            **{key: value for key, value in row.items() if key != "progress_cursor_enabled"},
+            "arm": "progress_ring" if row.get("arm") == "cursor" else row.get("arm"),
+        }
+        for row in rows if row.get("arm") != "progress_ring"
+    ]
+    ring_summary = _summary(eager_ring_rows, writers, len(eager_ring_rows))
+    cursor_summary = _summary(eager_cursor_rows, writers, len(eager_cursor_rows))
+    cursor_validation = validate_point_progress_cursor_rows(rows, writers)
+    comparisons: list[dict[str, Any]] = []
+    for ring_comparison, cursor_comparison in zip(
+        ring_summary["comparison"], cursor_summary["comparison"], strict=True,
+    ):
+        writer = ring_comparison["writer"]
+        workload = ring_comparison["workload"]
+        paired_ring_to_cursor: list[float] = []
+        paired_ring_to_cursor_p99: list[float] = []
+        for repetition in range(1, 6):
+            pair = {
+                arm: next((row for row in rows if row.get("writer") == writer
+                           and row.get("workload") == workload and row.get("repetition") == repetition
+                           and row.get("arm") == arm and row.get("exit_code") == 0), None)
+                for arm in ("progress_ring", "cursor")
+            }
+            ring, cursor = pair["progress_ring"], pair["cursor"]
+            if ring and cursor and ring["puts_per_second"] > 0:
+                paired_ring_to_cursor.append((cursor["puts_per_second"] / ring["puts_per_second"] - 1) * 100)
+                if workload == "point":
+                    paired_ring_to_cursor_p99.append((cursor["p99_ms"] / ring["p99_ms"] - 1) * 100)
+        comparisons.append({
+            "writer": writer,
+            "workload": workload,
+            "eager": ring_comparison["baseline"],
+            "progress_ring": ring_comparison["candidate"],
+            "cursor": cursor_comparison["candidate"],
+            "eager_to_ring": ring_comparison,
+            "eager_to_cursor": cursor_comparison,
+            "paired_ring_to_cursor_changes_pct": paired_ring_to_cursor,
+            "paired_ring_to_cursor_change_median_pct": (
+                median(paired_ring_to_cursor) if paired_ring_to_cursor else None
+            ),
+            "ring_to_cursor_pair_wins": sum(value > 0 for value in paired_ring_to_cursor),
+            "paired_ring_to_cursor_p99_changes_pct": paired_ring_to_cursor_p99,
+            "paired_ring_to_cursor_p99_change_median_pct": (
+                median(paired_ring_to_cursor_p99) if paired_ring_to_cursor_p99 else None
+            ),
+        })
+    by_cell = {f"w{row['writer']}-{row['workload']}": row for row in comparisons}
+    qualification_gates = dict(cursor_summary["qualification_gates"])
+    qualification_gates["candidate_qualified"] = bool(
+        cursor_validation["complete"] and qualification_gates["candidate_qualified"]
+    )
+    summary = dict(cursor_summary)
+    summary.update({
+        "suite": "v8-point-progress-cursor",
+        "complete": len(rows) == planned and cursor_validation["complete"],
+        "arms": ["eager", "progress_ring", "cursor"],
+        "results": rows,
+        "matrix_validation": cursor_validation,
+        "comparison": comparisons,
+        "comparison_by_cell": by_cell,
+        "qualification_gates": qualification_gates,
+        "runs_started": len(rows),
+        "runs_completed": sum(row.get("exit_code") == 0 for row in rows),
+        "runs_planned": planned,
+        "qualification_note": (
+            "Same-host, same-source, same-release-binary three-arm comparison of Eager (mode 0), Ring (mode 1), "
+            "and Cursor (mode 2). Cursor is qualified against Eager using the historical F0.5 performance gates; "
+            "Ring-to-Cursor paired results are also reported. Passing does not change production defaults."
+        ),
+    })
+    return summary
+
+
 def run_suite(args: argparse.Namespace) -> int:
     if len(args.commit) != 40 or any(char not in "0123456789abcdef" for char in args.commit):
         raise ValueError("commit must be a full lowercase 40-character SHA")
@@ -426,18 +539,33 @@ def run_suite(args: argparse.Namespace) -> int:
     results_dir, db_root = args.results_dir, args.db_root
     results_dir.mkdir(parents=True, exist_ok=True)
     db_root.mkdir(parents=True, exist_ok=True)
-    schedule = build_point_progress_ring_schedule(writers)
-    plan = build_point_progress_ring_plan(
-        writers=writers,
-        machine_type=args.machine_type,
-        machine_spec={"vcpus": 16, "ssd_count": args.ssd_count, "ssd_gib": args.ssd_gib},
-        commit=args.commit,
-        binary_sha256=args.binary_sha256,
+    candidate_mode = getattr(args, "candidate_mode", "ring")
+    if candidate_mode == "cursor":
+        schedule = build_point_progress_cursor_schedule(writers)
+        plan = build_point_progress_cursor_plan(
+            writers=writers,
+            machine_type=args.machine_type,
+            machine_spec={"vcpus": 16, "ssd_count": args.ssd_count, "ssd_gib": args.ssd_gib},
+            commit=args.commit,
+            binary_sha256=args.binary_sha256,
+        )
+    else:
+        schedule = build_point_progress_ring_schedule(writers)
+        plan = build_point_progress_ring_plan(
+            writers=writers,
+            machine_type=args.machine_type,
+            machine_spec={"vcpus": 16, "ssd_count": args.ssd_count, "ssd_gib": args.ssd_gib},
+            commit=args.commit,
+            binary_sha256=args.binary_sha256,
+        )
+    schedule_filename = (
+        "point-progress-cursor-schedule.tsv" if candidate_mode == "cursor"
+        else "point-progress-ring-schedule.tsv"
     )
     (results_dir / "benchmark-plan.json").write_text(json.dumps(plan, indent=2) + "\n", encoding="utf-8")
     (results_dir / "commit.txt").write_text(args.commit + "\n", encoding="utf-8")
     (results_dir / "write-perf.sha256").write_text(args.binary_sha256 + "\n", encoding="utf-8")
-    with (results_dir / "point-progress-ring-schedule.tsv").open("w", encoding="utf-8", newline="") as stream:
+    with (results_dir / schedule_filename).open("w", encoding="utf-8", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=schedule[0].keys(), delimiter="\t", lineterminator="\n")
         writer.writeheader()
         writer.writerows({**row, "batch_size": row["batch_size"] or "none"} for row in schedule)
@@ -476,7 +604,11 @@ def run_suite(args: argparse.Namespace) -> int:
             failure = f"run {attempted} failed validation or exited nonzero"
             break
 
-    summary = _summary(rows, writers, len(schedule))
+    summary = (
+        _cursor_summary(rows, writers, len(schedule))
+        if candidate_mode == "cursor"
+        else _summary(rows, writers, len(schedule))
+    )
     summary.update({"source_commit": args.commit, "binary_sha256": args.binary_sha256})
     summary["runs_started"] = started
     summary["runs_attempted"] = attempted
@@ -645,6 +777,148 @@ def verify_results_directory(results: Path) -> dict[str, Any]:
         return {"verified": False, "errors": [str(error)]}
 
 
+def verify_cursor_results_directory(results: Path) -> dict[str, Any]:
+    """Verify the Cursor matrix separately, preserving the historical F0.5 Ring verifier."""
+    errors: list[str] = []
+    try:
+        summary = json.loads((results / "summary.json").read_text(encoding="utf-8"))
+        remote_exit = json.loads((results / "remote-exit.json").read_text(encoding="utf-8"))
+        plan = json.loads((results / "benchmark-plan.json").read_text(encoding="utf-8"))
+        commit = (results / "commit.txt").read_text(encoding="utf-8").strip()
+        binary_sha = (results / "write-perf.sha256").read_text(encoding="utf-8").strip()
+        if not all(isinstance(value, dict) for value in (summary, remote_exit, plan)):
+            raise ValueError("summary, remote-exit, and plan must be JSON objects")
+        schedule = build_point_progress_cursor_schedule(plan.get("writers", ()))
+        expected_plan = build_point_progress_cursor_plan(
+            writers=plan.get("writers", ()),
+            machine_type="c4-standard-16-lssd",
+            machine_spec={"vcpus": 16, "ssd_count": 2, "ssd_gib": 750},
+            commit=commit,
+            binary_sha256=binary_sha,
+        )
+        for key, value in expected_plan.items():
+            if plan.get(key) != value:
+                errors.append(f"plan field {key} differs from fixed Cursor suite")
+        if len(commit) != 40 or any(char not in "0123456789abcdef" for char in commit):
+            errors.append("source commit identity is invalid")
+        if len(binary_sha) != 64 or any(char not in "0123456789abcdef" for char in binary_sha):
+            errors.append("binary checksum is invalid")
+        if (
+            summary.get("suite") != "v8-point-progress-cursor"
+            or summary.get("source_commit") != commit
+            or summary.get("binary_sha256") != binary_sha
+            or summary.get("complete") is not True
+            or summary.get("runs_started") != len(schedule)
+            or summary.get("runs_attempted", summary.get("runs_started")) != len(schedule)
+            or summary.get("runs_completed") != len(schedule)
+            or summary.get("runs_planned") != len(schedule)
+        ):
+            errors.append("summary metadata or run counts are incomplete")
+        if (
+            remote_exit.get("failed") is not False
+            or remote_exit.get("runs_started") != len(schedule)
+            or remote_exit.get("runs_attempted", remote_exit.get("runs_started")) != len(schedule)
+        ):
+            errors.append("remote-exit does not confirm all planned runs")
+        with (results / "point-progress-cursor-schedule.tsv").open(encoding="utf-8", newline="") as stream:
+            schedule_rows = list(csv.DictReader(stream, delimiter="\t"))
+        expected_schedule_rows = [
+            {
+                key: (
+                    "none" if key == "batch_size" and value is None
+                    else "" if value is None
+                    else str(value)
+                )
+                for key, value in planned_row.items()
+            }
+            for planned_row in schedule
+        ]
+        if schedule_rows != expected_schedule_rows:
+            errors.append("schedule file differs from the exact planned run order or configuration")
+        rows = summary.get("results")
+        if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+            errors.append("summary results are missing or malformed")
+            rows = []
+        validation = validate_point_progress_cursor_rows(rows, plan.get("writers", ()))
+        if validation["complete"] is not True:
+            errors.append("run rows do not match the fixed Cursor matrix")
+        if validation["complete"] is True:
+            recomputed = _cursor_summary(rows, tuple(plan.get("writers", ())), len(schedule))
+            for key in (
+                "suite", "complete", "runs_started", "runs_completed", "runs_planned", "writers",
+                "workloads", "arms", "matrix_validation", "comparison", "comparison_by_cell",
+                "qualification_gates",
+            ):
+                if summary.get(key) != recomputed.get(key):
+                    errors.append(f"summary field {key} does not match archived run rows")
+        expected_ids = {_run_id(row) for row in schedule}
+        actual_ids = {
+            path.name for path in results.iterdir()
+            if path.is_dir() and path.name.startswith(("r", "w"))
+        }
+        if actual_ids != expected_ids:
+            errors.append("run directories do not exactly match the schedule")
+        rows_by_id = {_run_id(row): row for row in rows if isinstance(row, dict)}
+        for row in schedule:
+            name = _run_id(row)
+            run_dir = results / name
+            metadata_path, result_path = run_dir / "run-metadata.json", run_dir / "result.json"
+            if not metadata_path.is_file() or not result_path.is_file():
+                errors.append(f"{name} is missing its result or metadata")
+                continue
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            if not isinstance(metadata, dict):
+                errors.append(f"{name} run metadata is malformed")
+                continue
+            if rows_by_id.get(name) != metadata:
+                errors.append(f"{name} summary row differs from run metadata")
+            identity = {key: row[key] for key in row}
+            identity.update({"source_commit": commit, "binary_sha256": binary_sha})
+            if any(metadata.get(key) != value for key, value in identity.items()):
+                errors.append(f"{name} metadata identity differs from the schedule")
+            environment_path = run_dir / "environment.txt"
+            if not environment_path.is_file() or environment_path.read_text(encoding="utf-8") != (
+                _expected_environment_text(
+                    bool(row["progress_ring_enabled"]),
+                    bool(row["progress_cursor_enabled"]),
+                    row["progress_counters_enabled"],
+                )
+            ):
+                errors.append(f"{name} environment does not match the fixed Cursor configuration")
+            try:
+                raw = json.loads(result_path.read_text(encoding="utf-8"))
+                expected_metrics = _validate_record(raw, row)
+                if any(metadata.get(key) != value for key, value in expected_metrics.items()):
+                    errors.append(f"{name} metadata metrics differ from raw result")
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+                errors.append(f"{name} raw result is invalid: {error}")
+        summary_tsv_path = results / "summary.tsv"
+        if not summary_tsv_path.is_file():
+            errors.append("summary.tsv is missing")
+        else:
+            with summary_tsv_path.open(encoding="utf-8", newline="") as stream:
+                summary_tsv_rows = list(csv.DictReader(stream, delimiter="\t"))
+            metadata_by_id = {_run_id(row): row for row in rows if isinstance(row, dict)}
+            expected_summary_tsv_rows = []
+            for planned_row in schedule:
+                metadata = metadata_by_id.get(_run_id(planned_row), {})
+                expected_summary_tsv_rows.append({
+                    key: (
+                        json.dumps(metadata[key], sort_keys=True)
+                        if isinstance(metadata.get(key), dict)
+                        else "" if metadata.get(key) is None else str(metadata.get(key))
+                    )
+                    for key in _summary_fields(schedule)
+                })
+            if summary_tsv_rows != expected_summary_tsv_rows:
+                errors.append("summary.tsv rows differ from run metadata")
+        if errors:
+            return {"verified": False, "planned": len(schedule), "errors": errors}
+        return {"verified": True, "planned": len(schedule), "observed": len(rows), "errors": []}
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+        return {"verified": False, "errors": [str(error)]}
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, required=True)
@@ -657,6 +931,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--machine-type", required=True)
     parser.add_argument("--ssd-count", type=int, required=True)
     parser.add_argument("--ssd-gib", type=int, required=True)
+    parser.add_argument("--candidate-mode", choices=("ring", "cursor"), default="ring")
     return parser.parse_args(argv)
 
 
