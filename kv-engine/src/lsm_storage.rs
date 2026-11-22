@@ -22845,7 +22845,7 @@ mod tests {
                     "--nocapture",
                 ])
                 .env(CHILD_ENV, "1")
-                .env("TOYKV_BENCH_V8_POINT_PROGRESS_RING", "1")
+                .env("TOYKV_BENCH_V8_POINT_PROGRESS_RING", "2")
                 .output()?;
             ensure!(
                 output.status.success(),
@@ -40221,7 +40221,7 @@ mod tests {
                 )
                 .arg("--nocapture")
                 .env(CHILD_ENV, "1")
-                .env("TOYKV_BENCH_V8_POINT_PROGRESS_RING", "1")
+                .env("TOYKV_BENCH_V8_POINT_PROGRESS_RING", "2")
                 .output()
                 .unwrap();
             assert!(
