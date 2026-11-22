@@ -2751,17 +2751,30 @@ struct WalV8ParallelIo {
     completion_thread: Mutex<Option<thread::JoinHandle<()>>>,
 }
 
+struct WalV8ParallelIoConfig {
+    #[cfg(feature = "bench")]
+    extent_preparation: Option<Arc<WalV8SlidingExtentPreparation>>,
+    direct_completion_enabled: bool,
+    singleton_submission_enabled: bool,
+    #[cfg(all(test, feature = "bench"))]
+    worker_group_limit: Option<usize>,
+}
+
 impl WalV8ParallelIo {
     fn spawn(
         worker_file: File,
         coordinator: WalV8ParallelCoordinator,
         first_ticket: u64,
         extent_preallocator: Option<Arc<WalV8ExtentPreallocator>>,
-        #[cfg(feature = "bench")] extent_preparation: Option<Arc<WalV8SlidingExtentPreparation>>,
-        direct_completion_enabled: bool,
-        singleton_submission_enabled: bool,
-        #[cfg(test)] worker_group_limit: Option<usize>,
+        config: WalV8ParallelIoConfig,
     ) -> Result<Arc<Self>> {
+        #[cfg(feature = "bench")]
+        let extent_preparation = config.extent_preparation;
+        let direct_completion_enabled = config.direct_completion_enabled;
+        let singleton_submission_enabled = config.singleton_submission_enabled;
+        #[cfg(all(test, feature = "bench"))]
+        let worker_group_limit = config.worker_group_limit;
+
         ensure!(
             !direct_completion_enabled || coordinator.progress_cursor_enabled(),
             "Cursor direct completion requires Cursor progress mode"
@@ -2835,13 +2848,10 @@ impl WalV8ParallelIo {
             (worker, None)
         };
         #[cfg(not(feature = "bench"))]
-        let mut worker = {
-            let worker = if submit_any_ready_ticket {
-                IoWorker::spawn_out_of_order(worker_file, buffer_pool, None)?
-            } else {
-                IoWorker::spawn(worker_file, buffer_pool, None)?
-            };
-            worker
+        let mut worker = if submit_any_ready_ticket {
+            IoWorker::spawn_out_of_order(worker_file, buffer_pool, None)?
+        } else {
+            IoWorker::spawn(worker_file, buffer_pool, None)?
         };
         let client = worker.client();
         let progress = worker.sync_progress();
@@ -4383,7 +4393,7 @@ impl WalV8LeaderWriter {
             progress_mode,
             direct_completion_enabled,
             singleton_submission_enabled,
-            #[cfg(test)]
+            #[cfg(all(test, feature = "bench"))]
             None,
         )
     }
@@ -4394,7 +4404,7 @@ impl WalV8LeaderWriter {
         progress_mode: WalV8ProgressMode,
         direct_completion_enabled: bool,
         singleton_submission_enabled: bool,
-        #[cfg(test)] worker_group_limit: Option<usize>,
+        #[cfg(all(test, feature = "bench"))] worker_group_limit: Option<usize>,
     ) -> Result<WalV8ParallelWriter> {
         validate_positional_write_handle(&worker_file)
             .context("validate v8 WAL I/O worker handle")?;
@@ -4598,12 +4608,14 @@ impl WalV8LeaderWriter {
             self.coordinator.clone(),
             initial_ticket,
             extent_preallocator,
-            #[cfg(feature = "bench")]
-            extent_preparation,
-            direct_completion_enabled,
-            singleton_submission_enabled,
-            #[cfg(test)]
-            worker_group_limit,
+            WalV8ParallelIoConfig {
+                #[cfg(feature = "bench")]
+                extent_preparation,
+                direct_completion_enabled,
+                singleton_submission_enabled,
+                #[cfg(all(test, feature = "bench"))]
+                worker_group_limit,
+            },
         )?;
         #[cfg(feature = "bench")]
         if let Some(profile) = profile {

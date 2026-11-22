@@ -1192,6 +1192,14 @@ enum WorkerCompletionSender {
     },
 }
 
+struct WorkerCompletionConfig {
+    sender: WorkerCompletionSender,
+    receiver: Option<Receiver<GroupWriteResult>>,
+    failure_events: Option<Sender<GroupWriteResult>>,
+    #[cfg(test)]
+    group_limit: Option<usize>,
+}
+
 impl WorkerCompletionSender {
     #[cfg(feature = "bench")]
     fn supports_completion_timeline(&self) -> bool {
@@ -2398,11 +2406,13 @@ impl<B: WorkerBuffer> IoWorker<B> {
             buffer_pool,
             async_write_min_bytes,
             allow_out_of_order_groups,
-            WorkerCompletionSender::Relay(completion_tx),
-            Some(completion_rx),
-            Some(failure_events),
-            #[cfg(test)]
-            None,
+            WorkerCompletionConfig {
+                sender: WorkerCompletionSender::Relay(completion_tx),
+                receiver: Some(completion_rx),
+                failure_events: Some(failure_events),
+                #[cfg(test)]
+                group_limit: None,
+            },
         )
     }
 
@@ -2420,14 +2430,16 @@ impl<B: WorkerBuffer> IoWorker<B> {
             buffer_pool,
             async_write_min_bytes,
             allow_out_of_order_groups,
-            WorkerCompletionSender::CursorDirect {
-                sender: completion_tx,
-                handle: completion_handle,
+            WorkerCompletionConfig {
+                sender: WorkerCompletionSender::CursorDirect {
+                    sender: completion_tx,
+                    handle: completion_handle,
+                },
+                receiver: None,
+                failure_events: None,
+                #[cfg(test)]
+                group_limit: None,
             },
-            None,
-            None,
-            #[cfg(test)]
-            None,
         )
     }
 
@@ -2446,13 +2458,15 @@ impl<B: WorkerBuffer> IoWorker<B> {
             buffer_pool,
             async_write_min_bytes,
             allow_out_of_order_groups,
-            WorkerCompletionSender::CursorDirect {
-                sender: completion_tx,
-                handle: completion_handle,
+            WorkerCompletionConfig {
+                sender: WorkerCompletionSender::CursorDirect {
+                    sender: completion_tx,
+                    handle: completion_handle,
+                },
+                receiver: None,
+                failure_events: None,
+                group_limit: Some(group_limit),
             },
-            None,
-            None,
-            Some(group_limit),
         )
     }
 
@@ -2461,11 +2475,14 @@ impl<B: WorkerBuffer> IoWorker<B> {
         buffer_pool: Arc<ArrayQueue<B>>,
         async_write_min_bytes: Option<usize>,
         allow_out_of_order_groups: bool,
-        completion_sender: WorkerCompletionSender,
-        completion_receiver: Option<Receiver<GroupWriteResult>>,
-        failure_events: Option<Sender<GroupWriteResult>>,
-        #[cfg(test)] group_limit: Option<usize>,
+        completion: WorkerCompletionConfig,
     ) -> Result<Self> {
+        let completion_sender = completion.sender;
+        let completion_receiver = completion.receiver;
+        let failure_events = completion.failure_events;
+        #[cfg(test)]
+        let group_limit = completion.group_limit;
+
         let (command_tx, command_rx) = unbounded();
         let (startup_tx, startup_rx) = bounded::<Result<()>>(1);
         #[cfg(test)]
