@@ -72,13 +72,12 @@ pub(crate) fn wait_for_progress_token(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum WalV8ProgressMode {
     Eager,
-    Ring,
     Cursor,
 }
 
 impl WalV8ProgressMode {
     pub(crate) fn uses_ring(self) -> bool {
-        self != Self::Eager
+        self == Self::Cursor
     }
 }
 
@@ -3834,7 +3833,7 @@ mod tests {
         capacity: usize,
         next_ticket: u64,
     ) -> Result<WalV8ParallelCoordinator> {
-        coordinator_with_progress_mode(capacity, next_ticket, WalV8ProgressMode::Ring)
+        coordinator_with_progress_mode(capacity, next_ticket, WalV8ProgressMode::Cursor)
     }
 
     fn coordinator_with_progress_mode(
@@ -4306,7 +4305,7 @@ mod tests {
 
     #[test]
     fn progress_ring_registration_failure_leaves_slot_free_for_same_ticket_retry() -> Result<()> {
-        check_progress_registration_failure(WalV8ProgressMode::Ring)
+        check_progress_registration_failure(WalV8ProgressMode::Cursor)
     }
 
     fn check_progress_registration_failure(mode: WalV8ProgressMode) -> Result<()> {
@@ -4350,7 +4349,7 @@ mod tests {
 
     #[test]
     fn progress_ring_reuses_single_slot_only_after_durable_publication() -> Result<()> {
-        check_progress_single_slot_reuse(WalV8ProgressMode::Ring)
+        check_progress_single_slot_reuse(WalV8ProgressMode::Cursor)
     }
 
     fn check_progress_single_slot_reuse(mode: WalV8ProgressMode) -> Result<()> {
@@ -4541,7 +4540,7 @@ mod tests {
 
     #[test]
     fn progress_ring_late_digest_wakes_after_consumed_data_token_and_scan() -> Result<()> {
-        check_progress_late_digest_wake(WalV8ProgressMode::Ring)
+        check_progress_late_digest_wake(WalV8ProgressMode::Cursor)
     }
 
     fn check_progress_late_digest_wake(mode: WalV8ProgressMode) -> Result<()> {
@@ -4898,7 +4897,7 @@ mod tests {
 
     #[test]
     fn progress_ring_stale_digest_after_slot_reuse_does_not_change_new_ticket() -> Result<()> {
-        check_progress_stale_digest(WalV8ProgressMode::Ring)
+        check_progress_stale_digest(WalV8ProgressMode::Cursor)
     }
 
     fn check_progress_stale_digest(mode: WalV8ProgressMode) -> Result<()> {
@@ -5060,7 +5059,7 @@ mod tests {
 
     #[test]
     fn progress_ring_completion_batch_validates_entire_group_before_mutation() -> Result<()> {
-        check_progress_group_atomicity(WalV8ProgressMode::Ring, false)
+        check_progress_group_atomicity(WalV8ProgressMode::Cursor, false)
     }
 
     fn check_progress_group_atomicity(

@@ -159,9 +159,11 @@ Both the producer and Coordinator code live in the
    fresh Active WALs, reopens and rotation successors. Activate the ring with
    empty cells at an empty admission window. Keep the recovered absolute
    ticket cursors and verified digest boundary in the Coordinator. The bench
-   switch (proposed name `TOYKV_BENCH_V8_POINT_PROGRESS_RING`) selects eager
-   mode with `0` or when absent, and F0 with `1`. Use explicit mode injection
-   in parallel tests. Export the actual mode from the opened writer in both
+   switch `TOYKV_BENCH_V8_POINT_PROGRESS_RING` selects Eager with `0` and
+   Cursor with `2`; retired mode `1` is rejected. Non-bench builds keep Eager
+   by default and allow explicit Cursor opt-in through
+   `TOYKV_WAL_V8_PROGRESS_MODE=cursor` (`eager` selects the fallback). Use
+   explicit mode injection in parallel tests. Export the actual mode from the opened writer in both
    `wal_io_start` and `wal_io_end`, including on a reopened writer. Keep
    F0.2 and F0.3 behind test construction until both runtime waits are wired.
 5. Adapt sync diagnostics, completion timeline and HOL sampling to F0 or
@@ -317,3 +319,18 @@ promotion or production enablement. The mode remains off by default.
 
 See the [GCP qualification report](benchmarks/rfc-027-v8-point-progress-ring-gcp-20261121.md)
 for the complete score, archive verification and run provenance.
+
+## Cursor production opt-in stage
+
+The first production-selection slice retires the intermediate Ring mode while
+keeping Eager as the default. Cursor can be selected in a non-bench build with
+`TOYKV_WAL_V8_PROGRESS_MODE=cursor`; unset or `eager` keeps the previous Eager
+behavior. The benchmark runner now compares only Eager and Cursor. The old
+two-arm F0.5 Ring plan and result verifier remain for reading archived results,
+but the runner no longer launches mode 1.
+
+This does not promote Cursor to the production default. Before considering that
+change, qualify the non-bench Cursor path with production I/O configuration,
+including buffered FRONTIER and production extent preparation, across PITR,
+crash recovery, rotation and seal tests. Keep Eager available as the rollback
+mode until that qualification and a separate default-change review are complete.

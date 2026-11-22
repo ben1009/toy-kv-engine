@@ -65,10 +65,11 @@ the retained and rejected experiments.
 
 The [V8 Point Progress Ring](../../rfcs/027-v8-point-progress-ring.md) proposed
 moving producer readiness to a bounded ring and having the elected driver apply
-queued completions in batches. The bench-only Ring and Cursor candidates did
-not pass their Point8/Point16 throughput promotion gates and are not qualified
-for production. See the [Ring qualification](benchmarks/rfc-027-v8-point-progress-ring-gcp-20261121.md),
-[three-arm Cursor qualification](benchmarks/rfc-027-v8-point-progress-cursor-gcp-20261122.md),
+queued completions in batches. Ring did not pass its Point8/Point16 throughput
+promotion gates. Cursor remains opt-in and is not the default: the latest
+qualification did not pass the throughput gate, and non-bench production-path
+qualification is still required. See the [Ring qualification](benchmarks/rfc-027-v8-point-progress-ring-gcp-20261121.md),
+[archived three-arm Cursor qualification](benchmarks/rfc-027-v8-point-progress-cursor-gcp-20261122.md),
 and [implementation plan](rfc-027-v8-point-progress-ring-implementation-plan.md).
 
 ## Implementation and adoption

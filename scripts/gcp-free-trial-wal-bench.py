@@ -65,7 +65,6 @@ from gcp_wal_matrix import (
     build_point_direct_frame_plan,
     build_point_direct_frame_schedule,
     build_point_progress_cursor_plan,
-    build_point_progress_ring_plan,
     build_v8_extent_policy_storage_plan,
     build_v8_extent_policy_storage_schedule,
     build_v8_mutex_diagnostic_plan,
@@ -78,7 +77,6 @@ from gcp_wal_matrix import (
     validate_point_borrowed_input_rows,
     validate_point_direct_frame_rows,
     validate_point_progress_cursor_rows,
-    validate_point_progress_ring_rows,
     validate_v8_extent_policy_storage_rows,
     validate_v8_mutex_diagnostic_rows,
     validate_v8_point_cpu_attribution_rows,
@@ -1156,16 +1154,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                              help="Compare V8 Point owned vs borrowed preparation with Batch16/64 guardrails")
     suite_group.add_argument("--v8-point-direct-frame-ab", action="store_true",
                              help="Compare V8 Point direct-frame encoding with the existing path and Batch guardrails")
-    suite_group.add_argument("--v8-point-progress-ring-ab", action="store_true",
-                             help="Qualify V8 Point progress-ring waits with same-binary Point/Batch guardrails")
     suite_group.add_argument("--v8-point-progress-cursor-ab", action="store_true",
-                             help="Qualify V8 Point progress-cursor mode with same-binary Point/Batch guardrails")
+                             help="Compare V8 Eager and Cursor progress modes with Point/Batch guardrails")
     suite_group.add_argument("--v8-extent-policy-storage-ab", action="store_true",
                              help="Compare V8 BTreeMap and Vec extent-policy storage with Point/Batch guardrails")
     parser.add_argument("--baseline-commit", help="Full source commit used as the borrowed-input A/B baseline")
     parser.add_argument("--source-patch-sha256",
                         help="SHA-256 of the exact source patch used for a commit-order trace run")
-    parser.add_argument("--network", help="VPC network (legacy suites default to default; progress-ring requires isolated VPC)")
+    parser.add_argument("--network", help="VPC network (legacy suites default to default; Cursor qualification requires isolated VPC)")
     parser.add_argument("--subnet", help="Subnetwork name in the requested region")
     parser.add_argument(
         "--ssh-source-range",
@@ -1194,7 +1190,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Use a manually verified SSH source CIDR when the HTTPS lookup cannot verify that route",
     )
     args = parser.parse_args(argv)
-    point_progress_suite = args.v8_point_progress_ring_ab or args.v8_point_progress_cursor_ab
+    point_progress_suite = args.v8_point_progress_cursor_ab
     explicit_network = args.network is not None
     if args.repetitions <= 0:
         parser.error("--repetitions must be a positive integer")
@@ -1208,13 +1204,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     if point_progress_suite:
         network_name = (args.network or "").rstrip("/").rsplit("/", 1)[-1].lower()
         if not explicit_network or not network_name:
-            parser.error("progress-ring/cursor qualification requires an explicit isolated --network")
+            parser.error("Cursor qualification requires an explicit isolated --network")
         if network_name == "default":
-            parser.error("progress-ring/cursor qualification cannot use the default VPC")
+            parser.error("Cursor qualification cannot use the default VPC")
         if not args.subnet:
-            parser.error("progress-ring/cursor qualification requires an explicit isolated --subnet")
+            parser.error("Cursor qualification requires an explicit isolated --subnet")
         if not args.ssh_source_range:
-            parser.error("progress-ring/cursor qualification requires --ssh-source-range, including for preflight")
+            parser.error("Cursor qualification requires --ssh-source-range, including for preflight")
     if args.num is None:
         args.num = (
             POINT_PROGRESS_RING_NUM if point_progress_suite else
@@ -1286,9 +1282,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     if args.v8_extent_policy_storage_ab and args.machine_type != "c4-standard-16-lssd":
         parser.error("--v8-extent-policy-storage-ab requires c4-standard-16-lssd")
     if point_progress_suite and args.writers != POINT_PROGRESS_RING_WRITERS:
-        parser.error(f"progress-ring/cursor qualification requires writers {POINT_PROGRESS_RING_WRITERS}")
+        parser.error(f"Cursor qualification requires writers {POINT_PROGRESS_RING_WRITERS}")
     if point_progress_suite and args.machine_type != "c4-standard-16-lssd":
-        parser.error("progress-ring/cursor qualification requires c4-standard-16-lssd")
+        parser.error("Cursor qualification requires c4-standard-16-lssd")
     if not re.fullmatch(r"[0-9a-fA-F]{40}", args.commit):
         parser.error("--commit must be a full 40-character SHA")
     if args.num < 64:
@@ -1302,7 +1298,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     if args.v8_extent_policy_storage_ab and args.num != V8_EXTENT_POLICY_STORAGE_NUM:
         parser.error(f"--v8-extent-policy-storage-ab uses a fixed {V8_EXTENT_POLICY_STORAGE_NUM}-put workload")
     if point_progress_suite and args.num != POINT_PROGRESS_RING_NUM:
-        parser.error(f"progress-ring/cursor qualification uses a fixed {POINT_PROGRESS_RING_NUM}-put workload")
+        parser.error(f"Cursor qualification uses a fixed {POINT_PROGRESS_RING_NUM}-put workload")
     if args.v8_mutex_diagnostic and args.num != V8_MUTEX_DIAGNOSTIC_NUM:
         parser.error(f"--v8-mutex-diagnostic uses a fixed {V8_MUTEX_DIAGNOSTIC_NUM}-put workload")
     if args.v8_point_cpu_attribution and args.num != V8_POINT_CPU_ATTRIBUTION_NUM:
@@ -1343,11 +1339,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             )
     if point_progress_suite:
         if args.max_runtime_minutes != 60:
-            parser.error("progress-ring/cursor qualification requires --max-runtime-minutes 60")
+            parser.error("Cursor qualification requires --max-runtime-minutes 60")
         if args.max_estimated_spend_usd is None:
-            parser.error("progress-ring/cursor qualification requires cost guard arguments, including for preflight")
+            parser.error("Cursor qualification requires cost guard arguments, including for preflight")
         if args.max_estimated_spend_usd > 2:
-            parser.error("progress-ring/cursor qualification cannot exceed the authorized $2 estimated-spend ceiling")
+            parser.error("Cursor qualification cannot exceed the authorized $2 estimated-spend ceiling")
     if not args.preflight_only:
         if not args.confirm_free_trial:
             parser.error("VM creation requires --confirm-free-trial after manually checking Billing Overview")
@@ -2774,9 +2770,8 @@ def provision_and_run(
     cpu_attribution_suite = getattr(args, "v8_point_cpu_attribution", False)
     point_borrowed_input_suite = getattr(args, "v8_point_borrowed_input_ab", False)
     point_direct_frame_suite = getattr(args, "v8_point_direct_frame_ab", False)
-    point_progress_ring_suite = getattr(args, "v8_point_progress_ring_ab", False)
     point_progress_cursor_suite = getattr(args, "v8_point_progress_cursor_ab", False)
-    point_progress_suite = point_progress_ring_suite or point_progress_cursor_suite
+    point_progress_suite = point_progress_cursor_suite
     extent_policy_storage_suite = getattr(args, "v8_extent_policy_storage_ab", False)
     missing_tools = [tool for tool in ("ssh", "ssh-keygen") if not shutil.which(tool)]
     if missing_tools:
@@ -3100,8 +3095,6 @@ def provision_and_run(
                 remote_suite = "v8-extent-policy-storage"
             elif point_progress_cursor_suite:
                 remote_suite = "v8-point-progress-cursor"
-            elif point_progress_ring_suite:
-                remote_suite = "v8-point-progress-ring"
             elif point_direct_frame_suite:
                 remote_suite = "v8-point-direct-frame"
             elif point_borrowed_input_suite:
@@ -3250,7 +3243,7 @@ def provision_and_run(
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(sys.argv[1:] if argv is None else argv)
-    point_progress_suite = args.v8_point_progress_ring_ab or args.v8_point_progress_cursor_ab
+    point_progress_suite = args.v8_point_progress_cursor_ab
     if point_progress_suite:
         args.progress_ring_vm_tag = f"{POINT_PROGRESS_RING_VM_TAG}-{uuid.uuid4().hex[:12]}"
     if args.results_dir is None:
@@ -3360,14 +3353,6 @@ def main(argv: list[str] | None = None) -> int:
         elif args.v8_point_progress_cursor_ab:
             report["benchmark_suite"] = "v8-point-progress-cursor"
             report["benchmark_plan"] = build_point_progress_cursor_plan(
-                writers=args.writers,
-                machine_type=args.machine_type,
-                machine_spec=MACHINE_SPECS[args.machine_type],
-                commit=args.commit.lower(),
-            )
-        elif args.v8_point_progress_ring_ab:
-            report["benchmark_suite"] = "v8-point-progress-ring"
-            report["benchmark_plan"] = build_point_progress_ring_plan(
                 writers=args.writers,
                 machine_type=args.machine_type,
                 machine_spec=MACHINE_SPECS[args.machine_type],

@@ -84,17 +84,14 @@ POINT_PROGRESS_RING_WRITERS = (1, 8, 16)
 POINT_PROGRESS_RING_REPETITIONS = 5
 POINT_PROGRESS_RING_NUM = 100_000
 POINT_PROGRESS_RING_ARMS = ("eager", "progress_ring")
-POINT_PROGRESS_CURSOR_ARMS = ("eager", "progress_ring", "cursor")
+POINT_PROGRESS_CURSOR_ARMS = ("eager", "cursor")
 POINT_PROGRESS_RING_ORDERS = (
     ("eager", "progress_ring"),
     ("progress_ring", "eager"),
 )
-POINT_PROGRESS_CURSOR_ORDERS = (
-    ("eager", "progress_ring", "cursor"),
-    ("progress_ring", "cursor", "eager"),
-    ("cursor", "eager", "progress_ring"),
-    ("eager", "cursor", "progress_ring"),
-    ("cursor", "progress_ring", "eager"),
+POINT_PROGRESS_CURSOR_ORDERS = tuple(
+    tuple("cursor" if arm == "progress_ring" else arm for arm in order)
+    for order in POINT_PROGRESS_RING_ORDERS
 )
 POINT_PROGRESS_RING_CELLS = (
     (1, "point", "wal_concurrent", 1, None, 10),
@@ -518,7 +515,7 @@ def build_point_progress_ring_schedule(writers: Iterable[int]) -> list[dict[str,
 
 
 def build_point_progress_cursor_schedule(writers: Iterable[int]) -> list[dict[str, object]]:
-    """Build a same-host three-arm comparison of Eager, Ring, and Cursor modes."""
+    """Build a same-host Eager/Cursor comparison; retired Ring mode is not runnable."""
     writer_counts = validate_writer_counts(writers)
     if writer_counts != POINT_PROGRESS_RING_WRITERS:
         raise ValueError(f"progress-cursor qualification requires writers {POINT_PROGRESS_RING_WRITERS}")
@@ -545,7 +542,7 @@ def build_point_progress_cursor_schedule(writers: Iterable[int]) -> list[dict[st
                     "extent_window_bytes": POINT_LOOKAHEAD_WINDOW_BYTES,
                     "frontier_mode": "direct",
                     "scan_diagnostics_enabled": False,
-                    "progress_ring_enabled": arm != "eager",
+                    "progress_ring_enabled": arm == "cursor",
                     "progress_cursor_enabled": arm == "cursor",
                     "progress_counters_enabled": False,
                 })
@@ -641,12 +638,8 @@ def build_point_progress_cursor_plan(
         "runs_planned": len(schedule),
         "score_runs_planned": len(schedule),
         "runtime_protocol": (
-            f"single {vcpus}-vCPU host; {layout}; same source and binary for three arms"
+            f"single {vcpus}-vCPU host; {layout}; same source and binary for two arms"
         ),
-        "progress_ring_control": {
-            "environment_variable": "TOYKV_BENCH_V8_POINT_PROGRESS_RING",
-            "candidate_value": "1",
-        },
         "progress_cursor_ab": {
             "environment_variable": "TOYKV_BENCH_V8_POINT_PROGRESS_RING",
             "baseline_value": "0",
@@ -654,11 +647,11 @@ def build_point_progress_cursor_plan(
         },
         "progress_counters_enabled": False,
         "qualification_note": (
-            "Same-host, same-source, same-release-binary three-arm qualification of Eager (mode 0), Ring (mode 1), "
+            "Same-host, same-source, same-release-binary two-arm qualification of Eager (mode 0) "
             "and Cursor (mode 2); the only changing factor is the progress mode. All arms use "
             "Direct FRONTIER, dynamic coalescing, 1 MiB Point lookahead, and existing digest sampling. Point latency "
-            "is sampled every 10 completed puts; Batch64 is throughput-only. The independent Cursor matrix keeps "
-            "the historical F0.5 Ring plan and verifier unchanged, and does not change production defaults."
+            "is sampled every 10 completed puts; Batch64 is throughput-only. The historical F0.5 Ring "
+            "plan and verifier remain available for archived results. Production defaults remain Eager."
         ),
     })
     return plan
@@ -737,7 +730,7 @@ def validate_point_progress_ring_rows(
 def validate_point_progress_cursor_rows(
     rows: list[Mapping[str, object]], writers: Iterable[int] = POINT_PROGRESS_RING_WRITERS,
 ) -> dict[str, object]:
-    """Validate the three-arm Eager/Ring/Cursor matrix and counter switch."""
+    """Validate the Eager/Cursor matrix and counter switch."""
     schedule = build_point_progress_cursor_schedule(writers)
     validation = _validate_point_progress_rows(rows, schedule)
     invalid_mode_flags: list[Mapping[str, object]] = []

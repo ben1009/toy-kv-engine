@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the RFC 027 F0.5 same-binary V8 Point progress-ring qualification."""
+"""Run RFC 027's same-binary V8 Point Eager/Cursor progress qualification."""
 
 from __future__ import annotations
 
@@ -88,9 +88,9 @@ def _environment(
     progress_counters_enabled: bool | None = None,
 ) -> dict[str, str]:
     # An allowlist makes the candidate switch the only inherited experiment variable.
-    if progress_cursor_enabled and not progress_ring_enabled:
-        raise ValueError("Cursor mode requires progress-ring mode")
-    progress_mode = "2" if progress_cursor_enabled else "1" if progress_ring_enabled else "0"
+    if progress_ring_enabled is not progress_cursor_enabled:
+        raise ValueError("only Eager (0) and Cursor (2) progress modes are runnable")
+    progress_mode = "2" if progress_cursor_enabled else "0"
     environment = {
         "PATH": os.environ.get("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"),
         "HOME": os.environ.get("HOME", "/home/bench"),
@@ -109,6 +109,15 @@ def _expected_environment_text(
     progress_cursor_enabled: bool = False,
     progress_counters_enabled: bool | None = None,
 ) -> str:
+    if progress_ring_enabled and not progress_cursor_enabled:
+        # Historical F0.5 archives used the now-retired mode 1. Keep their
+        # verifier readable without allowing the current runner to execute it.
+        controlled = {
+            **FIXED_ENVIRONMENT,
+            "TOYKV_BENCH_V8_POINT_PROGRESS_RING": "1",
+        }
+        controlled.update({key: "<unset>" for key in UNSET_EXPERIMENT_VARIABLES})
+        return "\n".join(f"{key}={value}" for key, value in sorted(controlled.items())) + "\n"
     controlled = {
         key: value for key, value in _environment(
             progress_ring_enabled, progress_cursor_enabled, progress_counters_enabled,
@@ -445,56 +454,26 @@ def _summary(rows: list[dict[str, Any]], writers: tuple[int, ...], planned: int)
 
 
 def _cursor_summary(rows: list[dict[str, Any]], writers: tuple[int, ...], planned: int) -> dict[str, Any]:
-    """Summarize Eager/Ring/Cursor comparisons without changing the F0.5 summary."""
-    eager_ring_rows = [row for row in rows if row.get("arm") != "cursor"]
+    """Summarize the runnable Eager/Cursor comparison while retaining the F0.5 verifier."""
     eager_cursor_rows = [
         {
             **{key: value for key, value in row.items() if key != "progress_cursor_enabled"},
             "arm": "progress_ring" if row.get("arm") == "cursor" else row.get("arm"),
         }
-        for row in rows if row.get("arm") != "progress_ring"
+        for row in rows
     ]
-    ring_summary = _summary(eager_ring_rows, writers, len(eager_ring_rows))
-    cursor_summary = _summary(eager_cursor_rows, writers, len(eager_cursor_rows))
+    cursor_summary = _summary(eager_cursor_rows, writers, planned)
     cursor_validation = validate_point_progress_cursor_rows(rows, writers)
-    comparisons: list[dict[str, Any]] = []
-    for ring_comparison, cursor_comparison in zip(
-        ring_summary["comparison"], cursor_summary["comparison"], strict=True,
-    ):
-        writer = ring_comparison["writer"]
-        workload = ring_comparison["workload"]
-        paired_ring_to_cursor: list[float] = []
-        paired_ring_to_cursor_p99: list[float] = []
-        for repetition in range(1, 6):
-            pair = {
-                arm: next((row for row in rows if row.get("writer") == writer
-                           and row.get("workload") == workload and row.get("repetition") == repetition
-                           and row.get("arm") == arm and row.get("exit_code") == 0), None)
-                for arm in ("progress_ring", "cursor")
-            }
-            ring, cursor = pair["progress_ring"], pair["cursor"]
-            if ring and cursor and ring["puts_per_second"] > 0:
-                paired_ring_to_cursor.append((cursor["puts_per_second"] / ring["puts_per_second"] - 1) * 100)
-                if workload == "point":
-                    paired_ring_to_cursor_p99.append((cursor["p99_ms"] / ring["p99_ms"] - 1) * 100)
-        comparisons.append({
-            "writer": writer,
-            "workload": workload,
-            "eager": ring_comparison["baseline"],
-            "progress_ring": ring_comparison["candidate"],
-            "cursor": cursor_comparison["candidate"],
-            "eager_to_ring": ring_comparison,
-            "eager_to_cursor": cursor_comparison,
-            "paired_ring_to_cursor_changes_pct": paired_ring_to_cursor,
-            "paired_ring_to_cursor_change_median_pct": (
-                median(paired_ring_to_cursor) if paired_ring_to_cursor else None
-            ),
-            "ring_to_cursor_pair_wins": sum(value > 0 for value in paired_ring_to_cursor),
-            "paired_ring_to_cursor_p99_changes_pct": paired_ring_to_cursor_p99,
-            "paired_ring_to_cursor_p99_change_median_pct": (
-                median(paired_ring_to_cursor_p99) if paired_ring_to_cursor_p99 else None
-            ),
-        })
+    comparisons = [
+        {
+            "writer": comparison["writer"],
+            "workload": comparison["workload"],
+            "eager": comparison["baseline"],
+            "cursor": comparison["candidate"],
+            "eager_to_cursor": comparison,
+        }
+        for comparison in cursor_summary["comparison"]
+    ]
     by_cell = {f"w{row['writer']}-{row['workload']}": row for row in comparisons}
     qualification_gates = dict(cursor_summary["qualification_gates"])
     qualification_gates["candidate_qualified"] = bool(
@@ -504,7 +483,7 @@ def _cursor_summary(rows: list[dict[str, Any]], writers: tuple[int, ...], planne
     summary.update({
         "suite": "v8-point-progress-cursor",
         "complete": len(rows) == planned and cursor_validation["complete"],
-        "arms": ["eager", "progress_ring", "cursor"],
+        "arms": ["eager", "cursor"],
         "results": rows,
         "matrix_validation": cursor_validation,
         "comparison": comparisons,
@@ -514,9 +493,9 @@ def _cursor_summary(rows: list[dict[str, Any]], writers: tuple[int, ...], planne
         "runs_completed": sum(row.get("exit_code") == 0 for row in rows),
         "runs_planned": planned,
         "qualification_note": (
-            "Same-host, same-source, same-release-binary three-arm comparison of Eager (mode 0), Ring (mode 1), "
-            "and Cursor (mode 2). Cursor is qualified against Eager using the historical F0.5 performance gates; "
-            "Ring-to-Cursor paired results are also reported. Passing does not change production defaults."
+            "Same-host, same-source, same-release-binary two-arm comparison of Eager (mode 0) and Cursor (mode 2). "
+            "Cursor is qualified against Eager using the historical F0.5 performance gates. Passing does not "
+            "change production defaults."
         ),
     })
     return summary
@@ -539,29 +518,18 @@ def run_suite(args: argparse.Namespace) -> int:
     results_dir, db_root = args.results_dir, args.db_root
     results_dir.mkdir(parents=True, exist_ok=True)
     db_root.mkdir(parents=True, exist_ok=True)
-    candidate_mode = getattr(args, "candidate_mode", "ring")
-    if candidate_mode == "cursor":
-        schedule = build_point_progress_cursor_schedule(writers)
-        plan = build_point_progress_cursor_plan(
-            writers=writers,
-            machine_type=args.machine_type,
-            machine_spec={"vcpus": 16, "ssd_count": args.ssd_count, "ssd_gib": args.ssd_gib},
-            commit=args.commit,
-            binary_sha256=args.binary_sha256,
-        )
-    else:
-        schedule = build_point_progress_ring_schedule(writers)
-        plan = build_point_progress_ring_plan(
-            writers=writers,
-            machine_type=args.machine_type,
-            machine_spec={"vcpus": 16, "ssd_count": args.ssd_count, "ssd_gib": args.ssd_gib},
-            commit=args.commit,
-            binary_sha256=args.binary_sha256,
-        )
-    schedule_filename = (
-        "point-progress-cursor-schedule.tsv" if candidate_mode == "cursor"
-        else "point-progress-ring-schedule.tsv"
+    candidate_mode = getattr(args, "candidate_mode", "cursor")
+    if candidate_mode != "cursor":
+        raise ValueError("Ring mode 1 is retired; only the Eager/Cursor comparison can be run")
+    schedule = build_point_progress_cursor_schedule(writers)
+    plan = build_point_progress_cursor_plan(
+        writers=writers,
+        machine_type=args.machine_type,
+        machine_spec={"vcpus": 16, "ssd_count": args.ssd_count, "ssd_gib": args.ssd_gib},
+        commit=args.commit,
+        binary_sha256=args.binary_sha256,
     )
+    schedule_filename = "point-progress-cursor-schedule.tsv"
     (results_dir / "benchmark-plan.json").write_text(json.dumps(plan, indent=2) + "\n", encoding="utf-8")
     (results_dir / "commit.txt").write_text(args.commit + "\n", encoding="utf-8")
     (results_dir / "write-perf.sha256").write_text(args.binary_sha256 + "\n", encoding="utf-8")
@@ -604,11 +572,7 @@ def run_suite(args: argparse.Namespace) -> int:
             failure = f"run {attempted} failed validation or exited nonzero"
             break
 
-    summary = (
-        _cursor_summary(rows, writers, len(schedule))
-        if candidate_mode == "cursor"
-        else _summary(rows, writers, len(schedule))
-    )
+    summary = _cursor_summary(rows, writers, len(schedule))
     summary.update({"source_commit": args.commit, "binary_sha256": args.binary_sha256})
     summary["runs_started"] = started
     summary["runs_attempted"] = attempted
@@ -931,7 +895,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--machine-type", required=True)
     parser.add_argument("--ssd-count", type=int, required=True)
     parser.add_argument("--ssd-gib", type=int, required=True)
-    parser.add_argument("--candidate-mode", choices=("ring", "cursor"), default="ring")
+    parser.add_argument("--candidate-mode", choices=("cursor",), default="cursor")
     return parser.parse_args(argv)
 
 

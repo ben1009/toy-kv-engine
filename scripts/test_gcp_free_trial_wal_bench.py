@@ -465,7 +465,7 @@ class PointProgressRingQualificationTests(unittest.TestCase):
 
     def test_environment_uses_supported_ordered_data_submit_mode(self) -> None:
         for ring_enabled, cursor_enabled, counters_enabled, mode in (
-            (False, False, None, "0"), (True, False, None, "1"), (True, True, False, "2"),
+            (False, False, None, "0"), (True, True, False, "2"),
         ):
             environment = progress_ring_runner._environment(ring_enabled, cursor_enabled, counters_enabled)
             self.assertEqual(environment["TOYKV_BENCH_V8_DATA_SUBMIT_ORDER"], "ordered")
@@ -474,17 +474,19 @@ class PointProgressRingQualificationTests(unittest.TestCase):
                 environment.get("TOYKV_BENCH_V8_PROGRESS_COUNTERS"),
                 "0" if counters_enabled is False else None,
             )
-        with self.assertRaisesRegex(ValueError, "requires progress-ring mode"):
+        with self.assertRaisesRegex(ValueError, r"only Eager \(0\) and Cursor \(2\)"):
             progress_ring_runner._environment(False, True)
+        with self.assertRaisesRegex(ValueError, r"only Eager \(0\) and Cursor \(2\)"):
+            progress_ring_runner._environment(True, False)
 
     def test_cursor_fixture_uses_mode_two_and_keeps_f05_verifier_separate(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             results = self._make_fixture(Path(temporary), cursor=True)
             schedule = build_point_progress_cursor_schedule(POINT_PROGRESS_RING_WRITERS)
-            self.assertEqual(len(schedule), 60)
+            self.assertEqual(len(schedule), 40)
             self.assertEqual(
                 {row["arm"] for row in schedule},
-                {"eager", "progress_ring", "cursor"},
+                {"eager", "cursor"},
             )
             self.assertTrue(progress_ring_runner.verify_cursor_results_directory(results)["verified"])
             self.assertFalse(progress_ring_runner.verify_results_directory(results)["verified"])
@@ -496,12 +498,12 @@ class PointProgressRingQualificationTests(unittest.TestCase):
             self.assertIn("TOYKV_BENCH_V8_PROGRESS_COUNTERS=0\n", environment)
             plan = json.loads((results / "benchmark-plan.json").read_text(encoding="utf-8"))
             self.assertEqual(plan["suite"], "v8-point-progress-cursor")
-            self.assertEqual(plan["arms"], ["eager", "progress_ring", "cursor"])
+            self.assertEqual(plan["arms"], ["eager", "cursor"])
             self.assertEqual(plan["arm_orders"], [list(order) for order in POINT_PROGRESS_CURSOR_ORDERS])
-            self.assertEqual(plan["runs_planned"], 60)
+            self.assertEqual(plan["runs_planned"], 40)
             self.assertEqual(
                 plan["runtime_protocol"],
-                "single 16-vCPU host; RAID0 over 2 Local SSDs; same source and binary for three arms",
+                "single 16-vCPU host; RAID0 over 2 Local SSDs; same source and binary for two arms",
             )
             self.assertEqual(plan["progress_cursor_ab"]["candidate_value"], "2")
             self.assertFalse(plan["progress_counters_enabled"])
@@ -563,40 +565,31 @@ class PointProgressRingQualificationTests(unittest.TestCase):
             "--ssh-source-range", "192.0.2.10/32",
             "--max-runtime-minutes", "60", "--estimated-hourly-cost-usd", "1.5",
             "--max-estimated-spend-usd", "2",
-            "--v8-point-progress-ring-ab", "--preflight-only",
+            "--v8-point-progress-cursor-ab", "--preflight-only",
         ]
         args = BENCH.parse_args(valid_args)
         self.assertEqual(args.writers, POINT_PROGRESS_RING_WRITERS)
         self.assertEqual(args.num, POINT_PROGRESS_RING_NUM)
         self.assertEqual(args.machine_type, "c4-standard-16-lssd")
-        cursor_args = BENCH.parse_args([
-            *[argument for argument in valid_args if argument != "--v8-point-progress-ring-ab"],
-            "--v8-point-progress-cursor-ab",
-        ])
-        self.assertEqual(cursor_args.writers, POINT_PROGRESS_RING_WRITERS)
-        self.assertEqual(cursor_args.num, POINT_PROGRESS_RING_NUM)
-        self.assertEqual(cursor_args.machine_type, "c4-standard-16-lssd")
+        with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
+            BENCH.parse_args([
+                *[argument for argument in valid_args if argument != "--v8-point-progress-cursor-ab"],
+                "--v8-point-progress-ring-ab", "--preflight-only",
+            ])
         stderr = StringIO()
         with redirect_stderr(stderr), self.assertRaises(SystemExit):
             BENCH.parse_args([*valid_args, "--writers", "16"])
         self.assertIn("requires writers (1, 8, 16)", stderr.getvalue())
 
-    def test_progress_ring_requires_isolated_network_subnet_and_ssh_cidr(self) -> None:
+    def test_retired_progress_ring_cli_mode_is_rejected(self) -> None:
         base = [
             "--project", "test-project", "--zone", "us-east1-b", "--commit", "a" * 40,
             "--max-runtime-minutes", "60", "--estimated-hourly-cost-usd", "1.5",
             "--max-estimated-spend-usd", "2",
             "--v8-point-progress-ring-ab", "--preflight-only",
         ]
-        invalid_arguments = (
-            base,
-            [*base, "--network", "default", "--subnet", "default", "--ssh-source-range", "192.0.2.10/32"],
-            [*base, "--network", "walbench-isolated", "--ssh-source-range", "192.0.2.10/32"],
-            [*base, "--network", "walbench-isolated", "--subnet", "walbench-subnet"],
-        )
-        for arguments in invalid_arguments:
-            with self.subTest(arguments=arguments), self.assertRaises(SystemExit):
-                BENCH.parse_args(arguments)
+        with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
+            BENCH.parse_args(base)
 
     def test_progress_cursor_requires_isolated_network_subnet_and_ssh_cidr(self) -> None:
         base = [
@@ -636,7 +629,7 @@ class PointProgressRingQualificationTests(unittest.TestCase):
                         "--network", "walbench-isolated", "--subnet", "walbench-subnet",
                         "--ssh-source-range", "192.0.2.10/32", "--skip-ssh-egress-check",
                         "--max-runtime-minutes", "60", "--estimated-hourly-cost-usd", "1.5",
-                        "--max-estimated-spend-usd", "2", "--v8-point-progress-ring-ab",
+                        "--max-estimated-spend-usd", "2", "--v8-point-progress-cursor-ab",
                         "--preflight-only", "--results-dir", str(results),
                     ])
                     self.assertEqual(status, 0)
@@ -861,7 +854,7 @@ class PointProgressRingQualificationTests(unittest.TestCase):
             seen_binary_paths.append(kwargs["binary"])
             kwargs["on_subprocess_started"]()
             raw = self._raw_record(row)
-            if row["arm"] == "progress_ring" and row["writer"] in (8, 16) and row["workload"] == "point":
+            if row["arm"] == "cursor" and row["writer"] in (8, 16) and row["workload"] == "point":
                 raw["result"]["ops_per_sec"] = 101_000.0
             return {
                 **row,
@@ -943,9 +936,9 @@ class PointProgressRingQualificationTests(unittest.TestCase):
             summary = json.loads((args.results_dir / "summary.json").read_text(encoding="utf-8"))
             self.assertEqual(plan["suite"], "v8-point-progress-cursor")
             self.assertEqual(summary["suite"], "v8-point-progress-cursor")
-            self.assertEqual(summary["arms"], ["eager", "progress_ring", "cursor"])
-            self.assertEqual(summary["runs_planned"], 60)
-            self.assertEqual(summary["runs_started"], 60)
+            self.assertEqual(summary["arms"], ["eager", "cursor"])
+            self.assertEqual(summary["runs_planned"], 40)
+            self.assertEqual(summary["runs_started"], 40)
             self.assertTrue(summary["complete"])
 
     def test_launch_count_does_not_include_deadline_rejected_attempt(self) -> None:
