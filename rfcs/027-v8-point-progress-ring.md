@@ -179,6 +179,9 @@ qualification run. F0.5 completed its 40-run GCP matrix, but Point8 and Point16
 failed the throughput promotion gates. The candidate is stopped and is not
 qualified for production promotion. See the
 [GCP qualification report](../docs/wal/benchmarks/rfc-027-v8-point-progress-ring-gcp-20261121.md).
+The subsequent [Cursor direct-completion comparison](../docs/wal/benchmarks/rfc-027-v8-cursor-direct-completion-gcp-20261122.md)
+improved Point1 and Point8, but missed the Point16 promotion threshold and
+does not change the production-default decision.
 
 ### Post-qualification source review
 

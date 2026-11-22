@@ -70,7 +70,8 @@ promotion gates. Cursor remains opt-in and is not the default: the latest
 qualification did not pass the throughput gate, and non-bench production-path
 qualification is still required. See the [Ring qualification](benchmarks/rfc-027-v8-point-progress-ring-gcp-20261121.md),
 [archived three-arm Cursor qualification](benchmarks/rfc-027-v8-point-progress-cursor-gcp-20261122.md),
-and [implementation plan](rfc-027-v8-point-progress-ring-implementation-plan.md).
+[Cursor direct-completion comparison](benchmarks/rfc-027-v8-cursor-direct-completion-gcp-20261122.md),
+and the [implementation plan](rfc-027-v8-point-progress-ring-implementation-plan.md).
 
 ## Implementation and adoption
 
@@ -265,6 +266,7 @@ experiments. Each report records its own outcome and measurement limits.
 - [RFC 026 V8 Point single-frame direct encoding GCP qualification — below throughput gate, 2026-11-18](experiments/rfc-026-point-direct-frame-v1-20261118.md)
 - [RFC 027 V8 Point Progress Ring GCP qualification — promotion gates failed, 2026-11-21](benchmarks/rfc-027-v8-point-progress-ring-gcp-20261121.md)
 - [RFC 027 V8 Point Progress Cursor GCP qualification — promotion gates failed, 2026-11-22](benchmarks/rfc-027-v8-point-progress-cursor-gcp-20261122.md)
+- [RFC 027 V8 Cursor direct-completion GCP qualification — Point16 gate failed, 2026-11-22](benchmarks/rfc-027-v8-cursor-direct-completion-gcp-20261122.md)
 - [RFC 026 V7/V8 Point admission and sync diagnostic — sequencer wait is real but not demonstrably saturated, 2026-11-19](experiments/rfc-026-v8-point-admission-sync-diagnostic-20261119.md)
 - [Deferred task work with native completion waiting](experiments/rfc-024-deferred-ring-wait-20261003.md)
 - [Extent preparation for large batches](experiments/rfc-024-large-batch-preallocation-20261004.md)
