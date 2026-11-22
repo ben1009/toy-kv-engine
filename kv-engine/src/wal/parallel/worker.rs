@@ -2045,6 +2045,52 @@ struct SlotState {
 struct GroupSlots {
     state: Mutex<SlotState>,
     available: Condvar,
+    #[cfg(test)]
+    limit: usize,
+}
+
+impl GroupSlots {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(SlotState {
+                active_groups: 0,
+                next_group_id: 0,
+                closed: false,
+            }),
+            available: Condvar::new(),
+            #[cfg(test)]
+            limit: MAX_INFLIGHT_GROUPS,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_limit(limit: usize) -> Self {
+        assert!(limit > 0, "WAL worker group-slot limit must be nonzero");
+        assert!(
+            limit <= MAX_INFLIGHT_GROUPS,
+            "WAL worker group-slot limit exceeds its core bound"
+        );
+        Self {
+            state: Mutex::new(SlotState {
+                active_groups: 0,
+                next_group_id: 0,
+                closed: false,
+            }),
+            available: Condvar::new(),
+            limit,
+        }
+    }
+
+    fn limit(&self) -> usize {
+        #[cfg(test)]
+        {
+            self.limit
+        }
+        #[cfg(not(test))]
+        {
+            MAX_INFLIGHT_GROUPS
+        }
+    }
 }
 
 struct GroupPermit {
@@ -2355,6 +2401,8 @@ impl<B: WorkerBuffer> IoWorker<B> {
             WorkerCompletionSender::Relay(completion_tx),
             Some(completion_rx),
             Some(failure_events),
+            #[cfg(test)]
+            None,
         )
     }
 
@@ -2378,6 +2426,33 @@ impl<B: WorkerBuffer> IoWorker<B> {
             },
             None,
             None,
+            #[cfg(test)]
+            None,
+        )
+    }
+
+    #[cfg(all(test, feature = "bench"))]
+    pub(crate) fn spawn_cursor_direct_completions_with_group_limit(
+        wal_file: Arc<File>,
+        buffer_pool: Arc<ArrayQueue<B>>,
+        async_write_min_bytes: Option<usize>,
+        allow_out_of_order_groups: bool,
+        completion_tx: Sender<DirectGroupWriteCompletion>,
+        completion_handle: WalV8WorkerCompletionHandle,
+        group_limit: usize,
+    ) -> Result<Self> {
+        Self::spawn_with_completion_sender(
+            wal_file,
+            buffer_pool,
+            async_write_min_bytes,
+            allow_out_of_order_groups,
+            WorkerCompletionSender::CursorDirect {
+                sender: completion_tx,
+                handle: completion_handle,
+            },
+            None,
+            None,
+            Some(group_limit),
         )
     }
 
@@ -2389,17 +2464,14 @@ impl<B: WorkerBuffer> IoWorker<B> {
         completion_sender: WorkerCompletionSender,
         completion_receiver: Option<Receiver<GroupWriteResult>>,
         failure_events: Option<Sender<GroupWriteResult>>,
+        #[cfg(test)] group_limit: Option<usize>,
     ) -> Result<Self> {
         let (command_tx, command_rx) = unbounded();
         let (startup_tx, startup_rx) = bounded::<Result<()>>(1);
-        let slots = Arc::new(GroupSlots {
-            state: Mutex::new(SlotState {
-                active_groups: 0,
-                next_group_id: 0,
-                closed: false,
-            }),
-            available: Condvar::new(),
-        });
+        #[cfg(test)]
+        let slots = Arc::new(group_limit.map_or_else(GroupSlots::new, GroupSlots::with_limit));
+        #[cfg(not(test))]
+        let slots = Arc::new(GroupSlots::new());
         let worker_slots = Arc::clone(&slots);
         let sync_progress = Arc::new(WalSyncProgress::default());
         let worker_sync_progress = Arc::clone(&sync_progress);
@@ -2561,6 +2633,21 @@ impl<B: WorkerBuffer> IoWorker<B> {
             .expect("WAL worker completions were transferred")
     }
 
+    #[cfg(test)]
+    pub(crate) fn active_group_count_for_test(&self) -> usize {
+        self.slots.state.lock().active_groups
+    }
+
+    #[cfg(test)]
+    pub(crate) fn group_slot_limit_for_test(&self) -> usize {
+        self.slots.limit()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn close_group_admission_for_test(&self) {
+        close_group_admission(&self.slots);
+    }
+
     pub(crate) fn close(mut self) -> Result<()> {
         self.shutdown_and_join()
     }
@@ -2631,7 +2718,7 @@ impl<B: WorkerBuffer> IoWorkerClient<B> {
             );
         }
         let mut state = self.slots.state.lock();
-        while state.active_groups >= MAX_INFLIGHT_GROUPS && !state.closed {
+        while state.active_groups >= self.slots.limit() && !state.closed {
             self.slots.available.wait(&mut state);
         }
         ensure!(!state.closed, "WAL I/O worker is closed");
@@ -2866,6 +2953,8 @@ fn run_worker_loop<B: WorkerBuffer>(
 
         if !ring_staged.is_empty() {
             flush_staged_writes(ring_staged, core, sync_progress, || ring.submit())?;
+            #[cfg(all(test, feature = "chaos-testing"))]
+            crate::chaos::failpoint::before_parallel_wal_completion_drain();
         }
 
         let completion_count = {
@@ -3310,10 +3399,11 @@ mod tests {
     use super::process_worker_events;
     use super::{
         DIRECT_IO_ALIGNMENT, DirectBuf, GroupId, GroupPermit, GroupSlots, GroupWriteResult,
-        IoWorker, RequestId, SlotState, WalSyncProgress, WorkerCommand, WorkerCompletionSender,
-        WorkerCore, WorkerError, WorkerEvent, WorkerWake, WriteBuffer, WriteGroup,
-        WriteGroupBuffers, close_group_admission, enqueue_group_command, fail_shutdown_reply,
-        flush_staged_writes, process_completions, retry_interrupted, wait_for_worker_progress,
+        IoWorker, MAX_INFLIGHT_GROUPS, RequestId, SlotState, WalSyncProgress, WorkerCommand,
+        WorkerCompletionSender, WorkerCore, WorkerError, WorkerEvent, WorkerWake, WriteBuffer,
+        WriteGroup, WriteGroupBuffers, close_group_admission, enqueue_group_command,
+        fail_shutdown_reply, flush_staged_writes, process_completions, retry_interrupted,
+        wait_for_worker_progress,
     };
     #[cfg(feature = "bench")]
     use crossbeam_channel::bounded;
@@ -3635,6 +3725,114 @@ mod tests {
     #[test]
     fn io_worker_forces_large_writes_async_beside_ordinary_small_writes() {
         check_io_worker_writes_groups(Some(64 * 1024));
+    }
+
+    #[cfg(all(feature = "chaos-testing", target_os = "linux"))]
+    #[test]
+    fn failpoint_relay_worker_reports_cqe_errors_and_closes_after_rejection() -> anyhow::Result<()>
+    {
+        use crate::chaos::failpoint::{
+            FailScenario, parallel_wal_injected_negative_cqe_count,
+            parallel_wal_injected_short_cqe_count, reset_parallel_wal_failure_test_counters,
+        };
+
+        for (failpoint, expected_error) in [
+            ("parallel_wal.negative_cqe", "io_uring write failed"),
+            ("parallel_wal.short_cqe", "short io_uring write"),
+        ] {
+            let _scenario = FailScenario::setup();
+            reset_parallel_wal_failure_test_counters();
+            fail::cfg(failpoint, "return").map_err(anyhow::Error::msg)?;
+
+            let parent =
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/wal-opt/worker-cqe-failures");
+            std::fs::create_dir_all(&parent)?;
+            let directory = tempfile::tempdir_in(parent)?;
+            let path = directory.path().join("wal");
+            File::create(&path)?.set_len((3 * DIRECT_IO_ALIGNMENT) as u64)?;
+            let file = File::options()
+                .read(true)
+                .write(true)
+                .custom_flags(libc::O_DIRECT)
+                .open(&path)?;
+            let buffer_pool = Arc::new(super::ArrayQueue::new(4));
+            let mut worker = match IoWorker::spawn(Arc::new(file), buffer_pool, None) {
+                Ok(worker) => worker,
+                Err(error) if io_uring_unavailable(&error) => {
+                    eprintln!("skipping test (io_uring unavailable): {error:#}");
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            };
+            let completions = worker.take_completions();
+
+            for ticket in 0..2_u64 {
+                let mut buffer = DirectBuf::new(DIRECT_IO_ALIGNMENT);
+                buffer.as_mut_slice().fill(0x40 + ticket as u8);
+                buffer.set_len(DIRECT_IO_ALIGNMENT);
+                let group = WriteGroup::new(
+                    ticket..ticket + 1,
+                    vec![WriteBuffer::new(
+                        buffer,
+                        ticket * DIRECT_IO_ALIGNMENT as u64,
+                        DIRECT_IO_ALIGNMENT,
+                    )],
+                )
+                .map_err(|error| anyhow::anyhow!("invalid test WAL group: {error:?}"))?;
+                worker.submit_group(group)?;
+            }
+
+            let mut results = Vec::with_capacity(2);
+            for _ in 0..2 {
+                results.push(
+                    completions
+                        .recv_timeout(Duration::from_secs(5))
+                        .map_err(anyhow::Error::msg)?,
+                );
+            }
+            results.sort_unstable_by_key(|result| result.tickets.start);
+            assert_eq!(results[0].tickets, 0..1);
+            assert_eq!(results[0].error, None);
+            assert_eq!(results[1].tickets, 1..2);
+            assert!(
+                results[1]
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.contains(expected_error)),
+                "unexpected ticket 1 completion: {:?}",
+                results[1]
+            );
+            assert_eq!(worker.active_group_count_for_test(), 0);
+            assert!(
+                worker
+                    .submit_group(
+                        WriteGroup::new(
+                            2..3,
+                            vec![WriteBuffer::new(
+                                DirectBuf::new(DIRECT_IO_ALIGNMENT),
+                                2 * DIRECT_IO_ALIGNMENT as u64,
+                                DIRECT_IO_ALIGNMENT,
+                            )],
+                        )
+                        .map_err(|error| {
+                            anyhow::anyhow!("invalid rejected test WAL group: {error:?}")
+                        })?
+                    )
+                    .is_err(),
+                "a poisoned Relay worker must reject later submissions"
+            );
+            worker.close()?;
+
+            if failpoint == "parallel_wal.negative_cqe" {
+                assert_eq!(parallel_wal_injected_negative_cqe_count(), 1);
+                assert_eq!(parallel_wal_injected_short_cqe_count(), 0);
+            } else {
+                assert_eq!(parallel_wal_injected_negative_cqe_count(), 0);
+                assert_eq!(parallel_wal_injected_short_cqe_count(), 1);
+            }
+        }
+
+        Ok(())
     }
 
     #[test]
@@ -4401,6 +4599,7 @@ mod tests {
                 closed: false,
             }),
             available: Condvar::new(),
+            limit: MAX_INFLIGHT_GROUPS,
         });
         close_group_admission(&slots);
         let permit = GroupPermit {
@@ -4548,14 +4747,7 @@ mod tests {
         let mut group_permits = std::collections::HashMap::new();
         let (completion_tx, completion_rx) = crossbeam_channel::unbounded();
         let completion_sender = WorkerCompletionSender::Relay(completion_tx);
-        let slots = GroupSlots {
-            state: Mutex::new(SlotState {
-                active_groups: 0,
-                next_group_id: 0,
-                closed: false,
-            }),
-            available: Condvar::new(),
-        };
+        let slots = GroupSlots::new();
         let sync_progress = WalSyncProgress::default();
         let io_event = sync_progress.begin_io_event();
 
@@ -4793,14 +4985,7 @@ mod tests {
 
             Ok(())
         });
-        let slots = Arc::new(GroupSlots {
-            state: Mutex::new(SlotState {
-                active_groups: 0,
-                next_group_id: 0,
-                closed: false,
-            }),
-            available: Condvar::new(),
-        });
+        let slots = Arc::new(GroupSlots::new());
         let (failure_events, completions) = crossbeam_channel::unbounded();
         let mut worker: IoWorker<DirectBuf> = IoWorker {
             commands: command_tx,
@@ -4819,14 +5004,7 @@ mod tests {
 
     #[cfg(feature = "bench")]
     fn direct_completion_slots() -> Arc<GroupSlots> {
-        Arc::new(GroupSlots {
-            state: Mutex::new(SlotState {
-                active_groups: 0,
-                next_group_id: 0,
-                closed: false,
-            }),
-            available: Condvar::new(),
-        })
+        Arc::new(GroupSlots::new())
     }
 
     #[cfg(feature = "bench")]

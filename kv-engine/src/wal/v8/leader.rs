@@ -2709,6 +2709,7 @@ impl WalV8ParallelIo {
         extent_preallocator: Option<Arc<WalV8ExtentPreallocator>>,
         #[cfg(feature = "bench")] extent_preparation: Option<Arc<WalV8SlidingExtentPreparation>>,
         direct_completion_enabled: bool,
+        #[cfg(test)] worker_group_limit: Option<usize>,
     ) -> Result<Arc<Self>> {
         ensure!(
             !direct_completion_enabled || coordinator.progress_cursor_enabled(),
@@ -2739,6 +2740,28 @@ impl WalV8ParallelIo {
             let capacity = coordinator.completion_queue_capacity();
             ensure!(capacity > 0, "v8 direct completion queue capacity is empty");
             let (sender, receiver) = crossbeam_channel::bounded(capacity);
+            #[cfg(test)]
+            let worker = if let Some(group_limit) = worker_group_limit {
+                IoWorker::spawn_cursor_direct_completions_with_group_limit(
+                    worker_file,
+                    buffer_pool,
+                    None,
+                    submit_any_ready_ticket,
+                    sender,
+                    coordinator.worker_completion_handle(),
+                    group_limit,
+                )?
+            } else {
+                IoWorker::spawn_cursor_direct_completions(
+                    worker_file,
+                    buffer_pool,
+                    None,
+                    submit_any_ready_ticket,
+                    sender,
+                    coordinator.worker_completion_handle(),
+                )?
+            };
+            #[cfg(not(test))]
             let worker = IoWorker::spawn_cursor_direct_completions(
                 worker_file,
                 buffer_pool,
@@ -4228,6 +4251,8 @@ impl WalV8LeaderWriter {
             worker_file,
             progress_mode,
             direct_completion_enabled,
+            #[cfg(test)]
+            None,
         )
     }
 
@@ -4236,6 +4261,7 @@ impl WalV8LeaderWriter {
         worker_file: File,
         progress_mode: WalV8ProgressMode,
         direct_completion_enabled: bool,
+        #[cfg(test)] worker_group_limit: Option<usize>,
     ) -> Result<WalV8ParallelWriter> {
         validate_positional_write_handle(&worker_file)
             .context("validate v8 WAL I/O worker handle")?;
@@ -4441,6 +4467,8 @@ impl WalV8LeaderWriter {
             #[cfg(feature = "bench")]
             extent_preparation,
             direct_completion_enabled,
+            #[cfg(test)]
+            worker_group_limit,
         )?;
         #[cfg(feature = "bench")]
         if let Some(profile) = profile {
@@ -6385,6 +6413,9 @@ fn write_aligned_once(file: &File, bytes: &[u8], offset: u64) -> io::Result<()> 
 }
 
 fn fdatasync_once(file: &File) -> io::Result<()> {
+    #[cfg(all(test, feature = "chaos-testing"))]
+    crate::chaos::failpoint::before_parallel_wal_fdatasync_call();
+
     #[cfg(feature = "chaos-testing")]
     crate::chaos::failpoint::fail_point!("wal.v8.leader.fdatasync", |_| Err(io::Error::other(
         "injected v8 WAL sync failure"
@@ -9575,6 +9606,7 @@ mod tests {
         path: &Path,
         installed: &WalV8InstalledRecovery,
         mode: WalV8ProgressMode,
+        worker_group_limit: Option<usize>,
     ) -> Result<WalV8ParallelWriter> {
         let worker_file = std::fs::OpenOptions::new()
             .read(true)
@@ -9585,6 +9617,7 @@ mod tests {
             worker_file,
             mode,
             true,
+            worker_group_limit,
         )
     }
 
@@ -9599,6 +9632,7 @@ mod tests {
             &path,
             &installed,
             WalV8ProgressMode::Cursor,
+            None,
         ) {
             Ok(writer) => writer,
             Err(error) if is_io_uring_unavailable_error(&error) => {
@@ -9641,8 +9675,12 @@ mod tests {
             [first_batch.clone(), second_batch.clone()]
         );
 
-        let reopened =
-            open_parallel_with_direct_completion(&path, &recovered, WalV8ProgressMode::Cursor)?;
+        let reopened = open_parallel_with_direct_completion(
+            &path,
+            &recovered,
+            WalV8ProgressMode::Cursor,
+            None,
+        )?;
         let third_batch = batch(30);
         reopened.append_prepared_batch(
             reopened.preflight_batch(&third_batch, LIVE_WAL_V5_LIMITS)?,
@@ -9664,6 +9702,264 @@ mod tests {
             replayed_batches(&path, &final_recovered)?,
             [first_batch, second_batch, third_batch]
         );
+
+        Ok(())
+    }
+
+    #[cfg(all(feature = "bench", feature = "chaos-testing"))]
+    #[test]
+    fn failpoint_cursor_direct_worker_failure_unblocks_sync_and_slot_waiters() -> Result<()> {
+        use std::sync::mpsc;
+
+        use crate::chaos::failpoint::{
+            FailScenario, arm_parallel_wal_completion_drain_gate, arm_parallel_wal_sync_gate,
+            parallel_wal_injected_negative_cqe_count, reset_parallel_wal_failure_test_counters,
+        };
+
+        const GROUP_LIMIT: usize = 8;
+        const TIMEOUT: Duration = Duration::from_secs(5);
+
+        let _scenario = FailScenario::setup();
+        reset_parallel_wal_failure_test_counters();
+
+        let directory = tempfile::tempdir()?;
+        let path = directory
+            .path()
+            .join("cursor-direct-completion-failure-v8.wal");
+        let wal_header = header();
+        let installed = install_empty(&path, wal_header)?;
+        let writer = match open_parallel_with_direct_completion(
+            &path,
+            &installed,
+            WalV8ProgressMode::Cursor,
+            Some(GROUP_LIMIT),
+        ) {
+            Ok(writer) => Arc::new(writer),
+            Err(error) if is_io_uring_unavailable_error(&error) => {
+                eprintln!("skipping test (io_uring unavailable): {error:#}");
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+
+        let first_batch = batch(10);
+        let first_job = writer.admit_prepared_batch(
+            writer.preflight_batch(&first_batch, LIVE_WAL_V5_LIMITS)?,
+            first_batch.commit_ts,
+            first_batch.recorded_at,
+        )?;
+        assert_eq!(first_job.assignment().segment_ticket, 0);
+
+        let later_batches: Vec<_> = (11..=19).map(batch).collect();
+        let mut later_jobs = later_batches
+            .iter()
+            .map(|input| {
+                writer.admit_prepared_batch(
+                    writer.preflight_batch(input, LIVE_WAL_V5_LIMITS)?,
+                    input.commit_ts,
+                    input.recorded_at,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        assert_eq!(later_jobs.len(), GROUP_LIMIT + 1);
+        let blocked_producer_job = later_jobs.pop().expect("ticket 9 job exists");
+
+        let sync_gate = arm_parallel_wal_sync_gate();
+
+        thread::scope(|scope| -> Result<()> {
+            let (first_tx, first_rx) = mpsc::channel();
+            let first_writer = Arc::clone(&writer);
+            let first_handle = scope.spawn(move || {
+                let finish = first_job
+                    .finish()
+                    .map(|_| ())
+                    .map_err(|error| format!("{error:#}"));
+                let durable = first_writer
+                    .wait_durable(0)
+                    .map_err(|error| format!("{error:#}"));
+                let _ = first_tx.send((finish, durable));
+            });
+
+            ensure!(
+                sync_gate.wait_until_entered(TIMEOUT),
+                "first durability driver did not reach fdatasync"
+            );
+
+            // Let ticket 0 reach its sync before pausing CQE draining. The
+            // worker must be free to publish its completion first; otherwise
+            // the durability driver cannot enter the frontier sync at all.
+            let completion_gate = arm_parallel_wal_completion_drain_gate();
+
+            for (index, job) in later_jobs.into_iter().enumerate() {
+                assert_eq!(job.assignment().segment_ticket, index as u64 + 1);
+                job.finish()?;
+                if index == 0 {
+                    ensure!(
+                        completion_gate.wait_until_entered(TIMEOUT),
+                        "worker did not pause with a DATA SQE awaiting CQE processing"
+                    );
+                }
+            }
+
+            let active_groups = writer
+                .io
+                .worker
+                .lock()
+                .as_ref()
+                .context("direct completion worker was already removed")?
+                .active_group_count_for_test();
+            assert_eq!(
+                active_groups, GROUP_LIMIT,
+                "the test must fill every Worker GroupSlot before blocking the next producer"
+            );
+
+            let (waiter_started_tx, waiter_started_rx) = mpsc::channel();
+            let (waiter_result_tx, waiter_result_rx) = mpsc::channel();
+            for ticket in 1..=GROUP_LIMIT as u64 {
+                let waiter_writer = Arc::clone(&writer);
+                let started = waiter_started_tx.clone();
+                let results = waiter_result_tx.clone();
+                scope.spawn(move || {
+                    let _ = started.send(ticket);
+                    let result = waiter_writer
+                        .wait_durable(ticket)
+                        .map_err(|error| format!("{error:#}"));
+                    let _ = results.send((ticket, result));
+                });
+            }
+            drop(waiter_started_tx);
+            drop(waiter_result_tx);
+            for _ in 1..=GROUP_LIMIT {
+                waiter_started_rx
+                    .recv_timeout(TIMEOUT)
+                    .context("durability waiter did not start")?;
+            }
+
+            let (producer_started_tx, producer_started_rx) = mpsc::channel();
+            let (producer_result_tx, producer_result_rx) = mpsc::channel();
+            let producer_handle = scope.spawn(move || {
+                let _ = producer_started_tx.send(());
+                let result = blocked_producer_job
+                    .finish()
+                    .map(|_| ())
+                    .map_err(|error| format!("{error:#}"));
+                let _ = producer_result_tx.send(result);
+            });
+            producer_started_rx
+                .recv_timeout(TIMEOUT)
+                .context("blocked producer did not start")?;
+            assert!(
+                matches!(
+                    producer_result_rx.recv_timeout(Duration::from_millis(50)),
+                    Err(mpsc::RecvTimeoutError::Timeout)
+                ),
+                "producer should wait while all worker group slots are occupied"
+            );
+
+            fail::cfg("parallel_wal.negative_cqe", "return").map_err(anyhow::Error::msg)?;
+            completion_gate.release();
+
+            let poison_deadline = Instant::now() + TIMEOUT;
+            while !writer.is_poisoned() && Instant::now() < poison_deadline {
+                thread::sleep(Duration::from_millis(1));
+            }
+            ensure!(
+                writer.is_poisoned(),
+                "direct worker failure did not poison the V8 coordinator"
+            );
+            assert_eq!(parallel_wal_injected_negative_cqe_count(), 1);
+
+            // Unblock the driver only after the worker has failed, so the
+            // test exercises failure while it is parked at the FRONTIER sync
+            // call, before that ticket can be acknowledged.
+            sync_gate.release();
+            let (first_finish, first_durable) = first_rx
+                .recv_timeout(TIMEOUT)
+                .context("first producer or durability driver did not unblock")?;
+            first_handle
+                .join()
+                .map_err(|_| anyhow::anyhow!("first producer panicked"))?;
+            assert!(
+                first_finish.is_ok(),
+                "first DATA job failed: {first_finish:?}"
+            );
+            assert!(
+                first_durable.is_err(),
+                "ticket 0 must not be acknowledged after the coordinator is poisoned"
+            );
+
+            let mut waiter_results = Vec::with_capacity(GROUP_LIMIT);
+            for _ in 1..=GROUP_LIMIT {
+                waiter_results.push(
+                    waiter_result_rx
+                        .recv_timeout(TIMEOUT)
+                        .context("durability waiter remained blocked after worker failure")?,
+                );
+            }
+            for (ticket, result) in waiter_results {
+                assert!(
+                    result.is_err(),
+                    "ticket {ticket} received an invalid durability ACK"
+                );
+            }
+
+            let blocked_producer = producer_result_rx
+                .recv_timeout(TIMEOUT)
+                .context("GroupSlots waiter remained blocked after worker failure")?;
+            assert!(
+                blocked_producer.is_err(),
+                "blocked producer was admitted after worker failure"
+            );
+            producer_handle
+                .join()
+                .map_err(|_| anyhow::anyhow!("blocked producer panicked"))?;
+
+            assert!(writer.is_poisoned());
+            assert_eq!(
+                writer.coordinator.durable_ticket_end(),
+                0,
+                "a ticket was acknowledged after the worker failure poisoned the coordinator"
+            );
+
+            let worker = writer
+                .io
+                .worker
+                .lock()
+                .take()
+                .context("direct completion worker was already removed")?;
+            // Joining a failed or stopped worker must complete after it has
+            // closed GroupSlots and released permits for queued commands.
+            let _ = worker.close();
+            assert_eq!(
+                writer.coordinator.durable_ticket_end(),
+                0,
+                "a FRONTIER prefix must not advance after the worker failure poisoned the coordinator"
+            );
+
+            Ok(())
+        })?;
+
+        let durable_boundary = writer.active_boundaries()?.1;
+        assert_eq!(durable_boundary.ticket_end, 0);
+        drop(writer);
+        let recovered = super::super::install::recover_and_install_active(
+            &path,
+            &[durable_boundary],
+            wal_header.predecessor,
+            LIVE_WAL_V5_LIMITS,
+            MAX_WAL_FILE_SIZE,
+        )?;
+        let replayed = replayed_batches(&path, &recovered)?;
+        assert!(
+            replayed.len() <= 1,
+            "recovery accepted DATA beyond the FRONTIER sync that was in progress"
+        );
+        if let Some(replayed_batch) = replayed.first() {
+            // The failure is injected before the fdatasync syscall. Once the
+            // gate is released, ticket 0's sync may reach disk even though
+            // poison prevents the caller from receiving an ACK.
+            assert_eq!(replayed_batch, &first_batch);
+        }
 
         Ok(())
     }
