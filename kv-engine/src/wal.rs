@@ -164,6 +164,9 @@ pub struct WalIoDiagnostics {
     pub progress_cursor_enabled: bool,
     /// Whether Cursor DATA completions bypass the benchmark-only reaper relay.
     pub cursor_direct_completion_enabled: bool,
+    /// Whether Cursor DATA submissions use the benchmark-only allocation-free group
+    /// representation.
+    pub cursor_singleton_submission_enabled: bool,
     pub progress_diagnostics: Option<WalV8ProgressDiagnostics>,
 }
 

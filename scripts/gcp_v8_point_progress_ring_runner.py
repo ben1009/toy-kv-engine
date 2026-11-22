@@ -20,6 +20,7 @@ from typing import Any, Callable
 
 from gcp_wal_matrix import (
     CURSOR_DIRECT_COMPLETION_PLAN_SCHEMA_V1,
+    CURSOR_SINGLETON_SUBMISSION_PLAN_SCHEMA_V1,
     POINT_LOOKAHEAD_WINDOW_BYTES,
     POINT_PROGRESS_PLAN_SCHEMA_V1,
     POINT_PROGRESS_PLAN_SCHEMA_V2,
@@ -28,6 +29,8 @@ from gcp_wal_matrix import (
     POINT_PROGRESS_RING_WRITERS,
     build_cursor_direct_completion_plan,
     build_cursor_direct_completion_schedule,
+    build_cursor_singleton_submission_plan,
+    build_cursor_singleton_submission_schedule,
     build_point_progress_cursor_v2_plan,
     build_point_progress_cursor_v2_schedule,
     build_point_progress_cursor_plan,
@@ -38,6 +41,7 @@ from gcp_wal_matrix import (
     validate_point_progress_cursor_v2_rows,
     validate_point_progress_ring_rows,
     validate_cursor_direct_completion_rows,
+    validate_cursor_singleton_submission_rows,
 )
 
 RUN_TIMEOUT_SECONDS = 300
@@ -91,6 +95,8 @@ def _summary_fields(schedule: list[dict[str, Any]]) -> tuple[str, ...]:
         fields += ("progress_cursor_start", "progress_cursor_end")
     if any("cursor_direct_completion_enabled" in row for row in schedule):
         fields += ("cursor_direct_completion_start", "cursor_direct_completion_end")
+    if any("cursor_singleton_submission_enabled" in row for row in schedule):
+        fields += ("cursor_singleton_submission_start", "cursor_singleton_submission_end")
     return fields
 
 
@@ -99,6 +105,7 @@ def _environment(
     progress_cursor_enabled: bool = False,
     progress_counters_enabled: bool | None = None,
     cursor_direct_completion_enabled: bool | None = None,
+    cursor_singleton_submission_enabled: bool | None = None,
 ) -> dict[str, str]:
     # An allowlist makes the candidate switch the only inherited experiment variable.
     if progress_ring_enabled is not progress_cursor_enabled:
@@ -118,6 +125,10 @@ def _environment(
         environment["TOYKV_BENCH_V8_CURSOR_DIRECT_COMPLETION"] = (
             "1" if cursor_direct_completion_enabled else "0"
         )
+    if cursor_singleton_submission_enabled is not None:
+        environment["TOYKV_BENCH_V8_CURSOR_SINGLETON_SUBMISSION"] = (
+            "1" if cursor_singleton_submission_enabled else "0"
+        )
     return environment
 
 
@@ -126,6 +137,7 @@ def _expected_environment_text(
     progress_cursor_enabled: bool = False,
     progress_counters_enabled: bool | None = None,
     cursor_direct_completion_enabled: bool | None = None,
+    cursor_singleton_submission_enabled: bool | None = None,
 ) -> str:
     if progress_ring_enabled and not progress_cursor_enabled:
         # Historical F0.5 archives used the now-retired mode 1. Keep their
@@ -139,7 +151,7 @@ def _expected_environment_text(
     controlled = {
         key: value for key, value in _environment(
             progress_ring_enabled, progress_cursor_enabled, progress_counters_enabled,
-            cursor_direct_completion_enabled,
+            cursor_direct_completion_enabled, cursor_singleton_submission_enabled,
         ).items()
         if key not in ("PATH", "HOME", "TMPDIR", "LC_ALL")
     }
@@ -185,6 +197,10 @@ def _validate_record(record: dict[str, Any], row: dict[str, Any]) -> dict[str, A
             "cursor_direct_completion_enabled", False
         ) is not bool(row["cursor_direct_completion_enabled"]):
             raise ValueError(f"{boundary} direct-completion mode differs from the planned arm")
+        if "cursor_singleton_submission_enabled" in row and snapshot.get(
+            "cursor_singleton_submission_enabled", False
+        ) is not bool(row["cursor_singleton_submission_enabled"]):
+            raise ValueError(f"{boundary} singleton-submission mode differs from the planned arm")
         if snapshot.get("progress_diagnostics") is not None:
             raise ValueError(f"{boundary} progress diagnostics must be disabled for scored runs")
         preparation = _require_object(
@@ -294,6 +310,13 @@ def _validate_record(record: dict[str, Any], row: dict[str, Any]) -> dict[str, A
         metrics["cursor_direct_completion_end"] = pipeline["wal_io_end"][
             "cursor_direct_completion_enabled"
         ]
+    if "cursor_singleton_submission_enabled" in row:
+        metrics["cursor_singleton_submission_start"] = pipeline["wal_io_start"][
+            "cursor_singleton_submission_enabled"
+        ]
+        metrics["cursor_singleton_submission_end"] = pipeline["wal_io_end"][
+            "cursor_singleton_submission_enabled"
+        ]
     return metrics
 
 
@@ -320,6 +343,7 @@ def _run_one(
         bool(row.get("progress_cursor_enabled", False)),
         row.get("progress_counters_enabled"),
         row.get("cursor_direct_completion_enabled"),
+        row.get("cursor_singleton_submission_enabled"),
     )
     (run_dir / "command.sh").write_text(shlex.join(command) + "\n", encoding="utf-8")
     (run_dir / "environment.txt").write_text(
@@ -328,6 +352,7 @@ def _run_one(
             bool(row.get("progress_cursor_enabled", False)),
             row.get("progress_counters_enabled"),
             row.get("cursor_direct_completion_enabled"),
+            row.get("cursor_singleton_submission_enabled"),
         ), encoding="utf-8",
     )
     (run_dir / "start_utc.txt").write_text(datetime.now(timezone.utc).isoformat() + "\n", encoding="utf-8")
@@ -634,6 +659,107 @@ def _direct_completion_summary(
     }
 
 
+def _singleton_submission_summary(
+    rows: list[dict[str, Any]], writers: tuple[int, ...], planned: int,
+) -> dict[str, Any]:
+    validation = validate_cursor_singleton_submission_rows(rows, writers)
+    cells = [(writer, "point") for writer in writers] + [(16, "batch64")]
+    metrics = (
+        "puts_per_second", "cpu_us_per_put", "p50_ms", "p95_ms", "p99_ms", "sync_count",
+        "puts_per_sync", "ordered_link_hash_cpu_ns",
+    )
+    comparisons: list[dict[str, Any]] = []
+    for writer, workload in cells:
+        arms = {
+            arm: [row for row in rows if row.get("writer") == writer and row.get("workload") == workload
+                  and row.get("arm") == arm and row.get("exit_code") == 0]
+            for arm in ("cursor_control", "cursor_singleton")
+        }
+        stats = {
+            arm: {
+                "runs": len(arm_rows),
+                **{
+                    metric: median(float(row[metric]) for row in arm_rows)
+                    if arm_rows and all(row.get(metric) is not None for row in arm_rows) else None
+                    for metric in metrics
+                },
+            }
+            for arm, arm_rows in arms.items()
+        }
+        changes: list[float] = []
+        p99_changes: list[float] = []
+        for repetition in range(1, 6):
+            pair = {
+                arm: next((row for row in rows if row.get("writer") == writer
+                           and row.get("workload") == workload and row.get("repetition") == repetition
+                           and row.get("arm") == arm and row.get("exit_code") == 0), None)
+                for arm in ("cursor_control", "cursor_singleton")
+            }
+            baseline, candidate = pair["cursor_control"], pair["cursor_singleton"]
+            if baseline and candidate and baseline["puts_per_second"] > 0:
+                changes.append((candidate["puts_per_second"] / baseline["puts_per_second"] - 1) * 100)
+                if workload == "point":
+                    p99_changes.append((candidate["p99_ms"] / baseline["p99_ms"] - 1) * 100)
+        baseline_median = stats["cursor_control"]["puts_per_second"]
+        candidate_median = stats["cursor_singleton"]["puts_per_second"]
+        comparisons.append({
+            "writer": writer,
+            "workload": workload,
+            "cursor_control": stats["cursor_control"],
+            "cursor_singleton": stats["cursor_singleton"],
+            "paired_throughput_changes_pct": changes,
+            "paired_throughput_change_median_pct": median(changes) if changes else None,
+            "candidate_pair_wins": sum(value > 0 for value in changes),
+            "paired_p99_changes_pct": p99_changes,
+            "paired_p99_change_median_pct": median(p99_changes) if p99_changes else None,
+            "median_throughput_change_pct": (
+                (candidate_median / baseline_median - 1) * 100
+                if baseline_median and candidate_median else None
+            ),
+        })
+    by_cell = {f"w{row['writer']}-{row['workload']}": row for row in comparisons}
+    point_gates = [
+        bool(by_cell[f"w{writer}-point"]["paired_throughput_changes_pct"])
+        and by_cell[f"w{writer}-point"]["paired_throughput_change_median_pct"] >= 5
+        and by_cell[f"w{writer}-point"]["candidate_pair_wins"] >= 4
+        for writer in (8, 16)
+    ]
+    p99_gates = [
+        bool(by_cell[f"w{writer}-point"]["paired_p99_changes_pct"])
+        and by_cell[f"w{writer}-point"]["paired_p99_change_median_pct"] <= 5
+        for writer in (8, 16)
+    ]
+    point1 = by_cell["w1-point"]["paired_throughput_changes_pct"]
+    batch64 = by_cell["w16-batch64"]["paired_throughput_changes_pct"]
+    guardrails = bool(point1) and median(point1) >= -2 and bool(batch64) and median(batch64) >= -2
+    return {
+        "suite": "v8-cursor-singleton-submission",
+        "complete": len(rows) == planned and validation["complete"],
+        "runs_started": len(rows),
+        "runs_completed": sum(row.get("exit_code") == 0 for row in rows),
+        "runs_planned": planned,
+        "writers": list(writers),
+        "workloads": ["point", "batch64"],
+        "arms": ["cursor_control", "cursor_singleton"],
+        "results": rows,
+        "matrix_validation": validation,
+        "comparison": comparisons,
+        "comparison_by_cell": by_cell,
+        "qualification_gates": {
+            "point8_and_point16_each_gain_at_least_5pct_and_win_4_of_5": all(point_gates),
+            "point8_and_point16_p99_regression_at_most_5pct": all(p99_gates),
+            "point1_and_batch64_paired_median_regression_at_most_2pct": guardrails,
+            "candidate_qualified": bool(validation["complete"] and all(point_gates)
+                                        and all(p99_gates) and guardrails),
+        },
+        "qualification_note": (
+            "Same-host, same-source, same-release-binary Cursor-only comparison. Both arms keep the completion "
+            "relay and all other runtime settings fixed; only singleton DATA group representation differs. "
+            "Scored runs disable detailed diagnostics. This experiment does not change production defaults."
+        ),
+    }
+
+
 def _cursor_v2_summary(rows: list[dict[str, Any]], writers: tuple[int, ...], planned: int) -> dict[str, Any]:
     """Recompute the archived three-arm summary used by plan schema V2."""
     eager_ring_rows = [row for row in rows if row.get("arm") != "cursor"]
@@ -772,8 +898,19 @@ def run_suite(args: argparse.Namespace) -> int:
         )
         schedule_filename = "cursor-direct-completion-schedule.tsv"
         summarize = _direct_completion_summary
+    elif candidate_mode == "singleton-submission":
+        schedule = build_cursor_singleton_submission_schedule(writers)
+        plan = build_cursor_singleton_submission_plan(
+            writers=writers,
+            machine_type=args.machine_type,
+            machine_spec={"vcpus": 16, "ssd_count": args.ssd_count, "ssd_gib": args.ssd_gib},
+            commit=args.commit,
+            binary_sha256=args.binary_sha256,
+        )
+        schedule_filename = "cursor-singleton-submission-schedule.tsv"
+        summarize = _singleton_submission_summary
     else:
-        raise ValueError("candidate mode must be Cursor or Cursor direct completion")
+        raise ValueError("candidate mode must be Cursor, Cursor direct completion, or Cursor singleton submission")
     (results_dir / "benchmark-plan.json").write_text(json.dumps(plan, indent=2) + "\n", encoding="utf-8")
     (results_dir / "commit.txt").write_text(args.commit + "\n", encoding="utf-8")
     (results_dir / "write-perf.sha256").write_text(args.binary_sha256 + "\n", encoding="utf-8")
@@ -1268,6 +1405,130 @@ def verify_direct_completion_results_directory(results: Path) -> dict[str, Any]:
         return {"verified": False, "errors": [str(error)]}
 
 
+def verify_singleton_submission_results_directory(results: Path) -> dict[str, Any]:
+    """Strictly verify the Cursor singleton-submission experiment archive."""
+    errors: list[str] = []
+    try:
+        summary = json.loads((results / "summary.json").read_text(encoding="utf-8"))
+        remote_exit = json.loads((results / "remote-exit.json").read_text(encoding="utf-8"))
+        plan = json.loads((results / "benchmark-plan.json").read_text(encoding="utf-8"))
+        commit = (results / "commit.txt").read_text(encoding="utf-8").strip()
+        binary_sha = (results / "write-perf.sha256").read_text(encoding="utf-8").strip()
+        if not all(isinstance(value, dict) for value in (summary, remote_exit, plan)):
+            raise ValueError("summary, remote-exit, and plan must be JSON objects")
+        writers = tuple(plan.get("writers", ()))
+        schedule = build_cursor_singleton_submission_schedule(writers)
+        expected_plan = build_cursor_singleton_submission_plan(
+            writers=writers,
+            machine_type="c4-standard-16-lssd",
+            machine_spec={"vcpus": 16, "ssd_count": 2, "ssd_gib": 750},
+            commit=commit,
+            binary_sha256=binary_sha,
+        )
+        if plan != expected_plan:
+            errors.append("benchmark plan differs from the fixed singleton-submission suite")
+        if len(commit) != 40 or any(char not in "0123456789abcdef" for char in commit):
+            errors.append("source commit identity is invalid")
+        if len(binary_sha) != 64 or any(char not in "0123456789abcdef" for char in binary_sha):
+            errors.append("binary checksum is invalid")
+        if (
+            summary.get("suite") != "v8-cursor-singleton-submission"
+            or summary.get("source_commit") != commit
+            or summary.get("binary_sha256") != binary_sha
+            or summary.get("complete") is not True
+            or summary.get("runs_started") != len(schedule)
+            or summary.get("runs_attempted") != len(schedule)
+            or summary.get("runs_completed") != len(schedule)
+            or summary.get("runs_planned") != len(schedule)
+        ):
+            errors.append("summary metadata or run counts are incomplete")
+        if (
+            remote_exit.get("failed") is not False
+            or remote_exit.get("runs_started") != len(schedule)
+            or remote_exit.get("runs_attempted") != len(schedule)
+        ):
+            errors.append("remote-exit does not confirm all planned runs")
+        with (results / "cursor-singleton-submission-schedule.tsv").open(
+            encoding="utf-8", newline="",
+        ) as stream:
+            actual_schedule = list(csv.DictReader(stream, delimiter="\t"))
+        expected_schedule = [
+            {key: ("none" if key == "batch_size" and value is None else "" if value is None else str(value))
+             for key, value in row.items()}
+            for row in schedule
+        ]
+        if actual_schedule != expected_schedule:
+            errors.append("schedule file differs from the planned run order/configuration")
+        rows = summary.get("results")
+        if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+            raise ValueError("summary results are missing or malformed")
+        validation = validate_cursor_singleton_submission_rows(rows, writers)
+        if validation["complete"] is not True:
+            errors.append("run rows do not match the singleton-submission matrix")
+        recomputed = _singleton_submission_summary(rows, writers, len(schedule))
+        for key in (
+            "suite", "complete", "runs_started", "runs_completed", "runs_planned", "writers", "workloads",
+            "arms", "matrix_validation", "comparison", "comparison_by_cell", "qualification_gates",
+        ):
+            if summary.get(key) != recomputed.get(key):
+                errors.append(f"summary field {key} differs from the archived rows")
+        expected_ids = {_run_id(row) for row in schedule}
+        actual_ids = {path.name for path in results.iterdir()
+                      if path.is_dir() and path.name.startswith(("r", "w"))}
+        if actual_ids != expected_ids:
+            errors.append("run directories do not exactly match the schedule")
+        rows_by_id = {_run_id(row): row for row in rows}
+        for row in schedule:
+            run_id = _run_id(row)
+            run_dir = results / run_id
+            result_path, metadata_path = run_dir / "result.json", run_dir / "run-metadata.json"
+            if not result_path.is_file() or not metadata_path.is_file():
+                errors.append(f"{run_id} is missing its result or metadata")
+                continue
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            if metadata != rows_by_id.get(run_id):
+                errors.append(f"{run_id} metadata differs from the summary row")
+            identity = {**row, "source_commit": commit, "binary_sha256": binary_sha}
+            if any(metadata.get(key) != value for key, value in identity.items()):
+                errors.append(f"{run_id} metadata identity differs from the schedule")
+            expected_environment = _expected_environment_text(
+                True,
+                True,
+                False,
+                False,
+                bool(row["cursor_singleton_submission_enabled"]),
+            )
+            environment_path = run_dir / "environment.txt"
+            if not environment_path.is_file() or environment_path.read_text(encoding="utf-8") != expected_environment:
+                errors.append(f"{run_id} environment differs from the planned arm")
+            try:
+                raw = json.loads(result_path.read_text(encoding="utf-8"))
+                expected_metrics = _validate_record(raw, row)
+                if any(metadata.get(key) != value for key, value in expected_metrics.items()):
+                    errors.append(f"{run_id} metrics differ from raw result")
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+                errors.append(f"{run_id} raw result is invalid: {error}")
+        summary_tsv_path = results / "summary.tsv"
+        if not summary_tsv_path.is_file():
+            errors.append("summary.tsv is missing")
+        else:
+            with summary_tsv_path.open(encoding="utf-8", newline="") as stream:
+                summary_tsv = list(csv.DictReader(stream, delimiter="\t"))
+            expected_tsv = []
+            for row in schedule:
+                metadata = rows_by_id.get(_run_id(row), {})
+                expected_tsv.append({
+                    key: json.dumps(metadata[key], sort_keys=True) if isinstance(metadata.get(key), dict)
+                    else "" if metadata.get(key) is None else str(metadata.get(key))
+                    for key in _summary_fields(schedule)
+                })
+            if summary_tsv != expected_tsv:
+                errors.append("summary.tsv rows differ from run metadata")
+        return {"verified": not errors, "planned": len(schedule), "observed": len(rows), "errors": errors}
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+        return {"verified": False, "errors": [str(error)]}
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, required=True)
@@ -1280,7 +1541,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--machine-type", required=True)
     parser.add_argument("--ssd-count", type=int, required=True)
     parser.add_argument("--ssd-gib", type=int, required=True)
-    parser.add_argument("--candidate-mode", choices=("cursor", "direct-completion"), default="cursor")
+    parser.add_argument(
+        "--candidate-mode",
+        choices=("cursor", "direct-completion", "singleton-submission"),
+        default="cursor",
+    )
     return parser.parse_args(argv)
 
 
