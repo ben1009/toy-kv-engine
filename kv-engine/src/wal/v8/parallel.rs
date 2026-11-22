@@ -3425,17 +3425,16 @@ fn cursor_frontier_snapshot_locked(
             frame_buffer_bytes: entry.plan.frame_buffer_bytes,
         })
     };
-    Ok(WalV8FrontierReadySnapshot {
-        ready_prefix: WalV8ReadyPrefix::Cursor {
-            ticket_count,
-            tail,
-            #[cfg(feature = "bench")]
-            data_bytes: cursor.data_bytes,
-        },
-        admitted_ticket_count: state.tickets.len(),
-        closed: state.closed,
-        ..empty_frontier_ready_snapshot()
-    })
+    let mut snapshot = empty_frontier_ready_snapshot();
+    snapshot.ready_prefix = WalV8ReadyPrefix::Cursor {
+        ticket_count,
+        tail,
+        #[cfg(feature = "bench")]
+        data_bytes: cursor.data_bytes,
+    };
+    snapshot.admitted_ticket_count = state.tickets.len();
+    snapshot.closed = state.closed;
+    Ok(snapshot)
 }
 
 fn ready_cursor_index(state: &CoordinatorState, cursor: WalV8ReadyCursor) -> Result<usize> {
