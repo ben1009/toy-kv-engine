@@ -83,11 +83,22 @@ POINT_DIRECT_FRAME_ORDERS = (
 POINT_PROGRESS_RING_WRITERS = (1, 8, 16)
 POINT_PROGRESS_RING_REPETITIONS = 5
 POINT_PROGRESS_RING_NUM = 100_000
+POINT_PROGRESS_PLAN_SCHEMA_V1 = 1
+POINT_PROGRESS_PLAN_SCHEMA_V2 = 2
+POINT_PROGRESS_PLAN_SCHEMA_V3 = 3
 POINT_PROGRESS_RING_ARMS = ("eager", "progress_ring")
 POINT_PROGRESS_CURSOR_ARMS = ("eager", "cursor")
+POINT_PROGRESS_CURSOR_V2_ARMS = ("eager", "progress_ring", "cursor")
 POINT_PROGRESS_RING_ORDERS = (
     ("eager", "progress_ring"),
     ("progress_ring", "eager"),
+)
+POINT_PROGRESS_CURSOR_V2_ORDERS = (
+    ("eager", "progress_ring", "cursor"),
+    ("progress_ring", "cursor", "eager"),
+    ("cursor", "eager", "progress_ring"),
+    ("eager", "cursor", "progress_ring"),
+    ("cursor", "progress_ring", "eager"),
 )
 POINT_PROGRESS_CURSOR_ORDERS = tuple(
     tuple("cursor" if arm == "progress_ring" else arm for arm in order)
@@ -549,6 +560,39 @@ def build_point_progress_cursor_schedule(writers: Iterable[int]) -> list[dict[st
     return schedule
 
 
+def build_point_progress_cursor_v2_schedule(writers: Iterable[int]) -> list[dict[str, object]]:
+    """Build the historical Eager/Ring/Cursor schedule for archived V2 plans."""
+    writer_counts = validate_writer_counts(writers)
+    if writer_counts != POINT_PROGRESS_RING_WRITERS:
+        raise ValueError(f"historical progress-cursor qualification requires writers {POINT_PROGRESS_RING_WRITERS}")
+
+    schedule: list[dict[str, object]] = []
+    for writer, workload, bench, batch_entries, batch_size, sample_every in POINT_PROGRESS_RING_CELLS:
+        for repetition in range(1, POINT_PROGRESS_RING_REPETITIONS + 1):
+            order = POINT_PROGRESS_CURSOR_V2_ORDERS[(repetition - 1) % len(POINT_PROGRESS_CURSOR_V2_ORDERS)]
+            for arm in order:
+                schedule.append({
+                    "run_index": len(schedule) + 1,
+                    "writer": writer,
+                    "workload": workload,
+                    "repetition": repetition,
+                    "arm": arm,
+                    "bench": bench,
+                    "batch_entries": batch_entries,
+                    "batch_size": batch_size,
+                    "num": POINT_PROGRESS_RING_NUM,
+                    "sample_every": sample_every,
+                    "extent_mode": "sliding-point-lookahead",
+                    "extent_window_bytes": POINT_LOOKAHEAD_WINDOW_BYTES,
+                    "frontier_mode": "direct",
+                    "scan_diagnostics_enabled": False,
+                    "progress_ring_enabled": arm != "eager",
+                    "progress_cursor_enabled": arm == "cursor",
+                    "progress_counters_enabled": False,
+                })
+    return schedule
+
+
 def build_point_progress_ring_plan(
     *, writers: Iterable[int], machine_type: str, machine_spec: Mapping[str, int],
     commit: str, binary_sha256: str | None = None,
@@ -559,6 +603,7 @@ def build_point_progress_ring_plan(
     ssd_count = int(machine_spec["ssd_count"])
     layout = "single Local SSD" if ssd_count == 1 else f"RAID0 over {ssd_count} Local SSDs"
     plan: dict[str, object] = {
+        "plan_schema_version": POINT_PROGRESS_PLAN_SCHEMA_V1,
         "suite": "v8-point-progress-ring",
         "writers": list(writer_counts),
         "workloads": [
@@ -632,6 +677,7 @@ def build_point_progress_cursor_plan(
     )
     plan.pop("progress_ring_ab")
     plan.update({
+        "plan_schema_version": POINT_PROGRESS_PLAN_SCHEMA_V3,
         "suite": "v8-point-progress-cursor",
         "arms": list(POINT_PROGRESS_CURSOR_ARMS),
         "arm_orders": [list(order) for order in POINT_PROGRESS_CURSOR_ORDERS],
@@ -652,6 +698,53 @@ def build_point_progress_cursor_plan(
             "Direct FRONTIER, dynamic coalescing, 1 MiB Point lookahead, and existing digest sampling. Point latency "
             "is sampled every 10 completed puts; Batch64 is throughput-only. The historical F0.5 Ring "
             "plan and verifier remain available for archived results. Production defaults remain Eager."
+        ),
+    })
+    return plan
+
+
+def build_point_progress_cursor_v2_plan(
+    *, writers: Iterable[int], machine_type: str, machine_spec: Mapping[str, int],
+    commit: str, binary_sha256: str | None = None,
+) -> dict[str, object]:
+    """Build the historical three-arm plan used by 60-run Cursor archives."""
+    writer_counts = validate_writer_counts(writers)
+    schedule = build_point_progress_cursor_v2_schedule(writer_counts)
+    vcpus = int(machine_spec["vcpus"])
+    ssd_count = int(machine_spec["ssd_count"])
+    layout = "single Local SSD" if ssd_count == 1 else f"RAID0 over {ssd_count} Local SSDs"
+    plan = build_point_progress_ring_plan(
+        writers=writer_counts,
+        machine_type=machine_type,
+        machine_spec=machine_spec,
+        commit=commit,
+        binary_sha256=binary_sha256,
+    )
+    plan.pop("progress_ring_ab")
+    plan.update({
+        "plan_schema_version": POINT_PROGRESS_PLAN_SCHEMA_V2,
+        "suite": "v8-point-progress-cursor",
+        "arms": list(POINT_PROGRESS_CURSOR_V2_ARMS),
+        "arm_orders": [list(order) for order in POINT_PROGRESS_CURSOR_V2_ORDERS],
+        "runs_planned": len(schedule),
+        "score_runs_planned": len(schedule),
+        "runtime_protocol": f"single {vcpus}-vCPU host; {layout}; same source and binary for three arms",
+        "progress_ring_control": {
+            "environment_variable": "TOYKV_BENCH_V8_POINT_PROGRESS_RING",
+            "candidate_value": "1",
+        },
+        "progress_cursor_ab": {
+            "environment_variable": "TOYKV_BENCH_V8_POINT_PROGRESS_RING",
+            "baseline_value": "0",
+            "candidate_value": "2",
+        },
+        "progress_counters_enabled": False,
+        "qualification_note": (
+            "Same-host, same-source, same-release-binary three-arm qualification of Eager (mode 0), Ring (mode 1), "
+            "and Cursor (mode 2); the only changing factor is the progress mode. All arms use "
+            "Direct FRONTIER, dynamic coalescing, 1 MiB Point lookahead, and existing digest sampling. Point latency "
+            "is sampled every 10 completed puts; Batch64 is throughput-only. The independent Cursor matrix keeps "
+            "the historical F0.5 Ring plan and verifier unchanged, and does not change production defaults."
         ),
     })
     return plan
@@ -732,6 +825,27 @@ def validate_point_progress_cursor_rows(
 ) -> dict[str, object]:
     """Validate the Eager/Cursor matrix and counter switch."""
     schedule = build_point_progress_cursor_schedule(writers)
+    validation = _validate_point_progress_rows(rows, schedule)
+    invalid_mode_flags: list[Mapping[str, object]] = []
+    for row in rows:
+        arm = row.get("arm")
+        if (
+            type(row.get("progress_cursor_enabled")) is not bool
+            or row.get("progress_cursor_enabled") is not (arm == "cursor")
+            or row.get("progress_counters_enabled") is not False
+        ):
+            invalid_mode_flags.append(row)
+    if invalid_mode_flags:
+        validation["complete"] = False
+        validation["invalid_rows"].extend(dict(row) for row in invalid_mode_flags)
+    return validation
+
+
+def validate_point_progress_cursor_v2_rows(
+    rows: list[Mapping[str, object]], writers: Iterable[int] = POINT_PROGRESS_RING_WRITERS,
+) -> dict[str, object]:
+    """Validate archived three-arm Eager/Ring/Cursor rows, without running Ring mode."""
+    schedule = build_point_progress_cursor_v2_schedule(writers)
     validation = _validate_point_progress_rows(rows, schedule)
     invalid_mode_flags: list[Mapping[str, object]] = []
     for row in rows:

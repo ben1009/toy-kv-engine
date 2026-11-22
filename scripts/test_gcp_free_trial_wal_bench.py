@@ -34,6 +34,10 @@ from gcp_wal_matrix import (
     POINT_DIRECT_FRAME_NUM,
     POINT_DIRECT_FRAME_WRITERS,
     POINT_PROGRESS_CURSOR_ORDERS,
+    POINT_PROGRESS_CURSOR_V2_ORDERS,
+    POINT_PROGRESS_PLAN_SCHEMA_V1,
+    POINT_PROGRESS_PLAN_SCHEMA_V2,
+    POINT_PROGRESS_PLAN_SCHEMA_V3,
     POINT_PROGRESS_RING_NUM,
     POINT_PROGRESS_RING_WRITERS,
     V8_EXTENT_POLICY_STORAGE_NUM,
@@ -58,6 +62,8 @@ from gcp_wal_matrix import (
     build_point_progress_ring_schedule,
     build_point_progress_cursor_plan,
     build_point_progress_cursor_schedule,
+    build_point_progress_cursor_v2_plan,
+    build_point_progress_cursor_v2_schedule,
     build_v8_extent_policy_storage_plan,
     build_v8_extent_policy_storage_schedule,
     build_v8_mutex_diagnostic_plan,
@@ -390,13 +396,27 @@ class PointProgressRingQualificationTests(unittest.TestCase):
         return record
 
     @classmethod
-    def _make_fixture(cls, root: Path, *, cursor: bool = False) -> Path:
+    def _make_fixture(
+        cls,
+        root: Path,
+        *,
+        cursor: bool = False,
+        cursor_schema_version: int | None = None,
+        include_schema_version: bool = True,
+    ) -> Path:
         results = root / "results"
         results.mkdir()
         commit = "a" * 40
         binary_sha = "b" * 64
-        schedule_builder = build_point_progress_cursor_schedule if cursor else build_point_progress_ring_schedule
-        plan_builder = build_point_progress_cursor_plan if cursor else build_point_progress_ring_plan
+        if cursor_schema_version == POINT_PROGRESS_PLAN_SCHEMA_V2:
+            schedule_builder = build_point_progress_cursor_v2_schedule
+            plan_builder = build_point_progress_cursor_v2_plan
+        elif cursor:
+            schedule_builder = build_point_progress_cursor_schedule
+            plan_builder = build_point_progress_cursor_plan
+        else:
+            schedule_builder = build_point_progress_ring_schedule
+            plan_builder = build_point_progress_ring_plan
         schedule = schedule_builder(POINT_PROGRESS_RING_WRITERS)
         plan = plan_builder(
             writers=POINT_PROGRESS_RING_WRITERS,
@@ -405,6 +425,8 @@ class PointProgressRingQualificationTests(unittest.TestCase):
             commit=commit,
             binary_sha256=binary_sha,
         )
+        if not include_schema_version:
+            plan.pop("plan_schema_version", None)
         (results / "benchmark-plan.json").write_text(json.dumps(plan), encoding="utf-8")
         (results / "commit.txt").write_text(commit + "\n", encoding="utf-8")
         (results / "write-perf.sha256").write_text(binary_sha + "\n", encoding="utf-8")
@@ -438,10 +460,14 @@ class PointProgressRingQualificationTests(unittest.TestCase):
                 encoding="utf-8",
             )
             rows.append(metadata)
-        summary = (
-            progress_ring_runner._cursor_summary(rows, POINT_PROGRESS_RING_WRITERS, len(schedule))
-            if cursor else progress_ring_runner._summary(rows, POINT_PROGRESS_RING_WRITERS, len(schedule))
-        )
+        if cursor_schema_version == POINT_PROGRESS_PLAN_SCHEMA_V2:
+            summary = progress_ring_runner._cursor_v2_summary(
+                rows, POINT_PROGRESS_RING_WRITERS, len(schedule),
+            )
+        elif cursor:
+            summary = progress_ring_runner._cursor_summary(rows, POINT_PROGRESS_RING_WRITERS, len(schedule))
+        else:
+            summary = progress_ring_runner._summary(rows, POINT_PROGRESS_RING_WRITERS, len(schedule))
         summary.update({
             "source_commit": commit,
             "binary_sha256": binary_sha,
@@ -497,6 +523,7 @@ class PointProgressRingQualificationTests(unittest.TestCase):
             self.assertIn("TOYKV_BENCH_V8_POINT_PROGRESS_RING=2\n", environment)
             self.assertIn("TOYKV_BENCH_V8_PROGRESS_COUNTERS=0\n", environment)
             plan = json.loads((results / "benchmark-plan.json").read_text(encoding="utf-8"))
+            self.assertEqual(plan["plan_schema_version"], POINT_PROGRESS_PLAN_SCHEMA_V3)
             self.assertEqual(plan["suite"], "v8-point-progress-cursor")
             self.assertEqual(plan["arms"], ["eager", "cursor"])
             self.assertEqual(plan["arm_orders"], [list(order) for order in POINT_PROGRESS_CURSOR_ORDERS])
@@ -508,6 +535,77 @@ class PointProgressRingQualificationTests(unittest.TestCase):
             self.assertEqual(plan["progress_cursor_ab"]["candidate_value"], "2")
             self.assertFalse(plan["progress_counters_enabled"])
             self.assertTrue(BENCH._verify_result_set(results)["verified"])
+
+    def test_historical_progress_plan_schemas_remain_verifiable(self) -> None:
+        self.assertEqual(
+            len(build_point_progress_cursor_v2_schedule(POINT_PROGRESS_RING_WRITERS)),
+            60,
+        )
+        self.assertEqual(POINT_PROGRESS_CURSOR_V2_ORDERS[0], ("eager", "progress_ring", "cursor"))
+        self.assertEqual(
+            build_point_progress_ring_plan(
+                writers=POINT_PROGRESS_RING_WRITERS,
+                machine_type="c4-standard-16-lssd",
+                machine_spec=BENCH.MACHINE_SPECS["c4-standard-16-lssd"],
+                commit="a" * 40,
+            )["plan_schema_version"],
+            POINT_PROGRESS_PLAN_SCHEMA_V1,
+        )
+        self.assertEqual(
+            build_point_progress_cursor_v2_plan(
+                writers=POINT_PROGRESS_RING_WRITERS,
+                machine_type="c4-standard-16-lssd",
+                machine_spec=BENCH.MACHINE_SPECS["c4-standard-16-lssd"],
+                commit="a" * 40,
+            )["plan_schema_version"],
+            POINT_PROGRESS_PLAN_SCHEMA_V2,
+        )
+
+        # Historical V1/V2/V3 artifacts did not yet include the version field;
+        # their suite, arms and run count uniquely identify the schema.
+        with tempfile.TemporaryDirectory() as temporary:
+            results = self._make_fixture(Path(temporary), include_schema_version=False)
+            self.assertTrue(progress_ring_runner.verify_results_directory(results)["verified"])
+        with tempfile.TemporaryDirectory() as temporary:
+            results = self._make_fixture(
+                Path(temporary), cursor=True,
+                cursor_schema_version=POINT_PROGRESS_PLAN_SCHEMA_V2,
+                include_schema_version=False,
+            )
+            verification = progress_ring_runner.verify_cursor_results_directory(results)
+            self.assertTrue(verification["verified"], verification["errors"])
+            self.assertEqual(verification["planned"], 60)
+        with tempfile.TemporaryDirectory() as temporary:
+            results = self._make_fixture(
+                Path(temporary), cursor=True,
+                cursor_schema_version=POINT_PROGRESS_PLAN_SCHEMA_V2,
+            )
+            verification = progress_ring_runner.verify_cursor_results_directory(results)
+            self.assertTrue(verification["verified"], verification["errors"])
+            self.assertEqual(verification["planned"], 60)
+        with tempfile.TemporaryDirectory() as temporary:
+            results = self._make_fixture(
+                Path(temporary), cursor=True, include_schema_version=False,
+            )
+            verification = progress_ring_runner.verify_cursor_results_directory(results)
+            self.assertTrue(verification["verified"], verification["errors"])
+
+    def test_remote_runner_rejects_retired_ring_suite(self) -> None:
+        remote_script = Path(__file__).with_name("gcp-free-trial-wal-bench-remote.sh")
+        completed = subprocess.run(
+            [
+                "bash", str(remote_script), "a" * 40, "100000", "test-project", "us-central1-a",
+                "wal-test", "4102444800", "c4-standard-16-lssd", "1,8,16",
+                "v8-point-progress-ring", "-", "-",
+            ],
+            cwd=Path(__file__).resolve().parents[1],
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=5,
+        )
+        self.assertEqual(completed.returncode, 64)
+        self.assertIn("unsupported benchmark suite: v8-point-progress-ring", completed.stderr)
 
     def test_verifier_accepts_legacy_plan_label_only_with_ordered_run_environment(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -20,7 +20,7 @@ use std::collections::BTreeMap;
 
 use anyhow::{Context, Result, ensure};
 use crossbeam_channel::{Receiver, Sender};
-use parking_lot::{Condvar, Mutex, MutexGuard};
+use parking_lot::{Condvar, Mutex};
 
 use crate::{pitr::RecordedAt, wal::MAX_WAL_FILE_SIZE};
 
@@ -338,7 +338,7 @@ impl TicketProgressRing {
         Ok(payload)
     }
 
-    fn retire_prefix(&self, ticket_start: u64, ticket_end: u64, use_cursor: bool) -> Result<()> {
+    fn retire_prefix(&self, ticket_start: u64, ticket_end: u64) -> Result<()> {
         let ticket_count = ticket_end
             .checked_sub(ticket_start)
             .context("v8 progress ring retirement range moves backwards")?;
@@ -353,54 +353,32 @@ impl TicketProgressRing {
             "v8 progress ring retirement exceeds its capacity"
         );
 
-        if use_cursor {
-            // The Coordinator lock excludes admission and reuse. Once a cell
-            // validates here, producers can only repeat the accepted digest
-            // or frame event. Neither operation can change the payload.
-            // Keep a bounded stack snapshot so the successful path validates
-            // and clears each cell while holding its mutex once. If a later
-            // cell is invalid, restore the already-cleared prefix before
-            // returning the error, preserving all-or-nothing retirement.
-            let mut retired_payloads =
-                [TicketProgressPayload::default(); MAX_PARALLEL_INFLIGHT_TICKETS];
-            let capacity = u64::try_from(self.cells.len())?;
-            let start = usize::try_from(ticket_start % capacity)?;
-            let (before, after) = self.cells.split_at(start);
-            let cells = || after.iter().chain(before).take(ticket_count);
-            for (offset, (ticket, cell)) in (ticket_start..ticket_end).zip(cells()).enumerate() {
-                let mut payload = cell.payload.lock();
-                if let Err(error) = self.validate_retiring_cell(ticket, &payload) {
-                    drop(payload);
-                    for (restore_cell, previous) in
-                        cells().take(offset).zip(retired_payloads[..offset].iter())
-                    {
-                        *restore_cell.payload.lock() = *previous;
-                    }
-                    return Err(error);
+        // The Coordinator lock excludes admission and reuse. Once a cell
+        // validates here, producers can only repeat the accepted digest or
+        // frame event. Neither operation can change the payload. Keep a
+        // bounded stack snapshot so the successful path validates and clears
+        // each cell while holding its mutex once. If a later cell is invalid,
+        // restore the already-cleared prefix before returning the error,
+        // preserving all-or-nothing retirement.
+        let mut retired_payloads =
+            [TicketProgressPayload::default(); MAX_PARALLEL_INFLIGHT_TICKETS];
+        let capacity = u64::try_from(self.cells.len())?;
+        let start = usize::try_from(ticket_start % capacity)?;
+        let (before, after) = self.cells.split_at(start);
+        let cells = || after.iter().chain(before).take(ticket_count);
+        for (offset, (ticket, cell)) in (ticket_start..ticket_end).zip(cells()).enumerate() {
+            let mut payload = cell.payload.lock();
+            if let Err(error) = self.validate_retiring_cell(ticket, &payload) {
+                drop(payload);
+                for (restore_cell, previous) in
+                    cells().take(offset).zip(retired_payloads[..offset].iter())
+                {
+                    *restore_cell.payload.lock() = *previous;
                 }
-                retired_payloads[offset] = *payload;
-                *payload = TicketProgressPayload::default();
+                return Err(error);
             }
-            return Ok(());
-        }
-
-        let mut payloads: Vec<MutexGuard<'_, TicketProgressPayload>> = Vec::new();
-        payloads
-            .try_reserve_exact(ticket_count)
-            .context("reserve v8 progress ring retirement locks")?;
-        for ticket in ticket_start..ticket_end {
-            payloads.push(self.cell(ticket)?.payload.lock());
-        }
-
-        for (offset, payload) in payloads.iter().enumerate() {
-            let ticket = ticket_start
-                .checked_add(u64::try_from(offset)?)
-                .context("v8 progress ring retirement ticket overflows")?;
-            self.validate_retiring_cell(ticket, payload)?;
-        }
-
-        for payload in &mut payloads {
-            **payload = TicketProgressPayload::default();
+            retired_payloads[offset] = *payload;
+            *payload = TicketProgressPayload::default();
         }
         Ok(())
     }
@@ -2419,11 +2397,8 @@ impl WalV8ParallelCoordinator {
             None
         };
         if let Some(progress_ring) = &self.inner.progress_ring
-            && let Err(error) = progress_ring.retire_prefix(
-                state.durable_ticket_end,
-                reservation.ticket_end,
-                state.ready_cursor.is_some(),
-            )
+            && let Err(error) =
+                progress_ring.retire_prefix(state.durable_ticket_end, reservation.ticket_end)
         {
             poison_locked(&self.inner, &mut state);
             return Err(error).context("retire v8 progress ring durable prefix");
@@ -4973,8 +4948,7 @@ mod tests {
             .expect("test enables progress ring");
         let first_before = ring.snapshot(0)?;
         let second_before = ring.snapshot(1)?;
-        assert!(ring.retire_prefix(0, 2, false).is_err());
-        assert!(ring.retire_prefix(0, 2, true).is_err());
+        assert!(ring.retire_prefix(0, 2).is_err());
         assert_eq!(ring.snapshot(0)?, first_before);
         assert_eq!(ring.snapshot(1)?, second_before);
         drop(second);

@@ -2655,7 +2655,6 @@ struct WalV8ParallelIo {
     #[cfg(feature = "bench")]
     extent_preparation: Option<Arc<WalV8SlidingExtentPreparation>>,
     completion_events: Option<Receiver<WalV8CompletedGroupEvent>>,
-    completion_batch: Mutex<Vec<WalV8CompletedGroupEvent>>,
     #[cfg(test)]
     progress_wait_hook: Mutex<Option<WalV8ProgressWaitHook>>,
     #[cfg(test)]
@@ -2682,12 +2681,6 @@ impl WalV8ParallelIo {
             (None, None)
         };
         let progress_tokens = coordinator.take_progress_token_receiver()?;
-        let mut completion_batch = Vec::new();
-        if completion_events.is_some() && !coordinator.progress_cursor_enabled() {
-            completion_batch
-                .try_reserve_exact(coordinator.completion_queue_capacity())
-                .context("reserve v8 completion event drain buffer")?;
-        }
         let shutdown_started = Arc::new(AtomicBool::new(false));
         let submit_any_ready_ticket = benchmark_submits_any_ready_ticket()?;
         let worker_file = Arc::new(worker_file);
@@ -2823,7 +2816,6 @@ impl WalV8ParallelIo {
             #[cfg(feature = "bench")]
             extent_preparation,
             completion_events,
-            completion_batch: Mutex::new(completion_batch),
             #[cfg(test)]
             progress_wait_hook: Mutex::new(None),
             #[cfg(test)]
@@ -2865,25 +2857,18 @@ impl WalV8ParallelIo {
             consume_progress_token_before_scan(tokens);
         }
 
-        if let Some(mut batch) = driver.completion_batch.take() {
-            let snapshot = self
-                .drain_completion_events(receiver, &mut batch)
-                .and_then(|()| {
-                    self.coordinator
-                        .advance_and_snapshot(driver, &batch, capture_monotonic_ns)
-                });
-            batch.clear();
-            driver.completion_batch = Some(batch);
-            return snapshot;
-        }
-
-        let mut batch = self.completion_batch.lock();
-        batch.clear();
-        self.drain_completion_events(receiver, &mut batch)?;
+        let mut batch = driver
+            .completion_batch
+            .take()
+            .context("cursor durability driver completion buffer is missing")?;
         let snapshot = self
-            .coordinator
-            .advance_and_snapshot(driver, &batch, capture_monotonic_ns);
+            .drain_completion_events(receiver, &mut batch)
+            .and_then(|()| {
+                self.coordinator
+                    .advance_and_snapshot(driver, &batch, capture_monotonic_ns)
+            });
         batch.clear();
+        driver.completion_batch = Some(batch);
         snapshot
     }
 

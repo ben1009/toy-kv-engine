@@ -20,13 +20,19 @@ from typing import Any, Callable
 
 from gcp_wal_matrix import (
     POINT_LOOKAHEAD_WINDOW_BYTES,
+    POINT_PROGRESS_PLAN_SCHEMA_V1,
+    POINT_PROGRESS_PLAN_SCHEMA_V2,
+    POINT_PROGRESS_PLAN_SCHEMA_V3,
     POINT_PROGRESS_RING_NUM,
     POINT_PROGRESS_RING_WRITERS,
+    build_point_progress_cursor_v2_plan,
+    build_point_progress_cursor_v2_schedule,
     build_point_progress_cursor_plan,
     build_point_progress_cursor_schedule,
     build_point_progress_ring_plan,
     build_point_progress_ring_schedule,
     validate_point_progress_cursor_rows,
+    validate_point_progress_cursor_v2_rows,
     validate_point_progress_ring_rows,
 )
 
@@ -501,6 +507,104 @@ def _cursor_summary(rows: list[dict[str, Any]], writers: tuple[int, ...], planne
     return summary
 
 
+def _cursor_v2_summary(rows: list[dict[str, Any]], writers: tuple[int, ...], planned: int) -> dict[str, Any]:
+    """Recompute the archived three-arm summary used by plan schema V2."""
+    eager_ring_rows = [row for row in rows if row.get("arm") != "cursor"]
+    eager_cursor_rows = [
+        {
+            **{key: value for key, value in row.items() if key != "progress_cursor_enabled"},
+            "arm": "progress_ring" if row.get("arm") == "cursor" else row.get("arm"),
+        }
+        for row in rows if row.get("arm") != "progress_ring"
+    ]
+    ring_summary = _summary(eager_ring_rows, writers, len(eager_ring_rows))
+    cursor_summary = _summary(eager_cursor_rows, writers, len(eager_cursor_rows))
+    cursor_validation = validate_point_progress_cursor_v2_rows(rows, writers)
+    comparisons: list[dict[str, Any]] = []
+    for ring_comparison, cursor_comparison in zip(
+        ring_summary["comparison"], cursor_summary["comparison"], strict=True,
+    ):
+        writer = ring_comparison["writer"]
+        workload = ring_comparison["workload"]
+        paired_ring_to_cursor: list[float] = []
+        paired_ring_to_cursor_p99: list[float] = []
+        for repetition in range(1, 6):
+            pair = {
+                arm: next((row for row in rows if row.get("writer") == writer
+                           and row.get("workload") == workload and row.get("repetition") == repetition
+                           and row.get("arm") == arm and row.get("exit_code") == 0), None)
+                for arm in ("progress_ring", "cursor")
+            }
+            ring, cursor = pair["progress_ring"], pair["cursor"]
+            if ring and cursor and ring["puts_per_second"] > 0:
+                paired_ring_to_cursor.append((cursor["puts_per_second"] / ring["puts_per_second"] - 1) * 100)
+                if workload == "point":
+                    paired_ring_to_cursor_p99.append((cursor["p99_ms"] / ring["p99_ms"] - 1) * 100)
+        comparisons.append({
+            "writer": writer,
+            "workload": workload,
+            "eager": ring_comparison["baseline"],
+            "progress_ring": ring_comparison["candidate"],
+            "cursor": cursor_comparison["candidate"],
+            "eager_to_ring": ring_comparison,
+            "eager_to_cursor": cursor_comparison,
+            "paired_ring_to_cursor_changes_pct": paired_ring_to_cursor,
+            "paired_ring_to_cursor_change_median_pct": (
+                median(paired_ring_to_cursor) if paired_ring_to_cursor else None
+            ),
+            "ring_to_cursor_pair_wins": sum(value > 0 for value in paired_ring_to_cursor),
+            "paired_ring_to_cursor_p99_changes_pct": paired_ring_to_cursor_p99,
+            "paired_ring_to_cursor_p99_change_median_pct": (
+                median(paired_ring_to_cursor_p99) if paired_ring_to_cursor_p99 else None
+            ),
+        })
+    by_cell = {f"w{row['writer']}-{row['workload']}": row for row in comparisons}
+    qualification_gates = dict(cursor_summary["qualification_gates"])
+    qualification_gates["candidate_qualified"] = bool(
+        cursor_validation["complete"] and qualification_gates["candidate_qualified"]
+    )
+    summary = dict(cursor_summary)
+    summary.update({
+        "suite": "v8-point-progress-cursor",
+        "complete": len(rows) == planned and cursor_validation["complete"],
+        "arms": ["eager", "progress_ring", "cursor"],
+        "results": rows,
+        "matrix_validation": cursor_validation,
+        "comparison": comparisons,
+        "comparison_by_cell": by_cell,
+        "qualification_gates": qualification_gates,
+        "runs_started": len(rows),
+        "runs_completed": sum(row.get("exit_code") == 0 for row in rows),
+        "runs_planned": planned,
+        "qualification_note": (
+            "Same-host, same-source, same-release-binary three-arm comparison of Eager (mode 0), Ring (mode 1), "
+            "and Cursor (mode 2). Cursor is qualified against Eager using the historical F0.5 performance gates; "
+            "Ring-to-Cursor paired results are also reported. Passing does not change production defaults."
+        ),
+    })
+    return summary
+
+
+def _cursor_plan_schema_version(plan: dict[str, Any]) -> int:
+    """Read explicit schema versions and recognize only known pre-versioned archives."""
+    version = plan.get("plan_schema_version")
+    if version is not None:
+        if type(version) is not int:
+            raise ValueError("plan_schema_version must be an integer")
+        return version
+
+    suite = plan.get("suite")
+    arms = plan.get("arms")
+    planned = plan.get("runs_planned")
+    if suite == "v8-point-progress-cursor" and arms == ["eager", "progress_ring", "cursor"] and planned == 60:
+        return POINT_PROGRESS_PLAN_SCHEMA_V2
+    if suite == "v8-point-progress-cursor" and arms == ["eager", "cursor"] and planned == 40:
+        return POINT_PROGRESS_PLAN_SCHEMA_V3
+    if suite == "v8-point-progress-ring" and arms == ["eager", "progress_ring"] and planned == 40:
+        return POINT_PROGRESS_PLAN_SCHEMA_V1
+    raise ValueError("benchmark plan has no recognized progress plan schema")
+
+
 def run_suite(args: argparse.Namespace) -> int:
     if len(args.commit) != 40 or any(char not in "0123456789abcdef" for char in args.commit):
         raise ValueError("commit must be a full lowercase 40-character SHA")
@@ -617,7 +721,12 @@ def verify_results_directory(results: Path) -> dict[str, Any]:
             commit=commit,
             binary_sha256=binary_sha,
         )
+        schema_version = _cursor_plan_schema_version(plan)
+        if schema_version != POINT_PROGRESS_PLAN_SCHEMA_V1:
+            errors.append("F0.5 archive must use progress plan schema V1")
         for key, value in expected_plan.items():
+            if key == "plan_schema_version" and key not in plan:
+                continue
             # Older F0.5 archives called the ordered policy "ticket_prefix".
             # Keep that descriptive alias readable, but still verify every
             # run's captured environment against the actual supported value.
@@ -742,7 +851,7 @@ def verify_results_directory(results: Path) -> dict[str, Any]:
 
 
 def verify_cursor_results_directory(results: Path) -> dict[str, Any]:
-    """Verify the Cursor matrix separately, preserving the historical F0.5 Ring verifier."""
+    """Verify historical V2 and current V3 Cursor matrices without running retired Ring mode."""
     errors: list[str] = []
     try:
         summary = json.loads((results / "summary.json").read_text(encoding="utf-8"))
@@ -752,17 +861,40 @@ def verify_cursor_results_directory(results: Path) -> dict[str, Any]:
         binary_sha = (results / "write-perf.sha256").read_text(encoding="utf-8").strip()
         if not all(isinstance(value, dict) for value in (summary, remote_exit, plan)):
             raise ValueError("summary, remote-exit, and plan must be JSON objects")
-        schedule = build_point_progress_cursor_schedule(plan.get("writers", ()))
-        expected_plan = build_point_progress_cursor_plan(
-            writers=plan.get("writers", ()),
-            machine_type="c4-standard-16-lssd",
-            machine_spec={"vcpus": 16, "ssd_count": 2, "ssd_gib": 750},
-            commit=commit,
-            binary_sha256=binary_sha,
-        )
+        schema_version = _cursor_plan_schema_version(plan)
+        if schema_version == POINT_PROGRESS_PLAN_SCHEMA_V2:
+            schedule = build_point_progress_cursor_v2_schedule(plan.get("writers", ()))
+            expected_plan = build_point_progress_cursor_v2_plan(
+                writers=plan.get("writers", ()),
+                machine_type="c4-standard-16-lssd",
+                machine_spec={"vcpus": 16, "ssd_count": 2, "ssd_gib": 750},
+                commit=commit,
+                binary_sha256=binary_sha,
+            )
+            validate_rows = validate_point_progress_cursor_v2_rows
+            summarize = _cursor_v2_summary
+            schema_label = "historical three-arm Cursor V2"
+        elif schema_version == POINT_PROGRESS_PLAN_SCHEMA_V3:
+            schedule = build_point_progress_cursor_schedule(plan.get("writers", ()))
+            expected_plan = build_point_progress_cursor_plan(
+                writers=plan.get("writers", ()),
+                machine_type="c4-standard-16-lssd",
+                machine_spec={"vcpus": 16, "ssd_count": 2, "ssd_gib": 750},
+                commit=commit,
+                binary_sha256=binary_sha,
+            )
+            validate_rows = validate_point_progress_cursor_rows
+            summarize = _cursor_summary
+            schema_label = "two-arm Cursor V3"
+        else:
+            raise ValueError(f"unsupported Cursor progress plan schema V{schema_version}")
         for key, value in expected_plan.items():
+            # Existing archived plans predate the explicit schema field. Their
+            # arm set and planned run count identify V1/V2/V3 unambiguously.
+            if key == "plan_schema_version" and key not in plan:
+                continue
             if plan.get(key) != value:
-                errors.append(f"plan field {key} differs from fixed Cursor suite")
+                errors.append(f"plan field {key} differs from {schema_label} suite")
         if len(commit) != 40 or any(char not in "0123456789abcdef" for char in commit):
             errors.append("source commit identity is invalid")
         if len(binary_sha) != 64 or any(char not in "0123456789abcdef" for char in binary_sha):
@@ -803,11 +935,11 @@ def verify_cursor_results_directory(results: Path) -> dict[str, Any]:
         if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
             errors.append("summary results are missing or malformed")
             rows = []
-        validation = validate_point_progress_cursor_rows(rows, plan.get("writers", ()))
+        validation = validate_rows(rows, plan.get("writers", ()))
         if validation["complete"] is not True:
-            errors.append("run rows do not match the fixed Cursor matrix")
+            errors.append(f"run rows do not match the {schema_label} matrix")
         if validation["complete"] is True:
-            recomputed = _cursor_summary(rows, tuple(plan.get("writers", ())), len(schedule))
+            recomputed = summarize(rows, tuple(plan.get("writers", ())), len(schedule))
             for key in (
                 "suite", "complete", "runs_started", "runs_completed", "runs_planned", "writers",
                 "workloads", "arms", "matrix_validation", "comparison", "comparison_by_cell",
@@ -848,7 +980,7 @@ def verify_cursor_results_directory(results: Path) -> dict[str, Any]:
                     row["progress_counters_enabled"],
                 )
             ):
-                errors.append(f"{name} environment does not match the fixed Cursor configuration")
+                errors.append(f"{name} environment does not match the {schema_label} configuration")
             try:
                 raw = json.loads(result_path.read_text(encoding="utf-8"))
                 expected_metrics = _validate_record(raw, row)

@@ -50,7 +50,7 @@ if [[ "$SUITE" != "batch64" && "$SUITE" != "rfc026-full" \
     && "$SUITE" != "v8-point-lookahead" && "$SUITE" != "v8-mutex-diagnostic" \
     && "$SUITE" != "v8-point-borrowed-input" && "$SUITE" != "v8-point-direct-frame" \
     && "$SUITE" != "v8-extent-policy-storage" && "$SUITE" != "v8-point-cpu-attribution" \
-    && "$SUITE" != "v8-point-progress-ring" && "$SUITE" != "v8-point-progress-cursor" ]]; then
+    && "$SUITE" != "v8-point-progress-cursor" ]]; then
     echo "unsupported benchmark suite: $SUITE" >&2
     exit 64
 fi
@@ -87,10 +87,10 @@ if [[ "$SUITE" == "v8-point-direct-frame" ]] \
     echo "v8-point-direct-frame requires c4-standard-16-lssd, writers 1,8,16, and 100000 operations" >&2
     exit 64
 fi
-if [[ "$SUITE" == "v8-point-progress-ring" || "$SUITE" == "v8-point-progress-cursor" ]] \
+if [[ "$SUITE" == "v8-point-progress-cursor" ]] \
     && { [[ "$NUM" != "100000" ]] || [[ "$MACHINE_TYPE" != "c4-standard-16-lssd" ]] \
         || [[ "$WRITERS_CSV" != "1,8,16" ]]; }; then
-    echo "progress-ring/cursor qualification requires c4-standard-16-lssd, writers 1,8,16, and 100000 operations" >&2
+    echo "progress-cursor qualification requires c4-standard-16-lssd, writers 1,8,16, and 100000 operations" >&2
     exit 64
 fi
 if [[ "$SUITE" == "v8-extent-policy-storage" ]] \
@@ -387,17 +387,13 @@ if [[ "$BENCH_SUITE" == "v8-point-direct-frame" ]]; then
     exit $?
 fi
 
-if [[ "$BENCH_SUITE" == "v8-point-progress-ring" || "$BENCH_SUITE" == "v8-point-progress-cursor" ]]; then
+if [[ "$BENCH_SUITE" == "v8-point-progress-cursor" ]]; then
     if [[ ! -r /tmp/gcp-v8-point-progress-ring-runner.py ]]; then
-        echo "progress-ring runner was not uploaded" >&2
+        echo "progress-cursor runner was not uploaded" >&2
         exit 1
     fi
     cp /tmp/gcp-v8-point-progress-ring-runner.py "$REPO/scripts/gcp_v8_point_progress_ring_runner.py"
     echo "WAL_BENCHMARK_STARTED $(date --iso-8601=seconds)" | tee -a "$BENCH_BOOT_LOG"
-    candidate_mode_args=()
-    if [[ "$BENCH_SUITE" == "v8-point-progress-cursor" ]]; then
-        candidate_mode_args=(--candidate-mode cursor)
-    fi
     PYTHONPATH="$REPO/scripts${PYTHONPATH:+:$PYTHONPATH}" \
         python3 "$REPO/scripts/gcp_v8_point_progress_ring_runner.py" \
         --binary "$BINARY" \
@@ -410,7 +406,7 @@ if [[ "$BENCH_SUITE" == "v8-point-progress-ring" || "$BENCH_SUITE" == "v8-point-
         --machine-type "$BENCH_MACHINE_TYPE" \
         --ssd-count "$BENCH_SSD_COUNT" \
         --ssd-gib "$BENCH_SSD_TOTAL_GIB" \
-        "${candidate_mode_args[@]}"
+        --candidate-mode cursor
     exit $?
 fi
 
