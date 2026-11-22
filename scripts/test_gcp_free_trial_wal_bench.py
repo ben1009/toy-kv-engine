@@ -700,6 +700,32 @@ class PointProgressRingQualificationTests(unittest.TestCase):
             self.assertTrue((unpacked / "point-progress-ring-schedule.tsv").is_file())
             self.assertEqual(progress_ring_runner.verify_results_directory(unpacked)["verified"], True)
 
+    def test_archive_round_trip_includes_cursor_schedule(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            results = self._make_fixture(root, cursor=True)
+            temp_root = root / "archive-tmp"
+            temp_root.mkdir()
+            command = BENCH._build_remote_archive_command(root=str(results), max_bytes=64 * 1024 * 1024)
+            completed = subprocess.run(
+                ["bash", "-euc", command], capture_output=True, text=True, check=False,
+                env={**os.environ, "TMPDIR": str(temp_root)},
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            archive_values = self._archive_output(completed.stdout)
+            archive = Path(archive_values["ARCHIVE_PATH"])
+            archive_copy = root / "bundle.tar.gz"
+            shutil.copyfile(archive, archive_copy)
+            self.assertEqual(self._sha256(archive_copy), archive_values["ARCHIVE_SHA256"])
+            extracted = root / "extracted"
+            extracted.mkdir()
+            with tarfile.open(archive_copy, "r:gz") as bundle:
+                bundle.extractall(extracted)
+            unpacked = extracted / "results"
+            self.assertTrue((unpacked / "point-progress-cursor-schedule.tsv").is_file())
+            self.assertFalse((unpacked / "point-progress-ring-schedule.tsv").exists())
+            self.assertTrue(progress_ring_runner.verify_cursor_results_directory(unpacked)["verified"])
+
     def test_verifier_rejects_missing_extra_bad_samples_and_scores_not_matching_raw(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

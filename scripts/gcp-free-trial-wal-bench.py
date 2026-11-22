@@ -132,6 +132,7 @@ root_names = {
     "point-borrowed-input-schedule.tsv",
     "point-direct-frame-schedule.tsv",
     "point-progress-ring-schedule.tsv",
+    "point-progress-cursor-schedule.tsv",
     "extent-policy-storage-schedule.tsv",
     "commit-order-trace-analysis.json", "commit.txt", "remote-exit.json",
     "finished_utc.txt", "remote-finished-utc.txt", "remote-status.txt", "host.txt",
