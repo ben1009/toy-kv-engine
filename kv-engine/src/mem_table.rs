@@ -558,8 +558,12 @@ pub struct WalV8DurabilityPhaseObservation {
     pub frontier_lock_wait_ns: u64,
     pub coalescing_wall_ns: u64,
     pub coalescing_cpu_ns: u64,
-    pub coalescing_active_wall_ns: u64,
-    pub coalescing_active_cpu_ns: u64,
+    /// Active wall time from the detailed wait breakdown; `Some(0)` when no
+    /// coalescing call was made, and `None` when a call lacks that breakdown.
+    pub coalescing_active_wall_ns: Option<u64>,
+    /// Active CPU time from the detailed wait breakdown, with the same
+    /// availability semantics as `coalescing_active_wall_ns`.
+    pub coalescing_active_cpu_ns: Option<u64>,
     pub coalescing_state_lock_wait_wall_ns: u64,
     pub coalescing_state_lock_wait_cpu_ns: u64,
     pub coalescing_condvar_wait_wall_ns: u64,

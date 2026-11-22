@@ -41,6 +41,14 @@ behavior, synchronization, or the Cursor fast path. Patch SHA-256:
 
 `c55c8e0ef1e7490e7892ba05f137b7fa8456b97c56935199a15d6a8a289f7f37`
 
+The exact patch is now retained as
+[diagnostic-cursor-sampler.patch](artifacts/rfc-028-v8-point16-critical-path-gcp-20261122/diagnostic-cursor-sampler.patch),
+with a checked-in SHA-256 sidecar. The artifact integrity/scope test is
+`scripts/test_gcp_rfc028_sampler_patch.py` and can be run with
+`PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_gcp_rfc028_sampler_patch.py'`.
+The patch was verified with `git apply --check` against the recorded source
+revision before the run.
+
 The patched binary SHA-256 is
 `c54349f0c4ccfb0a0dfa9bc22f9431ad31bb1c3fff24f6c444992ed0093e4744`.
 The runtime source revision was `118067e805e12e597b3ad46199b256a7f5f57c80`.
@@ -170,6 +178,14 @@ microseconds; these are observed stage latencies, not additive components.
 - Direct Completion did not materially change puts per sync here. Its raw
   throughput was higher in both writer counts, but one instrumented run per
   arm is insufficient to claim a repeatable improvement.
+- In the archived Cursor records, `coalescing_active_wall_ns` and
+  `coalescing_active_cpu_ns` were computed as the total minus a detailed wait
+  breakdown. Cursor did not provide that breakdown, so those archived fields
+  equal total coalescing time and must not be interpreted as active work. The
+  phase tables above use only the valid total coalescing wall and CPU fields.
+  The sampler now emits these active fields as unavailable (`null`) when a
+  coalescing attempt lacks a wait breakdown; an advance with no coalescing
+  attempt records zero.
 - Phase p99s use only 78–101 samples and are noisy. ACK p99s use 781 samples.
   Instrumentation can perturb scheduling and latency; these are not promotion
   scores.

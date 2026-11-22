@@ -254,6 +254,19 @@ impl Drop for WalV8DurabilityPhaseSampleGuard {
     }
 }
 
+#[cfg(feature = "bench")]
+fn coalescing_active_duration_ns(
+    total_ns: u64,
+    detailed_wait_ns: Option<u64>,
+    coalescing_attempted: bool,
+) -> Option<u64> {
+    match detailed_wait_ns {
+        Some(wait_ns) => Some(total_ns.saturating_sub(wait_ns)),
+        None if !coalescing_attempted => Some(0),
+        None => None,
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct WalV8RetirementObservation {
     #[cfg(feature = "bench")]
@@ -5541,6 +5554,8 @@ impl WalV8ParallelWriter {
             #[cfg(feature = "bench")]
             let mut coalescing_detail = None;
             #[cfg(feature = "bench")]
+            let mut coalescing_attempted = false;
+            #[cfg(feature = "bench")]
             let mut coalescing_wall_ns = 0_u64;
             #[cfg(feature = "bench")]
             let mut coalescing_cpu_ns = 0_u64;
@@ -5596,6 +5611,10 @@ impl WalV8ParallelWriter {
                 let ready_tickets_before_coalescing = snapshot.ready_prefix.len() as u64;
                 #[cfg(feature = "bench")]
                 let admitted_tickets_before_coalescing = snapshot.admitted_ticket_count as u64;
+                #[cfg(feature = "bench")]
+                {
+                    coalescing_attempted = true;
+                }
                 #[cfg(feature = "bench")]
                 let started = profile.as_ref().map(|_| Instant::now());
                 #[cfg(feature = "bench")]
@@ -6009,19 +6028,23 @@ impl WalV8ParallelWriter {
                         frontier_lock_wait_ns,
                         coalescing_wall_ns,
                         coalescing_cpu_ns,
-                        coalescing_active_wall_ns: coalescing_wall_ns.saturating_sub(
-                            coalescing_detail.map_or(0, |detail| {
+                        coalescing_active_wall_ns: coalescing_active_duration_ns(
+                            coalescing_wall_ns,
+                            coalescing_detail.map(|detail| {
                                 detail
                                     .state_lock_wait_wall_ns
                                     .saturating_add(detail.condvar_wait_wall_ns)
                             }),
+                            coalescing_attempted,
                         ),
-                        coalescing_active_cpu_ns: coalescing_cpu_ns.saturating_sub(
-                            coalescing_detail.map_or(0, |detail| {
+                        coalescing_active_cpu_ns: coalescing_active_duration_ns(
+                            coalescing_cpu_ns,
+                            coalescing_detail.map(|detail| {
                                 detail
                                     .state_lock_wait_cpu_ns
                                     .saturating_add(detail.condvar_wait_cpu_ns)
                             }),
+                            coalescing_attempted,
                         ),
                         coalescing_state_lock_wait_wall_ns: coalescing_detail
                             .map_or(0, |detail| detail.state_lock_wait_wall_ns),
@@ -6630,6 +6653,14 @@ mod tests {
     use crate::wal::v7::admission::{
         WalV7ResourceCharge, WalV7ResourceLedger, WalV7ResourceLimits, WalV7RetainedResources,
     };
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn coalescing_active_duration_is_unknown_without_a_wait_breakdown() {
+        assert_eq!(coalescing_active_duration_ns(120, None, true), None);
+        assert_eq!(coalescing_active_duration_ns(0, None, false), Some(0));
+        assert_eq!(coalescing_active_duration_ns(120, Some(35), true), Some(85));
+    }
 
     #[test]
     fn extent_policy_vec_matches_btree_for_mixed_out_of_order_ranges() -> Result<()> {
