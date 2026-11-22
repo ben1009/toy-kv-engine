@@ -334,3 +334,17 @@ change, qualify the non-bench Cursor path with production I/O configuration,
 including buffered FRONTIER and production extent preparation, across PITR,
 crash recovery, rotation and seal tests. Keep Eager available as the rollback
 mode until that qualification and a separate default-change review are complete.
+
+## Cursor completion and submission follow-ups (2026-11-22)
+
+The Direct Completion comparison did not pass its Point16 throughput gate.
+The separate allocation-free Singleton DATA Submission comparison also failed
+the throughput gate: Point8 gained 1.11%, while Point16 regressed 0.43% and
+won one of five pairs. Both remain experimental; neither changes the
+production default. Because the standalone Singleton candidate did not qualify,
+do not infer that combining it with Direct Completion will help or proceed to
+a combined performance run on these results.
+
+See the [Direct Completion GCP report](benchmarks/rfc-027-v8-cursor-direct-completion-gcp-20261122.md)
+and [Singleton Submission GCP report](benchmarks/rfc-027-v8-cursor-singleton-submission-gcp-20261122.md)
+for the complete scores, validation and provenance.
