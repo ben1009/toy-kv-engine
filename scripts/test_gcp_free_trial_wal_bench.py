@@ -40,6 +40,9 @@ from gcp_wal_matrix import (
     POINT_PROGRESS_PLAN_SCHEMA_V3,
     POINT_PROGRESS_RING_NUM,
     POINT_PROGRESS_RING_WRITERS,
+    CURSOR_DIRECT_COMPLETION_ARMS,
+    build_cursor_direct_completion_plan,
+    build_cursor_direct_completion_schedule,
     V8_EXTENT_POLICY_STORAGE_NUM,
     V8_EXTENT_POLICY_STORAGE_WRITERS,
     V8_MUTEX_DIAGNOSTIC_NUM,
@@ -77,6 +80,7 @@ from gcp_wal_matrix import (
     validate_point_borrowed_input_rows,
     validate_point_direct_frame_rows,
     validate_point_progress_ring_rows,
+    validate_cursor_direct_completion_rows,
     validate_v8_extent_policy_storage_rows,
     validate_v8_mutex_diagnostic_rows,
     validate_v8_point_cpu_attribution_rows,
@@ -348,6 +352,9 @@ class PointProgressRingQualificationTests(unittest.TestCase):
             "progress_cursor_enabled": cursor_enabled,
             "sliding_extent_preparation": end_preparation,
         }
+        if "cursor_direct_completion_enabled" in row:
+            start["cursor_direct_completion_enabled"] = bool(row["cursor_direct_completion_enabled"])
+            end["cursor_direct_completion_enabled"] = bool(row["cursor_direct_completion_enabled"])
         point = row["workload"] == "point"
         speed = 100_000.0
         if ring_enabled and row["writer"] in (8, 16) and point:
@@ -401,6 +408,7 @@ class PointProgressRingQualificationTests(unittest.TestCase):
         root: Path,
         *,
         cursor: bool = False,
+        direct_completion: bool = False,
         cursor_schema_version: int | None = None,
         include_schema_version: bool = True,
     ) -> Path:
@@ -408,7 +416,10 @@ class PointProgressRingQualificationTests(unittest.TestCase):
         results.mkdir()
         commit = "a" * 40
         binary_sha = "b" * 64
-        if cursor_schema_version == POINT_PROGRESS_PLAN_SCHEMA_V2:
+        if direct_completion:
+            schedule_builder = build_cursor_direct_completion_schedule
+            plan_builder = build_cursor_direct_completion_plan
+        elif cursor_schema_version == POINT_PROGRESS_PLAN_SCHEMA_V2:
             schedule_builder = build_point_progress_cursor_v2_schedule
             plan_builder = build_point_progress_cursor_v2_plan
         elif cursor:
@@ -430,7 +441,11 @@ class PointProgressRingQualificationTests(unittest.TestCase):
         (results / "benchmark-plan.json").write_text(json.dumps(plan), encoding="utf-8")
         (results / "commit.txt").write_text(commit + "\n", encoding="utf-8")
         (results / "write-perf.sha256").write_text(binary_sha + "\n", encoding="utf-8")
-        schedule_name = "point-progress-cursor-schedule.tsv" if cursor else "point-progress-ring-schedule.tsv"
+        schedule_name = (
+            "cursor-direct-completion-schedule.tsv" if direct_completion else
+            "point-progress-cursor-schedule.tsv" if cursor else
+            "point-progress-ring-schedule.tsv"
+        )
         with (results / schedule_name).open("w", encoding="utf-8", newline="") as stream:
             writer = csv.DictWriter(stream, fieldnames=schedule[0].keys(), delimiter="\t", lineterminator="\n")
             writer.writeheader()
@@ -455,12 +470,16 @@ class PointProgressRingQualificationTests(unittest.TestCase):
             (run_dir / "environment.txt").write_text(
                 progress_ring_runner._expected_environment_text(
                     bool(row["progress_ring_enabled"]), bool(row.get("progress_cursor_enabled", False)),
-                    row.get("progress_counters_enabled"),
+                    row.get("progress_counters_enabled"), row.get("cursor_direct_completion_enabled"),
                 ),
                 encoding="utf-8",
             )
             rows.append(metadata)
-        if cursor_schema_version == POINT_PROGRESS_PLAN_SCHEMA_V2:
+        if direct_completion:
+            summary = progress_ring_runner._direct_completion_summary(
+                rows, POINT_PROGRESS_RING_WRITERS, len(schedule),
+            )
+        elif cursor_schema_version == POINT_PROGRESS_PLAN_SCHEMA_V2:
             summary = progress_ring_runner._cursor_v2_summary(
                 rows, POINT_PROGRESS_RING_WRITERS, len(schedule),
             )
@@ -500,6 +519,14 @@ class PointProgressRingQualificationTests(unittest.TestCase):
                 environment.get("TOYKV_BENCH_V8_PROGRESS_COUNTERS"),
                 "0" if counters_enabled is False else None,
             )
+        direct_environment = progress_ring_runner._environment(
+            True, True, False, True,
+        )
+        self.assertEqual(direct_environment["TOYKV_BENCH_V8_CURSOR_DIRECT_COMPLETION"], "1")
+        self.assertIn(
+            "TOYKV_BENCH_V8_CURSOR_DIRECT_COMPLETION=1\n",
+            progress_ring_runner._expected_environment_text(True, True, False, True),
+        )
         with self.assertRaisesRegex(ValueError, r"only Eager \(0\) and Cursor \(2\)"):
             progress_ring_runner._environment(False, True)
         with self.assertRaisesRegex(ValueError, r"only Eager \(0\) and Cursor \(2\)"):
@@ -533,8 +560,82 @@ class PointProgressRingQualificationTests(unittest.TestCase):
                 "single 16-vCPU host; RAID0 over 2 Local SSDs; same source and binary for two arms",
             )
             self.assertEqual(plan["progress_cursor_ab"]["candidate_value"], "2")
-            self.assertFalse(plan["progress_counters_enabled"])
+
+    def test_cursor_direct_completion_fixture_verifies_actual_arm_switch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            results = self._make_fixture(Path(temporary), direct_completion=True)
+            schedule = build_cursor_direct_completion_schedule(POINT_PROGRESS_RING_WRITERS)
+            self.assertEqual(len(schedule), 40)
+            self.assertEqual({row["arm"] for row in schedule}, set(CURSOR_DIRECT_COMPLETION_ARMS))
+            self.assertTrue(progress_ring_runner.verify_direct_completion_results_directory(results)["verified"])
+            summary = json.loads((results / "summary.json").read_text(encoding="utf-8"))
+            self.assertTrue(validate_cursor_direct_completion_rows(
+                summary["results"], POINT_PROGRESS_RING_WRITERS,
+            )["complete"])
             self.assertTrue(BENCH._verify_result_set(results)["verified"])
+            plan = json.loads((results / "benchmark-plan.json").read_text(encoding="utf-8"))
+            self.assertEqual(plan["suite"], "v8-cursor-direct-completion")
+            self.assertEqual(plan["arms"], list(CURSOR_DIRECT_COMPLETION_ARMS))
+            self.assertEqual(plan["runs_planned"], 40)
+            direct = next(row for row in schedule if row["arm"] == "cursor_direct")
+            relay = next(row for row in schedule if row["arm"] == "cursor_relay")
+            self.assertTrue(direct["cursor_direct_completion_enabled"])
+            self.assertFalse(relay["cursor_direct_completion_enabled"])
+            direct_env = (results / progress_ring_runner._run_id(direct) / "environment.txt").read_text(
+                encoding="utf-8",
+            )
+            relay_env = (results / progress_ring_runner._run_id(relay) / "environment.txt").read_text(
+                encoding="utf-8",
+            )
+            self.assertIn("TOYKV_BENCH_V8_CURSOR_DIRECT_COMPLETION=1\n", direct_env)
+            self.assertIn("TOYKV_BENCH_V8_CURSOR_DIRECT_COMPLETION=0\n", relay_env)
+
+            direct_metadata_path = results / progress_ring_runner._run_id(direct) / "run-metadata.json"
+            metadata = json.loads(direct_metadata_path.read_text(encoding="utf-8"))
+            metadata["cursor_direct_completion_enabled"] = False
+            direct_metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+            verification = progress_ring_runner.verify_direct_completion_results_directory(results)
+            self.assertFalse(verification["verified"])
+            self.assertTrue(any("metadata" in error or "matrix" in error for error in verification["errors"]))
+
+    def test_run_suite_writes_separate_direct_completion_plan_and_schedule(self) -> None:
+        binary = Path("scripts/gcp_v8_point_progress_ring_runner.py")
+        binary_sha256 = self._sha256(binary)
+        commit = "a" * 40
+
+        def fake_run_one(**kwargs: object) -> dict[str, object]:
+            row = kwargs["row"]
+            kwargs["on_subprocess_started"]()
+            raw = self._raw_record(row)
+            return {
+                **row,
+                "source_commit": commit,
+                "binary_sha256": binary_sha256,
+                "exit_code": 0,
+                "duration_seconds": 5.0,
+                **progress_ring_runner._validate_record(raw, row),
+            }
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args = SimpleNamespace(
+                commit=commit, binary=binary, binary_sha256=binary_sha256,
+                machine_type="c4-standard-16-lssd", ssd_count=2, ssd_gib=750,
+                writers=",".join(map(str, POINT_PROGRESS_RING_WRITERS)),
+                results_dir=root / "results", db_root=root / "db", safe_deadline_epoch=4_000_000_000,
+                candidate_mode="direct-completion",
+            )
+            with patch.object(progress_ring_runner, "_run_one", side_effect=fake_run_one):
+                status = progress_ring_runner.run_suite(args)
+            self.assertEqual(status, 0)
+            self.assertTrue((args.results_dir / "cursor-direct-completion-schedule.tsv").is_file())
+            self.assertFalse((args.results_dir / "point-progress-cursor-schedule.tsv").exists())
+            plan = json.loads((args.results_dir / "benchmark-plan.json").read_text(encoding="utf-8"))
+            summary = json.loads((args.results_dir / "summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(plan["suite"], "v8-cursor-direct-completion")
+            self.assertEqual(summary["suite"], "v8-cursor-direct-completion")
+            self.assertEqual(summary["arms"], list(CURSOR_DIRECT_COMPLETION_ARMS))
+            self.assertTrue(summary["complete"])
 
     def test_historical_progress_plan_schemas_remain_verifiable(self) -> None:
         self.assertEqual(
@@ -705,6 +806,51 @@ class PointProgressRingQualificationTests(unittest.TestCase):
         for arguments in invalid_arguments:
             with self.subTest(arguments=arguments), self.assertRaises(SystemExit):
                 BENCH.parse_args(arguments)
+
+    def test_direct_completion_cli_uses_cursor_isolated_network_and_spend_guards(self) -> None:
+        valid = [
+            "--project", "test-project", "--zone", "us-east1-b", "--commit", "a" * 40,
+            "--network", "walbench-isolated", "--subnet", "walbench-subnet",
+            "--ssh-source-range", "192.0.2.10/32", "--max-runtime-minutes", "60",
+            "--estimated-hourly-cost-usd", "1.5", "--max-estimated-spend-usd", "2",
+            "--v8-cursor-direct-completion-ab", "--preflight-only",
+        ]
+        args = BENCH.parse_args(valid)
+        self.assertEqual(args.writers, POINT_PROGRESS_RING_WRITERS)
+        self.assertEqual(args.num, POINT_PROGRESS_RING_NUM)
+        self.assertEqual(args.machine_type, "c4-standard-16-lssd")
+        self.assertTrue(args.v8_cursor_direct_completion_ab)
+        for suffix in (
+            ["--network", "default", "--subnet", "default", "--ssh-source-range", "192.0.2.10/32"],
+            ["--network", "walbench-isolated", "--subnet", "walbench-subnet"],
+        ):
+            with self.subTest(suffix=suffix), redirect_stderr(StringIO()), self.assertRaises(SystemExit):
+                BENCH.parse_args([
+                    *[item for item in valid if item not in (
+                        "--network", "walbench-isolated", "--subnet", "walbench-subnet",
+                        "--ssh-source-range", "192.0.2.10/32",
+                    )],
+                    *suffix,
+                ])
+
+    def test_remote_runner_accepts_direct_completion_suite_only_for_fixed_matrix(self) -> None:
+        remote_script = Path(__file__).with_name("gcp-free-trial-wal-bench-remote.sh")
+        command = [
+            "bash", str(remote_script), "a" * 40, "100000", "test-project", "us-central1-a",
+            "wal-test", "4102444800", "c4-standard-16-lssd", "1,8,16",
+            "v8-cursor-direct-completion", "-", "-",
+        ]
+        accepted = subprocess.run(
+            command, cwd=Path(__file__).resolve().parents[1], capture_output=True,
+            check=False, text=True, timeout=5,
+        )
+        self.assertNotEqual(accepted.returncode, 64, accepted.stderr)
+        rejected = subprocess.run(
+            [*command[:9], "16", *command[10:]], cwd=Path(__file__).resolve().parents[1],
+            capture_output=True, check=False, text=True, timeout=5,
+        )
+        self.assertEqual(rejected.returncode, 64)
+        self.assertIn("requires c4-standard-16-lssd, writers 1,8,16", rejected.stderr)
 
     def test_progress_ring_preflight_audits_isolated_ingress(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -4132,7 +4278,8 @@ print('[hotpath] diagnostic report follows')
             run_dir = results / "r1-w16-point-v8_parallel"
             run_dir.mkdir(parents=True)
             for name in (
-                "profile-schedule.tsv", "rust-toolchain.txt", "write-perf.sha256", "perf-version.txt",
+                "profile-schedule.tsv", "cursor-direct-completion-schedule.tsv", "rust-toolchain.txt",
+                "write-perf.sha256", "perf-version.txt",
             ):
                 (results / name).write_text("fixture\n", encoding="utf-8")
             for name in (
@@ -4146,13 +4293,14 @@ print('[hotpath] diagnostic report follows')
             result = self._run_remote_bundle(command, results, root)
             self.assertEqual(result.returncode, 0, result.stderr)
             metadata = self._archive_metadata(result.stdout)
-            self.assertEqual(metadata["ARCHIVE_FILES"], "11")
+            self.assertEqual(metadata["ARCHIVE_FILES"], "12")
             archive = Path(metadata["ARCHIVE_PATH"])
             self.assertEqual(archive.parent, root / "remote-tmp")
             with tarfile.open(archive, "r:gz") as bundle:
                 names = set(bundle.getnames())
             for name in (
                 "results/profile-schedule.tsv", "results/rust-toolchain.txt",
+                "results/cursor-direct-completion-schedule.tsv",
                 "results/write-perf.sha256", "results/perf-version.txt",
                 "results/r1-w16-point-v8_parallel/stderr.log", "results/r1-w16-point-v8_parallel/timeline.json",
                 "results/r1-w16-point-v8_parallel/perf.data", "results/r1-w16-point-v8_parallel/perf-report.txt",

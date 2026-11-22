@@ -57,6 +57,9 @@ use crate::wal::{
 };
 
 #[cfg(feature = "bench")]
+use crate::wal::parallel_worker::DirectGroupWriteCompletion;
+
+#[cfg(feature = "bench")]
 use super::parallel::{WalV8ReadyPrefix, WalV8TicketProgress};
 
 use super::{
@@ -342,6 +345,8 @@ const WAL_V8_POINT_FRONTIER_CREDIT_BATCH_ENV: &str = "TOYKV_BENCH_V8_POINT_FRONT
 const WAL_V8_POINT_PROGRESS_RING_ENV: &str = "TOYKV_BENCH_V8_POINT_PROGRESS_RING";
 #[cfg(feature = "bench")]
 const WAL_V8_POINT_PROGRESS_COUNTERS_ENV: &str = "TOYKV_BENCH_V8_PROGRESS_COUNTERS";
+#[cfg(feature = "bench")]
+const WAL_V8_CURSOR_DIRECT_COMPLETION_ENV: &str = "TOYKV_BENCH_V8_CURSOR_DIRECT_COMPLETION";
 #[cfg(not(feature = "bench"))]
 const WAL_V8_PROGRESS_MODE_ENV: &str = "TOYKV_WAL_V8_PROGRESS_MODE";
 const WAL_V8_EXTENT_PREPARATION_CHUNK_BYTES: usize = 128 * 1024;
@@ -419,6 +424,36 @@ fn progress_counters_enabled_from_value(
 fn progress_counters_enabled_from_environment(progress_mode: WalV8ProgressMode) -> Result<bool> {
     progress_counters_enabled_from_value(
         std::env::var_os(WAL_V8_POINT_PROGRESS_COUNTERS_ENV).as_deref(),
+        progress_mode,
+    )
+}
+
+#[cfg(feature = "bench")]
+fn cursor_direct_completion_enabled_from_value(
+    value: Option<&OsStr>,
+    progress_mode: WalV8ProgressMode,
+) -> Result<bool> {
+    let enabled = match value {
+        None => false,
+        Some(value) if value.to_str() == Some("0") => false,
+        Some(value) if value.to_str() == Some("1") => true,
+        Some(value) => anyhow::bail!(
+            "invalid {WAL_V8_CURSOR_DIRECT_COMPLETION_ENV} {value:?}; expected `0` or `1`"
+        ),
+    };
+    ensure!(
+        !enabled || progress_mode == WalV8ProgressMode::Cursor,
+        "{WAL_V8_CURSOR_DIRECT_COMPLETION_ENV}=1 requires Cursor progress mode"
+    );
+    Ok(enabled)
+}
+
+#[cfg(feature = "bench")]
+fn cursor_direct_completion_enabled_from_environment(
+    progress_mode: WalV8ProgressMode,
+) -> Result<bool> {
+    cursor_direct_completion_enabled_from_value(
+        std::env::var_os(WAL_V8_CURSOR_DIRECT_COMPLETION_ENV).as_deref(),
         progress_mode,
     )
 }
@@ -2655,6 +2690,8 @@ struct WalV8ParallelIo {
     #[cfg(feature = "bench")]
     extent_preparation: Option<Arc<WalV8SlidingExtentPreparation>>,
     completion_events: Option<Receiver<WalV8CompletedGroupEvent>>,
+    #[cfg(feature = "bench")]
+    direct_completions: Option<Receiver<DirectGroupWriteCompletion>>,
     #[cfg(test)]
     progress_wait_hook: Mutex<Option<WalV8ProgressWaitHook>>,
     #[cfg(test)]
@@ -2671,24 +2708,62 @@ impl WalV8ParallelIo {
         first_ticket: u64,
         extent_preallocator: Option<Arc<WalV8ExtentPreallocator>>,
         #[cfg(feature = "bench")] extent_preparation: Option<Arc<WalV8SlidingExtentPreparation>>,
+        direct_completion_enabled: bool,
     ) -> Result<Arc<Self>> {
-        let (completion_event_sender, completion_events) = if coordinator.progress_ring_enabled() {
-            let capacity = coordinator.completion_queue_capacity();
-            ensure!(capacity > 0, "v8 completion event queue capacity is empty");
-            let (sender, receiver) = crossbeam_channel::bounded(capacity);
-            (Some(sender), Some(receiver))
-        } else {
-            (None, None)
-        };
+        ensure!(
+            !direct_completion_enabled || coordinator.progress_cursor_enabled(),
+            "Cursor direct completion requires Cursor progress mode"
+        );
+        #[cfg(not(feature = "bench"))]
+        ensure!(
+            !direct_completion_enabled,
+            "Cursor direct completion is available only with the bench feature"
+        );
+
+        let (completion_event_sender, completion_events) =
+            if coordinator.progress_ring_enabled() && !direct_completion_enabled {
+                let capacity = coordinator.completion_queue_capacity();
+                ensure!(capacity > 0, "v8 completion event queue capacity is empty");
+                let (sender, receiver) = crossbeam_channel::bounded(capacity);
+                (Some(sender), Some(receiver))
+            } else {
+                (None, None)
+            };
         let progress_tokens = coordinator.take_progress_token_receiver()?;
         let shutdown_started = Arc::new(AtomicBool::new(false));
         let submit_any_ready_ticket = benchmark_submits_any_ready_ticket()?;
         let worker_file = Arc::new(worker_file);
         let buffer_pool = Arc::new(ArrayQueue::<WalV8DataBuffer>::new(1));
-        let mut worker = if submit_any_ready_ticket {
-            IoWorker::spawn_out_of_order(worker_file, buffer_pool, None)?
+        #[cfg(feature = "bench")]
+        let (mut worker, direct_completions) = if direct_completion_enabled {
+            let capacity = coordinator.completion_queue_capacity();
+            ensure!(capacity > 0, "v8 direct completion queue capacity is empty");
+            let (sender, receiver) = crossbeam_channel::bounded(capacity);
+            let worker = IoWorker::spawn_cursor_direct_completions(
+                worker_file,
+                buffer_pool,
+                None,
+                submit_any_ready_ticket,
+                sender,
+                coordinator.worker_completion_handle(),
+            )?;
+            (worker, Some(receiver))
         } else {
-            IoWorker::spawn(worker_file, buffer_pool, None)?
+            let worker = if submit_any_ready_ticket {
+                IoWorker::spawn_out_of_order(worker_file, buffer_pool, None)?
+            } else {
+                IoWorker::spawn(worker_file, buffer_pool, None)?
+            };
+            (worker, None)
+        };
+        #[cfg(not(feature = "bench"))]
+        let mut worker = {
+            let worker = if submit_any_ready_ticket {
+                IoWorker::spawn_out_of_order(worker_file, buffer_pool, None)?
+            } else {
+                IoWorker::spawn(worker_file, buffer_pool, None)?
+            };
+            worker
         };
         let client = worker.client();
         let progress = worker.sync_progress();
@@ -2697,7 +2772,11 @@ impl WalV8ParallelIo {
         // worker still contributes SQE/CQE and eventfd metrics, but its DATA
         // submission groups are not V8 durability groups.
         progress.suppress_commit_group_metrics();
-        let completions = worker.take_completions();
+        let completions = if direct_completion_enabled {
+            None
+        } else {
+            Some(worker.take_completions())
+        };
         #[cfg(feature = "bench")]
         let completion_progress = Arc::clone(&progress);
         let completion_coordinator = coordinator.clone();
@@ -2707,84 +2786,93 @@ impl WalV8ParallelIo {
         let completion_reap_hook: WalV8SharedCompletionReapHook = Arc::new(Mutex::new(None));
         #[cfg(test)]
         let completion_reap_hook_for_thread = Arc::clone(&completion_reap_hook);
-        let completion_thread = thread::Builder::new()
-            .name("wal-v8-completion-reaper".to_owned())
-            .spawn(move || {
-                let _exit_guard = WalV8CompletionReaperExitGuard {
-                    coordinator: completion_coordinator.clone(),
-                    shutdown_started: completion_shutdown_started,
-                };
-                #[cfg(feature = "bench")]
-                let mut completion_timeline_enabled = None;
-                while let Ok(result) = completions.recv() {
-                    #[cfg(feature = "bench")]
-                    let completion_observed_at =
-                        completion_coordinator.capture_data_completion_time();
-                    #[cfg(feature = "bench")]
-                    let timeline_enabled = *completion_timeline_enabled.get_or_insert_with(|| {
-                        completion_progress.completion_timeline_sample_every() > 0
-                    });
-                    #[cfg(feature = "bench")]
-                    let reaper_recv_at = timeline_enabled
-                        .then(|| completion_observed_at.unwrap_or_else(Instant::now));
-                    #[cfg(feature = "bench")]
-                    let mut cpu_sample = {
-                        let profile = completion_progress.profile();
-                        let work_items = result.tickets.end.saturating_sub(result.tickets.start);
-                        profile.as_ref().and_then(|profile| {
-                            profile.begin_wal_cpu_thread_sample(
-                                crate::mem_table::WalCpuThreadRole::V8CompletionReaper,
-                                work_items,
-                            )
-                        })
-                    };
-                    #[cfg(feature = "bench")]
-                    let timeline = reaper_recv_at.and_then(|received_at| {
-                        completion_progress.take_completion_timeline(result.group_id, received_at)
-                    });
-                    #[cfg(test)]
-                    if let Some(hook) = completion_reap_hook_for_thread.lock().clone() {
-                        hook(WalV8CompletionReapTestEvent::BeforeReap);
-                    }
-                    let reap_result = {
+        let completion_thread = if let Some(completions) = completions {
+            Some(
+                thread::Builder::new()
+                    .name("wal-v8-completion-reaper".to_owned())
+                    .spawn(move || {
+                        let _exit_guard = WalV8CompletionReaperExitGuard {
+                            coordinator: completion_coordinator.clone(),
+                            shutdown_started: completion_shutdown_started,
+                        };
                         #[cfg(feature = "bench")]
-                        {
-                            reap_v8_group_result(
-                                &completion_coordinator,
-                                result,
-                                completion_event_sender_for_thread.as_ref(),
-                                completion_observed_at,
-                                timeline,
-                            )
+                        let mut completion_timeline_enabled = None;
+                        while let Ok(result) = completions.recv() {
+                            #[cfg(feature = "bench")]
+                            let completion_observed_at =
+                                completion_coordinator.capture_data_completion_time();
+                            #[cfg(feature = "bench")]
+                            let timeline_enabled =
+                                *completion_timeline_enabled.get_or_insert_with(|| {
+                                    completion_progress.completion_timeline_sample_every() > 0
+                                });
+                            #[cfg(feature = "bench")]
+                            let reaper_recv_at = timeline_enabled
+                                .then(|| completion_observed_at.unwrap_or_else(Instant::now));
+                            #[cfg(feature = "bench")]
+                            let mut cpu_sample = {
+                                let profile = completion_progress.profile();
+                                let work_items =
+                                    result.tickets.end.saturating_sub(result.tickets.start);
+                                profile.as_ref().and_then(|profile| {
+                                    profile.begin_wal_cpu_thread_sample(
+                                        crate::mem_table::WalCpuThreadRole::V8CompletionReaper,
+                                        work_items,
+                                    )
+                                })
+                            };
+                            #[cfg(feature = "bench")]
+                            let timeline = reaper_recv_at.and_then(|received_at| {
+                                completion_progress
+                                    .take_completion_timeline(result.group_id, received_at)
+                            });
+                            #[cfg(test)]
+                            if let Some(hook) = completion_reap_hook_for_thread.lock().clone() {
+                                hook(WalV8CompletionReapTestEvent::BeforeReap);
+                            }
+                            let reap_result = {
+                                #[cfg(feature = "bench")]
+                                {
+                                    reap_v8_group_result(
+                                        &completion_coordinator,
+                                        result,
+                                        completion_event_sender_for_thread.as_ref(),
+                                        completion_observed_at,
+                                        timeline,
+                                    )
+                                }
+                                #[cfg(not(feature = "bench"))]
+                                {
+                                    reap_v8_group_result(
+                                        &completion_coordinator,
+                                        result,
+                                        completion_event_sender_for_thread.as_ref(),
+                                    )
+                                }
+                            };
+                            #[cfg(test)]
+                            if reap_result.is_ok()
+                                && let Some(hook) = completion_reap_hook_for_thread.lock().clone()
+                            {
+                                hook(WalV8CompletionReapTestEvent::AfterReap);
+                            }
+                            #[cfg(feature = "bench")]
+                            if let Some(sample) = cpu_sample.as_mut()
+                                && reap_result.is_ok()
+                            {
+                                sample.mark_completed();
+                            }
+                            if let Err(error) = reap_result {
+                                log::error!("v8 WAL completion reaper failed: {error:#}");
+                                completion_coordinator.poison();
+                            }
                         }
-                        #[cfg(not(feature = "bench"))]
-                        {
-                            reap_v8_group_result(
-                                &completion_coordinator,
-                                result,
-                                completion_event_sender_for_thread.as_ref(),
-                            )
-                        }
-                    };
-                    #[cfg(test)]
-                    if reap_result.is_ok()
-                        && let Some(hook) = completion_reap_hook_for_thread.lock().clone()
-                    {
-                        hook(WalV8CompletionReapTestEvent::AfterReap);
-                    }
-                    #[cfg(feature = "bench")]
-                    if let Some(sample) = cpu_sample.as_mut()
-                        && reap_result.is_ok()
-                    {
-                        sample.mark_completed();
-                    }
-                    if let Err(error) = reap_result {
-                        log::error!("v8 WAL completion reaper failed: {error:#}");
-                        completion_coordinator.poison();
-                    }
-                }
-            })
-            .context("failed to spawn v8 WAL completion reaper")?;
+                    })
+                    .context("failed to spawn v8 WAL completion reaper")?,
+            )
+        } else {
+            None
+        };
 
         Ok(Arc::new(Self {
             client,
@@ -2816,13 +2904,15 @@ impl WalV8ParallelIo {
             #[cfg(feature = "bench")]
             extent_preparation,
             completion_events,
+            #[cfg(feature = "bench")]
+            direct_completions,
             #[cfg(test)]
             progress_wait_hook: Mutex::new(None),
             #[cfg(test)]
             completion_reap_hook,
             progress_tokens,
             shutdown_started,
-            completion_thread: Mutex::new(Some(completion_thread)),
+            completion_thread: Mutex::new(completion_thread),
         }))
     }
 
@@ -2835,7 +2925,11 @@ impl WalV8ParallelIo {
             self.coordinator.owns_durability_driver(driver),
             "v8 progress scan is not owned by the active durability driver"
         );
-        let Some(receiver) = &self.completion_events else {
+        #[cfg(feature = "bench")]
+        let has_direct_completion_queue = self.direct_completions.is_some();
+        #[cfg(not(feature = "bench"))]
+        let has_direct_completion_queue = false;
+        if self.completion_events.is_none() && !has_direct_completion_queue {
             return Ok(if capture_monotonic_ns {
                 #[cfg(feature = "bench")]
                 {
@@ -2848,7 +2942,7 @@ impl WalV8ParallelIo {
             } else {
                 self.coordinator.frontier_ready_snapshot()
             });
-        };
+        }
 
         // The capacity-one token is persistent: consuming it before scanning
         // means a publisher racing after the scan leaves another token for the
@@ -2861,12 +2955,26 @@ impl WalV8ParallelIo {
             .completion_batch
             .take()
             .context("cursor durability driver completion buffer is missing")?;
-        let snapshot = self
-            .drain_completion_events(receiver, &mut batch)
-            .and_then(|()| {
-                self.coordinator
-                    .advance_and_snapshot(driver, &batch, capture_monotonic_ns)
-            });
+        let drain_result = if let Some(receiver) = &self.completion_events {
+            self.drain_completion_events(receiver, &mut batch)
+        } else {
+            #[cfg(feature = "bench")]
+            {
+                let receiver = self
+                    .direct_completions
+                    .as_ref()
+                    .context("Cursor direct completion queue is missing")?;
+                self.drain_direct_completion_events(receiver, &mut batch)
+            }
+            #[cfg(not(feature = "bench"))]
+            {
+                anyhow::bail!("Cursor direct completion is unavailable without bench feature")
+            }
+        };
+        let snapshot = drain_result.and_then(|()| {
+            self.coordinator
+                .advance_and_snapshot(driver, &batch, capture_monotonic_ns)
+        });
         batch.clear();
         driver.completion_batch = Some(batch);
         snapshot
@@ -2885,6 +2993,44 @@ impl WalV8ParallelIo {
                     if !self.shutdown_started.load(Ordering::Acquire) {
                         self.coordinator.poison();
                         anyhow::bail!("v8 DATA completion queue disconnected before teardown");
+                    }
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "bench")]
+    fn drain_direct_completion_events(
+        &self,
+        receiver: &Receiver<DirectGroupWriteCompletion>,
+        batch: &mut Vec<WalV8CompletedGroupEvent>,
+    ) -> Result<()> {
+        for _ in 0..self.coordinator.completion_queue_capacity() {
+            match receiver.try_recv() {
+                Ok(completion) => {
+                    if let Some(error) = completion.result.error.as_deref() {
+                        self.coordinator.poison();
+                        anyhow::bail!(
+                            "Cursor direct completion queue received failed DATA result: {error}"
+                        );
+                    }
+                    batch.push(WalV8CompletedGroupEvent {
+                        group_id: completion.result.group_id,
+                        tickets: completion.result.tickets,
+                        write_count: completion.result.write_count,
+                        write_bytes: completion.result.write_bytes,
+                        completion_observed_at: completion.completion_observed_at,
+                    });
+                }
+                Err(crossbeam_channel::TryRecvError::Empty) => break,
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    if !self.shutdown_started.load(Ordering::Acquire) {
+                        self.coordinator.poison();
+                        anyhow::bail!(
+                            "v8 direct DATA completion queue disconnected before teardown"
+                        );
                     }
                     break;
                 }
@@ -3980,6 +4126,7 @@ impl WalV8LeaderWriter {
             sliding_extent_preparation: None,
             progress_ring_enabled: false,
             progress_cursor_enabled: false,
+            cursor_direct_completion_enabled: false,
             progress_diagnostics: None,
         };
 
@@ -4067,9 +4214,28 @@ impl WalV8LeaderWriter {
     }
 
     fn into_parallel_with_worker_file_and_progress_mode(
+        self,
+        worker_file: File,
+        progress_mode: WalV8ProgressMode,
+    ) -> Result<WalV8ParallelWriter> {
+        #[cfg(feature = "bench")]
+        let direct_completion_enabled =
+            cursor_direct_completion_enabled_from_environment(progress_mode)?;
+        #[cfg(not(feature = "bench"))]
+        let direct_completion_enabled = false;
+
+        self.into_parallel_with_worker_file_progress_and_completion(
+            worker_file,
+            progress_mode,
+            direct_completion_enabled,
+        )
+    }
+
+    fn into_parallel_with_worker_file_progress_and_completion(
         mut self,
         worker_file: File,
         progress_mode: WalV8ProgressMode,
+        direct_completion_enabled: bool,
     ) -> Result<WalV8ParallelWriter> {
         validate_positional_write_handle(&worker_file)
             .context("validate v8 WAL I/O worker handle")?;
@@ -4112,6 +4278,7 @@ impl WalV8LeaderWriter {
             io_diagnostics.data = WalIoHandleMetadata::from_file(&worker_file)?;
             io_diagnostics.progress_ring_enabled = progress_mode.uses_ring();
             io_diagnostics.progress_cursor_enabled = self.coordinator.progress_cursor_enabled();
+            io_diagnostics.cursor_direct_completion_enabled = direct_completion_enabled;
         }
         #[cfg(feature = "bench")]
         let (extent_preallocator, extent_preparation) =
@@ -4273,6 +4440,7 @@ impl WalV8LeaderWriter {
             extent_preallocator,
             #[cfg(feature = "bench")]
             extent_preparation,
+            direct_completion_enabled,
         )?;
         #[cfg(feature = "bench")]
         if let Some(profile) = profile {
@@ -7004,6 +7172,42 @@ mod tests {
 
     #[cfg(feature = "bench")]
     #[test]
+    fn cursor_direct_completion_switch_requires_cursor_mode() {
+        assert!(
+            !cursor_direct_completion_enabled_from_value(None, WalV8ProgressMode::Cursor).unwrap()
+        );
+        assert!(
+            !cursor_direct_completion_enabled_from_value(
+                Some(OsStr::new("0")),
+                WalV8ProgressMode::Cursor
+            )
+            .unwrap()
+        );
+        assert!(
+            cursor_direct_completion_enabled_from_value(
+                Some(OsStr::new("1")),
+                WalV8ProgressMode::Cursor
+            )
+            .unwrap()
+        );
+        assert!(
+            cursor_direct_completion_enabled_from_value(
+                Some(OsStr::new("1")),
+                WalV8ProgressMode::Eager
+            )
+            .is_err()
+        );
+        assert!(
+            cursor_direct_completion_enabled_from_value(
+                Some(OsStr::new("2")),
+                WalV8ProgressMode::Cursor
+            )
+            .is_err()
+        );
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
     fn lightweight_progress_counters_are_opt_in_for_cursor_mode() {
         assert!(!progress_counters_enabled_from_value(None, WalV8ProgressMode::Cursor).unwrap());
         assert!(
@@ -9364,6 +9568,104 @@ mod tests {
             .open(path)?;
         open_writer(path, installed)?
             .into_parallel_with_worker_file_and_progress_mode(worker_file, mode)
+    }
+
+    #[cfg(feature = "bench")]
+    fn open_parallel_with_direct_completion(
+        path: &Path,
+        installed: &WalV8InstalledRecovery,
+        mode: WalV8ProgressMode,
+    ) -> Result<WalV8ParallelWriter> {
+        let worker_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_DIRECT)
+            .open(path)?;
+        open_writer(path, installed)?.into_parallel_with_worker_file_progress_and_completion(
+            worker_file,
+            mode,
+            true,
+        )
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn cursor_direct_completion_writes_reopens_and_recovers_without_reaper() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("cursor-direct-completion-v8.wal");
+        let wal_header = header();
+        let installed = install_empty(&path, wal_header)?;
+        let writer = match open_parallel_with_direct_completion(
+            &path,
+            &installed,
+            WalV8ProgressMode::Cursor,
+        ) {
+            Ok(writer) => writer,
+            Err(error) if is_io_uring_unavailable_error(&error) => {
+                eprintln!("skipping test (io_uring unavailable): {error:#}");
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+
+        assert!(writer.io.completion_thread.lock().is_none());
+        assert!(writer.io.completion_events.is_none());
+        assert!(writer.io.direct_completions.is_some());
+        assert!(writer.io_diagnostics().cursor_direct_completion_enabled);
+
+        let first_batch = batch(10);
+        writer.append_prepared_batch(
+            writer.preflight_batch(&first_batch, LIVE_WAL_V5_LIMITS)?,
+            first_batch.commit_ts,
+            first_batch.recorded_at,
+        )?;
+        let second_batch = batch(20);
+        writer.append_prepared_batch(
+            writer.preflight_batch(&second_batch, LIVE_WAL_V5_LIMITS)?,
+            second_batch.commit_ts,
+            second_batch.recorded_at,
+        )?;
+        let (_, first_boundary) = writer.active_boundaries()?;
+        assert_eq!(first_boundary.ticket_end, 2);
+        drop(writer);
+
+        let recovered = super::super::install::recover_and_install_active(
+            &path,
+            &[first_boundary],
+            wal_header.predecessor,
+            LIVE_WAL_V5_LIMITS,
+            MAX_WAL_FILE_SIZE,
+        )?;
+        assert_eq!(
+            replayed_batches(&path, &recovered)?,
+            [first_batch.clone(), second_batch.clone()]
+        );
+
+        let reopened =
+            open_parallel_with_direct_completion(&path, &recovered, WalV8ProgressMode::Cursor)?;
+        let third_batch = batch(30);
+        reopened.append_prepared_batch(
+            reopened.preflight_batch(&third_batch, LIVE_WAL_V5_LIMITS)?,
+            third_batch.commit_ts,
+            third_batch.recorded_at,
+        )?;
+        let (_, final_boundary) = reopened.active_boundaries()?;
+        assert_eq!(final_boundary.ticket_end, 3);
+        drop(reopened);
+
+        let final_recovered = super::super::install::recover_and_install_active(
+            &path,
+            &[final_boundary],
+            wal_header.predecessor,
+            LIVE_WAL_V5_LIMITS,
+            MAX_WAL_FILE_SIZE,
+        )?;
+        assert_eq!(
+            replayed_batches(&path, &final_recovered)?,
+            [first_batch, second_batch, third_batch]
+        );
+
+        Ok(())
     }
 
     #[cfg(feature = "bench")]

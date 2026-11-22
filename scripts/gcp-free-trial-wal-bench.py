@@ -46,6 +46,7 @@ from gcp_wal_matrix import (
     POINT_DIRECT_FRAME_WRITERS,
     POINT_PROGRESS_RING_NUM,
     POINT_PROGRESS_RING_WRITERS,
+    build_cursor_direct_completion_plan,
     V8_EXTENT_POLICY_STORAGE_NUM,
     V8_EXTENT_POLICY_STORAGE_WRITERS,
     V8_MUTEX_DIAGNOSTIC_NUM,
@@ -85,6 +86,9 @@ from gcp_wal_matrix import (
 from gcp_commit_order_trace_runner import analyze_trace
 from gcp_v8_point_progress_ring_runner import verify_results_directory as verify_progress_ring_results
 from gcp_v8_point_progress_ring_runner import verify_cursor_results_directory as verify_progress_cursor_results
+from gcp_v8_point_progress_ring_runner import (
+    verify_direct_completion_results_directory as verify_cursor_direct_completion_results,
+)
 MACHINE_TYPE = "c4-standard-8-lssd"
 MACHINE_SPECS = {
     "c4-standard-8-lssd": {"vcpus": 8, "ssd_count": 1, "ssd_gb": 375, "ssd_gib": 375},
@@ -131,6 +135,7 @@ root_names = {
     "point-direct-frame-schedule.tsv",
     "point-progress-ring-schedule.tsv",
     "point-progress-cursor-schedule.tsv",
+    "cursor-direct-completion-schedule.tsv",
     "extent-policy-storage-schedule.tsv",
     "commit-order-trace-analysis.json", "commit.txt", "remote-exit.json",
     "finished_utc.txt", "remote-finished-utc.txt", "remote-status.txt", "host.txt",
@@ -1156,6 +1161,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                              help="Compare V8 Point direct-frame encoding with the existing path and Batch guardrails")
     suite_group.add_argument("--v8-point-progress-cursor-ab", action="store_true",
                              help="Compare V8 Eager and Cursor progress modes with Point/Batch guardrails")
+    suite_group.add_argument("--v8-cursor-direct-completion-ab", action="store_true",
+                             help="Compare Cursor relay and direct completion with Point/Batch guardrails")
     suite_group.add_argument("--v8-extent-policy-storage-ab", action="store_true",
                              help="Compare V8 BTreeMap and Vec extent-policy storage with Point/Batch guardrails")
     parser.add_argument("--baseline-commit", help="Full source commit used as the borrowed-input A/B baseline")
@@ -1190,7 +1197,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Use a manually verified SSH source CIDR when the HTTPS lookup cannot verify that route",
     )
     args = parser.parse_args(argv)
-    point_progress_suite = args.v8_point_progress_cursor_ab
+    point_cursor_direct_completion_suite = args.v8_cursor_direct_completion_ab
+    point_progress_suite = args.v8_point_progress_cursor_ab or point_cursor_direct_completion_suite
     explicit_network = args.network is not None
     if args.repetitions <= 0:
         parser.error("--repetitions must be a positive integer")
@@ -1431,7 +1439,7 @@ def gcloud_base(project: str, zone: str) -> list[str]:
 
 
 def _run_identifier(row: dict[str, Any], suite: str) -> str:
-    if suite in ("v8-point-progress-ring", "v8-point-progress-cursor"):
+    if suite in ("v8-point-progress-ring", "v8-point-progress-cursor", "v8-cursor-direct-completion"):
         return f"r{row['repetition']}-w{row['writer']}-{row['workload']}-{row['arm']}"
     if suite == "v8-small-ticket-profile":
         return f"w{row['writer']}-{row['workload']}-{row['arm']}"
@@ -1455,7 +1463,7 @@ def _run_identifier(row: dict[str, Any], suite: str) -> str:
 
 
 def _summary_row_identifier(row: dict[str, Any], suite: str) -> str:
-    if suite in ("v8-point-progress-ring", "v8-point-progress-cursor"):
+    if suite in ("v8-point-progress-ring", "v8-point-progress-cursor", "v8-cursor-direct-completion"):
         return f"r{int(row['repetition'])}-w{int(row['writer'])}-{row['workload']}-{row['arm']}"
     if suite == "v8-small-ticket-profile":
         return f"w{int(row['writer'])}-{row['workload']}-{row['arm']}"
@@ -1483,7 +1491,7 @@ def _summary_row_identifier(row: dict[str, Any], suite: str) -> str:
 
 
 def _expected_run_metadata(row: dict[str, Any], suite: str) -> dict[str, Any]:
-    if suite in ("v8-point-progress-ring", "v8-point-progress-cursor"):
+    if suite in ("v8-point-progress-ring", "v8-point-progress-cursor", "v8-cursor-direct-completion"):
         keys = (
             "run_index", "writer", "workload", "repetition", "arm", "bench",
             "batch_entries", "batch_size", "num", "sample_every", "extent_mode",
@@ -1492,6 +1500,10 @@ def _expected_run_metadata(row: dict[str, Any], suite: str) -> dict[str, Any]:
         )
         if suite == "v8-point-progress-cursor":
             keys += ("progress_cursor_enabled", "progress_counters_enabled")
+        elif suite == "v8-cursor-direct-completion":
+            keys += (
+                "progress_cursor_enabled", "progress_counters_enabled", "cursor_direct_completion_enabled",
+            )
         return {key: row[key] for key in keys}
     if suite == "v8-small-ticket-profile":
         return {key: row[key] for key in ("writer", "workload", "arm", "perf_capture")}
@@ -1567,6 +1579,8 @@ def _verify_result_set(results: Path) -> dict[str, Any]:
             return verify_progress_ring_results(results)
         if suite == "v8-point-progress-cursor":
             return verify_progress_cursor_results(results)
+        if suite == "v8-cursor-direct-completion":
+            return verify_cursor_direct_completion_results(results)
         if suite == "v8-small-ticket-profile":
             with (results / "profile-schedule.tsv").open(encoding="utf-8", newline="") as stream:
                 schedule_rows = list(csv.DictReader(stream, delimiter="\t"))
@@ -2771,7 +2785,8 @@ def provision_and_run(
     point_borrowed_input_suite = getattr(args, "v8_point_borrowed_input_ab", False)
     point_direct_frame_suite = getattr(args, "v8_point_direct_frame_ab", False)
     point_progress_cursor_suite = getattr(args, "v8_point_progress_cursor_ab", False)
-    point_progress_suite = point_progress_cursor_suite
+    point_cursor_direct_completion_suite = getattr(args, "v8_cursor_direct_completion_ab", False)
+    point_progress_suite = point_progress_cursor_suite or point_cursor_direct_completion_suite
     extent_policy_storage_suite = getattr(args, "v8_extent_policy_storage_ab", False)
     missing_tools = [tool for tool in ("ssh", "ssh-keygen") if not shutil.which(tool)]
     if missing_tools:
@@ -3093,6 +3108,8 @@ def provision_and_run(
                 remote_suite = "commit-order-trace"
             elif extent_policy_storage_suite:
                 remote_suite = "v8-extent-policy-storage"
+            elif point_cursor_direct_completion_suite:
+                remote_suite = "v8-cursor-direct-completion"
             elif point_progress_cursor_suite:
                 remote_suite = "v8-point-progress-cursor"
             elif point_direct_frame_suite:
@@ -3243,7 +3260,8 @@ def provision_and_run(
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(sys.argv[1:] if argv is None else argv)
-    point_progress_suite = args.v8_point_progress_cursor_ab
+    point_cursor_direct_completion_suite = args.v8_cursor_direct_completion_ab
+    point_progress_suite = args.v8_point_progress_cursor_ab or point_cursor_direct_completion_suite
     if point_progress_suite:
         args.progress_ring_vm_tag = f"{POINT_PROGRESS_RING_VM_TAG}-{uuid.uuid4().hex[:12]}"
     if args.results_dir is None:
@@ -3345,6 +3363,14 @@ def main(argv: list[str] | None = None) -> int:
         elif args.v8_point_direct_frame_ab:
             report["benchmark_suite"] = "v8-point-direct-frame"
             report["benchmark_plan"] = build_point_direct_frame_plan(
+                writers=args.writers,
+                machine_type=args.machine_type,
+                machine_spec=MACHINE_SPECS[args.machine_type],
+                commit=args.commit.lower(),
+            )
+        elif point_cursor_direct_completion_suite:
+            report["benchmark_suite"] = "v8-cursor-direct-completion"
+            report["benchmark_plan"] = build_cursor_direct_completion_plan(
                 writers=args.writers,
                 machine_type=args.machine_type,
                 machine_spec=MACHINE_SPECS[args.machine_type],

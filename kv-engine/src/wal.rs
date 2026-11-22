@@ -162,6 +162,8 @@ pub struct WalIoDiagnostics {
     pub progress_ring_enabled: bool,
     /// Whether the ring uses the validated ready prefix cursor.
     pub progress_cursor_enabled: bool,
+    /// Whether Cursor DATA completions bypass the benchmark-only reaper relay.
+    pub cursor_direct_completion_enabled: bool,
     pub progress_diagnostics: Option<WalV8ProgressDiagnostics>,
 }
 

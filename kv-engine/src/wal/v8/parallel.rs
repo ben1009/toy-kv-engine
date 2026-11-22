@@ -109,6 +109,41 @@ pub(crate) struct WalV8ParallelCoordinator {
     inner: Arc<CoordinatorInner>,
 }
 
+/// Narrow notification and terminal-failure handle lent to the I/O worker in
+/// the Cursor direct-completion experiment. It carries no writer or worker
+/// ownership and is used only after publishing to the bounded completion queue
+/// or after worker cleanup has released its permits and admission waiters.
+#[derive(Clone)]
+pub(crate) struct WalV8WorkerCompletionHandle {
+    coordinator: WalV8ParallelCoordinator,
+}
+
+impl WalV8WorkerCompletionHandle {
+    pub(crate) fn notify_completion_queued(&self) -> Result<()> {
+        ensure!(
+            self.coordinator.progress_ring_enabled(),
+            "direct completion notification requires Cursor progress mode"
+        );
+        try_signal_progress_token(&self.coordinator.inner)
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn capture_data_completion_time(&self) -> Option<Instant> {
+        self.coordinator.capture_data_completion_time()
+    }
+
+    #[cfg(not(feature = "bench"))]
+    pub(crate) fn capture_data_completion_time(&self) -> Option<Instant> {
+        None
+    }
+
+    /// This is called only after the worker has fenced admission and dropped
+    /// all worker-owned permits, or from its unwind guard after stack cleanup.
+    pub(crate) fn worker_failed_after_cleanup(&self) {
+        self.coordinator.poison();
+    }
+}
+
 struct CoordinatorInner {
     state: Mutex<CoordinatorState>,
     changed: Condvar,
@@ -874,6 +909,12 @@ impl WalV8DurablePrefixCheck {
 }
 
 impl WalV8ParallelCoordinator {
+    pub(crate) fn worker_completion_handle(&self) -> WalV8WorkerCompletionHandle {
+        WalV8WorkerCompletionHandle {
+            coordinator: self.clone(),
+        }
+    }
+
     pub(crate) fn progress_ring_enabled(&self) -> bool {
         self.inner.progress_ring.is_some()
     }
@@ -3719,8 +3760,12 @@ fn record_durable_notification_for_waiters(state: &mut CoordinatorState) {
 }
 
 fn signal_progress_token(inner: &CoordinatorInner) {
+    let _ = try_signal_progress_token(inner);
+}
+
+fn try_signal_progress_token(inner: &CoordinatorInner) -> Result<()> {
     let Some(sender) = &inner.progress_token_sender else {
-        return;
+        anyhow::bail!("v8 progress token sender is unavailable");
     };
     let result = sender.try_send(());
     #[cfg(feature = "bench")]
@@ -3736,7 +3781,12 @@ fn signal_progress_token(inner: &CoordinatorInner) {
             inner.progress_token_accepts.fetch_add(1, Ordering::Relaxed);
         }
     }
-    let _ = result;
+    match result {
+        Ok(()) | Err(crossbeam_channel::TrySendError::Full(())) => Ok(()),
+        Err(crossbeam_channel::TrySendError::Disconnected(())) => {
+            anyhow::bail!("v8 progress token receiver disconnected")
+        }
+    }
 }
 
 fn poison_locked(inner: &CoordinatorInner, state: &mut CoordinatorState) {

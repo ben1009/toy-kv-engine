@@ -1886,6 +1886,7 @@ struct WalIoDiagnosticsRecord {
     sliding_extent_preparation: Option<WalV8SlidingExtentPreparationRecord>,
     progress_ring_enabled: bool,
     progress_cursor_enabled: bool,
+    cursor_direct_completion_enabled: bool,
     #[cfg(feature = "bench")]
     #[serde(skip_serializing_if = "Option::is_none")]
     progress_diagnostics: Option<kv_engine::wal::WalV8ProgressDiagnostics>,
@@ -2011,6 +2012,7 @@ impl From<WalIoDiagnostics> for WalIoDiagnosticsRecord {
             sliding_extent_preparation: diagnostics.sliding_extent_preparation.map(Into::into),
             progress_ring_enabled: diagnostics.progress_ring_enabled,
             progress_cursor_enabled: diagnostics.progress_cursor_enabled,
+            cursor_direct_completion_enabled: diagnostics.cursor_direct_completion_enabled,
             progress_diagnostics: diagnostics.progress_diagnostics,
         }
     }
@@ -2034,6 +2036,7 @@ impl WalIoDiagnosticsRecord {
             && self.extent_preparation == other.extent_preparation
             && self.progress_ring_enabled == other.progress_ring_enabled
             && self.progress_cursor_enabled == other.progress_cursor_enabled
+            && self.cursor_direct_completion_enabled == other.cursor_direct_completion_enabled
             && sliding_configuration_stable
     }
 }
@@ -12770,6 +12773,7 @@ mod tests {
                         sliding_extent_preparation: None,
                         progress_ring_enabled: false,
                         progress_cursor_enabled: false,
+                        cursor_direct_completion_enabled: false,
                         #[cfg(feature = "bench")]
                         progress_diagnostics: None,
                     }),
@@ -12793,6 +12797,7 @@ mod tests {
                         sliding_extent_preparation: None,
                         progress_ring_enabled: false,
                         progress_cursor_enabled: false,
+                        cursor_direct_completion_enabled: false,
                         #[cfg(feature = "bench")]
                         progress_diagnostics: None,
                     }),
