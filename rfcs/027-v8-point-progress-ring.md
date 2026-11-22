@@ -180,6 +180,27 @@ failed the throughput promotion gates. The candidate is stopped and is not
 qualified for production promotion. See the
 [GCP qualification report](../docs/wal/benchmarks/rfc-027-v8-point-progress-ring-gcp-20261121.md).
 
+### Post-qualification source review
+
+In the scored F0 revision (`d04a0bba`), readiness scans and FRONTIER
+validation repeatedly lock ticket cells. Admission locks each cell before
+and after range registration, and retirement allocates a vector of cell
+guards for each FRONTIER. The Reaper sends completions through a second
+queue, which the driver drains under a scratch buffer mutex. The first
+accepted digest for a ticket can also wake the driver before its DATA is
+ready. The qualification measured aggregate CPU and throughput. The cost
+each operation contributed to the CPU difference remains unmeasured.
+[Source review](https://github.com/ben1009/toy-kv-engine/pull/562#issuecomment-7071356609)
+
+The proposed follow-up would let the elected driver advance a validated
+ready prefix cursor using whole-group DATA completion and the existing
+ordered digest fold. That cursor could avoid rechecking tickets whose
+frames and completion were already validated and support retirement without
+a per-FRONTIER allocation. It would need to preserve reservation identity,
+late-digest wakeups, poison handling and recovery. If approved, the
+prototype would go through a separate RFC and PR and be compared with both
+eager mode and the stopped F0 implementation. F0 remains off by default.
+
 ## Appendix A. Historical alternatives — not part of the implementation plan
 
 This appendix consolidates the former progress-simplification RFC. F0 (Sections 3–8) was the sole candidate and is now stopped after the failed qualification; neither A0 nor P0 is a fallback, and P1 requires an independently approved experiment. The [archived full analysis at commit 01c6c6e8](https://github.com/ben1009/toy-kv-engine/blob/01c6c6e87317d8e00379b5e1ca67c63fe0d52a5b/docs/wal/rfc-026-v8-point-progress-simplification.md) preserves the earlier detailed review history, not an alternative implementation specification.
