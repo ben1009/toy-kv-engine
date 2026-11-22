@@ -2526,7 +2526,7 @@ mod bench_cpu_affinity {
                 io_wq_worker_count_after_warmup > 0,
                 "io-wq warmup created no workers after {warmup_puts} puts"
             );
-            engine.reset_write_profile();
+            engine.reset_write_profile_measurements();
 
             let before = thread_snapshot()?;
             let wal_helpers = if mode == "none" {

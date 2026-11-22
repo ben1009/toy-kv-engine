@@ -10087,6 +10087,12 @@ impl KvEngine {
     }
 
     #[cfg(feature = "bench")]
+    /// Discard warmup measurements while preserving the active sampling settings.
+    pub fn reset_write_profile_measurements(&self) {
+        self.inner.write_profile.reset_measurements();
+    }
+
+    #[cfg(feature = "bench")]
     /// Sample synchronous MVCC publication internals for benchmark runs.
     /// Passing `None` disables sampling and clears previously retained samples.
     pub fn set_mvcc_publication_sample_every(&self, sample_every: Option<u64>) -> Result<()> {

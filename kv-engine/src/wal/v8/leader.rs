@@ -9273,6 +9273,63 @@ mod tests {
             .into_parallel_with_worker_file_and_progress_mode(worker_file, mode)
     }
 
+    #[cfg(feature = "bench")]
+    #[test]
+    fn progress_ring_sync_diagnostics_survive_warmup_measurement_reset() -> Result<()> {
+        for mode in [WalV8ProgressMode::Ring, WalV8ProgressMode::Cursor] {
+            let directory = tempfile::tempdir()?;
+            let path = directory.path().join("progress-warmup-v8.wal");
+            let installed = install_empty(&path, header())?;
+            let writer = match open_parallel_with_progress_mode(&path, &installed, mode) {
+                Ok(writer) => writer,
+                Err(error) if is_io_uring_unavailable_error(&error) => {
+                    eprintln!("skipping test (io_uring unavailable): {error:#}");
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            };
+            let profile = Arc::new(crate::mem_table::WriteProfile::default());
+            writer.set_write_profile(Arc::clone(&profile))?;
+            writer.set_wal_sync_diagnostics_enabled(&profile, true)?;
+
+            let append = |commit_ts| -> Result<()> {
+                let input = batch(commit_ts);
+                let prepared = writer.preflight_batch(&input, LIVE_WAL_V5_LIMITS)?;
+                writer.append_prepared_batch(prepared, input.commit_ts, input.recorded_at)?;
+                Ok(())
+            };
+
+            append(10)?;
+            assert_eq!(profile.wal_sync_observations().len(), 1);
+            profile.reset_measurements();
+            assert!(profile.wal_sync_diagnostics_enabled());
+            assert!(profile.wal_sync_observations().is_empty());
+            let start = writer
+                .io_diagnostics()
+                .progress_diagnostics
+                .context("warm writer lost progress diagnostics")?;
+
+            append(20)?;
+            let end = writer
+                .io_diagnostics()
+                .progress_diagnostics
+                .context("timed writer lost progress diagnostics")?;
+            assert!(end.token_attempts > start.token_attempts, "{mode:?}");
+            assert!(end.owner_scans > start.owner_scans, "{mode:?}");
+            assert_eq!(
+                end.completion_events_drained - start.completion_events_drained,
+                1,
+                "{mode:?}"
+            );
+            let observed = profile.wal_sync_observations();
+            assert_eq!(observed.len(), 1, "{mode:?}");
+            assert_eq!(observed[0].written_frontier_start, 1, "{mode:?}");
+            assert_eq!(observed[0].written_frontier_end, 2, "{mode:?}");
+        }
+
+        Ok(())
+    }
+
     #[test]
     fn progress_ring_driver_scan_to_park_observes_late_data_completion() -> Result<()> {
         check_progress_scan_to_park(WalV8ProgressMode::Ring)

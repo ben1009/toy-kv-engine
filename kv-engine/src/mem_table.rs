@@ -1157,6 +1157,25 @@ impl WriteProfile {
     #[cfg(feature = "bench")]
     pub(crate) fn reset(&self) {
         let o = std::sync::atomic::Ordering::Relaxed;
+        self.wal_sync_diagnostics_enabled.store(false, o);
+        self.wal_hol_diagnostics_enabled.store(false, o);
+        self.wal_v8_completion_timeline_sample_every.store(0, o);
+        self.wal_v8_durability_sample_every.store(0, o);
+        self.wal_cpu_attribution_sample_every.store(0, o);
+        self.clear_measurements(0);
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn reset_measurements(&self) {
+        let commit_order_trace_limit = self
+            .commit_order_trace_limit
+            .load(std::sync::atomic::Ordering::Relaxed);
+        self.clear_measurements(commit_order_trace_limit);
+    }
+
+    #[cfg(feature = "bench")]
+    fn clear_measurements(&self, commit_order_trace_limit: u64) {
+        let o = std::sync::atomic::Ordering::Relaxed;
         self.batch_build_ns.store(0, o);
         self.mvcc_wal_only_ns.store(0, o);
         self.wal_write_ns.store(0, o);
@@ -1181,10 +1200,6 @@ impl WriteProfile {
         #[cfg(feature = "bench")]
         self.wal_sync_observations.lock().clear();
         #[cfg(feature = "bench")]
-        self.wal_sync_diagnostics_enabled.store(false, o);
-        #[cfg(feature = "bench")]
-        self.wal_hol_diagnostics_enabled.store(false, o);
-        #[cfg(feature = "bench")]
         self.wal_v8_completion_timeline.lock().clear();
         #[cfg(feature = "bench")]
         self.wal_v8_completion_timeline_dropped_samples.store(0, o);
@@ -1193,9 +1208,6 @@ impl WriteProfile {
             self.wal_completion_handoff_timeline.lock().clear();
             self.wal_completion_handoff_timeline_dropped_samples
                 .store(0, o);
-            self.wal_v8_completion_timeline_sample_every.store(0, o);
-            self.wal_v8_durability_sample_every.store(0, o);
-            self.wal_cpu_attribution_sample_every.store(0, o);
             self.wal_cpu_attribution_sequence.store(0, o);
             self.wal_cpu_attribution_selected_samples.store(0, o);
             self.wal_cpu_attribution_dropped_samples.store(0, o);
@@ -1218,7 +1230,7 @@ impl WriteProfile {
             self.wal_v8_ack_dropped_samples.store(0, o);
             self.wal_v8_follower_waits.lock().clear();
             self.wal_v8_follower_wait_dropped_samples.store(0, o);
-            self.configure_commit_order_trace(0);
+            self.configure_commit_order_trace(commit_order_trace_limit);
         }
         self.wal_worker_eventfd_notifications.store(0, o);
         self.wal_worker_eventfd_writes.store(0, o);
