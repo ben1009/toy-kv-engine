@@ -370,7 +370,10 @@ impl TicketProgressRing {
             payloads.push(self.cell(ticket)?.payload.lock());
         }
 
-        for (ticket, payload) in (ticket_start..ticket_end).zip(&payloads) {
+        for (offset, payload) in payloads.iter().enumerate() {
+            let ticket = ticket_start
+                .checked_add(u64::try_from(offset)?)
+                .context("v8 progress ring retirement ticket overflows")?;
             self.validate_retiring_cell(ticket, payload)?;
         }
 
@@ -387,6 +390,7 @@ impl TicketProgressRing {
                     segment_incarnation: self.segment_incarnation,
                     ticket,
                 })
+                && payload.logical_batch_bytes.is_some()
                 && payload.frames_ready
                 && payload.digest_ready.is_some_and(|digest| {
                     digest.segment_incarnation == self.segment_incarnation
@@ -616,7 +620,7 @@ fn apply_data_group_completion_locked(
         "v8 DATA-completion group extends past admitted tickets"
     );
 
-    let mut completed_tickets = 0;
+    let mut all_complete = true;
     for (offset, entry) in state
         .tickets
         .iter()
@@ -633,10 +637,16 @@ fn apply_data_group_completion_locked(
                 && ticket_frames_ready(inner, entry)?,
             "v8 DATA-completion group does not match ready admitted tickets"
         );
-        completed_tickets += usize::from(entry.data_complete);
+        all_complete &= entry.data_complete;
     }
     ensure!(
-        completed_tickets == 0 || completed_tickets == ticket_count,
+        all_complete
+            || !state
+                .tickets
+                .iter()
+                .skip(start_index)
+                .take(ticket_count)
+                .any(|entry| entry.data_complete),
         "v8 DATA-completion group partially duplicates prior completion"
     );
     #[cfg(feature = "bench")]
@@ -651,7 +661,7 @@ fn apply_data_group_completion_locked(
         );
     }
 
-    if completed_tickets == ticket_count {
+    if all_complete {
         return Ok(metrics);
     }
 

@@ -9275,19 +9275,27 @@ mod tests {
 
     #[test]
     fn progress_ring_driver_scan_to_park_observes_late_data_completion() -> Result<()> {
+        check_progress_scan_to_park(WalV8ProgressMode::Ring)
+    }
+
+    #[test]
+    fn progress_cursor_driver_scan_to_park_observes_its_only_completion_wake() -> Result<()> {
+        check_progress_scan_to_park(WalV8ProgressMode::Cursor)
+    }
+
+    fn check_progress_scan_to_park(mode: WalV8ProgressMode) -> Result<()> {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("progress-ring-scan-to-park-v8.wal");
         let header = header();
         let installed = install_empty(&path, header)?;
-        let writer =
-            match open_parallel_with_progress_mode(&path, &installed, WalV8ProgressMode::Ring) {
-                Ok(writer) => Arc::new(writer),
-                Err(error) if is_io_uring_unavailable_error(&error) => {
-                    eprintln!("skipping test (io_uring unavailable): {error:#}");
-                    return Ok(());
-                }
-                Err(error) => return Err(error),
-            };
+        let writer = match open_parallel_with_progress_mode(&path, &installed, mode) {
+            Ok(writer) => Arc::new(writer),
+            Err(error) if is_io_uring_unavailable_error(&error) => {
+                eprintln!("skipping test (io_uring unavailable): {error:#}");
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
 
         let (first_wait_entered_tx, first_wait_entered_rx) = crossbeam_channel::bounded(1);
         let (second_wait_entered_tx, second_wait_entered_rx) = crossbeam_channel::bounded(1);
@@ -9389,38 +9397,47 @@ mod tests {
                 .recv_timeout(Duration::from_secs(5))
                 .context("durability driver did not reach its first post-scan wait")?;
 
-            // The first readiness scan has completed. Finish and submit DATA,
-            // then pause the reaper after CQE receipt but before it queues the
-            // completion event. This lets readiness wake the driver without
-            // allowing DATA-complete publication to race ahead of its next scan.
+            // Finish DATA after the first scan. Pause the Reaper before
+            // enqueueing completion so it cannot race ahead of the driver.
             job.finish()?;
             completion_received_rx
                 .recv_timeout(Duration::from_secs(5))
                 .context("completion reaper did not receive the DATA result")?;
-            cleanup.release(0);
-
-            // The driver consumed the readiness token, rescanned while the
-            // completion event queue was still empty, and is now paused before
-            // parking with the ticket still DATA-incomplete.
-            second_wait_entered_rx
-                .recv_timeout(Duration::from_secs(5))
-                .context("durability driver did not reach the DATA-incomplete wait")?;
+            let completion_wait_release = if mode == WalV8ProgressMode::Ring {
+                // Consume the digest token and rescan while DATA is incomplete.
+                cleanup.release(0);
+                second_wait_entered_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .context("durability driver did not reach the DATA-incomplete wait")?;
+                let digest_wait_result = wait_result_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .context("driver's digest wait did not return")?;
+                assert_eq!(digest_wait_result, WalV8ProgressTokenWait::Signaled);
+                1
+            } else {
+                assert!(
+                    writer
+                        .io
+                        .progress_tokens
+                        .as_ref()
+                        .context("missing progress token receiver")?
+                        .is_empty(),
+                    "the cursor must rely on the completion wake after a before-DATA digest"
+                );
+                0
+            };
             cleanup.release(2);
             completion_published_rx
                 .recv_timeout(Duration::from_secs(5))
                 .context("completion reaper did not queue and signal the DATA result")?;
-            cleanup.release(1);
+            cleanup.release(completion_wait_release);
             cleanup.release(3);
 
-            let first_wait_result = wait_result_rx
-                .recv_timeout(Duration::from_secs(5))
-                .context("driver's readiness wait did not return")?;
-            let second_wait_result = wait_result_rx
+            let completion_wait_result = wait_result_rx
                 .recv_timeout(Duration::from_secs(5))
                 .context("driver's completion wait did not return")?;
-            assert_eq!(first_wait_result, WalV8ProgressTokenWait::Signaled);
             assert_eq!(
-                second_wait_result,
+                completion_wait_result,
                 WalV8ProgressTokenWait::Signaled,
                 "late DATA-completion publication must wake the driver without timeout polling"
             );
