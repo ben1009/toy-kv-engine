@@ -610,6 +610,7 @@ def validate_point_progress_ring_rows(
         digest_cpu = row.get("ordered_link_hash_cpu_ns")
         if (
             expected_row is None
+            or type(row.get("exit_code")) is not int
             or row.get("exit_code") != 0
             or row.get("ops") != POINT_PROGRESS_RING_NUM
             or row.get("progress_ring_enabled") is not bool(expected_row["progress_ring_enabled"])

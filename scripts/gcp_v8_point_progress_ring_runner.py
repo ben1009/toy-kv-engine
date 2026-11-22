@@ -16,7 +16,7 @@ import subprocess
 import sys
 import time
 from statistics import median
-from typing import Any
+from typing import Any, Callable
 
 from gcp_wal_matrix import (
     POINT_LOOKAHEAD_WINDOW_BYTES,
@@ -97,9 +97,16 @@ def _expected_environment_text(progress_ring_enabled: bool) -> str:
     return "\n".join(f"{key}={value}" for key, value in sorted(controlled.items())) + "\n"
 
 
+def _require_object(value: Any, label: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} must be a JSON object")
+    return value
+
+
 def _validate_record(record: dict[str, Any], row: dict[str, Any]) -> dict[str, Any]:
-    result = record["result"]
-    params = record["params"]
+    record = _require_object(record, "benchmark record")
+    result = _require_object(record.get("result"), "benchmark result")
+    params = _require_object(record.get("params"), "benchmark parameters")
     expected_params = {
         "num": POINT_PROGRESS_RING_NUM,
         "threads": row["writer"],
@@ -113,16 +120,18 @@ def _validate_record(record: dict[str, Any], row: dict[str, Any]) -> dict[str, A
     ):
         raise ValueError("benchmark parameters do not match the fixed progress-ring plan")
 
-    pipeline = result["wal_pipeline"]
+    pipeline = _require_object(result.get("wal_pipeline"), "WAL pipeline metadata")
     if pipeline.get("wal_io_stable") is not True:
         raise ValueError("WAL I/O metadata changed during the run")
     io_by_boundary: dict[str, dict[str, Any]] = {}
     for boundary in ("wal_io_start", "wal_io_end"):
-        snapshot = pipeline[boundary]
+        snapshot = _require_object(pipeline.get(boundary), f"{boundary} WAL I/O snapshot")
         if snapshot.get("progress_ring_enabled") is not bool(row["progress_ring_enabled"]):
             raise ValueError(f"{boundary} progress-ring mode differs from the planned arm")
-        preparation = snapshot.get("sliding_extent_preparation")
-        if not isinstance(preparation, dict) or any((
+        preparation = _require_object(
+            snapshot.get("sliding_extent_preparation"), f"{boundary} extent preparation metadata",
+        )
+        if any((
             preparation.get("mode") != "sliding-point-lookahead",
             preparation.get("window_bytes") != POINT_LOOKAHEAD_WINDOW_BYTES,
             preparation.get("extent_policy_storage") != "vec",
@@ -148,8 +157,8 @@ def _validate_record(record: dict[str, Any], row: dict[str, Any]) -> dict[str, A
     if pipeline.get("worker_group_sizes") is not None:
         raise ValueError("DATA worker-group histogram must be disabled for scored runs")
 
-    digest = result.get("wal_v8_digest")
-    if not isinstance(digest, dict) or digest.get("cpu_timing_sample_rate") != 64:
+    digest = _require_object(result.get("wal_v8_digest"), "V8 digest metadata")
+    if digest.get("cpu_timing_sample_rate") != 64:
         raise ValueError("ordered-link hash CPU sample metadata is missing or incorrect")
     hash_cpu = digest.get("ordered_link_hash_cpu_ns")
     sampled_tickets = digest.get("cpu_timing_sampled_tickets")
@@ -221,6 +230,7 @@ def _validate_record(record: dict[str, Any], row: dict[str, Any]) -> dict[str, A
 def _run_one(
     *, binary: Path, binary_sha256: str, row: dict[str, Any], results_dir: Path,
     db_root: Path, safe_deadline_epoch: int,
+    on_subprocess_started: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     name = _run_id(row)
     run_dir = results_dir / name
@@ -245,13 +255,18 @@ def _run_one(
         raise TimeoutError("stopping before the VM safety deadline")
 
     started = time.monotonic()
-    completed = subprocess.run(
+    process = subprocess.Popen(
         ["timeout", "--signal=INT", "--kill-after=30s", str(RUN_TIMEOUT_SECONDS), *command],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
-        check=False,
         env=environment,
+    )
+    if on_subprocess_started is not None:
+        on_subprocess_started()
+    stdout, stderr = process.communicate()
+    completed = subprocess.CompletedProcess(
+        process.args, process.returncode, stdout, stderr,
     )
     duration = time.monotonic() - started
     (run_dir / "end_utc.txt").write_text(datetime.now(timezone.utc).isoformat() + "\n", encoding="utf-8")
@@ -282,6 +297,7 @@ def _summary(rows: list[dict[str, Any]], writers: tuple[int, ...], planned: int)
     validation = validate_point_progress_ring_rows(rows, writers)
     cells = [(writer, "point") for writer in writers] + [(16, "batch64")]
     comparisons: list[dict[str, Any]] = []
+    paired_ratios_by_cell: dict[tuple[int, str], tuple[list[float], list[float]]] = {}
     for writer, workload in cells:
         selected = {
             arm: [
@@ -307,7 +323,9 @@ def _summary(rows: list[dict[str, Any]], writers: tuple[int, ...], planned: int)
             for arm, arm_rows in selected.items()
         }
         paired: list[float] = []
+        paired_ratios: list[float] = []
         paired_p99: list[float] = []
+        paired_p99_ratios: list[float] = []
         for repetition in range(1, 6):
             pair = {
                 arm: next((row for row in rows if row.get("writer") == writer
@@ -317,9 +335,14 @@ def _summary(rows: list[dict[str, Any]], writers: tuple[int, ...], planned: int)
             }
             baseline, candidate = pair["eager"], pair["progress_ring"]
             if baseline and candidate and baseline["puts_per_second"] > 0:
-                paired.append((candidate["puts_per_second"] / baseline["puts_per_second"] - 1) * 100)
+                throughput_ratio = candidate["puts_per_second"] / baseline["puts_per_second"]
+                paired_ratios.append(throughput_ratio)
+                paired.append((throughput_ratio - 1) * 100)
                 if workload == "point":
-                    paired_p99.append((candidate["p99_ms"] / baseline["p99_ms"] - 1) * 100)
+                    p99_ratio = candidate["p99_ms"] / baseline["p99_ms"]
+                    paired_p99_ratios.append(p99_ratio)
+                    paired_p99.append((p99_ratio - 1) * 100)
+        paired_ratios_by_cell[(writer, workload)] = (paired_ratios, paired_p99_ratios)
         baseline_median = stats["eager"]["puts_per_second"]
         candidate_median = stats["progress_ring"]["puts_per_second"]
         comparisons.append({
@@ -339,16 +362,22 @@ def _summary(rows: list[dict[str, Any]], writers: tuple[int, ...], planned: int)
         })
     by_cell = {f"w{row['writer']}-{row['workload']}": row for row in comparisons}
     point_gates = [
-        by_cell[f"w{writer}-point"]["paired_throughput_change_median_pct"] is not None
-        and by_cell[f"w{writer}-point"]["paired_throughput_change_median_pct"] >= 5
+        bool(paired_ratios_by_cell[(writer, "point")][0])
+        and median(paired_ratios_by_cell[(writer, "point")][0]) >= 1.05
         and by_cell[f"w{writer}-point"]["candidate_pair_wins"] >= 4
-        and by_cell[f"w{writer}-point"]["paired_p99_change_median_pct"] is not None
-        and by_cell[f"w{writer}-point"]["paired_p99_change_median_pct"] <= 5
         for writer in (8, 16)
     ]
-    point1 = by_cell["w1-point"]["paired_throughput_change_median_pct"]
-    batch64 = by_cell["w16-batch64"]["paired_throughput_change_median_pct"]
-    guardrails = point1 is not None and point1 >= -2 and batch64 is not None and batch64 >= -2
+    p99_gates = [
+        bool(paired_ratios_by_cell[(writer, "point")][1])
+        and median(paired_ratios_by_cell[(writer, "point")][1]) <= 1.05
+        for writer in (8, 16)
+    ]
+    point1_ratios = paired_ratios_by_cell[(1, "point")][0]
+    batch64_ratios = paired_ratios_by_cell[(16, "batch64")][0]
+    guardrails = (
+        bool(point1_ratios) and median(point1_ratios) >= 0.98
+        and bool(batch64_ratios) and median(batch64_ratios) >= 0.98
+    )
     return {
         "suite": "v8-point-progress-ring",
         "complete": len(rows) == planned and validation["complete"],
@@ -364,13 +393,9 @@ def _summary(rows: list[dict[str, Any]], writers: tuple[int, ...], planned: int)
         "comparison_by_cell": by_cell,
         "qualification_gates": {
             "point8_and_point16_each_gain_at_least_5pct_and_win_4_of_5": all(point_gates),
-            "point8_and_point16_p99_regression_at_most_5pct": all(
-                by_cell[f"w{writer}-point"]["paired_p99_change_median_pct"] is not None
-                and by_cell[f"w{writer}-point"]["paired_p99_change_median_pct"] <= 5
-                for writer in (8, 16)
-            ),
+            "point8_and_point16_p99_regression_at_most_5pct": all(p99_gates),
             "point1_and_batch64_paired_median_regression_at_most_2pct": guardrails,
-            "candidate_qualified": bool(validation["complete"] and all(point_gates) and guardrails),
+            "candidate_qualified": bool(validation["complete"] and all(point_gates) and all(p99_gates) and guardrails),
         },
         "qualification_note": (
             "Same-host, same-source, same-release-binary A/B; the progress-ring switch is the only experiment "
@@ -385,7 +410,8 @@ def run_suite(args: argparse.Namespace) -> int:
         raise ValueError("commit must be a full lowercase 40-character SHA")
     if len(args.binary_sha256) != 64 or any(char not in "0123456789abcdef" for char in args.binary_sha256):
         raise ValueError("binary SHA-256 must be 64 lowercase hexadecimal characters")
-    if _sha256_file(args.binary) != args.binary_sha256:
+    binary = args.binary.expanduser().resolve(strict=True)
+    if _sha256_file(binary) != args.binary_sha256:
         raise ValueError("write-perf binary SHA-256 does not match its recorded identity")
     if args.machine_type != "c4-standard-16-lssd" or args.ssd_count != 2 or args.ssd_gib != 750:
         raise ValueError("progress-ring qualification requires c4-standard-16-lssd and two Local SSDs")
@@ -416,14 +442,21 @@ def run_suite(args: argparse.Namespace) -> int:
 
     rows: list[dict[str, Any]] = []
     attempted = 0
+    started = 0
     failure: str | None = None
     for row in schedule:
         attempted += 1
+
+        def record_subprocess_start() -> None:
+            nonlocal started
+            started += 1
+
         try:
             metadata = _run_one(
-                binary=args.binary, binary_sha256=args.binary_sha256,
+                binary=binary, binary_sha256=args.binary_sha256,
                 row={**row, "source_commit": args.commit}, results_dir=results_dir,
                 db_root=db_root, safe_deadline_epoch=args.safe_deadline_epoch,
+                on_subprocess_started=record_subprocess_start,
             )
         except (OSError, TimeoutError, subprocess.SubprocessError, ValueError) as error:
             failure = f"run {attempted} did not complete: {error}"
@@ -441,19 +474,28 @@ def run_suite(args: argparse.Namespace) -> int:
 
     summary = _summary(rows, writers, len(schedule))
     summary.update({"source_commit": args.commit, "binary_sha256": args.binary_sha256})
-    summary["complete"] = summary["complete"] and failure is None and attempted == len(schedule)
+    summary["runs_started"] = started
+    summary["runs_attempted"] = attempted
+    summary["complete"] = (
+        summary["complete"] and failure is None
+        and attempted == len(schedule) and started == len(schedule)
+    )
     if failure:
         summary["failure"] = failure
     (results_dir / "summary.json").write_text(
         json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8",
     )
     (results_dir / "remote-exit.json").write_text(
-        json.dumps({"failed": failure is not None or attempted != len(schedule), "runs_started": attempted}, indent=2)
+        json.dumps({
+            "failed": summary["complete"] is not True,
+            "runs_started": started,
+            "runs_attempted": attempted,
+        }, indent=2)
         + "\n",
         encoding="utf-8",
     )
     (results_dir / "finished_utc.txt").write_text(datetime.now(timezone.utc).isoformat() + "\n", encoding="utf-8")
-    return 1 if failure is not None or attempted != len(schedule) else 0
+    return 0 if summary["complete"] is True else 1
 
 
 def verify_results_directory(results: Path) -> dict[str, Any]:
@@ -493,11 +535,16 @@ def verify_results_directory(results: Path) -> dict[str, Any]:
             or summary.get("binary_sha256") != binary_sha
             or summary.get("complete") is not True
             or summary.get("runs_started") != len(schedule)
+            or summary.get("runs_attempted", summary.get("runs_started")) != len(schedule)
             or summary.get("runs_completed") != len(schedule)
             or summary.get("runs_planned") != len(schedule)
         ):
             errors.append("summary metadata or run counts are incomplete")
-        if remote_exit.get("failed") is not False or remote_exit.get("runs_started") != len(schedule):
+        if (
+            remote_exit.get("failed") is not False
+            or remote_exit.get("runs_started") != len(schedule)
+            or remote_exit.get("runs_attempted", remote_exit.get("runs_started")) != len(schedule)
+        ):
             errors.append("remote-exit does not confirm all planned runs")
         with (results / "point-progress-ring-schedule.tsv").open(encoding="utf-8", newline="") as stream:
             schedule_rows = list(csv.DictReader(stream, delimiter="\t"))
@@ -521,14 +568,15 @@ def verify_results_directory(results: Path) -> dict[str, Any]:
         validation = validate_point_progress_ring_rows(rows, plan.get("writers", ()))
         if validation["complete"] is not True:
             errors.append("run rows do not match the fixed F0.5 matrix")
-        recomputed = _summary(rows, tuple(plan.get("writers", ())), len(schedule))
-        for key in (
-            "suite", "complete", "runs_started", "runs_completed", "runs_planned", "writers",
-            "workloads", "arms", "matrix_validation", "comparison", "comparison_by_cell",
-            "qualification_gates",
-        ):
-            if summary.get(key) != recomputed.get(key):
-                errors.append(f"summary field {key} does not match archived run rows")
+        if validation["complete"] is True:
+            recomputed = _summary(rows, tuple(plan.get("writers", ())), len(schedule))
+            for key in (
+                "suite", "complete", "runs_started", "runs_completed", "runs_planned", "writers",
+                "workloads", "arms", "matrix_validation", "comparison", "comparison_by_cell",
+                "qualification_gates",
+            ):
+                if summary.get(key) != recomputed.get(key):
+                    errors.append(f"summary field {key} does not match archived run rows")
         expected_ids = {_run_id(row) for row in schedule}
         actual_ids = {
             path.name for path in results.iterdir()

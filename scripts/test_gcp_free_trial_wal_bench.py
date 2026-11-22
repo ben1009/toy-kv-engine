@@ -6,6 +6,7 @@ import base64
 import csv
 import hashlib
 import importlib.util
+from contextlib import redirect_stderr
 from io import BytesIO, StringIO
 import json
 import os
@@ -426,10 +427,15 @@ class PointProgressRingQualificationTests(unittest.TestCase):
             )
             rows.append(metadata)
         summary = progress_ring_runner._summary(rows, POINT_PROGRESS_RING_WRITERS, len(schedule))
-        summary.update({"source_commit": commit, "binary_sha256": binary_sha})
+        summary.update({
+            "source_commit": commit,
+            "binary_sha256": binary_sha,
+            "runs_attempted": len(schedule),
+        })
         (results / "summary.json").write_text(json.dumps(summary), encoding="utf-8")
         (results / "remote-exit.json").write_text(
-            json.dumps({"failed": False, "runs_started": len(schedule)}), encoding="utf-8",
+            json.dumps({"failed": False, "runs_started": len(schedule), "runs_attempted": len(schedule)}),
+            encoding="utf-8",
         )
         with (results / "summary.tsv").open("w", encoding="utf-8", newline="") as stream:
             fields = progress_ring_runner._summary_fields(schedule)
@@ -458,6 +464,14 @@ class PointProgressRingQualificationTests(unittest.TestCase):
             plan = json.loads(plan_path.read_text(encoding="utf-8"))
             plan["data_submit_order"] = "ticket_prefix"
             plan_path.write_text(json.dumps(plan), encoding="utf-8")
+            summary_path = results / "summary.json"
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            summary.pop("runs_attempted")
+            summary_path.write_text(json.dumps(summary), encoding="utf-8")
+            remote_exit_path = results / "remote-exit.json"
+            remote_exit = json.loads(remote_exit_path.read_text(encoding="utf-8"))
+            remote_exit.pop("runs_attempted")
+            remote_exit_path.write_text(json.dumps(remote_exit), encoding="utf-8")
             self.assertTrue(progress_ring_runner.verify_results_directory(results)["verified"])
 
             first = build_point_progress_ring_schedule(POINT_PROGRESS_RING_WRITERS)[0]
@@ -493,22 +507,22 @@ class PointProgressRingQualificationTests(unittest.TestCase):
         self.assertEqual(plan["runs_planned"], 40)
         self.assertEqual(plan["data_submit_order"], "ordered")
         self.assertEqual(plan["local_screen"]["status"], "skipped_by_user")
-        args = BENCH.parse_args([
+        valid_args = [
             "--project", "test-project", "--zone", "us-east1-b", "--commit", "a" * 40,
             "--network", "walbench-isolated", "--subnet", "walbench-subnet",
             "--ssh-source-range", "192.0.2.10/32",
             "--max-runtime-minutes", "60", "--estimated-hourly-cost-usd", "1.5",
             "--max-estimated-spend-usd", "2",
             "--v8-point-progress-ring-ab", "--preflight-only",
-        ])
+        ]
+        args = BENCH.parse_args(valid_args)
         self.assertEqual(args.writers, POINT_PROGRESS_RING_WRITERS)
         self.assertEqual(args.num, POINT_PROGRESS_RING_NUM)
         self.assertEqual(args.machine_type, "c4-standard-16-lssd")
-        with self.assertRaises(SystemExit):
-            BENCH.parse_args([
-                "--project", "test-project", "--zone", "us-east1-b", "--commit", "a" * 40,
-                "--writers", "16", "--v8-point-progress-ring-ab", "--preflight-only",
-            ])
+        stderr = StringIO()
+        with redirect_stderr(stderr), self.assertRaises(SystemExit):
+            BENCH.parse_args([*valid_args, "--writers", "16"])
+        self.assertIn("requires writers (1, 8, 16)", stderr.getvalue())
 
     def test_progress_ring_requires_isolated_network_subnet_and_ssh_cidr(self) -> None:
         base = [
@@ -529,29 +543,34 @@ class PointProgressRingQualificationTests(unittest.TestCase):
 
     def test_progress_ring_preflight_audits_isolated_ingress(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            results = Path(temporary) / "preflight"
+            root = Path(temporary)
+            results = root / "preflight-1"
+            audit_tags = []
+
+            def audit_and_capture(*args: object) -> None:
+                audit_tags.append(args[4])
+
             with (
                 patch.object(BENCH, "Gcloud", return_value=Mock()),
                 patch.object(BENCH, "preflight", return_value={"zone": "us-east1-b"}),
-                patch.object(BENCH, "audit_ssh_firewall_rules") as audit,
+                patch.object(BENCH, "audit_ssh_firewall_rules", side_effect=audit_and_capture),
             ):
-                status = BENCH.main([
-                    "--project", "test-project", "--zone", "us-east1-b", "--commit", "a" * 40,
-                    "--network", "walbench-isolated", "--subnet", "walbench-subnet",
-                    "--ssh-source-range", "192.0.2.10/32", "--skip-ssh-egress-check",
-                    "--max-runtime-minutes", "60", "--estimated-hourly-cost-usd", "1.5",
-                    "--max-estimated-spend-usd", "2", "--v8-point-progress-ring-ab",
-                    "--preflight-only", "--results-dir", str(results),
-                ])
-            self.assertEqual(status, 0)
-            audit.assert_called_once_with(
-                unittest.mock.ANY,
-                "test-project",
-                "walbench-isolated",
-                "us-east1",
-                BENCH.POINT_PROGRESS_RING_VM_TAG,
-                "192.0.2.10/32",
-            )
+                for index in (1, 2):
+                    results = root / f"preflight-{index}"
+                    status = BENCH.main([
+                        "--project", "test-project", "--zone", "us-east1-b", "--commit", "a" * 40,
+                        "--network", "walbench-isolated", "--subnet", "walbench-subnet",
+                        "--ssh-source-range", "192.0.2.10/32", "--skip-ssh-egress-check",
+                        "--max-runtime-minutes", "60", "--estimated-hourly-cost-usd", "1.5",
+                        "--max-estimated-spend-usd", "2", "--v8-point-progress-ring-ab",
+                        "--preflight-only", "--results-dir", str(results),
+                    ])
+                    self.assertEqual(status, 0)
+                    report = json.loads((results / "preflight.json").read_text(encoding="utf-8"))
+                    self.assertEqual(report["isolated_network_audit"]["vm_tag"], audit_tags[-1])
+                    self.assertTrue(audit_tags[-1].startswith(BENCH.POINT_PROGRESS_RING_VM_TAG + "-"))
+            self.assertEqual(len(audit_tags), 2)
+            self.assertNotEqual(audit_tags[0], audit_tags[1])
 
     def test_archive_round_trip_verifies_all_40_raw_runs_and_summaries(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -596,6 +615,190 @@ class PointProgressRingQualificationTests(unittest.TestCase):
             extra = results / "r99-w16-extra"
             extra.mkdir()
             self.assertFalse(progress_ring_runner.verify_results_directory(results)["verified"])
+
+    def test_summary_uses_unrounded_ratios_for_inclusive_promotion_boundaries(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            results = self._make_fixture(Path(temporary))
+            rows = json.loads((results / "summary.json").read_text(encoding="utf-8"))["results"]
+
+        def score(point_ratio: float, p99_ratio: float, guardrail_ratio: float) -> dict[str, object]:
+            adjusted = json.loads(json.dumps(rows))
+            for row in adjusted:
+                writer, workload, arm = row["writer"], row["workload"], row["arm"]
+                baseline = arm == "eager"
+                ratio = 1.0
+                if workload == "point" and writer in (8, 16):
+                    ratio = 1.0 if baseline else point_ratio
+                    row["p99_ms"] = 1.0 if baseline else p99_ratio
+                elif workload == "point" and writer == 1 or workload == "batch64":
+                    ratio = 1.0 if baseline else guardrail_ratio
+                row["puts_per_second"] = 100_000.0 * ratio
+            return progress_ring_runner._summary(adjusted, POINT_PROGRESS_RING_WRITERS, len(adjusted))
+
+        exact = score(1.05, 1.05, 0.98)
+        self.assertTrue(exact["qualification_gates"]["point8_and_point16_each_gain_at_least_5pct_and_win_4_of_5"])
+        self.assertTrue(exact["qualification_gates"]["point8_and_point16_p99_regression_at_most_5pct"])
+        self.assertTrue(exact["qualification_gates"]["point1_and_batch64_paired_median_regression_at_most_2pct"])
+        self.assertTrue(exact["qualification_gates"]["candidate_qualified"])
+
+        throughput_outside = score(1.04999, 1.05, 0.98)
+        self.assertFalse(
+            throughput_outside["qualification_gates"][
+                "point8_and_point16_each_gain_at_least_5pct_and_win_4_of_5"
+            ]
+        )
+        self.assertFalse(throughput_outside["qualification_gates"]["candidate_qualified"])
+
+        p99_outside = score(1.05, 1.05001, 0.98)
+        self.assertTrue(
+            p99_outside["qualification_gates"][
+                "point8_and_point16_each_gain_at_least_5pct_and_win_4_of_5"
+            ]
+        )
+        self.assertFalse(p99_outside["qualification_gates"]["point8_and_point16_p99_regression_at_most_5pct"])
+        self.assertFalse(p99_outside["qualification_gates"]["candidate_qualified"])
+
+        guardrail_outside = score(1.05, 1.05, 0.97999)
+        self.assertFalse(
+            guardrail_outside["qualification_gates"][
+                "point1_and_batch64_paired_median_regression_at_most_2pct"
+            ]
+        )
+        self.assertFalse(guardrail_outside["qualification_gates"]["candidate_qualified"])
+
+    def test_malformed_nested_benchmark_objects_raise_value_error_and_verifier_survives(self) -> None:
+        row = build_point_progress_ring_schedule(POINT_PROGRESS_RING_WRITERS)[0]
+        malformed_records = []
+        malformed_records.append(None)
+        malformed_records.append({"result": None, "params": {}})
+        malformed_records.append({"result": {}, "params": []})
+        malformed_records.append({"result": {"wal_pipeline": None}, "params": {}})
+        malformed_records.append({
+            "result": {"wal_pipeline": {"wal_io_start": None}}, "params": {},
+        })
+        for record in malformed_records:
+            with self.subTest(record=record), self.assertRaises(ValueError):
+                progress_ring_runner._validate_record(record, row)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            results = self._make_fixture(Path(temporary))
+            raw_path = results / progress_ring_runner._run_id(row) / "result.json"
+            raw = json.loads(raw_path.read_text(encoding="utf-8"))
+            raw["result"]["wal_pipeline"] = None
+            raw_path.write_text(json.dumps(raw), encoding="utf-8")
+            verification = progress_ring_runner.verify_results_directory(results)
+            self.assertFalse(verification["verified"])
+            self.assertTrue(any("WAL pipeline metadata" in error for error in verification["errors"]))
+
+    def test_verifier_skips_score_recomputation_for_invalid_matrix_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            results = self._make_fixture(Path(temporary))
+            summary_path = results / "summary.json"
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            point = next(row for row in summary["results"] if row["workload"] == "point")
+            point["p99_ms"] = 0
+            summary_path.write_text(json.dumps(summary), encoding="utf-8")
+            verification = progress_ring_runner.verify_results_directory(results)
+            self.assertFalse(verification["verified"])
+            self.assertTrue(any("run rows" in error for error in verification["errors"]))
+
+    def test_matrix_validator_rejects_boolean_exit_status(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            results = self._make_fixture(Path(temporary))
+            summary = json.loads((results / "summary.json").read_text(encoding="utf-8"))
+        summary["results"][0]["exit_code"] = False
+        validation = validate_point_progress_ring_rows(summary["results"], POINT_PROGRESS_RING_WRITERS)
+        self.assertFalse(validation["complete"])
+
+    def test_run_suite_uses_resolved_binary_and_reports_launches_separately(self) -> None:
+        binary = Path("scripts/gcp_v8_point_progress_ring_runner.py")
+        binary_sha256 = self._sha256(binary)
+        commit = "a" * 40
+        seen_binary_paths: list[Path] = []
+
+        def fake_run_one(**kwargs: object) -> dict[str, object]:
+            row = kwargs["row"]
+            seen_binary_paths.append(kwargs["binary"])
+            kwargs["on_subprocess_started"]()
+            raw = self._raw_record(row)
+            if row["arm"] == "progress_ring" and row["writer"] in (8, 16) and row["workload"] == "point":
+                raw["result"]["ops_per_sec"] = 101_000.0
+            return {
+                **row,
+                "source_commit": commit,
+                "binary_sha256": binary_sha256,
+                "exit_code": 0,
+                "duration_seconds": 5.0,
+                **progress_ring_runner._validate_record(raw, row),
+            }
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args = SimpleNamespace(
+                commit=commit,
+                binary=binary,
+                binary_sha256=binary_sha256,
+                machine_type="c4-standard-16-lssd",
+                ssd_count=2,
+                ssd_gib=750,
+                writers=",".join(map(str, POINT_PROGRESS_RING_WRITERS)),
+                results_dir=root / "results",
+                db_root=root / "db",
+                safe_deadline_epoch=4_000_000_000,
+            )
+            with patch.object(progress_ring_runner, "_run_one", side_effect=fake_run_one):
+                status = progress_ring_runner.run_suite(args)
+
+            self.assertEqual(status, 0, "complete matrices return success even when a promotion gate fails")
+            self.assertTrue(all(path == binary.resolve(strict=True) for path in seen_binary_paths))
+            summary = json.loads((args.results_dir / "summary.json").read_text(encoding="utf-8"))
+            remote_exit = json.loads((args.results_dir / "remote-exit.json").read_text(encoding="utf-8"))
+            self.assertTrue(summary["complete"])
+            self.assertFalse(summary["qualification_gates"]["candidate_qualified"])
+            self.assertEqual(summary["runs_started"], 40)
+            self.assertEqual(summary["runs_attempted"], 40)
+            self.assertEqual(remote_exit["runs_started"], 40)
+            self.assertEqual(remote_exit["runs_attempted"], 40)
+            self.assertFalse(remote_exit["failed"])
+
+    def test_launch_count_does_not_include_deadline_rejected_attempt(self) -> None:
+        binary = Path("scripts/gcp_v8_point_progress_ring_runner.py")
+        binary_sha256 = self._sha256(binary)
+        commit = "a" * 40
+        started = 0
+
+        def fake_run_one(**kwargs: object) -> dict[str, object]:
+            nonlocal started
+            if started == 12:
+                raise TimeoutError("stopping before the VM safety deadline")
+            kwargs["on_subprocess_started"]()
+            started += 1
+            return {
+                **kwargs["row"], "source_commit": commit, "binary_sha256": binary_sha256,
+                "exit_code": 0, "puts_per_second": 1.0, "cpu_us_per_put": 1.0,
+                "p50_ms": 1.0, "p95_ms": 1.0, "p99_ms": 1.0,
+                "sync_count": 1, "puts_per_sync": 1.0, "ordered_link_hash_cpu_ns": 0,
+            }
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args = SimpleNamespace(
+                commit=commit, binary=binary, binary_sha256=binary_sha256,
+                machine_type="c4-standard-16-lssd", ssd_count=2, ssd_gib=750,
+                writers=",".join(map(str, POINT_PROGRESS_RING_WRITERS)),
+                results_dir=root / "results", db_root=root / "db", safe_deadline_epoch=4_000_000_000,
+            )
+            with patch.object(progress_ring_runner, "_run_one", side_effect=fake_run_one):
+                status = progress_ring_runner.run_suite(args)
+            self.assertEqual(status, 1)
+            summary = json.loads((args.results_dir / "summary.json").read_text(encoding="utf-8"))
+            remote_exit = json.loads((args.results_dir / "remote-exit.json").read_text(encoding="utf-8"))
+            self.assertFalse(summary["complete"])
+            self.assertEqual(summary["runs_started"], 12)
+            self.assertEqual(summary["runs_attempted"], 13)
+            self.assertEqual(remote_exit["runs_started"], 12)
+            self.assertEqual(remote_exit["runs_attempted"], 13)
+            self.assertTrue(remote_exit["failed"])
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             results = self._make_fixture(root)

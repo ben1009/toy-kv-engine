@@ -2779,7 +2779,11 @@ def provision_and_run(
     suffix = uuid.uuid4().hex[:8]
     stamp = datetime.now(timezone.utc).strftime("%y%m%d-%H%M%S")
     instance = f"walbench-{stamp}-{suffix}"
-    tag = POINT_PROGRESS_RING_VM_TAG if point_progress_ring_suite else f"walbench-{suffix}"
+    tag = getattr(args, "progress_ring_vm_tag", None) if point_progress_ring_suite else None
+    if point_progress_ring_suite and not tag:
+        tag = f"{POINT_PROGRESS_RING_VM_TAG}-{suffix}"
+    elif not point_progress_ring_suite:
+        tag = f"walbench-{suffix}"
     firewall = f"walbench-ssh-{suffix}"
     key_log = results_dir / "ssh.log"
     ssh_log = results_dir / "remote-session.log"
@@ -3232,6 +3236,8 @@ def provision_and_run(
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(sys.argv[1:] if argv is None else argv)
+    if args.v8_point_progress_ring_ab:
+        args.progress_ring_vm_tag = f"{POINT_PROGRESS_RING_VM_TAG}-{uuid.uuid4().hex[:12]}"
     if args.results_dir is None:
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         args.results_dir = Path("bench-results") / f"gcp-wal-{stamp}"
@@ -3261,13 +3267,13 @@ def main(argv: list[str] | None = None) -> int:
                 args.project,
                 args.network,
                 region,
-                POINT_PROGRESS_RING_VM_TAG,
+                args.progress_ring_vm_tag,
                 args.ssh_source_range,
             )
             report["isolated_network_audit"] = {
                 "network": args.network,
                 "subnet": args.subnet,
-                "vm_tag": POINT_PROGRESS_RING_VM_TAG,
+                "vm_tag": args.progress_ring_vm_tag,
                 "ssh_source_range": args.ssh_source_range,
                 "effective_ingress_audited": True,
             }

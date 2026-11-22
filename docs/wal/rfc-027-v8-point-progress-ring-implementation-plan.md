@@ -225,13 +225,11 @@ cargo test --package kv-engine --lib --features bench,chaos-testing \
 
 ## F0.5 Local screen and GCP A/B
 
-1. Build a single release `write-perf` binary with `bench`. Screen Point8 and
-   Point16 locally with both modes. Advance only if both show higher throughput
-   and lower p99, and successful digest and frame publication and Reaper
-   enqueue avoid acquiring the Coordinator lock. Preparation and admission
-   retain their existing locking. Use separate diagnostic runs for role CPU,
-   owner lock hold time, digest and group counts per wake, and peak ring and
-   queue occupancy.
+1. Skip local Point8 and Point16 performance screening under the user's waiver;
+   do not use local throughput or p99 as an advance gate. Use the GCP matrix
+   below as the performance evidence. Keep F0-enabled correctness checks as a
+   separate requirement. Use separate diagnostic runs for role CPU, owner lock
+   hold time, digest and group counts per wake, and peak ring and queue occupancy.
 2. Schedule five counterbalanced pairs per workload on one
    `c4-standard-16-lssd` with two Local SSDs in ext4 RAID0. Run Point at 1, 8
    and 16 writers and Batch64 at 16 writers, for 40 scored runs. Use 100,000
