@@ -8780,7 +8780,7 @@ mod tests {
         let ledger = WalV7ResourceLedger::new(WalV7ResourceLimits {
             max_logical_wal_bytes: max_file_size,
             max_source_spool_bytes,
-            max_recovery_workspace_bytes: max_file_size,
+            max_recovery_workspace_bytes: max_file_size.min(max_source_spool_bytes),
             max_buffer_memory_bytes: max_file_size * 2,
             max_seal_index_bytes: max_file_size,
         })?;

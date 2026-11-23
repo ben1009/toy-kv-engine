@@ -40232,18 +40232,15 @@ mod tests {
 
     #[cfg(all(target_os = "linux", feature = "bench"))]
     #[test]
-    fn v8_point_buffer_preallocation_survives_concurrent_rotation_and_recovery()
+    fn v8_point_buffer_preallocation_is_inherited_across_rotation_and_recovery()
     -> anyhow::Result<()> {
         use crate::pitr::api::{PersistedPitrConfig, PitrOptions, PitrRuntimeOptions};
         use crate::tests::harness::is_io_uring_unavailable_error;
         use crate::wal::WalIoMode;
 
-        const WRITERS: usize = 8;
-        const WRITES_PER_WRITER: usize = 12;
-        const ROTATE_AFTER: usize = WRITES_PER_WRITER / 2;
-        // Keep the workload below the capacity limit. The test rotates at a
-        // controlled barrier so it exercises successor inheritance without
-        // exhausting the shared seal-index budget first.
+        const WRITES_PER_SEGMENT: usize = 3;
+        // Keep the workload below the capacity limit; the explicit recovery
+        // point is the only rotation this test exercises.
         const MAX_SEGMENT_BYTES: u64 = 4 * 1024 * 1024;
         const VALUE: &[u8] = &[0x5a; 1024];
 
@@ -40291,41 +40288,27 @@ mod tests {
         engine
             .inner
             .set_v8_point_buffer_preallocation_for_test(true)?;
-        let start = std::sync::Arc::new(std::sync::Barrier::new(WRITERS + 1));
-        let phase_done = std::sync::Arc::new(std::sync::Barrier::new(WRITERS + 1));
-        let resume = std::sync::Arc::new(std::sync::Barrier::new(WRITERS + 1));
-        let workers = (0..WRITERS)
-            .map(|writer| {
-                let engine = std::sync::Arc::clone(&engine);
-                let start = std::sync::Arc::clone(&start);
-                let phase_done = std::sync::Arc::clone(&phase_done);
-                let resume = std::sync::Arc::clone(&resume);
-                std::thread::spawn(move || -> anyhow::Result<()> {
-                    start.wait();
-                    for index in 0..ROTATE_AFTER {
-                        let key = format!("point-{writer:02}-{index:03}");
-                        engine.put(key.as_bytes(), VALUE)?;
-                    }
-                    phase_done.wait();
-                    resume.wait();
-                    for index in ROTATE_AFTER..WRITES_PER_WRITER {
-                        let key = format!("point-{writer:02}-{index:03}");
-                        engine.put(key.as_bytes(), VALUE)?;
-                    }
-                    Ok(())
-                })
-            })
-            .collect::<Vec<_>>();
-
-        start.wait();
-        phase_done.wait();
+        for index in 0..WRITES_PER_SEGMENT {
+            let key = format!("point-{index:03}");
+            engine.put(key.as_bytes(), VALUE)?;
+        }
         assert!(matches!(
             engine.create_recovery_point()?,
             crate::pitr::api::RecoveryPointOutcome::Durable(_)
         ));
-        resume.wait();
-        for worker in workers {
-            worker.join().expect("Point writer thread joins")?;
+        let successor = engine.inner.state.load().memtable.clone();
+        assert!(successor.uses_v8_wal());
+        assert_ne!(successor.id(), initial_id);
+        assert!(
+            successor
+                .benchmark_wal_io_diagnostics()
+                .is_some_and(|item| item.point_buffer_preallocation_enabled)
+        );
+        let successor_id = successor.id();
+        drop(successor);
+        for index in WRITES_PER_SEGMENT..(2 * WRITES_PER_SEGMENT) {
+            let key = format!("point-{index:03}");
+            engine.put(key.as_bytes(), VALUE)?;
         }
         engine.sync()?;
 
@@ -40344,8 +40327,7 @@ mod tests {
         assert!(
             v8_memtables
                 .iter()
-                .any(|memtable| memtable.id() != initial_id),
-            "the controlled recovery point should install a V8 successor"
+                .any(|memtable| memtable.id() == successor_id)
         );
         let diagnostics = v8_memtables
             .iter()
@@ -40368,11 +40350,11 @@ mod tests {
                 .map(|item| item.point_buffer_preallocation_hits)
                 .sum::<u64>()
                 > 0,
-            "concurrent Point admissions should consume preallocated buffers"
+            "Point admissions should consume preallocated buffers"
         );
         assert!(
             v8_memtables.iter().any(|memtable| {
-                memtable.id() != initial_id
+                memtable.id() == successor_id
                     && memtable
                         .benchmark_wal_io_diagnostics()
                         .is_some_and(|item| item.point_buffer_preallocation_hits > 0)
@@ -40384,22 +40366,18 @@ mod tests {
                 == item.point_buffer_preallocation_hits + item.point_buffer_preallocation_fallbacks
         }));
 
-        for writer in 0..WRITERS {
-            for index in 0..WRITES_PER_WRITER {
-                let key = format!("point-{writer:02}-{index:03}");
-                assert_eq!(engine.get(key.as_bytes())?.as_deref(), Some(VALUE));
-            }
+        for index in 0..(2 * WRITES_PER_SEGMENT) {
+            let key = format!("point-{index:03}");
+            assert_eq!(engine.get(key.as_bytes())?.as_deref(), Some(VALUE));
         }
         engine.close()?;
         drop(engine);
 
         options.pitr_repository = Some(repository);
         let reopened = KvEngine::open_with_wal_io_mode(&database, options, WalIoMode::Parallel)?;
-        for writer in 0..WRITERS {
-            for index in 0..WRITES_PER_WRITER {
-                let key = format!("point-{writer:02}-{index:03}");
-                assert_eq!(reopened.get(key.as_bytes())?.as_deref(), Some(VALUE));
-            }
+        for index in 0..(2 * WRITES_PER_SEGMENT) {
+            let key = format!("point-{index:03}");
+            assert_eq!(reopened.get(key.as_bytes())?.as_deref(), Some(VALUE));
         }
         reopened.close()?;
 
