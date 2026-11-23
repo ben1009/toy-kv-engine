@@ -221,15 +221,13 @@ impl WalV8ReservationOwner {
     #[cfg(feature = "bench")]
     pub(crate) fn promote_preclaim(
         self: &Arc<Self>,
-        preclaim: WalV8PointQuotaPreclaim,
-    ) -> Option<WalV7OwnedBatchReservation> {
+        mut preclaim: WalV8PointQuotaPreclaim,
+    ) -> Result<Option<WalV7OwnedBatchReservation>, WalV7ReservationError> {
         if !Arc::ptr_eq(self, &preclaim.owner) {
-            return None;
+            return Ok(None);
         }
         self.image_owner
-            .promote_batch_preclaim(&preclaim.claim, preclaim.marker_source_bytes)
-            .ok()
-            .flatten()
+            .promote_batch_preclaim(&mut preclaim.claim, preclaim.marker_source_bytes)
     }
 
     fn batch_charge(

@@ -5916,8 +5916,11 @@ impl WalV8ParallelWriter {
         #[cfg(feature = "bench")] quota_preclaim: Option<super::resource::WalV8PointQuotaPreclaim>,
     ) -> Result<WalV8AdmissionResources> {
         #[cfg(feature = "bench")]
-        let promoted = quota_preclaim.and_then(|claim| {
-            let result = self.reservation_owner.as_ref()?.promote_preclaim(claim);
+        let promoted = if let Some(claim) = quota_preclaim {
+            let result = match &self.reservation_owner {
+                Some(owner) => owner.promote_preclaim(claim)?,
+                None => None,
+            };
             let counter = if result.is_some() {
                 &self.point_resource_preclaim_promoted
             } else {
@@ -5925,7 +5928,9 @@ impl WalV8ParallelWriter {
             };
             counter.fetch_add(1, Ordering::Relaxed);
             result
-        });
+        } else {
+            None
+        };
         #[cfg(not(feature = "bench"))]
         let promoted = None;
         let reservation = match promoted {
@@ -9048,11 +9053,11 @@ mod tests {
         let other = open_owner()?;
         let baseline = ledger.snapshot();
         let claim = owner.try_preclaim_batch(128, FRAME_LEN_U64).unwrap();
-        assert!(other.promote_preclaim(claim).is_none());
+        assert!(other.promote_preclaim(claim)?.is_none());
         assert_eq!(ledger.snapshot(), baseline);
 
         let claim = owner.try_preclaim_batch(128, FRAME_LEN_U64).unwrap();
-        let reservation = owner.promote_preclaim(claim).unwrap();
+        let reservation = owner.promote_preclaim(claim)?.unwrap();
         assert_eq!(
             ledger.snapshot().logical_wal_bytes,
             baseline.logical_wal_bytes + 2 * FRAME_LEN_U64
@@ -9063,7 +9068,10 @@ mod tests {
         let claim = owner.try_preclaim_batch(128, FRAME_LEN_U64).unwrap();
         owner.image_owner().retire_after_durable_cleanup()?;
         let after_retirement = ledger.snapshot();
-        assert!(owner.promote_preclaim(claim).is_none());
+        assert!(matches!(
+            owner.promote_preclaim(claim),
+            Err(WalV7ReservationError::ReservationOwnerRetired)
+        ));
         assert!(owner.try_preclaim_batch(128, FRAME_LEN_U64).is_none());
         assert_eq!(ledger.snapshot(), after_retirement);
         Ok(())

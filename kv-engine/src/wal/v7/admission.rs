@@ -205,8 +205,6 @@ struct LedgerState {
     // Speculative charges constrain other preclaims only. Formal reservations
     // can revoke them under this same lock without waiting for a token holder.
     preclaims: BTreeMap<u64, WalV7ResourceCharge>,
-    #[cfg(feature = "bench")]
-    next_preclaim_id: u64,
     source_spool_generation: u64,
     source_spool_work_generation: u64,
 }
@@ -242,13 +240,15 @@ pub(crate) struct WalV7ResourceLedger {
 #[cfg(feature = "bench")]
 pub(crate) struct PointQuotaPreclaim {
     ledger: Arc<WalV7ResourceLedgerInner>,
-    id: u64,
+    id: Option<u64>,
 }
 
 #[cfg(feature = "bench")]
 impl Drop for PointQuotaPreclaim {
     fn drop(&mut self) {
-        self.ledger.state.lock().preclaims.remove(&self.id);
+        if let Some(id) = self.id {
+            self.ledger.state.lock().preclaims.remove(&id);
+        }
     }
 }
 
@@ -541,7 +541,7 @@ impl WalV7ReservationOwner {
     #[cfg(feature = "bench")]
     pub(crate) fn promote_batch_preclaim(
         self: &Arc<Self>,
-        claim: &PointQuotaPreclaim,
+        claim: &mut PointQuotaPreclaim,
         frontier_source_credit: u64,
     ) -> Result<Option<WalV7OwnedBatchReservation>, WalV7ReservationError> {
         self.reserve_owned_batch(frontier_source_credit, || {
@@ -1118,8 +1118,6 @@ impl WalV7ResourceLedger {
                     reservations: AHashMap::new(),
                     #[cfg(feature = "bench")]
                     preclaims: BTreeMap::new(),
-                    #[cfg(feature = "bench")]
-                    next_preclaim_id: 1,
                     source_spool_generation: 0,
                     source_spool_work_generation: 0,
                 }),
@@ -1178,19 +1176,29 @@ impl WalV7ResourceLedger {
         let id = state.next_id;
 
         #[cfg(feature = "bench")]
-        self.revoke_conflicting_preclaims(state, next, maintenance);
+        self.revoke_conflicting_preclaims(state, next);
 
-        state.charged = next;
         state.next_id = next_id;
+        Ok(self.register_reservation(state, id, charge, next))
+    }
+
+    fn register_reservation(
+        &self,
+        state: &mut LedgerState,
+        id: u64,
+        charge: WalV7ResourceCharge,
+        next: WalV7ResourceCharge,
+    ) -> WalV7Reservation {
+        state.charged = next;
         let previous = state.reservations.insert(id, charge);
         debug_assert!(previous.is_none());
 
-        Ok(WalV7Reservation {
+        WalV7Reservation {
             id,
             charge,
             ledger: Arc::clone(&self.inner),
             active: true,
-        })
+        }
     }
 
     fn check_charge_limits(
@@ -1251,43 +1259,44 @@ impl WalV7ResourceLedger {
             })?;
         self.check_charge_limits(next, false, state.source_spool_generation)
             .ok()?;
-        let id = state.next_preclaim_id;
-        state.next_preclaim_id = id.checked_add(1)?;
+        let id = state.next_id;
+        state.next_id = id.checked_add(1)?;
         state.preclaims.insert(id, charge);
         Some(PointQuotaPreclaim {
             ledger: Arc::clone(&self.inner),
-            id,
+            id: Some(id),
         })
     }
 
     #[cfg(feature = "bench")]
     fn promote_preclaim(
         &self,
-        claim: &PointQuotaPreclaim,
+        claim: &mut PointQuotaPreclaim,
     ) -> Result<Option<WalV7Reservation>, WalV7ReservationError> {
         if !Arc::ptr_eq(&self.inner, &claim.ledger) {
             return Err(WalV7ReservationError::ForeignReservation);
         }
-        let mut state = self.inner.state.lock();
-        let Some(charge) = state.preclaims.remove(&claim.id) else {
+        let Some(id) = claim.id.take() else {
             return Ok(None);
         };
-        match self.reserve_with_priority_locked(&mut state, charge, false) {
-            Ok(reservation) => Ok(Some(reservation)),
-            Err(error) => {
-                state.preclaims.insert(claim.id, charge);
-                Err(error)
-            }
-        }
+        let mut state = self.inner.state.lock();
+        let Some(charge) = state.preclaims.remove(&id) else {
+            return Ok(None);
+        };
+        // The combined charges fit when the claim was issued. Subsequent
+        // formal reservations revoke claims if that invariant would fail.
+        // Moving this charge into the formal ledger preserves the total.
+        let next = state
+            .charged
+            .checked_add(charge)
+            .ok_or(WalV7ReservationError::ArithmeticOverflow)?;
+        Ok(Some(
+            self.register_reservation(&mut state, id, charge, next),
+        ))
     }
 
     #[cfg(feature = "bench")]
-    fn revoke_conflicting_preclaims(
-        &self,
-        state: &mut LedgerState,
-        next: WalV7ResourceCharge,
-        maintenance: bool,
-    ) {
+    fn revoke_conflicting_preclaims(&self, state: &mut LedgerState, next: WalV7ResourceCharge) {
         if state.preclaims.is_empty() {
             return;
         }
@@ -1296,7 +1305,7 @@ impl WalV7ResourceLedger {
             .values()
             .try_fold(next, |total, &claim| total.checked_add(claim));
         if with_preclaims.is_none_or(|total| {
-            self.check_charge_limits(total, maintenance, state.source_spool_generation)
+            self.check_charge_limits(total, false, state.source_spool_generation)
                 .is_err()
         }) {
             // The prototype revokes the bounded set on conflict. Tokens keep
@@ -1667,6 +1676,10 @@ impl WalV7ResourceLedger {
 
     #[cfg(test)]
     fn set_max_seal_index_bytes_for_test(&self, max_seal_index_bytes: u64) {
+        #[cfg(feature = "bench")]
+        let mut state = self.inner.state.lock();
+        #[cfg(feature = "bench")]
+        state.preclaims.clear();
         self.inner
             .test_max_seal_index_bytes
             .store(max_seal_index_bytes, Ordering::Release);
@@ -2070,8 +2083,8 @@ mod tests {
                     let later = ledger.try_preclaim(full);
                     claimed.wait();
                     admitted.wait();
-                    let later = later.expect("quota was initially available");
-                    assert!(ledger.promote_preclaim(&later).unwrap().is_none());
+                    let mut later = later.expect("quota was initially available");
+                    assert!(ledger.promote_preclaim(&mut later).unwrap().is_none());
                 });
                 claimed.wait();
                 let rejected = ledger.try_preclaim(full).is_none();
@@ -2092,20 +2105,81 @@ mod tests {
     fn point_preclaim_promotion_and_drop_account_once() {
         let ledger = WalV7ResourceLedger::new(limits()).unwrap();
         let half = charge(50, 50, 0, 20, 16);
-        let first = ledger.try_preclaim(half).unwrap();
+        let mut first = ledger.try_preclaim(half).unwrap();
         let second = ledger.try_preclaim(half).unwrap();
         assert!(ledger.try_preclaim(half).is_none());
         assert_eq!(ledger.snapshot(), WalV7ResourceCharge::default());
 
-        let first_reservation = ledger.promote_preclaim(&first).unwrap().unwrap();
-        assert!(ledger.promote_preclaim(&first).unwrap().is_none());
-        drop(first);
+        let first_reservation = ledger.promote_preclaim(&mut first).unwrap().unwrap();
+        assert!(ledger.promote_preclaim(&mut first).unwrap().is_none());
+        {
+            let _ledger_lock = ledger.inner.state.lock();
+            drop(first);
+        }
         assert_eq!(ledger.snapshot(), half);
         assert!(ledger.try_preclaim(half).is_none());
         drop(second);
         assert!(ledger.try_preclaim(half).is_some());
         drop(first_reservation);
         assert_eq!(ledger.snapshot(), WalV7ResourceCharge::default());
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn point_preclaim_respects_maintenance_headroom_and_limit_changes() {
+        let ledger =
+            WalV7ResourceLedger::new_with_maintenance_buffer_reserve(limits(), 10).unwrap();
+        let mut claim = ledger.try_preclaim(charge(0, 0, 0, 20, 0)).unwrap();
+        let maintenance = ledger.reserve_maintenance(charge(0, 0, 0, 20, 0)).unwrap();
+        assert!(ledger.promote_preclaim(&mut claim).unwrap().is_none());
+        drop(maintenance);
+
+        let mut claim = ledger.try_preclaim(charge(0, 0, 0, 0, 32)).unwrap();
+        ledger.set_max_seal_index_bytes_for_test(31);
+        assert!(ledger.promote_preclaim(&mut claim).unwrap().is_none());
+        assert_eq!(ledger.snapshot(), WalV7ResourceCharge::default());
+    }
+
+    #[cfg(all(feature = "bench", target_os = "linux"))]
+    #[test]
+    #[ignore = "local CPU diagnostic"]
+    fn point_preclaim_promotion_cpu_diagnostic() {
+        use crate::wal::v8::digest::thread_cpu_time_ns;
+
+        const BATCHES: u64 = 10_000;
+        const WIDTH: usize = 16;
+        let ledger = WalV7ResourceLedger::new(limits()).unwrap();
+        let unit = charge(1, 1, 0, 1, 1);
+        let mut elapsed_ns = [0; 2];
+        let mut reservations = Vec::with_capacity(WIDTH);
+
+        for batch in 0..BATCHES {
+            let modes = if batch % 2 == 0 { [0, 1] } else { [1, 0] };
+            for mode in modes {
+                if mode == 0 {
+                    let start = thread_cpu_time_ns();
+                    for _ in 0..WIDTH {
+                        reservations.push(ledger.reserve(unit).unwrap());
+                    }
+                    elapsed_ns[mode] += thread_cpu_time_ns() - start;
+                } else {
+                    let mut claims: [_; WIDTH] =
+                        std::array::from_fn(|_| ledger.try_preclaim(unit).unwrap());
+                    let start = thread_cpu_time_ns();
+                    for claim in &mut claims {
+                        reservations.push(ledger.promote_preclaim(claim).unwrap().unwrap());
+                    }
+                    elapsed_ns[mode] += thread_cpu_time_ns() - start;
+                }
+                reservations.clear();
+            }
+        }
+        let operations = BATCHES * WIDTH as u64;
+        eprintln!(
+            "thread CPU per ledger acquisition: reserve {:.1} ns, promote {:.1} ns",
+            elapsed_ns[0] as f64 / operations as f64,
+            elapsed_ns[1] as f64 / operations as f64,
+        );
     }
 
     #[cfg(feature = "bench")]
