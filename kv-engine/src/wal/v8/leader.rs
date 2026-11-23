@@ -8780,7 +8780,7 @@ mod tests {
         let ledger = WalV7ResourceLedger::new(WalV7ResourceLimits {
             max_logical_wal_bytes: max_file_size,
             max_source_spool_bytes,
-            max_recovery_workspace_bytes: max_file_size.min(max_source_spool_bytes),
+            max_recovery_workspace_bytes: max_file_size,
             max_buffer_memory_bytes: max_file_size * 2,
             max_seal_index_bytes: max_file_size,
         })?;
@@ -8846,6 +8846,7 @@ mod tests {
     fn point_buffer_preallocation_does_not_reserve_quota_before_admission() -> Result<()> {
         const SEGMENT_LIMIT: u64 = 64 * 1024;
         const INITIAL_SOURCE_CHARGE: u64 = HEADER_LEN_U64 + FRAME_LEN_U64;
+        const SOURCE_SPOOL_LIMIT: u64 = SEGMENT_LIMIT + INITIAL_SOURCE_CHARGE;
 
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("point-prealloc-quota-v8.wal");
@@ -8854,7 +8855,7 @@ mod tests {
             &path,
             &installed,
             SEGMENT_LIMIT,
-            INITIAL_SOURCE_CHARGE,
+            SOURCE_SPOOL_LIMIT,
             4096,
         ) {
             Ok(writer) => writer,
@@ -8910,6 +8911,8 @@ mod tests {
         const SEGMENT_LIMIT: u64 = 64 * 1024;
         const INITIAL_SOURCE_CHARGE: u64 = HEADER_LEN_U64 + FRAME_LEN_U64;
         const ONE_BATCH_SOURCE_CHARGE: u64 = 2 * WAL_V8_FRAME_LEN as u64;
+        const SOURCE_SPOOL_LIMIT: u64 =
+            SEGMENT_LIMIT + INITIAL_SOURCE_CHARGE + ONE_BATCH_SOURCE_CHARGE;
 
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("point-prealloc-order-v8.wal");
@@ -8918,7 +8921,7 @@ mod tests {
             &path,
             &installed,
             SEGMENT_LIMIT,
-            INITIAL_SOURCE_CHARGE + ONE_BATCH_SOURCE_CHARGE,
+            SOURCE_SPOOL_LIMIT,
             4096,
         ) {
             Ok(writer) => writer,
