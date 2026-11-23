@@ -35,7 +35,7 @@ Wall values are μs except CPU fields are thread CPU μs; each configuration has
 - The wait also consumes measurable thread CPU (about 21–29 μs p50), so it is not pure sleeping. Completion apply, Digest Fold, and Cursor Advance each have low single-digit μs CPU p50.
 - `fdatasync` p50 remains about 1–2 μs, with a long tail (roughly 103–155 μs p95). Frontier write p50 is about 33–36 μs. Do not add stage percentiles to infer cycle time.
 - Direct Completion changed CPU/Put and diagnostic throughput in these single runs, but Sync count and Puts/Sync stayed close. One run per cell is not enough to claim a performance win.
-- The output field `coalescing_wait_breakdown_available` is false in a subset of Cursor samples even though all detailed phase fields are populated. This appears to be a reporting-flag inconsistency; the numeric optional fields are retained and were used for these summaries. Fix the flag before relying on it as a validator.
+- `coalescing_wait_breakdown_available` describes availability of the legacy State Lock/Condvar wait breakdown. It is expected to be false for Cursor; it does not describe the Cursor progress-token measurements. The Cursor-specific progress wait fields were populated and used for these summaries. Do not treat this flag as a Cursor sampling validity check.
 
 ## Memory and cleanup
 
