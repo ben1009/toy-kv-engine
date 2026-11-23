@@ -30,6 +30,7 @@ and do not define the current writer selection.
 - [V8 Point Progress Ring (F0 stopped after GCP qualification)](../rfcs/027-v8-point-progress-ring.md)
 - [RFC 027 V8 Point Progress Ring GCP qualification, 2026-11-21](wal/benchmarks/rfc-027-v8-point-progress-ring-gcp-20261121.md)
 - [RFC 027 V8 Cursor direct-completion GCP qualification, 2026-11-22](wal/benchmarks/rfc-027-v8-cursor-direct-completion-gcp-20261122.md)
+- [RFC 028 V8 Cursor coalescing GCP diagnostic, 2026-11-23](wal/benchmarks/rfc-028-v8-cursor-coalescing-gcp-20261123.md)
 
 ## Benchmark reports
 
@@ -40,6 +41,7 @@ and do not define the current writer selection.
 - [Io_uring Benchmark Results](benchmarks/io-uring-bench.md)
 - [Performance Profiling Report](benchmarks/perf-profile.md)
 - [GCP Free Trial WAL benchmark runner](wal/benchmarks/gcp-free-trial-wal-bench.md)
+- [RFC 028 V8 Cursor coalescing GCP diagnostic, 2026-11-23](wal/benchmarks/rfc-028-v8-cursor-coalescing-gcp-20261123.md)
 - [GCP V8 point sync diagnostic, 2026-11-10](wal/benchmarks/rfc-026-v8-point-sync-gcp-20261110.md)
 - [GCP V8 FRONTIER I/O A/B, 2026-11-11](wal/benchmarks/rfc-026-v8-frontier-io-ab-gcp-20261111.md)
 - [GCP V7/V8 CPU affinity, 2026-11-11](wal/benchmarks/rfc-026-v7-v8-cpu-affinity-gcp-20261111.md)
