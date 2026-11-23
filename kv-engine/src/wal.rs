@@ -2638,6 +2638,15 @@ impl Wal {
         false
     }
 
+    #[cfg(all(test, feature = "bench"))]
+    pub(crate) fn set_v8_point_buffer_preallocation_for_test(&self, enabled: bool) -> Result<()> {
+        self.v8_parallel
+            .as_ref()
+            .context("v8 WAL has no Parallel writer")?
+            .set_point_buffer_preallocation_for_test(enabled);
+        Ok(())
+    }
+
     #[cfg(feature = "bench")]
     pub(crate) fn admit_v8_prepared_parallel_point_batch<'a>(
         &self,

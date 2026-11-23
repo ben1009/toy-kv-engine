@@ -309,6 +309,8 @@ pub(crate) struct WalV8ParallelWriter {
     batch_point_frontier_credits: bool,
     #[cfg(feature = "bench")]
     point_buffer_preallocation_enabled: bool,
+    #[cfg(all(test, feature = "bench"))]
+    point_buffer_preallocation_test_override: AtomicBool,
     #[cfg(feature = "bench")]
     point_buffer_preallocation_attempts: AtomicU64,
     #[cfg(feature = "bench")]
@@ -4905,6 +4907,8 @@ impl WalV8LeaderWriter {
             batch_point_frontier_credits,
             #[cfg(feature = "bench")]
             point_buffer_preallocation_enabled,
+            #[cfg(all(test, feature = "bench"))]
+            point_buffer_preallocation_test_override: AtomicBool::new(false),
             #[cfg(feature = "bench")]
             point_buffer_preallocation_attempts: AtomicU64::new(0),
             #[cfg(feature = "bench")]
@@ -5496,8 +5500,36 @@ impl WalV8ParallelWriter {
         diagnostics.point_buffer_preallocation_fallbacks = self
             .point_buffer_preallocation_fallbacks
             .load(Ordering::Relaxed);
+        #[cfg(test)]
+        {
+            diagnostics.point_buffer_preallocation_enabled |= self
+                .point_buffer_preallocation_test_override
+                .load(Ordering::Relaxed);
+        }
 
         diagnostics
+    }
+
+    #[cfg(all(test, feature = "bench"))]
+    pub(crate) fn set_point_buffer_preallocation_for_test(&self, enabled: bool) {
+        self.point_buffer_preallocation_test_override
+            .store(enabled, Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "bench")]
+    fn should_preallocate_point_buffer(&self) -> bool {
+        #[cfg(test)]
+        {
+            self.point_buffer_preallocation_enabled
+                || self
+                    .point_buffer_preallocation_test_override
+                    .load(Ordering::Relaxed)
+        }
+
+        #[cfg(not(test))]
+        {
+            self.point_buffer_preallocation_enabled
+        }
     }
 
     #[cfg(feature = "bench")]
@@ -5671,7 +5703,7 @@ impl WalV8ParallelWriter {
         &self,
         scratch: &mut WalV8PointAdmissionScratch<'_>,
     ) -> bool {
-        if !self.point_buffer_preallocation_enabled {
+        if !self.should_preallocate_point_buffer() {
             return false;
         }
         self.point_buffer_preallocation_attempts
@@ -8776,6 +8808,269 @@ mod tests {
         )?;
 
         Ok((writer, owner))
+    }
+
+    #[cfg(feature = "bench")]
+    fn open_accounted_parallel_writer(
+        path: &Path,
+        installed: &WalV8InstalledRecovery,
+        max_file_size: u64,
+        max_source_spool_bytes: u64,
+        allocation_unit: u64,
+    ) -> Result<(WalV8ParallelWriter, Arc<WalV8ReservationOwner>)> {
+        let sync_file = OpenOptions::new().read(true).write(true).open(path)?;
+        let (leader, owner) = open_accounted_writer(
+            path,
+            installed,
+            max_file_size,
+            max_source_spool_bytes,
+            allocation_unit,
+            sync_file,
+        )?;
+        let worker_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_DIRECT)
+            .open(path)?;
+        let mut writer = leader.into_parallel_with_worker_file_and_progress_mode(
+            worker_file,
+            WalV8ProgressMode::Eager,
+        )?;
+        writer.point_buffer_preallocation_enabled = true;
+
+        Ok((writer, owner))
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn point_buffer_preallocation_does_not_reserve_quota_before_admission() -> Result<()> {
+        const SEGMENT_LIMIT: u64 = 64 * 1024;
+        const INITIAL_SOURCE_CHARGE: u64 = HEADER_LEN_U64 + FRAME_LEN_U64;
+
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("point-prealloc-quota-v8.wal");
+        let installed = install_empty(&path, header())?;
+        let (writer, owner) = match open_accounted_parallel_writer(
+            &path,
+            &installed,
+            SEGMENT_LIMIT,
+            INITIAL_SOURCE_CHARGE,
+            4096,
+        ) {
+            Ok(writer) => writer,
+            Err(error) if is_io_uring_unavailable_error(&error) => {
+                eprintln!("skipping test (io_uring unavailable): {error:#}");
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        let point = batch(10);
+        let prepared = writer.preflight_batch_with_write_class(
+            &point,
+            LIVE_WAL_V5_LIMITS,
+            WalV8WriteClass::Point,
+        )?;
+        let mut scratch = WalV8PointAdmissionScratch::new(prepared);
+
+        let quota_before = owner.image_owner().snapshot();
+        assert!(writer.try_preallocate_point_buffer(&mut scratch));
+        assert_eq!(owner.image_owner().snapshot(), quota_before);
+        assert_eq!(
+            writer
+                .point_buffer_preallocations_in_flight
+                .load(Ordering::Relaxed),
+            1
+        );
+
+        let error = writer
+            .admit_prepared_point_batch(scratch, point.commit_ts, point.recorded_at)
+            .err()
+            .expect("the exhausted source-spool quota must reject serialized admission");
+        assert!(format!("{error:#}").contains("source spool limit"));
+        assert_eq!(writer.coordinator.next_ticket(), 0);
+        assert_eq!(owner.image_owner().snapshot(), quota_before);
+        assert_eq!(
+            writer
+                .point_buffer_preallocations_in_flight
+                .load(Ordering::Relaxed),
+            0,
+            "failed admission drops its speculative buffer and permit"
+        );
+        let diagnostics = writer.io_diagnostics();
+        assert_eq!(diagnostics.point_buffer_preallocation_attempts, 1);
+        assert_eq!(diagnostics.point_buffer_preallocation_hits, 1);
+        assert_eq!(diagnostics.point_buffer_preallocation_fallbacks, 0);
+
+        Ok(())
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn speculative_point_buffer_does_not_steal_quota_from_earlier_admission() -> Result<()> {
+        const SEGMENT_LIMIT: u64 = 64 * 1024;
+        const INITIAL_SOURCE_CHARGE: u64 = HEADER_LEN_U64 + FRAME_LEN_U64;
+        const ONE_BATCH_SOURCE_CHARGE: u64 = 2 * WAL_V8_FRAME_LEN as u64;
+
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("point-prealloc-order-v8.wal");
+        let installed = install_empty(&path, header())?;
+        let (writer, owner) = match open_accounted_parallel_writer(
+            &path,
+            &installed,
+            SEGMENT_LIMIT,
+            INITIAL_SOURCE_CHARGE + ONE_BATCH_SOURCE_CHARGE,
+            4096,
+        ) {
+            Ok(writer) => writer,
+            Err(error) if is_io_uring_unavailable_error(&error) => {
+                eprintln!("skipping test (io_uring unavailable): {error:#}");
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        let earlier = batch(10);
+        let later = batch(20);
+        let earlier_scratch =
+            WalV8PointAdmissionScratch::new(writer.preflight_batch_with_write_class(
+                &earlier,
+                LIVE_WAL_V5_LIMITS,
+                WalV8WriteClass::Point,
+            )?);
+        let mut later_scratch =
+            WalV8PointAdmissionScratch::new(writer.preflight_batch_with_write_class(
+                &later,
+                LIVE_WAL_V5_LIMITS,
+                WalV8WriteClass::Point,
+            )?);
+
+        let quota_before_admission = owner.image_owner().snapshot();
+        assert!(writer.try_preallocate_point_buffer(&mut later_scratch));
+        assert_eq!(owner.image_owner().snapshot(), quota_before_admission);
+
+        let earlier_job = writer.admit_prepared_point_batch(
+            earlier_scratch,
+            earlier.commit_ts,
+            earlier.recorded_at,
+        )?;
+        let earlier_ticket = earlier_job.assignment().segment_ticket;
+        earlier_job.finish()?;
+        writer.wait_durable(earlier_ticket)?;
+
+        let quota_after_earlier_admission = owner.image_owner().snapshot();
+        assert_eq!(
+            quota_after_earlier_admission.source_spool_bytes,
+            quota_before_admission.source_spool_bytes + ONE_BATCH_SOURCE_CHARGE
+        );
+        let error = writer
+            .admit_prepared_point_batch(later_scratch, later.commit_ts, later.recorded_at)
+            .err()
+            .expect("the later admission exceeds the remaining source-spool quota");
+        assert!(format!("{error:#}").contains("source spool limit"));
+        assert_eq!(writer.coordinator.next_ticket(), 1);
+        assert_eq!(
+            owner.image_owner().snapshot(),
+            quota_after_earlier_admission
+        );
+        assert_eq!(
+            writer
+                .point_buffer_preallocations_in_flight
+                .load(Ordering::Relaxed),
+            0,
+            "failed later admission releases its speculative buffer permit"
+        );
+
+        Ok(())
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn point_buffer_preallocation_exhaustion_falls_back_to_normal_admission() -> Result<()> {
+        const SEGMENT_LIMIT: u64 = 256 * 1024;
+        const INITIAL_SOURCE_CHARGE: u64 = HEADER_LEN_U64 + FRAME_LEN_U64;
+        const BATCH_COUNT: usize = MAX_POINT_BUFFER_PREALLOCATIONS + 1;
+
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("point-prealloc-bound-v8.wal");
+        let installed = install_empty(&path, header())?;
+        let (writer, _owner) = match open_accounted_parallel_writer(
+            &path,
+            &installed,
+            SEGMENT_LIMIT,
+            2 * SEGMENT_LIMIT,
+            4096,
+        ) {
+            Ok(writer) => writer,
+            Err(error) if is_io_uring_unavailable_error(&error) => {
+                eprintln!("skipping test (io_uring unavailable): {error:#}");
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        let batches = (1..=BATCH_COUNT)
+            .map(|ticket| batch(ticket as u64))
+            .collect::<Vec<_>>();
+        let mut scratches = Vec::with_capacity(BATCH_COUNT);
+
+        for (index, point) in batches.iter().enumerate() {
+            let prepared = writer.preflight_batch_with_write_class(
+                point,
+                LIVE_WAL_V5_LIMITS,
+                WalV8WriteClass::Point,
+            )?;
+            let mut scratch = WalV8PointAdmissionScratch::new(prepared);
+            let preallocated = writer.try_preallocate_point_buffer(&mut scratch);
+            assert_eq!(
+                preallocated,
+                index < MAX_POINT_BUFFER_PREALLOCATIONS,
+                "the bounded permit pool should fall back after its configured limit"
+            );
+            scratches.push(scratch);
+        }
+
+        assert_eq!(
+            writer
+                .point_buffer_preallocations_in_flight
+                .load(Ordering::Relaxed),
+            MAX_POINT_BUFFER_PREALLOCATIONS
+        );
+        let fallback = scratches.pop().expect("the last scratch used fallback");
+        let fallback_point = batches.last().expect("one fallback batch exists");
+        let job = writer.admit_prepared_point_batch(
+            fallback,
+            fallback_point.commit_ts,
+            fallback_point.recorded_at,
+        )?;
+        let ticket = job.assignment().segment_ticket;
+        job.finish()?;
+        writer.wait_durable(ticket)?;
+        assert_eq!(
+            writer
+                .point_buffer_preallocations_in_flight
+                .load(Ordering::Relaxed),
+            MAX_POINT_BUFFER_PREALLOCATIONS,
+            "the ordinary allocation fallback must not consume another permit"
+        );
+
+        drop(scratches);
+        assert_eq!(
+            writer
+                .point_buffer_preallocations_in_flight
+                .load(Ordering::Relaxed),
+            0,
+            "abandoned pre-admission buffers release all permits"
+        );
+        let diagnostics = writer.io_diagnostics();
+        assert_eq!(
+            diagnostics.point_buffer_preallocation_attempts,
+            BATCH_COUNT as u64
+        );
+        assert_eq!(
+            diagnostics.point_buffer_preallocation_hits,
+            MAX_POINT_BUFFER_PREALLOCATIONS as u64
+        );
+        assert_eq!(diagnostics.point_buffer_preallocation_fallbacks, 1);
+
+        Ok(())
     }
 
     #[test]

@@ -40211,6 +40211,145 @@ mod tests {
 
     #[cfg(all(target_os = "linux", feature = "bench"))]
     #[test]
+    fn v8_point_buffer_preallocation_survives_concurrent_rotation_and_recovery()
+    -> anyhow::Result<()> {
+        use crate::pitr::api::{PersistedPitrConfig, PitrOptions, PitrRuntimeOptions};
+        use crate::tests::harness::is_io_uring_unavailable_error;
+        use crate::wal::WalIoMode;
+
+        const WRITERS: usize = 8;
+        const WRITES_PER_WRITER: usize = 12;
+        const MAX_SEGMENT_BYTES: u64 = 64 * 1024;
+        const VALUE: &[u8] = &[0x5a; 1024];
+
+        let directory = tempdir()?;
+        let database = directory.path().join("db");
+        let repository = directory.path().join("repository");
+        let mut options = LsmStorageOptions {
+            enable_wal: true,
+            target_sst_size: 1 << 30,
+            ..LsmStorageOptions::default_for_test()
+        };
+        let engine = match KvEngine::open_with_wal_io_mode(
+            &database,
+            options.clone(),
+            WalIoMode::Parallel,
+        ) {
+            Ok(engine) => engine,
+            Err(error) if is_io_uring_unavailable_error(&error) => {
+                eprintln!("skipping test (io_uring unavailable): {error:#}");
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        if let Err(error) = engine.enable_pitr(PitrOptions {
+            repository: repository.clone(),
+            config: PersistedPitrConfig {
+                archive_interval: std::time::Duration::from_secs(3600),
+                max_segment_bytes: MAX_SEGMENT_BYTES,
+                max_unarchived_bytes: 8 * 1024 * 1024,
+                max_source_spool_bytes: 32 * 1024 * 1024,
+            },
+            runtime: PitrRuntimeOptions::default(),
+        }) {
+            if is_io_uring_unavailable_error(&error) {
+                eprintln!("skipping test (io_uring unavailable): {error:#}");
+                engine.close()?;
+                return Ok(());
+            }
+            return Err(error);
+        }
+
+        let initial = engine.inner.state.load().memtable.clone();
+        assert!(initial.uses_v8_wal());
+        initial.set_v8_point_buffer_preallocation_for_test(true)?;
+        let initial_id = initial.id();
+        let seen_memtables = std::sync::Arc::new(std::sync::Mutex::new(vec![initial]));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(WRITERS + 1));
+        let workers = (0..WRITERS)
+            .map(|writer| {
+                let engine = std::sync::Arc::clone(&engine);
+                let seen_memtables = std::sync::Arc::clone(&seen_memtables);
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || -> anyhow::Result<()> {
+                    barrier.wait();
+                    for index in 0..WRITES_PER_WRITER {
+                        let active = engine.inner.state.load().memtable.clone();
+                        if active.uses_v8_wal() {
+                            active.set_v8_point_buffer_preallocation_for_test(true)?;
+                        }
+                        let mut seen = seen_memtables.lock().expect("test memtable list lock");
+                        if !seen.iter().any(|memtable| memtable.id() == active.id()) {
+                            seen.push(active);
+                        }
+                        drop(seen);
+
+                        let key = format!("point-{writer:02}-{index:03}");
+                        engine.put(key.as_bytes(), VALUE)?;
+                    }
+                    Ok(())
+                })
+            })
+            .collect::<Vec<_>>();
+
+        barrier.wait();
+        for worker in workers {
+            worker.join().expect("Point writer thread joins")?;
+        }
+        engine.sync()?;
+
+        let seen = seen_memtables.lock().expect("test memtable list lock");
+        assert!(
+            seen.iter().any(|memtable| memtable.id() != initial_id),
+            "the small PITR segment limit should exercise rotation"
+        );
+        let diagnostics = seen
+            .iter()
+            .filter_map(|memtable| memtable.benchmark_wal_io_diagnostics())
+            .collect::<Vec<_>>();
+        assert!(
+            diagnostics
+                .iter()
+                .any(|item| item.point_buffer_preallocation_enabled)
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .map(|item| item.point_buffer_preallocation_hits)
+                .sum::<u64>()
+                > 0,
+            "concurrent Point admissions should consume preallocated buffers"
+        );
+        assert!(diagnostics.iter().all(|item| {
+            item.point_buffer_preallocation_attempts
+                == item.point_buffer_preallocation_hits + item.point_buffer_preallocation_fallbacks
+        }));
+        drop(seen);
+
+        for writer in 0..WRITERS {
+            for index in 0..WRITES_PER_WRITER {
+                let key = format!("point-{writer:02}-{index:03}");
+                assert_eq!(engine.get(key.as_bytes())?.as_deref(), Some(VALUE));
+            }
+        }
+        engine.close()?;
+        drop(engine);
+
+        options.pitr_repository = Some(repository);
+        let reopened = KvEngine::open_with_wal_io_mode(&database, options, WalIoMode::Parallel)?;
+        for writer in 0..WRITERS {
+            for index in 0..WRITES_PER_WRITER {
+                let key = format!("point-{writer:02}-{index:03}");
+                assert_eq!(reopened.get(key.as_bytes())?.as_deref(), Some(VALUE));
+            }
+        }
+        reopened.close()?;
+
+        Ok(())
+    }
+
+    #[cfg(all(target_os = "linux", feature = "bench"))]
+    #[test]
     fn v8_progress_ring_rejects_inherited_completion_timeline_before_pitr_enable() {
         const CHILD_ENV: &str = "TOYKV_TEST_PROGRESS_RING_INHERITED_PROFILE_CHILD";
         if std::env::var_os(CHILD_ENV).is_none() {

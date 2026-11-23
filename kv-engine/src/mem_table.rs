@@ -4393,6 +4393,14 @@ impl MemTable {
         self.wal.as_ref().and_then(Wal::benchmark_io_diagnostics)
     }
 
+    #[cfg(all(test, feature = "bench"))]
+    pub(crate) fn set_v8_point_buffer_preallocation_for_test(&self, enabled: bool) -> Result<()> {
+        self.wal
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("memtable has no WAL"))?
+            .set_v8_point_buffer_preallocation_for_test(enabled)
+    }
+
     pub(crate) fn uses_pitr_batch_wal(&self) -> bool {
         self.wal_v7_source || self.wal_v8_source || self.wal.as_ref().is_some_and(Wal::is_pitr)
     }
