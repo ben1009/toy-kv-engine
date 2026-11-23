@@ -32,6 +32,7 @@ and do not define the current writer selection.
 - [RFC 027 V8 Cursor direct-completion GCP qualification, 2026-11-22](wal/benchmarks/rfc-027-v8-cursor-direct-completion-gcp-20261122.md)
 - [RFC 028 V8 Cursor coalescing GCP diagnostic, 2026-11-23](wal/benchmarks/rfc-028-v8-cursor-coalescing-gcp-20261123.md)
 - [RFC 028 V7/V8 Point buffer preallocation same-host GCP qualification, 2026-11-23](wal/benchmarks/rfc-028-v7-v8-point-preallocation-same-host-gcp-20261123.md)
+- [RFC 028 V8 Point resource preclaim Stage B GCP A/B — throughput gate failed, 2026-11-23](wal/benchmarks/rfc-028-v8-point-resource-preclaim-stage-b-gcp-20261123.md)
 
 ## Benchmark reports
 
