@@ -2981,6 +2981,93 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
             with self.subTest(suffix=suffix), redirect_stderr(StringIO()), self.assertRaises(SystemExit):
                 BENCH.parse_args([*valid, *suffix])
 
+    def test_point_preallocation_verifier_rejects_activity_in_disabled_point_arm(self) -> None:
+        row = next(
+            item for item in build_v7_v8_point_preallocation_schedule()
+            if item["workload"] == "point" and item["arm"] == "v8_prealloc_off"
+        )
+        counters = {"attempts": 0, "hits": 0, "fallbacks": 0}
+
+        def record_with_end_counters(end_counters: dict[str, int]) -> dict[str, object]:
+            def snapshot(values: dict[str, int]) -> dict[str, object]:
+                return {
+                    "progress_ring_enabled": True,
+                    "progress_cursor_enabled": True,
+                    "cursor_direct_completion_enabled": True,
+                    "cursor_singleton_submission_enabled": False,
+                    "progress_diagnostics": None,
+                    "sliding_extent_preparation": {
+                        "mode": "sliding-point-lookahead",
+                        "window_bytes": POINT_LOOKAHEAD_WINDOW_BYTES,
+                        "extent_policy_storage": "vec",
+                        "extent_policy_scan_diagnostics_enabled": False,
+                        "initialized_bytes": 0,
+                    },
+                    "data": {"o_direct": True, "device": 1, "inode": 11},
+                    "frontier": {"o_direct": True, "device": 1, "inode": 12},
+                    "sync": {"o_direct": False, "device": 1, "inode": 13},
+                    "point_buffer_preallocation_enabled": False,
+                    "point_buffer_preallocation_attempts": values["attempts"],
+                    "point_buffer_preallocation_hits": values["hits"],
+                    "point_buffer_preallocation_fallbacks": values["fallbacks"],
+                }
+
+            start = snapshot(counters)
+            end = snapshot(end_counters)
+            end["sliding_extent_preparation"]["initialized_bytes"] = POINT_LOOKAHEAD_WINDOW_BYTES
+            return {
+                "params": {
+                    "num": POINT_PREALLOCATION_NUM,
+                    "threads": row["writer"],
+                    "value_size": 1024,
+                    "batch_size": row["batch_size"],
+                    "wal_format_version": 8,
+                    "wal_io_mode": "parallel",
+                },
+                "latency": {
+                    "sample_every": 10,
+                    "samples": POINT_PREALLOCATION_NUM // 10,
+                    "unsampled_completed_operations": POINT_PREALLOCATION_NUM * 9 // 10,
+                    "p50_ms": 0.1,
+                    "p95_ms": 0.2,
+                    "p99_ms": 0.3,
+                },
+                "result": {
+                    "ops": POINT_PREALLOCATION_NUM,
+                    "ops_per_sec": 10_000.0,
+                    "process_cpu_user_ms": 1.0,
+                    "process_cpu_system_ms": 1.0,
+                    "wal_v8_digest": {
+                        "cpu_timing_sample_rate": 64,
+                        "ordered_link_hash_cpu_ns": 0,
+                        "cpu_timing_sampled_tickets": 1,
+                    },
+                    "wal_pipeline": {
+                        "sync_count": 10,
+                        "wal_io_stable": True,
+                        "wal_io_start": start,
+                        "wal_io_end": end,
+                    },
+                },
+            }
+
+        self.assertEqual(
+            progress_ring_runner._validate_point_preallocation_record(
+                record_with_end_counters(counters), row,
+            )["point_buffer_preallocation_attempts"],
+            0,
+        )
+        for unexpected in (
+            {"attempts": 1, "hits": 1, "fallbacks": 0},
+            {"attempts": 1, "hits": 0, "fallbacks": 1},
+        ):
+            with self.subTest(counters=unexpected), self.assertRaisesRegex(
+                ValueError, "disabled Point arm entered preallocation path",
+            ):
+                progress_ring_runner._validate_point_preallocation_record(
+                    record_with_end_counters(unexpected), row,
+                )
+
     def test_point_direct_frame_result_verifier_requires_actual_point_hits_and_batch_misses(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             results = Path(temp) / "results"

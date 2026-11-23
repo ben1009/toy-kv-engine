@@ -493,6 +493,8 @@ def _validate_point_preallocation_record(record: dict[str, Any], row: dict[str, 
         raise ValueError("V8 preallocation attempts do not equal hits plus fallbacks")
     if is_point and expected_preallocation and hits <= 0:
         raise ValueError("Point preallocation candidate recorded no fast-path hits")
+    if is_point and not expected_preallocation and any((attempts, hits, fallbacks)):
+        raise ValueError("disabled Point arm entered preallocation path")
     if not is_point and (attempts != 0 or hits != 0 or fallbacks != 0):
         raise ValueError("Batch64 entered the Point-only preallocation path")
 

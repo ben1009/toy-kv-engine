@@ -543,6 +543,7 @@ impl LsmStorageInner {
 #[cfg(test)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NativeWriteStage {
+    BeforeWalAdmission,
     Admitted,
     Durable,
     CapacityRetry,

@@ -19504,6 +19504,8 @@ impl LsmStorageInner {
         });
         {
             let _guard = self.active_memtable_lock.read();
+            #[cfg(test)]
+            self.pause_native_write_blocking(native_write::NativeWriteStage::BeforeWalAdmission, 0);
             let state = self.state.load_full();
             let (memtable, publish_data, ticket) = if let Some(ref mvcc) = self.mvcc {
                 let (commit_ts, encoded_key, prefixed_val, ticket) =
@@ -40570,6 +40572,155 @@ mod tests {
         for key in &expected_values {
             assert_eq!(reopened.get(key.as_bytes())?.as_deref(), Some(VALUE));
         }
+        reopened.close()?;
+
+        Ok(())
+    }
+
+    #[cfg(all(target_os = "linux", feature = "bench"))]
+    #[test]
+    fn v8_point_buffer_preallocation_admission_overlaps_rotation_and_recovers() -> anyhow::Result<()>
+    {
+        use crate::pitr::api::{PersistedPitrConfig, PitrOptions, PitrRuntimeOptions};
+        use crate::tests::harness::is_io_uring_unavailable_error;
+        use crate::wal::WalIoMode;
+
+        const MAX_SEGMENT_BYTES: u64 = 4 * 1024 * 1024;
+        const KEY: &[u8] = b"admission-in-flight-during-rotation";
+        const VALUE: &[u8] = &[0x6b; 1024];
+
+        let directory = tempdir()?;
+        let database = directory.path().join("db");
+        let repository = directory.path().join("repository");
+        let options = LsmStorageOptions {
+            enable_wal: true,
+            target_sst_size: 1 << 30,
+            ..LsmStorageOptions::default_for_test()
+        };
+        let engine = match KvEngine::open_with_wal_io_mode(
+            &database,
+            options.clone(),
+            WalIoMode::Parallel,
+        ) {
+            Ok(engine) => Arc::new(engine),
+            Err(error) if is_io_uring_unavailable_error(&error) => {
+                eprintln!("skipping test (io_uring unavailable): {error:#}");
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        if let Err(error) = engine.enable_pitr(PitrOptions {
+            repository: repository.clone(),
+            config: PersistedPitrConfig {
+                archive_interval: std::time::Duration::from_secs(3600),
+                max_segment_bytes: MAX_SEGMENT_BYTES,
+                max_unarchived_bytes: 16 * 1024 * 1024,
+                max_source_spool_bytes: 64 * 1024 * 1024,
+            },
+            runtime: PitrRuntimeOptions::default(),
+        }) {
+            if is_io_uring_unavailable_error(&error) {
+                eprintln!("skipping test (io_uring unavailable): {error:#}");
+                engine.close()?;
+                return Ok(());
+            }
+            return Err(error);
+        }
+        engine
+            .inner
+            .set_v8_point_buffer_preallocation_for_test(true)?;
+
+        let source = engine.inner.state.load().memtable.clone();
+        let pause = crate::lsm_storage::native_write::NativeWritePause::new(
+            crate::lsm_storage::native_write::NativeWriteStage::BeforeWalAdmission,
+        );
+        *engine.inner.native_write_pause.lock() = Some(Arc::clone(&pause));
+
+        std::thread::scope(|scope| -> anyhow::Result<()> {
+            // Release the writer during unwinding too, so a failed assertion
+            // cannot leave a scoped thread parked in the test hook.
+            let _release_guard = NativeWritePauseReleaseGuard(Arc::clone(&pause));
+            let writer_engine = Arc::clone(&engine);
+            let writer = scope.spawn(move || writer_engine.put(KEY, VALUE));
+
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()?;
+            runtime.block_on(async {
+                tokio::time::timeout(std::time::Duration::from_secs(5), pause.reached.notified())
+                    .await
+            })?;
+            assert_eq!(
+                engine.get(KEY)?,
+                None,
+                "paused admission must not be visible"
+            );
+            assert!(Arc::ptr_eq(&source, &engine.inner.state.load().memtable));
+
+            let rotation_engine = Arc::clone(&engine);
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let rotation = scope.spawn(move || {
+                started_tx.send(()).expect("test receiver is alive");
+                rotation_engine.create_recovery_point()
+            });
+            started_rx.recv_timeout(std::time::Duration::from_secs(5))?;
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !engine
+                .inner
+                .active_memtable_lock
+                .exclusive_pending_for_test()
+            {
+                anyhow::ensure!(
+                    std::time::Instant::now() < deadline,
+                    "recovery-point rotation did not contend with the paused active writer"
+                );
+                std::thread::yield_now();
+            }
+            assert!(
+                !rotation.is_finished(),
+                "rotation must wait while the writer is before WAL admission"
+            );
+
+            pause.release_blocking();
+            writer
+                .join()
+                .expect("paused writer thread must not panic")?;
+            assert!(matches!(
+                rotation.join().expect("rotation thread must not panic")?,
+                crate::pitr::api::RecoveryPointOutcome::Durable(_)
+            ));
+            Ok(())
+        })?;
+
+        let successor = engine.inner.state.load().memtable.clone();
+        assert!(!Arc::ptr_eq(&source, &successor));
+        let source_diagnostics = source
+            .benchmark_wal_io_diagnostics()
+            .expect("source V8 WAL exposes preallocation diagnostics");
+        assert_eq!(source_diagnostics.point_buffer_preallocation_attempts, 1);
+        assert_eq!(source_diagnostics.point_buffer_preallocation_hits, 1);
+        assert_eq!(source_diagnostics.point_buffer_preallocations_in_flight, 0);
+        let successor_diagnostics = successor
+            .benchmark_wal_io_diagnostics()
+            .expect("successor V8 WAL exposes preallocation diagnostics");
+        assert!(successor_diagnostics.point_buffer_preallocation_enabled);
+        assert_eq!(
+            successor_diagnostics.point_buffer_preallocations_in_flight,
+            0
+        );
+        assert_eq!(engine.get(KEY)?.as_deref(), Some(VALUE));
+
+        engine.close()?;
+        drop(successor);
+        drop(source);
+        drop(engine);
+
+        let mut reopen_options = options;
+        reopen_options.pitr_repository = Some(repository);
+        let reopened =
+            KvEngine::open_with_wal_io_mode(&database, reopen_options, WalIoMode::Parallel)?;
+        assert_eq!(reopened.get(KEY)?.as_deref(), Some(VALUE));
         reopened.close()?;
 
         Ok(())
