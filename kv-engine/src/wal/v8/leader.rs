@@ -8301,47 +8301,104 @@ mod tests {
 
     #[cfg(feature = "bench")]
     #[test]
-    fn progress_ring_rejects_unsupported_diagnostics_when_profile_is_attached() -> Result<()> {
+    fn progress_ring_rejects_hol_and_timeline_but_samples_durability_phases() -> Result<()> {
         let directory = tempfile::tempdir()?;
-        let path = directory.path().join("progress-ring-profile-v8.wal");
-        let installed = install_empty(&path, header())?;
-        let writer =
-            match open_parallel_with_progress_mode(&path, &installed, WalV8ProgressMode::Cursor) {
+        for direct_completion in [false, true] {
+            let mode_name = if direct_completion { "direct" } else { "relay" };
+            let path = directory
+                .path()
+                .join(format!("progress-ring-profile-{mode_name}-v8.wal"));
+            let installed = install_empty(&path, header())?;
+            let writer = if direct_completion {
+                open_parallel_with_direct_completion(
+                    &path,
+                    &installed,
+                    WalV8ProgressMode::Cursor,
+                    None,
+                )
+            } else {
+                open_parallel_with_progress_mode(&path, &installed, WalV8ProgressMode::Cursor)
+            };
+            let writer = match writer {
                 Ok(writer) => writer,
                 Err(error) if is_io_uring_unavailable_error(&error) => {
-                    eprintln!("skipping test (io_uring unavailable): {error:#}");
+                    eprintln!("skipping {mode_name} case (io_uring unavailable): {error:#}");
+                    if direct_completion {
+                        continue;
+                    }
                     return Ok(());
                 }
                 Err(error) => return Err(error),
             };
-        let wal = crate::wal::Wal::from_v8_parallel(writer, &installed)?;
+            let wal = crate::wal::Wal::from_v8_parallel(writer, &installed)?;
 
-        let hol_profile = Arc::new(crate::mem_table::WriteProfile::default());
-        hol_profile.set_wal_hol_diagnostics_enabled(true);
-        let error = wal
-            .set_write_profile(Arc::clone(&hol_profile))
-            .expect_err("ring writer must reject preconfigured HOL diagnostics");
-        assert!(error.to_string().contains("V8 HOL diagnostics"));
+            if !direct_completion {
+                let hol_profile = Arc::new(crate::mem_table::WriteProfile::default());
+                hol_profile.set_wal_hol_diagnostics_enabled(true);
+                let error = wal
+                    .set_write_profile(Arc::clone(&hol_profile))
+                    .expect_err("Cursor writer must reject preconfigured HOL diagnostics");
+                assert!(error.to_string().contains("V8 HOL diagnostics"));
 
-        let timeline_profile = Arc::new(crate::mem_table::WriteProfile::default());
-        timeline_profile.set_wal_v8_completion_timeline_sample_every(1);
-        let error = wal
-            .set_write_profile(Arc::clone(&timeline_profile))
-            .expect_err("ring writer must reject a preconfigured completion timeline");
-        assert!(
-            error
-                .to_string()
-                .contains("completion timeline diagnostics")
-        );
+                let timeline_profile = Arc::new(crate::mem_table::WriteProfile::default());
+                timeline_profile.set_wal_v8_completion_timeline_sample_every(1);
+                let error = wal
+                    .set_write_profile(Arc::clone(&timeline_profile))
+                    .expect_err("Cursor writer must reject a preconfigured completion timeline");
+                assert!(
+                    error
+                        .to_string()
+                        .contains("completion timeline diagnostics")
+                );
+            }
 
-        let durability_profile = Arc::new(crate::mem_table::WriteProfile::default());
-        durability_profile.set_wal_v8_durability_sample_every(1);
-        let error = wal
-            .set_write_profile(Arc::clone(&durability_profile))
-            .expect_err("ring writer must reject preconfigured durability sampling");
-        assert!(error.to_string().contains("durability phase diagnostics"));
+            let durability_profile = Arc::new(crate::mem_table::WriteProfile::default());
+            wal.set_write_profile(Arc::clone(&durability_profile))?;
+            wal.put_batch(&[(b"unsampled", b"value")], 1)?;
+            wal.sync()?;
+            assert!(
+                durability_profile
+                    .wal_v8_durability_phase_observations()
+                    .is_empty()
+            );
 
-        wal.set_write_profile(Arc::new(crate::mem_table::WriteProfile::default()))?;
+            durability_profile.set_wal_v8_durability_sample_every(1);
+            std::thread::scope(|scope| -> Result<()> {
+                let writers: Vec<_> = (0..4)
+                    .map(|writer| {
+                        let wal = &wal;
+                        scope.spawn(move || -> Result<()> {
+                            let key = format!("sampled-{writer}");
+                            wal.put_batch(&[(key.as_bytes(), b"value")], writer + 2)?;
+                            Ok(())
+                        })
+                    })
+                    .collect();
+                for writer in writers {
+                    writer
+                        .join()
+                        .map_err(|_| anyhow::anyhow!("sampled WAL writer panicked"))??;
+                }
+                Ok(())
+            })?;
+            wal.sync()?;
+
+            let observations = durability_profile.wal_v8_durability_phase_observations();
+            assert!(
+                !observations.is_empty(),
+                "Cursor {mode_name} must emit durability phase samples"
+            );
+            assert!(observations.iter().all(|observation| {
+                observation.coalescing_iterations.is_some()
+                    && observation.coalescing_progress_wait_wall_ns.is_some()
+                    && observation.coalescing_progress_wait_cpu_ns.is_some()
+                    && observation.coalescing_completion_drain_wall_ns.is_some()
+                    && observation.coalescing_completion_apply_wall_ns.is_some()
+                    && observation.coalescing_digest_fold_cpu_ns.is_some()
+                    && observation.coalescing_cursor_advance_cpu_ns.is_some()
+                    && observation.coalescing_ready_tickets_gained.is_some()
+            }));
+        }
 
         Ok(())
     }
