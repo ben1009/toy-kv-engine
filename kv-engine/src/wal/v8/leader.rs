@@ -120,12 +120,13 @@ fn data_completion_to_frontier_start_ns(
 pub(crate) type WalV8PreparedBatch<'a> = PreparedWalV8Batch<'a, WalV8PreflightReservation>;
 
 /// Point-owned preparation state created before entering the MVCC sequencer.
-/// The optional DATA buffer is uncharged and bounded; admission reserves quota
-/// only after the caller enters the MVCC sequencer.
+/// The optional DATA buffer is uncharged and bounded. A quota preclaim
+/// remains revocable until serialized admission promotes it.
 #[cfg(feature = "bench")]
 pub(crate) struct WalV8PointAdmissionScratch<'a> {
     prepared: WalV8PreparedBatch<'a>,
     preallocated_buffer: Option<WalV8PointBufferPreallocation>,
+    quota_preclaim: Option<super::resource::WalV8PointQuotaPreclaim>,
 }
 
 /// A bounded speculative DATA buffer allocation. It has no quota reservation;
@@ -170,16 +171,16 @@ impl<'a> WalV8PointAdmissionScratch<'a> {
         Self {
             prepared,
             preallocated_buffer: None,
+            quota_preclaim: None,
         }
     }
 
-    pub(crate) fn into_parts(
-        self,
-    ) -> (
-        WalV8PreparedBatch<'a>,
-        Option<WalV8PointBufferPreallocation>,
-    ) {
-        (self.prepared, self.preallocated_buffer)
+    pub(crate) fn has_quota_preclaim(&self) -> bool {
+        self.quota_preclaim.is_some()
+    }
+
+    pub(crate) fn into_prepared(self) -> WalV8PreparedBatch<'a> {
+        self.prepared
     }
 
     fn set_preallocated_buffer(&mut self, preallocated_buffer: WalV8PointBufferPreallocation) {
@@ -309,6 +310,16 @@ pub(crate) struct WalV8ParallelWriter {
     batch_point_frontier_credits: bool,
     #[cfg(feature = "bench")]
     point_buffer_preallocation_enabled: bool,
+    #[cfg(feature = "bench")]
+    point_resource_preclaim_enabled: bool,
+    #[cfg(feature = "bench")]
+    point_resource_preclaim_attempts: AtomicU64,
+    #[cfg(feature = "bench")]
+    point_resource_preclaim_granted: AtomicU64,
+    #[cfg(feature = "bench")]
+    point_resource_preclaim_promoted: AtomicU64,
+    #[cfg(feature = "bench")]
+    point_resource_preclaim_invalidated: AtomicU64,
     #[cfg(all(test, feature = "bench"))]
     point_buffer_preallocation_test_override: AtomicBool,
     #[cfg(feature = "bench")]
@@ -2734,6 +2745,23 @@ fn point_buffer_preallocation_from_environment() -> Result<bool> {
     }
 }
 
+#[cfg(feature = "bench")]
+fn point_resource_preclaim_from_environment() -> Result<bool> {
+    let Some(value) = std::env::var_os("TOYKV_BENCH_V8_POINT_RESOURCE_PRECLAIM") else {
+        return Ok(false);
+    };
+    let value = value
+        .to_str()
+        .context("TOYKV_BENCH_V8_POINT_RESOURCE_PRECLAIM is not valid UTF-8")?;
+    match value {
+        "0" => Ok(false),
+        "1" => Ok(true),
+        _ => anyhow::bail!(
+            "invalid TOYKV_BENCH_V8_POINT_RESOURCE_PRECLAIM {value:?}; expected `0` or `1`"
+        ),
+    }
+}
+
 struct WalV8ParallelFrontier {
     frontier: WalV8Frontier,
     offset: u64,
@@ -4539,6 +4567,11 @@ impl WalV8LeaderWriter {
             point_buffer_preallocation_hits: 0,
             point_buffer_preallocation_fallbacks: 0,
             point_buffer_preallocations_in_flight: 0,
+            point_resource_preclaim_enabled: false,
+            point_resource_preclaim_attempts: 0,
+            point_resource_preclaim_granted: 0,
+            point_resource_preclaim_promoted: 0,
+            point_resource_preclaim_invalidated: 0,
             progress_diagnostics: None,
         };
 
@@ -4697,6 +4730,8 @@ impl WalV8LeaderWriter {
         let batch_point_frontier_credits = point_frontier_credit_batch_from_environment()?;
         #[cfg(feature = "bench")]
         let point_buffer_preallocation_enabled = point_buffer_preallocation_from_environment()?;
+        #[cfg(feature = "bench")]
+        let point_resource_preclaim_enabled = point_resource_preclaim_from_environment()?;
         #[cfg(feature = "bench")]
         {
             io_diagnostics.data = WalIoHandleMetadata::from_file(&worker_file)?;
@@ -4908,6 +4943,16 @@ impl WalV8LeaderWriter {
             batch_point_frontier_credits,
             #[cfg(feature = "bench")]
             point_buffer_preallocation_enabled,
+            #[cfg(feature = "bench")]
+            point_resource_preclaim_enabled,
+            #[cfg(feature = "bench")]
+            point_resource_preclaim_attempts: AtomicU64::new(0),
+            #[cfg(feature = "bench")]
+            point_resource_preclaim_granted: AtomicU64::new(0),
+            #[cfg(feature = "bench")]
+            point_resource_preclaim_promoted: AtomicU64::new(0),
+            #[cfg(feature = "bench")]
+            point_resource_preclaim_invalidated: AtomicU64::new(0),
             #[cfg(all(test, feature = "bench"))]
             point_buffer_preallocation_test_override: AtomicBool::new(false),
             #[cfg(feature = "bench")]
@@ -5493,6 +5538,18 @@ impl WalV8ParallelWriter {
         diagnostics.progress_ring_enabled = self.coordinator.progress_ring_enabled();
         diagnostics.progress_cursor_enabled = self.coordinator.progress_cursor_enabled();
         diagnostics.progress_diagnostics = self.coordinator.progress_diagnostics();
+        diagnostics.point_resource_preclaim_enabled = self.point_resource_preclaim_enabled;
+        diagnostics.point_resource_preclaim_attempts = self
+            .point_resource_preclaim_attempts
+            .load(Ordering::Relaxed);
+        diagnostics.point_resource_preclaim_granted =
+            self.point_resource_preclaim_granted.load(Ordering::Relaxed);
+        diagnostics.point_resource_preclaim_promoted = self
+            .point_resource_preclaim_promoted
+            .load(Ordering::Relaxed);
+        diagnostics.point_resource_preclaim_invalidated = self
+            .point_resource_preclaim_invalidated
+            .load(Ordering::Relaxed);
         diagnostics.point_buffer_preallocation_attempts = self
             .point_buffer_preallocation_attempts
             .load(Ordering::Relaxed);
@@ -5702,13 +5759,27 @@ impl WalV8ParallelWriter {
         self.admit_prepared_batch_inner(prepared, commit_ts, recorded_at, || {})
     }
 
-    /// Preallocate an eligible Point DATA buffer without charging shared quota.
-    /// Quota reservation remains inside serialized admission.
+    /// Prepare optional Point scratch before the sequencer. The return value
+    /// indicates whether the DATA buffer was preallocated.
     #[cfg(feature = "bench")]
     pub(crate) fn try_preallocate_point_buffer(
         &self,
         scratch: &mut WalV8PointAdmissionScratch<'_>,
     ) -> bool {
+        if self.point_resource_preclaim_enabled
+            && scratch.prepared.frame_buffer_bytes() == WAL_V8_FRAME_LEN
+            && let Some(owner) = &self.reservation_owner
+            && let Ok(logical_bytes) = u64::try_from(scratch.prepared.logical_batch_bytes())
+        {
+            self.point_resource_preclaim_attempts
+                .fetch_add(1, Ordering::Relaxed);
+            scratch.quota_preclaim =
+                owner.try_preclaim_batch(logical_bytes, WAL_V8_FRAME_LEN as u64);
+            if scratch.quota_preclaim.is_some() {
+                self.point_resource_preclaim_granted
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
         if !self.should_preallocate_point_buffer() {
             return false;
         }
@@ -5740,8 +5811,8 @@ impl WalV8ParallelWriter {
         true
     }
 
-    /// Admit a Point scratch object. The regular quota reservation remains
-    /// serialized; an optional preallocated DATA buffer is consumed afterward.
+    /// Admit a Point scratch object, promoting its quota preclaim or using
+    /// the ordinary reservation path before consuming the DATA buffer.
     #[cfg(feature = "bench")]
     pub(crate) fn admit_prepared_point_batch<'a>(
         &self,
@@ -5749,7 +5820,11 @@ impl WalV8ParallelWriter {
         commit_ts: u64,
         recorded_at: crate::pitr::RecordedAt,
     ) -> Result<WalV8FrameJob<'a>> {
-        let (prepared, preallocated_buffer) = scratch.into_parts();
+        let WalV8PointAdmissionScratch {
+            prepared,
+            preallocated_buffer,
+            quota_preclaim,
+        } = scratch;
         ensure!(!self.is_poisoned(), "v8 Parallel WAL is poisoned");
         let logical_bytes = u64::try_from(prepared.logical_batch_bytes())?;
         let frame_bytes = u64::try_from(prepared.frame_buffer_bytes())?;
@@ -5759,6 +5834,7 @@ impl WalV8ParallelWriter {
             frame_bytes,
             prepared.frame_buffer_bytes(),
             preallocated_buffer,
+            quota_preclaim,
         )?;
         #[cfg(not(feature = "bench"))]
         let resources = self.reserve_and_allocate_batch_resources(
@@ -5814,6 +5890,7 @@ impl WalV8ParallelWriter {
             frame_bytes,
             prepared.frame_buffer_bytes(),
             None,
+            None,
         )?;
         #[cfg(not(feature = "bench"))]
         let resources = self.reserve_and_allocate_batch_resources(
@@ -5836,8 +5913,25 @@ impl WalV8ParallelWriter {
         frame_bytes: u64,
         buffer_bytes: usize,
         #[cfg(feature = "bench")] preallocated_buffer: Option<WalV8PointBufferPreallocation>,
+        #[cfg(feature = "bench")] quota_preclaim: Option<super::resource::WalV8PointQuotaPreclaim>,
     ) -> Result<WalV8AdmissionResources> {
-        let reservation = self.reserve_batch_resources(logical_bytes, frame_bytes)?;
+        #[cfg(feature = "bench")]
+        let promoted = quota_preclaim.and_then(|claim| {
+            let result = self.reservation_owner.as_ref()?.promote_preclaim(claim);
+            let counter = if result.is_some() {
+                &self.point_resource_preclaim_promoted
+            } else {
+                &self.point_resource_preclaim_invalidated
+            };
+            counter.fetch_add(1, Ordering::Relaxed);
+            result
+        });
+        #[cfg(not(feature = "bench"))]
+        let promoted = None;
+        let reservation = match promoted {
+            Some(reservation) => Some(reservation),
+            None => self.reserve_batch_resources(logical_bytes, frame_bytes)?,
+        };
         #[cfg(feature = "bench")]
         let data_buffer = preallocated_buffer
             .map(WalV8PointBufferPreallocation::into_data_buffer)
@@ -8914,6 +9008,69 @@ mod tests {
     #[cfg(feature = "bench")]
     #[test]
     fn speculative_point_buffer_does_not_steal_quota_from_earlier_admission() -> Result<()> {
+        point_scratch_does_not_steal_quota_from_earlier_admission(false)
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn point_resource_preclaim_yields_to_earlier_v8_admission() -> Result<()> {
+        point_scratch_does_not_steal_quota_from_earlier_admission(true)
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn point_resource_preclaim_is_bound_to_live_image_owner() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("point-preclaim-owner.wal");
+        let installed = install_empty(&path, header())?;
+        let ledger = crate::wal::v7::admission::WalV7ResourceLedger::new(
+            crate::wal::v7::admission::WalV7ResourceLimits {
+                max_logical_wal_bytes: 64 * 1024,
+                max_source_spool_bytes: 256 * 1024,
+                max_recovery_workspace_bytes: 128 * 1024,
+                max_buffer_memory_bytes: 64 * 1024,
+                max_seal_index_bytes: 1024,
+            },
+        )?;
+        let retained = crate::wal::v7::admission::WalV7RetainedResources::new(ledger.clone());
+        let open_owner = || -> Result<_> {
+            Ok(Arc::new(
+                WalV8ReservationOwner::new_with_retained_resources(
+                    retained.clone(),
+                    &installed,
+                    HEADER_LEN_U64 + FRAME_LEN_U64,
+                    64 * 1024,
+                    FRAME_LEN_U64,
+                )?,
+            ))
+        };
+        let owner = open_owner()?;
+        let other = open_owner()?;
+        let baseline = ledger.snapshot();
+        let claim = owner.try_preclaim_batch(128, FRAME_LEN_U64).unwrap();
+        assert!(other.promote_preclaim(claim).is_none());
+        assert_eq!(ledger.snapshot(), baseline);
+
+        let claim = owner.try_preclaim_batch(128, FRAME_LEN_U64).unwrap();
+        let reservation = owner.promote_preclaim(claim).unwrap();
+        assert_eq!(
+            ledger.snapshot().logical_wal_bytes,
+            baseline.logical_wal_bytes + 2 * FRAME_LEN_U64
+        );
+        drop(reservation);
+        assert_eq!(ledger.snapshot(), baseline);
+
+        let claim = owner.try_preclaim_batch(128, FRAME_LEN_U64).unwrap();
+        owner.image_owner().retire_after_durable_cleanup()?;
+        let after_retirement = ledger.snapshot();
+        assert!(owner.promote_preclaim(claim).is_none());
+        assert!(owner.try_preclaim_batch(128, FRAME_LEN_U64).is_none());
+        assert_eq!(ledger.snapshot(), after_retirement);
+        Ok(())
+    }
+
+    #[cfg(feature = "bench")]
+    fn point_scratch_does_not_steal_quota_from_earlier_admission(preclaim: bool) -> Result<()> {
         const SEGMENT_LIMIT: u64 = 64 * 1024;
         const INITIAL_SOURCE_CHARGE: u64 = HEADER_LEN_U64 + FRAME_LEN_U64;
         const ONE_BATCH_SOURCE_CHARGE: u64 = 2 * WAL_V8_FRAME_LEN as u64;
@@ -8923,7 +9080,7 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("point-prealloc-order-v8.wal");
         let installed = install_empty(&path, header())?;
-        let (writer, owner) = match open_accounted_parallel_writer(
+        let (mut writer, owner) = match open_accounted_parallel_writer(
             &path,
             &installed,
             SEGMENT_LIMIT,
@@ -8937,6 +9094,7 @@ mod tests {
             }
             Err(error) => return Err(error),
         };
+        writer.point_resource_preclaim_enabled = preclaim;
         let earlier = batch(10);
         let later = batch(20);
         let earlier_scratch =
@@ -8954,6 +9112,7 @@ mod tests {
 
         let quota_before_admission = owner.image_owner().snapshot();
         assert!(writer.try_preallocate_point_buffer(&mut later_scratch));
+        assert_eq!(later_scratch.quota_preclaim.is_some(), preclaim);
         assert_eq!(owner.image_owner().snapshot(), quota_before_admission);
 
         let earlier_job = writer.admit_prepared_point_batch(
@@ -8987,6 +9146,20 @@ mod tests {
             0,
             "failed later admission releases its speculative buffer permit"
         );
+        let diagnostics = writer.io_diagnostics();
+        assert_eq!(
+            diagnostics.point_resource_preclaim_attempts,
+            u64::from(preclaim)
+        );
+        assert_eq!(
+            diagnostics.point_resource_preclaim_granted,
+            u64::from(preclaim)
+        );
+        assert_eq!(
+            diagnostics.point_resource_preclaim_invalidated,
+            u64::from(preclaim)
+        );
+        assert_eq!(diagnostics.point_resource_preclaim_promoted, 0);
 
         Ok(())
     }

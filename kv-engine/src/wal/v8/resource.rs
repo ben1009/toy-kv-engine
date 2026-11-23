@@ -24,6 +24,13 @@ pub(crate) struct WalV8ReservationOwner {
     source_allocation_unit: u64,
 }
 
+#[cfg(feature = "bench")]
+pub(crate) struct WalV8PointQuotaPreclaim {
+    claim: crate::wal::v7::admission::PointQuotaPreclaim,
+    owner: Arc<WalV8ReservationOwner>,
+    marker_source_bytes: u64,
+}
+
 impl WalV8ReservationOwner {
     /// The caller must first drop the temporary recovery reservation and retain
     /// the reconstructed ledger, which already owns the fixed 8 KiB image
@@ -190,6 +197,46 @@ impl WalV8ReservationOwner {
         logical_batch_bytes: u64,
         frame_buffer_bytes: u64,
     ) -> Result<WalV7OwnedBatchReservation> {
+        let (charge, marker_source_bytes) =
+            self.batch_charge(logical_batch_bytes, frame_buffer_bytes)?;
+        self.image_owner
+            .reserve_batch_charge(charge, marker_source_bytes)
+            .map_err(Into::into)
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn try_preclaim_batch(
+        self: &Arc<Self>,
+        logical_bytes: u64,
+        frame_bytes: u64,
+    ) -> Option<WalV8PointQuotaPreclaim> {
+        let (charge, marker_source_bytes) = self.batch_charge(logical_bytes, frame_bytes).ok()?;
+        Some(WalV8PointQuotaPreclaim {
+            claim: self.image_owner.try_preclaim_batch_charge(charge)?,
+            owner: Arc::clone(self),
+            marker_source_bytes,
+        })
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn promote_preclaim(
+        self: &Arc<Self>,
+        preclaim: WalV8PointQuotaPreclaim,
+    ) -> Option<WalV7OwnedBatchReservation> {
+        if !Arc::ptr_eq(self, &preclaim.owner) {
+            return None;
+        }
+        self.image_owner
+            .promote_batch_preclaim(&preclaim.claim, preclaim.marker_source_bytes)
+            .ok()
+            .flatten()
+    }
+
+    fn batch_charge(
+        &self,
+        logical_batch_bytes: u64,
+        frame_buffer_bytes: u64,
+    ) -> Result<(WalV7ResourceCharge, u64)> {
         let mut charge = WalV7ResourceCharge::for_batch(logical_batch_bytes)?;
         let expected_wal_bytes = frame_buffer_bytes
             .checked_add(WAL_V8_FRAME_LEN as u64)
@@ -203,9 +250,7 @@ impl WalV8ReservationOwner {
             .checked_add(marker_source_bytes)
             .context("v8 source spool reservation overflows")?;
 
-        self.image_owner
-            .reserve_batch_charge(charge, marker_source_bytes)
-            .map_err(Into::into)
+        Ok((charge, marker_source_bytes))
     }
 }
 

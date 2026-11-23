@@ -1932,6 +1932,11 @@ struct WalIoDiagnosticsRecord {
     point_buffer_preallocation_attempts: u64,
     point_buffer_preallocation_hits: u64,
     point_buffer_preallocation_fallbacks: u64,
+    point_resource_preclaim_enabled: bool,
+    point_resource_preclaim_attempts: u64,
+    point_resource_preclaim_granted: u64,
+    point_resource_preclaim_promoted: u64,
+    point_resource_preclaim_invalidated: u64,
     #[cfg(feature = "bench")]
     #[serde(skip_serializing_if = "Option::is_none")]
     progress_diagnostics: Option<kv_engine::wal::WalV8ProgressDiagnostics>,
@@ -2063,6 +2068,11 @@ impl From<WalIoDiagnostics> for WalIoDiagnosticsRecord {
             point_buffer_preallocation_attempts: diagnostics.point_buffer_preallocation_attempts,
             point_buffer_preallocation_hits: diagnostics.point_buffer_preallocation_hits,
             point_buffer_preallocation_fallbacks: diagnostics.point_buffer_preallocation_fallbacks,
+            point_resource_preclaim_enabled: diagnostics.point_resource_preclaim_enabled,
+            point_resource_preclaim_attempts: diagnostics.point_resource_preclaim_attempts,
+            point_resource_preclaim_granted: diagnostics.point_resource_preclaim_granted,
+            point_resource_preclaim_promoted: diagnostics.point_resource_preclaim_promoted,
+            point_resource_preclaim_invalidated: diagnostics.point_resource_preclaim_invalidated,
             progress_diagnostics: diagnostics.progress_diagnostics,
         }
     }
@@ -2089,6 +2099,7 @@ impl WalIoDiagnosticsRecord {
             && self.cursor_direct_completion_enabled == other.cursor_direct_completion_enabled
             && self.cursor_singleton_submission_enabled == other.cursor_singleton_submission_enabled
             && self.point_buffer_preallocation_enabled == other.point_buffer_preallocation_enabled
+            && self.point_resource_preclaim_enabled == other.point_resource_preclaim_enabled
             && sliding_configuration_stable
     }
 }
@@ -12831,6 +12842,11 @@ mod tests {
                         point_buffer_preallocation_attempts: 0,
                         point_buffer_preallocation_hits: 0,
                         point_buffer_preallocation_fallbacks: 0,
+                        point_resource_preclaim_enabled: false,
+                        point_resource_preclaim_attempts: 0,
+                        point_resource_preclaim_granted: 0,
+                        point_resource_preclaim_promoted: 0,
+                        point_resource_preclaim_invalidated: 0,
                         #[cfg(feature = "bench")]
                         progress_diagnostics: None,
                     }),
@@ -12860,6 +12876,11 @@ mod tests {
                         point_buffer_preallocation_attempts: 0,
                         point_buffer_preallocation_hits: 0,
                         point_buffer_preallocation_fallbacks: 0,
+                        point_resource_preclaim_enabled: false,
+                        point_resource_preclaim_attempts: 0,
+                        point_resource_preclaim_granted: 0,
+                        point_resource_preclaim_promoted: 0,
+                        point_resource_preclaim_invalidated: 0,
                         #[cfg(feature = "bench")]
                         progress_diagnostics: None,
                     }),

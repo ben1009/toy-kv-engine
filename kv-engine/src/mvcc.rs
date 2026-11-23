@@ -1399,15 +1399,14 @@ impl LsmMvccInner {
         #[cfg(feature = "bench")]
         let phase_timer = WalCpuPhaseTimer::start(cpu_attribution.is_some());
         #[cfg(feature = "bench")]
-        let admission_result = if point_buffer_preallocated {
+        let admission_result = if point_buffer_preallocated || point_scratch.has_quota_preclaim() {
             memtable.admit_prepared_v8_point_pitr_wal_batch_only(
                 point_scratch,
                 commit_ts,
                 recorded_at,
             )
         } else {
-            let (prepared, unused_preallocated_buffer) = point_scratch.into_parts();
-            drop(unused_preallocated_buffer);
+            let prepared = point_scratch.into_prepared();
             memtable.admit_prepared_v8_pitr_wal_batch_only(prepared, commit_ts, recorded_at)
         };
         #[cfg(not(feature = "bench"))]

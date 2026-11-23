@@ -201,11 +201,11 @@ struct LedgerState {
     next_id: u64,
     charged: WalV7ResourceCharge,
     reservations: AHashMap<u64, WalV7ResourceCharge>,
-    #[cfg(all(test, feature = "bench"))]
+    #[cfg(feature = "bench")]
     // Speculative charges constrain other preclaims only. Formal reservations
     // can revoke them under this same lock without waiting for a token holder.
     preclaims: BTreeMap<u64, WalV7ResourceCharge>,
-    #[cfg(all(test, feature = "bench"))]
+    #[cfg(feature = "bench")]
     next_preclaim_id: u64,
     source_spool_generation: u64,
     source_spool_work_generation: u64,
@@ -239,14 +239,13 @@ pub(crate) struct WalV7ResourceLedger {
     inner: Arc<WalV7ResourceLedgerInner>,
 }
 
-// Ledger prototype. The owner and WAL integration are a separate slice.
-#[cfg(all(test, feature = "bench"))]
-struct PointQuotaPreclaim {
+#[cfg(feature = "bench")]
+pub(crate) struct PointQuotaPreclaim {
     ledger: Arc<WalV7ResourceLedgerInner>,
     id: u64,
 }
 
-#[cfg(all(test, feature = "bench"))]
+#[cfg(feature = "bench")]
 impl Drop for PointQuotaPreclaim {
     fn drop(&mut self) {
         self.ledger.state.lock().preclaims.remove(&self.id);
@@ -521,6 +520,40 @@ impl WalV7ReservationOwner {
         {
             return Err(WalV7ReservationError::InvalidBatchLength);
         }
+        self.reserve_owned_batch(frontier_source_credit, || {
+            self.ledger.reserve(charge).map(Some)
+        })?
+        .ok_or(WalV7ReservationError::UnknownReservation)
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn try_preclaim_batch_charge(
+        &self,
+        charge: WalV7ResourceCharge,
+    ) -> Option<PointQuotaPreclaim> {
+        let state = self.state.try_lock()?;
+        if state.retired {
+            return None;
+        }
+        self.ledger.try_preclaim(charge)
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn promote_batch_preclaim(
+        self: &Arc<Self>,
+        claim: &PointQuotaPreclaim,
+        frontier_source_credit: u64,
+    ) -> Result<Option<WalV7OwnedBatchReservation>, WalV7ReservationError> {
+        self.reserve_owned_batch(frontier_source_credit, || {
+            self.ledger.promote_preclaim(claim)
+        })
+    }
+
+    fn reserve_owned_batch(
+        self: &Arc<Self>,
+        frontier_source_credit: u64,
+        reserve: impl FnOnce() -> Result<Option<WalV7Reservation>, WalV7ReservationError>,
+    ) -> Result<Option<WalV7OwnedBatchReservation>, WalV7ReservationError> {
         let (_owner_lock_timer, mut state) =
             mutex_diagnostics::lock(&self.state, MutexLockKind::ReservationOwner);
         if state.retired {
@@ -530,13 +563,15 @@ impl WalV7ReservationOwner {
             .active_batch_operations
             .checked_add(1)
             .ok_or(WalV7ReservationError::ArithmeticOverflow)?;
-        let reservation = self.ledger.reserve(charge)?;
+        let Some(reservation) = reserve()? else {
+            return Ok(None);
+        };
         let id = reservation.id;
         state.reservations.insert(id, reservation);
         state.active_batch_operations = active_batch_operations;
         drop(state);
 
-        Ok(WalV7OwnedBatchReservation {
+        Ok(Some(WalV7OwnedBatchReservation {
             operation: Arc::new(WalV7BatchOperation {
                 owner: Arc::clone(self),
                 id,
@@ -545,7 +580,7 @@ impl WalV7ReservationOwner {
             }),
             frontier_credit_held: true,
             frontier_source_credit,
-        })
+        }))
     }
 
     /// Reserve source-spool bytes for an extent allocated ahead of admitted
@@ -1081,9 +1116,9 @@ impl WalV7ResourceLedger {
                     next_id: 1,
                     charged: WalV7ResourceCharge::default(),
                     reservations: AHashMap::new(),
-                    #[cfg(all(test, feature = "bench"))]
+                    #[cfg(feature = "bench")]
                     preclaims: BTreeMap::new(),
-                    #[cfg(all(test, feature = "bench"))]
+                    #[cfg(feature = "bench")]
                     next_preclaim_id: 1,
                     source_spool_generation: 0,
                     source_spool_work_generation: 0,
@@ -1142,7 +1177,7 @@ impl WalV7ResourceLedger {
             .ok_or(WalV7ReservationError::ReservationIdExhausted)?;
         let id = state.next_id;
 
-        #[cfg(all(test, feature = "bench"))]
+        #[cfg(feature = "bench")]
         self.revoke_conflicting_preclaims(state, next, maintenance);
 
         state.charged = next;
@@ -1198,7 +1233,7 @@ impl WalV7ResourceLedger {
         Ok(())
     }
 
-    #[cfg(all(test, feature = "bench"))]
+    #[cfg(feature = "bench")]
     fn try_preclaim(&self, charge: WalV7ResourceCharge) -> Option<PointQuotaPreclaim> {
         const MAX_PRECLAIMS: usize = 16;
         if charge.is_empty() || charge.recovery_workspace_bytes != 0 {
@@ -1225,7 +1260,7 @@ impl WalV7ResourceLedger {
         })
     }
 
-    #[cfg(all(test, feature = "bench"))]
+    #[cfg(feature = "bench")]
     fn promote_preclaim(
         &self,
         claim: &PointQuotaPreclaim,
@@ -1246,7 +1281,7 @@ impl WalV7ResourceLedger {
         }
     }
 
-    #[cfg(all(test, feature = "bench"))]
+    #[cfg(feature = "bench")]
     fn revoke_conflicting_preclaims(
         &self,
         state: &mut LedgerState,

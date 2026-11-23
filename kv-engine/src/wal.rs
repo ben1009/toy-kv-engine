@@ -178,6 +178,16 @@ pub struct WalIoDiagnostics {
     /// Outstanding speculative buffer permits for in-process lifecycle tests.
     /// This field is not serialized into benchmark results.
     pub point_buffer_preallocations_in_flight: u64,
+    /// Whether this writer tries speculative Point quota preclaims.
+    pub point_resource_preclaim_enabled: bool,
+    /// Number of eligible Point requests that tried to preclaim quota.
+    pub point_resource_preclaim_attempts: u64,
+    /// Number of speculative claims issued by the ledger.
+    pub point_resource_preclaim_granted: u64,
+    /// Number of claims converted to a formal reservation during admission.
+    pub point_resource_preclaim_promoted: u64,
+    /// Number of issued claims rejected at promotion and sent through fallback.
+    pub point_resource_preclaim_invalidated: u64,
     pub progress_diagnostics: Option<WalV8ProgressDiagnostics>,
 }
 
