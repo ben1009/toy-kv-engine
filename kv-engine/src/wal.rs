@@ -167,6 +167,14 @@ pub struct WalIoDiagnostics {
     /// Whether Cursor DATA submissions use the benchmark-only allocation-free group
     /// representation.
     pub cursor_singleton_submission_enabled: bool,
+    /// Whether Point batches attempt the benchmark-only pre-admission resource claim.
+    pub point_resource_preclaim_enabled: bool,
+    /// Number of Point resource preclaim attempts during the run.
+    pub point_resource_preclaim_attempts: u64,
+    /// Number of Point resource preclaims successfully acquired before serialized admission.
+    pub point_resource_preclaim_hits: u64,
+    /// Number of preclaim misses that used the serialized fallback.
+    pub point_resource_preclaim_fallbacks: u64,
     pub progress_diagnostics: Option<WalV8ProgressDiagnostics>,
 }
 
@@ -2615,6 +2623,56 @@ impl Wal {
                 return Err(error);
             }
         };
+        self.finish_v8_parallel_admission(writer, job)
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn try_preclaim_v8_point_batch(
+        &self,
+        scratch: &mut v8::leader::WalV8PointAdmissionScratch<'_>,
+    ) -> bool {
+        if let Some(writer) = &self.v8_parallel {
+            return writer.try_preclaim_point_admission(scratch);
+        }
+
+        false
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn admit_v8_prepared_parallel_point_batch<'a>(
+        &self,
+        scratch: v8::leader::WalV8PointAdmissionScratch<'a>,
+        commit_ts: u64,
+        recorded_at: crate::pitr::RecordedAt,
+    ) -> Result<(u64, v8::leader::WalV8FrameJob<'a>)> {
+        ensure!(
+            self.format_version == WAL_FORMAT_VERSION_V8,
+            "v8 batch admission selected for format {}",
+            self.format_version
+        );
+        ensure!(
+            !self.poisoned.load(Ordering::Acquire),
+            "WAL is poisoned due to a previous I/O error"
+        );
+        let writer = self
+            .v8_parallel
+            .as_ref()
+            .context("v8 WAL has no Parallel writer")?;
+        let job = match writer.admit_prepared_point_batch(scratch, commit_ts, recorded_at) {
+            Ok(job) => job,
+            Err(error) => {
+                self.record_v8_parallel_error(writer, &error);
+                return Err(error);
+            }
+        };
+        self.finish_v8_parallel_admission(writer, job)
+    }
+
+    fn finish_v8_parallel_admission<'a>(
+        &self,
+        writer: &v8::leader::WalV8ParallelWriter,
+        job: v8::leader::WalV8FrameJob<'a>,
+    ) -> Result<(u64, v8::leader::WalV8FrameJob<'a>)> {
         let assignment = job.assignment();
         let data_end = assignment
             .first_data_offset

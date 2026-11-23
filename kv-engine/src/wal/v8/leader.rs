@@ -27,6 +27,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(feature = "bench")]
+use std::sync::atomic::AtomicU64;
+
 #[cfg(test)]
 use std::os::unix::fs::OpenOptionsExt;
 
@@ -113,6 +116,57 @@ fn data_completion_to_frontier_start_ns(
 }
 
 pub(crate) type WalV8PreparedBatch<'a> = PreparedWalV8Batch<'a, WalV8PreflightReservation>;
+
+/// Point-owned preparation state created before entering the MVCC sequencer.
+/// The optional preclaim owns its DATA buffer and quota token together so an
+/// abandoned pre-ticket attempt releases the buffer before its charge.
+#[cfg(feature = "bench")]
+pub(crate) struct WalV8PointAdmissionScratch<'a> {
+    prepared: WalV8PreparedBatch<'a>,
+    preclaim: Option<WalV8PointPreclaim>,
+}
+
+/// A speculative Point resource claim and its DATA buffer. The buffer must be
+/// dropped before the reservation releases its memory charge.
+#[cfg(feature = "bench")]
+pub(crate) struct WalV8PointPreclaim {
+    data_buffer: DirectBufAllocation,
+    reservation: WalV7OwnedBatchReservation,
+}
+
+#[cfg(feature = "bench")]
+impl<'a> WalV8PointAdmissionScratch<'a> {
+    pub(crate) fn new(prepared: WalV8PreparedBatch<'a>) -> Self {
+        Self {
+            prepared,
+            preclaim: None,
+        }
+    }
+
+    pub(crate) fn into_parts(self) -> (WalV8PreparedBatch<'a>, Option<WalV8PointPreclaim>) {
+        (self.prepared, self.preclaim)
+    }
+
+    fn set_preclaim(&mut self, preclaim: WalV8PointPreclaim) {
+        debug_assert!(self.preclaim.is_none());
+        self.preclaim = Some(preclaim);
+    }
+}
+
+struct WalV8AdmissionResources {
+    data_buffer: DirectBufAllocation,
+    reservation: Option<WalV7OwnedBatchReservation>,
+}
+
+#[cfg(feature = "bench")]
+impl WalV8PointPreclaim {
+    fn into_admission_resources(self) -> WalV8AdmissionResources {
+        WalV8AdmissionResources {
+            data_buffer: self.data_buffer,
+            reservation: Some(self.reservation),
+        }
+    }
+}
 
 pub(crate) struct WalV8PreflightReservation {
     _coordinator: WalV8PreparationReservation,
@@ -216,6 +270,14 @@ pub(crate) struct WalV8ParallelWriter {
     /// durable prefixes. Batch and mixed prefixes retain the existing path.
     #[cfg(feature = "bench")]
     batch_point_frontier_credits: bool,
+    #[cfg(feature = "bench")]
+    point_resource_preclaim_enabled: bool,
+    #[cfg(feature = "bench")]
+    point_resource_preclaim_attempts: AtomicU64,
+    #[cfg(feature = "bench")]
+    point_resource_preclaim_hits: AtomicU64,
+    #[cfg(feature = "bench")]
+    point_resource_preclaim_fallbacks: AtomicU64,
     #[cfg(feature = "bench")]
     profile: arc_swap::ArcSwapOption<crate::mem_table::WriteProfile>,
 }
@@ -2614,6 +2676,23 @@ fn point_frontier_credit_batch_from_environment() -> Result<bool> {
     }
 }
 
+#[cfg(feature = "bench")]
+fn point_resource_preclaim_from_environment() -> Result<bool> {
+    let Some(value) = std::env::var_os("TOYKV_BENCH_V8_POINT_RESOURCE_PRECLAIM") else {
+        return Ok(false);
+    };
+    let value = value
+        .to_str()
+        .context("TOYKV_BENCH_V8_POINT_RESOURCE_PRECLAIM is not valid UTF-8")?;
+    match value {
+        "0" => Ok(false),
+        "1" => Ok(true),
+        _ => anyhow::bail!(
+            "invalid TOYKV_BENCH_V8_POINT_RESOURCE_PRECLAIM {value:?}; expected `0` or `1`"
+        ),
+    }
+}
+
 struct WalV8ParallelFrontier {
     frontier: WalV8Frontier,
     offset: u64,
@@ -4414,6 +4493,10 @@ impl WalV8LeaderWriter {
             progress_cursor_enabled: false,
             cursor_direct_completion_enabled: false,
             cursor_singleton_submission_enabled: false,
+            point_resource_preclaim_enabled: false,
+            point_resource_preclaim_attempts: 0,
+            point_resource_preclaim_hits: 0,
+            point_resource_preclaim_fallbacks: 0,
             progress_diagnostics: None,
         };
 
@@ -4571,12 +4654,15 @@ impl WalV8LeaderWriter {
         #[cfg(feature = "bench")]
         let batch_point_frontier_credits = point_frontier_credit_batch_from_environment()?;
         #[cfg(feature = "bench")]
+        let point_resource_preclaim_enabled = point_resource_preclaim_from_environment()?;
+        #[cfg(feature = "bench")]
         {
             io_diagnostics.data = WalIoHandleMetadata::from_file(&worker_file)?;
             io_diagnostics.progress_ring_enabled = progress_mode.uses_ring();
             io_diagnostics.progress_cursor_enabled = self.coordinator.progress_cursor_enabled();
             io_diagnostics.cursor_direct_completion_enabled = direct_completion_enabled;
             io_diagnostics.cursor_singleton_submission_enabled = singleton_submission_enabled;
+            io_diagnostics.point_resource_preclaim_enabled = point_resource_preclaim_enabled;
         }
         #[cfg(feature = "bench")]
         let (extent_preallocator, extent_preparation) =
@@ -4778,6 +4864,14 @@ impl WalV8LeaderWriter {
             coalesce_budget_override_us,
             #[cfg(feature = "bench")]
             batch_point_frontier_credits,
+            #[cfg(feature = "bench")]
+            point_resource_preclaim_enabled,
+            #[cfg(feature = "bench")]
+            point_resource_preclaim_attempts: AtomicU64::new(0),
+            #[cfg(feature = "bench")]
+            point_resource_preclaim_hits: AtomicU64::new(0),
+            #[cfg(feature = "bench")]
+            point_resource_preclaim_fallbacks: AtomicU64::new(0),
             #[cfg(feature = "bench")]
             profile: self.profile,
         })
@@ -5353,6 +5447,14 @@ impl WalV8ParallelWriter {
         diagnostics.progress_ring_enabled = self.coordinator.progress_ring_enabled();
         diagnostics.progress_cursor_enabled = self.coordinator.progress_cursor_enabled();
         diagnostics.progress_diagnostics = self.coordinator.progress_diagnostics();
+        diagnostics.point_resource_preclaim_attempts = self
+            .point_resource_preclaim_attempts
+            .load(Ordering::Relaxed);
+        diagnostics.point_resource_preclaim_hits =
+            self.point_resource_preclaim_hits.load(Ordering::Relaxed);
+        diagnostics.point_resource_preclaim_fallbacks = self
+            .point_resource_preclaim_fallbacks
+            .load(Ordering::Relaxed);
 
         diagnostics
     }
@@ -5521,6 +5623,106 @@ impl WalV8ParallelWriter {
         self.admit_prepared_batch_inner(prepared, commit_ts, recorded_at, || {})
     }
 
+    /// Attempt a reversible Point-only resource preclaim without waiting for
+    /// owner or ledger contention. A miss preserves the existing serialized
+    /// reservation and allocation path.
+    #[cfg(feature = "bench")]
+    pub(crate) fn try_preclaim_point_admission(
+        &self,
+        scratch: &mut WalV8PointAdmissionScratch<'_>,
+    ) -> bool {
+        if !self.point_resource_preclaim_enabled {
+            return false;
+        }
+        self.point_resource_preclaim_attempts
+            .fetch_add(1, Ordering::Relaxed);
+
+        let Some(owner) = &self.reservation_owner else {
+            self.point_resource_preclaim_fallbacks
+                .fetch_add(1, Ordering::Relaxed);
+            return true;
+        };
+        let logical_bytes = match u64::try_from(scratch.prepared.logical_batch_bytes()) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                self.point_resource_preclaim_fallbacks
+                    .fetch_add(1, Ordering::Relaxed);
+                return true;
+            }
+        };
+        let frame_bytes = match u64::try_from(scratch.prepared.frame_buffer_bytes()) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                self.point_resource_preclaim_fallbacks
+                    .fetch_add(1, Ordering::Relaxed);
+                return true;
+            }
+        };
+        let reservation = owner.try_reserve_batch(logical_bytes, frame_bytes);
+        let Ok(Some(reservation)) = reservation else {
+            self.point_resource_preclaim_fallbacks
+                .fetch_add(1, Ordering::Relaxed);
+            return true;
+        };
+
+        // The full DATA buffer charge is held before allocating its memory.
+        // If the producer abandons this pre-ticket attempt, scratch Drop
+        // releases the buffer first and then the quota reservation.
+        let data_buffer = DirectBufAllocation::new(scratch.prepared.frame_buffer_bytes());
+        scratch.set_preclaim(WalV8PointPreclaim {
+            data_buffer,
+            reservation,
+        });
+        self.point_resource_preclaim_hits
+            .fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
+    /// Admit a Point scratch object, consuming a successful speculative
+    /// preclaim or falling back to the unchanged serialized resource path.
+    #[cfg(feature = "bench")]
+    pub(crate) fn admit_prepared_point_batch<'a>(
+        &self,
+        scratch: WalV8PointAdmissionScratch<'a>,
+        commit_ts: u64,
+        recorded_at: crate::pitr::RecordedAt,
+    ) -> Result<WalV8FrameJob<'a>> {
+        let (prepared, preclaim) = scratch.into_parts();
+        ensure!(!self.is_poisoned(), "v8 Parallel WAL is poisoned");
+        let logical_bytes = u64::try_from(prepared.logical_batch_bytes())?;
+        let frame_bytes = u64::try_from(prepared.frame_buffer_bytes())?;
+        let resources = match preclaim {
+            Some(preclaim)
+                if preclaim
+                    .reservation
+                    .owner_retired_if_uncontended()
+                    .is_some_and(|retired| !retired) =>
+            {
+                preclaim.into_admission_resources()
+            }
+            Some(preclaim) => {
+                drop(preclaim);
+                #[cfg(feature = "bench")]
+                if self.point_resource_preclaim_enabled {
+                    self.point_resource_preclaim_fallbacks
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                self.reserve_and_allocate_batch_resources(
+                    logical_bytes,
+                    frame_bytes,
+                    prepared.frame_buffer_bytes(),
+                )?
+            }
+            None => self.reserve_and_allocate_batch_resources(
+                logical_bytes,
+                frame_bytes,
+                prepared.frame_buffer_bytes(),
+            )?,
+        };
+
+        self.admit_prepared_batch_with_resources(prepared, commit_ts, recorded_at, resources, || {})
+    }
+
     fn reserve_batch_resources(
         &self,
         logical_bytes: u64,
@@ -5559,22 +5761,58 @@ impl WalV8ParallelWriter {
         ensure!(!self.is_poisoned(), "v8 Parallel WAL is poisoned");
         let logical_bytes = u64::try_from(prepared.logical_batch_bytes())?;
         let frame_bytes = u64::try_from(prepared.frame_buffer_bytes())?;
-        let mut reservation = self.reserve_batch_resources(logical_bytes, frame_bytes)?;
+        let resources = self.reserve_and_allocate_batch_resources(
+            logical_bytes,
+            frame_bytes,
+            prepared.frame_buffer_bytes(),
+        )?;
+        self.admit_prepared_batch_with_resources(
+            prepared,
+            commit_ts,
+            recorded_at,
+            resources,
+            after_admission,
+        )
+    }
 
+    fn reserve_and_allocate_batch_resources(
+        &self,
+        logical_bytes: u64,
+        frame_bytes: u64,
+        buffer_bytes: usize,
+    ) -> Result<WalV8AdmissionResources> {
+        let reservation = self.reserve_batch_resources(logical_bytes, frame_bytes)?;
         // Own the allocation before publishing the ticket. Initialization is
         // payload-sized work, so defer it to finish after the MVCC sequencer
         // has been released.
-        let data_buffer = DirectBufAllocation::new(prepared.frame_buffer_bytes());
+        let data_buffer = DirectBufAllocation::new(buffer_bytes);
+        Ok(WalV8AdmissionResources {
+            data_buffer,
+            reservation,
+        })
+    }
+
+    fn admit_prepared_batch_with_resources<'a, F>(
+        &self,
+        prepared: WalV8PreparedBatch<'a>,
+        commit_ts: u64,
+        recorded_at: crate::pitr::RecordedAt,
+        mut resources: WalV8AdmissionResources,
+        after_admission: F,
+    ) -> Result<WalV8FrameJob<'a>>
+    where
+        F: FnOnce(),
+    {
         let publisher = WalV8LeaderAdmissionPublisher {
             coordinator: &self.coordinator,
-            reservation: RefCell::new(&mut reservation),
+            reservation: RefCell::new(&mut resources.reservation),
             extent_preallocator: self.io.extent_preallocator.as_deref(),
         };
         let admitted = prepared.admit_with_metadata(commit_ts, recorded_at, &publisher)?;
         let assignment = admitted.assignment();
         #[cfg(feature = "bench")]
         let write_class = admitted.write_class();
-        if let Some(reservation) = reservation.take() {
+        if let Some(reservation) = resources.reservation.take() {
             let previous = self.frontier_resources.lock().insert(
                 assignment.segment_ticket,
                 WalV8FrontierResource {
@@ -5596,7 +5834,7 @@ impl WalV8ParallelWriter {
             coordinator: self.coordinator.clone(),
             producer_guards: Arc::clone(&self.producer_guards),
             io: Arc::clone(&self.io),
-            data_buffer: Some(data_buffer),
+            data_buffer: Some(resources.data_buffer),
             #[cfg(feature = "bench")]
             profile: self.profile.load_full(),
         })

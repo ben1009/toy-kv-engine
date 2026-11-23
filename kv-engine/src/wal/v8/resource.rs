@@ -207,6 +207,33 @@ impl WalV8ReservationOwner {
             .reserve_batch_charge(charge, marker_source_bytes)
             .map_err(Into::into)
     }
+
+    /// Try to reserve one Point batch without waiting on owner or ledger lock
+    /// contention. `Ok(None)` indicates contention; quota and accounting
+    /// errors let the caller fall back to the normal serialized reservation.
+    #[cfg(feature = "bench")]
+    pub(crate) fn try_reserve_batch(
+        self: &Arc<Self>,
+        logical_batch_bytes: u64,
+        frame_buffer_bytes: u64,
+    ) -> Result<Option<WalV7OwnedBatchReservation>> {
+        let mut charge = WalV7ResourceCharge::for_batch(logical_batch_bytes)?;
+        let expected_wal_bytes = frame_buffer_bytes
+            .checked_add(WAL_V8_FRAME_LEN as u64)
+            .context("v8 DATA and FRONTIER reservation overflows")?;
+        ensure!(
+            charge.logical_wal_bytes == expected_wal_bytes,
+            "v8 DATA frame reservation differs from the encoded batch length"
+        );
+        let marker_source_bytes = round_up(WAL_V8_FRAME_LEN as u64, self.source_allocation_unit)?;
+        charge.source_spool_bytes = round_up(frame_buffer_bytes, self.source_allocation_unit)?
+            .checked_add(marker_source_bytes)
+            .context("v8 source spool reservation overflows")?;
+
+        self.image_owner
+            .try_reserve_batch_charge(charge, marker_source_bytes)
+            .map_err(Into::into)
+    }
 }
 
 fn round_up(bytes: u64, unit: u64) -> Result<u64> {

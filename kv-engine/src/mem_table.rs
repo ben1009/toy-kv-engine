@@ -4132,6 +4132,44 @@ impl MemTable {
         Ok((Some(ticket), Some(frame_job)))
     }
 
+    #[cfg(feature = "bench")]
+    pub(crate) fn try_preclaim_prepared_v8_point_wal_batch_only(
+        &self,
+        scratch: &mut crate::wal::v8::leader::WalV8PointAdmissionScratch<'_>,
+    ) -> bool {
+        if let Some(wal) = &self.wal {
+            return wal.try_preclaim_v8_point_batch(scratch);
+        }
+
+        false
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn admit_prepared_v8_point_pitr_wal_batch_only<'a>(
+        &self,
+        scratch: crate::wal::v8::leader::WalV8PointAdmissionScratch<'a>,
+        commit_ts: u64,
+        recorded_at: crate::pitr::RecordedAt,
+    ) -> Result<(
+        Option<u64>,
+        Option<crate::wal::v8::leader::WalV8FrameJob<'a>>,
+    )> {
+        let wal = self
+            .wal
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("PITR WAL is not configured"))?;
+        anyhow::ensure!(
+            wal.is_v8() && wal.is_parallel(),
+            "prepared v8 batch requires a Parallel v8 WAL"
+        );
+        let (ticket, frame_job) =
+            wal.admit_v8_prepared_parallel_point_batch(scratch, commit_ts, recorded_at)?;
+        self.last_ticket
+            .fetch_max(ticket + 1, std::sync::atomic::Ordering::Release);
+
+        Ok((Some(ticket), Some(frame_job)))
+    }
+
     pub(crate) fn finish_v8_frame_job(
         &self,
         frame_job: crate::wal::v8::leader::WalV8FrameJob<'_>,
