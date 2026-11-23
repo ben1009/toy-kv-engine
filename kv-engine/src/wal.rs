@@ -180,6 +180,10 @@ pub struct WalIoDiagnostics {
     pub point_buffer_preallocations_in_flight: u64,
     /// Whether this writer tries speculative Point quota preclaims.
     pub point_resource_preclaim_enabled: bool,
+    /// Whether speculative Point quota checks use the cached aggregate charge.
+    pub point_resource_preclaim_sum_cache_enabled: bool,
+    /// Whether Point quota preclaims run after the independent DATA buffer attempt.
+    pub point_resource_preclaim_after_buffer_enabled: bool,
     /// Number of eligible Point requests that tried to preclaim quota.
     pub point_resource_preclaim_attempts: u64,
     /// Number of speculative claims issued by the ledger.
@@ -188,6 +192,38 @@ pub struct WalIoDiagnostics {
     pub point_resource_preclaim_promoted: u64,
     /// Number of issued claims rejected at promotion and sent through fallback.
     pub point_resource_preclaim_invalidated: u64,
+    /// Eligible preclaims declined because the reservation-owner try-lock was busy.
+    pub point_resource_preclaim_owner_trylock_busy: u64,
+    /// Eligible preclaims declined because the reservation owner was retired.
+    pub point_resource_preclaim_owner_retired: u64,
+    /// Eligible preclaims declined because the ledger try-lock was busy.
+    pub point_resource_preclaim_ledger_trylock_busy: u64,
+    /// Eligible preclaims declined because the bounded active-claim set was full.
+    pub point_resource_preclaim_max_preclaims: u64,
+    /// High-water mark of simultaneous active speculative preclaims.
+    pub point_resource_preclaim_max_live: u64,
+    /// Preclaims declined by the corresponding quota checks.
+    pub point_resource_preclaim_logical_quota_rejected: u64,
+    pub point_resource_preclaim_source_spool_quota_rejected: u64,
+    pub point_resource_preclaim_buffer_quota_rejected: u64,
+    pub point_resource_preclaim_seal_index_quota_rejected: u64,
+    pub point_resource_preclaim_recovery_workspace_rejected: u64,
+    pub point_resource_preclaim_arithmetic_rejected: u64,
+    pub point_resource_preclaim_invalid_charge_rejected: u64,
+    /// Eligible admissions that used the ordinary reservation fallback.
+    pub point_resource_preclaim_fallbacks: u64,
+    /// Issued claims revoked by formal admission before promotion.
+    pub point_resource_preclaim_revoked: u64,
+    /// Issued claims dropped while still active instead of being promoted or revoked.
+    pub point_resource_preclaim_abandoned: u64,
+    /// Zero disables CPU timing; positive values select every Nth attempt.
+    pub point_resource_preclaim_cpu_sample_every: u64,
+    /// Sum of sampled thread CPU time around the preclaim attempt.
+    pub point_resource_preclaim_cpu_ns: u64,
+    pub point_resource_preclaim_cpu_samples: u64,
+    /// Sum of sampled thread CPU time around admission-time promotion.
+    pub point_resource_preclaim_promotion_cpu_ns: u64,
+    pub point_resource_preclaim_promotion_cpu_samples: u64,
     pub progress_diagnostics: Option<WalV8ProgressDiagnostics>,
 }
 

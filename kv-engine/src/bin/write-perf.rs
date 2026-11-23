@@ -1933,10 +1933,32 @@ struct WalIoDiagnosticsRecord {
     point_buffer_preallocation_hits: u64,
     point_buffer_preallocation_fallbacks: u64,
     point_resource_preclaim_enabled: bool,
+    point_resource_preclaim_sum_cache_enabled: bool,
+    point_resource_preclaim_after_buffer_enabled: bool,
     point_resource_preclaim_attempts: u64,
     point_resource_preclaim_granted: u64,
     point_resource_preclaim_promoted: u64,
     point_resource_preclaim_invalidated: u64,
+    point_resource_preclaim_owner_trylock_busy: u64,
+    point_resource_preclaim_owner_retired: u64,
+    point_resource_preclaim_ledger_trylock_busy: u64,
+    point_resource_preclaim_max_preclaims: u64,
+    point_resource_preclaim_max_live: u64,
+    point_resource_preclaim_logical_quota_rejected: u64,
+    point_resource_preclaim_source_spool_quota_rejected: u64,
+    point_resource_preclaim_buffer_quota_rejected: u64,
+    point_resource_preclaim_seal_index_quota_rejected: u64,
+    point_resource_preclaim_recovery_workspace_rejected: u64,
+    point_resource_preclaim_arithmetic_rejected: u64,
+    point_resource_preclaim_invalid_charge_rejected: u64,
+    point_resource_preclaim_fallbacks: u64,
+    point_resource_preclaim_revoked: u64,
+    point_resource_preclaim_abandoned: u64,
+    point_resource_preclaim_cpu_sample_every: u64,
+    point_resource_preclaim_cpu_ns: u64,
+    point_resource_preclaim_cpu_samples: u64,
+    point_resource_preclaim_promotion_cpu_ns: u64,
+    point_resource_preclaim_promotion_cpu_samples: u64,
     #[cfg(feature = "bench")]
     #[serde(skip_serializing_if = "Option::is_none")]
     progress_diagnostics: Option<kv_engine::wal::WalV8ProgressDiagnostics>,
@@ -2069,10 +2091,48 @@ impl From<WalIoDiagnostics> for WalIoDiagnosticsRecord {
             point_buffer_preallocation_hits: diagnostics.point_buffer_preallocation_hits,
             point_buffer_preallocation_fallbacks: diagnostics.point_buffer_preallocation_fallbacks,
             point_resource_preclaim_enabled: diagnostics.point_resource_preclaim_enabled,
+            point_resource_preclaim_sum_cache_enabled: diagnostics
+                .point_resource_preclaim_sum_cache_enabled,
+            point_resource_preclaim_after_buffer_enabled: diagnostics
+                .point_resource_preclaim_after_buffer_enabled,
             point_resource_preclaim_attempts: diagnostics.point_resource_preclaim_attempts,
             point_resource_preclaim_granted: diagnostics.point_resource_preclaim_granted,
             point_resource_preclaim_promoted: diagnostics.point_resource_preclaim_promoted,
             point_resource_preclaim_invalidated: diagnostics.point_resource_preclaim_invalidated,
+            point_resource_preclaim_owner_trylock_busy: diagnostics
+                .point_resource_preclaim_owner_trylock_busy,
+            point_resource_preclaim_owner_retired: diagnostics
+                .point_resource_preclaim_owner_retired,
+            point_resource_preclaim_ledger_trylock_busy: diagnostics
+                .point_resource_preclaim_ledger_trylock_busy,
+            point_resource_preclaim_max_preclaims: diagnostics
+                .point_resource_preclaim_max_preclaims,
+            point_resource_preclaim_max_live: diagnostics.point_resource_preclaim_max_live,
+            point_resource_preclaim_logical_quota_rejected: diagnostics
+                .point_resource_preclaim_logical_quota_rejected,
+            point_resource_preclaim_source_spool_quota_rejected: diagnostics
+                .point_resource_preclaim_source_spool_quota_rejected,
+            point_resource_preclaim_buffer_quota_rejected: diagnostics
+                .point_resource_preclaim_buffer_quota_rejected,
+            point_resource_preclaim_seal_index_quota_rejected: diagnostics
+                .point_resource_preclaim_seal_index_quota_rejected,
+            point_resource_preclaim_recovery_workspace_rejected: diagnostics
+                .point_resource_preclaim_recovery_workspace_rejected,
+            point_resource_preclaim_arithmetic_rejected: diagnostics
+                .point_resource_preclaim_arithmetic_rejected,
+            point_resource_preclaim_invalid_charge_rejected: diagnostics
+                .point_resource_preclaim_invalid_charge_rejected,
+            point_resource_preclaim_fallbacks: diagnostics.point_resource_preclaim_fallbacks,
+            point_resource_preclaim_revoked: diagnostics.point_resource_preclaim_revoked,
+            point_resource_preclaim_abandoned: diagnostics.point_resource_preclaim_abandoned,
+            point_resource_preclaim_cpu_sample_every: diagnostics
+                .point_resource_preclaim_cpu_sample_every,
+            point_resource_preclaim_cpu_ns: diagnostics.point_resource_preclaim_cpu_ns,
+            point_resource_preclaim_cpu_samples: diagnostics.point_resource_preclaim_cpu_samples,
+            point_resource_preclaim_promotion_cpu_ns: diagnostics
+                .point_resource_preclaim_promotion_cpu_ns,
+            point_resource_preclaim_promotion_cpu_samples: diagnostics
+                .point_resource_preclaim_promotion_cpu_samples,
             progress_diagnostics: diagnostics.progress_diagnostics,
         }
     }
@@ -2100,6 +2160,12 @@ impl WalIoDiagnosticsRecord {
             && self.cursor_singleton_submission_enabled == other.cursor_singleton_submission_enabled
             && self.point_buffer_preallocation_enabled == other.point_buffer_preallocation_enabled
             && self.point_resource_preclaim_enabled == other.point_resource_preclaim_enabled
+            && self.point_resource_preclaim_sum_cache_enabled
+                == other.point_resource_preclaim_sum_cache_enabled
+            && self.point_resource_preclaim_after_buffer_enabled
+                == other.point_resource_preclaim_after_buffer_enabled
+            && self.point_resource_preclaim_cpu_sample_every
+                == other.point_resource_preclaim_cpu_sample_every
             && sliding_configuration_stable
     }
 }
@@ -12843,10 +12909,32 @@ mod tests {
                         point_buffer_preallocation_hits: 0,
                         point_buffer_preallocation_fallbacks: 0,
                         point_resource_preclaim_enabled: false,
+                        point_resource_preclaim_sum_cache_enabled: false,
+                        point_resource_preclaim_after_buffer_enabled: false,
                         point_resource_preclaim_attempts: 0,
                         point_resource_preclaim_granted: 0,
                         point_resource_preclaim_promoted: 0,
                         point_resource_preclaim_invalidated: 0,
+                        point_resource_preclaim_owner_trylock_busy: 0,
+                        point_resource_preclaim_owner_retired: 0,
+                        point_resource_preclaim_ledger_trylock_busy: 0,
+                        point_resource_preclaim_max_preclaims: 0,
+                        point_resource_preclaim_max_live: 0,
+                        point_resource_preclaim_logical_quota_rejected: 0,
+                        point_resource_preclaim_source_spool_quota_rejected: 0,
+                        point_resource_preclaim_buffer_quota_rejected: 0,
+                        point_resource_preclaim_seal_index_quota_rejected: 0,
+                        point_resource_preclaim_recovery_workspace_rejected: 0,
+                        point_resource_preclaim_arithmetic_rejected: 0,
+                        point_resource_preclaim_invalid_charge_rejected: 0,
+                        point_resource_preclaim_fallbacks: 0,
+                        point_resource_preclaim_revoked: 0,
+                        point_resource_preclaim_abandoned: 0,
+                        point_resource_preclaim_cpu_sample_every: 0,
+                        point_resource_preclaim_cpu_ns: 0,
+                        point_resource_preclaim_cpu_samples: 0,
+                        point_resource_preclaim_promotion_cpu_ns: 0,
+                        point_resource_preclaim_promotion_cpu_samples: 0,
                         #[cfg(feature = "bench")]
                         progress_diagnostics: None,
                     }),
@@ -12877,10 +12965,32 @@ mod tests {
                         point_buffer_preallocation_hits: 0,
                         point_buffer_preallocation_fallbacks: 0,
                         point_resource_preclaim_enabled: false,
+                        point_resource_preclaim_sum_cache_enabled: false,
+                        point_resource_preclaim_after_buffer_enabled: false,
                         point_resource_preclaim_attempts: 0,
                         point_resource_preclaim_granted: 0,
                         point_resource_preclaim_promoted: 0,
                         point_resource_preclaim_invalidated: 0,
+                        point_resource_preclaim_owner_trylock_busy: 0,
+                        point_resource_preclaim_owner_retired: 0,
+                        point_resource_preclaim_ledger_trylock_busy: 0,
+                        point_resource_preclaim_max_preclaims: 0,
+                        point_resource_preclaim_max_live: 0,
+                        point_resource_preclaim_logical_quota_rejected: 0,
+                        point_resource_preclaim_source_spool_quota_rejected: 0,
+                        point_resource_preclaim_buffer_quota_rejected: 0,
+                        point_resource_preclaim_seal_index_quota_rejected: 0,
+                        point_resource_preclaim_recovery_workspace_rejected: 0,
+                        point_resource_preclaim_arithmetic_rejected: 0,
+                        point_resource_preclaim_invalid_charge_rejected: 0,
+                        point_resource_preclaim_fallbacks: 0,
+                        point_resource_preclaim_revoked: 0,
+                        point_resource_preclaim_abandoned: 0,
+                        point_resource_preclaim_cpu_sample_every: 0,
+                        point_resource_preclaim_cpu_ns: 0,
+                        point_resource_preclaim_cpu_samples: 0,
+                        point_resource_preclaim_promotion_cpu_ns: 0,
+                        point_resource_preclaim_promotion_cpu_samples: 0,
                         #[cfg(feature = "bench")]
                         progress_diagnostics: None,
                     }),
