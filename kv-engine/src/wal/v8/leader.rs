@@ -4883,7 +4883,7 @@ impl WalV8LeaderWriter {
             if let Some(owner) = &self.reservation_owner {
                 owner.set_point_preclaim_sum_cache_enabled(
                     point_resource_preclaim_sum_cache_enabled,
-                );
+                )?;
             }
             io_diagnostics.data = WalIoHandleMetadata::from_file(&worker_file)?;
             io_diagnostics.progress_ring_enabled = progress_mode.uses_ring();
@@ -9620,7 +9620,7 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("point-prealloc-bound-v8.wal");
         let installed = install_empty(&path, header())?;
-        let (mut writer, owner) = match open_accounted_parallel_writer(
+        let (mut writer, _owner) = match open_accounted_parallel_writer(
             &path,
             &installed,
             SEGMENT_LIMIT,
@@ -9644,9 +9644,7 @@ mod tests {
                 // Keep the first 16 buffers live so Stage A falls back for
                 // this Point, then verify Stage B still runs independently.
                 writer.point_resource_preclaim_enabled = true;
-                writer.point_resource_preclaim_sum_cache_enabled = true;
                 writer.point_resource_preclaim_after_buffer = true;
-                owner.set_point_preclaim_sum_cache_enabled(true);
             }
             let prepared = writer.preflight_batch_with_write_class(
                 point,
@@ -9712,7 +9710,10 @@ mod tests {
         );
         assert_eq!(diagnostics.point_buffer_preallocation_fallbacks, 1);
         assert!(diagnostics.point_resource_preclaim_enabled);
-        assert!(diagnostics.point_resource_preclaim_sum_cache_enabled);
+        assert_eq!(
+            diagnostics.point_resource_preclaim_sum_cache_enabled,
+            writer.point_resource_preclaim_sum_cache_enabled
+        );
         assert!(diagnostics.point_resource_preclaim_after_buffer_enabled);
         assert_eq!(diagnostics.point_resource_preclaim_attempts, 1);
         assert_eq!(diagnostics.point_resource_preclaim_granted, 1);

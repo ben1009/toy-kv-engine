@@ -147,6 +147,7 @@ pub(crate) enum WalV7ReservationError {
     ReservationOwnerRetired,
     ActiveOperationsOutstanding,
     AccountingUnderflow,
+    SpeculativeTotalCacheModeConflict,
 }
 
 impl fmt::Display for WalV7ReservationError {
@@ -170,6 +171,9 @@ impl fmt::Display for WalV7ReservationError {
                 "v7 reservation owner still has active batch operations"
             }
             Self::AccountingUnderflow => "v7 resource accounting underflow",
+            Self::SpeculativeTotalCacheModeConflict => {
+                "v7 speculative total cache mode conflicts with the shared ledger configuration"
+            }
         })
     }
 }
@@ -208,7 +212,8 @@ struct LedgerState {
     #[cfg(feature = "bench")]
     speculative_total: WalV7ResourceCharge,
     #[cfg(feature = "bench")]
-    speculative_total_cache_enabled: bool,
+    // Shared by every writer on this ledger; configured once, then frozen.
+    speculative_total_cache_enabled: Option<bool>,
     source_spool_generation: u64,
     source_spool_work_generation: u64,
 }
@@ -218,6 +223,18 @@ impl LedgerState {
         self.source_spool_generation != generation
             || work_generation
                 .is_some_and(|generation| self.source_spool_work_generation != generation)
+    }
+
+    #[cfg(all(test, feature = "bench"))]
+    fn debug_assert_speculative_total_matches_preclaims(&self) {
+        let total = self
+            .preclaims
+            .values()
+            .try_fold(WalV7ResourceCharge::default(), |total, &claim| {
+                total.checked_add(claim)
+            })
+            .expect("test speculative charge sum should not overflow");
+        debug_assert_eq!(self.speculative_total, total);
     }
 }
 
@@ -321,6 +338,8 @@ impl Drop for PointQuotaPreclaim {
                         state.preclaims.clear();
                         state.speculative_total = WalV7ResourceCharge::default();
                     }
+                    #[cfg(test)]
+                    state.debug_assert_speculative_total_matches_preclaims();
                     true
                 } else {
                     false
@@ -556,8 +575,11 @@ impl WalV7ReservationOwner {
     }
 
     #[cfg(feature = "bench")]
-    pub(crate) fn set_point_preclaim_sum_cache_enabled(&self, enabled: bool) {
-        self.ledger.set_speculative_total_cache_enabled(enabled);
+    pub(crate) fn set_point_preclaim_sum_cache_enabled(
+        &self,
+        enabled: bool,
+    ) -> Result<(), WalV7ReservationError> {
+        self.ledger.set_speculative_total_cache_enabled(enabled)
     }
 
     /// Capture after the rejected attempt unwinds, before checking progress,
@@ -1213,7 +1235,7 @@ impl WalV7ResourceLedger {
                     #[cfg(feature = "bench")]
                     speculative_total: WalV7ResourceCharge::default(),
                     #[cfg(feature = "bench")]
-                    speculative_total_cache_enabled: false,
+                    speculative_total_cache_enabled: None,
                     source_spool_generation: 0,
                     source_spool_work_generation: 0,
                 }),
@@ -1241,8 +1263,24 @@ impl WalV7ResourceLedger {
     }
 
     #[cfg(feature = "bench")]
-    pub(crate) fn set_speculative_total_cache_enabled(&self, enabled: bool) {
-        self.inner.state.lock().speculative_total_cache_enabled = enabled;
+    pub(crate) fn set_speculative_total_cache_enabled(
+        &self,
+        enabled: bool,
+    ) -> Result<(), WalV7ReservationError> {
+        let mut state = self.inner.state.lock();
+        match state.speculative_total_cache_enabled {
+            Some(configured) if configured != enabled => {
+                Err(WalV7ReservationError::SpeculativeTotalCacheModeConflict)
+            }
+            Some(_) => Ok(()),
+            None if !state.preclaims.is_empty() => {
+                Err(WalV7ReservationError::SpeculativeTotalCacheModeConflict)
+            }
+            None => {
+                state.speculative_total_cache_enabled = Some(enabled);
+                Ok(())
+            }
+        }
     }
 
     fn reserve_with_priority(
@@ -1367,6 +1405,7 @@ impl WalV7ResourceLedger {
         let Some(mut state) = self.inner.state.try_lock() else {
             return Err(PointPreclaimDeclineReason::LedgerTryLockBusy);
         };
+        let cache_enabled = *state.speculative_total_cache_enabled.get_or_insert(false);
         if state.preclaims.len() >= MAX_PRECLAIMS {
             return Err(PointPreclaimDeclineReason::MaxPreclaims);
         }
@@ -1374,7 +1413,7 @@ impl WalV7ResourceLedger {
             .charged
             .checked_add(charge)
             .ok_or(PointPreclaimDeclineReason::ArithmeticOverflow)?;
-        let next = if state.speculative_total_cache_enabled {
+        let next = if cache_enabled {
             next.checked_add(state.speculative_total)
                 .ok_or(PointPreclaimDeclineReason::ArithmeticOverflow)?
         } else {
@@ -1396,6 +1435,8 @@ impl WalV7ResourceLedger {
             .ok_or(PointPreclaimDeclineReason::ReservationIdExhausted)?;
         state.preclaims.insert(id, charge);
         state.speculative_total = next_speculative_total;
+        #[cfg(test)]
+        state.debug_assert_speculative_total_matches_preclaims();
         let active_preclaims_at_issue = u64::try_from(state.preclaims.len()).unwrap_or(u64::MAX);
         Ok(PointQuotaPreclaim {
             ledger: Arc::clone(&self.inner),
@@ -1420,6 +1461,8 @@ impl WalV7ResourceLedger {
         let Some(charge) = state.preclaims.get(&id).copied() else {
             claim.id = None;
             claim.lifecycle.revoked.fetch_add(1, Ordering::Relaxed);
+            #[cfg(test)]
+            state.debug_assert_speculative_total_matches_preclaims();
             return Ok(None);
         };
         let Some(next_speculative_total) = state.speculative_total.checked_sub(charge) else {
@@ -1427,6 +1470,8 @@ impl WalV7ResourceLedger {
             state.speculative_total = WalV7ResourceCharge::default();
             claim.id = None;
             claim.lifecycle.revoked.fetch_add(1, Ordering::Relaxed);
+            #[cfg(test)]
+            state.debug_assert_speculative_total_matches_preclaims();
             return Err(WalV7ReservationError::AccountingUnderflow);
         };
         // The combined charges fit when the claim was issued. Subsequent
@@ -1437,11 +1482,15 @@ impl WalV7ResourceLedger {
             state.speculative_total = next_speculative_total;
             claim.id = None;
             claim.lifecycle.revoked.fetch_add(1, Ordering::Relaxed);
+            #[cfg(test)]
+            state.debug_assert_speculative_total_matches_preclaims();
             return Err(WalV7ReservationError::ArithmeticOverflow);
         };
         state.preclaims.remove(&id);
         state.speculative_total = next_speculative_total;
         claim.id = None;
+        #[cfg(test)]
+        state.debug_assert_speculative_total_matches_preclaims();
         Ok(Some(
             self.register_reservation(&mut state, id, charge, next),
         ))
@@ -1452,7 +1501,7 @@ impl WalV7ResourceLedger {
         if state.preclaims.is_empty() {
             return;
         }
-        let with_preclaims = if state.speculative_total_cache_enabled {
+        let with_preclaims = if state.speculative_total_cache_enabled == Some(true) {
             next.checked_add(state.speculative_total)
         } else {
             state
@@ -1468,6 +1517,8 @@ impl WalV7ResourceLedger {
             // their IDs so a later promotion observes revocation.
             state.preclaims.clear();
             state.speculative_total = WalV7ResourceCharge::default();
+            #[cfg(test)]
+            state.debug_assert_speculative_total_matches_preclaims();
         }
     }
 
@@ -1839,6 +1890,7 @@ impl WalV7ResourceLedger {
         {
             state.preclaims.clear();
             state.speculative_total = WalV7ResourceCharge::default();
+            state.debug_assert_speculative_total_matches_preclaims();
         }
         self.inner
             .test_max_seal_index_bytes
@@ -2387,7 +2439,7 @@ mod tests {
     #[test]
     fn point_preclaim_cached_total_tracks_issue_drop_promotion_and_revocation() {
         let ledger = WalV7ResourceLedger::new(limits()).unwrap();
-        ledger.set_speculative_total_cache_enabled(true);
+        ledger.set_speculative_total_cache_enabled(true).unwrap();
         let small = charge(20, 20, 0, 8, 6);
         let medium = charge(30, 30, 0, 12, 9);
         let larger = charge(60, 60, 0, 24, 18);
@@ -2433,6 +2485,260 @@ mod tests {
         );
         drop(invalidated_by_limit_change);
         assert_speculative_total_matches_preclaims(&ledger);
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn point_preclaim_cache_mode_is_fixed_for_shared_ledger() {
+        let ledger = WalV7ResourceLedger::new(limits()).unwrap();
+        assert_eq!(ledger.set_speculative_total_cache_enabled(true), Ok(()));
+        assert_eq!(ledger.set_speculative_total_cache_enabled(true), Ok(()));
+        assert_eq!(
+            ledger.set_speculative_total_cache_enabled(false),
+            Err(WalV7ReservationError::SpeculativeTotalCacheModeConflict)
+        );
+
+        let implicitly_configured = WalV7ResourceLedger::new(limits()).unwrap();
+        drop(
+            implicitly_configured
+                .try_preclaim(charge(1, 1, 0, 1, 1))
+                .unwrap(),
+        );
+        assert_eq!(
+            implicitly_configured.set_speculative_total_cache_enabled(true),
+            Err(WalV7ReservationError::SpeculativeTotalCacheModeConflict)
+        );
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn point_preclaim_concurrent_producers_and_formal_admission_preserve_total() {
+        const PRODUCERS: usize = 16;
+
+        for cache_enabled in [false, true] {
+            let ledger = WalV7ResourceLedger::new(WalV7ResourceLimits {
+                max_logical_wal_bytes: 1_000_000,
+                max_source_spool_bytes: 2_000_000,
+                max_recovery_workspace_bytes: 1_000_000,
+                max_buffer_memory_bytes: 1_000_000,
+                max_seal_index_bytes: 4096,
+            })
+            .unwrap();
+            ledger
+                .set_speculative_total_cache_enabled(cache_enabled)
+                .unwrap();
+            let owner = Arc::new(
+                WalV7ReservationOwner::new_image(
+                    ledger.clone(),
+                    None,
+                    1,
+                    1,
+                    WalV7ResourceCharge::default(),
+                )
+                .unwrap(),
+            );
+            let batch_charge = WalV7ResourceCharge::for_batch(128).unwrap();
+            let formal_charge = charge(900_000, 0, 0, 0, 0);
+            let (claims_ready_tx, claims_ready_rx) = crossbeam_channel::bounded(PRODUCERS);
+            let (start_tx, start_rx) = crossbeam_channel::bounded(PRODUCERS);
+            let (operations_done_tx, operations_done_rx) = crossbeam_channel::bounded(PRODUCERS);
+            let promoted_count = Arc::new(AtomicU64::new(0));
+            let revoked_count = Arc::new(AtomicU64::new(0));
+            let dropped_count = Arc::new(AtomicU64::new(0));
+
+            std::thread::scope(|scope| {
+                let formal_ledger = ledger.clone();
+                let formal_promoted_count = Arc::clone(&promoted_count);
+                let formal_revoked_count = Arc::clone(&revoked_count);
+                let formal_dropped_count = Arc::clone(&dropped_count);
+                let formal = scope.spawn(move || {
+                    for _ in 0..PRODUCERS {
+                        claims_ready_rx
+                            .recv_timeout(std::time::Duration::from_secs(5))
+                            .expect("all speculative producers should reach the admission gate");
+                    }
+
+                    for _ in 0..PRODUCERS {
+                        start_tx
+                            .send(())
+                            .expect("producer receivers should remain available");
+                    }
+                    let reservation = formal_ledger
+                        .reserve(formal_charge)
+                        .expect("formal admission fits after revoking conflicting speculation");
+                    assert_speculative_total_matches_preclaims(&formal_ledger);
+                    for _ in 0..PRODUCERS {
+                        operations_done_rx
+                            .recv_timeout(std::time::Duration::from_secs(5))
+                            .expect("all speculative producers should finish");
+                    }
+                    assert_eq!(
+                        formal_promoted_count.load(Ordering::Relaxed)
+                            + formal_revoked_count.load(Ordering::Relaxed),
+                        (PRODUCERS / 2) as u64
+                    );
+                    assert_eq!(
+                        formal_dropped_count.load(Ordering::Relaxed),
+                        (PRODUCERS / 2) as u64
+                    );
+
+                    drop(reservation);
+                    assert_speculative_total_matches_preclaims(&formal_ledger);
+                });
+
+                for producer in 0..PRODUCERS {
+                    let owner = Arc::clone(&owner);
+                    let producer_ledger = ledger.clone();
+                    let claims_ready = claims_ready_tx.clone();
+                    let start = start_rx.clone();
+                    let operations_done = operations_done_tx.clone();
+                    let promoted_count = Arc::clone(&promoted_count);
+                    let revoked_count = Arc::clone(&revoked_count);
+                    let dropped_count = Arc::clone(&dropped_count);
+                    scope.spawn(move || {
+                        let mut claim = loop {
+                            match owner.try_preclaim_batch_charge(
+                                batch_charge,
+                                Arc::new(PointPreclaimLifecycleCounters::default()),
+                            ) {
+                                Ok(claim) => break claim,
+                                Err(
+                                    PointPreclaimDeclineReason::OwnerTryLockBusy
+                                    | PointPreclaimDeclineReason::LedgerTryLockBusy,
+                                ) => std::thread::yield_now(),
+                                Err(reason) => panic!("unexpected preclaim decline: {reason:?}"),
+                            }
+                        };
+                        assert_speculative_total_matches_preclaims(&producer_ledger);
+                        claims_ready
+                            .send(())
+                            .expect("formal admission thread should await all claims");
+                        start
+                            .recv_timeout(std::time::Duration::from_secs(5))
+                            .expect("formal admission should release speculative producers");
+
+                        if producer % 2 == 0 {
+                            match owner
+                                .promote_batch_preclaim(&mut claim, WAL_V7_FRAME_LEN as u64)
+                                .unwrap()
+                            {
+                                Some(reservation) => {
+                                    drop(reservation);
+                                    promoted_count.fetch_add(1, Ordering::Relaxed);
+                                }
+                                None => {
+                                    revoked_count.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                        } else {
+                            drop(claim);
+                            dropped_count.fetch_add(1, Ordering::Relaxed);
+                        }
+
+                        assert_speculative_total_matches_preclaims(&producer_ledger);
+                        operations_done
+                            .send(())
+                            .expect("formal admission thread should await producer completion");
+                    });
+                }
+
+                formal.join().unwrap();
+            });
+
+            assert_eq!(
+                promoted_count.load(Ordering::Relaxed) + revoked_count.load(Ordering::Relaxed),
+                (PRODUCERS / 2) as u64
+            );
+            assert_eq!(
+                dropped_count.load(Ordering::Relaxed),
+                (PRODUCERS / 2) as u64
+            );
+            assert_eq!(
+                promoted_count.load(Ordering::Relaxed)
+                    + revoked_count.load(Ordering::Relaxed)
+                    + dropped_count.load(Ordering::Relaxed),
+                PRODUCERS as u64
+            );
+            let state = ledger.inner.state.lock();
+            state.debug_assert_speculative_total_matches_preclaims();
+            assert!(state.preclaims.is_empty());
+            assert_eq!(state.speculative_total, WalV7ResourceCharge::default());
+            drop(state);
+            assert_eq!(ledger.snapshot(), WalV7ResourceCharge::default());
+        }
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn point_preclaim_promotion_racing_owner_retirement_releases_claim() {
+        for cache_enabled in [false, true] {
+            let ledger = WalV7ResourceLedger::new(WalV7ResourceLimits {
+                max_logical_wal_bytes: 100_000,
+                max_source_spool_bytes: 200_000,
+                max_recovery_workspace_bytes: 100_000,
+                max_buffer_memory_bytes: 100_000,
+                max_seal_index_bytes: 4096,
+            })
+            .unwrap();
+            ledger
+                .set_speculative_total_cache_enabled(cache_enabled)
+                .unwrap();
+            let owner = Arc::new(
+                WalV7ReservationOwner::new_image(
+                    ledger.clone(),
+                    None,
+                    1,
+                    1,
+                    WalV7ResourceCharge::default(),
+                )
+                .unwrap(),
+            );
+            let mut claim = owner
+                .try_preclaim_batch_charge(
+                    WalV7ResourceCharge::for_batch(128).unwrap(),
+                    Arc::new(PointPreclaimLifecycleCounters::default()),
+                )
+                .unwrap();
+            let start = Arc::new(Barrier::new(3));
+
+            std::thread::scope(|scope| {
+                let promoter = Arc::clone(&owner);
+                let promoter_start = Arc::clone(&start);
+                let promotion = scope.spawn(move || {
+                    promoter_start.wait();
+                    match promoter.promote_batch_preclaim(&mut claim, WAL_V7_FRAME_LEN as u64) {
+                        Ok(Some(reservation)) => drop(reservation),
+                        Ok(None) | Err(WalV7ReservationError::ReservationOwnerRetired) => {}
+                        Err(error) => panic!("unexpected promotion error: {error}"),
+                    }
+                });
+
+                let retiring = Arc::clone(&owner);
+                let retire_start = Arc::clone(&start);
+                let retirement = scope.spawn(move || {
+                    retire_start.wait();
+                    retiring.retire_after_durable_cleanup().unwrap();
+                });
+
+                start.wait();
+                promotion.join().unwrap();
+                retirement.join().unwrap();
+            });
+
+            assert!(matches!(
+                owner.try_preclaim_batch_charge(
+                    WalV7ResourceCharge::for_batch(128).unwrap(),
+                    Arc::new(PointPreclaimLifecycleCounters::default()),
+                ),
+                Err(PointPreclaimDeclineReason::OwnerRetired)
+            ));
+            let state = ledger.inner.state.lock();
+            state.debug_assert_speculative_total_matches_preclaims();
+            assert!(state.preclaims.is_empty());
+            assert_eq!(state.speculative_total, WalV7ResourceCharge::default());
+            drop(state);
+            assert_eq!(ledger.snapshot(), WalV7ResourceCharge::default());
+        }
     }
 
     #[cfg(feature = "bench")]

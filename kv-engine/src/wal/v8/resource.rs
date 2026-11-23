@@ -146,9 +146,12 @@ impl WalV8ReservationOwner {
     }
 
     #[cfg(feature = "bench")]
-    pub(crate) fn set_point_preclaim_sum_cache_enabled(&self, enabled: bool) {
+    pub(crate) fn set_point_preclaim_sum_cache_enabled(
+        &self,
+        enabled: bool,
+    ) -> std::result::Result<(), WalV7ReservationError> {
         self.image_owner
-            .set_point_preclaim_sum_cache_enabled(enabled);
+            .set_point_preclaim_sum_cache_enabled(enabled)
     }
 
     /// Release the fresh-inode workspace after this image has become a strict
