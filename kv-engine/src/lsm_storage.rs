@@ -19447,12 +19447,38 @@ impl LsmStorageInner {
         value: &[u8],
         allow_lifecycle_closing: bool,
     ) -> Result<()> {
+        self.put_with_lifecycle_admission_before_wal_admission(
+            key,
+            value,
+            allow_lifecycle_closing,
+            || {},
+        )
+    }
+
+    #[cfg(all(test, feature = "bench"))]
+    fn put_with_native_write_pause_before_admission_for_test(
+        &self,
+        key: &[u8],
+        value: &[u8],
+    ) -> Result<()> {
+        self.put_with_lifecycle_admission_before_wal_admission(key, value, false, || {
+            self.pause_native_write_blocking(native_write::NativeWriteStage::BeforeWalAdmission, 0);
+        })
+    }
+
+    fn put_with_lifecycle_admission_before_wal_admission(
+        &self,
+        key: &[u8],
+        value: &[u8],
+        allow_lifecycle_closing: bool,
+        mut before_wal_admission: impl FnMut(),
+    ) -> Result<()> {
         let mut retries = 0;
         let mut ack_timing = PutAckTiming::default();
 
         loop {
             let expected_memtable = self.state.load().memtable.clone();
-            match self.put_once(key, value, &mut ack_timing) {
+            match self.put_once(key, value, &mut ack_timing, &mut before_wal_admission) {
                 Ok(()) => {
                     #[cfg(feature = "bench")]
                     if let Some(commit_ts) = ack_timing.commit_ts {
@@ -19483,7 +19509,13 @@ impl LsmStorageInner {
         }
     }
 
-    fn put_once(&self, key: &[u8], value: &[u8], ack_timing: &mut PutAckTiming) -> Result<()> {
+    fn put_once(
+        &self,
+        key: &[u8],
+        value: &[u8],
+        ack_timing: &mut PutAckTiming,
+        before_wal_admission: &mut impl FnMut(),
+    ) -> Result<()> {
         *ack_timing = PutAckTiming::default();
         anyhow::ensure!(
             !(value.len() == 1 && value[0] == crate::vlog::KvKind::Tombstone as u8),
@@ -19504,8 +19536,7 @@ impl LsmStorageInner {
         });
         {
             let _guard = self.active_memtable_lock.read();
-            #[cfg(test)]
-            self.pause_native_write_blocking(native_write::NativeWriteStage::BeforeWalAdmission, 0);
+            before_wal_admission();
             let state = self.state.load_full();
             let (memtable, publish_data, ticket) = if let Some(ref mvcc) = self.mvcc {
                 let (commit_ts, encoded_key, prefixed_val, ticket) =
@@ -40556,7 +40587,7 @@ mod tests {
             diagnostics
                 .iter()
                 .all(|item| item.point_buffer_preallocation_hits > 0),
-            "every WAL created across rotations must receive Point admissions through preallocation"
+            "every WAL created across rotations should record a preallocation hit"
         );
         assert!(diagnostics.iter().all(|item| {
             item.point_buffer_preallocation_attempts
@@ -40641,7 +40672,11 @@ mod tests {
             // cannot leave a scoped thread parked in the test hook.
             let _release_guard = NativeWritePauseReleaseGuard(Arc::clone(&pause));
             let writer_engine = Arc::clone(&engine);
-            let writer = scope.spawn(move || writer_engine.put(KEY, VALUE));
+            let writer = scope.spawn(move || {
+                writer_engine
+                    .inner
+                    .put_with_native_write_pause_before_admission_for_test(KEY, VALUE)
+            });
 
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_time()
@@ -40683,15 +40718,18 @@ mod tests {
             );
 
             pause.release_blocking();
-            writer
-                .join()
-                .expect("paused writer thread must not panic")?;
+            let write_result = writer.join().expect("paused writer thread must not panic");
+            assert!(
+                write_result.is_err(),
+                "a write paused before admission must not cross the active PITR barrier"
+            );
             assert!(matches!(
                 rotation.join().expect("rotation thread must not panic")?,
                 crate::pitr::api::RecoveryPointOutcome::Durable(_)
             ));
             Ok(())
         })?;
+        *engine.inner.native_write_pause.lock() = None;
 
         let successor = engine.inner.state.load().memtable.clone();
         assert!(!Arc::ptr_eq(&source, &successor));
@@ -40705,6 +40743,17 @@ mod tests {
             .benchmark_wal_io_diagnostics()
             .expect("successor V8 WAL exposes preallocation diagnostics");
         assert!(successor_diagnostics.point_buffer_preallocation_enabled);
+        assert_eq!(
+            successor_diagnostics.point_buffer_preallocations_in_flight,
+            0
+        );
+        assert_eq!(engine.get(KEY)?, None);
+        engine.put(KEY, VALUE)?;
+        let successor_diagnostics = successor
+            .benchmark_wal_io_diagnostics()
+            .expect("successor V8 WAL exposes benchmark I/O diagnostics");
+        assert_eq!(successor_diagnostics.point_buffer_preallocation_attempts, 1);
+        assert_eq!(successor_diagnostics.point_buffer_preallocation_hits, 1);
         assert_eq!(
             successor_diagnostics.point_buffer_preallocations_in_flight,
             0

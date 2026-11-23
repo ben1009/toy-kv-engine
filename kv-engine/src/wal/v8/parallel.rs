@@ -473,6 +473,10 @@ struct CoordinatorState {
     tickets: VecDeque<TicketState>,
     pending_frontier: Option<WalV8FrontierReservation>,
     last_frontier_end: u64,
+    /// Tickets whose DATA was allocated before the previous FRONTIER marker.
+    /// The next marker must cover this whole physical window so its durable
+    /// byte boundary cannot split a later DATA ticket.
+    last_frontier_ticket_end: u64,
     change_generation: u64,
     durability_generation: u64,
     durability_driver_active: bool,
@@ -901,6 +905,8 @@ pub(crate) struct WalV8DataGroupWindow {
 pub(crate) struct WalV8FrontierReservation {
     pub(crate) ticket_end: u64,
     pub(crate) frame_offset: u64,
+    /// Exclusive ticket boundary whose DATA offsets precede this marker.
+    pub(crate) preceding_ticket_end: u64,
     /// RFC 026 logical prefix digest for exactly `ticket_end`.
     pub(crate) prefix_digest: WalV8Digest,
 }
@@ -1176,6 +1182,7 @@ impl WalV8ParallelCoordinator {
                     tickets,
                     pending_frontier: None,
                     last_frontier_end: config.next_data_offset,
+                    last_frontier_ticket_end: config.next_ticket,
                     change_generation: 0,
                     durability_generation: 0,
                     durability_driver_active: false,
@@ -1364,6 +1371,9 @@ impl WalV8ParallelCoordinator {
                     return Vec::new();
                 }
             }
+        }
+        if !ready_prefix_reaches_frontier_floor(&state, prefix.len()) {
+            prefix.clear();
         }
         prefix
     }
@@ -2393,6 +2403,10 @@ impl WalV8ParallelCoordinator {
             ticket_end > state.durable_ticket_end,
             "v8 FRONTIER does not advance the durable ticket boundary"
         );
+        ensure!(
+            ticket_end >= state.last_frontier_ticket_end,
+            "v8 FRONTIER does not cover DATA allocated before its predecessor"
+        );
         let ticket_count = usize::try_from(ticket_end - state.durable_ticket_end)
             .context("v8 FRONTIER ticket count exceeds usize")?;
         let ready = if let Some(cursor) = state.ready_cursor {
@@ -2444,6 +2458,7 @@ impl WalV8ParallelCoordinator {
         let reservation = WalV8FrontierReservation {
             ticket_end,
             frame_offset,
+            preceding_ticket_end: state.next_ticket,
             prefix_digest,
         };
         state.next_data_offset = frontier_end;
@@ -2564,6 +2579,8 @@ impl WalV8ParallelCoordinator {
         if !valid_ticket_prefix
             || state.tickets[ticket_count - 1].prefix_digest_after
                 != Some(reservation.prefix_digest)
+            || reservation.preceding_ticket_end < reservation.ticket_end
+            || reservation.preceding_ticket_end > state.next_ticket
             || frontier_end < state.last_frontier_end
             || frontier_end > state.next_data_offset
             || frontier_end > self.inner.max_file_size
@@ -2617,6 +2634,7 @@ impl WalV8ParallelCoordinator {
         state.durable_ticket_end = reservation.ticket_end;
         state.durable_prefix_digest = reservation.prefix_digest;
         state.last_frontier_end = frontier_end;
+        state.last_frontier_ticket_end = reservation.preceding_ticket_end;
         state.pending_frontier = None;
         #[cfg(feature = "bench")]
         let durable_published_at = Instant::now();
@@ -3541,6 +3559,34 @@ fn empty_frontier_ready_snapshot() -> WalV8FrontierReadySnapshot {
     }
 }
 
+fn ready_prefix_reaches_frontier_floor(state: &CoordinatorState, ticket_count: usize) -> bool {
+    state
+        .durable_ticket_end
+        .saturating_add(u64::try_from(ticket_count).unwrap_or(u64::MAX))
+        >= state.last_frontier_ticket_end
+}
+
+fn empty_ready_prefix_like(prefix: &WalV8ReadyPrefix) -> WalV8ReadyPrefix {
+    match prefix {
+        WalV8ReadyPrefix::Tickets(_) => WalV8ReadyPrefix::Tickets(Vec::new()),
+        WalV8ReadyPrefix::Cursor { .. } => WalV8ReadyPrefix::Cursor {
+            ticket_count: 0,
+            tail: None,
+            #[cfg(feature = "bench")]
+            data_bytes: 0,
+        },
+    }
+}
+
+fn enforce_frontier_ticket_floor(
+    state: &CoordinatorState,
+    snapshot: &mut WalV8FrontierReadySnapshot,
+) {
+    if !ready_prefix_reaches_frontier_floor(state, snapshot.ready_prefix.len()) {
+        snapshot.ready_prefix = empty_ready_prefix_like(&snapshot.ready_prefix);
+    }
+}
+
 fn frontier_ready_snapshot_locked(
     inner: &CoordinatorInner,
     state: &CoordinatorState,
@@ -3634,6 +3680,8 @@ fn frontier_ready_snapshot_locked(
             capture_monotonic_ns.then(crate::mem_table::benchmark_monotonic_ns);
     }
 
+    enforce_frontier_ticket_floor(state, &mut snapshot);
+
     Ok(snapshot)
 }
 
@@ -3661,6 +3709,7 @@ fn cursor_frontier_snapshot_locked(
     };
     snapshot.admitted_ticket_count = state.tickets.len();
     snapshot.closed = state.closed;
+    enforce_frontier_ticket_floor(state, &mut snapshot);
     Ok(snapshot)
 }
 
@@ -5620,6 +5669,100 @@ mod tests {
         first.disarm_after_durable();
         second.disarm_after_durable();
         drop(preparation);
+
+        Ok(())
+    }
+
+    #[test]
+    fn next_frontier_waits_for_tickets_before_previous_marker() -> Result<()> {
+        for mode in [WalV8ProgressMode::Eager, WalV8ProgressMode::Cursor] {
+            let coordinator = coordinator_with_progress_mode(3, 0, mode)?;
+            let mut first = admit(&batch(10), &coordinator)?.encode()?;
+            let mut second = admit(&batch(20), &coordinator)?.encode()?;
+            let mut third = admit(&batch(30), &coordinator)?.encode()?;
+            let mut driver = if mode == WalV8ProgressMode::Cursor {
+                Some(
+                    coordinator
+                        .acquire_durability_driver(3)?
+                        .context("missing cursor durability driver")?,
+                )
+            } else {
+                None
+            };
+
+            let mark_frames_ready = |encoded: &mut super::super::prepare::EncodedWalV8Batch<
+                WalV8ParallelAdmissionGuard,
+            >,
+                                     coordinator: &WalV8ParallelCoordinator|
+             -> Result<()> {
+                let assignment = encoded.assignment();
+                coordinator.mark_digest_ready(encoded.digest_ready()?)?;
+                let mut frames = vec![0; encoded.frame_buffer_bytes()];
+                encoded.encode_data_frames_into(&mut frames)?;
+                coordinator.mark_frames_ready(assignment.segment_ticket)
+            };
+            let complete_cursor_group = |driver: &WalV8DurabilityDriver,
+                                         ticket: u64|
+             -> Result<WalV8FrontierReadySnapshot> {
+                coordinator.advance_and_snapshot(
+                    driver,
+                    &[WalV8CompletedGroupEvent {
+                        group_id: ticket + 1,
+                        tickets: ticket..ticket + 1,
+                        write_count: 1,
+                        write_bytes: FRAME_LEN_U64,
+                        #[cfg(feature = "bench")]
+                        completion_observed_at: None,
+                    }],
+                    false,
+                )
+            };
+
+            mark_frames_ready(&mut first, &coordinator)?;
+            let first_snapshot = if let Some(driver) = &mut driver {
+                complete_cursor_group(driver, 0)?
+            } else {
+                coordinator.mark_data_complete(0)?;
+                coordinator.frontier_ready_snapshot()
+            };
+            assert_eq!(first_snapshot.ready_prefix.len(), 1);
+
+            let first_frontier = coordinator.reserve_frontier(1)?;
+            assert_eq!(first_frontier.preceding_ticket_end, 3);
+            coordinator.publish_durable_frontier(first_frontier)?;
+            first.disarm_after_durable();
+
+            mark_frames_ready(&mut second, &coordinator)?;
+            let partial_snapshot = if let Some(driver) = &mut driver {
+                complete_cursor_group(driver, 1)?
+            } else {
+                coordinator.mark_data_complete(1)?;
+                coordinator.frontier_ready_snapshot()
+            };
+            assert!(
+                partial_snapshot.ready_prefix.is_empty(),
+                "frontier must not advance past only part of the pre-marker DATA window"
+            );
+            assert!(coordinator.reserve_frontier(2).is_err());
+            assert!(!coordinator.is_poisoned());
+
+            mark_frames_ready(&mut third, &coordinator)?;
+            let complete_snapshot = if let Some(driver) = &mut driver {
+                complete_cursor_group(driver, 2)?
+            } else {
+                coordinator.mark_data_complete(2)?;
+                coordinator.frontier_ready_snapshot()
+            };
+            assert_eq!(complete_snapshot.ready_prefix.len(), 2);
+
+            let second_frontier = coordinator.reserve_frontier(3)?;
+            coordinator.publish_durable_frontier(second_frontier)?;
+            second.disarm_after_durable();
+            third.disarm_after_durable();
+            if let Some(mut driver) = driver {
+                driver.complete();
+            }
+        }
 
         Ok(())
     }
