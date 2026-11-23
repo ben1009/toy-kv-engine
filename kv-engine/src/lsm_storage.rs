@@ -40240,7 +40240,9 @@ mod tests {
 
         const WRITERS: usize = 8;
         const WRITES_PER_WRITER: usize = 12;
-        const MAX_SEGMENT_BYTES: u64 = 64 * 1024;
+        // Leave enough seal-index capacity for concurrent admissions, while
+        // keeping the segment small enough for this workload to rotate it.
+        const MAX_SEGMENT_BYTES: u64 = 256 * 1024;
         const VALUE: &[u8] = &[0x5a; 1024];
 
         let directory = tempdir()?;
