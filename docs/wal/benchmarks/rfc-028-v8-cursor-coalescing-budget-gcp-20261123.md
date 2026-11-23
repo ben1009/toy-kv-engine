@@ -39,7 +39,7 @@ Paired changes versus Dynamic, from the runner's paired analysis:
 
 Fixed 100 μs did not help. Fixed 400 μs consistently won all five paired runs at both writer counts, reduced sync frequency, and improved sampled p99, but its throughput gain peaked at 2.80%, below the project's 5% threshold for retaining a performance change. Keep Dynamic as the default; treat 400 μs as a promising but sub-threshold candidate. No production default was changed.
 
-Absolute throughput was about 25.6–27.7k puts/s, below earlier C4 Point runs. This suite had no concurrent V7 sentinel, so conclusions should use the same-host paired differences only; the absolute level is not comparable across dates.
+Absolute throughput was about 25.6–27.7k puts/s, below earlier C4 Point runs. The original suite had no concurrent V7 sentinel, so it could not determine whether that absolute level reflected the host or the V8 configuration.
 
 ## Verification and cleanup
 
@@ -51,3 +51,18 @@ Absolute throughput was about 25.6–27.7k puts/s, below earlier C4 Point runs. 
 - GCP runner tests: 178 passed; remote shell syntax check passed.
 
 The runner archive allowlist initially omitted `cursor-coalescing-budget-schedule.tsv`, preventing strict local verification on the first collection. This revision includes the allowlist fix and regression test; the targeted test passed, and recollection then passed full verification.
+
+## Follow-up V7 sentinel
+
+A separate `commit-order-trace` suite ran on a newly provisioned C4 Local SSD VM on 2026-11-23 to get a V7 environment sentinel. It scheduled two diagnostic trace runs and five unprofiled V7/V8 Point score pairs (12 runs total), using 16 writers, 100,000 puts, and 1 KiB values. The score runs sampled latency every 100 operations.
+
+| Score arm | Median puts/s | Five-run range |
+|---|---:|---:|
+| V7 Parallel | 49.27k | 48.73–49.48k |
+| V8 Parallel | 32.75k | 32.54–33.38k |
+
+The V7 sentinel is in the previously observed 48–49k/s range, so this newly provisioned VM had a normal V7 baseline. The V8 arm in this sentinel suite used Direct FRONTIER, a fixed 400 μs coalescing budget, and 4 MiB sliding fallocate. It did not use the 1 MiB Point Lookahead + Dynamic configuration from the budget suite; do not compare its V8 score directly with that suite. Because the sentinel ran on a different VM, it does not retroactively normalize the original suite's absolute throughput.
+
+The sentinel source commit was `c1bc31756e867f6962e5589dfadef3c2fb79e25b`; release binary SHA-256 was `57d2b9193172d1db296051b4abbb679d057dc54ed43d827a6f57f3fb1c99983e`. No source patch was applied (empty-patch SHA-256: `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`). The paired V8/V7 throughput change was −33.29% for this distinct V8 configuration.
+
+Verification passed: `summary.json` reports 12/12 complete, `remote-exit.json` reports `failed=false` and 12 runs started, and the strict local verifier found all planned result/metadata pairs. The retained archive is `bench-results/rfc028-v7-sentinel-20261123/gcp-run/collection-attempt-01/results.tar.gz` (392,232 bytes, SHA-256 `5adab9c9e0e090cf187a15d3174e292d433ecc9f6f0db25d75a97456c3202ae9`), with matching checksum metadata. Cleanup verification confirms the VM, boot disk, SSH rule, VPC, subnet, route, and Terraform state are absent.
