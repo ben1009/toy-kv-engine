@@ -1882,6 +1882,8 @@ pub(crate) struct LsmStorageInner {
     pub(crate) active_memtable_lock: ActiveMemtableGate,
     #[cfg(test)]
     native_write_pause: Mutex<Option<Arc<native_write::NativeWritePause>>>,
+    #[cfg(all(test, feature = "bench"))]
+    point_buffer_preallocation_test_override: AtomicBool,
     path: PathBuf,
     /// Held from before manifest replay through Active V7/V8 installation, then
     /// retained until close or drop so no second process can recover over an
@@ -15344,6 +15346,8 @@ impl LsmStorageInner {
             active_memtable_lock: ActiveMemtableGate::default(),
             #[cfg(test)]
             native_write_pause: Mutex::new(None),
+            #[cfg(all(test, feature = "bench"))]
+            point_buffer_preallocation_test_override: AtomicBool::new(false),
             path: plan.path,
             wal_v7_open_lock: Mutex::new(plan.wal_v7_open_lock),
             block_cache: plan.block_cache,
@@ -19044,6 +19048,16 @@ impl LsmStorageInner {
         self.rotate_after_wal_full(error, expected_memtable, retries, false)
     }
 
+    #[cfg(all(test, feature = "bench"))]
+    fn set_v8_point_buffer_preallocation_for_test(&self, enabled: bool) -> Result<()> {
+        self.point_buffer_preallocation_test_override
+            .store(enabled, Ordering::Relaxed);
+        self.state
+            .load()
+            .memtable
+            .set_v8_point_buffer_preallocation_for_test(enabled)
+    }
+
     /// Native async point and range writers keep their exclusive preparation
     /// permit while this blocking rotation runs, so queued preparers cannot
     /// acquire active-memtable leases ahead of the freeze. Transactions call
@@ -19192,19 +19206,6 @@ impl LsmStorageInner {
                 return Err(error.context("v7 WAL batch cannot fit a fresh segment"));
             }
             None => {}
-        }
-
-        // V8 rejects this batch before ticket assignment when the current PITR
-        // segment cannot fit it. Rotate the still-active source before retrying.
-        if error.downcast_ref::<crate::wal::v8::leader::WalV8LeaderCapacityError>()
-            == Some(&crate::wal::v8::leader::WalV8LeaderCapacityError::RotationRequired)
-        {
-            return self.rotate_after_wal_full(
-                error,
-                expected_memtable,
-                retries,
-                allow_lifecycle_closing,
-            );
         }
 
         if !crate::wal::Wal::is_retryable_full_error(&error) {
@@ -21205,6 +21206,13 @@ impl LsmStorageInner {
                 ))
             },
         )?;
+        #[cfg(all(test, feature = "bench"))]
+        if self
+            .point_buffer_preallocation_test_override
+            .load(Ordering::Relaxed)
+        {
+            memtable.set_v8_point_buffer_preallocation_for_test(true)?;
+        }
         memtable.set_write_profile(self.write_profile.clone())?;
         self.sync_dir()?;
         self.manifest
@@ -40275,15 +40283,17 @@ mod tests {
 
         let initial = engine.inner.state.load().memtable.clone();
         assert!(initial.uses_v8_wal());
-        initial.set_v8_point_buffer_preallocation_for_test(true)?;
         let initial_id = initial.id();
-        let seen_memtables = std::sync::Arc::new(std::sync::Mutex::new(vec![initial]));
+        engine
+            .inner
+            .set_v8_point_buffer_preallocation_for_test(true)?;
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(WRITERS + 1));
+        let rotation_lock = std::sync::Arc::new(std::sync::Mutex::new(()));
         let workers = (0..WRITERS)
             .map(|writer| {
                 let engine = std::sync::Arc::clone(&engine);
-                let seen_memtables = std::sync::Arc::clone(&seen_memtables);
                 let barrier = std::sync::Arc::clone(&barrier);
+                let rotation_lock = std::sync::Arc::clone(&rotation_lock);
                 std::thread::spawn(move || -> anyhow::Result<()> {
                     barrier.wait();
                     for index in 0..WRITES_PER_WRITER {
@@ -40291,17 +40301,7 @@ mod tests {
                         let retry_deadline =
                             std::time::Instant::now() + std::time::Duration::from_secs(5);
                         loop {
-                            let active = engine.inner.state.load().memtable.clone();
-                            if active.uses_v8_wal() {
-                                active.set_v8_point_buffer_preallocation_for_test(true)?;
-                            }
-                            let mut seen =
-                                seen_memtables.lock().expect("test memtable list lock");
-                            if !seen.iter().any(|memtable| memtable.id() == active.id()) {
-                                seen.push(active);
-                            }
-                            drop(seen);
-
+                            let attempted_memtable_id = engine.inner.state.load().memtable.id();
                             match engine.put(key.as_bytes(), VALUE) {
                                 Ok(()) => break,
                                 Err(error)
@@ -40316,6 +40316,34 @@ mod tests {
                                         ));
                                     }
                                     std::thread::sleep(std::time::Duration::from_millis(1));
+                                }
+                                Err(error)
+                                    if error.downcast_ref::<
+                                        crate::wal::v8::leader::WalV8LeaderCapacityError,
+                                    >()
+                                        == Some(
+                                            &crate::wal::v8::leader::WalV8LeaderCapacityError::RotationRequired,
+                                        ) =>
+                                {
+                                    if std::time::Instant::now() >= retry_deadline {
+                                        return Err(error.context(
+                                            "V8 PITR segment did not rotate after capacity rejection",
+                                        ));
+                                    }
+                                    let _rotation_guard = rotation_lock
+                                        .lock()
+                                        .expect("test PITR rotation lock");
+                                    let active = engine.inner.state.load().memtable.clone();
+                                    if active.id() == attempted_memtable_id {
+                                        match engine.create_recovery_point()? {
+                                            crate::pitr::api::RecoveryPointOutcome::Durable(_) => {}
+                                            _ => {
+                                                return Err(anyhow::anyhow!(
+                                                    "test PITR rotation did not publish a durable recovery point"
+                                                ));
+                                            }
+                                        }
+                                    }
                                 }
                                 Err(error) => return Err(error),
                             }
@@ -40332,19 +40360,38 @@ mod tests {
         }
         engine.sync()?;
 
-        let seen = seen_memtables.lock().expect("test memtable list lock");
-        assert!(
-            seen.iter().any(|memtable| memtable.id() != initial_id),
-            "the small PITR segment limit should exercise rotation"
-        );
-        let diagnostics = seen
+        let state = engine.inner.state.load();
+        let memtables = state
+            .imm_memtables
             .iter()
-            .filter_map(|memtable| memtable.benchmark_wal_io_diagnostics())
+            .cloned()
+            .chain(std::iter::once(state.memtable.clone()))
+            .collect::<Vec<_>>();
+        drop(state);
+        let v8_memtables = memtables
+            .iter()
+            .filter(|memtable| memtable.uses_v8_wal())
             .collect::<Vec<_>>();
         assert!(
-            diagnostics
+            v8_memtables
                 .iter()
-                .any(|item| item.point_buffer_preallocation_enabled)
+                .any(|memtable| memtable.id() != initial_id),
+            "the small PITR segment limit should exercise rotation"
+        );
+        let diagnostics = v8_memtables
+            .iter()
+            .map(|memtable| {
+                memtable
+                    .benchmark_wal_io_diagnostics()
+                    .expect("V8 memtable has benchmark I/O diagnostics")
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            !diagnostics.is_empty()
+                && diagnostics
+                    .iter()
+                    .all(|item| { item.point_buffer_preallocation_enabled }),
+            "the test preallocation setting should be inherited by every V8 successor"
         );
         assert!(
             diagnostics
@@ -40354,11 +40401,19 @@ mod tests {
                 > 0,
             "concurrent Point admissions should consume preallocated buffers"
         );
+        assert!(
+            v8_memtables.iter().any(|memtable| {
+                memtable.id() != initial_id
+                    && memtable
+                        .benchmark_wal_io_diagnostics()
+                        .is_some_and(|item| item.point_buffer_preallocation_hits > 0)
+            }),
+            "a rotated V8 memtable should record a preallocation hit"
+        );
         assert!(diagnostics.iter().all(|item| {
             item.point_buffer_preallocation_attempts
                 == item.point_buffer_preallocation_hits + item.point_buffer_preallocation_fallbacks
         }));
-        drop(seen);
 
         for writer in 0..WRITERS {
             for index in 0..WRITES_PER_WRITER {
