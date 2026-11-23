@@ -27,6 +27,8 @@ from gcp_wal_matrix import (
     POINT_PROGRESS_PLAN_SCHEMA_V3,
     POINT_PROGRESS_RING_NUM,
     POINT_PROGRESS_RING_WRITERS,
+    POINT_PREALLOCATION_NUM,
+    POINT_PREALLOCATION_WRITERS,
     build_cursor_direct_completion_plan,
     build_cursor_direct_completion_schedule,
     build_cursor_coalescing_budget_plan,
@@ -39,6 +41,8 @@ from gcp_wal_matrix import (
     build_point_progress_cursor_schedule,
     build_point_progress_ring_plan,
     build_point_progress_ring_schedule,
+    build_v7_v8_point_preallocation_plan,
+    build_v7_v8_point_preallocation_schedule,
     validate_point_progress_cursor_rows,
     validate_point_progress_cursor_v2_rows,
     validate_point_progress_ring_rows,
@@ -100,6 +104,12 @@ def _summary_fields(schedule: list[dict[str, Any]]) -> tuple[str, ...]:
         fields += ("cursor_direct_completion_start", "cursor_direct_completion_end")
     if any("cursor_singleton_submission_enabled" in row for row in schedule):
         fields += ("cursor_singleton_submission_start", "cursor_singleton_submission_end")
+    if any("point_buffer_preallocation_enabled" in row for row in schedule):
+        fields += (
+            "point_buffer_preallocation_enabled_start", "point_buffer_preallocation_enabled_end",
+            "point_buffer_preallocation_attempts", "point_buffer_preallocation_hits",
+            "point_buffer_preallocation_fallbacks",
+        )
     return fields
 
 
@@ -110,6 +120,7 @@ def _environment(
     cursor_direct_completion_enabled: bool | None = None,
     cursor_singleton_submission_enabled: bool | None = None,
     coalescing_budget_us: int | None = None,
+    point_buffer_preallocation_enabled: bool | None = None,
 ) -> dict[str, str]:
     # An allowlist makes the selected experiment switches the only inherited variables.
     if progress_ring_enabled is not progress_cursor_enabled:
@@ -137,7 +148,41 @@ def _environment(
         if coalescing_budget_us not in (100, 400):
             raise ValueError("coalescing budget override must be 100 or 400 μs")
         environment["TOYKV_WAL_V8_COALESCE_BUDGET_US"] = str(coalescing_budget_us)
+    if point_buffer_preallocation_enabled is not None:
+        environment["TOYKV_BENCH_V8_POINT_BUFFER_PREALLOC"] = (
+            "1" if point_buffer_preallocation_enabled else "0"
+        )
     return environment
+
+
+def _point_preallocation_environment(row: dict[str, Any]) -> dict[str, str]:
+    if row["format_version"] == 7:
+        return {
+            "PATH": os.environ.get("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"),
+            "HOME": os.environ.get("HOME", "/home/bench"),
+            "TMPDIR": os.environ.get("TMPDIR", "/tmp"),
+            "LC_ALL": "C",
+        }
+    return _environment(
+        True,
+        True,
+        False,
+        True,
+        False,
+        point_buffer_preallocation_enabled=bool(row["point_buffer_preallocation_enabled"]),
+    )
+
+
+def _point_preallocation_environment_text(row: dict[str, Any]) -> str:
+    environment = _point_preallocation_environment(row)
+    if row["format_version"] == 7:
+        return "\n".join(("WAL_FORMAT=v7", "WAL_IO_MODE=parallel", "V8_EXPERIMENT_VARIABLES=<unset>")) + "\n"
+    controlled = {
+        key: value for key, value in environment.items()
+        if key not in ("PATH", "HOME", "TMPDIR", "LC_ALL")
+    }
+    controlled.update({key: "<unset>" for key in UNSET_EXPERIMENT_VARIABLES})
+    return "\n".join(f"{key}={value}" for key, value in sorted(controlled.items())) + "\n"
 
 
 def _expected_environment_text(
@@ -332,16 +377,149 @@ def _validate_record(record: dict[str, Any], row: dict[str, Any]) -> dict[str, A
     return metrics
 
 
+def _validate_point_preallocation_record(record: dict[str, Any], row: dict[str, Any]) -> dict[str, Any]:
+    """Validate the V7/V8/preallocation arms and prove V8 mode from WAL snapshots."""
+    record = _require_object(record, "benchmark record")
+    result = _require_object(record.get("result"), "benchmark result")
+    params = _require_object(record.get("params"), "benchmark parameters")
+    expected_params = {
+        "num": POINT_PREALLOCATION_NUM,
+        "threads": row["writer"],
+        "value_size": 1024,
+        "batch_size": row["batch_size"],
+        "wal_format_version": row["format_version"],
+        "wal_io_mode": "parallel",
+    }
+    if result.get("ops") != POINT_PREALLOCATION_NUM or any(
+        params.get(key) != value for key, value in expected_params.items()
+    ):
+        raise ValueError("benchmark parameters do not match the V7/V8 preallocation plan")
+    pipeline = _require_object(result.get("wal_pipeline"), "WAL pipeline metadata")
+    sync_count = pipeline.get("sync_count")
+    if type(sync_count) is not int or sync_count <= 0:
+        raise ValueError("WAL sync count is invalid")
+    cpu_ms = float(result["process_cpu_user_ms"]) + float(result["process_cpu_system_ms"])
+    ops_per_second = float(result["ops_per_sec"])
+    if not math.isfinite(cpu_ms) or cpu_ms < 0 or not math.isfinite(ops_per_second) or ops_per_second <= 0:
+        raise ValueError("process CPU or throughput metric is invalid")
+
+    is_point = row["workload"] == "point"
+    latency = record.get("latency")
+    if is_point:
+        if not isinstance(latency, dict):
+            raise ValueError("Point result is missing latency samples")
+        samples = latency.get("samples")
+        unsampled = latency.get("unsampled_completed_operations")
+        if (
+            latency.get("sample_every") != 10
+            or type(samples) is not int
+            or samples != POINT_PREALLOCATION_NUM // 10
+            or type(unsampled) is not int
+            or unsampled + samples != POINT_PREALLOCATION_NUM
+        ):
+            raise ValueError("Point latency sample count does not match the 1-in-10 plan")
+        latency_metrics = {key: float(latency[key]) for key in ("p50_ms", "p95_ms", "p99_ms")}
+        if any(not math.isfinite(value) or value <= 0 for value in latency_metrics.values()):
+            raise ValueError("Point latency percentiles are invalid")
+        sample_every, sample_count, unsampled_count = 10, samples, unsampled
+    else:
+        if latency is not None:
+            raise ValueError("Batch64 should not collect per-Put latency samples")
+        latency_metrics = {"p50_ms": None, "p95_ms": None, "p99_ms": None}
+        sample_every = sample_count = unsampled_count = None
+
+    metrics: dict[str, Any] = {
+        "ops": int(result["ops"]),
+        "puts_per_second": ops_per_second,
+        "cpu_seconds": cpu_ms / 1000,
+        "cpu_us_per_put": cpu_ms * 1000 / POINT_PREALLOCATION_NUM,
+        **latency_metrics,
+        "latency_sample_every": sample_every,
+        "latency_samples": sample_count,
+        "latency_unsampled_operations": unsampled_count,
+        "sync_count": sync_count,
+        "puts_per_sync": POINT_PREALLOCATION_NUM / sync_count,
+        "ordered_link_hash_cpu_ns": None,
+        "data_o_direct": False,
+        "frontier_o_direct": False,
+        "sync_o_direct": False,
+        "progress_ring_start": False,
+        "progress_ring_end": False,
+        "extent_scan_diagnostics_start": False,
+        "extent_scan_diagnostics_end": False,
+        "initialized_bytes": 0,
+        "progress_cursor_start": False,
+        "progress_cursor_end": False,
+        "cursor_direct_completion_start": False,
+        "cursor_direct_completion_end": False,
+        "cursor_singleton_submission_start": False,
+        "cursor_singleton_submission_end": False,
+        "point_buffer_preallocation_enabled_start": False,
+        "point_buffer_preallocation_enabled_end": False,
+        "point_buffer_preallocation_attempts": 0,
+        "point_buffer_preallocation_hits": 0,
+        "point_buffer_preallocation_fallbacks": 0,
+    }
+    if row["format_version"] == 7:
+        if row["arm"] != "v7_parallel" or any(
+            key in pipeline for key in ("wal_io_start", "wal_io_end", "wal_io_stable")
+        ):
+            raise ValueError("V7 arm unexpectedly reported V8 runtime state")
+        return metrics
+
+    if row["arm"] == "v7_parallel":
+        raise ValueError("V7 arm was configured with V8 WAL format")
+    v8_metrics = _validate_record(record, row)
+    if pipeline.get("wal_io_stable") is not True:
+        raise ValueError("V8 WAL I/O metadata changed during the run")
+    start = _require_object(pipeline.get("wal_io_start"), "WAL I/O start snapshot")
+    end = _require_object(pipeline.get("wal_io_end"), "WAL I/O end snapshot")
+    expected_preallocation = bool(row["point_buffer_preallocation_enabled"])
+    if any(
+        snapshot.get("point_buffer_preallocation_enabled") is not expected_preallocation
+        for snapshot in (start, end)
+    ):
+        raise ValueError("V8 point-buffer preallocation did not match the planned arm")
+    attempts = end.get("point_buffer_preallocation_attempts", 0) - start.get(
+        "point_buffer_preallocation_attempts", 0
+    )
+    hits = end.get("point_buffer_preallocation_hits", 0) - start.get("point_buffer_preallocation_hits", 0)
+    fallbacks = end.get("point_buffer_preallocation_fallbacks", 0) - start.get(
+        "point_buffer_preallocation_fallbacks", 0
+    )
+    if any(type(value) is not int or value < 0 for value in (attempts, hits, fallbacks)):
+        raise ValueError("V8 preallocation counters are invalid")
+    if attempts != hits + fallbacks:
+        raise ValueError("V8 preallocation attempts do not equal hits plus fallbacks")
+    if is_point and expected_preallocation and hits <= 0:
+        raise ValueError("Point preallocation candidate recorded no fast-path hits")
+    if not is_point and (attempts != 0 or hits != 0 or fallbacks != 0):
+        raise ValueError("Batch64 entered the Point-only preallocation path")
+
+    metrics.update(v8_metrics)
+    metrics.update({
+        "point_buffer_preallocation_enabled_start": start["point_buffer_preallocation_enabled"],
+        "point_buffer_preallocation_enabled_end": end["point_buffer_preallocation_enabled"],
+        "point_buffer_preallocation_attempts": attempts,
+        "point_buffer_preallocation_hits": hits,
+        "point_buffer_preallocation_fallbacks": fallbacks,
+    })
+    return metrics
+
+
 def _run_one(
     *, binary: Path, binary_sha256: str, row: dict[str, Any], results_dir: Path,
     db_root: Path, safe_deadline_epoch: int,
+    candidate_mode: str | None = None,
     on_subprocess_started: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     name = _run_id(row)
     run_dir = results_dir / name
     run_dir.mkdir(parents=True, exist_ok=False)
+    format_version = int(row.get("format_version", 8))
     command = [
-        str(binary), "--bench", str(row["bench"]), "--wal", "--pitr", "--pitr-format", "v8",
+        str(binary), "--bench", str(row["bench"]), "--wal", "--pitr", "--pitr-format",
+        f"v{format_version}",
         "--wal-io-mode", "parallel", "--num", str(row["num"]), "--threads", str(row["writer"]),
         "--value-size", "1024", "--target-sst-size", "2147483648", "--compaction", "none",
         "--output", "json", "--path", str(db_root / name),
@@ -350,17 +528,22 @@ def _run_one(
         command.extend(("--latency-sample-every", str(row["sample_every"])))
     else:
         command.extend(("--wal-batch-size", str(row["batch_entries"])))
-    environment = _environment(
-        bool(row["progress_ring_enabled"]),
-        bool(row.get("progress_cursor_enabled", False)),
-        row.get("progress_counters_enabled"),
-        row.get("cursor_direct_completion_enabled"),
-        row.get("cursor_singleton_submission_enabled"),
-        row.get("coalescing_budget_us"),
+    preallocation_suite = candidate_mode == "v7-v8-point-preallocation"
+    environment = (
+        _point_preallocation_environment(row)
+        if preallocation_suite else
+        _environment(
+            bool(row["progress_ring_enabled"]),
+            bool(row.get("progress_cursor_enabled", False)),
+            row.get("progress_counters_enabled"),
+            row.get("cursor_direct_completion_enabled"),
+            row.get("cursor_singleton_submission_enabled"),
+            row.get("coalescing_budget_us"),
+        )
     )
     (run_dir / "command.sh").write_text(shlex.join(command) + "\n", encoding="utf-8")
     (run_dir / "environment.txt").write_text(
-        _expected_environment_text(
+        _point_preallocation_environment_text(row) if preallocation_suite else _expected_environment_text(
             bool(row["progress_ring_enabled"]),
             bool(row.get("progress_cursor_enabled", False)),
             row.get("progress_counters_enabled"),
@@ -401,7 +584,8 @@ def _run_one(
     try:
         if completed.returncode != 0:
             raise ValueError(f"write-perf exited with status {completed.returncode}")
-        metadata.update(_validate_record(json.loads(completed.stdout), row))
+        validator = _validate_point_preallocation_record if preallocation_suite else _validate_record
+        metadata.update(validator(json.loads(completed.stdout), row))
     except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
         metadata["exit_code"] = 65 if completed.returncode == 0 else completed.returncode
         (run_dir / "validation-error.txt").write_text(f"invalid benchmark result: {error}\n", encoding="utf-8")
@@ -570,6 +754,237 @@ def _cursor_summary(rows: list[dict[str, Any]], writers: tuple[int, ...], planne
         ),
     })
     return summary
+
+
+def _point_preallocation_summary(rows: list[dict[str, Any]], planned: int) -> dict[str, Any]:
+    schedule = build_v7_v8_point_preallocation_schedule()
+    expected = {
+        (row["writer"], row["workload"], row["repetition"], row["arm"])
+        for row in schedule
+    }
+    observed = [
+        (row.get("writer"), row.get("workload"), row.get("repetition"), row.get("arm"))
+        for row in rows
+    ]
+    validation = {
+        "complete": len(observed) == len(expected) and set(observed) == expected and len(set(observed)) == len(observed)
+        and all(row.get("exit_code") == 0 for row in rows),
+        "planned": len(expected),
+        "observed": len(observed),
+        "missing_cells": [list(cell) for cell in sorted(expected - set(observed), key=str)],
+        "unexpected_cells": [list(cell) for cell in sorted(set(observed) - expected, key=str)],
+        "duplicate_cells": [list(cell) for cell in sorted(set(cell for cell in observed if observed.count(cell) > 1), key=str)],
+    }
+    comparisons: list[dict[str, Any]] = []
+    metric_names = (
+        "puts_per_second", "cpu_us_per_put", "p50_ms", "p95_ms", "p99_ms",
+        "sync_count", "puts_per_sync", "point_buffer_preallocation_hits",
+        "point_buffer_preallocation_fallbacks",
+    )
+    cells = [(writer, "point") for writer in POINT_PREALLOCATION_WRITERS] + [(16, "batch64")]
+    for writer, workload in cells:
+        arms = ("v7_parallel", "v8_prealloc_off", "v8_prealloc_on") if workload == "point" else (
+            "v8_prealloc_off", "v8_prealloc_on",
+        )
+        selected = {
+            arm: [
+                row for row in rows if row.get("writer") == writer
+                and row.get("workload") == workload and row.get("arm") == arm
+                and row.get("exit_code") == 0
+            ]
+            for arm in arms
+        }
+        stats = {
+            arm: {
+                "runs": len(arm_rows),
+                **{
+                    metric: median(float(row[metric]) for row in arm_rows)
+                    if arm_rows and all(row.get(metric) is not None for row in arm_rows) else None
+                    for metric in metric_names
+                },
+            }
+            for arm, arm_rows in selected.items()
+        }
+        comparisons_for_cell: dict[str, Any] = {}
+        pairs = (
+            (("v7_parallel", "v8_prealloc_off"), ("v8_off_vs_v7", "v8_prealloc_off")),
+            (("v7_parallel", "v8_prealloc_on"), ("v8_on_vs_v7", "v8_prealloc_on")),
+        ) if workload == "point" else ()
+        pair_specs = list(pairs)
+        pair_specs.append((("v8_prealloc_off", "v8_prealloc_on"), ("v8_on_vs_off", "v8_prealloc_on")))
+        for (baseline_arm, candidate_arm), (name, _) in pair_specs:
+            changes: list[float] = []
+            p99_changes: list[float] = []
+            wins = 0
+            for repetition in range(1, 6):
+                baseline = next((row for row in rows if row.get("writer") == writer
+                                 and row.get("workload") == workload and row.get("repetition") == repetition
+                                 and row.get("arm") == baseline_arm and row.get("exit_code") == 0), None)
+                candidate = next((row for row in rows if row.get("writer") == writer
+                                  and row.get("workload") == workload and row.get("repetition") == repetition
+                                  and row.get("arm") == candidate_arm and row.get("exit_code") == 0), None)
+                if baseline is None or candidate is None or baseline["puts_per_second"] <= 0:
+                    continue
+                change = (candidate["puts_per_second"] / baseline["puts_per_second"] - 1) * 100
+                changes.append(change)
+                wins += change > 0
+                if workload == "point" and baseline.get("p99_ms"):
+                    p99_changes.append((candidate["p99_ms"] / baseline["p99_ms"] - 1) * 100)
+            comparisons_for_cell[name] = {
+                "baseline_arm": baseline_arm,
+                "candidate_arm": candidate_arm,
+                "paired_throughput_changes_pct": changes,
+                "paired_throughput_change_median_pct": median(changes) if changes else None,
+                "candidate_pair_wins": wins,
+                "paired_p99_changes_pct": p99_changes,
+                "paired_p99_change_median_pct": median(p99_changes) if p99_changes else None,
+            }
+        comparisons.append({
+            "writer": writer,
+            "workload": workload,
+            "arms": stats,
+            "paired": comparisons_for_cell,
+        })
+    return {
+        "suite": "v7-v8-point-preallocation",
+        "complete": validation["complete"] and len(rows) == planned == len(schedule),
+        "runs_started": len(rows),
+        "runs_completed": sum(row.get("exit_code") == 0 for row in rows),
+        "runs_planned": planned,
+        "writers": list(POINT_PREALLOCATION_WRITERS),
+        "workloads": ["point", "batch64"],
+        "arms": ["v7_parallel", "v8_prealloc_off", "v8_prealloc_on"],
+        "results": rows,
+        "matrix_validation": validation,
+        "comparison": comparisons,
+        "qualification_note": (
+            "Same-host, same-source, same-release-binary V7/V8/Point-preallocation comparison. Point1/8/16 have "
+            "five counterbalanced triples; Batch64 has five V8 off/on guardrail pairs. This report is descriptive "
+            "and does not change production defaults."
+        ),
+    }
+
+
+def verify_point_preallocation_results_directory(results: Path) -> dict[str, Any]:
+    """Verify every V7/V8 preallocation result and its captured environment."""
+    errors: list[str] = []
+    try:
+        summary = json.loads((results / "summary.json").read_text(encoding="utf-8"))
+        remote_exit = json.loads((results / "remote-exit.json").read_text(encoding="utf-8"))
+        plan = json.loads((results / "benchmark-plan.json").read_text(encoding="utf-8"))
+        commit = (results / "commit.txt").read_text(encoding="utf-8").strip()
+        binary_sha = (results / "write-perf.sha256").read_text(encoding="utf-8").strip()
+        if not all(isinstance(value, dict) for value in (summary, remote_exit, plan)):
+            raise ValueError("summary, remote-exit, and plan must be JSON objects")
+        schedule = build_v7_v8_point_preallocation_schedule()
+        expected_plan = build_v7_v8_point_preallocation_plan(
+            machine_type="c4-standard-16-lssd",
+            machine_spec={"vcpus": 16, "ssd_count": 2, "ssd_gib": 750},
+            commit=commit,
+            binary_sha256=binary_sha,
+        )
+        if plan != expected_plan:
+            errors.append("benchmark plan differs from the fixed V7/V8 preallocation suite")
+        if len(commit) != 40 or any(char not in "0123456789abcdef" for char in commit):
+            errors.append("source commit identity is invalid")
+        if len(binary_sha) != 64 or any(char not in "0123456789abcdef" for char in binary_sha):
+            errors.append("binary checksum is invalid")
+        if (
+            summary.get("suite") != "v7-v8-point-preallocation"
+            or summary.get("source_commit") != commit
+            or summary.get("binary_sha256") != binary_sha
+            or summary.get("complete") is not True
+            or summary.get("runs_started") != len(schedule)
+            or summary.get("runs_attempted") != len(schedule)
+            or summary.get("runs_completed") != len(schedule)
+            or summary.get("runs_planned") != len(schedule)
+        ):
+            errors.append("summary identity or 55-run completion counts are invalid")
+        if (
+            remote_exit.get("failed") is not False
+            or remote_exit.get("runs_started") != len(schedule)
+            or remote_exit.get("runs_attempted") != len(schedule)
+        ):
+            errors.append("remote-exit does not confirm all planned runs")
+        schedule_path = results / "v7-v8-point-preallocation-schedule.tsv"
+        with schedule_path.open(encoding="utf-8", newline="") as stream:
+            actual_schedule = list(csv.DictReader(stream, delimiter="\t"))
+        expected_schedule = [
+            {
+                key: "none" if key == "batch_size" and value is None
+                else "" if value is None
+                else str(value)
+                for key, value in row.items()
+            }
+            for row in schedule
+        ]
+        if actual_schedule != expected_schedule:
+            errors.append("schedule file differs from the exact planned order/configuration")
+
+        rows = summary.get("results")
+        if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+            raise ValueError("summary results are missing or malformed")
+        recomputed = _point_preallocation_summary(rows, len(schedule))
+        for key in (
+            "suite", "complete", "runs_started", "runs_completed", "runs_planned", "writers", "workloads",
+            "arms", "matrix_validation", "comparison",
+        ):
+            if summary.get(key) != recomputed.get(key):
+                errors.append(f"summary field {key} differs from the archived run rows")
+
+        expected_ids = {_run_id(row) for row in schedule}
+        actual_ids = {
+            path.name for path in results.iterdir()
+            if path.is_dir() and path.name.startswith(("r", "w"))
+        }
+        if actual_ids != expected_ids:
+            errors.append("run directories do not exactly match the 55-run schedule")
+        rows_by_id = {_run_id(row): row for row in rows}
+        for row in schedule:
+            run_id = _run_id(row)
+            run_dir = results / run_id
+            result_path = run_dir / "result.json"
+            metadata_path = run_dir / "run-metadata.json"
+            if not result_path.is_file() or not metadata_path.is_file():
+                errors.append(f"{run_id} is missing result.json or run-metadata.json")
+                continue
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            if not isinstance(metadata, dict) or metadata != rows_by_id.get(run_id):
+                errors.append(f"{run_id} metadata differs from its summary row")
+                continue
+            identity = {**row, "source_commit": commit, "binary_sha256": binary_sha}
+            if any(metadata.get(key) != value for key, value in identity.items()):
+                errors.append(f"{run_id} metadata identity differs from the schedule")
+            env_path = run_dir / "environment.txt"
+            if not env_path.is_file() or env_path.read_text(encoding="utf-8") != _point_preallocation_environment_text(row):
+                errors.append(f"{run_id} environment differs from its planned arm")
+            try:
+                raw = json.loads(result_path.read_text(encoding="utf-8"))
+                metrics = _validate_point_preallocation_record(raw, row)
+                if any(metadata.get(key) != value for key, value in metrics.items()):
+                    errors.append(f"{run_id} metrics differ from result.json")
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+                errors.append(f"{run_id} result is invalid: {error}")
+
+        summary_tsv = results / "summary.tsv"
+        if not summary_tsv.is_file():
+            errors.append("summary.tsv is missing")
+        else:
+            with summary_tsv.open(encoding="utf-8", newline="") as stream:
+                actual_rows = list(csv.DictReader(stream, delimiter="\t"))
+            expected_rows = []
+            for row in schedule:
+                metadata = rows_by_id.get(_run_id(row), {})
+                expected_rows.append({
+                    key: json.dumps(metadata[key], sort_keys=True) if isinstance(metadata.get(key), dict)
+                    else "" if metadata.get(key) is None else str(metadata.get(key))
+                    for key in _summary_fields(schedule)
+                })
+            if actual_rows != expected_rows:
+                errors.append("summary.tsv rows differ from per-run metadata")
+        return {"verified": not errors, "planned": len(schedule), "observed": len(rows), "errors": errors}
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError, csv.Error) as error:
+        return {"verified": False, "errors": [str(error)]}
 
 
 def _direct_completion_summary(
@@ -952,7 +1367,10 @@ def run_suite(args: argparse.Namespace) -> int:
     if args.machine_type != "c4-standard-16-lssd" or args.ssd_count != 2 or args.ssd_gib != 750:
         raise ValueError("Cursor qualification requires c4-standard-16-lssd and two Local SSDs")
     writers = tuple(int(value) for value in args.writers.split(","))
-    expected_writers = (8, 16) if candidate_mode == "coalescing-budget" else POINT_PROGRESS_RING_WRITERS
+    expected_writers = (
+        POINT_PREALLOCATION_WRITERS if candidate_mode == "v7-v8-point-preallocation" else
+        (8, 16) if candidate_mode == "coalescing-budget" else POINT_PROGRESS_RING_WRITERS
+    )
     if writers != expected_writers:
         raise ValueError(f"{candidate_mode} qualification requires writers {expected_writers}")
 
@@ -1001,6 +1419,16 @@ def run_suite(args: argparse.Namespace) -> int:
         )
         schedule_filename = "cursor-coalescing-budget-schedule.tsv"
         summarize = _coalescing_budget_summary
+    elif candidate_mode == "v7-v8-point-preallocation":
+        schedule = build_v7_v8_point_preallocation_schedule()
+        plan = build_v7_v8_point_preallocation_plan(
+            machine_type=args.machine_type,
+            machine_spec={"vcpus": 16, "ssd_count": args.ssd_count, "ssd_gib": args.ssd_gib},
+            commit=args.commit,
+            binary_sha256=args.binary_sha256,
+        )
+        schedule_filename = "v7-v8-point-preallocation-schedule.tsv"
+        summarize = lambda rows, _writers, planned: _point_preallocation_summary(rows, planned)
     else:
         raise ValueError("unsupported Cursor candidate mode")
     (results_dir / "benchmark-plan.json").write_text(json.dumps(plan, indent=2) + "\n", encoding="utf-8")
@@ -1029,6 +1457,7 @@ def run_suite(args: argparse.Namespace) -> int:
                 binary=binary, binary_sha256=args.binary_sha256,
                 row={**row, "source_commit": args.commit}, results_dir=results_dir,
                 db_root=db_root, safe_deadline_epoch=args.safe_deadline_epoch,
+                candidate_mode=candidate_mode,
                 on_subprocess_started=record_subprocess_start,
             )
         except (OSError, TimeoutError, subprocess.SubprocessError, ValueError) as error:
@@ -1766,7 +2195,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--ssd-gib", type=int, required=True)
     parser.add_argument(
         "--candidate-mode",
-        choices=("cursor", "direct-completion", "singleton-submission", "coalescing-budget"),
+        choices=(
+            "cursor", "direct-completion", "singleton-submission", "coalescing-budget",
+            "v7-v8-point-preallocation",
+        ),
         default="cursor",
     )
     return parser.parse_args(argv)

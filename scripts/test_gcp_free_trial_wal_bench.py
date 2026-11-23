@@ -53,6 +53,9 @@ from gcp_wal_matrix import (
     build_cursor_singleton_submission_schedule,
     V8_EXTENT_POLICY_STORAGE_NUM,
     V8_EXTENT_POLICY_STORAGE_WRITERS,
+    POINT_PREALLOCATION_NUM,
+    POINT_PREALLOCATION_POINT_ORDERS,
+    POINT_PREALLOCATION_WRITERS,
     V8_MUTEX_DIAGNOSTIC_NUM,
     V8_MUTEX_DIAGNOSTIC_SAMPLE_EVERY,
     V8_MUTEX_DIAGNOSTIC_WRITERS,
@@ -77,6 +80,8 @@ from gcp_wal_matrix import (
     build_point_progress_cursor_v2_schedule,
     build_v8_extent_policy_storage_plan,
     build_v8_extent_policy_storage_schedule,
+    build_v7_v8_point_preallocation_plan,
+    build_v7_v8_point_preallocation_schedule,
     build_v8_mutex_diagnostic_plan,
     build_v8_mutex_diagnostic_schedule,
     build_v8_point_cpu_attribution_plan,
@@ -2919,6 +2924,62 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
                 "--project", "test-project", "--zone", "us-east1-b", "--commit", "c" * 40,
                 "--writers", "16", "--v8-extent-policy-storage-ab", "--preflight-only",
             ])
+
+    def test_v7_v8_point_preallocation_schedule_and_plan(self) -> None:
+        schedule = build_v7_v8_point_preallocation_schedule()
+        self.assertEqual(len(schedule), 55)
+        for writer in POINT_PREALLOCATION_WRITERS:
+            for repetition in range(1, 6):
+                rows = [
+                    row
+                    for row in schedule
+                    if row["writer"] == writer and row["repetition"] == repetition and row["workload"] == "point"
+                ]
+                self.assertEqual([row["arm"] for row in rows], list(POINT_PREALLOCATION_POINT_ORDERS[repetition - 1]))
+                self.assertEqual(len(rows), 3)
+                self.assertEqual({row["workload"] for row in rows}, {"point"})
+        batch = [row for row in schedule if row["workload"] == "batch64"]
+        self.assertEqual(len(batch), 10)
+        self.assertTrue(all(row["writer"] == 16 for row in batch))
+        self.assertTrue(all(row["format_version"] == 8 for row in batch))
+        self.assertEqual(
+            {row["point_buffer_preallocation_enabled"] for row in batch},
+            {False, True},
+        )
+        self.assertEqual(
+            {row["arm"] for row in batch},
+            {"v8_prealloc_off", "v8_prealloc_on"},
+        )
+        plan = build_v7_v8_point_preallocation_plan(
+            machine_type="c4-standard-16-lssd",
+            machine_spec=BENCH.MACHINE_SPECS["c4-standard-16-lssd"],
+            commit="c" * 40,
+            binary_sha256="d" * 64,
+        )
+        self.assertEqual(plan["runs_planned"], 55)
+        self.assertEqual(plan["arms"], ["v7_parallel", "v8_prealloc_off", "v8_prealloc_on"])
+        self.assertEqual(plan["binary_sha256"], "d" * 64)
+
+    def test_v7_v8_point_preallocation_cli_requires_isolated_16_vcpu_setup(self) -> None:
+        valid = [
+            "--project", "test-project", "--zone", "us-central1-a", "--commit", "c" * 40,
+            "--network", "walbench-isolated", "--subnet", "walbench-subnet",
+            "--ssh-source-range", "192.0.2.10/32", "--max-runtime-minutes", "60",
+            "--estimated-hourly-cost-usd", "1.25", "--max-estimated-spend-usd", "2",
+            "--v7-v8-point-preallocation-ab", "--preflight-only",
+        ]
+        args = BENCH.parse_args(valid)
+        self.assertEqual(args.writers, POINT_PREALLOCATION_WRITERS)
+        self.assertEqual(args.num, POINT_PREALLOCATION_NUM)
+        self.assertEqual(args.machine_type, "c4-standard-16-lssd")
+        for suffix in (
+            ["--network", "default", "--subnet", "default", "--ssh-source-range", "192.0.2.10/32"],
+            ["--writers", "16"],
+            ["--num", str(POINT_PREALLOCATION_NUM + 1)],
+            ["--max-estimated-spend-usd", "2.1"],
+        ):
+            with self.subTest(suffix=suffix), redirect_stderr(StringIO()), self.assertRaises(SystemExit):
+                BENCH.parse_args([*valid, *suffix])
 
     def test_point_direct_frame_result_verifier_requires_actual_point_hits_and_batch_misses(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

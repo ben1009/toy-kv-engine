@@ -83,6 +83,21 @@ POINT_DIRECT_FRAME_ORDERS = (
 POINT_PROGRESS_RING_WRITERS = (1, 8, 16)
 POINT_PROGRESS_RING_REPETITIONS = 5
 POINT_PROGRESS_RING_NUM = 100_000
+POINT_PREALLOCATION_WRITERS = (1, 8, 16)
+POINT_PREALLOCATION_REPETITIONS = 5
+POINT_PREALLOCATION_NUM = 100_000
+POINT_PREALLOCATION_ARMS = ("v7_parallel", "v8_prealloc_off", "v8_prealloc_on")
+POINT_PREALLOCATION_POINT_ORDERS = (
+    ("v7_parallel", "v8_prealloc_off", "v8_prealloc_on"),
+    ("v8_prealloc_off", "v8_prealloc_on", "v7_parallel"),
+    ("v8_prealloc_on", "v7_parallel", "v8_prealloc_off"),
+    ("v7_parallel", "v8_prealloc_on", "v8_prealloc_off"),
+    ("v8_prealloc_on", "v8_prealloc_off", "v7_parallel"),
+)
+POINT_PREALLOCATION_BATCH_ORDERS = (
+    ("v8_prealloc_off", "v8_prealloc_on"),
+    ("v8_prealloc_on", "v8_prealloc_off"),
+)
 POINT_PROGRESS_PLAN_SCHEMA_V1 = 1
 POINT_PROGRESS_PLAN_SCHEMA_V2 = 2
 POINT_PROGRESS_PLAN_SCHEMA_V3 = 3
@@ -579,6 +594,105 @@ def build_point_progress_cursor_schedule(writers: Iterable[int]) -> list[dict[st
                     "progress_counters_enabled": False,
                 })
     return schedule
+
+
+def build_v7_v8_point_preallocation_schedule() -> list[dict[str, object]]:
+    """Build the V7/V8/preallocation comparison and Batch64 guardrail schedule."""
+    point_cells = tuple(
+        (writer, "point", "wal_concurrent", 1, None, 10)
+        for writer in POINT_PREALLOCATION_WRITERS
+    )
+    cells = (*point_cells, (16, "batch64", "wal_batch_concurrent", 64, 64, None))
+    schedule: list[dict[str, object]] = []
+    for writer, workload, bench, batch_entries, batch_size, sample_every in cells:
+        for repetition in range(1, POINT_PREALLOCATION_REPETITIONS + 1):
+            if workload == "point":
+                order = POINT_PREALLOCATION_POINT_ORDERS[repetition - 1]
+                arms = order
+            else:
+                arms = POINT_PREALLOCATION_BATCH_ORDERS[(repetition - 1) % 2]
+            for arm in arms:
+                is_v7 = arm == "v7_parallel"
+                schedule.append({
+                    "run_index": len(schedule) + 1,
+                    "writer": writer,
+                    "workload": workload,
+                    "repetition": repetition,
+                    "arm": arm,
+                    "bench": bench,
+                    "batch_entries": batch_entries,
+                    "batch_size": batch_size,
+                    "num": POINT_PREALLOCATION_NUM,
+                    "sample_every": sample_every,
+                    "format_version": 7 if is_v7 else 8,
+                    "point_buffer_preallocation_enabled": None if is_v7 else arm == "v8_prealloc_on",
+                    "progress_ring_enabled": not is_v7,
+                    "progress_cursor_enabled": not is_v7,
+                    "progress_counters_enabled": False if not is_v7 else None,
+                    "cursor_direct_completion_enabled": not is_v7 if not is_v7 else None,
+                    "cursor_singleton_submission_enabled": False if not is_v7 else None,
+                    "extent_mode": "sliding-point-lookahead" if not is_v7 else None,
+                    "extent_window_bytes": POINT_LOOKAHEAD_WINDOW_BYTES if not is_v7 else 0,
+                    "frontier_mode": "direct" if not is_v7 else None,
+                })
+    return schedule
+
+
+def build_v7_v8_point_preallocation_plan(
+    *, machine_type: str, machine_spec: Mapping[str, int], commit: str,
+    binary_sha256: str | None = None,
+) -> dict[str, object]:
+    schedule = build_v7_v8_point_preallocation_schedule()
+    return {
+        "plan_schema_version": 1,
+        "suite": "v7-v8-point-preallocation",
+        "writers": list(POINT_PREALLOCATION_WRITERS),
+        "workloads": [
+            {"writer": writer, "name": "point", "bench": "wal_concurrent", "batch_size": None,
+             "num": POINT_PREALLOCATION_NUM, "latency_sample_every": 10}
+            for writer in POINT_PREALLOCATION_WRITERS
+        ] + [
+            {"writer": 16, "name": "batch64", "bench": "wal_batch_concurrent", "batch_size": 64,
+             "num": POINT_PREALLOCATION_NUM, "latency_sample_every": None}
+        ],
+        "arms": list(POINT_PREALLOCATION_ARMS),
+        "repetitions_per_point_cell": POINT_PREALLOCATION_REPETITIONS,
+        "repetitions_per_batch_guardrail": POINT_PREALLOCATION_REPETITIONS,
+        "point_arm_orders": [list(order) for order in POINT_PREALLOCATION_POINT_ORDERS],
+        "batch_arm_orders": [list(order) for order in POINT_PREALLOCATION_BATCH_ORDERS],
+        "runs_planned": len(schedule),
+        "score_runs_planned": len(schedule),
+        "counterbalanced": True,
+        "machine_type": machine_type,
+        "vcpus": int(machine_spec["vcpus"]),
+        "local_ssd_count": int(machine_spec["ssd_count"]),
+        "local_ssd_total_gib": int(machine_spec["ssd_gib"]),
+        "runtime_protocol": "single C4 Local SSD host; same source commit and binary for all arms",
+        "value_bytes": 1024,
+        "compaction": "none",
+        "commit": commit,
+        "binary_sha256": binary_sha256,
+        "v8_configuration": {
+            "progress_mode": "cursor (mode 2)",
+            "completion": "direct",
+            "frontier": "direct",
+            "coalescing": "dynamic",
+            "extent_preparation": "1 MiB sliding-point-lookahead for Point; Batch64 remains fallocate-only",
+            "singleton_submission": False,
+            "point_buffer_preallocation": "sole V8 A/B variable",
+        },
+        "v7_configuration": "V7 Parallel; no V8-only environment variables",
+        "local_screen": {
+            "status": "skipped_by_user",
+            "reason": "Local SSD results were excluded at the user's direction because the local SSD is unstable.",
+        },
+        "qualification_note": (
+            "Point1/8/16 each compare V7 Parallel, V8 preallocation off, and V8 preallocation on in five "
+            "counterbalanced repetitions. Batch64 is a five-pair V8 off/on regression guardrail. Same host, "
+            "source commit, release bench binary, and V8 settings are used throughout. Point latency is sampled "
+            "every 10 puts; Batch64 latency sampling is disabled."
+        ),
+    }
 
 
 def build_cursor_direct_completion_schedule(

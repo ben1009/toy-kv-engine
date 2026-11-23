@@ -175,6 +175,9 @@ pub struct WalIoDiagnostics {
     pub point_buffer_preallocation_hits: u64,
     /// Number of attempts that used the regular in-sequencer allocation path.
     pub point_buffer_preallocation_fallbacks: u64,
+    /// Outstanding speculative buffer permits for in-process lifecycle tests.
+    /// This field is not serialized into benchmark results.
+    pub point_buffer_preallocations_in_flight: u64,
     pub progress_diagnostics: Option<WalV8ProgressDiagnostics>,
 }
 

@@ -4538,6 +4538,7 @@ impl WalV8LeaderWriter {
             point_buffer_preallocation_attempts: 0,
             point_buffer_preallocation_hits: 0,
             point_buffer_preallocation_fallbacks: 0,
+            point_buffer_preallocations_in_flight: 0,
             progress_diagnostics: None,
         };
 
@@ -5500,6 +5501,11 @@ impl WalV8ParallelWriter {
         diagnostics.point_buffer_preallocation_fallbacks = self
             .point_buffer_preallocation_fallbacks
             .load(Ordering::Relaxed);
+        diagnostics.point_buffer_preallocations_in_flight = u64::try_from(
+            self.point_buffer_preallocations_in_flight
+                .load(Ordering::Relaxed),
+        )
+        .expect("outstanding preallocation permits fit in u64");
         #[cfg(test)]
         {
             diagnostics.point_buffer_preallocation_enabled |= self

@@ -40386,6 +40386,197 @@ mod tests {
 
     #[cfg(all(target_os = "linux", feature = "bench"))]
     #[test]
+    fn v8_point_buffer_preallocation_survives_concurrent_rotation_and_recovery()
+    -> anyhow::Result<()> {
+        use crate::pitr::api::{PersistedPitrConfig, PitrOptions, PitrRuntimeOptions};
+        use crate::tests::harness::is_io_uring_unavailable_error;
+        use crate::wal::WalIoMode;
+
+        const WRITER_COUNT: usize = 8;
+        const PHASE_COUNT: usize = 3;
+        const WRITES_PER_PHASE: usize = 12;
+        const WRITES_BEFORE_ROTATION: usize = 2;
+        const MAX_SEGMENT_BYTES: u64 = 4 * 1024 * 1024;
+        const VALUE: &[u8] = &[0x5a; 1024];
+
+        let directory = tempdir()?;
+        let database = directory.path().join("db");
+        let repository = directory.path().join("repository");
+        let options = LsmStorageOptions {
+            enable_wal: true,
+            target_sst_size: 1 << 30,
+            ..LsmStorageOptions::default_for_test()
+        };
+        let engine = match KvEngine::open_with_wal_io_mode(
+            &database,
+            options.clone(),
+            WalIoMode::Parallel,
+        ) {
+            Ok(engine) => Arc::new(engine),
+            Err(error) if is_io_uring_unavailable_error(&error) => {
+                eprintln!("skipping test (io_uring unavailable): {error:#}");
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        if let Err(error) = engine.enable_pitr(PitrOptions {
+            repository: repository.clone(),
+            config: PersistedPitrConfig {
+                archive_interval: std::time::Duration::from_secs(3600),
+                max_segment_bytes: MAX_SEGMENT_BYTES,
+                max_unarchived_bytes: 16 * 1024 * 1024,
+                max_source_spool_bytes: 64 * 1024 * 1024,
+            },
+            runtime: PitrRuntimeOptions::default(),
+        }) {
+            if is_io_uring_unavailable_error(&error) {
+                eprintln!("skipping test (io_uring unavailable): {error:#}");
+                engine.close()?;
+                return Ok(());
+            }
+            return Err(error);
+        }
+        engine
+            .inner
+            .set_v8_point_buffer_preallocation_for_test(true)?;
+
+        let start_phase = Arc::new(std::sync::Barrier::new(WRITER_COUNT + 1));
+        let rotate_now = Arc::new(std::sync::Barrier::new(WRITER_COUNT + 1));
+        let after_rotation = Arc::new(std::sync::Barrier::new(WRITER_COUNT + 1));
+        let finish_phase = Arc::new(std::sync::Barrier::new(WRITER_COUNT + 1));
+        let first_error = Arc::new(parking_lot::Mutex::new(None::<anyhow::Error>));
+        let mut test_memtables = vec![engine.inner.state.load().memtable.clone()];
+        let mut recovery_points = 0;
+
+        std::thread::scope(|scope| {
+            for writer in 0..WRITER_COUNT {
+                let engine = Arc::clone(&engine);
+                let start_phase = Arc::clone(&start_phase);
+                let rotate_now = Arc::clone(&rotate_now);
+                let after_rotation = Arc::clone(&after_rotation);
+                let finish_phase = Arc::clone(&finish_phase);
+                let first_error = Arc::clone(&first_error);
+                scope.spawn(move || {
+                    for phase in 0..PHASE_COUNT {
+                        start_phase.wait();
+                        for write in 0..WRITES_BEFORE_ROTATION {
+                            let key = format!("writer-{writer}-phase-{phase}-put-{write}");
+                            if let Err(error) = engine.put(key.as_bytes(), VALUE) {
+                                let mut first_error = first_error.lock();
+                                if first_error.is_none() {
+                                    *first_error = Some(error);
+                                }
+                            }
+                        }
+                        rotate_now.wait();
+                        after_rotation.wait();
+                        for write in WRITES_BEFORE_ROTATION..WRITES_PER_PHASE {
+                            let key = format!("writer-{writer}-phase-{phase}-put-{write}");
+                            if let Err(error) = engine.put(key.as_bytes(), VALUE) {
+                                let mut first_error = first_error.lock();
+                                if first_error.is_none() {
+                                    *first_error = Some(error);
+                                }
+                            }
+                        }
+                        finish_phase.wait();
+                    }
+                });
+            }
+
+            for _ in 0..PHASE_COUNT {
+                start_phase.wait();
+                rotate_now.wait();
+                match engine.create_recovery_point() {
+                    Ok(crate::pitr::api::RecoveryPointOutcome::Durable(_)) => recovery_points += 1,
+                    Ok(outcome) => {
+                        let mut first_error = first_error.lock();
+                        if first_error.is_none() {
+                            *first_error = Some(anyhow::anyhow!(
+                                "concurrent rotation did not publish a durable recovery point: {outcome:?}"
+                            ));
+                        }
+                    }
+                    Err(error) => {
+                        let mut first_error = first_error.lock();
+                        if first_error.is_none() {
+                            *first_error = Some(error);
+                        }
+                    }
+                }
+                test_memtables.push(engine.inner.state.load().memtable.clone());
+                after_rotation.wait();
+                finish_phase.wait();
+            }
+        });
+
+        if let Some(error) = first_error.lock().take() {
+            return Err(error);
+        }
+        assert_eq!(recovery_points, PHASE_COUNT);
+        engine.sync()?;
+
+        let expected_values = (0..WRITER_COUNT)
+            .flat_map(|writer| {
+                (0..PHASE_COUNT).flat_map(move |phase| {
+                    (0..WRITES_PER_PHASE)
+                        .map(move |write| format!("writer-{writer}-phase-{phase}-put-{write}"))
+                })
+            })
+            .collect::<Vec<_>>();
+        for key in &expected_values {
+            assert_eq!(engine.get(key.as_bytes())?.as_deref(), Some(VALUE));
+        }
+
+        assert_eq!(test_memtables.len(), PHASE_COUNT + 1);
+        assert!(test_memtables.iter().all(|memtable| memtable.uses_v8_wal()));
+        let diagnostics = test_memtables
+            .iter()
+            .map(|memtable| {
+                memtable
+                    .benchmark_wal_io_diagnostics()
+                    .expect("V8 memtable exposes benchmark I/O diagnostics")
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            diagnostics
+                .iter()
+                .all(|item| item.point_buffer_preallocation_enabled),
+            "every V8 WAL used by the test must have preallocation enabled"
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .all(|item| item.point_buffer_preallocations_in_flight == 0),
+            "rotation must not strand speculative buffer permits"
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .all(|item| item.point_buffer_preallocation_hits > 0),
+            "every WAL created across rotations must receive Point admissions through preallocation"
+        );
+        assert!(diagnostics.iter().all(|item| {
+            item.point_buffer_preallocation_attempts
+                == item.point_buffer_preallocation_hits + item.point_buffer_preallocation_fallbacks
+        }));
+        drop(test_memtables);
+
+        engine.close()?;
+        drop(engine);
+        let mut options = options;
+        options.pitr_repository = Some(repository);
+        let reopened = KvEngine::open_with_wal_io_mode(&database, options, WalIoMode::Parallel)?;
+        for key in &expected_values {
+            assert_eq!(reopened.get(key.as_bytes())?.as_deref(), Some(VALUE));
+        }
+        reopened.close()?;
+
+        Ok(())
+    }
+
+    #[cfg(all(target_os = "linux", feature = "bench"))]
+    #[test]
     fn v8_progress_ring_rejects_inherited_completion_timeline_before_pitr_enable() {
         const CHILD_ENV: &str = "TOYKV_TEST_PROGRESS_RING_INHERITED_PROFILE_CHILD";
         if std::env::var_os(CHILD_ENV).is_none() {

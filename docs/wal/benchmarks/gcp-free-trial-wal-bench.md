@@ -309,6 +309,36 @@ as V8-only measurements. This suite is diagnostic: its instrumented throughput
 and latency are not unprofiled performance scores. It leaves WAL protocol and
 Coordinator Mutex behavior unchanged.
 
+For the same-host V7/V8 Point buffer-preallocation comparison, use
+`--v7-v8-point-preallocation-ab`:
+
+```bash
+python3 scripts/gcp-free-trial-wal-bench.py \
+  --project YOUR_PROJECT_ID \
+  --zone YOUR_C4_ZONE \
+  --machine-type c4-standard-16-lssd \
+  --v7-v8-point-preallocation-ab \
+  --commit 0123456789abcdef0123456789abcdef01234567 \
+  --network YOUR_ISOLATED_VPC \
+  --subnet YOUR_SUBNET \
+  --ssh-source-range YOUR_PUBLIC_IPV4/32 \
+  --estimated-hourly-cost-usd YOUR_CURRENT_ESTIMATE \
+  --max-estimated-spend-usd 2.00 \
+  --max-runtime-minutes 60 \
+  --confirm-free-trial
+```
+
+This fixed plan runs 55 score cases on one C4 Local SSD host with one release
+binary: Point1/8/16 each compare V7 Parallel, V8 preallocation off, and V8
+preallocation on in five counterbalanced repetitions (45 runs), followed by
+five paired Batch64 V8 off/on regression checks (10 runs). V8 keeps Cursor
+progress, Direct Completion, Direct FRONTIER, dynamic coalescing, and 1 MiB
+Point-only lookahead fixed across arms. Batch64 must record zero Point buffer
+preallocation attempts in both arms. The validator requires the enabled Point
+arm to report actual preallocation hits, verifies every run's result and
+metadata, and rejects incomplete archives before cleanup. The user-requested
+local SSD screening is skipped; this suite is the same-host GCP comparison.
+
 Replace the example commit, CIDR, and cost values. Use a full 40-character
 commit SHA. The two cost arguments are mandatory for a full run: look up
 current pricing for the selected region and estimate the VM, Local SSD, boot
