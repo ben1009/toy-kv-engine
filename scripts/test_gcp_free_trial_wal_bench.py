@@ -983,6 +983,7 @@ class PointProgressRingQualificationTests(unittest.TestCase):
         accepted = subprocess.run(
             command, cwd=Path(__file__).resolve().parents[1], capture_output=True,
             check=False, text=True, timeout=5,
+            env={**os.environ, "TOYKV_GCP_BENCH_VALIDATE_ONLY": "1"},
         )
         self.assertNotEqual(accepted.returncode, 64, accepted.stderr)
         rejected = subprocess.run(
@@ -1002,6 +1003,7 @@ class PointProgressRingQualificationTests(unittest.TestCase):
         accepted = subprocess.run(
             command, cwd=Path(__file__).resolve().parents[1], capture_output=True,
             check=False, text=True, timeout=5,
+            env={**os.environ, "TOYKV_GCP_BENCH_VALIDATE_ONLY": "1"},
         )
         self.assertNotEqual(accepted.returncode, 64, accepted.stderr)
         rejected = subprocess.run(

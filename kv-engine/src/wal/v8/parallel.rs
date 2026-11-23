@@ -1782,7 +1782,7 @@ impl WalV8ParallelCoordinator {
                 }
                 drop(state);
                 #[cfg(feature = "bench")]
-                if let Some(timing) = timing.as_deref_mut() {
+                if let Some(timing) = timing.as_mut() {
                     timing.coordinator_lock_hold_wall_ns =
                         timing.coordinator_lock_hold_wall_ns.saturating_add(
                             coordinator_lock_hold_wall_started

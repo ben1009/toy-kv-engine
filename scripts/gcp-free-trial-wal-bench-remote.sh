@@ -143,6 +143,11 @@ elif [[ "$BASELINE_COMMIT" != "-" ]]; then
     exit 64
 fi
 
+# Offline tests exercise the argument and suite guards without provisioning a VM.
+if [[ "${TOYKV_GCP_BENCH_VALIDATE_ONLY:-0}" == "1" ]]; then
+    exit 0
+fi
+
 BOOT_LOG=/var/log/gcp-free-trial-wal-bench.log
 exec > >(tee -a "$BOOT_LOG") 2>&1
 echo "[$(date --iso-8601=seconds)] starting GCP WAL benchmark setup"
