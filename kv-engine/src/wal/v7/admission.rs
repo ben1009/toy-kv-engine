@@ -2670,6 +2670,123 @@ mod tests {
 
     #[cfg(feature = "bench")]
     #[test]
+    fn point_preclaim_formal_admission_deterministically_revokes_held_claims() {
+        const PRODUCERS: usize = 16;
+
+        for cache_enabled in [false, true] {
+            let ledger = WalV7ResourceLedger::new(WalV7ResourceLimits {
+                max_logical_wal_bytes: 1_000_000,
+                max_source_spool_bytes: 2_000_000,
+                max_recovery_workspace_bytes: 1_000_000,
+                max_buffer_memory_bytes: 1_000_000,
+                max_seal_index_bytes: 4096,
+            })
+            .unwrap();
+            ledger
+                .set_speculative_total_cache_enabled(cache_enabled)
+                .unwrap();
+            let owner = Arc::new(
+                WalV7ReservationOwner::new_image(
+                    ledger.clone(),
+                    None,
+                    1,
+                    1,
+                    WalV7ResourceCharge::default(),
+                )
+                .unwrap(),
+            );
+            let formal_charge = charge(900_000, 0, 0, 0, 0);
+            let (claims_ready_tx, claims_ready_rx) = crossbeam_channel::bounded(PRODUCERS);
+            let (release_tx, release_rx) = crossbeam_channel::bounded(PRODUCERS);
+            let (completed_tx, completed_rx) = crossbeam_channel::bounded(PRODUCERS);
+
+            std::thread::scope(|scope| {
+                for _ in 0..PRODUCERS {
+                    let owner = Arc::clone(&owner);
+                    let producer_ledger = ledger.clone();
+                    let claims_ready = claims_ready_tx.clone();
+                    let release = release_rx.clone();
+                    let completed = completed_tx.clone();
+                    scope.spawn(move || {
+                        let mut claim = loop {
+                            match owner.try_preclaim_batch_charge(
+                                WalV7ResourceCharge::for_batch(128).unwrap(),
+                                Arc::new(PointPreclaimLifecycleCounters::default()),
+                            ) {
+                                Ok(claim) => break claim,
+                                Err(
+                                    PointPreclaimDeclineReason::OwnerTryLockBusy
+                                    | PointPreclaimDeclineReason::LedgerTryLockBusy,
+                                ) => std::thread::yield_now(),
+                                Err(reason) => panic!("unexpected preclaim decline: {reason:?}"),
+                            }
+                        };
+                        assert_speculative_total_matches_preclaims(&producer_ledger);
+                        claims_ready
+                            .send(())
+                            .expect("test coordinator should wait for every held claim");
+                        release
+                            .recv_timeout(std::time::Duration::from_secs(5))
+                            .expect("test coordinator should release every held claim");
+
+                        assert!(
+                            owner
+                                .promote_batch_preclaim(&mut claim, WAL_V7_FRAME_LEN as u64)
+                                .unwrap()
+                                .is_none(),
+                            "formal admission must revoke every conflicting held claim"
+                        );
+                        assert_speculative_total_matches_preclaims(&producer_ledger);
+                        drop(claim);
+                        assert_speculative_total_matches_preclaims(&producer_ledger);
+                        completed
+                            .send(())
+                            .expect("test coordinator should await every producer");
+                    });
+                }
+                drop(claims_ready_tx);
+                drop(completed_tx);
+
+                for _ in 0..PRODUCERS {
+                    claims_ready_rx
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .expect("all producers should acquire a speculative claim");
+                }
+                assert_speculative_total_matches_preclaims(&ledger);
+                assert_eq!(ledger.inner.state.lock().preclaims.len(), PRODUCERS);
+
+                let reservation = ledger
+                    .reserve(formal_charge)
+                    .expect("formal reservation fits without speculative charges");
+                assert_speculative_total_matches_preclaims(&ledger);
+                {
+                    let state = ledger.inner.state.lock();
+                    assert!(state.preclaims.is_empty());
+                    assert_eq!(state.speculative_total, WalV7ResourceCharge::default());
+                }
+                assert_eq!(ledger.snapshot(), formal_charge);
+
+                for _ in 0..PRODUCERS {
+                    release_tx
+                        .send(())
+                        .expect("all producer threads should be waiting on their claims");
+                }
+                for _ in 0..PRODUCERS {
+                    completed_rx
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .expect("all revoked claims should reject promotion and be dropped");
+                }
+
+                drop(reservation);
+                assert_speculative_total_matches_preclaims(&ledger);
+            });
+
+            assert_eq!(ledger.snapshot(), WalV7ResourceCharge::default());
+        }
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
     fn point_preclaim_promotion_racing_owner_retirement_releases_claim() {
         for cache_enabled in [false, true] {
             let ledger = WalV7ResourceLedger::new(WalV7ResourceLimits {
