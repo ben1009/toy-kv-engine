@@ -29,6 +29,8 @@ from gcp_wal_matrix import (
     POINT_PROGRESS_RING_WRITERS,
     build_cursor_direct_completion_plan,
     build_cursor_direct_completion_schedule,
+    build_cursor_coalescing_budget_plan,
+    build_cursor_coalescing_budget_schedule,
     build_cursor_singleton_submission_plan,
     build_cursor_singleton_submission_schedule,
     build_point_progress_cursor_v2_plan,
@@ -41,6 +43,7 @@ from gcp_wal_matrix import (
     validate_point_progress_cursor_v2_rows,
     validate_point_progress_ring_rows,
     validate_cursor_direct_completion_rows,
+    validate_cursor_coalescing_budget_rows,
     validate_cursor_singleton_submission_rows,
 )
 
@@ -106,8 +109,9 @@ def _environment(
     progress_counters_enabled: bool | None = None,
     cursor_direct_completion_enabled: bool | None = None,
     cursor_singleton_submission_enabled: bool | None = None,
+    coalescing_budget_us: int | None = None,
 ) -> dict[str, str]:
-    # An allowlist makes the candidate switch the only inherited experiment variable.
+    # An allowlist makes the selected experiment switches the only inherited variables.
     if progress_ring_enabled is not progress_cursor_enabled:
         raise ValueError("only Eager (0) and Cursor (2) progress modes are runnable")
     progress_mode = "2" if progress_cursor_enabled else "0"
@@ -129,6 +133,10 @@ def _environment(
         environment["TOYKV_BENCH_V8_CURSOR_SINGLETON_SUBMISSION"] = (
             "1" if cursor_singleton_submission_enabled else "0"
         )
+    if coalescing_budget_us is not None:
+        if coalescing_budget_us not in (100, 400):
+            raise ValueError("coalescing budget override must be 100 or 400 μs")
+        environment["TOYKV_WAL_V8_COALESCE_BUDGET_US"] = str(coalescing_budget_us)
     return environment
 
 
@@ -138,6 +146,7 @@ def _expected_environment_text(
     progress_counters_enabled: bool | None = None,
     cursor_direct_completion_enabled: bool | None = None,
     cursor_singleton_submission_enabled: bool | None = None,
+    coalescing_budget_us: int | None = None,
 ) -> str:
     if progress_ring_enabled and not progress_cursor_enabled:
         # Historical F0.5 archives used the now-retired mode 1. Keep their
@@ -151,11 +160,14 @@ def _expected_environment_text(
     controlled = {
         key: value for key, value in _environment(
             progress_ring_enabled, progress_cursor_enabled, progress_counters_enabled,
-            cursor_direct_completion_enabled, cursor_singleton_submission_enabled,
+            cursor_direct_completion_enabled, cursor_singleton_submission_enabled, coalescing_budget_us,
         ).items()
         if key not in ("PATH", "HOME", "TMPDIR", "LC_ALL")
     }
-    controlled.update({key: "<unset>" for key in UNSET_EXPERIMENT_VARIABLES})
+    controlled.update({
+        key: "<unset>" for key in UNSET_EXPERIMENT_VARIABLES
+        if key != "TOYKV_WAL_V8_COALESCE_BUDGET_US" or coalescing_budget_us is None
+    })
     return "\n".join(f"{key}={value}" for key, value in sorted(controlled.items())) + "\n"
 
 
@@ -344,6 +356,7 @@ def _run_one(
         row.get("progress_counters_enabled"),
         row.get("cursor_direct_completion_enabled"),
         row.get("cursor_singleton_submission_enabled"),
+        row.get("coalescing_budget_us"),
     )
     (run_dir / "command.sh").write_text(shlex.join(command) + "\n", encoding="utf-8")
     (run_dir / "environment.txt").write_text(
@@ -353,6 +366,7 @@ def _run_one(
             row.get("progress_counters_enabled"),
             row.get("cursor_direct_completion_enabled"),
             row.get("cursor_singleton_submission_enabled"),
+            row.get("coalescing_budget_us"),
         ), encoding="utf-8",
     )
     (run_dir / "start_utc.txt").write_text(datetime.now(timezone.utc).isoformat() + "\n", encoding="utf-8")
@@ -858,6 +872,74 @@ def _cursor_plan_schema_version(plan: dict[str, Any]) -> int:
     raise ValueError("benchmark plan has no recognized progress plan schema")
 
 
+def _coalescing_budget_summary(
+    rows: list[dict[str, Any]], writers: tuple[int, ...], planned: int,
+) -> dict[str, Any]:
+    validation = validate_cursor_coalescing_budget_rows(rows)
+    comparisons: list[dict[str, Any]] = []
+    arms = ("dynamic", "fixed_100", "fixed_400")
+    for writer in writers:
+        by_repetition = {
+            repetition: {
+                row["arm"]: row for row in rows
+                if row.get("writer") == writer and row.get("repetition") == repetition
+            }
+            for repetition in range(1, 6)
+        }
+        for arm in arms[1:]:
+            paired = [
+                (pair["dynamic"], pair[arm]) for pair in by_repetition.values()
+                if "dynamic" in pair and arm in pair
+                and pair["dynamic"].get("exit_code") == 0 and pair[arm].get("exit_code") == 0
+            ]
+            throughput_changes = [
+                (candidate["puts_per_second"] / baseline["puts_per_second"] - 1.0) * 100.0
+                for baseline, candidate in paired
+            ]
+            p99_changes = [
+                (candidate["p99_ms"] / baseline["p99_ms"] - 1.0) * 100.0
+                for baseline, candidate in paired
+            ]
+            comparisons.append({
+                "writer": writer,
+                "baseline": "dynamic",
+                "candidate": arm,
+                "paired_runs": len(paired),
+                "paired_throughput_change_pct_median": median(throughput_changes) if paired else None,
+                "paired_throughput_wins": sum(change > 0 for change in throughput_changes),
+                "paired_cpu_us_per_put_change_median": median([
+                    candidate["cpu_us_per_put"] - baseline["cpu_us_per_put"]
+                    for baseline, candidate in paired
+                ]) if paired else None,
+                "paired_p99_change_pct_median": median(p99_changes) if paired else None,
+                "paired_sync_count_change_median": median([
+                    candidate["sync_count"] - baseline["sync_count"]
+                    for baseline, candidate in paired
+                ]) if paired else None,
+                "paired_puts_per_sync_change_median": median([
+                    candidate["puts_per_sync"] - baseline["puts_per_sync"]
+                    for baseline, candidate in paired
+                ]) if paired else None,
+            })
+    return {
+        "suite": "v8-cursor-coalescing-budget",
+        "complete": len(rows) == planned and validation["complete"],
+        "runs_started": len(rows),
+        "runs_completed": sum(row.get("exit_code") == 0 for row in rows),
+        "runs_planned": planned,
+        "writers": list(writers),
+        "workloads": ["point"],
+        "arms": list(arms),
+        "results": rows,
+        "matrix_validation": validation,
+        "comparison": comparisons,
+        "qualification_note": (
+            "Same-host, same-source, same-release-binary Cursor Direct Point score comparison. Only the "
+            "coalescing budget differs. Results are exploratory and no default change is implied."
+        ),
+    }
+
+
 def run_suite(args: argparse.Namespace) -> int:
     if len(args.commit) != 40 or any(char not in "0123456789abcdef" for char in args.commit):
         raise ValueError("commit must be a full lowercase 40-character SHA")
@@ -866,16 +948,17 @@ def run_suite(args: argparse.Namespace) -> int:
     binary = args.binary.expanduser().resolve(strict=True)
     if _sha256_file(binary) != args.binary_sha256:
         raise ValueError("write-perf binary SHA-256 does not match its recorded identity")
+    candidate_mode = getattr(args, "candidate_mode", "cursor")
     if args.machine_type != "c4-standard-16-lssd" or args.ssd_count != 2 or args.ssd_gib != 750:
-        raise ValueError("progress-ring qualification requires c4-standard-16-lssd and two Local SSDs")
+        raise ValueError("Cursor qualification requires c4-standard-16-lssd and two Local SSDs")
     writers = tuple(int(value) for value in args.writers.split(","))
-    if writers != POINT_PROGRESS_RING_WRITERS:
-        raise ValueError(f"progress-ring qualification requires writers {POINT_PROGRESS_RING_WRITERS}")
+    expected_writers = (8, 16) if candidate_mode == "coalescing-budget" else POINT_PROGRESS_RING_WRITERS
+    if writers != expected_writers:
+        raise ValueError(f"{candidate_mode} qualification requires writers {expected_writers}")
 
     results_dir, db_root = args.results_dir, args.db_root
     results_dir.mkdir(parents=True, exist_ok=True)
     db_root.mkdir(parents=True, exist_ok=True)
-    candidate_mode = getattr(args, "candidate_mode", "cursor")
     if candidate_mode == "cursor":
         schedule = build_point_progress_cursor_schedule(writers)
         plan = build_point_progress_cursor_plan(
@@ -909,8 +992,17 @@ def run_suite(args: argparse.Namespace) -> int:
         )
         schedule_filename = "cursor-singleton-submission-schedule.tsv"
         summarize = _singleton_submission_summary
+    elif candidate_mode == "coalescing-budget":
+        schedule = build_cursor_coalescing_budget_schedule(writers)
+        plan = build_cursor_coalescing_budget_plan(
+            machine_type=args.machine_type,
+            machine_spec={"vcpus": 16, "ssd_count": args.ssd_count, "ssd_gib": args.ssd_gib},
+            commit=args.commit,
+        )
+        schedule_filename = "cursor-coalescing-budget-schedule.tsv"
+        summarize = _coalescing_budget_summary
     else:
-        raise ValueError("candidate mode must be Cursor, Cursor direct completion, or Cursor singleton submission")
+        raise ValueError("unsupported Cursor candidate mode")
     (results_dir / "benchmark-plan.json").write_text(json.dumps(plan, indent=2) + "\n", encoding="utf-8")
     (results_dir / "commit.txt").write_text(args.commit + "\n", encoding="utf-8")
     (results_dir / "write-perf.sha256").write_text(args.binary_sha256 + "\n", encoding="utf-8")
@@ -1529,6 +1621,137 @@ def verify_singleton_submission_results_directory(results: Path) -> dict[str, An
         return {"verified": False, "errors": [str(error)]}
 
 
+def verify_coalescing_budget_results_directory(results: Path) -> dict[str, Any]:
+    """Strictly verify the Cursor Direct Dynamic/100/400 us score matrix."""
+    errors: list[str] = []
+    try:
+        summary = json.loads((results / "summary.json").read_text(encoding="utf-8"))
+        remote_exit = json.loads((results / "remote-exit.json").read_text(encoding="utf-8"))
+        plan = json.loads((results / "benchmark-plan.json").read_text(encoding="utf-8"))
+        commit = (results / "commit.txt").read_text(encoding="utf-8").strip()
+        binary_sha = (results / "write-perf.sha256").read_text(encoding="utf-8").strip()
+        if not all(isinstance(value, dict) for value in (summary, remote_exit, plan)):
+            raise ValueError("summary, remote-exit, and plan must be JSON objects")
+        schedule = build_cursor_coalescing_budget_schedule(plan.get("writers", ()))
+        expected_plan = build_cursor_coalescing_budget_plan(
+            machine_type="c4-standard-16-lssd",
+            machine_spec={"vcpus": 16, "ssd_count": 2, "ssd_gib": 750},
+            commit=commit,
+        )
+        if plan != expected_plan:
+            errors.append("benchmark plan differs from the fixed coalescing-budget suite")
+        if len(commit) != 40 or any(char not in "0123456789abcdef" for char in commit):
+            errors.append("source commit identity is invalid")
+        if len(binary_sha) != 64 or any(char not in "0123456789abcdef" for char in binary_sha):
+            errors.append("binary checksum is invalid")
+        if (
+            summary.get("suite") != "v8-cursor-coalescing-budget"
+            or summary.get("source_commit") != commit
+            or summary.get("binary_sha256") != binary_sha
+            or summary.get("complete") is not True
+            or summary.get("runs_started") != len(schedule)
+            or summary.get("runs_attempted") != len(schedule)
+            or summary.get("runs_completed") != len(schedule)
+            or summary.get("runs_planned") != len(schedule)
+        ):
+            errors.append("summary metadata or run counts are incomplete")
+        if (
+            remote_exit.get("failed") is not False
+            or remote_exit.get("runs_started") != len(schedule)
+            or remote_exit.get("runs_attempted") != len(schedule)
+        ):
+            errors.append("remote-exit does not confirm all planned runs")
+        with (results / "cursor-coalescing-budget-schedule.tsv").open(
+            encoding="utf-8", newline="",
+        ) as stream:
+            actual_schedule = list(csv.DictReader(stream, delimiter="\t"))
+        expected_schedule = [
+            {
+                key: "none" if key == "batch_size" and value is None
+                else "" if value is None
+                else str(value)
+                for key, value in row.items()
+            }
+            for row in schedule
+        ]
+        if actual_schedule != expected_schedule:
+            errors.append("schedule file differs from the planned run order/configuration")
+        rows = summary.get("results")
+        if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+            raise ValueError("summary results are missing or malformed")
+        validation = validate_cursor_coalescing_budget_rows(rows)
+        if validation["complete"] is not True:
+            errors.append("run rows do not match the coalescing-budget matrix")
+        recomputed = _coalescing_budget_summary(rows, tuple(plan.get("writers", ())), len(schedule))
+        for key in (
+            "suite", "complete", "runs_started", "runs_completed", "runs_planned", "writers", "workloads",
+            "arms", "matrix_validation", "comparison",
+        ):
+            if summary.get(key) != recomputed.get(key):
+                errors.append(f"summary field {key} differs from the archived rows")
+        expected_ids = {_run_id(row) for row in schedule}
+        actual_ids = {
+            path.name for path in results.iterdir()
+            if path.is_dir() and path.name.startswith(("r", "w"))
+        }
+        if actual_ids != expected_ids:
+            errors.append("run directories do not exactly match the schedule")
+        rows_by_id = {_run_id(row): row for row in rows}
+        for row in schedule:
+            run_id = _run_id(row)
+            run_dir = results / run_id
+            result_path, metadata_path = run_dir / "result.json", run_dir / "run-metadata.json"
+            if not result_path.is_file() or not metadata_path.is_file():
+                errors.append(f"{run_id} is missing its result or metadata")
+                continue
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            if not isinstance(metadata, dict):
+                errors.append(f"{run_id} metadata is malformed")
+                continue
+            if metadata != rows_by_id.get(run_id):
+                errors.append(f"{run_id} metadata differs from the summary row")
+            identity = {**row, "source_commit": commit, "binary_sha256": binary_sha}
+            if any(metadata.get(key) != value for key, value in identity.items()):
+                errors.append(f"{run_id} metadata identity differs from the schedule")
+            expected_environment = _expected_environment_text(
+                True,
+                True,
+                False,
+                True,
+                False,
+                row["coalescing_budget_us"],
+            )
+            environment_path = run_dir / "environment.txt"
+            if not environment_path.is_file() or environment_path.read_text(encoding="utf-8") != expected_environment:
+                errors.append(f"{run_id} environment differs from the planned budget arm")
+            try:
+                raw = json.loads(result_path.read_text(encoding="utf-8"))
+                expected_metrics = _validate_record(raw, row)
+                if any(metadata.get(key) != value for key, value in expected_metrics.items()):
+                    errors.append(f"{run_id} metrics differ from raw result")
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+                errors.append(f"{run_id} raw result is invalid: {error}")
+        summary_tsv_path = results / "summary.tsv"
+        if not summary_tsv_path.is_file():
+            errors.append("summary.tsv is missing")
+        else:
+            with summary_tsv_path.open(encoding="utf-8", newline="") as stream:
+                actual_summary_tsv = list(csv.DictReader(stream, delimiter="\t"))
+            expected_summary_tsv = []
+            for row in schedule:
+                metadata = rows_by_id.get(_run_id(row), {})
+                expected_summary_tsv.append({
+                    key: json.dumps(metadata[key], sort_keys=True) if isinstance(metadata.get(key), dict)
+                    else "" if metadata.get(key) is None else str(metadata.get(key))
+                    for key in _summary_fields(schedule)
+                })
+            if actual_summary_tsv != expected_summary_tsv:
+                errors.append("summary.tsv rows differ from run metadata")
+        return {"verified": not errors, "planned": len(schedule), "observed": len(rows), "errors": errors}
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+        return {"verified": False, "errors": [str(error)]}
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, required=True)
@@ -1543,7 +1766,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--ssd-gib", type=int, required=True)
     parser.add_argument(
         "--candidate-mode",
-        choices=("cursor", "direct-completion", "singleton-submission"),
+        choices=("cursor", "direct-completion", "singleton-submission", "coalescing-budget"),
         default="cursor",
     )
     return parser.parse_args(argv)

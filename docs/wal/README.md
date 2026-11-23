@@ -82,6 +82,10 @@ shows progress-token waiting dominates the sampled coalescing wall time, while
 completion drain and coordinator-lock wait remain small. It also records a
 stale availability flag despite populated phase fields; these single-run
 diagnostics do not establish a performance winner.
+The [coalescing-budget A/B](benchmarks/rfc-028-v8-cursor-coalescing-budget-gcp-20261123.md)
+found fixed 400 μs consistently ahead of Dynamic at 8 and 16 writers, but its
+paired throughput gains stayed below the 5% qualification threshold. Dynamic
+remains the default.
 
 ## Implementation and adoption
 
@@ -280,6 +284,7 @@ experiments. Each report records its own outcome and measurement limits.
 - [RFC 027 V8 Cursor singleton-submission GCP qualification — throughput gate failed, 2026-11-22](benchmarks/rfc-027-v8-cursor-singleton-submission-gcp-20261122.md)
 - [RFC 028 V8 Point critical-path GCP diagnostic — no single bottleneck established, 2026-11-22](benchmarks/rfc-028-v8-point16-critical-path-gcp-20261122.md)
 - [RFC 028 V8 Cursor coalescing GCP diagnostic — progress-token wait dominates sampled coalescing wall time, 2026-11-23](benchmarks/rfc-028-v8-cursor-coalescing-gcp-20261123.md)
+- [RFC 028 V8 Cursor coalescing-budget A/B — fixed 400 μs wins consistently but misses the throughput gate, 2026-11-23](benchmarks/rfc-028-v8-cursor-coalescing-budget-gcp-20261123.md)
 - [RFC 026 V7/V8 Point admission and sync diagnostic — sequencer wait is real but not demonstrably saturated, 2026-11-19](experiments/rfc-026-v8-point-admission-sync-diagnostic-20261119.md)
 - [Deferred task work with native completion waiting](experiments/rfc-024-deferred-ring-wait-20261003.md)
 - [Extent preparation for large batches](experiments/rfc-024-large-batch-preallocation-20261004.md)

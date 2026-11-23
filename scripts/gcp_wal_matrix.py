@@ -93,6 +93,15 @@ POINT_PROGRESS_CURSOR_ARMS = ("eager", "cursor")
 POINT_PROGRESS_CURSOR_V2_ARMS = ("eager", "progress_ring", "cursor")
 CURSOR_DIRECT_COMPLETION_ARMS = ("cursor_relay", "cursor_direct")
 CURSOR_SINGLETON_SUBMISSION_ARMS = ("cursor_control", "cursor_singleton")
+CURSOR_COALESCING_BUDGET_WRITERS = (8, 16)
+CURSOR_COALESCING_BUDGET_REPETITIONS = 5
+CURSOR_COALESCING_BUDGET_NUM = 100_000
+CURSOR_COALESCING_BUDGET_ARMS = ("dynamic", "fixed_100", "fixed_400")
+CURSOR_COALESCING_BUDGET_ORDERS = (
+    ("dynamic", "fixed_100", "fixed_400"),
+    ("fixed_100", "fixed_400", "dynamic"),
+    ("fixed_400", "dynamic", "fixed_100"),
+)
 POINT_PROGRESS_RING_ORDERS = (
     ("eager", "progress_ring"),
     ("progress_ring", "eager"),
@@ -647,6 +656,116 @@ def build_cursor_singleton_submission_schedule(
                     "cursor_singleton_submission_enabled": arm == "cursor_singleton",
                 })
     return schedule
+
+
+def build_cursor_coalescing_budget_schedule(
+    writers: Iterable[int] = CURSOR_COALESCING_BUDGET_WRITERS,
+) -> list[dict[str, object]]:
+    """Build a same-binary Dynamic/100/400 us Cursor Direct Point score sweep."""
+    writer_counts = validate_writer_counts(writers)
+    if writer_counts != CURSOR_COALESCING_BUDGET_WRITERS:
+        raise ValueError(
+            f"Cursor coalescing-budget qualification requires writers {CURSOR_COALESCING_BUDGET_WRITERS}"
+        )
+
+    schedule: list[dict[str, object]] = []
+    for repetition in range(1, CURSOR_COALESCING_BUDGET_REPETITIONS + 1):
+        writer_order = CURSOR_COALESCING_BUDGET_WRITERS if repetition % 2 else tuple(
+            reversed(CURSOR_COALESCING_BUDGET_WRITERS)
+        )
+        for writer_index, writer in enumerate(writer_order):
+            rotation = (repetition + writer_index - 1) % len(CURSOR_COALESCING_BUDGET_ORDERS)
+            order = CURSOR_COALESCING_BUDGET_ORDERS[rotation]
+            for arm in order:
+                schedule.append({
+                    "run_index": len(schedule) + 1,
+                    "writer": writer,
+                    "workload": "point",
+                    "repetition": repetition,
+                    "arm": arm,
+                    "bench": "wal_concurrent",
+                    "batch_entries": 1,
+                    "batch_size": None,
+                    "num": CURSOR_COALESCING_BUDGET_NUM,
+                    "sample_every": 10,
+                    "coalescing_budget_us": {
+                        "dynamic": None,
+                        "fixed_100": 100,
+                        "fixed_400": 400,
+                    }[arm],
+                    "extent_mode": "sliding-point-lookahead",
+                    "extent_window_bytes": POINT_LOOKAHEAD_WINDOW_BYTES,
+                    "frontier_mode": "direct",
+                    "progress_ring_enabled": True,
+                    "progress_cursor_enabled": True,
+                    "progress_counters_enabled": False,
+                    "cursor_direct_completion_enabled": True,
+                    "cursor_singleton_submission_enabled": False,
+                    "scan_diagnostics_enabled": False,
+                })
+    return schedule
+
+
+def build_cursor_coalescing_budget_plan(
+    *, machine_type: str, machine_spec: Mapping[str, int], commit: str,
+) -> dict[str, object]:
+    return {
+        "plan_schema_version": 1,
+        "suite": "v8-cursor-coalescing-budget",
+        "commit": commit,
+        "machine_type": machine_type,
+        "machine_spec": dict(machine_spec),
+        "writers": list(CURSOR_COALESCING_BUDGET_WRITERS),
+        "workloads": ["point"],
+        "arms": list(CURSOR_COALESCING_BUDGET_ARMS),
+        "repetitions": CURSOR_COALESCING_BUDGET_REPETITIONS,
+        "runs_planned": len(build_cursor_coalescing_budget_schedule()),
+        "num": CURSOR_COALESCING_BUDGET_NUM,
+        "value_size_bytes": 1024,
+        "latency_sample_every": 10,
+        "runtime_protocol": {
+            "progress_mode": "cursor (2)",
+            "completion": "direct",
+            "singleton_submission": False,
+            "frontier_mode": "direct",
+            "extent_preparation": "1 MiB sliding-point-lookahead",
+            "extent_policy_scan_diagnostics": False,
+            "coalescing_budget_us": {
+                "dynamic": "unset; preserve runtime adaptive policy",
+                "fixed_100": 100,
+                "fixed_400": 400,
+            },
+        },
+        "qualification_note": (
+            "Same-host, same-source, same-release-binary Cursor Direct Point comparison. Only the V8 coalescing "
+            "budget differs; no phase profiling is enabled. Five counterbalanced repetitions at 8 and 16 writers."
+        ),
+    }
+
+
+def validate_cursor_coalescing_budget_rows(
+    rows: list[Mapping[str, object]],
+) -> dict[str, object]:
+    schedule = build_cursor_coalescing_budget_schedule()
+    validation = _validate_point_progress_rows(rows, schedule)
+    invalid_rows: list[Mapping[str, object]] = []
+    for row in rows:
+        if (
+            row.get("progress_cursor_enabled") is not True
+            or row.get("progress_counters_enabled") is not False
+            or row.get("cursor_direct_completion_enabled") is not True
+            or row.get("cursor_singleton_submission_enabled") is not False
+            or row.get("coalescing_budget_us") != next(
+                (expected["coalescing_budget_us"] for expected in schedule
+                 if expected["run_index"] == row.get("run_index")),
+                object(),
+            )
+        ):
+            invalid_rows.append(row)
+    if invalid_rows:
+        validation["complete"] = False
+        validation["invalid_rows"].extend(dict(row) for row in invalid_rows)
+    return validation
 
 
 def build_point_progress_cursor_v2_schedule(writers: Iterable[int]) -> list[dict[str, object]]:

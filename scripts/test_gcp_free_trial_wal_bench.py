@@ -42,8 +42,13 @@ from gcp_wal_matrix import (
     POINT_PROGRESS_RING_WRITERS,
     CURSOR_DIRECT_COMPLETION_ARMS,
     CURSOR_SINGLETON_SUBMISSION_ARMS,
+    CURSOR_COALESCING_BUDGET_ARMS,
+    CURSOR_COALESCING_BUDGET_NUM,
+    CURSOR_COALESCING_BUDGET_WRITERS,
     build_cursor_direct_completion_plan,
     build_cursor_direct_completion_schedule,
+    build_cursor_coalescing_budget_plan,
+    build_cursor_coalescing_budget_schedule,
     build_cursor_singleton_submission_plan,
     build_cursor_singleton_submission_schedule,
     V8_EXTENT_POLICY_STORAGE_NUM,
@@ -85,6 +90,7 @@ from gcp_wal_matrix import (
     validate_point_progress_ring_rows,
     validate_cursor_direct_completion_rows,
     validate_cursor_singleton_submission_rows,
+    validate_cursor_coalescing_budget_rows,
     validate_v8_extent_policy_storage_rows,
     validate_v8_mutex_diagnostic_rows,
     validate_v8_point_cpu_attribution_rows,
@@ -419,6 +425,7 @@ class PointProgressRingQualificationTests(unittest.TestCase):
         cursor: bool = False,
         direct_completion: bool = False,
         singleton_submission: bool = False,
+        coalescing_budget: bool = False,
         cursor_schema_version: int | None = None,
         include_schema_version: bool = True,
     ) -> Path:
@@ -426,7 +433,10 @@ class PointProgressRingQualificationTests(unittest.TestCase):
         results.mkdir()
         commit = "a" * 40
         binary_sha = "b" * 64
-        if singleton_submission:
+        if coalescing_budget:
+            schedule_builder = build_cursor_coalescing_budget_schedule
+            plan_builder = build_cursor_coalescing_budget_plan
+        elif singleton_submission:
             schedule_builder = build_cursor_singleton_submission_schedule
             plan_builder = build_cursor_singleton_submission_plan
         elif direct_completion:
@@ -441,20 +451,29 @@ class PointProgressRingQualificationTests(unittest.TestCase):
         else:
             schedule_builder = build_point_progress_ring_schedule
             plan_builder = build_point_progress_ring_plan
-        schedule = schedule_builder(POINT_PROGRESS_RING_WRITERS)
-        plan = plan_builder(
-            writers=POINT_PROGRESS_RING_WRITERS,
-            machine_type="c4-standard-16-lssd",
-            machine_spec=BENCH.MACHINE_SPECS["c4-standard-16-lssd"],
-            commit=commit,
-            binary_sha256=binary_sha,
-        )
+        writers = CURSOR_COALESCING_BUDGET_WRITERS if coalescing_budget else POINT_PROGRESS_RING_WRITERS
+        schedule = schedule_builder(writers)
+        if coalescing_budget:
+            plan = plan_builder(
+                machine_type="c4-standard-16-lssd",
+                machine_spec={"vcpus": 16, "ssd_count": 2, "ssd_gib": 750},
+                commit=commit,
+            )
+        else:
+            plan = plan_builder(
+                writers=writers,
+                machine_type="c4-standard-16-lssd",
+                machine_spec=BENCH.MACHINE_SPECS["c4-standard-16-lssd"],
+                commit=commit,
+                binary_sha256=binary_sha,
+            )
         if not include_schema_version:
             plan.pop("plan_schema_version", None)
         (results / "benchmark-plan.json").write_text(json.dumps(plan), encoding="utf-8")
         (results / "commit.txt").write_text(commit + "\n", encoding="utf-8")
         (results / "write-perf.sha256").write_text(binary_sha + "\n", encoding="utf-8")
         schedule_name = (
+            "cursor-coalescing-budget-schedule.tsv" if coalescing_budget else
             "cursor-singleton-submission-schedule.tsv" if singleton_submission else
             "cursor-direct-completion-schedule.tsv" if direct_completion else
             "point-progress-cursor-schedule.tsv" if cursor else
@@ -486,11 +505,14 @@ class PointProgressRingQualificationTests(unittest.TestCase):
                     bool(row["progress_ring_enabled"]), bool(row.get("progress_cursor_enabled", False)),
                     row.get("progress_counters_enabled"), row.get("cursor_direct_completion_enabled"),
                     row.get("cursor_singleton_submission_enabled"),
+                    row.get("coalescing_budget_us"),
                 ),
                 encoding="utf-8",
             )
             rows.append(metadata)
-        if singleton_submission:
+        if coalescing_budget:
+            summary = progress_ring_runner._coalescing_budget_summary(rows, writers, len(schedule))
+        elif singleton_submission:
             summary = progress_ring_runner._singleton_submission_summary(
                 rows, POINT_PROGRESS_RING_WRITERS, len(schedule),
             )
@@ -665,6 +687,49 @@ class PointProgressRingQualificationTests(unittest.TestCase):
             self.assertFalse(verification["verified"])
             self.assertTrue(any("metadata" in error or "matrix" in error for error in verification["errors"]))
 
+    def test_cursor_coalescing_budget_fixture_verifies_dynamic_and_fixed_arms(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            results = self._make_fixture(Path(temporary), coalescing_budget=True)
+            schedule = build_cursor_coalescing_budget_schedule(CURSOR_COALESCING_BUDGET_WRITERS)
+            self.assertEqual(len(schedule), 30)
+            self.assertEqual({row["arm"] for row in schedule}, set(CURSOR_COALESCING_BUDGET_ARMS))
+            self.assertEqual({row["writer"] for row in schedule}, {8, 16})
+            summary = json.loads((results / "summary.json").read_text(encoding="utf-8"))
+            self.assertTrue(validate_cursor_coalescing_budget_rows(summary["results"])["complete"])
+            self.assertTrue(progress_ring_runner.verify_coalescing_budget_results_directory(results)["verified"])
+            self.assertTrue(BENCH._verify_result_set(results)["verified"])
+            plan = json.loads((results / "benchmark-plan.json").read_text(encoding="utf-8"))
+            self.assertEqual(plan["suite"], "v8-cursor-coalescing-budget")
+            self.assertEqual(plan["runs_planned"], 30)
+            self.assertEqual(plan["arms"], list(CURSOR_COALESCING_BUDGET_ARMS))
+
+            dynamic = next(row for row in schedule if row["arm"] == "dynamic")
+            fixed = next(row for row in schedule if row["arm"] == "fixed_100")
+            dynamic_environment = (results / progress_ring_runner._run_id(dynamic) / "environment.txt").read_text(
+                encoding="utf-8",
+            )
+            fixed_environment = (results / progress_ring_runner._run_id(fixed) / "environment.txt").read_text(
+                encoding="utf-8",
+            )
+            self.assertIn("TOYKV_WAL_V8_COALESCE_BUDGET_US=<unset>\n", dynamic_environment)
+            self.assertNotIn(
+                "TOYKV_WAL_V8_COALESCE_BUDGET_US",
+                progress_ring_runner._environment(True, True, False, True, False),
+            )
+            self.assertIn("TOYKV_WAL_V8_COALESCE_BUDGET_US=100\n", fixed_environment)
+            self.assertTrue(dynamic["progress_cursor_enabled"])
+            self.assertTrue(dynamic["cursor_direct_completion_enabled"])
+            self.assertFalse(dynamic["cursor_singleton_submission_enabled"])
+            self.assertEqual(dynamic["num"], CURSOR_COALESCING_BUDGET_NUM)
+
+            fixed_metadata_path = results / progress_ring_runner._run_id(fixed) / "run-metadata.json"
+            metadata = json.loads(fixed_metadata_path.read_text(encoding="utf-8"))
+            metadata["coalescing_budget_us"] = 400
+            fixed_metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+            verification = progress_ring_runner.verify_coalescing_budget_results_directory(results)
+            self.assertFalse(verification["verified"])
+            self.assertTrue(any("metadata" in error or "matrix" in error for error in verification["errors"]))
+
     def test_run_suite_writes_separate_direct_completion_plan_and_schedule(self) -> None:
         binary = Path("scripts/gcp_v8_point_progress_ring_runner.py")
         binary_sha256 = self._sha256(binary)
@@ -749,6 +814,57 @@ class PointProgressRingQualificationTests(unittest.TestCase):
             self.assertEqual(plan["suite"], "v8-cursor-singleton-submission")
             self.assertEqual(summary["suite"], "v8-cursor-singleton-submission")
             self.assertEqual(summary["arms"], list(CURSOR_SINGLETON_SUBMISSION_ARMS))
+            self.assertTrue(summary["complete"])
+
+    def test_run_suite_writes_coalescing_budget_plan_and_counterbalanced_schedule(self) -> None:
+        binary = Path("scripts/gcp_v8_point_progress_ring_runner.py")
+        binary_sha256 = self._sha256(binary)
+        commit = "a" * 40
+
+        def fake_run_one(**kwargs: object) -> dict[str, object]:
+            row = kwargs["row"]
+            kwargs["on_subprocess_started"]()
+            raw = self._raw_record(row)
+            return {
+                **row,
+                "source_commit": commit,
+                "binary_sha256": binary_sha256,
+                "exit_code": 0,
+                "duration_seconds": 5.0,
+                **progress_ring_runner._validate_record(raw, row),
+            }
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args = SimpleNamespace(
+                commit=commit,
+                binary=binary,
+                binary_sha256=binary_sha256,
+                machine_type="c4-standard-16-lssd",
+                ssd_count=2,
+                ssd_gib=750,
+                writers="8,16",
+                results_dir=root / "results",
+                db_root=root / "db",
+                safe_deadline_epoch=4_000_000_000,
+                candidate_mode="coalescing-budget",
+            )
+            with patch.object(progress_ring_runner, "_run_one", side_effect=fake_run_one):
+                status = progress_ring_runner.run_suite(args)
+            self.assertEqual(status, 0)
+            schedule_path = args.results_dir / "cursor-coalescing-budget-schedule.tsv"
+            self.assertTrue(schedule_path.is_file())
+            with schedule_path.open(encoding="utf-8", newline="") as stream:
+                schedule = list(csv.DictReader(stream, delimiter="\t"))
+            self.assertEqual(len(schedule), 30)
+            self.assertEqual({row["writer"] for row in schedule}, {"8", "16"})
+            self.assertEqual({row["arm"] for row in schedule}, set(CURSOR_COALESCING_BUDGET_ARMS))
+            self.assertFalse((args.results_dir / "point-progress-cursor-schedule.tsv").exists())
+            plan = json.loads((args.results_dir / "benchmark-plan.json").read_text(encoding="utf-8"))
+            summary = json.loads((args.results_dir / "summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(plan["suite"], "v8-cursor-coalescing-budget")
+            self.assertEqual(plan["runs_planned"], 30)
+            self.assertEqual(summary["suite"], "v8-cursor-coalescing-budget")
             self.assertTrue(summary["complete"])
 
     def test_historical_progress_plan_schemas_remain_verifiable(self) -> None:
@@ -972,6 +1088,24 @@ class PointProgressRingQualificationTests(unittest.TestCase):
                     )],
                     *suffix,
                 ])
+
+    def test_coalescing_budget_cli_selects_point8_point16_and_fixed_workload(self) -> None:
+        valid = [
+            "--project", "test-project", "--zone", "us-east1-b", "--commit", "a" * 40,
+            "--network", "walbench-isolated", "--subnet", "walbench-subnet",
+            "--ssh-source-range", "192.0.2.10/32", "--max-runtime-minutes", "60",
+            "--estimated-hourly-cost-usd", "1.5", "--max-estimated-spend-usd", "2",
+            "--v8-cursor-coalescing-budget-ab", "--preflight-only",
+        ]
+        args = BENCH.parse_args(valid)
+        self.assertEqual(args.writers, CURSOR_COALESCING_BUDGET_WRITERS)
+        self.assertEqual(args.num, CURSOR_COALESCING_BUDGET_NUM)
+        self.assertEqual(args.machine_type, "c4-standard-16-lssd")
+        self.assertTrue(args.v8_cursor_coalescing_budget_ab)
+        with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
+            BENCH.parse_args([*valid, "--writers", "16"])
+        with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
+            BENCH.parse_args([*valid, "--num", "100001"])
 
     def test_remote_runner_accepts_direct_completion_suite_only_for_fixed_matrix(self) -> None:
         remote_script = Path(__file__).with_name("gcp-free-trial-wal-bench-remote.sh")
@@ -4440,7 +4574,7 @@ print('[hotpath] diagnostic report follows')
             run_dir.mkdir(parents=True)
             for name in (
                 "profile-schedule.tsv", "cursor-direct-completion-schedule.tsv", "rust-toolchain.txt",
-                "write-perf.sha256", "perf-version.txt",
+                "cursor-coalescing-budget-schedule.tsv", "write-perf.sha256", "perf-version.txt",
             ):
                 (results / name).write_text("fixture\n", encoding="utf-8")
             for name in (
@@ -4454,7 +4588,7 @@ print('[hotpath] diagnostic report follows')
             result = self._run_remote_bundle(command, results, root)
             self.assertEqual(result.returncode, 0, result.stderr)
             metadata = self._archive_metadata(result.stdout)
-            self.assertEqual(metadata["ARCHIVE_FILES"], "12")
+            self.assertEqual(metadata["ARCHIVE_FILES"], "13")
             archive = Path(metadata["ARCHIVE_PATH"])
             self.assertEqual(archive.parent, root / "remote-tmp")
             with tarfile.open(archive, "r:gz") as bundle:
@@ -4462,6 +4596,7 @@ print('[hotpath] diagnostic report follows')
             for name in (
                 "results/profile-schedule.tsv", "results/rust-toolchain.txt",
                 "results/cursor-direct-completion-schedule.tsv",
+                "results/cursor-coalescing-budget-schedule.tsv",
                 "results/write-perf.sha256", "results/perf-version.txt",
                 "results/r1-w16-point-v8_parallel/stderr.log", "results/r1-w16-point-v8_parallel/timeline.json",
                 "results/r1-w16-point-v8_parallel/perf.data", "results/r1-w16-point-v8_parallel/perf-report.txt",
