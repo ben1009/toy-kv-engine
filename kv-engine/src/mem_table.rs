@@ -658,6 +658,8 @@ pub struct WalCpuAttributionObservation {
     pub preflight_cpu_ns: u64,
     pub sequencer_wait_wall_ns: u64,
     pub sequencer_wait_cpu_ns: u64,
+    pub sequencer_hold_wall_ns: u64,
+    pub sequencer_hold_cpu_ns: u64,
     pub commit_setup_wall_ns: u64,
     pub commit_setup_cpu_ns: u64,
     pub admission_wall_ns: u64,

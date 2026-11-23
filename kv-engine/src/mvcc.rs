@@ -1369,6 +1369,8 @@ impl LsmMvccInner {
         let phase_timer = WalCpuPhaseTimer::start(cpu_attribution.is_some());
         let write_guard = self.write_lock.lock();
         #[cfg(feature = "bench")]
+        let hold_timer = WalCpuPhaseTimer::start(cpu_attribution.is_some());
+        #[cfg(feature = "bench")]
         if let Some(sample) = cpu_attribution.as_mut() {
             let (wall_ns, cpu_ns) = phase_timer.finish();
             sample.observation.sequencer_wait_wall_ns = wall_ns;
@@ -1428,6 +1430,12 @@ impl LsmMvccInner {
         #[cfg(feature = "bench")]
         if let Some(sample) = cpu_attribution.as_mut() {
             sample.observation.ticket = ticket;
+        }
+        #[cfg(feature = "bench")]
+        if let Some(sample) = cpu_attribution.as_mut() {
+            let (wall_ns, cpu_ns) = hold_timer.finish();
+            sample.observation.sequencer_hold_wall_ns = wall_ns;
+            sample.observation.sequencer_hold_cpu_ns = cpu_ns;
         }
         drop(write_guard);
         if let Some(frame_job) = frame_job {

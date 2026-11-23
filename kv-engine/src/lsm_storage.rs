@@ -40421,11 +40421,40 @@ mod tests {
     #[test]
     fn v8_point_buffer_preallocation_survives_concurrent_rotation_and_recovery()
     -> anyhow::Result<()> {
+        exercise_point_preallocation_rotation(8, false)
+    }
+
+    #[cfg(all(target_os = "linux", feature = "bench"))]
+    #[test]
+    fn v8_point_resource_preclaim_survives_mixed_rotation_and_recovery() -> anyhow::Result<()> {
+        const CHILD: &str = "TOYKV_TEST_POINT_PRECLAIM_MIXED_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            return exercise_point_preallocation_rotation(16, true);
+        }
+        let output = std::process::Command::new(std::env::current_exe()?)
+            .args(["--exact", "lsm_storage::tests::v8_point_resource_preclaim_survives_mixed_rotation_and_recovery", "--nocapture"])
+            .env(CHILD, "1")
+            .env("TOYKV_BENCH_V8_POINT_RESOURCE_PRECLAIM", "1")
+            .output()?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "{stdout}\n{stderr}"
+        );
+        eprint!("{stderr}");
+        Ok(())
+    }
+
+    #[cfg(all(target_os = "linux", feature = "bench"))]
+    fn exercise_point_preallocation_rotation(
+        writer_count: usize,
+        mixed: bool,
+    ) -> anyhow::Result<()> {
         use crate::pitr::api::{PersistedPitrConfig, PitrOptions, PitrRuntimeOptions};
         use crate::tests::harness::is_io_uring_unavailable_error;
         use crate::wal::WalIoMode;
 
-        const WRITER_COUNT: usize = 8;
         const PHASE_COUNT: usize = 3;
         const WRITES_PER_PHASE: usize = 12;
         const WRITES_BEFORE_ROTATION: usize = 2;
@@ -40473,16 +40502,16 @@ mod tests {
             .inner
             .set_v8_point_buffer_preallocation_for_test(true)?;
 
-        let start_phase = Arc::new(std::sync::Barrier::new(WRITER_COUNT + 1));
-        let rotate_now = Arc::new(std::sync::Barrier::new(WRITER_COUNT + 1));
-        let after_rotation = Arc::new(std::sync::Barrier::new(WRITER_COUNT + 1));
-        let finish_phase = Arc::new(std::sync::Barrier::new(WRITER_COUNT + 1));
+        let start_phase = Arc::new(std::sync::Barrier::new(writer_count + 1));
+        let rotate_now = Arc::new(std::sync::Barrier::new(writer_count + 1));
+        let after_rotation = Arc::new(std::sync::Barrier::new(writer_count + 1));
+        let finish_phase = Arc::new(std::sync::Barrier::new(writer_count + 1));
         let first_error = Arc::new(parking_lot::Mutex::new(None::<anyhow::Error>));
         let mut test_memtables = vec![engine.inner.state.load().memtable.clone()];
         let mut recovery_points = 0;
 
         std::thread::scope(|scope| {
-            for writer in 0..WRITER_COUNT {
+            for writer in 0..writer_count {
                 let engine = Arc::clone(&engine);
                 let start_phase = Arc::clone(&start_phase);
                 let rotate_now = Arc::clone(&rotate_now);
@@ -40494,7 +40523,12 @@ mod tests {
                         start_phase.wait();
                         for write in 0..WRITES_BEFORE_ROTATION {
                             let key = format!("writer-{writer}-phase-{phase}-put-{write}");
-                            if let Err(error) = engine.put(key.as_bytes(), VALUE) {
+                            let result = if mixed && writer % 8 == 0 {
+                                engine.write_batch(&[WriteBatchRecord::Put(key.as_bytes(), VALUE)])
+                            } else {
+                                engine.put(key.as_bytes(), VALUE)
+                            };
+                            if let Err(error) = result {
                                 let mut first_error = first_error.lock();
                                 if first_error.is_none() {
                                     *first_error = Some(error);
@@ -40505,7 +40539,12 @@ mod tests {
                         after_rotation.wait();
                         for write in WRITES_BEFORE_ROTATION..WRITES_PER_PHASE {
                             let key = format!("writer-{writer}-phase-{phase}-put-{write}");
-                            if let Err(error) = engine.put(key.as_bytes(), VALUE) {
+                            let result = if mixed && writer % 8 == 0 {
+                                engine.write_batch(&[WriteBatchRecord::Put(key.as_bytes(), VALUE)])
+                            } else {
+                                engine.put(key.as_bytes(), VALUE)
+                            };
+                            if let Err(error) = result {
                                 let mut first_error = first_error.lock();
                                 if first_error.is_none() {
                                     *first_error = Some(error);
@@ -40549,7 +40588,7 @@ mod tests {
         assert_eq!(recovery_points, PHASE_COUNT);
         engine.sync()?;
 
-        let expected_values = (0..WRITER_COUNT)
+        let expected_values = (0..writer_count)
             .flat_map(|writer| {
                 (0..PHASE_COUNT).flat_map(move |phase| {
                     (0..WRITES_PER_PHASE)
@@ -40593,6 +40632,19 @@ mod tests {
             item.point_buffer_preallocation_attempts
                 == item.point_buffer_preallocation_hits + item.point_buffer_preallocation_fallbacks
         }));
+        if mixed {
+            assert!(
+                diagnostics
+                    .iter()
+                    .all(|item| item.point_resource_preclaim_promoted > 0)
+            );
+            assert!(
+                diagnostics
+                    .iter()
+                    .all(|item| item.point_resource_preclaim_attempts
+                        <= ((writer_count - writer_count.div_ceil(8)) * WRITES_PER_PHASE) as u64)
+            );
+        }
         drop(test_memtables);
 
         engine.close()?;

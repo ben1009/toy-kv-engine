@@ -8463,6 +8463,31 @@ mod tests {
             };
             #[cfg(not(feature = "bench"))]
             let value = batch(10);
+            #[cfg(feature = "bench")]
+            if std::env::var_os(EXTENT_PREPARATION_ENV).as_deref()
+                == Some(OsStr::new("sliding-point-lookahead"))
+            {
+                let mut writer = writer;
+                writer.point_resource_preclaim_enabled = true;
+                let mut scratch =
+                    WalV8PointAdmissionScratch::new(writer.preflight_batch_with_write_class(
+                        &value,
+                        LIVE_WAL_V5_LIMITS,
+                        WalV8WriteClass::Point,
+                    )?);
+                writer.try_preallocate_point_buffer(&mut scratch);
+                ensure!(
+                    scratch.has_quota_preclaim(),
+                    "crash child failed to get a claim"
+                );
+                let job = writer.admit_prepared_point_batch(scratch, 10, value.recorded_at)?;
+                let ticket = job.assignment().segment_ticket;
+                ensure!(writer.io_diagnostics().point_resource_preclaim_promoted == 1);
+                job.finish()?;
+                writer.wait_durable(ticket)?;
+                std::fs::write(ack_path, b"acknowledged")?;
+                anyhow::bail!("configured V8 writer crash point did not stop the child");
+            }
             writer.append_prepared_batch(
                 writer.preflight_batch(&value, LIVE_WAL_V5_LIMITS)?,
                 10,

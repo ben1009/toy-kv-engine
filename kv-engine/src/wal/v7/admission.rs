@@ -2126,6 +2126,33 @@ mod tests {
 
     #[cfg(feature = "bench")]
     #[test]
+    fn point_preclaim_unwinds_before_ticket_and_obeys_id_boundary() {
+        let ledger = WalV7ResourceLedger::new(limits()).unwrap();
+        let full = charge(100, 100, 0, 40, 32);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _claim = ledger.try_preclaim(full).unwrap();
+            panic!("simulated producer unwind before admission");
+        }));
+        assert!(result.is_err());
+        assert!(ledger.try_preclaim(full).is_some());
+        assert_eq!(ledger.snapshot(), WalV7ResourceCharge::default());
+
+        // Issuing a claim consumes a shared ID, even if the claim is dropped.
+        ledger.inner.state.lock().next_id = u64::MAX - 1;
+        let mut last = ledger.try_preclaim(full).unwrap();
+        assert!(ledger.try_preclaim(full).is_none());
+        assert!(matches!(
+            ledger.reserve(full),
+            Err(WalV7ReservationError::ReservationIdExhausted)
+        ));
+        let promoted = ledger.promote_preclaim(&mut last).unwrap().unwrap();
+        assert_eq!(promoted.id, u64::MAX - 1);
+        drop(promoted);
+        assert_eq!(ledger.snapshot(), WalV7ResourceCharge::default());
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
     fn point_preclaim_respects_maintenance_headroom_and_limit_changes() {
         let ledger =
             WalV7ResourceLedger::new_with_maintenance_buffer_reserve(limits(), 10).unwrap();
