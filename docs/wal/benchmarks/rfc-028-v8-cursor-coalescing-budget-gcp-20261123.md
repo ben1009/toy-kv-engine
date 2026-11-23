@@ -50,4 +50,4 @@ Absolute throughput was about 25.6–27.7k puts/s, below earlier C4 Point runs. 
 - GCP cleanup verified: VM, boot disk, temporary SSH rule, VPC, subnet, and route absent; Terraform state has zero resources.
 - GCP runner tests: 178 passed; remote shell syntax check passed.
 
-The checked-in runner archive allowlist was missing `cursor-coalescing-budget-schedule.tsv`; this prevented strict local verification on the first collection. The allowlist and regression test were fixed locally, the targeted archive test passed, and recollection then passed full verification. The change remains uncommitted.
+The runner archive allowlist initially omitted `cursor-coalescing-budget-schedule.tsv`, preventing strict local verification on the first collection. This revision includes the allowlist fix and regression test; the targeted test passed, and recollection then passed full verification.
