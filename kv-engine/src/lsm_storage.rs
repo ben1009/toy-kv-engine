@@ -19194,6 +19194,19 @@ impl LsmStorageInner {
             None => {}
         }
 
+        // V8 rejects this batch before ticket assignment when the current PITR
+        // segment cannot fit it. Rotate the still-active source before retrying.
+        if error.downcast_ref::<crate::wal::v8::leader::WalV8LeaderCapacityError>()
+            == Some(&crate::wal::v8::leader::WalV8LeaderCapacityError::RotationRequired)
+        {
+            return self.rotate_after_wal_full(
+                error,
+                expected_memtable,
+                retries,
+                allow_lifecycle_closing,
+            );
+        }
+
         if !crate::wal::Wal::is_retryable_full_error(&error) {
             return Err(error);
         }
@@ -40274,18 +40287,39 @@ mod tests {
                 std::thread::spawn(move || -> anyhow::Result<()> {
                     barrier.wait();
                     for index in 0..WRITES_PER_WRITER {
-                        let active = engine.inner.state.load().memtable.clone();
-                        if active.uses_v8_wal() {
-                            active.set_v8_point_buffer_preallocation_for_test(true)?;
-                        }
-                        let mut seen = seen_memtables.lock().expect("test memtable list lock");
-                        if !seen.iter().any(|memtable| memtable.id() == active.id()) {
-                            seen.push(active);
-                        }
-                        drop(seen);
-
                         let key = format!("point-{writer:02}-{index:03}");
-                        engine.put(key.as_bytes(), VALUE)?;
+                        let retry_deadline =
+                            std::time::Instant::now() + std::time::Duration::from_secs(5);
+                        loop {
+                            let active = engine.inner.state.load().memtable.clone();
+                            if active.uses_v8_wal() {
+                                active.set_v8_point_buffer_preallocation_for_test(true)?;
+                            }
+                            let mut seen =
+                                seen_memtables.lock().expect("test memtable list lock");
+                            if !seen.iter().any(|memtable| memtable.id() == active.id()) {
+                                seen.push(active);
+                            }
+                            drop(seen);
+
+                            match engine.put(key.as_bytes(), VALUE) {
+                                Ok(()) => break,
+                                Err(error)
+                                    if error.chain().any(|cause| {
+                                        cause.to_string()
+                                            == "commit admission is stopped at a PITR barrier"
+                                    }) =>
+                                {
+                                    if std::time::Instant::now() >= retry_deadline {
+                                        return Err(error.context(
+                                            "PITR admission did not reopen during concurrent rotation",
+                                        ));
+                                    }
+                                    std::thread::sleep(std::time::Duration::from_millis(1));
+                                }
+                                Err(error) => return Err(error),
+                            }
+                        }
                     }
                     Ok(())
                 })
