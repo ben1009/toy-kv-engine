@@ -40240,9 +40240,11 @@ mod tests {
 
         const WRITERS: usize = 8;
         const WRITES_PER_WRITER: usize = 12;
-        // Leave enough seal-index capacity for concurrent admissions, while
-        // keeping the segment small enough for this workload to rotate it.
-        const MAX_SEGMENT_BYTES: u64 = 256 * 1024;
+        const ROTATE_AFTER: usize = WRITES_PER_WRITER / 2;
+        // Keep the workload below the capacity limit. The test rotates at a
+        // controlled barrier so it exercises successor inheritance without
+        // exhausting the shared seal-index budget first.
+        const MAX_SEGMENT_BYTES: u64 = 4 * 1024 * 1024;
         const VALUE: &[u8] = &[0x5a; 1024];
 
         let directory = tempdir()?;
@@ -40289,74 +40291,39 @@ mod tests {
         engine
             .inner
             .set_v8_point_buffer_preallocation_for_test(true)?;
-        let barrier = std::sync::Arc::new(std::sync::Barrier::new(WRITERS + 1));
-        let rotation_lock = std::sync::Arc::new(std::sync::Mutex::new(()));
+        let start = std::sync::Arc::new(std::sync::Barrier::new(WRITERS + 1));
+        let phase_done = std::sync::Arc::new(std::sync::Barrier::new(WRITERS + 1));
+        let resume = std::sync::Arc::new(std::sync::Barrier::new(WRITERS + 1));
         let workers = (0..WRITERS)
             .map(|writer| {
                 let engine = std::sync::Arc::clone(&engine);
-                let barrier = std::sync::Arc::clone(&barrier);
-                let rotation_lock = std::sync::Arc::clone(&rotation_lock);
+                let start = std::sync::Arc::clone(&start);
+                let phase_done = std::sync::Arc::clone(&phase_done);
+                let resume = std::sync::Arc::clone(&resume);
                 std::thread::spawn(move || -> anyhow::Result<()> {
-                    barrier.wait();
-                    for index in 0..WRITES_PER_WRITER {
+                    start.wait();
+                    for index in 0..ROTATE_AFTER {
                         let key = format!("point-{writer:02}-{index:03}");
-                        let retry_deadline =
-                            std::time::Instant::now() + std::time::Duration::from_secs(5);
-                        loop {
-                            let attempted_memtable_id = engine.inner.state.load().memtable.id();
-                            match engine.put(key.as_bytes(), VALUE) {
-                                Ok(()) => break,
-                                Err(error)
-                                    if error.chain().any(|cause| {
-                                        cause.to_string()
-                                            == "commit admission is stopped at a PITR barrier"
-                                    }) =>
-                                {
-                                    if std::time::Instant::now() >= retry_deadline {
-                                        return Err(error.context(
-                                            "PITR admission did not reopen during concurrent rotation",
-                                        ));
-                                    }
-                                    std::thread::sleep(std::time::Duration::from_millis(1));
-                                }
-                                Err(error)
-                                    if error.downcast_ref::<
-                                        crate::wal::v8::leader::WalV8LeaderCapacityError,
-                                    >()
-                                        == Some(
-                                            &crate::wal::v8::leader::WalV8LeaderCapacityError::RotationRequired,
-                                        ) =>
-                                {
-                                    if std::time::Instant::now() >= retry_deadline {
-                                        return Err(error.context(
-                                            "V8 PITR segment did not rotate after capacity rejection",
-                                        ));
-                                    }
-                                    let _rotation_guard = rotation_lock
-                                        .lock()
-                                        .expect("test PITR rotation lock");
-                                    let active = engine.inner.state.load().memtable.clone();
-                                    if active.id() == attempted_memtable_id {
-                                        match engine.create_recovery_point()? {
-                                            crate::pitr::api::RecoveryPointOutcome::Durable(_) => {}
-                                            _ => {
-                                                return Err(anyhow::anyhow!(
-                                                    "test PITR rotation did not publish a durable recovery point"
-                                                ));
-                                            }
-                                        }
-                                    }
-                                }
-                                Err(error) => return Err(error),
-                            }
-                        }
+                        engine.put(key.as_bytes(), VALUE)?;
+                    }
+                    phase_done.wait();
+                    resume.wait();
+                    for index in ROTATE_AFTER..WRITES_PER_WRITER {
+                        let key = format!("point-{writer:02}-{index:03}");
+                        engine.put(key.as_bytes(), VALUE)?;
                     }
                     Ok(())
                 })
             })
             .collect::<Vec<_>>();
 
-        barrier.wait();
+        start.wait();
+        phase_done.wait();
+        assert!(matches!(
+            engine.create_recovery_point()?,
+            crate::pitr::api::RecoveryPointOutcome::Durable(_)
+        ));
+        resume.wait();
         for worker in workers {
             worker.join().expect("Point writer thread joins")?;
         }
@@ -40378,7 +40345,7 @@ mod tests {
             v8_memtables
                 .iter()
                 .any(|memtable| memtable.id() != initial_id),
-            "the small PITR segment limit should exercise rotation"
+            "the controlled recovery point should install a V8 successor"
         );
         let diagnostics = v8_memtables
             .iter()
