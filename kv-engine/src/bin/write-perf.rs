@@ -1928,10 +1928,10 @@ struct WalIoDiagnosticsRecord {
     progress_cursor_enabled: bool,
     cursor_direct_completion_enabled: bool,
     cursor_singleton_submission_enabled: bool,
-    point_resource_preclaim_enabled: bool,
-    point_resource_preclaim_attempts: u64,
-    point_resource_preclaim_hits: u64,
-    point_resource_preclaim_fallbacks: u64,
+    point_buffer_preallocation_enabled: bool,
+    point_buffer_preallocation_attempts: u64,
+    point_buffer_preallocation_hits: u64,
+    point_buffer_preallocation_fallbacks: u64,
     #[cfg(feature = "bench")]
     #[serde(skip_serializing_if = "Option::is_none")]
     progress_diagnostics: Option<kv_engine::wal::WalV8ProgressDiagnostics>,
@@ -2059,10 +2059,10 @@ impl From<WalIoDiagnostics> for WalIoDiagnosticsRecord {
             progress_cursor_enabled: diagnostics.progress_cursor_enabled,
             cursor_direct_completion_enabled: diagnostics.cursor_direct_completion_enabled,
             cursor_singleton_submission_enabled: diagnostics.cursor_singleton_submission_enabled,
-            point_resource_preclaim_enabled: diagnostics.point_resource_preclaim_enabled,
-            point_resource_preclaim_attempts: diagnostics.point_resource_preclaim_attempts,
-            point_resource_preclaim_hits: diagnostics.point_resource_preclaim_hits,
-            point_resource_preclaim_fallbacks: diagnostics.point_resource_preclaim_fallbacks,
+            point_buffer_preallocation_enabled: diagnostics.point_buffer_preallocation_enabled,
+            point_buffer_preallocation_attempts: diagnostics.point_buffer_preallocation_attempts,
+            point_buffer_preallocation_hits: diagnostics.point_buffer_preallocation_hits,
+            point_buffer_preallocation_fallbacks: diagnostics.point_buffer_preallocation_fallbacks,
             progress_diagnostics: diagnostics.progress_diagnostics,
         }
     }
@@ -2088,7 +2088,7 @@ impl WalIoDiagnosticsRecord {
             && self.progress_cursor_enabled == other.progress_cursor_enabled
             && self.cursor_direct_completion_enabled == other.cursor_direct_completion_enabled
             && self.cursor_singleton_submission_enabled == other.cursor_singleton_submission_enabled
-            && self.point_resource_preclaim_enabled == other.point_resource_preclaim_enabled
+            && self.point_buffer_preallocation_enabled == other.point_buffer_preallocation_enabled
             && sliding_configuration_stable
     }
 }
@@ -12827,10 +12827,10 @@ mod tests {
                         progress_cursor_enabled: false,
                         cursor_direct_completion_enabled: false,
                         cursor_singleton_submission_enabled: false,
-                        point_resource_preclaim_enabled: false,
-                        point_resource_preclaim_attempts: 0,
-                        point_resource_preclaim_hits: 0,
-                        point_resource_preclaim_fallbacks: 0,
+                        point_buffer_preallocation_enabled: false,
+                        point_buffer_preallocation_attempts: 0,
+                        point_buffer_preallocation_hits: 0,
+                        point_buffer_preallocation_fallbacks: 0,
                         #[cfg(feature = "bench")]
                         progress_diagnostics: None,
                     }),
@@ -12856,10 +12856,10 @@ mod tests {
                         progress_cursor_enabled: false,
                         cursor_direct_completion_enabled: false,
                         cursor_singleton_submission_enabled: false,
-                        point_resource_preclaim_enabled: false,
-                        point_resource_preclaim_attempts: 0,
-                        point_resource_preclaim_hits: 0,
-                        point_resource_preclaim_fallbacks: 0,
+                        point_buffer_preallocation_enabled: false,
+                        point_buffer_preallocation_attempts: 0,
+                        point_buffer_preallocation_hits: 0,
+                        point_buffer_preallocation_fallbacks: 0,
                         #[cfg(feature = "bench")]
                         progress_diagnostics: None,
                     }),

@@ -167,14 +167,14 @@ pub struct WalIoDiagnostics {
     /// Whether Cursor DATA submissions use the benchmark-only allocation-free group
     /// representation.
     pub cursor_singleton_submission_enabled: bool,
-    /// Whether Point batches attempt the benchmark-only pre-admission resource claim.
-    pub point_resource_preclaim_enabled: bool,
-    /// Number of Point resource preclaim attempts during the run.
-    pub point_resource_preclaim_attempts: u64,
-    /// Number of Point resource preclaims successfully acquired before serialized admission.
-    pub point_resource_preclaim_hits: u64,
-    /// Number of preclaim misses that used the serialized fallback.
-    pub point_resource_preclaim_fallbacks: u64,
+    /// Whether Point batches attempt the bounded benchmark-only DATA-buffer preallocation.
+    pub point_buffer_preallocation_enabled: bool,
+    /// Number of Point DATA-buffer preallocation attempts during the run.
+    pub point_buffer_preallocation_attempts: u64,
+    /// Number of Point DATA buffers allocated before serialized admission.
+    pub point_buffer_preallocation_hits: u64,
+    /// Number of attempts that used the regular in-sequencer allocation path.
+    pub point_buffer_preallocation_fallbacks: u64,
     pub progress_diagnostics: Option<WalV8ProgressDiagnostics>,
 }
 
@@ -2627,12 +2627,12 @@ impl Wal {
     }
 
     #[cfg(feature = "bench")]
-    pub(crate) fn try_preclaim_v8_point_batch(
+    pub(crate) fn try_preallocate_v8_point_buffer(
         &self,
         scratch: &mut v8::leader::WalV8PointAdmissionScratch<'_>,
     ) -> bool {
         if let Some(writer) = &self.v8_parallel {
-            return writer.try_preclaim_point_admission(scratch);
+            return writer.try_preallocate_point_buffer(scratch);
         }
 
         false

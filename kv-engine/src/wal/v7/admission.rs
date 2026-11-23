@@ -528,52 +528,6 @@ impl WalV7ReservationOwner {
         })
     }
 
-    /// Try to reserve one batch without waiting on the owner or shared ledger
-    /// mutexes. This is for speculative pre-admission only; callers must fall
-    /// back to `reserve_batch_charge` when the owner is contended or resources
-    /// are unavailable.
-    #[cfg(feature = "bench")]
-    pub(crate) fn try_reserve_batch_charge(
-        self: &Arc<Self>,
-        charge: WalV7ResourceCharge,
-        frontier_source_credit: u64,
-    ) -> Result<Option<WalV7OwnedBatchReservation>, WalV7ReservationError> {
-        if charge.logical_wal_bytes < WAL_V7_FRAME_LEN as u64
-            || frontier_source_credit < WAL_V7_FRAME_LEN as u64
-            || charge.source_spool_bytes < frontier_source_credit
-        {
-            return Err(WalV7ReservationError::InvalidBatchLength);
-        }
-        let Some(mut state) = self.state.try_lock() else {
-            return Ok(None);
-        };
-        if state.retired {
-            return Err(WalV7ReservationError::ReservationOwnerRetired);
-        }
-        let active_batch_operations = state
-            .active_batch_operations
-            .checked_add(1)
-            .ok_or(WalV7ReservationError::ArithmeticOverflow)?;
-        let Some(reservation) = self.ledger.try_reserve(charge)? else {
-            return Ok(None);
-        };
-        let id = reservation.id;
-        state.reservations.insert(id, reservation);
-        state.active_batch_operations = active_batch_operations;
-        drop(state);
-
-        Ok(Some(WalV7OwnedBatchReservation {
-            operation: Arc::new(WalV7BatchOperation {
-                owner: Arc::clone(self),
-                id,
-                admitted: AtomicBool::new(false),
-                finished: false,
-            }),
-            frontier_credit_held: true,
-            frontier_source_credit,
-        }))
-    }
-
     /// Reserve source-spool bytes for an extent allocated ahead of admitted
     /// WAL frames. The reservation belongs to this image and remains charged
     /// until durable source cleanup retires the image owner.
@@ -842,17 +796,6 @@ impl WalV7OwnedBatchReservation {
     /// Mark the reservation persistent immediately after coordinates advance.
     pub(crate) fn mark_admitted(&mut self) {
         self.operation.admitted.store(true, Ordering::Release);
-    }
-
-    /// Check whether a speculative reservation's image owner retired before
-    /// its caller entered the serialized admission path.
-    #[cfg(feature = "bench")]
-    pub(crate) fn owner_retired_if_uncontended(&self) -> Option<bool> {
-        self.operation
-            .owner
-            .state
-            .try_lock()
-            .map(|state| state.retired)
     }
 
     pub(crate) fn pin_buffer(&self) -> WalV7BatchBufferPin {
@@ -1137,15 +1080,6 @@ impl WalV7ResourceLedger {
         self.reserve_with_priority(charge, false)
     }
 
-    /// Try to reserve resources without waiting on the ledger mutex.
-    #[cfg(feature = "bench")]
-    pub(crate) fn try_reserve(
-        &self,
-        charge: WalV7ResourceCharge,
-    ) -> Result<Option<WalV7Reservation>, WalV7ReservationError> {
-        self.try_reserve_with_priority(charge, false)
-    }
-
     pub(crate) fn reserve_maintenance(
         &self,
         charge: WalV7ResourceCharge,
@@ -1165,28 +1099,6 @@ impl WalV7ResourceLedger {
         let (_lock_timer, mut state) =
             mutex_diagnostics::lock(&self.inner.state, MutexLockKind::ResourceLedger);
         self.reserve_with_priority_locked(&mut state, charge, maintenance)
-    }
-
-    /// Try to charge resources without waiting for ledger contention.
-    ///
-    /// `Ok(None)` means another operation currently owns the ledger mutex.
-    /// Quota and accounting errors remain errors so callers can decide whether
-    /// to use their existing serialized fallback path.
-    #[cfg(feature = "bench")]
-    fn try_reserve_with_priority(
-        &self,
-        charge: WalV7ResourceCharge,
-        maintenance: bool,
-    ) -> Result<Option<WalV7Reservation>, WalV7ReservationError> {
-        if charge.is_empty() {
-            return Err(WalV7ReservationError::EmptyReservation);
-        }
-
-        let Some(mut state) = self.inner.state.try_lock() else {
-            return Ok(None);
-        };
-        self.reserve_with_priority_locked(&mut state, charge, maintenance)
-            .map(Some)
     }
 
     fn reserve_with_priority_locked(
@@ -1995,83 +1907,6 @@ mod tests {
             max_buffer_memory_bytes: 40,
             max_seal_index_bytes: 32,
         }
-    }
-
-    #[cfg(feature = "bench")]
-    fn test_batch_owner(ledger: WalV7ResourceLedger) -> Arc<WalV7ReservationOwner> {
-        Arc::new(WalV7ReservationOwner {
-            ledger,
-            retained_resources: None,
-            installed_dev: 0,
-            installed_ino: 0,
-            state: Mutex::new(WalV7ReservationOwnerState {
-                retired: false,
-                active_batch_operations: 0,
-                active_source_spool_preparations: 0,
-                reservations: AHashMap::new(),
-            }),
-        })
-    }
-
-    #[cfg(feature = "bench")]
-    #[test]
-    fn speculative_batch_reservation_is_nonblocking_and_reversible() {
-        let ledger = WalV7ResourceLedger::new(batch_limits()).unwrap();
-        let owner = test_batch_owner(ledger.clone());
-        let charge = charge(8192, 8192, 0, 12_296, 8);
-
-        {
-            let _owner_state = owner.state.lock();
-            assert!(
-                owner
-                    .try_reserve_batch_charge(charge, 4096)
-                    .unwrap()
-                    .is_none()
-            );
-        }
-        {
-            let _ledger_state = ledger.inner.state.lock();
-            assert!(
-                owner
-                    .try_reserve_batch_charge(charge, 4096)
-                    .unwrap()
-                    .is_none()
-            );
-        }
-
-        let reservation = owner
-            .try_reserve_batch_charge(charge, 4096)
-            .unwrap()
-            .expect("uncontended speculative reservation should succeed");
-        assert_eq!(ledger.snapshot(), charge);
-        drop(reservation);
-        assert_eq!(ledger.snapshot(), WalV7ResourceCharge::default());
-    }
-
-    #[cfg(feature = "bench")]
-    #[test]
-    fn speculative_batch_reservation_preserves_quota_errors_without_partial_charge() {
-        let ledger = WalV7ResourceLedger::new(batch_limits()).unwrap();
-        let owner = test_batch_owner(ledger.clone());
-        let held = owner
-            .try_reserve_batch_charge(charge(8192, 8192, 0, 12_296, 8), 4096)
-            .unwrap()
-            .expect("initial speculative reservation should fit");
-        let second = owner
-            .try_reserve_batch_charge(charge(8192, 8192, 0, 12_296, 8), 4096)
-            .unwrap()
-            .expect("second speculative reservation should fit");
-        let before = ledger.snapshot();
-
-        assert!(matches!(
-            owner.try_reserve_batch_charge(charge(8192, 8192, 0, 12_296, 8), 4096),
-            Err(WalV7ReservationError::LogicalWalLimit)
-        ));
-        assert_eq!(ledger.snapshot(), before);
-
-        drop(held);
-        drop(second);
-        assert_eq!(ledger.snapshot(), WalV7ResourceCharge::default());
     }
 
     #[test]

@@ -4133,12 +4133,12 @@ impl MemTable {
     }
 
     #[cfg(feature = "bench")]
-    pub(crate) fn try_preclaim_prepared_v8_point_wal_batch_only(
+    pub(crate) fn try_preallocate_prepared_v8_point_buffer_only(
         &self,
         scratch: &mut crate::wal::v8::leader::WalV8PointAdmissionScratch<'_>,
     ) -> bool {
         if let Some(wal) = &self.wal {
-            return wal.try_preclaim_v8_point_batch(scratch);
+            return wal.try_preallocate_v8_point_buffer(scratch);
         }
 
         false
