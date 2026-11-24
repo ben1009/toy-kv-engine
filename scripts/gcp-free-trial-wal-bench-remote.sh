@@ -56,7 +56,8 @@ if [[ "$SUITE" != "batch64" && "$SUITE" != "rfc026-full" \
      && "$SUITE" != "v8-cursor-coalescing-budget" \
      && "$SUITE" != "v7-v8-point-preallocation" \
      && "$SUITE" != "v8-point-resource-retirement" \
-     && "$SUITE" != "v8-point-resource-retirement-stage-a" ]]; then
+     && "$SUITE" != "v8-point-resource-retirement-stage-a" \
+     && "$SUITE" != "v8-point-ack-d1" ]]; then
     echo "unsupported benchmark suite: $SUITE" >&2
     exit 64
 fi
@@ -135,6 +136,12 @@ if [[ "$SUITE" == "v8-point-resource-retirement" || "$SUITE" == "v8-point-resour
     echo "point resource-retirement qualification requires c4-standard-16-lssd, writers 8,16, and 100000 operations" >&2
     exit 64
 fi
+if [[ "$SUITE" == "v8-point-ack-d1" ]] \
+    && { [[ "$NUM" != "100000" ]] || [[ "$MACHINE_TYPE" != "c4-standard-16-lssd" ]] \
+        || [[ "$WRITERS_CSV" != "8,16" ]]; }; then
+    echo "v8-point-ack-d1 requires c4-standard-16-lssd, writers 8,16, and 100000 operations" >&2
+    exit 64
+fi
 if [[ "$SUITE" == "v8-point-cpu-attribution" ]] \
     && { [[ "$NUM" != "100000" ]] || [[ "$MACHINE_TYPE" != "c4-standard-16-lssd" ]] \
         || { [[ "$WRITERS_CSV" != "1,4,8,16" ]] && [[ "$WRITERS_CSV" != "8,16" ]]; }; }; then
@@ -145,23 +152,25 @@ if [[ ! "$SAFE_DEADLINE_EPOCH" =~ ^[0-9]+$ ]] || (( SAFE_DEADLINE_EPOCH < 1 )); 
     echo "safe VM deadline must be a positive Unix epoch" >&2
     exit 64
 fi
-if [[ "$SUITE" == "commit-order-trace" || "$SUITE" == "v8-point-borrowed-input" ]] \
+if [[ "$SUITE" == "commit-order-trace" || "$SUITE" == "v8-point-borrowed-input" \
+    || "$SUITE" == "v8-point-ack-d1" ]] \
     && [[ ! "$SOURCE_PATCH_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
     echo "$SUITE requires a lowercase source patch SHA-256" >&2
     exit 64
 fi
-if [[ "$SUITE" != "commit-order-trace" && "$SUITE" != "v8-point-borrowed-input" ]] \
+if [[ "$SUITE" != "commit-order-trace" && "$SUITE" != "v8-point-borrowed-input" \
+    && "$SUITE" != "v8-point-ack-d1" ]] \
     && [[ "$SOURCE_PATCH_SHA256" != "-" ]]; then
     echo "source patch SHA-256 is only valid for commit-order-trace and v8-point-borrowed-input" >&2
     exit 64
 fi
-if [[ "$SUITE" == "v8-point-borrowed-input" ]]; then
+if [[ "$SUITE" == "v8-point-borrowed-input" || "$SUITE" == "v8-point-ack-d1" ]]; then
     if [[ ! "$BASELINE_COMMIT" =~ ^[0-9a-fA-F]{40}$ ]]; then
-        echo "v8-point-borrowed-input requires a full baseline commit SHA" >&2
+        echo "$SUITE requires a full baseline commit SHA" >&2
         exit 64
     fi
 elif [[ "$BASELINE_COMMIT" != "-" ]]; then
-    echo "baseline commit is only valid for v8-point-borrowed-input" >&2
+    echo "baseline commit is only valid for source A/B suites" >&2
     exit 64
 fi
 
@@ -349,6 +358,67 @@ printf '%s\n' "$ACTUAL_COMMIT" >"$BENCH_RESULTS/commit.txt"
 printf '%s\n' "$TOOLCHAIN" >"$BENCH_RESULTS/rust-toolchain.txt"
 printf '%s\n' "$BINARY_SHA256" >"$BENCH_RESULTS/write-perf.sha256"
 cp "$REPO/rust-toolchain" "$BENCH_RESULTS/rust-toolchain.toml"
+
+if [[ "$BENCH_SUITE" == "v8-point-ack-d1" ]]; then
+    if [[ ! -r /tmp/gcp-v8-point-ack-d1-runner.py ]]; then
+        echo "D1 ACK A/B runner was not uploaded" >&2
+        exit 1
+    fi
+    CANDIDATE_BINARY="$BENCH_WORK/write-perf-d1-after"
+    BASELINE_BINARY="$BENCH_WORK/write-perf-d1-before"
+    cp "$BINARY" "$CANDIDATE_BINARY"
+    printf '%s\n' "$ACTUAL_COMMIT" >"$BENCH_RESULTS/candidate-commit.txt"
+    printf '%s\n' "$BINARY_SHA256" >"$BENCH_RESULTS/candidate-binary.sha256"
+
+    git -C "$REPO" fetch --depth=1 origin "$BENCH_BASELINE_COMMIT"
+    BASELINE_REPO="$BENCH_WORK/toy-kv-engine-d1-baseline"
+    git -C "$REPO" worktree add --quiet --detach "$BASELINE_REPO" FETCH_HEAD
+    BASELINE_ACTUAL="$(git -C "$BASELINE_REPO" rev-parse HEAD)"
+    if [[ "$BASELINE_ACTUAL" != "$BENCH_BASELINE_COMMIT" ]]; then
+        echo "checked out baseline $BASELINE_ACTUAL instead of $BENCH_BASELINE_COMMIT" >&2
+        exit 1
+    fi
+    BASELINE_TOOLCHAIN="$(sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$BASELINE_REPO/rust-toolchain")"
+    if [[ "$BASELINE_TOOLCHAIN" != "$TOOLCHAIN" ]]; then
+        echo "baseline and candidate Rust toolchains differ" >&2
+        exit 1
+    fi
+
+    git -C "$REPO" diff --binary "$BENCH_BASELINE_COMMIT" "$ACTUAL_COMMIT" -- \
+        kv-engine/src/wal/v8/leader.rs kv-engine/src/wal/v8/parallel.rs \
+        >"$BENCH_RESULTS/source.patch"
+    ACTUAL_SOURCE_PATCH_SHA256="$(sha256sum "$BENCH_RESULTS/source.patch" | cut -d' ' -f1)"
+    if [[ "$ACTUAL_SOURCE_PATCH_SHA256" != "$BENCH_SOURCE_PATCH_SHA256" ]]; then
+        echo "D1 source patch SHA-256 differs from the local experiment record" >&2
+        exit 1
+    fi
+    printf '%s\n' "$BENCH_BASELINE_COMMIT" >"$BENCH_RESULTS/baseline-commit.txt"
+    printf '%s\n' "$BENCH_SOURCE_PATCH_SHA256" >"$BENCH_RESULTS/source-patch.sha256"
+
+    (
+        cd "$BASELINE_REPO"
+        CARGO_TARGET_DIR="$REPO/target" cargo "+$TOOLCHAIN" build --locked --release \
+            --package kv-engine --features bench --bin write-perf
+    )
+    cp "$REPO/target/release/write-perf" "$BASELINE_BINARY"
+    BASELINE_BINARY_SHA256="$(sha256sum "$BASELINE_BINARY" | cut -d' ' -f1)"
+    printf '%s\n' "$BASELINE_BINARY_SHA256" >"$BENCH_RESULTS/baseline-binary.sha256"
+
+    cp /tmp/gcp-v8-point-ack-d1-runner.py "$REPO/scripts/gcp_v8_point_ack_d1_runner.py"
+    echo "WAL_BENCHMARK_STARTED $(date --iso-8601=seconds)" | tee -a "$BENCH_BOOT_LOG"
+    PYTHONPATH="$REPO/scripts${PYTHONPATH:+:$PYTHONPATH}" \
+        python3 "$REPO/scripts/gcp_v8_point_ack_d1_runner.py" \
+        --baseline-binary "$BASELINE_BINARY" --candidate-binary "$CANDIDATE_BINARY" \
+        --results-dir "$BENCH_RESULTS" --db-root "$BENCH_WORK/databases" \
+        --writers "$BENCH_WRITERS" --safe-deadline-epoch "$BENCH_SAFE_DEADLINE_EPOCH" \
+        --baseline-commit "$BENCH_BASELINE_COMMIT" --candidate-commit "$ACTUAL_COMMIT" \
+        --source-patch-sha256 "$BENCH_SOURCE_PATCH_SHA256" \
+        --baseline-binary-sha256 "$BASELINE_BINARY_SHA256" \
+        --candidate-binary-sha256 "$BINARY_SHA256" \
+        --machine-type "$BENCH_MACHINE_TYPE" --ssd-count "$BENCH_SSD_COUNT" \
+        --ssd-gib "$BENCH_SSD_TOTAL_GIB"
+    exit $?
+fi
 
 if [[ "$BENCH_SUITE" == "v8-point-borrowed-input" ]]; then
     if [[ ! -r /tmp/gcp-v8-point-borrowed-input-runner.py ]]; then

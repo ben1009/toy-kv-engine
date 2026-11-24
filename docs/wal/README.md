@@ -103,6 +103,9 @@ The [coalescing-budget A/B](benchmarks/rfc-028-v8-cursor-coalescing-budget-gcp-2
 found fixed 400 μs consistently ahead of Dynamic at 8 and 16 writers, but its
 paired throughput gains stayed below the 5% qualification threshold. Dynamic
 remains the default.
+The [D1 ACK-check A/B](benchmarks/rfc-028-v8-point-ack-d1-gcp-20261124.md)
+found no stable throughput gain from consolidating the Coordinator ACK checks;
+Point16 was 1.86% slower in paired median.
 
 ## Implementation and adoption
 
@@ -300,6 +303,7 @@ experiments. Each report records its own outcome and measurement limits.
 - [RFC 027 V8 Cursor direct-completion GCP qualification — Point16 gate failed, 2026-11-22](benchmarks/rfc-027-v8-cursor-direct-completion-gcp-20261122.md)
 - [RFC 027 V8 Cursor singleton-submission GCP qualification — throughput gate failed, 2026-11-22](benchmarks/rfc-027-v8-cursor-singleton-submission-gcp-20261122.md)
 - [RFC 028 V8 Point critical-path GCP diagnostic — no single bottleneck established, 2026-11-22](benchmarks/rfc-028-v8-point16-critical-path-gcp-20261122.md)
+- [RFC 028 V8 Point D1 ACK-check GCP A/B — no stable throughput gain, 2026-11-24](benchmarks/rfc-028-v8-point-ack-d1-gcp-20261124.md)
 - [RFC 028 V8 Cursor coalescing GCP diagnostic — progress-token wait dominates sampled coalescing wall time, 2026-11-23](benchmarks/rfc-028-v8-cursor-coalescing-gcp-20261123.md)
 - [RFC 028 V8 Cursor coalescing-budget A/B — fixed 400 μs wins consistently but misses the throughput gate, 2026-11-23](benchmarks/rfc-028-v8-cursor-coalescing-budget-gcp-20261123.md)
 - [RFC 028 V8 Point buffer preallocation GCP A/B — Point8 +9.59%, Point16 +3.88%, 2026-11-23](benchmarks/rfc-028-v8-point-buffer-preallocation-gcp-20261123.md)

@@ -58,6 +58,10 @@ from gcp_wal_matrix import (
     POINT_PREALLOCATION_WRITERS,
     POINT_RESOURCE_RETIREMENT_NUM,
     POINT_RESOURCE_RETIREMENT_WRITERS,
+    POINT_ACK_D1_ARMS,
+    POINT_ACK_D1_NUM,
+    POINT_ACK_D1_ORDERS,
+    POINT_ACK_D1_WRITERS,
     V8_MUTEX_DIAGNOSTIC_NUM,
     V8_MUTEX_DIAGNOSTIC_SAMPLE_EVERY,
     V8_MUTEX_DIAGNOSTIC_WRITERS,
@@ -86,6 +90,8 @@ from gcp_wal_matrix import (
     build_v7_v8_point_preallocation_schedule,
     build_point_resource_retirement_plan,
     build_point_resource_retirement_schedule,
+    build_point_ack_d1_plan,
+    build_point_ack_d1_schedule,
     build_v8_mutex_diagnostic_plan,
     build_v8_mutex_diagnostic_schedule,
     build_v8_point_cpu_attribution_plan,
@@ -98,6 +104,7 @@ from gcp_wal_matrix import (
     validate_point_direct_frame_rows,
     validate_point_progress_ring_rows,
     validate_point_resource_retirement_rows,
+    validate_point_ack_d1_rows,
     validate_cursor_direct_completion_rows,
     validate_cursor_singleton_submission_rows,
     validate_cursor_coalescing_budget_rows,
@@ -131,6 +138,7 @@ from gcp_v8_mutex_diagnostic_runner import (
 from gcp_v8_point_borrowed_input_runner import _summary_fields
 import gcp_v8_point_cpu_attribution_runner as cpu_attribution_runner
 import gcp_v8_point_progress_ring_runner as progress_ring_runner
+import gcp_v8_point_ack_d1_runner as ack_d1_runner
 from gcp_v8_point_cpu_attribution_runner import (
     _build_command as build_cpu_attribution_command,
     _completion_handoff_timeline_summary,
@@ -1737,6 +1745,159 @@ class PointProgressRingQualificationTests(unittest.TestCase):
                 writer.writeheader()
                 writer.writerows(tsv_rows)
             self.assertFalse(progress_ring_runner.verify_results_directory(results)["verified"])
+
+    def test_d1_schedule_holds_stage_a_and_retirement_mode_constant(self) -> None:
+        schedule = build_point_ack_d1_schedule()
+        self.assertEqual(len(schedule), 30)
+        self.assertEqual({row["arm"] for row in schedule}, set(POINT_ACK_D1_ARMS))
+        plan = build_point_ack_d1_plan(
+            machine_type="c4-standard-16-lssd",
+            machine_spec={"vcpus": 16, "ssd_count": 2, "ssd_gib": 750},
+            baseline_commit="a" * 40,
+            candidate_commit="b" * 40,
+            source_patch_sha256="c" * 64,
+        )
+        self.assertEqual(plan["runs_planned"], 30)
+        self.assertEqual(plan["point_resource_retirement_mode"], 0)
+        self.assertTrue(plan["point_buffer_preallocation_enabled"])
+        self.assertEqual(
+            [tuple(row["arm"] for row in schedule if row["writer"] == 8
+                   and row["workload"] == "point" and row["repetition"] == repetition)
+             for repetition in range(1, 6)],
+            [POINT_ACK_D1_ORDERS[(repetition - 1) % len(POINT_ACK_D1_ORDERS)]
+             for repetition in range(1, 6)],
+        )
+        for row in schedule:
+            self.assertEqual(row["point_resource_retirement_mode"], 0)
+            self.assertEqual(row["point_buffer_preallocation_enabled"], row["workload"] == "point")
+            self.assertTrue(row["progress_cursor_enabled"])
+            self.assertTrue(row["cursor_direct_completion_enabled"])
+            self.assertFalse(row["cursor_singleton_submission_enabled"])
+            self.assertFalse(row["scan_diagnostics_enabled"])
+
+        observed = []
+        for row in schedule:
+            raw = self._raw_record(row)
+            metrics = progress_ring_runner._validate_point_resource_retirement_stage_a_record(raw, row)
+            observed.append({**row, **metrics, "exit_code": 0})
+        self.assertTrue(validate_point_ack_d1_rows(observed)["complete"])
+
+        point_row = next(row for row in observed if row["workload"] == "point")
+        point_row["point_buffer_preallocation_hits"] = 0
+        self.assertFalse(validate_point_ack_d1_rows(observed)["complete"])
+
+    def test_d1_runner_writes_verifiable_same_host_ab_bundle(self) -> None:
+        baseline = "a" * 40
+        candidate = "b" * 40
+        patch_bytes = b"synthetic D1 source diff\n"
+        patch_sha = hashlib.sha256(patch_bytes).hexdigest()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            baseline_binary = root / "write-perf-before"
+            candidate_binary = root / "write-perf-after"
+            baseline_binary.write_bytes(b"baseline executable")
+            candidate_binary.write_bytes(b"candidate executable")
+            baseline_sha = self._sha256(baseline_binary)
+            candidate_sha = self._sha256(candidate_binary)
+
+            def fake_run_one(**kwargs: object) -> dict[str, object]:
+                row = kwargs["row"]
+                kwargs["on_subprocess_started"]()
+                results_dir = kwargs["results_dir"]
+                run_dir = results_dir / ack_d1_runner._run_id(row)
+                run_dir.mkdir()
+                raw = self._raw_record(row)
+                metrics = progress_ring_runner._validate_point_resource_retirement_stage_a_record(raw, row)
+                metadata = {
+                    **row,
+                    "binary_sha256": kwargs["binary_sha256"],
+                    "exit_code": 0,
+                    "duration_seconds": 5.0,
+                    **metrics,
+                }
+                (run_dir / "result.json").write_text(json.dumps(raw), encoding="utf-8")
+                (run_dir / "run-metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
+                (run_dir / "environment.txt").write_text(
+                    progress_ring_runner._expected_environment_text(
+                        True,
+                        True,
+                        False,
+                        True,
+                        False,
+                        # The D1 runner sets Stage A only for Point rows; Batch64
+                        # inherits the default-off behavior and leaves the switch unset.
+                        point_buffer_preallocation_enabled=(
+                            True if row["workload"] == "point" else None
+                        ),
+                        point_resource_retirement_mode=0,
+                    ),
+                    encoding="utf-8",
+                )
+                return metadata
+
+            results_dir = root / "results"
+            args = SimpleNamespace(
+                baseline_binary=baseline_binary,
+                baseline_binary_sha256=baseline_sha,
+                baseline_commit=baseline,
+                candidate_binary=candidate_binary,
+                candidate_binary_sha256=candidate_sha,
+                candidate_commit=candidate,
+                source_patch_sha256=patch_sha,
+                results_dir=results_dir,
+                db_root=root / "db",
+                writers="8,16",
+                machine_type="c4-standard-16-lssd",
+                ssd_count=2,
+                ssd_gib=750,
+                safe_deadline_epoch=4_000_000_000,
+            )
+            with patch.object(ack_d1_runner, "_run_one", side_effect=fake_run_one):
+                self.assertEqual(ack_d1_runner.run_suite(args), 0)
+            (results_dir / "source.patch").write_bytes(patch_bytes)
+            verification = ack_d1_runner.verify_results_directory(results_dir)
+            self.assertTrue(verification["verified"], verification["errors"])
+
+            (results_dir / "source.patch").write_bytes(b"changed patch")
+            self.assertFalse(ack_d1_runner.verify_results_directory(results_dir)["verified"])
+
+    def test_d1_remote_suite_requires_fixed_shape_and_source_identity(self) -> None:
+        remote_script = Path(__file__).with_name("gcp-free-trial-wal-bench-remote.sh")
+        environment = {**os.environ, "TOYKV_GCP_BENCH_VALIDATE_ONLY": "1"}
+        valid = [
+            "bash", str(remote_script), "a" * 40, str(POINT_ACK_D1_NUM), "test-project",
+            "us-central1-a", "wal-test", "4102444800", "c4-standard-16-lssd", "8,16",
+            "v8-point-ack-d1", "c" * 64, "b" * 40,
+        ]
+        accepted = subprocess.run(valid, cwd=Path(__file__).resolve().parents[1], env=environment,
+                                  capture_output=True, text=True, timeout=5)
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+
+        for index, value in ((3, "99999"), (9, "16,8"), (11, "-"), (12, "-")):
+            with self.subTest(argument=index, value=value):
+                invalid = list(valid)
+                invalid[index] = value
+                rejected = subprocess.run(invalid, cwd=Path(__file__).resolve().parents[1], env=environment,
+                                          capture_output=True, text=True, timeout=5)
+                self.assertEqual(rejected.returncode, 64)
+
+    def test_d1_preflight_requires_isolated_network_and_fixed_budget(self) -> None:
+        common = [
+            "--project", "test-project", "--zone", "us-central1-a", "--commit", "a" * 40,
+            "--baseline-commit", "b" * 40, "--source-patch-sha256", "c" * 64,
+            "--machine-type", "c4-standard-16-lssd", "--writers", "8", "16",
+            "--v8-point-ack-d1-ab", "--ssh-source-range", "192.0.2.1/32",
+            "--max-runtime-minutes", "60", "--estimated-hourly-cost-usd", "1.50",
+            "--max-estimated-spend-usd", "2", "--preflight-only",
+        ]
+        args = BENCH.parse_args([*common, "--network", "d1-isolated", "--subnet", "d1-subnet"])
+        self.assertEqual(args.writers, POINT_ACK_D1_WRITERS)
+        self.assertEqual(args.num, POINT_ACK_D1_NUM)
+        self.assertTrue(args.v8_point_ack_d1_ab)
+        for suffix in ([], ["--network", "default", "--subnet", "default"],
+                       ["--network", "d1-isolated"]):
+            with self.subTest(suffix=suffix), redirect_stderr(StringIO()), self.assertRaises(SystemExit):
+                BENCH.parse_args([*common, *suffix])
 
     @staticmethod
     def _archive_output(output: str) -> dict[str, str]:

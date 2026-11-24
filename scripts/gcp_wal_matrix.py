@@ -120,6 +120,14 @@ POINT_RESOURCE_RETIREMENT_ORDERS = (
     ("per_ticket", "batch", "detach"),
     ("batch", "detach", "per_ticket"),
 )
+POINT_ACK_D1_WRITERS = (8, 16)
+POINT_ACK_D1_REPETITIONS = 5
+POINT_ACK_D1_NUM = 100_000
+POINT_ACK_D1_ARMS = ("d1_before", "d1_after")
+POINT_ACK_D1_ORDERS = (
+    ("d1_before", "d1_after"),
+    ("d1_after", "d1_before"),
+)
 CURSOR_COALESCING_BUDGET_WRITERS = (8, 16)
 CURSOR_COALESCING_BUDGET_REPETITIONS = 5
 CURSOR_COALESCING_BUDGET_NUM = 100_000
@@ -908,6 +916,169 @@ def build_point_resource_retirement_plan(
         ),
     }
     return plan
+
+
+def build_point_ack_d1_schedule() -> list[dict[str, object]]:
+    """Build paired pre-D1/D1 runs with Stage A and retirement mode 0 fixed."""
+    cells = [
+        (writer, "point", "wal_concurrent", 1, None, 10)
+        for writer in POINT_ACK_D1_WRITERS
+    ]
+    cells.append((16, "batch64", "wal_batch_concurrent", 64, 64, None))
+    schedule: list[dict[str, object]] = []
+    for writer, workload, bench, batch_entries, batch_size, sample_every in cells:
+        for repetition in range(1, POINT_ACK_D1_REPETITIONS + 1):
+            order = POINT_ACK_D1_ORDERS[(repetition - 1) % len(POINT_ACK_D1_ORDERS)]
+            for arm in order:
+                schedule.append({
+                    "run_index": len(schedule) + 1,
+                    "writer": writer,
+                    "workload": workload,
+                    "repetition": repetition,
+                    "arm": arm,
+                    "bench": bench,
+                    "batch_entries": batch_entries,
+                    "batch_size": batch_size,
+                    "num": POINT_ACK_D1_NUM,
+                    "sample_every": sample_every,
+                    "point_buffer_preallocation_enabled": workload == "point",
+                    "point_resource_retirement_mode": 0,
+                    "extent_mode": "sliding-point-lookahead",
+                    "extent_window_bytes": POINT_LOOKAHEAD_WINDOW_BYTES,
+                    "frontier_mode": "direct",
+                    "progress_ring_enabled": True,
+                    "progress_cursor_enabled": True,
+                    "progress_counters_enabled": False,
+                    "cursor_direct_completion_enabled": True,
+                    "cursor_singleton_submission_enabled": False,
+                    "scan_diagnostics_enabled": False,
+                })
+    return schedule
+
+
+def build_point_ack_d1_plan(
+    *, machine_type: str, machine_spec: Mapping[str, int], baseline_commit: str,
+    candidate_commit: str, source_patch_sha256: str,
+    baseline_binary_sha256: str | None = None, candidate_binary_sha256: str | None = None,
+) -> dict[str, object]:
+    """Describe the D1 source A/B while holding Stage A and retirement fixed."""
+    schedule = build_point_ack_d1_schedule()
+    vcpus = int(machine_spec["vcpus"])
+    ssd_count = int(machine_spec["ssd_count"])
+    layout = "single Local SSD" if ssd_count == 1 else f"RAID0 over {ssd_count} Local SSDs"
+    plan: dict[str, object] = {
+        "plan_schema_version": 1,
+        "suite": "v8-point-ack-d1",
+        "writers": list(POINT_ACK_D1_WRITERS),
+        "workloads": [
+            {"writer": writer, "name": "point", "bench": "wal_concurrent", "batch_size": None,
+             "num": POINT_ACK_D1_NUM, "latency_sample_every": 10}
+            for writer in POINT_ACK_D1_WRITERS
+        ] + [
+            {"writer": 16, "name": "batch64", "bench": "wal_batch_concurrent", "batch_size": 64,
+             "num": POINT_ACK_D1_NUM, "latency_sample_every": None}
+        ],
+        "arms": list(POINT_ACK_D1_ARMS),
+        "repetitions_per_cell": POINT_ACK_D1_REPETITIONS,
+        "arm_orders": [list(order) for order in POINT_ACK_D1_ORDERS],
+        "runs_planned": len(schedule),
+        "score_runs_planned": len(schedule),
+        "counterbalanced": True,
+        "machine_type": machine_type,
+        "vcpus": vcpus,
+        "local_ssd_count": ssd_count,
+        "local_ssd_total_gib": int(machine_spec["ssd_gib"]),
+        "runtime_protocol": f"single {vcpus}-vCPU host; {layout}; both revisions built with the pinned toolchain",
+        "value_bytes": 1024,
+        "compaction": "none",
+        "baseline_commit": baseline_commit,
+        "candidate_commit": candidate_commit,
+        "source_patch_sha256": source_patch_sha256,
+        "progress_mode": "cursor (mode 2)",
+        "direct_completion_enabled": True,
+        "point_buffer_preallocation_enabled": True,
+        "point_resource_retirement_mode": 0,
+        "extent_preparation": "sliding-point-lookahead, 1 MiB",
+        "frontier_mode": "direct",
+        "coalescing": "dynamic",
+        "singleton_submission_enabled": False,
+        "v8_configuration": {
+            "data_submission": "ordered",
+            "point_preallocation": "Stage A enabled",
+            "retirement_mode": 0,
+        },
+        "qualification_note": (
+            "The only source difference is D1's consolidated Coordinator ACK checks. Both builds use the same "
+            "toolchain and fixed Cursor + Direct Completion + Direct FRONTIER + Point lookahead configuration; "
+            "Stage A is enabled and retirement mode 0 is fixed. Batch64 is a regression guardrail."
+        ),
+    }
+    if baseline_binary_sha256 is not None:
+        plan["baseline_binary_sha256"] = baseline_binary_sha256
+    if candidate_binary_sha256 is not None:
+        plan["candidate_binary_sha256"] = candidate_binary_sha256
+    return plan
+
+
+def validate_point_ack_d1_rows(rows: list[Mapping[str, object]]) -> dict[str, object]:
+    """Validate the D1 pair matrix and prove Stage A/mode 0 were exercised."""
+    schedule = build_point_ack_d1_schedule()
+    expected = {
+        (row["writer"], row["workload"], row["repetition"], row["arm"]): row
+        for row in schedule
+    }
+    observed: dict[tuple[object, object, object, object], int] = {}
+    invalid: list[Mapping[str, object]] = []
+    for row in rows:
+        identity = tuple(row.get(key) for key in ("writer", "workload", "repetition", "arm"))
+        observed[identity] = observed.get(identity, 0) + 1
+        planned = expected.get(identity)
+        counter_names = (
+            "point_buffer_preallocation_attempts",
+            "point_buffer_preallocation_hits",
+            "point_buffer_preallocation_fallbacks",
+            "point_resource_retirement_detached_prefixes",
+            "point_resource_retirement_detached_tickets",
+            "point_resource_retirement_batched_prefixes",
+        )
+        counters_valid = all(type(row.get(name)) is int and row[name] >= 0 for name in counter_names)
+        point_preallocation_valid = (
+            counters_valid
+            and row.get("point_buffer_preallocation_attempts")
+            == row.get("point_buffer_preallocation_hits") + row.get("point_buffer_preallocation_fallbacks")
+            and (row.get("point_buffer_preallocation_hits", 0) > 0 if planned and planned["workload"] == "point" else True)
+        )
+        batch_preallocation_disabled = counters_valid and all(
+            row.get(name) == 0 for name in counter_names[:3]
+        )
+        if (
+            planned is None
+            or row.get("exit_code") != 0
+            or row.get("ops") != POINT_ACK_D1_NUM
+            or row.get("point_resource_retirement_mode") != 0
+            or row.get("point_buffer_preallocation_enabled") is not (planned["workload"] == "point")
+            or not point_preallocation_valid
+            or (planned["workload"] == "batch64" and not batch_preallocation_disabled)
+            or any(type(row.get(key)) is not int or row[key] != 0 for key in (
+                "point_resource_retirement_detached_prefixes",
+                "point_resource_retirement_detached_tickets",
+                "point_resource_retirement_batched_prefixes",
+            ))
+        ):
+            invalid.append(row)
+    expected_cells = set(expected)
+    observed_cells = set(observed)
+    return {
+        "complete": not (
+            expected_cells != observed_cells or any(count != 1 for count in observed.values()) or invalid
+        ),
+        "planned": len(schedule),
+        "observed": len(rows),
+        "missing_cells": [list(cell) for cell in sorted(expected_cells - observed_cells, key=str)],
+        "unexpected_cells": [list(cell) for cell in sorted(observed_cells - expected_cells, key=str)],
+        "duplicate_cells": [list(cell) for cell, count in observed.items() if count != 1],
+        "invalid_rows": [dict(row) for row in invalid],
+    }
 
 
 def build_cursor_coalescing_budget_schedule(

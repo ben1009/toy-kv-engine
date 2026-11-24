@@ -50,6 +50,8 @@ from gcp_wal_matrix import (
     POINT_PREALLOCATION_WRITERS,
     POINT_RESOURCE_RETIREMENT_NUM,
     POINT_RESOURCE_RETIREMENT_WRITERS,
+    POINT_ACK_D1_NUM,
+    POINT_ACK_D1_WRITERS,
     CURSOR_COALESCING_BUDGET_NUM,
     CURSOR_COALESCING_BUDGET_WRITERS,
     build_cursor_direct_completion_plan,
@@ -76,6 +78,7 @@ from gcp_wal_matrix import (
     build_point_progress_cursor_plan,
     build_v7_v8_point_preallocation_plan,
     build_point_resource_retirement_plan,
+    build_point_ack_d1_plan,
     build_v8_extent_policy_storage_plan,
     build_v8_extent_policy_storage_schedule,
     build_v8_mutex_diagnostic_plan,
@@ -111,6 +114,7 @@ from gcp_v8_point_progress_ring_runner import (
 from gcp_v8_point_progress_ring_runner import (
     verify_point_resource_retirement_results_directory as verify_point_resource_retirement_results,
 )
+from gcp_v8_point_ack_d1_runner import verify_results_directory as verify_point_ack_d1_results
 MACHINE_TYPE = "c4-standard-8-lssd"
 MACHINE_SPECS = {
     "c4-standard-8-lssd": {"vcpus": 8, "ssd_count": 1, "ssd_gb": 375, "ssd_gib": 375},
@@ -127,6 +131,7 @@ V8_POINT_CPU_ATTRIBUTION_RUNNER = Path(__file__).with_name("gcp_v8_point_cpu_att
 POINT_BORROWED_INPUT_RUNNER = Path(__file__).with_name("gcp_v8_point_borrowed_input_runner.py")
 POINT_DIRECT_FRAME_RUNNER = Path(__file__).with_name("gcp_v8_point_direct_frame_runner.py")
 POINT_PROGRESS_RING_RUNNER = Path(__file__).with_name("gcp_v8_point_progress_ring_runner.py")
+POINT_ACK_D1_RUNNER = Path(__file__).with_name("gcp_v8_point_ack_d1_runner.py")
 POINT_PROGRESS_RING_VM_TAG = "walbench-point-progress-ring"
 V8_EXTENT_POLICY_STORAGE_RUNNER = Path(__file__).with_name("gcp_v8_extent_policy_storage_runner.py")
 REPO_URL = "https://github.com/ben1009/toy-kv-engine.git"
@@ -163,6 +168,7 @@ root_names = {
     "extent-policy-storage-schedule.tsv",
     "v7-v8-point-preallocation-schedule.tsv",
     "point-resource-retirement-schedule.tsv",
+    "point-ack-d1-schedule.tsv", "candidate-commit.txt", "source.patch",
     "commit-order-trace-analysis.json", "commit.txt", "remote-exit.json",
     "finished_utc.txt", "remote-finished-utc.txt", "remote-status.txt", "host.txt",
     "os-release.txt", "uname.txt", "lscpu.txt", "lsblk.txt", "findmnt.txt", "df.txt",
@@ -1201,7 +1207,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                              help="Compare V8 Point per-ticket, detached, and batched resource retirement")
     suite_group.add_argument("--v8-point-resource-retirement-stage-a-ab", action="store_true",
                              help="Repeat the retirement matrix with Point buffer preallocation enabled")
-    parser.add_argument("--baseline-commit", help="Full source commit used as the borrowed-input A/B baseline")
+    suite_group.add_argument("--v8-point-ack-d1-ab", action="store_true",
+                             help="Compare D1 Coordinator ACK checks with Stage A enabled and retirement mode 0")
+    parser.add_argument("--baseline-commit", help="Full source commit used as the source A/B baseline")
     parser.add_argument("--source-patch-sha256",
                         help="SHA-256 of the exact source patch used for a commit-order trace run")
     parser.add_argument("--network", help="VPC network (legacy suites default to default; Cursor qualification requires isolated VPC)")
@@ -1241,10 +1249,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     point_resource_retirement_suite = (
         args.v8_point_resource_retirement_ab or point_resource_retirement_stage_a_suite
     )
+    point_ack_d1_suite = args.v8_point_ack_d1_ab
     point_progress_suite = (
         args.v8_point_progress_cursor_ab or point_cursor_direct_completion_suite
         or point_cursor_singleton_submission_suite or point_cursor_coalescing_budget_suite
-        or point_preallocation_suite or point_resource_retirement_suite
+        or point_preallocation_suite or point_resource_retirement_suite or point_ack_d1_suite
     )
     explicit_network = args.network is not None
     if args.repetitions <= 0:
@@ -1271,6 +1280,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             CURSOR_COALESCING_BUDGET_NUM if point_cursor_coalescing_budget_suite else
             POINT_PREALLOCATION_NUM if point_preallocation_suite else
             POINT_RESOURCE_RETIREMENT_NUM if point_resource_retirement_suite else
+            POINT_ACK_D1_NUM if point_ack_d1_suite else
             POINT_PROGRESS_RING_NUM if point_progress_suite else
             POINT_DIRECT_FRAME_NUM if args.v8_point_direct_frame_ab else
             V8_EXTENT_POLICY_STORAGE_NUM if args.v8_extent_policy_storage_ab else
@@ -1287,6 +1297,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             or args.v8_extent_policy_storage_ab
             or point_preallocation_suite
             or point_resource_retirement_suite
+            or point_ack_d1_suite
             or point_progress_suite
         ) else MACHINE_TYPE
     args.network = args.network or "default"
@@ -1309,6 +1320,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             args.writers = POINT_PREALLOCATION_WRITERS
         elif point_resource_retirement_suite:
             args.writers = POINT_RESOURCE_RETIREMENT_WRITERS
+        elif point_ack_d1_suite:
+            args.writers = POINT_ACK_D1_WRITERS
         elif point_cursor_coalescing_budget_suite:
             args.writers = CURSOR_COALESCING_BUDGET_WRITERS
         elif point_progress_suite:
@@ -1357,12 +1370,18 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error(f"--v8-point-resource-retirement-ab requires writers {POINT_RESOURCE_RETIREMENT_WRITERS}")
     if point_resource_retirement_suite and args.machine_type != "c4-standard-16-lssd":
         parser.error("--v8-point-resource-retirement-ab requires c4-standard-16-lssd")
+    if point_ack_d1_suite and args.writers != POINT_ACK_D1_WRITERS:
+        parser.error(f"--v8-point-ack-d1-ab requires writers {POINT_ACK_D1_WRITERS}")
+    if point_ack_d1_suite and args.machine_type != "c4-standard-16-lssd":
+        parser.error("--v8-point-ack-d1-ab requires c4-standard-16-lssd")
     expected_progress_writers = (
         CURSOR_COALESCING_BUDGET_WRITERS
         if point_cursor_coalescing_budget_suite else POINT_PROGRESS_RING_WRITERS
     )
     if point_resource_retirement_suite:
         expected_progress_writers = POINT_RESOURCE_RETIREMENT_WRITERS
+    if point_ack_d1_suite:
+        expected_progress_writers = POINT_ACK_D1_WRITERS
     if point_progress_suite and args.writers != expected_progress_writers:
         parser.error(f"Cursor qualification requires writers {expected_progress_writers}")
     if point_progress_suite and args.machine_type != "c4-standard-16-lssd":
@@ -1385,6 +1404,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error(f"--v7-v8-point-preallocation-ab uses a fixed {POINT_PREALLOCATION_NUM}-put workload")
     if point_resource_retirement_suite and args.num != POINT_RESOURCE_RETIREMENT_NUM:
         parser.error(f"--v8-point-resource-retirement-ab uses a fixed {POINT_RESOURCE_RETIREMENT_NUM}-put workload")
+    if point_ack_d1_suite and args.num != POINT_ACK_D1_NUM:
+        parser.error(f"--v8-point-ack-d1-ab uses a fixed {POINT_ACK_D1_NUM}-put workload")
     if args.v8_mutex_diagnostic and args.num != V8_MUTEX_DIAGNOSTIC_NUM:
         parser.error(f"--v8-mutex-diagnostic uses a fixed {V8_MUTEX_DIAGNOSTIC_NUM}-put workload")
     if args.v8_point_cpu_attribution and args.num != V8_POINT_CPU_ATTRIBUTION_NUM:
@@ -1402,10 +1423,17 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     if args.v8_point_borrowed_input_ab:
         if not args.baseline_commit or not re.fullmatch(r"[0-9a-fA-F]{40}", args.baseline_commit):
             parser.error("--v8-point-borrowed-input-ab requires --baseline-commit with a full 40-character SHA")
+    elif point_ack_d1_suite:
+        if not args.baseline_commit or not re.fullmatch(r"[0-9a-fA-F]{40}", args.baseline_commit):
+            parser.error("--v8-point-ack-d1-ab requires --baseline-commit with a full 40-character SHA")
     elif args.baseline_commit:
-        parser.error("--baseline-commit is only valid with --v8-point-borrowed-input-ab")
-    if not (args.commit_order_trace or args.v8_point_borrowed_input_ab) and args.source_patch_sha256:
-        parser.error("--source-patch-sha256 is only valid with trace or borrowed-input A/B suites")
+        parser.error("--baseline-commit is only valid with source A/B suites")
+    if (args.v8_point_borrowed_input_ab or point_ack_d1_suite) and (
+        not args.source_patch_sha256 or not re.fullmatch(r"[0-9a-f]{64}", args.source_patch_sha256)
+    ):
+        parser.error("source A/B suites require --source-patch-sha256 with 64 lowercase hex characters")
+    if not (args.commit_order_trace or args.v8_point_borrowed_input_ab or point_ack_d1_suite) and args.source_patch_sha256:
+        parser.error("--source-patch-sha256 is only valid with trace or source A/B suites")
     if not MIN_RUNTIME_MINUTES <= args.max_runtime_minutes <= MAX_RUNTIME_MINUTES:
         parser.error(f"--max-runtime-minutes must be between {MIN_RUNTIME_MINUTES} and {MAX_RUNTIME_MINUTES}")
     if (args.estimated_hourly_cost_usd is None) != (args.max_estimated_spend_usd is None):
@@ -1696,6 +1724,8 @@ def _verify_result_set(results: Path) -> dict[str, Any]:
             return verify_point_preallocation_results(results)
         if suite == "v8-point-resource-retirement":
             return verify_point_resource_retirement_results(results)
+        if suite == "v8-point-ack-d1":
+            return verify_point_ack_d1_results(results)
         if suite == "v8-small-ticket-profile":
             with (results / "profile-schedule.tsv").open(encoding="utf-8", newline="") as stream:
                 schedule_rows = list(csv.DictReader(stream, delimiter="\t"))
@@ -2908,10 +2938,11 @@ def provision_and_run(
     point_resource_retirement_suite = (
         getattr(args, "v8_point_resource_retirement_ab", False) or point_resource_retirement_stage_a_suite
     )
+    point_ack_d1_suite = getattr(args, "v8_point_ack_d1_ab", False)
     point_progress_suite = (
         point_progress_cursor_suite or point_cursor_direct_completion_suite
         or point_cursor_singleton_submission_suite or point_cursor_coalescing_budget_suite
-        or point_preallocation_suite or point_resource_retirement_suite
+        or point_preallocation_suite or point_resource_retirement_suite or point_ack_d1_suite
     )
     extent_policy_storage_suite = getattr(args, "v8_extent_policy_storage_ab", False)
     missing_tools = [tool for tool in ("ssh", "ssh-keygen") if not shutil.which(tool)]
@@ -3226,6 +3257,13 @@ def provision_and_run(
                 append_local_log(key_log, storage_copy.stdout + storage_copy.stderr)
                 if storage_copy.returncode:
                     raise BenchError(f"Could not copy extent-policy storage helper: {storage_copy.stderr.strip()}")
+            if point_ack_d1_suite:
+                if not POINT_ACK_D1_RUNNER.is_file():
+                    raise BenchError(f"D1 ACK A/B runner is missing: {POINT_ACK_D1_RUNNER}")
+                ack_copy = upload_to_vm(POINT_ACK_D1_RUNNER, "/tmp/gcp-v8-point-ack-d1-runner.py")
+                append_local_log(key_log, ack_copy.stdout + ack_copy.stderr)
+                if ack_copy.returncode:
+                    raise BenchError(f"Could not copy D1 ACK A/B runner: {ack_copy.stderr.strip()}")
 
             safe_deadline_epoch = int(deadline_epoch - 600)
             if profile_suite:
@@ -3247,6 +3285,8 @@ def provision_and_run(
                     "v8-point-resource-retirement-stage-a"
                     if point_resource_retirement_stage_a_suite else "v8-point-resource-retirement"
                 )
+            elif point_ack_d1_suite:
+                remote_suite = "v8-point-ack-d1"
             elif point_progress_cursor_suite:
                 remote_suite = "v8-point-progress-cursor"
             elif point_direct_frame_suite:
@@ -3405,10 +3445,11 @@ def main(argv: list[str] | None = None) -> int:
     point_resource_retirement_suite = (
         args.v8_point_resource_retirement_ab or point_resource_retirement_stage_a_suite
     )
+    point_ack_d1_suite = args.v8_point_ack_d1_ab
     point_progress_suite = (
         args.v8_point_progress_cursor_ab or point_cursor_direct_completion_suite
         or point_cursor_singleton_submission_suite or point_cursor_coalescing_budget_suite
-        or point_preallocation_suite or point_resource_retirement_suite
+        or point_preallocation_suite or point_resource_retirement_suite or point_ack_d1_suite
     )
     if point_progress_suite:
         args.progress_ring_vm_tag = f"{POINT_PROGRESS_RING_VM_TAG}-{uuid.uuid4().hex[:12]}"
@@ -3553,6 +3594,15 @@ def main(argv: list[str] | None = None) -> int:
                 machine_spec=MACHINE_SPECS[args.machine_type],
                 commit=args.commit.lower(),
                 point_buffer_preallocation_enabled=point_resource_retirement_stage_a_suite,
+            )
+        elif point_ack_d1_suite:
+            report["benchmark_suite"] = "v8-point-ack-d1"
+            report["benchmark_plan"] = build_point_ack_d1_plan(
+                machine_type=args.machine_type,
+                machine_spec=MACHINE_SPECS[args.machine_type],
+                baseline_commit=args.baseline_commit.lower(),
+                candidate_commit=args.commit.lower(),
+                source_patch_sha256=args.source_patch_sha256,
             )
         elif args.v8_point_progress_cursor_ab:
             report["benchmark_suite"] = "v8-point-progress-cursor"
