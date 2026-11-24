@@ -6089,9 +6089,17 @@ impl WalV8ParallelWriter {
         let ticket_end = ticket
             .checked_add(1)
             .context("v8 Parallel durable ticket end overflows")?;
-        let Some(mut driver) = self.coordinator.acquire_durability_driver(ticket_end)? else {
+        let Some(driver) = self.coordinator.acquire_durability_driver(ticket_end)? else {
             return Ok(());
         };
+        self.drive_frontier_with_driver(ticket_end, driver)
+    }
+
+    fn drive_frontier_with_driver(
+        &self,
+        ticket_end: u64,
+        mut driver: WalV8DurabilityDriver,
+    ) -> Result<()> {
         let result = self.drive_frontier_through(ticket_end, &mut driver);
         if result.is_ok() {
             driver.complete();
@@ -7263,15 +7271,13 @@ impl WalV8ParallelWriter {
     }
 
     pub(crate) fn wait_durable(&self, ticket: u64) -> Result<()> {
-        ensure!(!self.is_poisoned(), "v8 Parallel WAL is poisoned");
-        ensure!(
-            ticket < self.coordinator.next_ticket(),
-            "v8 Parallel durability wait names an unassigned ticket"
-        );
-        if self.coordinator.durable_ticket_end() > ticket {
+        let ticket_end = ticket
+            .checked_add(1)
+            .context("v8 Parallel durable ticket end overflows")?;
+        let Some(driver) = self.coordinator.acquire_durability_driver(ticket_end)? else {
             return Ok(());
-        }
-        if let Err(error) = self.advance_frontier_through(ticket) {
+        };
+        if let Err(error) = self.drive_frontier_with_driver(ticket_end, driver) {
             self.coordinator.poison();
             return Err(error);
         }
@@ -8614,6 +8620,44 @@ mod tests {
             installed,
             MAX_WAL_FILE_SIZE,
         )
+    }
+
+    #[test]
+    fn wait_durable_checks_poison_and_ticket_assignment_without_poisoning_invalid_waits()
+    -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("wait-durable-validation.wal");
+        let installed = install_empty(&path, header())?;
+        let writer = match open_writer(&path, &installed) {
+            Ok(writer) => match writer.into_parallel() {
+                Ok(writer) => writer,
+                Err(error) if is_io_uring_unavailable_error(&error) => {
+                    eprintln!("skipping test (io_uring unavailable): {error:#}");
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            },
+            Err(error) if is_io_uring_unavailable_error(&error) => {
+                eprintln!("skipping test (io_uring unavailable): {error:#}");
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+
+        let error = writer
+            .wait_durable(0)
+            .expect_err("waiting for an unassigned ticket must fail");
+        assert!(format!("{error:#}").contains("unassigned ticket"));
+        assert!(!writer.is_poisoned());
+
+        writer.coordinator.poison();
+        let error = writer
+            .wait_durable(0)
+            .expect_err("poison must take precedence over ticket assignment");
+        assert!(format!("{error:#}").contains("coordinator is poisoned"));
+        assert!(writer.is_poisoned());
+
+        Ok(())
     }
 
     #[cfg(feature = "bench")]
