@@ -40277,6 +40277,7 @@ mod tests {
                 .env(CHILD_ENV, "1")
                 .env("TOYKV_BENCH_V8_DEDICATED_DURABILITY_DRIVER", "1")
                 .env("TOYKV_BENCH_V8_DURABILITY_DRIVER_DIAGNOSTICS", "0")
+                .env("TOYKV_BENCH_V8_INDEPENDENT_ACK_WAITER", "1")
                 .status()?;
             anyhow::ensure!(status.success(), "dedicated-driver rotation child failed");
             return Ok(());
@@ -40332,8 +40333,11 @@ mod tests {
         anyhow::ensure!(
             first_active
                 .benchmark_wal_io_diagnostics()
-                .is_some_and(|diagnostics| diagnostics.dedicated_durability_driver_enabled),
-            "initial V8 WAL did not install a dedicated durability driver"
+                .is_some_and(|diagnostics| {
+                    diagnostics.dedicated_durability_driver_enabled
+                        && diagnostics.independent_ack_waiter_enabled
+                }),
+            "initial V8 WAL did not install the dedicated driver and independent ACK waiter"
         );
         let (driver_joined_tx, driver_joined_rx) = crossbeam_channel::bounded(1);
         first_active.set_v8_dedicated_driver_joined_signal_for_test(driver_joined_tx)?;
@@ -40350,8 +40354,11 @@ mod tests {
         anyhow::ensure!(
             successor
                 .benchmark_wal_io_diagnostics()
-                .is_some_and(|diagnostics| diagnostics.dedicated_durability_driver_enabled),
-            "rotated V8 WAL did not install a dedicated durability driver"
+                .is_some_and(|diagnostics| {
+                    diagnostics.dedicated_durability_driver_enabled
+                        && diagnostics.independent_ack_waiter_enabled
+                }),
+            "rotated V8 WAL did not install the dedicated driver and independent ACK waiter"
         );
         drop(successor);
 
@@ -40371,6 +40378,17 @@ mod tests {
             .context("old V8 WAL owner dropped before its dedicated driver joined")?;
 
         let reopened = KvEngine::open_with_wal_io_mode(&database, options, WalIoMode::Parallel)?;
+        let recovered_active = reopened.inner.state.load().memtable.clone();
+        anyhow::ensure!(recovered_active.uses_v8_wal());
+        anyhow::ensure!(
+            recovered_active
+                .benchmark_wal_io_diagnostics()
+                .is_some_and(|diagnostics| {
+                    diagnostics.dedicated_durability_driver_enabled
+                        && diagnostics.independent_ack_waiter_enabled
+                }),
+            "recovered V8 WAL did not install the dedicated driver and independent ACK waiter"
+        );
         assert_eq!(reopened.get(b"before-rotation")?.as_deref(), Some(VALUE));
         assert_eq!(reopened.get(b"after-rotation")?.as_deref(), Some(VALUE));
         reopened.close()?;

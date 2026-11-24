@@ -163,6 +163,9 @@ struct CoordinatorInner {
     /// publication boundaries.
     #[cfg(feature = "bench")]
     ack_waiters_enabled: AtomicBool,
+    /// The ACK experiment mode is selected exactly once during WAL setup.
+    #[cfg(feature = "bench")]
+    ack_waiters_mode_configured: AtomicBool,
     /// Published before releasing admission or returning a producer job. A
     /// DATA submitter can identify a lone admitted head without taking the
     /// coordinator lock under its submission lock.
@@ -197,14 +200,17 @@ struct CoordinatorInner {
 
 /// Independent, benchmark-only ACK publication and wait channel. ACK readers
 /// can observe a durable prefix or poison without contending on Coordinator
-/// state. The event mutex is used only to close the check-to-sleep race and is
+/// state. The park mutex is used only to close the check-to-sleep race and is
 /// never held while acquiring Coordinator state.
 #[cfg(feature = "bench")]
 struct WalV8AckWaiters {
     durable_ticket_end: AtomicU64,
     poisoned: AtomicBool,
-    event_generation: Mutex<u64>,
+    event_generation: AtomicU64,
+    park_lock: Mutex<()>,
     changed: Condvar,
+    #[cfg(test)]
+    waiting: AtomicU64,
 }
 
 #[cfg(feature = "bench")]
@@ -213,8 +219,11 @@ impl WalV8AckWaiters {
         Self {
             durable_ticket_end: AtomicU64::new(durable_ticket_end),
             poisoned: AtomicBool::new(false),
-            event_generation: Mutex::new(0),
+            event_generation: AtomicU64::new(0),
+            park_lock: Mutex::new(()),
             changed: Condvar::new(),
+            #[cfg(test)]
+            waiting: AtomicU64::new(0),
         }
     }
 
@@ -229,19 +238,33 @@ impl WalV8AckWaiters {
     }
 
     fn notify_all(&self) {
-        let mut generation = self.event_generation.lock();
-        *generation = generation.wrapping_add(1);
+        let _park = self.park_lock.lock();
+        self.event_generation.fetch_add(1, Ordering::Release);
         self.changed.notify_all();
     }
 
     fn generation(&self) -> u64 {
-        *self.event_generation.lock()
+        self.event_generation.load(Ordering::Acquire)
     }
 
-    fn wait_for_change(&self, observed_generation: u64) {
-        let mut generation = self.event_generation.lock();
-        while *generation == observed_generation {
-            self.changed.wait(&mut generation);
+    fn wait_for_change(
+        &self,
+        observed_generation: u64,
+        mut should_wait: impl FnMut() -> Result<bool>,
+    ) -> Result<()> {
+        let mut park = self.park_lock.lock();
+        loop {
+            if self.event_generation.load(Ordering::Acquire) != observed_generation
+                || !should_wait()?
+            {
+                return Ok(());
+            }
+
+            #[cfg(test)]
+            self.waiting.fetch_add(1, Ordering::Relaxed);
+            self.changed.wait(&mut park);
+            #[cfg(test)]
+            self.waiting.fetch_sub(1, Ordering::Relaxed);
         }
     }
 }
@@ -553,6 +576,8 @@ struct CoordinatorState {
     durable_followers: usize,
     #[cfg(test)]
     durable_wait_only_waiters: usize,
+    #[cfg(feature = "bench")]
+    admissions_started: bool,
     #[cfg(feature = "bench")]
     ordered_link_hash_cpu_ns: u64,
     #[cfg(feature = "bench")]
@@ -1071,8 +1096,16 @@ impl WalV8ParallelCoordinator {
                 && state.tickets.is_empty()
                 && !state.durability_driver_active
                 && !state.closed
-                && !state.poisoned,
+                && !state.poisoned
+                && !state.admissions_started,
             "independent ACK waiter mode must be selected before admission"
+        );
+        ensure!(
+            self.inner
+                .ack_waiters_mode_configured
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok(),
+            "independent ACK waiter mode can only be selected once during initialization"
         );
         self.inner
             .ack_waiters_enabled
@@ -1086,20 +1119,26 @@ impl WalV8ParallelCoordinator {
             self.independent_ack_waiter_enabled(),
             "independent ACK waiter is disabled"
         );
-        if self.inner.ack_waiters.poisoned.load(Ordering::SeqCst) {
-            anyhow::bail!("v8 Parallel coordinator is poisoned");
-        }
         ensure!(
             ticket_end <= self.inner.admitted_ticket_end.load(Ordering::Acquire),
             "v8 durability wait names an unassigned ticket prefix"
         );
 
-        Ok(self
+        if self
             .inner
             .ack_waiters
             .durable_ticket_end
             .load(Ordering::SeqCst)
-            >= ticket_end)
+            >= ticket_end
+        {
+            return Ok(true);
+        }
+        ensure!(
+            !self.inner.ack_waiters.poisoned.load(Ordering::SeqCst),
+            "v8 Parallel coordinator is poisoned"
+        );
+
+        Ok(false)
     }
 
     #[cfg(feature = "bench")]
@@ -1108,8 +1147,16 @@ impl WalV8ParallelCoordinator {
     }
 
     #[cfg(feature = "bench")]
-    pub(crate) fn wait_for_ack_waiter_change(&self, observed_generation: u64) {
-        self.inner.ack_waiters.wait_for_change(observed_generation);
+    pub(crate) fn wait_for_ack_waiter_change(
+        &self,
+        observed_generation: u64,
+        ticket_end: u64,
+    ) -> Result<()> {
+        self.inner
+            .ack_waiters
+            .wait_for_change(observed_generation, || {
+                self.try_ack_prefix(ticket_end).map(|durable| !durable)
+            })
     }
 
     #[cfg(feature = "bench")]
@@ -1119,7 +1166,7 @@ impl WalV8ParallelCoordinator {
             if self.try_ack_prefix(ticket_end)? {
                 return Ok(());
             }
-            self.wait_for_ack_waiter_change(observed_generation);
+            self.wait_for_ack_waiter_change(observed_generation, ticket_end)?;
         }
     }
 
@@ -1327,6 +1374,8 @@ impl WalV8ParallelCoordinator {
                     #[cfg(test)]
                     durable_wait_only_waiters: 0,
                     #[cfg(feature = "bench")]
+                    admissions_started: false,
+                    #[cfg(feature = "bench")]
                     ordered_link_hash_cpu_ns: 0,
                     #[cfg(feature = "bench")]
                     completion_timeline_frontier_ready_end: config.next_ticket,
@@ -1348,6 +1397,8 @@ impl WalV8ParallelCoordinator {
                 ack_waiters: WalV8AckWaiters::new(config.next_ticket),
                 #[cfg(feature = "bench")]
                 ack_waiters_enabled: AtomicBool::new(false),
+                #[cfg(feature = "bench")]
+                ack_waiters_mode_configured: AtomicBool::new(false),
                 admitted_ticket_end: AtomicU64::new(config.next_ticket),
                 #[cfg(feature = "bench")]
                 data_completion_timestamps_enabled: std::sync::atomic::AtomicBool::new(false),
@@ -3602,6 +3653,10 @@ impl WalV8AdmissionPublisher for WalV8ParallelCoordinator {
             data_completion_hol_started_at: None,
         });
         state.next_ticket = next_ticket;
+        #[cfg(feature = "bench")]
+        {
+            state.admissions_started = true;
+        }
         state.next_data_offset = data_end;
         state.last_commit_ts = plan.commit_ts;
         state.last_recorded_at = Some(recorded_at);
@@ -4341,6 +4396,228 @@ mod tests {
 
     fn coordinator(max_inflight_tickets: usize) -> Result<WalV8ParallelCoordinator> {
         coordinator_with_byte_limit(max_inflight_tickets, 64 * 1024 * 1024)
+    }
+
+    #[cfg(feature = "bench")]
+    fn wait_for_ack_waiter(coordinator: &WalV8ParallelCoordinator) -> Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while coordinator
+            .inner
+            .ack_waiters
+            .waiting
+            .load(Ordering::Acquire)
+            == 0
+        {
+            ensure!(
+                Instant::now() < deadline,
+                "ACK waiter did not begin parking"
+            );
+            std::thread::yield_now();
+        }
+
+        Ok(())
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn independent_ack_waiter_mode_is_fixed_during_initialization() -> Result<()> {
+        let configured_coordinator = coordinator(4)?;
+        configured_coordinator.set_independent_ack_waiter_enabled(true)?;
+        assert!(configured_coordinator.independent_ack_waiter_enabled());
+        assert!(
+            configured_coordinator
+                .set_independent_ack_waiter_enabled(false)
+                .is_err()
+        );
+
+        let admitted_coordinator = coordinator(4)?;
+        let _admitted = admit(&batch(10), &admitted_coordinator)?;
+        assert!(
+            admitted_coordinator
+                .set_independent_ack_waiter_enabled(true)
+                .is_err()
+        );
+
+        let idle_after_admission = coordinator(4)?;
+        let durable_batch = batch(20);
+        let admitted = admit(&durable_batch, &idle_after_admission)?;
+        let mut encoded = admitted.encode()?;
+        mark_producer_ready(&mut encoded, &idle_after_admission, true)?;
+        let frontier = idle_after_admission.reserve_frontier(1)?;
+        idle_after_admission.publish_durable_frontier(frontier)?;
+        encoded.disarm_after_durable();
+        {
+            let state = idle_after_admission.inner.state.lock();
+            assert_eq!(state.next_ticket, state.durable_ticket_end);
+            assert!(state.tickets.is_empty());
+        }
+        assert!(
+            idle_after_admission
+                .set_independent_ack_waiter_enabled(true)
+                .is_err()
+        );
+
+        Ok(())
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn independent_ack_fast_path_does_not_take_coordinator_lock() -> Result<()> {
+        let coordinator = coordinator(4)?;
+        coordinator.set_independent_ack_waiter_enabled(true)?;
+        {
+            let mut state = coordinator.inner.state.lock();
+            state.next_ticket = 1;
+            coordinator
+                .inner
+                .admitted_ticket_end
+                .store(1, Ordering::Release);
+        }
+        coordinator.inner.ack_waiters.publish_durable_ticket_end(1);
+
+        let state_guard = coordinator.inner.state.lock();
+        let waiting = coordinator.clone();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let caller = std::thread::spawn(move || {
+            started_tx
+                .send(())
+                .expect("test receiver remains connected");
+            result_tx
+                .send(waiting.try_ack_prefix(1))
+                .expect("test receiver remains connected");
+        });
+        started_rx.recv_timeout(Duration::from_secs(1))?;
+        let result = result_rx.recv_timeout(Duration::from_secs(1));
+        drop(state_guard);
+        assert!(result.is_ok(), "durable ACK waited on Coordinator state");
+        assert!(result??);
+        caller.join().expect("ACK fast-path caller panicked");
+
+        Ok(())
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn independent_ack_park_rechecks_generation_and_predicate() -> Result<()> {
+        let ack_waiters = Arc::new(WalV8AckWaiters::new(0));
+
+        // A publication can race after the caller snapshots the generation
+        // but before it acquires the park lock. It must not sleep on the stale
+        // generation after the publisher's notification has already passed.
+        let observed_generation = ack_waiters.generation();
+        let park = ack_waiters.park_lock.lock();
+        let waiting_ack = Arc::clone(&ack_waiters);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            started_tx
+                .send(())
+                .expect("test receiver remains connected");
+            let _ = done_tx.send(waiting_ack.wait_for_change(observed_generation, || Ok(true)));
+        });
+        started_rx.recv_timeout(Duration::from_secs(1))?;
+        ack_waiters.event_generation.fetch_add(1, Ordering::Release);
+        ack_waiters.changed.notify_all();
+        drop(park);
+        done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .context("ACK waiter missed a generation change before parking")??;
+        waiter.join().expect("ACK generation-race waiter panicked");
+
+        // Durable publication precedes the notifier's acquisition of the
+        // park lock. Rechecking the predicate under that lock lets the waiter
+        // return even while the notification is still pending.
+        let ready = Arc::new(AtomicBool::new(false));
+        let observed_generation = ack_waiters.generation();
+        let park = ack_waiters.park_lock.lock();
+        let waiting_ack = Arc::clone(&ack_waiters);
+        let waiting_ready = Arc::clone(&ready);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            started_tx
+                .send(())
+                .expect("test receiver remains connected");
+            let _ = done_tx.send(waiting_ack.wait_for_change(observed_generation, || {
+                Ok(!waiting_ready.load(Ordering::Acquire))
+            }));
+        });
+        started_rx.recv_timeout(Duration::from_secs(1))?;
+        ready.store(true, Ordering::Release);
+        drop(park);
+        done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .context("ACK waiter did not recheck its predicate before parking")??;
+        waiter.join().expect("ACK predicate-race waiter panicked");
+
+        Ok(())
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn independent_ack_partial_prefix_poison_and_driver_handoff() -> Result<()> {
+        let partial_coordinator = coordinator(4)?;
+        partial_coordinator.set_independent_ack_waiter_enabled(true)?;
+        let first_batch = batch(10);
+        let second_batch = batch(20);
+        let mut first = admit(&first_batch, &partial_coordinator)?.encode()?;
+        let mut second = admit(&second_batch, &partial_coordinator)?.encode()?;
+        mark_producer_ready(&mut first, &partial_coordinator, true)?;
+        mark_producer_ready(&mut second, &partial_coordinator, false)?;
+
+        let frontier = partial_coordinator.reserve_frontier(1)?;
+        partial_coordinator.publish_durable_frontier(frontier)?;
+        first.disarm_after_durable();
+        assert!(partial_coordinator.try_ack_prefix(1)?);
+        assert!(!partial_coordinator.try_ack_prefix(2)?);
+
+        let waiting = partial_coordinator.clone();
+        let (waiter_tx, waiter_rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let _ = waiter_tx.send(waiting.wait_for_durable_prefix_independent(2));
+        });
+        wait_for_ack_waiter(&partial_coordinator)?;
+        partial_coordinator.poison();
+        assert!(waiter_rx.recv_timeout(Duration::from_secs(1))?.is_err());
+        waiter.join().expect("poisoned ACK waiter panicked");
+        assert!(partial_coordinator.try_ack_prefix(1)?);
+        assert!(partial_coordinator.try_ack_prefix(2).is_err());
+
+        // A later Driver Drop must wake a waiting caller so it can retry
+        // election. Use a fresh coordinator because Poison is terminal.
+        let handoff_coordinator = coordinator(4)?;
+        handoff_coordinator.set_independent_ack_waiter_enabled(true)?;
+        let pending = batch(30);
+        let mut encoded = admit(&pending, &handoff_coordinator)?.encode()?;
+        mark_producer_ready(&mut encoded, &handoff_coordinator, true)?;
+        let mut driver = handoff_coordinator
+            .acquire_durability_driver(1)?
+            .context("missing initial durability driver")?;
+        let observed_generation = handoff_coordinator.ack_waiter_generation();
+        let waiting = handoff_coordinator.clone();
+        let (handoff_tx, handoff_rx) = std::sync::mpsc::channel();
+        let follower = std::thread::spawn(move || {
+            let _ = handoff_tx.send(waiting.wait_for_ack_waiter_change(observed_generation, 1));
+        });
+        wait_for_ack_waiter(&handoff_coordinator)?;
+        driver.complete();
+        drop(driver);
+        handoff_rx
+            .recv_timeout(Duration::from_secs(1))
+            .context("Driver Drop did not wake the ACK waiter")??;
+        follower.join().expect("Driver handoff ACK waiter panicked");
+        let mut successor = handoff_coordinator
+            .acquire_durability_driver(1)?
+            .context("Driver Drop did not release election ownership")?;
+        let frontier = handoff_coordinator.reserve_frontier(1)?;
+        handoff_coordinator.publish_durable_frontier(frontier)?;
+        encoded.disarm_after_durable();
+        successor.complete();
+        drop(successor);
+        assert!(handoff_coordinator.try_ack_prefix(1)?);
+
+        Ok(())
     }
 
     #[test]

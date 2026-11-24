@@ -6482,7 +6482,7 @@ impl WalV8ParallelWriter {
                 WalV8DurabilityDriverElection::Durable => return Ok(()),
                 WalV8DurabilityDriverElection::Busy => self
                     .coordinator
-                    .wait_for_ack_waiter_change(observed_generation),
+                    .wait_for_ack_waiter_change(observed_generation, ticket_end)?,
                 WalV8DurabilityDriverElection::Driver(mut driver) => {
                     let result = self.drive_frontier_through(ticket_end, &mut driver);
                     if result.is_ok() {
