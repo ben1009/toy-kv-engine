@@ -40379,6 +40379,28 @@ mod tests {
     }
 
     #[cfg(all(target_os = "linux", feature = "bench"))]
+    fn put_through_transient_pitr_barrier(
+        engine: &KvEngine,
+        key: &[u8],
+        value: &[u8],
+    ) -> anyhow::Result<()> {
+        const PITR_BARRIER_ERROR: &str = "commit admission is stopped at a PITR barrier";
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match engine.put(key, value) {
+                Ok(()) => return Ok(()),
+                Err(error)
+                    if format!("{error:#}").contains(PITR_BARRIER_ERROR)
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    #[cfg(all(target_os = "linux", feature = "bench"))]
     #[test]
     fn v8_point_buffer_preallocation_is_inherited_across_rotation_and_recovery()
     -> anyhow::Result<()> {
@@ -40438,7 +40460,7 @@ mod tests {
             .set_v8_point_buffer_preallocation_for_test(true)?;
         for index in 0..WRITES_PER_SEGMENT {
             let key = format!("point-{index:03}");
-            engine.put(key.as_bytes(), VALUE)?;
+            put_through_transient_pitr_barrier(&engine, key.as_bytes(), VALUE)?;
         }
         assert!(matches!(
             engine.create_recovery_point()?,
@@ -40456,7 +40478,7 @@ mod tests {
         drop(successor);
         for index in WRITES_PER_SEGMENT..(2 * WRITES_PER_SEGMENT) {
             let key = format!("point-{index:03}");
-            engine.put(key.as_bytes(), VALUE)?;
+            put_through_transient_pitr_barrier(&engine, key.as_bytes(), VALUE)?;
         }
         engine.sync()?;
 
@@ -40550,27 +40572,6 @@ mod tests {
         const WRITES_BEFORE_ROTATION: usize = 2;
         const MAX_SEGMENT_BYTES: u64 = 4 * 1024 * 1024;
         const VALUE: &[u8] = &[0x5a; 1024];
-
-        fn put_through_transient_pitr_barrier(
-            engine: &KvEngine,
-            key: &[u8],
-            value: &[u8],
-        ) -> anyhow::Result<()> {
-            const PITR_BARRIER_ERROR: &str = "commit admission is stopped at a PITR barrier";
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            loop {
-                match engine.put(key, value) {
-                    Ok(()) => return Ok(()),
-                    Err(error)
-                        if format!("{error:#}").contains(PITR_BARRIER_ERROR)
-                            && std::time::Instant::now() < deadline =>
-                    {
-                        std::thread::sleep(std::time::Duration::from_millis(1));
-                    }
-                    Err(error) => return Err(error),
-                }
-            }
-        }
 
         let directory = tempdir()?;
         let database = directory.path().join("db");
