@@ -53,25 +53,31 @@ request-versus-sleep lost-wakeup window. The thread is the only caller that
 elects and owns `WalV8DurabilityDriver` in this mode. Writer waiters use a
 wait-only Coordinator predicate and never enter driver election.
 
-If the thread returns an error or panics, it stores a terminal error, poisons
-the Coordinator, and wakes durable waiters through the existing poison path.
-The waiter receives that terminal error where available. The normal I/O worker
-and completion reaper remain independently alive while the driver performs
-FRONTIER sync.
+If the thread returns an error or panics, it poisons the Coordinator first,
+waking durable waiters through the existing fail-stop path. It records the
+detailed terminal error afterward on a best-effort basis; a waiter may therefore
+observe the generic poison error instead of the underlying cause. The normal
+I/O worker and completion reaper remain independently alive while the driver
+performs FRONTIER sync.
 
 The driver join handle is owned by the outer `Wal`. Its field is dropped before
 the `Arc<WalV8ParallelWriter>` so teardown signals and joins the driver before
 releasing writer-owned segment resources. `Wal::close()` remains a durability
-barrier; it does not stop the thread. Rotation drains the old writer through
-the existing barrier, and dropping that WAL owner stops and joins its driver.
+barrier; it does not stop the thread. Per-ticket ACKs return after durable
+publication, while whole-WAL sync/close additionally waits for the driver's
+post-publication resource retirement to finish. Rotation drains the old writer
+through that barrier, and dropping that WAL owner stops and joins its driver.
 
 ## D3a benchmark diagnostics
 
-The benchmark output records:
+Detailed driver counters are disabled for scoring runs and enabled only with
+`TOYKV_BENCH_V8_DURABILITY_DRIVER_DIAGNOSTICS=1`. The benchmark output records
+when enabled:
 
 - Whether the dedicated driver owner was actually installed.
 - Number of durability requests, wake tokens, coalesced wake attempts, and
-  driver advances.
+  driver advance attempts. The latter includes failed calls and is not a count
+  of successful FRONTIER syncs.
 - Caller-driven writer election attempts, which must be zero in Dedicated mode.
 
 The mode parser accepts only `1` as enabled; absent and `0` are disabled, and

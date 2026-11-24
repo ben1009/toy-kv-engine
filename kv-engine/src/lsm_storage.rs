@@ -40265,6 +40265,106 @@ mod tests {
 
     #[cfg(all(target_os = "linux", feature = "bench"))]
     #[test]
+    fn v8_dedicated_durability_driver_rotates_and_recovers() -> anyhow::Result<()> {
+        const CHILD_ENV: &str = "TOYKV_TEST_V8_DEDICATED_ROTATION_CHILD";
+
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let status = std::process::Command::new(std::env::current_exe()?)
+                .arg("--nocapture")
+                .arg("v8_dedicated_durability_driver_rotates_and_recovers")
+                .env(CHILD_ENV, "1")
+                .env("TOYKV_BENCH_V8_DEDICATED_DURABILITY_DRIVER", "1")
+                .env("TOYKV_BENCH_V8_DURABILITY_DRIVER_DIAGNOSTICS", "0")
+                .status()?;
+            anyhow::ensure!(status.success(), "dedicated-driver rotation child failed");
+            return Ok(());
+        }
+
+        use crate::pitr::api::{PersistedPitrConfig, PitrOptions, PitrRuntimeOptions};
+        use crate::tests::harness::is_io_uring_unavailable_error;
+        use crate::wal::WalIoMode;
+
+        const MAX_SEGMENT_BYTES: u64 = 4 * 1024 * 1024;
+        const VALUE: &[u8] = &[0x5a; 1024];
+
+        let directory = tempdir()?;
+        let database = directory.path().join("db");
+        let repository = directory.path().join("repository");
+        let options = LsmStorageOptions {
+            enable_wal: true,
+            target_sst_size: 1 << 30,
+            ..LsmStorageOptions::default_for_test()
+        };
+        let engine = match KvEngine::open_with_wal_io_mode(
+            &database,
+            options.clone(),
+            WalIoMode::Parallel,
+        ) {
+            Ok(engine) => engine,
+            Err(error) if is_io_uring_unavailable_error(&error) => {
+                eprintln!("skipping test (io_uring unavailable): {error:#}");
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        if let Err(error) = engine.enable_pitr(PitrOptions {
+            repository,
+            config: PersistedPitrConfig {
+                archive_interval: std::time::Duration::from_secs(3600),
+                max_segment_bytes: MAX_SEGMENT_BYTES,
+                max_unarchived_bytes: 8 * 1024 * 1024,
+                max_source_spool_bytes: 32 * 1024 * 1024,
+            },
+            runtime: PitrRuntimeOptions::default(),
+        }) {
+            if is_io_uring_unavailable_error(&error) {
+                eprintln!("skipping test (io_uring unavailable): {error:#}");
+                engine.close()?;
+                return Ok(());
+            }
+            return Err(error);
+        }
+
+        let first_active = engine.inner.state.load().memtable.clone();
+        anyhow::ensure!(first_active.uses_v8_wal());
+        anyhow::ensure!(
+            first_active
+                .benchmark_wal_io_diagnostics()
+                .is_some_and(|diagnostics| diagnostics.dedicated_durability_driver_enabled),
+            "initial V8 WAL did not install a dedicated durability driver"
+        );
+        let first_active_id = first_active.id();
+        engine.put(b"before-rotation", VALUE)?;
+        anyhow::ensure!(matches!(
+            engine.create_recovery_point()?,
+            crate::pitr::api::RecoveryPointOutcome::Durable(_)
+        ));
+
+        let successor = engine.inner.state.load().memtable.clone();
+        anyhow::ensure!(successor.uses_v8_wal());
+        anyhow::ensure!(successor.id() != first_active_id);
+        anyhow::ensure!(
+            successor
+                .benchmark_wal_io_diagnostics()
+                .is_some_and(|diagnostics| diagnostics.dedicated_durability_driver_enabled),
+            "rotated V8 WAL did not install a dedicated durability driver"
+        );
+        drop(successor);
+
+        engine.put(b"after-rotation", VALUE)?;
+        engine.close()?;
+        drop(engine);
+
+        let reopened = KvEngine::open_with_wal_io_mode(&database, options, WalIoMode::Parallel)?;
+        assert_eq!(reopened.get(b"before-rotation")?.as_deref(), Some(VALUE));
+        assert_eq!(reopened.get(b"after-rotation")?.as_deref(), Some(VALUE));
+        reopened.close()?;
+
+        Ok(())
+    }
+
+    #[cfg(all(target_os = "linux", feature = "bench"))]
+    #[test]
     fn v8_point_buffer_preallocation_is_inherited_across_rotation_and_recovery()
     -> anyhow::Result<()> {
         use crate::pitr::api::{PersistedPitrConfig, PitrOptions, PitrRuntimeOptions};

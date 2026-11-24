@@ -174,14 +174,16 @@ pub struct WalIoDiagnostics {
     pub point_buffer_preallocation_enabled: bool,
     /// Whether durability advances are owned by a dedicated benchmark-only worker thread.
     pub dedicated_durability_driver_enabled: bool,
+    /// Whether contended request/wake/advance counters were enabled for this run.
+    pub dedicated_durability_diagnostics_enabled: bool,
     /// Number of writer durability requests submitted to the dedicated driver.
     pub dedicated_durability_requests: u64,
     /// Number of wake tokens sent to the dedicated driver.
     pub dedicated_durability_wake_signals: u64,
     /// Number of wake requests coalesced because the capacity-one channel was already full.
     pub dedicated_durability_coalesced_wakes: u64,
-    /// Number of durability advances performed by the dedicated driver.
-    pub dedicated_durability_advances: u64,
+    /// Number of driver advance attempts, including calls that returned an error.
+    pub dedicated_durability_advance_attempts: u64,
     /// Number of durability advances initiated by caller-driven writers.
     pub caller_durability_driver_election_attempts: u64,
     /// Number of Point DATA-buffer preallocation attempts during the run.
@@ -258,6 +260,9 @@ const V8_ADMISSION_CURSOR_PUBLISH_FAST_PATH_ENV: &str =
 
 #[cfg(feature = "bench")]
 const V8_DEDICATED_DURABILITY_DRIVER_ENV: &str = "TOYKV_BENCH_V8_DEDICATED_DURABILITY_DRIVER";
+#[cfg(feature = "bench")]
+const V8_DEDICATED_DURABILITY_DIAGNOSTICS_ENV: &str =
+    "TOYKV_BENCH_V8_DURABILITY_DRIVER_DIAGNOSTICS";
 
 #[cfg(feature = "bench")]
 fn v8_admission_cursor_publish_fast_path_env_enabled(value: Option<&str>) -> bool {
@@ -297,6 +302,28 @@ fn v8_dedicated_durability_driver_enabled() -> Result<bool> {
         }
         Err(error @ std::env::VarError::NotUnicode(_)) => {
             Err(error).context("read dedicated V8 durability driver setting")
+        }
+    }
+}
+
+#[cfg(feature = "bench")]
+fn v8_dedicated_durability_diagnostics_enabled_from_value(value: Option<&str>) -> Result<bool> {
+    match value {
+        Some("1") => Ok(true),
+        Some("0") | None => Ok(false),
+        Some(_) => anyhow::bail!("{V8_DEDICATED_DURABILITY_DIAGNOSTICS_ENV} must be `0` or `1`"),
+    }
+}
+
+#[cfg(feature = "bench")]
+fn v8_dedicated_durability_diagnostics_enabled() -> Result<bool> {
+    match std::env::var(V8_DEDICATED_DURABILITY_DIAGNOSTICS_ENV) {
+        Ok(value) => v8_dedicated_durability_diagnostics_enabled_from_value(Some(&value)),
+        Err(std::env::VarError::NotPresent) => {
+            v8_dedicated_durability_diagnostics_enabled_from_value(None)
+        }
+        Err(error @ std::env::VarError::NotUnicode(_)) => {
+            Err(error).context("read dedicated V8 durability diagnostics setting")
         }
     }
 }
@@ -1797,8 +1824,19 @@ impl Wal {
         let data_start = u64::try_from(v8::WAL_V8_HEADER_LEN + v8::codec::WAL_V8_FRAME_LEN)?;
 
         #[cfg(feature = "bench")]
+        let mut writer = writer;
+
+        #[cfg(feature = "bench")]
+        let dedicated_durability_diagnostics_enabled =
+            v8_dedicated_durability_diagnostics_enabled()?;
+
+        #[cfg(feature = "bench")]
+        writer.set_durability_driver_diagnostics_enabled(dedicated_durability_diagnostics_enabled);
+
+        #[cfg(feature = "bench")]
         let (writer, dedicated_durability_driver) = if v8_dedicated_durability_driver_enabled()? {
-            let (writer, driver) = writer.into_dedicated_durability_driver()?;
+            let (writer, driver) = writer
+                .into_dedicated_durability_driver(dedicated_durability_diagnostics_enabled)?;
             (writer, Some(driver))
         } else {
             (Arc::new(writer), None)
@@ -3090,6 +3128,12 @@ impl Wal {
                 return Err(error);
             }
         };
+        if ticket.is_none()
+            && let Err(error) = writer.wait_for_post_publish_cleanup()
+        {
+            self.record_v8_parallel_error(writer, &error);
+            return Err(error);
+        }
         if waited {
             self.refresh_v8_parallel_cursor(writer);
         }
@@ -4926,6 +4970,8 @@ impl Wal {
 #[cfg(test)]
 mod v8_wait_tests {
     use super::*;
+    #[cfg(feature = "bench")]
+    use std::{fs::OpenOptions, thread, time::Duration};
 
     #[cfg(feature = "bench")]
     #[test]
@@ -4935,6 +4981,129 @@ mod v8_wait_tests {
         assert!(v8_dedicated_durability_driver_enabled_from_value(Some("1")).unwrap());
         assert!(v8_dedicated_durability_driver_enabled_from_value(Some("true")).is_err());
         assert!(v8_dedicated_durability_driver_enabled_from_value(Some("2")).is_err());
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn dedicated_durability_diagnostics_are_opt_in() {
+        assert!(!v8_dedicated_durability_diagnostics_enabled_from_value(None).unwrap());
+        assert!(!v8_dedicated_durability_diagnostics_enabled_from_value(Some("0")).unwrap());
+        assert!(v8_dedicated_durability_diagnostics_enabled_from_value(Some("1")).unwrap());
+        assert!(v8_dedicated_durability_diagnostics_enabled_from_value(Some("true")).is_err());
+        assert!(v8_dedicated_durability_diagnostics_enabled_from_value(Some("2")).is_err());
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn dedicated_wal_close_waits_for_post_publish_retirement() -> Result<()> {
+        use crate::pitr::{ArchiveEpochId, ChainAnchor, RecordedAt, SegmentId, TimelineId};
+        use crate::wal::v8::codec::WalV8Header;
+
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("dedicated-wal-close-barrier.wal");
+        let archive_epoch_id = ArchiveEpochId([0x22; 16]);
+        let header = WalV8Header {
+            timeline_id: TimelineId([0x11; 16]),
+            archive_epoch_id,
+            segment_id: SegmentId(7),
+            predecessor: ChainAnchor::Genesis { archive_epoch_id },
+            incarnation: [0x44; 16],
+        };
+        let boundary = v8::install::create_empty_active_image(&path, header)?;
+        let installed = v8::install::recover_and_install_active(
+            &path,
+            &[boundary],
+            header.predecessor,
+            crate::pitr::LIVE_WAL_V5_LIMITS,
+            MAX_WAL_FILE_SIZE,
+        )?;
+        let open_file = || OpenOptions::new().read(true).write(true).open(&path);
+        let leader = v8::leader::WalV8LeaderWriter::new(
+            open_file()?,
+            open_file()?,
+            &installed,
+            MAX_WAL_FILE_SIZE,
+        )?;
+        let parallel = match leader.into_parallel() {
+            Ok(writer) => writer,
+            Err(error) if crate::tests::harness::is_io_uring_unavailable_error(&error) => {
+                eprintln!("skipping test (io_uring unavailable): {error:#}");
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+
+        let batch = crate::pitr::WalBatch {
+            commit_ts: 1,
+            recorded_at: RecordedAt { secs: 1, nanos: 0 },
+            entries: vec![crate::pitr::WalEntry::Put {
+                key: b"k".to_vec(),
+                value: b"value".to_vec(),
+            }],
+        };
+        let prepared = parallel.preflight_batch(&batch, crate::pitr::LIVE_WAL_V5_LIMITS)?;
+        let mut wal = Wal::from_v8_parallel(parallel, &installed)?;
+        if wal.dedicated_durability_driver.is_none() {
+            let writer = Arc::try_unwrap(
+                wal.v8_parallel
+                    .take()
+                    .context("v8 Parallel test writer is missing")?,
+            )
+            .map_err(|_| anyhow::anyhow!("v8 Parallel test writer has unexpected owners"))?;
+            let (writer, driver) = writer.into_dedicated_durability_driver(false)?;
+            wal.v8_parallel = Some(writer);
+            wal.dedicated_durability_driver = Some(driver);
+        }
+
+        let writer = Arc::clone(
+            wal.v8_parallel
+                .as_ref()
+                .context("v8 Parallel test writer is missing")?,
+        );
+        let (retirement_tx, retirement_rx) = crossbeam_channel::bounded(1);
+        let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+        writer.set_post_publish_retirement_hook_for_test(move || {
+            retirement_tx.send(()).map_err(anyhow::Error::from)?;
+            release_rx
+                .recv_timeout(Duration::from_secs(5))
+                .context("test did not release post-publish retirement")?;
+            Ok(())
+        });
+
+        let (_, job) =
+            wal.admit_v8_prepared_parallel_batch(prepared, batch.commit_ts, batch.recorded_at)?;
+        job.finish()?;
+
+        let wal = Arc::new(wal);
+        let close_wal = Arc::clone(&wal);
+        let (close_tx, close_rx) = crossbeam_channel::bounded(1);
+        let close_thread = thread::spawn(move || {
+            let _ = close_tx.send(close_wal.close());
+        });
+
+        retirement_rx
+            .recv_timeout(Duration::from_secs(5))
+            .context("Wal::close did not reach post-publish retirement")?;
+        assert!(
+            matches!(
+                close_rx.recv_timeout(Duration::from_millis(100)),
+                Err(crossbeam_channel::RecvTimeoutError::Timeout)
+            ),
+            "Wal::close returned while post-publish retirement was paused"
+        );
+
+        release_tx
+            .send(())
+            .context("release post-publish retirement")?;
+        close_rx
+            .recv_timeout(Duration::from_secs(3))
+            .context("Wal::close did not finish after post-publish retirement")??;
+        close_thread.join().expect("Wal::close thread panicked");
+
+        drop(writer);
+        drop(wal);
+
+        Ok(())
     }
 
     #[test]
