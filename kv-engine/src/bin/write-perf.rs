@@ -1933,6 +1933,12 @@ struct WalIoDiagnosticsRecord {
     cursor_singleton_submission_enabled: bool,
     admission_cursor_publish_fast_path_enabled: bool,
     point_buffer_preallocation_enabled: bool,
+    dedicated_durability_driver_enabled: bool,
+    dedicated_durability_requests: u64,
+    dedicated_durability_wake_signals: u64,
+    dedicated_durability_coalesced_wakes: u64,
+    dedicated_durability_advances: u64,
+    caller_durability_driver_election_attempts: u64,
     point_buffer_preallocation_attempts: u64,
     point_buffer_preallocation_hits: u64,
     point_buffer_preallocation_fallbacks: u64,
@@ -2098,6 +2104,13 @@ impl From<WalIoDiagnostics> for WalIoDiagnosticsRecord {
             admission_cursor_publish_fast_path_enabled: diagnostics
                 .admission_cursor_publish_fast_path_enabled,
             point_buffer_preallocation_enabled: diagnostics.point_buffer_preallocation_enabled,
+            dedicated_durability_driver_enabled: diagnostics.dedicated_durability_driver_enabled,
+            dedicated_durability_requests: diagnostics.dedicated_durability_requests,
+            dedicated_durability_wake_signals: diagnostics.dedicated_durability_wake_signals,
+            dedicated_durability_coalesced_wakes: diagnostics.dedicated_durability_coalesced_wakes,
+            dedicated_durability_advances: diagnostics.dedicated_durability_advances,
+            caller_durability_driver_election_attempts: diagnostics
+                .caller_durability_driver_election_attempts,
             point_buffer_preallocation_attempts: diagnostics.point_buffer_preallocation_attempts,
             point_buffer_preallocation_hits: diagnostics.point_buffer_preallocation_hits,
             point_buffer_preallocation_fallbacks: diagnostics.point_buffer_preallocation_fallbacks,
@@ -2179,6 +2192,7 @@ impl WalIoDiagnosticsRecord {
             && self.admission_cursor_publish_fast_path_enabled
                 == other.admission_cursor_publish_fast_path_enabled
             && self.point_buffer_preallocation_enabled == other.point_buffer_preallocation_enabled
+            && self.dedicated_durability_driver_enabled == other.dedicated_durability_driver_enabled
             && self.point_resource_retirement_mode == other.point_resource_retirement_mode
             && self.point_resource_preclaim_enabled == other.point_resource_preclaim_enabled
             && self.point_resource_preclaim_sum_cache_enabled
@@ -12927,6 +12941,12 @@ mod tests {
                         cursor_singleton_submission_enabled: false,
                         admission_cursor_publish_fast_path_enabled: false,
                         point_buffer_preallocation_enabled: false,
+                        dedicated_durability_driver_enabled: false,
+                        dedicated_durability_requests: 0,
+                        dedicated_durability_wake_signals: 0,
+                        dedicated_durability_coalesced_wakes: 0,
+                        dedicated_durability_advances: 0,
+                        caller_durability_driver_election_attempts: 0,
                         point_buffer_preallocation_attempts: 0,
                         point_buffer_preallocation_hits: 0,
                         point_buffer_preallocation_fallbacks: 0,
@@ -12988,6 +13008,12 @@ mod tests {
                         cursor_singleton_submission_enabled: false,
                         admission_cursor_publish_fast_path_enabled: false,
                         point_buffer_preallocation_enabled: false,
+                        dedicated_durability_driver_enabled: false,
+                        dedicated_durability_requests: 0,
+                        dedicated_durability_wake_signals: 0,
+                        dedicated_durability_coalesced_wakes: 0,
+                        dedicated_durability_advances: 0,
+                        caller_durability_driver_election_attempts: 0,
                         point_buffer_preallocation_attempts: 0,
                         point_buffer_preallocation_hits: 0,
                         point_buffer_preallocation_fallbacks: 0,

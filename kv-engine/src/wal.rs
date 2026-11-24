@@ -172,6 +172,18 @@ pub struct WalIoDiagnostics {
     pub admission_cursor_publish_fast_path_enabled: bool,
     /// Whether Point batches attempt the bounded benchmark-only DATA-buffer preallocation.
     pub point_buffer_preallocation_enabled: bool,
+    /// Whether durability advances are owned by a dedicated benchmark-only worker thread.
+    pub dedicated_durability_driver_enabled: bool,
+    /// Number of writer durability requests submitted to the dedicated driver.
+    pub dedicated_durability_requests: u64,
+    /// Number of wake tokens sent to the dedicated driver.
+    pub dedicated_durability_wake_signals: u64,
+    /// Number of wake requests coalesced because the capacity-one channel was already full.
+    pub dedicated_durability_coalesced_wakes: u64,
+    /// Number of durability advances performed by the dedicated driver.
+    pub dedicated_durability_advances: u64,
+    /// Number of durability advances initiated by caller-driven writers.
+    pub caller_durability_driver_election_attempts: u64,
     /// Number of Point DATA-buffer preallocation attempts during the run.
     pub point_buffer_preallocation_attempts: u64,
     /// Number of Point DATA buffers allocated before serialized admission.
@@ -245,6 +257,9 @@ const V8_ADMISSION_CURSOR_PUBLISH_FAST_PATH_ENV: &str =
     "TOYKV_BENCH_V8_ADMISSION_CURSOR_PUBLISH_FAST_PATH";
 
 #[cfg(feature = "bench")]
+const V8_DEDICATED_DURABILITY_DRIVER_ENV: &str = "TOYKV_BENCH_V8_DEDICATED_DURABILITY_DRIVER";
+
+#[cfg(feature = "bench")]
 fn v8_admission_cursor_publish_fast_path_env_enabled(value: Option<&str>) -> bool {
     value == Some("1")
 }
@@ -262,6 +277,28 @@ pub(crate) fn v8_admission_cursor_publish_fast_path_enabled() -> bool {
                 .as_deref(),
         )
     })
+}
+
+#[cfg(feature = "bench")]
+fn v8_dedicated_durability_driver_enabled_from_value(value: Option<&str>) -> Result<bool> {
+    match value {
+        Some("1") => Ok(true),
+        Some("0") | None => Ok(false),
+        Some(_) => anyhow::bail!("{V8_DEDICATED_DURABILITY_DRIVER_ENV} must be `0` or `1`"),
+    }
+}
+
+#[cfg(feature = "bench")]
+fn v8_dedicated_durability_driver_enabled() -> Result<bool> {
+    match std::env::var(V8_DEDICATED_DURABILITY_DRIVER_ENV) {
+        Ok(value) => v8_dedicated_durability_driver_enabled_from_value(Some(&value)),
+        Err(std::env::VarError::NotPresent) => {
+            v8_dedicated_durability_driver_enabled_from_value(None)
+        }
+        Err(error @ std::env::VarError::NotUnicode(_)) => {
+            Err(error).context("read dedicated V8 durability driver setting")
+        }
+    }
 }
 
 #[cfg(not(feature = "bench"))]
@@ -787,7 +824,14 @@ pub struct Wal {
     v7_leader: Option<Mutex<WalV7LeaderWriter>>,
     /// V8 Leader control writer, retained for serialized comparisons.
     v8_leader: Option<Mutex<v8::leader::WalV8LeaderWriter>>,
+    /// Dropped before `v8_parallel`, so its worker is joined before the writer
+    /// and its segment resources are released.
+    #[cfg(feature = "bench")]
+    dedicated_durability_driver: Option<v8::leader::WalV8DedicatedDurabilityDriver>,
     /// Concurrent v8 writer for the embedded-frontier Parallel pipeline.
+    #[cfg(feature = "bench")]
+    v8_parallel: Option<Arc<v8::leader::WalV8ParallelWriter>>,
+    #[cfg(not(feature = "bench"))]
     v8_parallel: Option<v8::leader::WalV8ParallelWriter>,
     /// Whether this WAL uses v3 typed entries (kind prefix).
     /// Only meaningful when `mvcc_format` is true. When false, the WAL uses v2
@@ -1167,6 +1211,8 @@ impl Wal {
                 parallel_runtime,
                 v7_leader: None,
                 v8_leader: None,
+                #[cfg(feature = "bench")]
+                dedicated_durability_driver: None,
                 v8_parallel: None,
                 is_v3,
                 direct_file: Some(direct_file),
@@ -1200,6 +1246,8 @@ impl Wal {
                 parallel_runtime: None,
                 v7_leader: None,
                 v8_leader: None,
+                #[cfg(feature = "bench")]
+                dedicated_durability_driver: None,
                 v8_parallel: None,
                 is_v3,
                 direct_file: None,
@@ -1542,6 +1590,8 @@ impl Wal {
             parallel_runtime,
             v7_leader: None,
             v8_leader: None,
+            #[cfg(feature = "bench")]
+            dedicated_durability_driver: None,
             v8_parallel: None,
             is_v3: true,
             direct_file: Some(direct_file),
@@ -1601,6 +1651,8 @@ impl Wal {
             parallel_runtime: None,
             v7_leader: None,
             v8_leader: None,
+            #[cfg(feature = "bench")]
+            dedicated_durability_driver: None,
             v8_parallel: None,
             is_v3: true,
             direct_file: Some(direct_file),
@@ -1647,6 +1699,8 @@ impl Wal {
             parallel_runtime: None,
             v7_leader: Some(Mutex::new(writer)),
             v8_leader: None,
+            #[cfg(feature = "bench")]
+            dedicated_durability_driver: None,
             v8_parallel: None,
             is_v3: true,
             direct_file: None,
@@ -1699,6 +1753,8 @@ impl Wal {
             parallel_runtime: None,
             v7_leader: None,
             v8_leader: Some(Mutex::new(writer)),
+            #[cfg(feature = "bench")]
+            dedicated_durability_driver: None,
             v8_parallel: None,
             is_v3: true,
             direct_file: None,
@@ -1740,6 +1796,14 @@ impl Wal {
         let append_offset = installed.image_len;
         let data_start = u64::try_from(v8::WAL_V8_HEADER_LEN + v8::codec::WAL_V8_FRAME_LEN)?;
 
+        #[cfg(feature = "bench")]
+        let (writer, dedicated_durability_driver) = if v8_dedicated_durability_driver_enabled()? {
+            let (writer, driver) = writer.into_dedicated_durability_driver()?;
+            (writer, Some(driver))
+        } else {
+            (Arc::new(writer), None)
+        };
+
         Ok(Self {
             buffered_file: Arc::new(Mutex::new(BufWriter::new(buffered_file))),
             mvcc_format: true,
@@ -1748,6 +1812,8 @@ impl Wal {
             parallel_runtime: None,
             v7_leader: None,
             v8_leader: None,
+            #[cfg(feature = "bench")]
+            dedicated_durability_driver,
             v8_parallel: Some(writer),
             is_v3: true,
             direct_file: None,
@@ -1827,6 +1893,8 @@ impl Wal {
             parallel_runtime: Some(parallel_runtime),
             v7_leader: None,
             v8_leader: None,
+            #[cfg(feature = "bench")]
+            dedicated_durability_driver: None,
             v8_parallel: None,
             is_v3: true,
             direct_file: Some(direct_file),
@@ -1883,7 +1951,7 @@ impl Wal {
         let parallel_poisoned = self
             .v8_parallel
             .as_ref()
-            .is_some_and(v8::leader::WalV8ParallelWriter::is_poisoned);
+            .is_some_and(|writer| writer.is_poisoned());
         if leader_poisoned || parallel_poisoned {
             self.poisoned.store(true, Ordering::Release);
         }
@@ -2171,14 +2239,20 @@ impl Wal {
 
     #[cfg(feature = "bench")]
     pub(crate) fn benchmark_io_diagnostics(&self) -> Option<WalIoDiagnostics> {
-        self.v8_leader
+        let mut diagnostics = self
+            .v8_leader
             .as_ref()
             .map(|writer| writer.lock().io_diagnostics())
             .or_else(|| {
                 self.v8_parallel
                     .as_ref()
-                    .map(v8::leader::WalV8ParallelWriter::io_diagnostics)
-            })
+                    .map(|writer| writer.io_diagnostics())
+            });
+        if let Some(diagnostics) = &mut diagnostics {
+            diagnostics.dedicated_durability_driver_enabled =
+                self.dedicated_durability_driver.is_some();
+        }
+        diagnostics
     }
 
     #[cfg(feature = "bench")]
@@ -2220,7 +2294,7 @@ impl Wal {
     pub(crate) fn v8_progress_ring_enabled(&self) -> bool {
         self.v8_parallel
             .as_ref()
-            .is_some_and(v8::leader::WalV8ParallelWriter::progress_ring_enabled)
+            .is_some_and(|writer| writer.progress_ring_enabled())
     }
 
     pub(crate) fn pitr_rotation_needed(&self) -> bool {
@@ -4852,6 +4926,16 @@ impl Wal {
 #[cfg(test)]
 mod v8_wait_tests {
     use super::*;
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn dedicated_durability_driver_is_strictly_opt_in() {
+        assert!(!v8_dedicated_durability_driver_enabled_from_value(None).unwrap());
+        assert!(!v8_dedicated_durability_driver_enabled_from_value(Some("0")).unwrap());
+        assert!(v8_dedicated_durability_driver_enabled_from_value(Some("1")).unwrap());
+        assert!(v8_dedicated_durability_driver_enabled_from_value(Some("true")).is_err());
+        assert!(v8_dedicated_durability_driver_enabled_from_value(Some("2")).is_err());
+    }
 
     #[test]
     fn already_durable_ticket_succeeds_after_wal_poison() {

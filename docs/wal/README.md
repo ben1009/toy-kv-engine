@@ -51,6 +51,9 @@ Preparation, durability progress and durable publication use separate
 notifications. One driver forms FRONTIERs. The WAL's published cursor path
 lets a durable follower return without taking the physical FRONTIER mutex.
 The direct writer append path takes that mutex to construct commit metadata.
+The benchmark-only [RFC 028 dedicated durability driver](../../rfcs/028-v8-dedicated-durability-driver.md)
+tests moving driver execution to an independently owned thread; caller-driven
+durability remains the default while D3a is being qualified.
 See the [notification rerun](benchmarks/rfc-026-v8-notification-rerun-20261102.md)
 for the evidence and the [implementation plan](rfc-026-implementation-plan.md)
 for the current runtime.

@@ -276,6 +276,98 @@ pub(crate) struct WalV8LeaderWriter {
 /// Shared v8 writer path for concurrent producers. Admission and DATA writes
 /// can overlap across callers; this mutex protects only the one-at-a-time
 /// FRONTIER write and sync cycle.
+#[cfg(feature = "bench")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WalV8DurabilityMode {
+    CallerDriven,
+    Dedicated,
+}
+
+#[cfg(feature = "bench")]
+struct WalV8DedicatedDurabilityRequests {
+    requested_ticket_end: AtomicU64,
+    shutdown_requested: AtomicBool,
+    wake_sender: Sender<()>,
+    terminal_error: Mutex<Option<String>>,
+    request_count: AtomicU64,
+    wake_signal_count: AtomicU64,
+    coalesced_wake_count: AtomicU64,
+    advance_count: AtomicU64,
+}
+
+#[cfg(feature = "bench")]
+impl WalV8DedicatedDurabilityRequests {
+    fn record_failure(&self, error: String) {
+        let mut terminal_error = self.terminal_error.lock();
+        if terminal_error.is_none() {
+            *terminal_error = Some(error);
+        }
+    }
+
+    fn terminal_error(&self) -> Option<String> {
+        self.terminal_error.lock().clone()
+    }
+
+    fn request(&self, ticket_end: u64) -> Result<()> {
+        ensure!(
+            !self.shutdown_requested.load(Ordering::Acquire),
+            "v8 dedicated durability driver is stopping"
+        );
+        self.requested_ticket_end
+            .fetch_max(ticket_end, Ordering::Release);
+        self.request_count.fetch_add(1, Ordering::Relaxed);
+        match self.wake_sender.try_send(()) {
+            Ok(()) => {
+                self.wake_signal_count.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+            Err(crossbeam_channel::TrySendError::Full(())) => {
+                self.coalesced_wake_count.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+            Err(crossbeam_channel::TrySendError::Disconnected(())) => {
+                anyhow::bail!("v8 dedicated durability driver has exited")
+            }
+        }
+    }
+
+    fn shutdown(&self) {
+        self.shutdown_requested.store(true, Ordering::Release);
+        let _ = self.wake_sender.try_send(());
+    }
+}
+
+/// WAL-owned join handle for the benchmark-only dedicated durability thread.
+/// The writer stores only request state, never this handle, so the worker's
+/// `Arc` cannot form a writer/JoinHandle ownership cycle.
+#[cfg(feature = "bench")]
+pub(crate) struct WalV8DedicatedDurabilityDriver {
+    requests: Arc<WalV8DedicatedDurabilityRequests>,
+    coordinator: WalV8ParallelCoordinator,
+    join: Option<thread::JoinHandle<()>>,
+}
+
+#[cfg(feature = "bench")]
+impl Drop for WalV8DedicatedDurabilityDriver {
+    fn drop(&mut self) {
+        self.requests.shutdown();
+        if self.requests.requested_ticket_end.load(Ordering::Acquire)
+            > self.coordinator.durable_ticket_end()
+        {
+            // A WAL owner should normally run its durability barrier before
+            // teardown. If it is dropped with an outstanding request, wake
+            // waiters with a terminal error instead of leaving them parked on
+            // a worker that is being stopped.
+            self.coordinator.poison();
+        }
+        if let Some(join) = self.join.take()
+            && join.join().is_err()
+        {
+            log::error!("v8 dedicated durability driver panicked during shutdown");
+        }
+    }
+}
+
 pub(crate) struct WalV8ParallelWriter {
     frontier_file: File,
     sync_file: File,
@@ -295,6 +387,10 @@ pub(crate) struct WalV8ParallelWriter {
     initial_ticket: u64,
     #[cfg(feature = "bench")]
     io_diagnostics: WalIoDiagnostics,
+    #[cfg(feature = "bench")]
+    durability_mode: WalV8DurabilityMode,
+    #[cfg(feature = "bench")]
+    dedicated_durability_requests: Option<Arc<WalV8DedicatedDurabilityRequests>>,
     /// Benchmark-only budget for eligible coalescing calls, independent of
     /// detailed sync-observation capture.
     #[cfg(feature = "bench")]
@@ -313,6 +409,8 @@ pub(crate) struct WalV8ParallelWriter {
     point_resource_retirement_detached_tickets: AtomicU64,
     #[cfg(feature = "bench")]
     point_resource_retirement_batched_prefixes: AtomicU64,
+    #[cfg(feature = "bench")]
+    caller_durability_driver_election_attempts: AtomicU64,
     #[cfg(all(test, feature = "bench"))]
     point_resource_retirement_detached_hook:
         Mutex<Option<WalV8PointResourceRetirementDetachedHook>>,
@@ -4191,13 +4289,17 @@ impl Drop for WalV8ParallelIo {
 /// durable boundary has been fully published, including during unwinding.
 struct WalV8FrontierCycleGuard {
     coordinator: WalV8ParallelCoordinator,
+    // Dedicated mode records the detailed failure in the outer driver before
+    // that driver's Drop poisons the coordinator and wakes ACK waiters.
+    defer_poison_to_driver: bool,
     armed: bool,
 }
 
 impl WalV8FrontierCycleGuard {
-    fn new(coordinator: &WalV8ParallelCoordinator) -> Self {
+    fn new(coordinator: &WalV8ParallelCoordinator, defer_poison_to_driver: bool) -> Self {
         Self {
             coordinator: coordinator.clone(),
+            defer_poison_to_driver,
             armed: true,
         }
     }
@@ -4209,7 +4311,7 @@ impl WalV8FrontierCycleGuard {
 
 impl Drop for WalV8FrontierCycleGuard {
     fn drop(&mut self) {
-        if self.armed {
+        if self.armed && !self.defer_poison_to_driver {
             self.coordinator.poison();
         }
     }
@@ -4657,6 +4759,12 @@ impl WalV8LeaderWriter {
             cursor_singleton_submission_enabled: false,
             admission_cursor_publish_fast_path_enabled: false,
             point_buffer_preallocation_enabled: false,
+            dedicated_durability_driver_enabled: false,
+            dedicated_durability_requests: 0,
+            dedicated_durability_wake_signals: 0,
+            dedicated_durability_coalesced_wakes: 0,
+            dedicated_durability_advances: 0,
+            caller_durability_driver_election_attempts: 0,
             point_buffer_preallocation_attempts: 0,
             point_buffer_preallocation_hits: 0,
             point_buffer_preallocation_fallbacks: 0,
@@ -5061,6 +5169,10 @@ impl WalV8LeaderWriter {
             #[cfg(feature = "bench")]
             io_diagnostics,
             #[cfg(feature = "bench")]
+            durability_mode: WalV8DurabilityMode::CallerDriven,
+            #[cfg(feature = "bench")]
+            dedicated_durability_requests: None,
+            #[cfg(feature = "bench")]
             coalesce_budget_override_us,
             #[cfg(feature = "bench")]
             batch_point_frontier_credits,
@@ -5072,6 +5184,8 @@ impl WalV8LeaderWriter {
             point_resource_retirement_detached_tickets: AtomicU64::new(0),
             #[cfg(feature = "bench")]
             point_resource_retirement_batched_prefixes: AtomicU64::new(0),
+            #[cfg(feature = "bench")]
+            caller_durability_driver_election_attempts: AtomicU64::new(0),
             #[cfg(all(test, feature = "bench"))]
             point_resource_retirement_detached_hook: Mutex::new(None),
             #[cfg(feature = "bench")]
@@ -5650,6 +5764,160 @@ impl WalV8LeaderWriter {
 }
 
 impl WalV8ParallelWriter {
+    #[cfg(feature = "bench")]
+    pub(crate) fn into_dedicated_durability_driver(
+        mut self,
+    ) -> Result<(Arc<Self>, WalV8DedicatedDurabilityDriver)> {
+        let (wake_sender, wake_receiver) = crossbeam_channel::bounded(1);
+        let requests = Arc::new(WalV8DedicatedDurabilityRequests {
+            requested_ticket_end: AtomicU64::new(self.coordinator.durable_ticket_end()),
+            shutdown_requested: AtomicBool::new(false),
+            wake_sender,
+            terminal_error: Mutex::new(None),
+            request_count: AtomicU64::new(0),
+            wake_signal_count: AtomicU64::new(0),
+            coalesced_wake_count: AtomicU64::new(0),
+            advance_count: AtomicU64::new(0),
+        });
+        self.durability_mode = WalV8DurabilityMode::Dedicated;
+        self.dedicated_durability_requests = Some(Arc::clone(&requests));
+
+        let coordinator = self.coordinator.clone();
+        let writer = Arc::new(self);
+        let worker_writer = Arc::clone(&writer);
+        let worker_requests = Arc::clone(&requests);
+        let join = thread::Builder::new()
+            .name("v8-dedicated-durability".to_owned())
+            .spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    worker_writer.dedicated_durability_loop(&worker_requests, wake_receiver)
+                }));
+                match result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        worker_requests.record_failure(format!("{error:#}"));
+                        worker_writer.coordinator.poison();
+                        log::error!("v8 dedicated durability driver failed: {error:#}");
+                    }
+                    Err(_) => {
+                        worker_requests
+                            .record_failure("dedicated durability driver panicked".to_owned());
+                        worker_writer.coordinator.poison();
+                        log::error!("v8 dedicated durability driver panicked");
+                    }
+                }
+            })
+            .context("spawn v8 dedicated durability driver")?;
+
+        Ok((
+            writer,
+            WalV8DedicatedDurabilityDriver {
+                requests,
+                coordinator,
+                join: Some(join),
+            },
+        ))
+    }
+
+    #[cfg(feature = "bench")]
+    fn dedicated_durability_loop(
+        &self,
+        requests: &WalV8DedicatedDurabilityRequests,
+        wake_receiver: Receiver<()>,
+    ) -> Result<()> {
+        loop {
+            if requests.shutdown_requested.load(Ordering::Acquire) {
+                return Ok(());
+            }
+
+            let requested_ticket_end = requests.requested_ticket_end.load(Ordering::Acquire);
+            if requested_ticket_end > self.coordinator.durable_ticket_end() {
+                let last_ticket = requested_ticket_end
+                    .checked_sub(1)
+                    .context("v8 dedicated durability request has an empty prefix")?;
+                requests.advance_count.fetch_add(1, Ordering::Relaxed);
+                self.advance_frontier_through_dedicated(last_ticket, requests)
+                    .context("advance requested v8 durable prefix")?;
+                continue;
+            }
+
+            match wake_receiver.recv() {
+                Ok(()) => {}
+                Err(_) if requests.shutdown_requested.load(Ordering::Acquire) => return Ok(()),
+                Err(_) => anyhow::bail!("v8 dedicated durability request channel disconnected"),
+            }
+        }
+    }
+
+    #[cfg(feature = "bench")]
+    fn advance_frontier_through_dedicated(
+        &self,
+        ticket: u64,
+        requests: &WalV8DedicatedDurabilityRequests,
+    ) -> Result<()> {
+        let ticket_end = ticket
+            .checked_add(1)
+            .context("v8 Parallel durable ticket end overflows")?;
+        let Some(mut driver) = self.coordinator.acquire_durability_driver(ticket_end)? else {
+            return Ok(());
+        };
+        let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.drive_frontier_through(ticket_end, &mut driver)
+        })) {
+            Ok(result) => result,
+            Err(_) => Err(anyhow::anyhow!(
+                "v8 dedicated durability driver panicked while advancing FRONTIER"
+            )),
+        };
+        match &result {
+            Ok(()) => driver.complete(),
+            Err(error) => {
+                // The frontier-cycle guard defers poison to this driver in
+                // dedicated mode. Record the cause before the driver drops and
+                // wakes waiters, so they can observe the actual failure.
+                requests.record_failure(format!("{error:#}"));
+            }
+        }
+
+        result
+    }
+
+    fn wait_for_requested_durable_prefix(&self, ticket_end: u64) -> Result<()> {
+        ensure!(ticket_end > 0, "v8 durability request prefix is empty");
+
+        #[cfg(feature = "bench")]
+        if self.durability_mode == WalV8DurabilityMode::Dedicated {
+            let requests = self
+                .dedicated_durability_requests
+                .as_ref()
+                .context("v8 dedicated durability request state is missing")?;
+            if let Err(error) = requests.request(ticket_end) {
+                self.coordinator.poison();
+                return Err(requests
+                    .terminal_error()
+                    .map(anyhow::Error::msg)
+                    .unwrap_or(error));
+            }
+            return self
+                .coordinator
+                .wait_for_durable_prefix(ticket_end)
+                .map_err(|error| {
+                    requests
+                        .terminal_error()
+                        .map(anyhow::Error::msg)
+                        .unwrap_or(error)
+                });
+        }
+
+        #[cfg(feature = "bench")]
+        self.caller_durability_driver_election_attempts
+            .fetch_add(1, Ordering::Relaxed);
+        self.advance_frontier_through(ticket_end - 1)
+            .inspect_err(|_| {
+                self.coordinator.poison();
+            })
+    }
+
     pub(crate) fn progress_ring_enabled(&self) -> bool {
         self.coordinator.progress_ring_enabled()
     }
@@ -5674,6 +5942,21 @@ impl WalV8ParallelWriter {
                 .load(Ordering::Relaxed),
         )
         .expect("outstanding preallocation permits fit in u64");
+        diagnostics.dedicated_durability_driver_enabled =
+            self.durability_mode == WalV8DurabilityMode::Dedicated;
+        if let Some(requests) = &self.dedicated_durability_requests {
+            diagnostics.dedicated_durability_requests =
+                requests.request_count.load(Ordering::Relaxed);
+            diagnostics.dedicated_durability_wake_signals =
+                requests.wake_signal_count.load(Ordering::Relaxed);
+            diagnostics.dedicated_durability_coalesced_wakes =
+                requests.coalesced_wake_count.load(Ordering::Relaxed);
+            diagnostics.dedicated_durability_advances =
+                requests.advance_count.load(Ordering::Relaxed);
+        }
+        diagnostics.caller_durability_driver_election_attempts = self
+            .caller_durability_driver_election_attempts
+            .load(Ordering::Relaxed);
         diagnostics.point_resource_retirement_detached_prefixes = self
             .point_resource_retirement_detached_prefixes
             .load(Ordering::Relaxed);
@@ -6376,7 +6659,13 @@ impl WalV8ParallelWriter {
                 .reserve_frontier_with(frontier_ticket_end, |reservation| {
                     self.io.register_frontier_offset(reservation.frame_offset)
                 })?;
-            let mut cycle_guard = WalV8FrontierCycleGuard::new(&self.coordinator);
+            #[cfg(feature = "bench")]
+            let defer_cycle_poison_to_driver =
+                self.durability_mode == WalV8DurabilityMode::Dedicated;
+            #[cfg(not(feature = "bench"))]
+            let defer_cycle_poison_to_driver = false;
+            let mut cycle_guard =
+                WalV8FrontierCycleGuard::new(&self.coordinator, defer_cycle_poison_to_driver);
             let durable_end = last_data_end.max(previous_frontier_end);
             ensure!(
                 previous_frontier_end <= durable_end
@@ -7258,29 +7547,24 @@ impl WalV8ParallelWriter {
         if ticket_end == 0 {
             return Ok(());
         }
-        if let Err(error) = self.advance_frontier_through(ticket_end - 1) {
-            self.coordinator.poison();
-            return Err(error);
-        }
 
-        Ok(())
+        self.wait_for_requested_durable_prefix(ticket_end)
     }
 
     pub(crate) fn wait_durable(&self, ticket: u64) -> Result<()> {
+        let ticket_end = ticket
+            .checked_add(1)
+            .context("v8 Parallel durable ticket end overflows")?;
         ensure!(!self.is_poisoned(), "v8 Parallel WAL is poisoned");
         ensure!(
-            ticket < self.coordinator.next_ticket(),
+            ticket_end <= self.coordinator.next_ticket(),
             "v8 Parallel durability wait names an unassigned ticket"
         );
-        if self.coordinator.durable_ticket_end() > ticket {
+        if self.coordinator.durable_ticket_end() >= ticket_end {
             return Ok(());
         }
-        if let Err(error) = self.advance_frontier_through(ticket) {
-            self.coordinator.poison();
-            return Err(error);
-        }
 
-        Ok(())
+        self.wait_for_requested_durable_prefix(ticket_end)
     }
 
     #[cfg(feature = "bench")]
@@ -8654,6 +8938,97 @@ mod tests {
             .expect_err("poison must take precedence over ticket assignment");
         assert!(format!("{error:#}").contains("v8 Parallel WAL is poisoned"));
         assert!(writer.is_poisoned());
+
+        Ok(())
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn dedicated_durability_driver_coalesces_concurrent_waiters_and_recovers() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("dedicated-durability-driver.wal");
+        let installed = install_empty(&path, header())?;
+        let leader = match open_writer(&path, &installed) {
+            Ok(writer) => writer,
+            Err(error) if is_io_uring_unavailable_error(&error) => {
+                eprintln!("skipping test (io_uring unavailable): {error:#}");
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        let parallel = match leader.into_parallel() {
+            Ok(writer) => writer,
+            Err(error) if is_io_uring_unavailable_error(&error) => {
+                eprintln!("skipping test (io_uring unavailable): {error:#}");
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        let (writer, driver) = parallel.into_dedicated_durability_driver()?;
+
+        let batches = (1..=4).map(|index| batch(index * 10)).collect::<Vec<_>>();
+        let mut jobs = Vec::with_capacity(batches.len());
+        for batch in &batches {
+            jobs.push(writer.admit_prepared_batch(
+                writer.preflight_batch(batch, LIVE_WAL_V5_LIMITS)?,
+                batch.commit_ts,
+                batch.recorded_at,
+            )?);
+        }
+        let tickets = jobs
+            .iter()
+            .map(|job| job.assignment().segment_ticket)
+            .collect::<Vec<_>>();
+
+        // Make later tickets frame-ready first. Their waiters must not elect
+        // themselves; the dedicated owner advances the required prefix.
+        for job in jobs.into_iter().rev() {
+            job.finish()?;
+        }
+
+        let waiters = tickets
+            .iter()
+            .copied()
+            .map(|ticket| {
+                let writer = Arc::clone(&writer);
+                thread::spawn(move || writer.wait_for_requested_durable_prefix(ticket + 1))
+            })
+            .collect::<Vec<_>>();
+        for waiter in waiters {
+            waiter
+                .join()
+                .expect("dedicated durability waiter panicked")?;
+        }
+        writer.sync()?;
+
+        let diagnostics = writer.io_diagnostics();
+        assert!(diagnostics.dedicated_durability_driver_enabled);
+        assert_eq!(diagnostics.caller_durability_driver_election_attempts, 0);
+        assert_eq!(
+            diagnostics.dedicated_durability_requests,
+            batches.len() as u64 + 1
+        );
+        assert!(diagnostics.dedicated_durability_wake_signals > 0);
+        assert!(diagnostics.dedicated_durability_advances > 0);
+        assert_eq!(
+            writer.coordinator.durable_ticket_end(),
+            batches.len() as u64
+        );
+
+        // The driver owner wakes and joins an idle worker before the writer and
+        // its segment handles are released.
+        drop(driver);
+        drop(writer);
+
+        let recovered = super::super::install::recover_and_install_active(
+            &path,
+            &[installed.active_boundary],
+            header().predecessor,
+            LIVE_WAL_V5_LIMITS,
+            MAX_WAL_FILE_SIZE,
+        )?;
+        assert_eq!(recovered.active_boundary.ticket_end, batches.len() as u64);
+        assert_eq!(replayed_batches(&path, &recovered)?, batches);
 
         Ok(())
     }
@@ -10990,7 +11365,10 @@ mod tests {
         let error = writer
             .append_batch(&batch(10), LIVE_WAL_V5_LIMITS)
             .expect_err("fdatasync failure must reject the commit");
-        assert!(format!("{error:#}").contains("fdatasync"));
+        assert!(
+            format!("{error:#}").contains("fdatasync"),
+            "unexpected sync failure: {error:#}"
+        );
         assert!(writer.is_poisoned());
         assert!(writer.append_batch(&batch(20), LIVE_WAL_V5_LIMITS).is_err());
         drop(writer);
@@ -11012,6 +11390,16 @@ mod tests {
 
     #[test]
     fn explicit_sync_failure_poisons_parallel_writer() -> Result<()> {
+        explicit_sync_failure_poisons_parallel_writer_with_mode(false)
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn dedicated_durability_sync_failure_poisons_and_wakes_waiter() -> Result<()> {
+        explicit_sync_failure_poisons_parallel_writer_with_mode(true)
+    }
+
+    fn explicit_sync_failure_poisons_parallel_writer_with_mode(dedicated: bool) -> Result<()> {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("active-v8.wal");
         let header = header();
@@ -11027,8 +11415,27 @@ mod tests {
         );
         // SAFETY: sync_fd was returned by open and ownership transfers to File.
         let sync_file = unsafe { File::from_raw_fd(sync_fd) };
-        let writer = WalV8LeaderWriter::new(write_file, sync_file, &installed, MAX_WAL_FILE_SIZE)?
-            .into_parallel()?;
+        let leader = WalV8LeaderWriter::new(write_file, sync_file, &installed, MAX_WAL_FILE_SIZE)?;
+        let parallel_writer = match leader.into_parallel() {
+            Ok(writer) => writer,
+            Err(error) if is_io_uring_unavailable_error(&error) => {
+                eprintln!("skipping test (io_uring unavailable): {error:#}");
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        #[cfg(feature = "bench")]
+        let (writer, dedicated_driver) = if dedicated {
+            let (writer, driver) = parallel_writer.into_dedicated_durability_driver()?;
+            (writer, Some(driver))
+        } else {
+            (Arc::new(parallel_writer), None)
+        };
+        #[cfg(not(feature = "bench"))]
+        let writer = {
+            ensure!(!dedicated, "dedicated driver requires the bench feature");
+            Arc::new(parallel_writer)
+        };
         let first_batch = batch(10);
         let prepared = writer.preflight_batch(&first_batch, LIVE_WAL_V5_LIMITS)?;
         let mut data_buffer = DirectBuf::new(prepared.frame_buffer_bytes());
@@ -11065,14 +11472,27 @@ mod tests {
         let error = writer
             .sync()
             .expect_err("explicit fdatasync failure must reject the durability advance");
-        assert!(format!("{error:#}").contains("fdatasync"));
+        let error_message = format!("{error:#}");
+        assert!(
+            error_message.contains("fdatasync"),
+            "unexpected sync failure: {error_message}"
+        );
         assert!(writer.is_poisoned());
+        #[cfg(feature = "bench")]
+        if dedicated {
+            let diagnostics = writer.io_diagnostics();
+            assert!(diagnostics.dedicated_durability_driver_enabled);
+            assert_eq!(diagnostics.caller_durability_driver_election_attempts, 0);
+            assert_eq!(diagnostics.dedicated_durability_advances, 1);
+        }
         assert!(
             writer
                 .preflight_batch(&batch(20), LIVE_WAL_V5_LIMITS)
                 .is_err()
         );
         drop(encoded);
+        #[cfg(feature = "bench")]
+        drop(dedicated_driver);
 
         Ok(())
     }

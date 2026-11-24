@@ -490,6 +490,8 @@ struct CoordinatorState {
     durability_waiters: usize,
     #[cfg(test)]
     durable_followers: usize,
+    #[cfg(test)]
+    durable_wait_only_waiters: usize,
     #[cfg(feature = "bench")]
     ordered_link_hash_cpu_ns: u64,
     #[cfg(feature = "bench")]
@@ -1196,6 +1198,8 @@ impl WalV8ParallelCoordinator {
                     durability_waiters: 0,
                     #[cfg(test)]
                     durable_followers: 0,
+                    #[cfg(test)]
+                    durable_wait_only_waiters: 0,
                     #[cfg(feature = "bench")]
                     ordered_link_hash_cpu_ns: 0,
                     #[cfg(feature = "bench")]
@@ -3096,6 +3100,38 @@ impl WalV8ParallelCoordinator {
                 state.durable_followers -= 1;
             }
         }
+    }
+
+    /// Wait for an exclusive ticket prefix to become durable without taking
+    /// ownership of the durability driver. Dedicated-driver mode uses this
+    /// after publishing a coalesced request to its background owner.
+    pub(crate) fn wait_for_durable_prefix(&self, ticket_end: u64) -> Result<()> {
+        let mut state = self.inner.state.lock();
+        ensure!(
+            ticket_end <= state.next_ticket,
+            "v8 durability wait names an unassigned ticket prefix"
+        );
+        #[cfg(test)]
+        {
+            state.durable_wait_only_waiters += 1;
+        }
+
+        let result = loop {
+            if state.poisoned {
+                break Err(anyhow::anyhow!("v8 Parallel coordinator is poisoned"));
+            }
+            if state.durable_ticket_end >= ticket_end {
+                break Ok(());
+            }
+            self.inner.durable_published.wait(&mut state);
+        };
+
+        #[cfg(test)]
+        {
+            state.durable_wait_only_waiters -= 1;
+        }
+
+        result
     }
 
     /// Wait for durability progress without subscribing to producer
@@ -6448,6 +6484,51 @@ mod tests {
             );
             std::thread::yield_now();
         }
+
+        Ok(())
+    }
+
+    fn wait_for_durable_wait_only_follower(coordinator: &WalV8ParallelCoordinator) -> Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while coordinator.inner.state.lock().durable_wait_only_waiters == 0 {
+            ensure!(
+                Instant::now() < deadline,
+                "wait-only durability caller did not start waiting"
+            );
+            std::thread::yield_now();
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn wait_for_durable_prefix_never_elects_a_driver() -> Result<()> {
+        let coordinator = coordinator(8)?;
+        let first = batch(10);
+        let mut encoded = admit(&first, &coordinator)?.encode()?;
+        mark_producer_ready(&mut encoded, &coordinator, true)?;
+
+        let waiting = coordinator.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let follower = std::thread::spawn(move || {
+            let _ = tx.send(waiting.wait_for_durable_prefix(1));
+        });
+        wait_for_durable_wait_only_follower(&coordinator)?;
+        assert!(!coordinator.inner.state.lock().durability_driver_active);
+
+        let mut driver = coordinator
+            .acquire_durability_driver(1)?
+            .context("wait-only follower unexpectedly elected the driver")?;
+        let frontier = coordinator.reserve_frontier(1)?;
+        coordinator.publish_durable_frontier(frontier)?;
+        encoded.disarm_after_durable();
+        driver.complete();
+        drop(driver);
+
+        rx.recv_timeout(Duration::from_secs(1))??;
+        follower.join().expect("wait-only follower panicked");
+        assert_eq!(coordinator.durable_ticket_end(), 1);
+        assert!(!coordinator.is_poisoned());
 
         Ok(())
     }
