@@ -78,6 +78,7 @@ UNSET_EXPERIMENT_VARIABLES = (
     "TOYKV_BENCH_V8_ADMISSION_CURSOR_PUBLISH_FAST_PATH",
     "TOYKV_BENCH_V8_DEDICATED_DURABILITY_DRIVER",
     "TOYKV_BENCH_V8_DURABILITY_DRIVER_DIAGNOSTICS",
+    "TOYKV_BENCH_V8_INDEPENDENT_ACK_WAITER",
 )
 FIXED_ENVIRONMENT = {
     "TOYKV_BENCH_V8_EXTENT_PREP": "sliding-point-lookahead",
@@ -142,6 +143,7 @@ def _summary_fields(schedule: list[dict[str, Any]]) -> tuple[str, ...]:
     if any("durability_driver_enabled" in row for row in schedule):
         fields += (
             "dedicated_durability_driver_enabled_start", "dedicated_durability_driver_enabled_end",
+            "independent_ack_waiter_enabled_start", "independent_ack_waiter_enabled_end",
             "dedicated_durability_diagnostics_enabled_start", "dedicated_durability_diagnostics_enabled_end",
             "dedicated_durability_requests", "dedicated_durability_wake_signals",
             "dedicated_durability_coalesced_wakes", "dedicated_durability_advance_attempts",
@@ -162,6 +164,7 @@ def _environment(
     admission_cursor_publish_fast_path_enabled: bool | None = None,
     dedicated_durability_driver_enabled: bool | None = None,
     dedicated_durability_diagnostics_enabled: bool | None = None,
+    independent_ack_waiter_enabled: bool | None = None,
 ) -> dict[str, str]:
     # An allowlist makes the selected experiment switches the only inherited variables.
     if progress_ring_enabled is not progress_cursor_enabled:
@@ -209,6 +212,10 @@ def _environment(
         environment["TOYKV_BENCH_V8_DURABILITY_DRIVER_DIAGNOSTICS"] = (
             "1" if dedicated_durability_diagnostics_enabled else "0"
         )
+    if independent_ack_waiter_enabled is not None:
+        environment["TOYKV_BENCH_V8_INDEPENDENT_ACK_WAITER"] = (
+            "1" if independent_ack_waiter_enabled else "0"
+        )
     return environment
 
 
@@ -254,6 +261,7 @@ def _expected_environment_text(
     admission_cursor_publish_fast_path_enabled: bool | None = None,
     dedicated_durability_driver_enabled: bool | None = None,
     dedicated_durability_diagnostics_enabled: bool | None = None,
+    independent_ack_waiter_enabled: bool | None = None,
 ) -> str:
     if progress_ring_enabled and not progress_cursor_enabled:
         # Historical F0.5 archives used the now-retired mode 1. Keep their
@@ -273,6 +281,7 @@ def _expected_environment_text(
             admission_cursor_publish_fast_path_enabled=admission_cursor_publish_fast_path_enabled,
             dedicated_durability_driver_enabled=dedicated_durability_driver_enabled,
             dedicated_durability_diagnostics_enabled=dedicated_durability_diagnostics_enabled,
+            independent_ack_waiter_enabled=independent_ack_waiter_enabled,
         ).items()
         if key not in ("PATH", "HOME", "TMPDIR", "LC_ALL")
     }
@@ -287,6 +296,8 @@ def _expected_environment_text(
              or dedicated_durability_driver_enabled is None)
         and (key != "TOYKV_BENCH_V8_DURABILITY_DRIVER_DIAGNOSTICS"
              or dedicated_durability_diagnostics_enabled is None)
+        and (key != "TOYKV_BENCH_V8_INDEPENDENT_ACK_WAITER"
+             or independent_ack_waiter_enabled is None)
     })
     return "\n".join(f"{key}={value}" for key, value in sorted(controlled.items())) + "\n"
 
@@ -565,10 +576,13 @@ def _validate_dedicated_durability_record(
     start = _require_object(pipeline.get("wal_io_start"), "WAL I/O start snapshot")
     end = _require_object(pipeline.get("wal_io_end"), "WAL I/O end snapshot")
     expected_driver = bool(row["durability_driver_enabled"])
+    expected_ack_waiter = bool(row["independent_ack_waiter_enabled"])
     expected_diagnostics = bool(row["durability_driver_diagnostics_enabled"])
     for snapshot in (start, end):
         if snapshot.get("dedicated_durability_driver_enabled") is not expected_driver:
             raise ValueError("dedicated durability driver mode differs from the schedule")
+        if snapshot.get("independent_ack_waiter_enabled") is not expected_ack_waiter:
+            raise ValueError("independent ACK waiter mode differs from the schedule")
         if snapshot.get("dedicated_durability_diagnostics_enabled") is not expected_diagnostics:
             raise ValueError("dedicated durability diagnostics mode differs from the schedule")
 
@@ -605,6 +619,8 @@ def _validate_dedicated_durability_record(
     metrics.update({
         "dedicated_durability_driver_enabled_start": start["dedicated_durability_driver_enabled"],
         "dedicated_durability_driver_enabled_end": end["dedicated_durability_driver_enabled"],
+        "independent_ack_waiter_enabled_start": start["independent_ack_waiter_enabled"],
+        "independent_ack_waiter_enabled_end": end["independent_ack_waiter_enabled"],
         "dedicated_durability_diagnostics_enabled_start": start[
             "dedicated_durability_diagnostics_enabled"
         ],
@@ -808,6 +824,9 @@ def _run_one(
                 bool(row["durability_driver_diagnostics_enabled"])
                 if dedicated_durability_suite else None
             ),
+            independent_ack_waiter_enabled=(
+                bool(row["independent_ack_waiter_enabled"]) if dedicated_durability_suite else None
+            ),
         )
     )
     (run_dir / "command.sh").write_text(shlex.join(command) + "\n", encoding="utf-8")
@@ -834,6 +853,9 @@ def _run_one(
             dedicated_durability_diagnostics_enabled=(
                 bool(row["durability_driver_diagnostics_enabled"])
                 if dedicated_durability_suite else None
+            ),
+            independent_ack_waiter_enabled=(
+                bool(row["independent_ack_waiter_enabled"]) if dedicated_durability_suite else None
             ),
         ), encoding="utf-8",
     )

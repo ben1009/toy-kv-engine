@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-if [[ $# -lt 11 || $# -gt 12 ]]; then
-    echo "usage: $0 <commit> <num> <project> <zone> <instance> <safe-deadline-epoch> <machine-type> <writers-csv> <suite> <source-patch-sha256> <baseline-commit> [repetitions]" >&2
+if [[ $# -lt 11 || $# -gt 13 ]]; then
+    echo "usage: $0 <commit> <num> <project> <zone> <instance> <safe-deadline-epoch> <machine-type> <writers-csv> <suite> <source-patch-sha256> <baseline-commit> [repetitions] [runner-bundle-sha256]" >&2
     exit 64
 fi
 
@@ -18,6 +18,7 @@ SUITE="$9"
 SOURCE_PATCH_SHA256="${10}"
 BASELINE_COMMIT="${11}"
 REPETITIONS="${12:-1}"
+RUNNER_BUNDLE_SHA256="${13:--}"
 if [[ ! "$REPETITIONS" =~ ^[1-9][0-9]*$ ]]; then
     echo "repetitions must be a positive integer: $REPETITIONS" >&2
     exit 64
@@ -172,6 +173,15 @@ if [[ "$SUITE" == "commit-order-trace" || "$SUITE" == "v8-point-borrowed-input" 
     echo "$SUITE requires a lowercase source patch SHA-256" >&2
     exit 64
 fi
+if [[ "$SUITE" == "v8-dedicated-durability-driver" ]]; then
+    if [[ ! "$RUNNER_BUNDLE_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+        echo "D3b requires a lowercase runner bundle SHA-256" >&2
+        exit 64
+    fi
+elif [[ "$RUNNER_BUNDLE_SHA256" != "-" ]]; then
+    echo "runner bundle SHA-256 is only valid for D3b" >&2
+    exit 64
+fi
 if [[ "$SUITE" != "commit-order-trace" && "$SUITE" != "v8-point-borrowed-input" \
     && "$SUITE" != "v8-point-ack-d1" ]] \
     && [[ "$SOURCE_PATCH_SHA256" != "-" ]]; then
@@ -312,6 +322,7 @@ runuser -u bench -- env \
     BENCH_WRITERS="$WRITERS_CSV" \
     BENCH_SUITE="$SUITE" \
     BENCH_SOURCE_PATCH_SHA256="$SOURCE_PATCH_SHA256" \
+    BENCH_RUNNER_BUNDLE_SHA256="$RUNNER_BUNDLE_SHA256" \
     BENCH_BASELINE_COMMIT="$BASELINE_COMMIT" \
     BENCH_REPETITIONS="${REPETITIONS:-1}" \
     BENCH_BOOT_LOG="$BOOT_LOG" \
@@ -441,6 +452,12 @@ if [[ "$BENCH_SUITE" == "v8-dedicated-durability-driver" ]]; then
     fi
     cp /tmp/gcp-v8-dedicated-durability-runner.py \
         "$REPO/scripts/gcp_v8_dedicated_durability_runner.py"
+    if [[ ! -r /tmp/gcp-v8-point-progress-ring-runner.py ]]; then
+        echo "D3b progress-ring helper was not uploaded" >&2
+        exit 1
+    fi
+    cp /tmp/gcp-v8-point-progress-ring-runner.py \
+        "$REPO/scripts/gcp_v8_point_progress_ring_runner.py"
     echo "WAL_BENCHMARK_STARTED $(date --iso-8601=seconds)" | tee -a "$BENCH_BOOT_LOG"
     PYTHONPATH="$REPO/scripts${PYTHONPATH:+:$PYTHONPATH}" \
         python3 "$REPO/scripts/gcp_v8_dedicated_durability_runner.py" \
@@ -448,7 +465,8 @@ if [[ "$BENCH_SUITE" == "v8-dedicated-durability-driver" ]]; then
         --results-dir "$BENCH_RESULTS" --db-root "$BENCH_WORK/databases" \
         --writers "$BENCH_WRITERS" --safe-deadline-epoch "$BENCH_SAFE_DEADLINE_EPOCH" \
         --machine-type "$BENCH_MACHINE_TYPE" --ssd-count "$BENCH_SSD_COUNT" \
-        --ssd-gib "$BENCH_SSD_TOTAL_GIB"
+        --ssd-gib "$BENCH_SSD_TOTAL_GIB" \
+        --runner-bundle-sha256 "$BENCH_RUNNER_BUNDLE_SHA256"
     exit $?
 fi
 

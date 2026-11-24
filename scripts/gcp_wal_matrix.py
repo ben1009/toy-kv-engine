@@ -140,20 +140,19 @@ POINT_ACK_D1_ORDERS = (
 DURABILITY_DRIVER_WRITERS = (1, 8, 16)
 DURABILITY_DRIVER_REPETITIONS = 5
 DURABILITY_DRIVER_NUM = 100_000
-DURABILITY_DRIVER_ARMS = ("caller_driven", "dedicated")
+DURABILITY_DRIVER_ARMS = (
+    "caller_legacy_ack",
+    "caller_independent_ack",
+    "dedicated_independent_ack",
+)
 DURABILITY_DRIVER_SCORE_ORDERS = (
-    ("caller_driven", "dedicated"),
-    ("dedicated", "caller_driven"),
-    ("caller_driven", "dedicated"),
-    ("dedicated", "caller_driven"),
-    ("caller_driven", "dedicated"),
+    ("caller_legacy_ack", "caller_independent_ack", "dedicated_independent_ack"),
+    ("caller_independent_ack", "dedicated_independent_ack", "caller_legacy_ack"),
+    ("dedicated_independent_ack", "caller_legacy_ack", "caller_independent_ack"),
+    ("caller_legacy_ack", "dedicated_independent_ack", "caller_independent_ack"),
+    ("dedicated_independent_ack", "caller_independent_ack", "caller_legacy_ack"),
 )
-DURABILITY_DRIVER_DIAGNOSTIC_ORDER = (
-    (8, "caller_driven"),
-    (8, "dedicated"),
-    (16, "dedicated"),
-    (16, "caller_driven"),
-)
+DURABILITY_DRIVER_DIAGNOSTIC_ORDER: tuple[tuple[int, str], ...] = ()
 CURSOR_COALESCING_BUDGET_WRITERS = (8, 16)
 CURSOR_COALESCING_BUDGET_REPETITIONS = 5
 CURSOR_COALESCING_BUDGET_NUM = 100_000
@@ -1154,7 +1153,7 @@ def build_point_ack_d1_plan(
 
 
 def build_dedicated_durability_driver_schedule() -> list[dict[str, object]]:
-    """Build 40 uninstrumented score runs plus four separate counter runs."""
+    """Build 60 uninstrumented D3b ACK-mode score runs."""
     cells = [
         (writer, "point", "wal_concurrent", 1, None, 10)
         for writer in DURABILITY_DRIVER_WRITERS
@@ -1183,57 +1182,31 @@ def build_dedicated_durability_driver_schedule() -> list[dict[str, object]]:
                     "cursor_singleton_submission_enabled": False,
                     "point_buffer_preallocation_enabled": workload == "point",
                     "point_resource_retirement_mode": 0,
-                    "durability_driver_enabled": arm == "dedicated",
+                    "durability_driver_enabled": arm == "dedicated_independent_ack",
+                    "independent_ack_waiter_enabled": arm != "caller_legacy_ack",
                     "durability_driver_diagnostics_enabled": False,
                     "extent_mode": "sliding-point-lookahead",
                     "extent_window_bytes": POINT_LOOKAHEAD_WINDOW_BYTES,
                     "frontier_mode": "direct",
                     "scan_diagnostics_enabled": False,
                 })
-    for writer, arm in DURABILITY_DRIVER_DIAGNOSTIC_ORDER:
-        schedule.append({
-            "run_index": len(schedule) + 1,
-            "phase": "diagnostic",
-            "writer": writer,
-            "workload": "point",
-            "repetition": 1,
-            "arm": arm,
-            "bench": "wal_concurrent",
-            "batch_entries": 1,
-            "batch_size": None,
-            "num": DURABILITY_DRIVER_NUM,
-            "sample_every": 10,
-            "progress_ring_enabled": True,
-            "progress_cursor_enabled": True,
-            "progress_counters_enabled": False,
-            "cursor_direct_completion_enabled": True,
-            "cursor_singleton_submission_enabled": False,
-            "point_buffer_preallocation_enabled": True,
-            "point_resource_retirement_mode": 0,
-            "durability_driver_enabled": arm == "dedicated",
-            "durability_driver_diagnostics_enabled": True,
-            "extent_mode": "sliding-point-lookahead",
-            "extent_window_bytes": POINT_LOOKAHEAD_WINDOW_BYTES,
-            "frontier_mode": "direct",
-            "scan_diagnostics_enabled": False,
-        })
     return schedule
 
 
 def build_dedicated_durability_driver_plan(
     *, writers: Iterable[int], machine_type: str, machine_spec: Mapping[str, int],
-    commit: str, binary_sha256: str | None = None,
+    commit: str, binary_sha256: str | None = None, runner_bundle_sha256: str | None = None,
 ) -> dict[str, object]:
     writer_counts = validate_writer_counts(writers)
     if writer_counts != DURABILITY_DRIVER_WRITERS:
-        raise ValueError(f"dedicated durability qualification requires writers {DURABILITY_DRIVER_WRITERS}")
+        raise ValueError(f"D3b ACK qualification requires writers {DURABILITY_DRIVER_WRITERS}")
     schedule = build_dedicated_durability_driver_schedule()
     vcpus = int(machine_spec["vcpus"])
     ssd_count = int(machine_spec["ssd_count"])
     layout = "single Local SSD" if ssd_count == 1 else f"RAID0 over {ssd_count} Local SSDs"
     plan: dict[str, object] = {
-        "plan_schema_version": 1,
-        "suite": "v8-dedicated-durability-driver",
+        "plan_schema_version": 2,
+        "suite": "v8-d3b-independent-ack",
         "writers": list(writer_counts),
         "workloads": [
             {"writer": writer, "name": "point", "bench": "wal_concurrent", "batch_size": None,
@@ -1247,8 +1220,8 @@ def build_dedicated_durability_driver_plan(
         "repetitions_per_cell": DURABILITY_DRIVER_REPETITIONS,
         "arm_orders": [list(order) for order in DURABILITY_DRIVER_SCORE_ORDERS],
         "runs_planned": len(schedule),
-        "score_runs_planned": 40,
-        "diagnostic_runs_planned": 4,
+        "score_runs_planned": 60,
+        "diagnostic_runs_planned": 0,
         "counterbalanced": True,
         "machine_type": machine_type,
         "vcpus": vcpus,
@@ -1264,20 +1237,25 @@ def build_dedicated_durability_driver_plan(
         "singleton_submission_enabled": False,
         "point_buffer_preallocation_enabled": True,
         "point_resource_retirement_mode": 0,
+        "ack_modes": {
+            "caller_legacy_ack": {"durability_driver": False, "independent_ack_waiter": False},
+            "caller_independent_ack": {"durability_driver": False, "independent_ack_waiter": True},
+            "dedicated_independent_ack": {"durability_driver": True, "independent_ack_waiter": True},
+        },
         "extent_preparation": "sliding-point-lookahead, 1 MiB for Point; Batch64 remains fallocate-only",
         "frontier_mode": "direct",
         "coalescing": "dynamic",
         "data_submit_order": "ordered",
         "instrumentation": {
-            "score_runs": "dedicated-driver detailed counters disabled",
-            "diagnostic_runs": "dedicated-driver counters enabled; not throughput scores",
-            "diagnostic_schedule": [list(item) for item in DURABILITY_DRIVER_DIAGNOSTIC_ORDER],
+            "score_runs": "all detailed profiling and driver diagnostics disabled",
+            "diagnostic_runs": "none",
         },
+        "runner_bundle_sha256": runner_bundle_sha256,
         "qualification_note": (
-            "Same-host, same-source, same-release-binary CallerDriven/Dedicated comparison. Stage A is enabled "
-            "for Point, retirement mode 0 is fixed, and D1/D2/C1/C2 remain disabled. Forty scoring runs are "
-            "unprofiled with five interleaved pairs for Point1/8/16 and Batch64. Four additional Point8/16 "
-            "diagnostic runs enable lightweight driver counters and are excluded from scoring summaries."
+            "Same-host, same-source, same-release-binary comparison of CallerDriven + legacy ACK, "
+            "CallerDriven + independent ACK, and Dedicated Driver + independent ACK. Stage A is enabled "
+            "for Point, retirement mode 0 is fixed, and D1/D2/C1/C2 remain disabled. All 60 runs are "
+            "unprofiled: five counterbalanced repetitions for Point1/8/16 and Batch64."
         ),
     }
     if binary_sha256 is not None:

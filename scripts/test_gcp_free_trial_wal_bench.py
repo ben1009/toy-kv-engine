@@ -26,8 +26,8 @@ from gcp_wal_matrix import (
     COMMIT_ORDER_TRACE_NUM,
     COMMIT_ORDER_TRACE_WRITERS,
     DURABILITY_DRIVER_ARMS,
-    DURABILITY_DRIVER_DIAGNOSTIC_ORDER,
     DURABILITY_DRIVER_NUM,
+    DURABILITY_DRIVER_SCORE_ORDERS,
     DURABILITY_DRIVER_WRITERS,
     FULL_DEFAULT_WRITERS,
     LEGACY_DEFAULT_WRITERS,
@@ -364,14 +364,10 @@ def fake_keygen(command, **_kwargs):
 class PointProgressRingQualificationTests(unittest.TestCase):
     def test_dedicated_durability_plan_and_schedule_are_fixed(self) -> None:
         schedule = build_dedicated_durability_driver_schedule()
-        self.assertEqual(len(schedule), 44)
+        self.assertEqual(len(schedule), 60)
         score = [row for row in schedule if row["phase"] == "score"]
         diagnostics = [row for row in schedule if row["phase"] == "diagnostic"]
-        self.assertEqual((len(score), len(diagnostics)), (40, 4))
-        self.assertEqual(
-            [(row["writer"], row["arm"]) for row in diagnostics],
-            list(DURABILITY_DRIVER_DIAGNOSTIC_ORDER),
-        )
+        self.assertEqual((len(score), len(diagnostics)), (60, 0))
         for workload in ("point", "batch64"):
             writers = DURABILITY_DRIVER_WRITERS if workload == "point" else (16,)
             for writer in writers:
@@ -382,11 +378,7 @@ class PointProgressRingQualificationTests(unittest.TestCase):
                         and row["writer"] == writer
                         and row["repetition"] == repetition
                     ]
-                    expected_order = (
-                        ["caller_driven", "dedicated"]
-                        if repetition % 2
-                        else ["dedicated", "caller_driven"]
-                    )
+                    expected_order = list(DURABILITY_DRIVER_SCORE_ORDERS[(repetition - 1) % 5])
                     self.assertEqual([row["arm"] for row in pair], expected_order)
         for row in schedule:
             self.assertTrue(row["progress_cursor_enabled"])
@@ -394,8 +386,9 @@ class PointProgressRingQualificationTests(unittest.TestCase):
             self.assertFalse(row["cursor_singleton_submission_enabled"])
             self.assertEqual(row["point_resource_retirement_mode"], 0)
             self.assertEqual(row["point_buffer_preallocation_enabled"], row["workload"] == "point")
-            self.assertEqual(row["durability_driver_enabled"], row["arm"] == "dedicated")
-            self.assertEqual(row["durability_driver_diagnostics_enabled"], row["phase"] == "diagnostic")
+            self.assertEqual(row["durability_driver_enabled"], row["arm"] == "dedicated_independent_ack")
+            self.assertEqual(row["independent_ack_waiter_enabled"], row["arm"] != "caller_legacy_ack")
+            self.assertFalse(row["durability_driver_diagnostics_enabled"])
 
         plan = build_dedicated_durability_driver_plan(
             writers=DURABILITY_DRIVER_WRITERS,
@@ -403,11 +396,13 @@ class PointProgressRingQualificationTests(unittest.TestCase):
             machine_spec={"vcpus": 16, "ssd_count": 2, "ssd_gib": 750},
             commit="a" * 40,
             binary_sha256="b" * 64,
+            runner_bundle_sha256="c" * 64,
         )
-        self.assertEqual(plan["runs_planned"], 44)
-        self.assertEqual(plan["score_runs_planned"], 40)
-        self.assertEqual(plan["diagnostic_runs_planned"], 4)
+        self.assertEqual(plan["runs_planned"], 60)
+        self.assertEqual(plan["score_runs_planned"], 60)
+        self.assertEqual(plan["diagnostic_runs_planned"], 0)
         self.assertEqual(plan["arms"], list(DURABILITY_DRIVER_ARMS))
+        self.assertEqual(plan["runner_bundle_sha256"], "c" * 64)
 
         rows = []
         for row in schedule:
@@ -455,6 +450,7 @@ class PointProgressRingQualificationTests(unittest.TestCase):
                         dedicated_durability_diagnostics_enabled=bool(
                             row["durability_driver_diagnostics_enabled"]
                         ),
+                        independent_ack_waiter_enabled=bool(row["independent_ack_waiter_enabled"]),
                     ),
                     encoding="utf-8",
                 )
@@ -472,13 +468,15 @@ class PointProgressRingQualificationTests(unittest.TestCase):
                 machine_type="c4-standard-16-lssd",
                 ssd_count=2,
                 ssd_gib=750,
+                runner_bundle_sha256="c" * 64,
             )
             with patch.object(dedicated_durability_runner, "_run_one", side_effect=fake_run_one):
                 self.assertEqual(dedicated_durability_runner.run_suite(args), 0)
             verification = dedicated_durability_runner.verify_results_directory(results)
             self.assertTrue(verification["verified"], verification["errors"])
             summary = json.loads((results / "summary.json").read_text(encoding="utf-8"))
-            self.assertEqual(summary["runs_completed"], 44)
+            self.assertEqual(summary["runs_completed"], 60)
+            self.assertEqual(summary["runner_bundle_sha256"], "c" * 64)
 
     def test_dedicated_durability_preflight_requires_fixed_isolated_matrix(self) -> None:
         common = [
@@ -567,9 +565,11 @@ class PointProgressRingQualificationTests(unittest.TestCase):
             end["point_buffer_preallocation_hits"] = attempts
         if "durability_driver_enabled" in row:
             driver_enabled = bool(row["durability_driver_enabled"])
+            ack_waiter_enabled = bool(row["independent_ack_waiter_enabled"])
             diagnostics_enabled = bool(row["durability_driver_diagnostics_enabled"])
             for snapshot in (start, end):
                 snapshot["dedicated_durability_driver_enabled"] = driver_enabled
+                snapshot["independent_ack_waiter_enabled"] = ack_waiter_enabled
                 snapshot["dedicated_durability_diagnostics_enabled"] = diagnostics_enabled
                 snapshot["dedicated_durability_requests"] = 0
                 snapshot["dedicated_durability_wake_signals"] = 0

@@ -15,6 +15,7 @@ import csv
 from collections.abc import Callable
 from datetime import datetime, timezone
 import http.client
+import hashlib
 import ipaddress
 import json
 import math
@@ -146,6 +147,18 @@ DEDICATED_DURABILITY_RUNNER = Path(__file__).with_name("gcp_v8_dedicated_durabil
 POINT_PROGRESS_RING_VM_TAG = "walbench-point-progress-ring"
 V8_EXTENT_POLICY_STORAGE_RUNNER = Path(__file__).with_name("gcp_v8_extent_policy_storage_runner.py")
 REPO_URL = "https://github.com/ben1009/toy-kv-engine.git"
+
+
+def _d3b_runner_bundle_sha256() -> str:
+    digest = hashlib.sha256()
+    for path in (Path(__file__), RUNNERS, MATRIX_MODULE, POINT_PROGRESS_RING_RUNNER, DEDICATED_DURABILITY_RUNNER):
+        digest.update(path.name.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
 MAX_RUNTIME_MINUTES = 180
 MIN_RUNTIME_MINUTES = 60
 MAX_ARTIFACT_BUNDLE_BYTES = 512 * 1024 * 1024
@@ -180,7 +193,8 @@ root_names = {
     "extent-policy-storage-schedule.tsv",
     "v7-v8-point-preallocation-schedule.tsv",
     "point-resource-retirement-schedule.tsv",
-    "point-ack-d1-schedule.tsv", "dedicated-durability-schedule.tsv", "candidate-commit.txt", "source.patch",
+    "point-ack-d1-schedule.tsv", "dedicated-durability-schedule.tsv", "runner-bundle.sha256",
+    "candidate-commit.txt", "source.patch",
     "commit-order-trace-analysis.json", "commit.txt", "remote-exit.json",
     "finished_utc.txt", "remote-finished-utc.txt", "remote-status.txt", "host.txt",
     "os-release.txt", "uname.txt", "lscpu.txt", "lsblk.txt", "findmnt.txt", "df.txt",
@@ -1223,8 +1237,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                              help="Repeat the retirement matrix with Point buffer preallocation enabled")
     suite_group.add_argument("--v8-point-ack-d1-ab", action="store_true",
                              help="Compare D1 Coordinator ACK checks with Stage A enabled and retirement mode 0")
-    suite_group.add_argument("--v8-dedicated-durability-driver-ab", action="store_true",
-                             help="Compare CallerDriven and Dedicated D3a with 40 score plus four diagnostic runs")
+    suite_group.add_argument(
+        "--v8-independent-ack-ab", "--v8-dedicated-durability-driver-ab",
+        dest="v8_dedicated_durability_driver_ab", action="store_true",
+        help="Compare legacy ACK, CallerDriven independent ACK, and Dedicated independent ACK (60 score runs)",
+    )
     parser.add_argument("--baseline-commit", help="Full source commit used as the source A/B baseline")
     parser.add_argument("--source-patch-sha256",
                         help="SHA-256 of the exact source patch used for a commit-order trace run")
@@ -1268,6 +1285,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     point_ack_d1_suite = args.v8_point_ack_d1_ab
     dedicated_durability_suite = args.v8_dedicated_durability_driver_ab
+    args.runner_bundle_sha256 = _d3b_runner_bundle_sha256() if dedicated_durability_suite else None
     point_progress_suite = (
         args.v8_point_progress_cursor_ab or point_cursor_direct_completion_suite
         or point_cursor_singleton_submission_suite or point_cursor_coalescing_budget_suite
@@ -1776,7 +1794,7 @@ def _verify_result_set(results: Path) -> dict[str, Any]:
             return verify_point_resource_retirement_results(results)
         if suite == "v8-point-ack-d1":
             return verify_point_ack_d1_results(results)
-        if suite == "v8-dedicated-durability-driver":
+        if suite == "v8-d3b-independent-ack":
             return verify_dedicated_durability_results(results)
         if suite == "v8-small-ticket-profile":
             with (results / "profile-schedule.tsv").open(encoding="utf-8", newline="") as stream:
@@ -2993,6 +3011,7 @@ def provision_and_run(
     )
     point_ack_d1_suite = getattr(args, "v8_point_ack_d1_ab", False)
     dedicated_durability_suite = getattr(args, "v8_dedicated_durability_driver_ab", False)
+    runner_bundle_sha256 = getattr(args, "runner_bundle_sha256", None)
     point_progress_suite = (
         point_progress_cursor_suite or point_cursor_direct_completion_suite
         or point_cursor_singleton_submission_suite or point_cursor_coalescing_budget_suite
@@ -3329,6 +3348,12 @@ def provision_and_run(
                 append_local_log(key_log, driver_copy.stdout + driver_copy.stderr)
                 if driver_copy.returncode:
                     raise BenchError(f"Could not copy dedicated durability runner: {driver_copy.stderr.strip()}")
+                progress_copy = upload_to_vm(
+                    POINT_PROGRESS_RING_RUNNER, "/tmp/gcp-v8-point-progress-ring-runner.py"
+                )
+                append_local_log(key_log, progress_copy.stdout + progress_copy.stderr)
+                if progress_copy.returncode:
+                    raise BenchError(f"Could not copy progress-ring helper: {progress_copy.stderr.strip()}")
 
             safe_deadline_epoch = int(deadline_epoch - 600)
             if profile_suite:
@@ -3376,6 +3401,7 @@ def provision_and_run(
                 args.source_patch_sha256 or "-",
                 getattr(args, "baseline_commit", "").lower() if getattr(args, "baseline_commit", None) else "-",
                 str(getattr(args, "repetitions", 1)),
+                runner_bundle_sha256 or "-",
             ])
             remaining = max(30, int(deadline - time.monotonic()))
             try:
@@ -3686,12 +3712,13 @@ def main(argv: list[str] | None = None) -> int:
                 source_patch_sha256=args.source_patch_sha256,
             )
         elif dedicated_durability_suite:
-            report["benchmark_suite"] = "v8-dedicated-durability-driver"
+            report["benchmark_suite"] = "v8-d3b-independent-ack"
             report["benchmark_plan"] = build_dedicated_durability_driver_plan(
                 writers=args.writers,
                 machine_type=args.machine_type,
                 machine_spec=MACHINE_SPECS[args.machine_type],
                 commit=args.commit.lower(),
+                runner_bundle_sha256=args.runner_bundle_sha256,
             )
         elif args.v8_point_progress_cursor_ab:
             report["benchmark_suite"] = "v8-point-progress-cursor"

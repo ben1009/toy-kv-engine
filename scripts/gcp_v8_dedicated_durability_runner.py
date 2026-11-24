@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run and verify D3a CallerDriven/Dedicated durability qualification."""
+"""Run and verify the three-arm D3b ACK waiter qualification."""
 
 from __future__ import annotations
 
@@ -60,44 +60,67 @@ def _summary(rows: list[dict[str, Any]], planned: int) -> dict[str, Any]:
             }
             for arm, selected in arms.items()
         }
-        paired: list[dict[str, float | int]] = []
-        for repetition in range(1, 6):
-            caller = next((row for row in arms["caller_driven"] if row.get("repetition") == repetition), None)
-            dedicated = next((row for row in arms["dedicated"] if row.get("repetition") == repetition), None)
-            if caller is None or dedicated is None or float(caller["puts_per_second"]) <= 0:
+        paired_comparisons: dict[str, list[dict[str, float | int]]] = {}
+        for arm in DURABILITY_DRIVER_ARMS:
+            if arm == "caller_legacy_ack":
                 continue
-            paired.append({
-                "repetition": repetition,
-                "throughput_change_pct": (
-                    float(dedicated["puts_per_second"]) / float(caller["puts_per_second"]) - 1
-                ) * 100,
-                "p99_change_pct": (
-                    (float(dedicated["p99_ms"]) / float(caller["p99_ms"]) - 1) * 100
-                    if workload == "point" and float(caller["p99_ms"]) > 0 else 0.0
-                ),
-            })
-        changes = [float(pair["throughput_change_pct"]) for pair in paired]
-        p99_changes = [float(pair["p99_change_pct"]) for pair in paired] if workload == "point" else []
+            paired: list[dict[str, float | int]] = []
+            for repetition in range(1, 6):
+                baseline = next(
+                    (row for row in arms["caller_legacy_ack"] if row.get("repetition") == repetition), None,
+                )
+                candidate = next(
+                    (row for row in arms[arm] if row.get("repetition") == repetition), None,
+                )
+                if baseline is None or candidate is None or float(baseline["puts_per_second"]) <= 0:
+                    continue
+                paired.append({
+                    "repetition": repetition,
+                    "throughput_change_pct": (
+                        float(candidate["puts_per_second"]) / float(baseline["puts_per_second"]) - 1
+                    ) * 100,
+                    "p99_change_pct": (
+                        (float(candidate["p99_ms"]) / float(baseline["p99_ms"]) - 1) * 100
+                        if workload == "point" and float(baseline["p99_ms"]) > 0 else 0.0
+                    ),
+                })
+            paired_comparisons[arm] = paired
+        changes = {
+            arm: [float(pair["throughput_change_pct"]) for pair in paired]
+            for arm, paired in paired_comparisons.items()
+        }
+        p99_changes = {
+            arm: [float(pair["p99_change_pct"]) for pair in paired]
+            for arm, paired in paired_comparisons.items()
+        }
         comparisons.append({
             "writer": writer,
             "workload": workload,
             "arms": arm_summary,
-            "paired_throughput_changes_pct": changes,
-            "paired_throughput_change_median_pct": median(changes) if changes else None,
-            "dedicated_pair_wins": sum(change > 0 for change in changes),
-            "paired_p99_changes_pct": p99_changes,
-            "paired_p99_change_median_pct": median(p99_changes) if p99_changes else None,
+            "baseline_arm": "caller_legacy_ack",
+            "paired_comparisons": {
+                arm: {
+                    "throughput_changes_pct": changes[arm],
+                    "throughput_change_median_pct": median(changes[arm]) if changes[arm] else None,
+                    "wins": sum(change > 0 for change in changes[arm]),
+                    "p99_changes_pct": p99_changes[arm] if workload == "point" else [],
+                    "p99_change_median_pct": (
+                        median(p99_changes[arm]) if workload == "point" and p99_changes[arm] else None
+                    ),
+                }
+                for arm in paired_comparisons
+            },
         })
     return {
-        "suite": "v8-dedicated-durability-driver",
+        "suite": "v8-d3b-independent-ack",
         "complete": len(rows) == planned == validation["planned"] and validation["complete"],
         "runs_started": len(rows),
         "runs_completed": sum(row.get("exit_code") == 0 for row in rows),
         "runs_planned": planned,
-        "score_runs_planned": 40,
+        "score_runs_planned": 60,
         "score_runs_completed": sum(row.get("exit_code") == 0 for row in score_rows),
-        "diagnostic_runs_planned": 4,
-        "diagnostic_runs_completed": sum(row.get("exit_code") == 0 for row in diagnostic_rows),
+        "diagnostic_runs_planned": 0,
+        "diagnostic_runs_completed": 0,
         "writers": list(DURABILITY_DRIVER_WRITERS),
         "workloads": ["point", "batch64"],
         "arms": list(DURABILITY_DRIVER_ARMS),
@@ -106,8 +129,8 @@ def _summary(rows: list[dict[str, Any]], planned: int) -> dict[str, Any]:
         "comparison": comparisons,
         "diagnostics": diagnostic_rows,
         "qualification_note": (
-            "Scoring excludes all detailed dedicated-driver counters. The four separate diagnostic runs enable "
-            "only the lightweight driver counters and are not performance scores."
+            "All three ACK/driver modes share the same source commit, release binary, Cursor/Direct/Stage A "
+            "configuration, and unprofiled scoring plan."
         ),
     }
 
@@ -116,13 +139,18 @@ def run_suite(args: argparse.Namespace) -> int:
     schedule = build_dedicated_durability_driver_schedule()
     writers = tuple(int(value) for value in args.writers.split(","))
     if writers != DURABILITY_DRIVER_WRITERS:
-        raise ValueError(f"D3a qualification requires writers {DURABILITY_DRIVER_WRITERS}")
+        raise ValueError(f"D3b ACK qualification requires writers {DURABILITY_DRIVER_WRITERS}")
     if args.machine_type != "c4-standard-16-lssd" or args.ssd_count != 2 or args.ssd_gib != 750:
-        raise ValueError("D3a qualification requires c4-standard-16-lssd and two Local SSDs")
+        raise ValueError("D3b qualification requires c4-standard-16-lssd and two Local SSDs")
     if len(args.commit) != 40 or any(character not in "0123456789abcdef" for character in args.commit):
         raise ValueError("source commit must be a full lowercase SHA-1 identity")
     if len(args.binary_sha256) != 64 or any(character not in "0123456789abcdef" for character in args.binary_sha256):
         raise ValueError("binary checksum must be a full lowercase SHA-256 identity")
+    runner_bundle_sha256 = args.runner_bundle_sha256
+    if len(runner_bundle_sha256) != 64 or any(
+        character not in "0123456789abcdef" for character in runner_bundle_sha256
+    ):
+        raise ValueError("runner bundle checksum must be a full lowercase SHA-256 identity")
     results_dir, db_root = args.results_dir, args.db_root
     results_dir.mkdir(parents=True, exist_ok=True)
     db_root.mkdir(parents=True, exist_ok=True)
@@ -135,8 +163,10 @@ def run_suite(args: argparse.Namespace) -> int:
         machine_spec={"vcpus": 16, "ssd_count": args.ssd_count, "ssd_gib": args.ssd_gib},
         commit=args.commit,
         binary_sha256=args.binary_sha256,
+        runner_bundle_sha256=runner_bundle_sha256,
     )
     (results_dir / "benchmark-plan.json").write_text(json.dumps(plan, indent=2) + "\n", encoding="utf-8")
+    (results_dir / "runner-bundle.sha256").write_text(runner_bundle_sha256 + "\n", encoding="utf-8")
     with (results_dir / "dedicated-durability-schedule.tsv").open("w", encoding="utf-8", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=schedule[0].keys(), delimiter="\t", lineterminator="\n")
         writer.writeheader()
@@ -182,6 +212,7 @@ def run_suite(args: argparse.Namespace) -> int:
 
     summary = _summary(rows, len(schedule))
     summary.update({"source_commit": args.commit, "binary_sha256": args.binary_sha256,
+                    "runner_bundle_sha256": runner_bundle_sha256,
                     "runs_attempted": attempted})
     summary["complete"] = summary["complete"] and failure is None and attempted == started == len(schedule)
     if failure:
@@ -199,7 +230,7 @@ def run_suite(args: argparse.Namespace) -> int:
 
 
 def verify_results_directory(results: Path) -> dict[str, Any]:
-    """Validate the fixed D3a schedule, run artifacts, environment and runtime proofs."""
+    """Validate the fixed D3b schedule, run artifacts, environment and runtime proofs."""
     errors: list[str] = []
     try:
         summary = json.loads((results / "summary.json").read_text(encoding="utf-8"))
@@ -208,27 +239,39 @@ def verify_results_directory(results: Path) -> dict[str, Any]:
         schedule = build_dedicated_durability_driver_schedule()
         commit = summary.get("source_commit")
         binary_sha256 = summary.get("binary_sha256")
+        runner_bundle_sha256 = summary.get("runner_bundle_sha256")
+        if not isinstance(runner_bundle_sha256, str) or len(runner_bundle_sha256) != 64 or any(
+            character not in "0123456789abcdef" for character in runner_bundle_sha256
+        ):
+            errors.append("runner bundle checksum is malformed")
+            runner_bundle_sha256 = "0" * 64
         expected_plan = build_dedicated_durability_driver_plan(
             writers=DURABILITY_DRIVER_WRITERS,
             machine_type="c4-standard-16-lssd",
             machine_spec={"vcpus": 16, "ssd_count": 2, "ssd_gib": 750},
             commit=commit,
             binary_sha256=binary_sha256,
+            runner_bundle_sha256=runner_bundle_sha256,
         )
         if plan != expected_plan:
-            errors.append("benchmark plan differs from the fixed D3a suite")
-        if summary.get("suite") != "v8-dedicated-durability-driver" or summary.get("complete") is not True:
-            errors.append("summary does not report a complete D3a suite")
+            errors.append("benchmark plan differs from the fixed D3b suite")
+        if summary.get("suite") != "v8-d3b-independent-ack" or summary.get("complete") is not True:
+            errors.append("summary does not report a complete D3b suite")
         if len(str(commit)) != 40 or len(str(binary_sha256)) != 64:
             errors.append("source or binary identity is malformed")
+        try:
+            if (results / "runner-bundle.sha256").read_text(encoding="utf-8") != runner_bundle_sha256 + "\n":
+                errors.append("runner bundle checksum sidecar differs from summary")
+        except OSError as error:
+            errors.append(f"runner bundle checksum sidecar is missing: {error}")
         if any(summary.get(key) != len(schedule) for key in ("runs_started", "runs_attempted", "runs_planned", "runs_completed")):
-            errors.append("summary run counts differ from the planned 44")
-        if summary.get("score_runs_planned") != 40 or summary.get("score_runs_completed") != 40:
-            errors.append("scoring run count differs from the planned 40")
-        if summary.get("diagnostic_runs_planned") != 4 or summary.get("diagnostic_runs_completed") != 4:
-            errors.append("diagnostic run count differs from the planned four")
+            errors.append("summary run counts differ from the planned 60")
+        if summary.get("score_runs_planned") != 60 or summary.get("score_runs_completed") != 60:
+            errors.append("scoring run count differs from the planned 60")
+        if summary.get("diagnostic_runs_planned") != 0 or summary.get("diagnostic_runs_completed") != 0:
+            errors.append("D3b scoring bundle unexpectedly contains diagnostic runs")
         if remote_exit.get("failed") is not False or remote_exit.get("runs_started") != len(schedule):
-            errors.append("remote exit does not confirm all 44 runs")
+            errors.append("remote exit does not confirm all 60 runs")
         if remote_exit.get("runs_attempted") != len(schedule):
             errors.append("remote attempted count does not match the plan")
         rows = summary.get("results")
@@ -237,7 +280,7 @@ def verify_results_directory(results: Path) -> dict[str, Any]:
             rows = []
         matrix = validate_dedicated_durability_driver_rows(rows)
         if not matrix["complete"]:
-            errors.append("D3a result rows do not cover the exact schedule")
+            errors.append("D3b result rows do not cover the exact schedule")
         if summary.get("matrix_validation") != matrix:
             errors.append("summary matrix validation differs from recomputed validation")
 
@@ -269,6 +312,7 @@ def verify_results_directory(results: Path) -> dict[str, Any]:
                     point_resource_retirement_mode=0,
                     dedicated_durability_driver_enabled=bool(expected["durability_driver_enabled"]),
                     dedicated_durability_diagnostics_enabled=bool(expected["durability_driver_diagnostics_enabled"]),
+                    independent_ack_waiter_enabled=bool(expected["independent_ack_waiter_enabled"]),
                 )
                 if (run_dir / "environment.txt").read_text(encoding="utf-8") != expected_environment:
                     errors.append(f"{run_dir.name} environment differs from the planned arm")
@@ -283,7 +327,7 @@ def verify_results_directory(results: Path) -> dict[str, Any]:
             except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
                 errors.append(f"{run_dir.name} could not be revalidated: {error}")
     except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
-        errors.append(f"could not load D3a result bundle: {error}")
+        errors.append(f"could not load D3b result bundle: {error}")
     return {"verified": not errors, "errors": errors}
 
 
@@ -299,6 +343,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--machine-type", required=True)
     parser.add_argument("--ssd-count", type=int, required=True)
     parser.add_argument("--ssd-gib", type=int, required=True)
+    parser.add_argument("--runner-bundle-sha256", required=True)
     args = parser.parse_args(argv)
     return run_suite(args)
 
