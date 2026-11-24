@@ -108,6 +108,16 @@ POINT_PROGRESS_CURSOR_ARMS = ("eager", "cursor")
 POINT_PROGRESS_CURSOR_V2_ARMS = ("eager", "progress_ring", "cursor")
 CURSOR_DIRECT_COMPLETION_ARMS = ("cursor_relay", "cursor_direct")
 CURSOR_SINGLETON_SUBMISSION_ARMS = ("cursor_control", "cursor_singleton")
+CURSOR_PUBLICATION_WRITERS = (1, 8, 16)
+CURSOR_PUBLICATION_REPETITIONS = 5
+CURSOR_PUBLICATION_NUM = 100_000
+CURSOR_PUBLICATION_ARMS = ("baseline", "admission_only", "cursor_dedup_only", "admission_and_cursor_dedup")
+CURSOR_PUBLICATION_ORDERS = (
+    ("baseline", "admission_only", "cursor_dedup_only", "admission_and_cursor_dedup"),
+    ("admission_only", "cursor_dedup_only", "admission_and_cursor_dedup", "baseline"),
+    ("cursor_dedup_only", "admission_and_cursor_dedup", "baseline", "admission_only"),
+    ("admission_and_cursor_dedup", "baseline", "admission_only", "cursor_dedup_only"),
+)
 POINT_RESOURCE_RETIREMENT_WRITERS = (8, 16)
 POINT_RESOURCE_RETIREMENT_REPETITIONS = 5
 POINT_RESOURCE_RETIREMENT_NUM = 100_000
@@ -790,6 +800,120 @@ def build_cursor_singleton_submission_schedule(
                     "cursor_singleton_submission_enabled": arm == "cursor_singleton",
                 })
     return schedule
+
+
+def build_cursor_publication_schedule(
+    writers: Iterable[int] = CURSOR_PUBLICATION_WRITERS,
+) -> list[dict[str, object]]:
+    """Build a four-arm same-binary D2a/D2b cursor-publication matrix."""
+    writer_counts = validate_writer_counts(writers)
+    if writer_counts != CURSOR_PUBLICATION_WRITERS:
+        raise ValueError(f"cursor-publication qualification requires writers {CURSOR_PUBLICATION_WRITERS}")
+
+    switches = {
+        "baseline": (False, False),
+        "admission_only": (True, False),
+        "cursor_dedup_only": (False, True),
+        "admission_and_cursor_dedup": (True, True),
+    }
+    schedule: list[dict[str, object]] = []
+    for writer, workload, bench, batch_entries, batch_size, sample_every in POINT_PROGRESS_RING_CELLS:
+        for repetition in range(1, CURSOR_PUBLICATION_REPETITIONS + 1):
+            order = CURSOR_PUBLICATION_ORDERS[(repetition - 1) % len(CURSOR_PUBLICATION_ORDERS)]
+            for arm in order:
+                admission_fast_path, cursor_dedup = switches[arm]
+                schedule.append({
+                    "run_index": len(schedule) + 1,
+                    "writer": writer,
+                    "workload": workload,
+                    "repetition": repetition,
+                    "arm": arm,
+                    "bench": bench,
+                    "batch_entries": batch_entries,
+                    "batch_size": batch_size,
+                    "num": CURSOR_PUBLICATION_NUM,
+                    "sample_every": sample_every,
+                    "extent_mode": "sliding-point-lookahead",
+                    "extent_window_bytes": POINT_LOOKAHEAD_WINDOW_BYTES,
+                    "frontier_mode": "direct",
+                    "scan_diagnostics_enabled": False,
+                    "progress_ring_enabled": True,
+                    "progress_cursor_enabled": True,
+                    "progress_counters_enabled": False,
+                    "cursor_direct_completion_enabled": True,
+                    "cursor_singleton_submission_enabled": False,
+                    "point_buffer_preallocation_enabled": workload == "point",
+                    "point_resource_retirement_mode": 0,
+                    "admission_cursor_publish_fast_path_enabled": admission_fast_path,
+                    "cursor_publication_dedup_enabled": cursor_dedup,
+                })
+    return schedule
+
+
+def build_cursor_publication_plan(
+    *, writers: Iterable[int], machine_type: str, machine_spec: Mapping[str, int],
+    commit: str, binary_sha256: str | None = None,
+) -> dict[str, object]:
+    """Describe the isolated D2a/D2b experiment with Stage A and retirement fixed."""
+    writer_counts = validate_writer_counts(writers)
+    schedule = build_cursor_publication_schedule(writer_counts)
+    vcpus = int(machine_spec["vcpus"])
+    ssd_count = int(machine_spec["ssd_count"])
+    layout = "single Local SSD" if ssd_count == 1 else f"RAID0 over {ssd_count} Local SSDs"
+    return {
+        "plan_schema_version": 1,
+        "suite": "v8-cursor-publication",
+        "writers": list(writer_counts),
+        "workloads": [
+            {"writer": writer, "name": workload, "bench": bench,
+             "batch_entries": entries, "batch_size": batch_size,
+             "num": CURSOR_PUBLICATION_NUM, "sample_every": sample_every}
+            for writer, workload, bench, entries, batch_size, sample_every in POINT_PROGRESS_RING_CELLS
+        ],
+        "arms": list(CURSOR_PUBLICATION_ARMS),
+        "repetitions_per_cell": CURSOR_PUBLICATION_REPETITIONS,
+        "arm_orders": [list(order) for order in CURSOR_PUBLICATION_ORDERS],
+        "runs_planned": len(schedule),
+        "score_runs_planned": len(schedule),
+        "counterbalanced": True,
+        "machine_type": machine_type,
+        "vcpus": vcpus,
+        "local_ssd_count": ssd_count,
+        "local_ssd_total_gib": int(machine_spec["ssd_gib"]),
+        "runtime_protocol": f"single {vcpus}-vCPU host; {layout}; same source and release binary for all arms",
+        "value_bytes": 1024,
+        "compaction": "none",
+        "commit": commit,
+        "binary_sha256": binary_sha256,
+        "progress_mode": "cursor (mode 2)",
+        "direct_completion_enabled": True,
+        "singleton_submission_enabled": False,
+        "point_buffer_preallocation_enabled": True,
+        "point_resource_retirement_mode": 0,
+        "extent_preparation": "sliding-point-lookahead, 1 MiB for Point; Batch64 remains fallocate-only",
+        "frontier_mode": "direct",
+        "coalescing": "dynamic",
+        "data_submit_order": "ordered",
+        "extent_policy_storage": "vec",
+        "extent_policy_scan_diagnostics_enabled": False,
+        "latency_sample_every": 10,
+        "d2_ab": {
+            "admission_fast_path_env": "TOYKV_BENCH_V8_ADMISSION_CURSOR_PUBLISH_FAST_PATH",
+            "cursor_publication_dedup_env": "TOYKV_BENCH_V8_CURSOR_PUBLICATION_DEDUP",
+            "runtime_proof_fields": [
+                "admission_cursor_publish_fast_path_enabled",
+                "cursor_publication_dedup_enabled",
+            ],
+            "stage_a_preallocation": "enabled for Point, disabled for Batch64",
+            "retirement_mode": 0,
+        },
+        "qualification_note": (
+            "Four-arm same-host, same-source, same-release-binary factorial comparison of D2a admission cursor "
+            "publication and D2b post-durability cursor deduplication. Cursor, Direct Completion, Direct FRONTIER, "
+            "dynamic coalescing, 1 MiB Point lookahead, Stage A Point preallocation, and retirement mode 0 are fixed. "
+            "Point1/8/16 and Batch64 each have five counterbalanced repetitions; latency is sampled every 10 Point puts."
+        ),
+    }
 
 
 def build_point_resource_retirement_schedule(
@@ -1635,6 +1759,38 @@ def validate_cursor_singleton_submission_rows(
     if invalid_mode_flags:
         validation["complete"] = False
         validation["invalid_rows"].extend(dict(row) for row in invalid_mode_flags)
+    return validation
+
+
+def validate_cursor_publication_rows(
+    rows: list[Mapping[str, object]], writers: Iterable[int] = CURSOR_PUBLICATION_WRITERS,
+) -> dict[str, object]:
+    """Validate each planned D2a/D2b arm against captured runtime settings."""
+    schedule = build_cursor_publication_schedule(writers)
+    validation = _validate_point_progress_rows(rows, schedule)
+    expected = {
+        (row["writer"], row["workload"], row["repetition"], row["arm"]): row
+        for row in schedule
+    }
+    invalid: list[Mapping[str, object]] = []
+    for row in rows:
+        identity = tuple(row.get(key) for key in ("writer", "workload", "repetition", "arm"))
+        planned = expected.get(identity)
+        if planned is None:
+            invalid.append(row)
+            continue
+        for key in (
+            "progress_cursor_enabled", "progress_counters_enabled", "cursor_direct_completion_enabled",
+            "cursor_singleton_submission_enabled", "point_buffer_preallocation_enabled",
+            "point_resource_retirement_mode", "admission_cursor_publish_fast_path_enabled",
+            "cursor_publication_dedup_enabled",
+        ):
+            if row.get(key) != planned[key]:
+                invalid.append(row)
+                break
+    if invalid:
+        validation["complete"] = False
+        validation["invalid_rows"].extend(dict(row) for row in invalid)
     return validation
 
 

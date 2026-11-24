@@ -54,9 +54,12 @@ from gcp_wal_matrix import (
     POINT_ACK_D1_WRITERS,
     CURSOR_COALESCING_BUDGET_NUM,
     CURSOR_COALESCING_BUDGET_WRITERS,
+    CURSOR_PUBLICATION_NUM,
+    CURSOR_PUBLICATION_WRITERS,
     build_cursor_direct_completion_plan,
     build_cursor_singleton_submission_plan,
     build_cursor_coalescing_budget_plan,
+    build_cursor_publication_plan,
     V8_EXTENT_POLICY_STORAGE_NUM,
     V8_EXTENT_POLICY_STORAGE_WRITERS,
     V8_MUTEX_DIAGNOSTIC_NUM,
@@ -107,6 +110,9 @@ from gcp_v8_point_progress_ring_runner import (
 )
 from gcp_v8_point_progress_ring_runner import (
     verify_coalescing_budget_results_directory as verify_cursor_coalescing_budget_results,
+)
+from gcp_v8_point_progress_ring_runner import (
+    verify_cursor_publication_results_directory as verify_cursor_publication_results,
 )
 from gcp_v8_point_progress_ring_runner import (
     verify_point_preallocation_results_directory as verify_point_preallocation_results,
@@ -165,6 +171,7 @@ root_names = {
     "cursor-direct-completion-schedule.tsv",
     "cursor-singleton-submission-schedule.tsv",
     "cursor-coalescing-budget-schedule.tsv",
+    "cursor-publication-schedule.tsv",
     "extent-policy-storage-schedule.tsv",
     "v7-v8-point-preallocation-schedule.tsv",
     "point-resource-retirement-schedule.tsv",
@@ -1199,6 +1206,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                              help="Compare allocation-free singleton DATA submission with Point/Batch guardrails")
     suite_group.add_argument("--v8-cursor-coalescing-budget-ab", action="store_true",
                              help="Compare Cursor Direct Point Dynamic, 100, and 400 μs coalescing budgets")
+    suite_group.add_argument("--v8-cursor-publication-ab", action="store_true",
+                             help="Compare D2a admission publication and D2b cursor deduplication in four arms")
     suite_group.add_argument("--v8-extent-policy-storage-ab", action="store_true",
                              help="Compare V8 BTreeMap and Vec extent-policy storage with Point/Batch guardrails")
     suite_group.add_argument("--v7-v8-point-preallocation-ab", action="store_true",
@@ -1244,6 +1253,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     point_cursor_direct_completion_suite = args.v8_cursor_direct_completion_ab
     point_cursor_singleton_submission_suite = args.v8_cursor_singleton_submission_ab
     point_cursor_coalescing_budget_suite = args.v8_cursor_coalescing_budget_ab
+    point_cursor_publication_suite = args.v8_cursor_publication_ab
     point_preallocation_suite = args.v7_v8_point_preallocation_ab
     point_resource_retirement_stage_a_suite = args.v8_point_resource_retirement_stage_a_ab
     point_resource_retirement_suite = (
@@ -1253,6 +1263,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     point_progress_suite = (
         args.v8_point_progress_cursor_ab or point_cursor_direct_completion_suite
         or point_cursor_singleton_submission_suite or point_cursor_coalescing_budget_suite
+        or point_cursor_publication_suite
         or point_preallocation_suite or point_resource_retirement_suite or point_ack_d1_suite
     )
     explicit_network = args.network is not None
@@ -1278,6 +1289,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     if args.num is None:
         args.num = (
             CURSOR_COALESCING_BUDGET_NUM if point_cursor_coalescing_budget_suite else
+            CURSOR_PUBLICATION_NUM if point_cursor_publication_suite else
             POINT_PREALLOCATION_NUM if point_preallocation_suite else
             POINT_RESOURCE_RETIREMENT_NUM if point_resource_retirement_suite else
             POINT_ACK_D1_NUM if point_ack_d1_suite else
@@ -1298,6 +1310,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             or point_preallocation_suite
             or point_resource_retirement_suite
             or point_ack_d1_suite
+            or point_cursor_publication_suite
             or point_progress_suite
         ) else MACHINE_TYPE
     args.network = args.network or "default"
@@ -1324,6 +1337,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             args.writers = POINT_ACK_D1_WRITERS
         elif point_cursor_coalescing_budget_suite:
             args.writers = CURSOR_COALESCING_BUDGET_WRITERS
+        elif point_cursor_publication_suite:
+            args.writers = CURSOR_PUBLICATION_WRITERS
         elif point_progress_suite:
             args.writers = POINT_PROGRESS_RING_WRITERS
         elif args.v8_small_ticket_profile:
@@ -1338,6 +1353,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error("--commit-order-trace requires exactly 16 writers")
     if point_cursor_coalescing_budget_suite and args.writers != CURSOR_COALESCING_BUDGET_WRITERS:
         parser.error(f"--v8-cursor-coalescing-budget-ab requires writers {CURSOR_COALESCING_BUDGET_WRITERS}")
+    if point_cursor_publication_suite and args.writers != CURSOR_PUBLICATION_WRITERS:
+        parser.error(f"--v8-cursor-publication-ab requires writers {CURSOR_PUBLICATION_WRITERS}")
+    if point_cursor_publication_suite and args.machine_type != "c4-standard-16-lssd":
+        parser.error("--v8-cursor-publication-ab requires c4-standard-16-lssd")
     if args.v8_mutex_diagnostic and args.writers != V8_MUTEX_DIAGNOSTIC_WRITERS:
         parser.error("--v8-mutex-diagnostic requires exactly 16 writers")
     if args.v8_mutex_diagnostic and args.machine_type != "c4-standard-16-lssd":
@@ -1375,6 +1394,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     if point_ack_d1_suite and args.machine_type != "c4-standard-16-lssd":
         parser.error("--v8-point-ack-d1-ab requires c4-standard-16-lssd")
     expected_progress_writers = (
+        CURSOR_PUBLICATION_WRITERS
+        if point_cursor_publication_suite else
         CURSOR_COALESCING_BUDGET_WRITERS
         if point_cursor_coalescing_budget_suite else POINT_PROGRESS_RING_WRITERS
     )
@@ -1548,7 +1569,7 @@ def _run_identifier(row: dict[str, Any], suite: str) -> str:
     if suite in (
         "v8-point-progress-ring", "v8-point-progress-cursor", "v8-cursor-direct-completion",
         "v8-cursor-singleton-submission", "v8-cursor-coalescing-budget", "v7-v8-point-preallocation",
-        "v8-point-resource-retirement",
+        "v8-point-resource-retirement", "v8-cursor-publication",
     ):
         return f"r{row['repetition']}-w{row['writer']}-{row['workload']}-{row['arm']}"
     if suite == "v8-small-ticket-profile":
@@ -1576,7 +1597,7 @@ def _summary_row_identifier(row: dict[str, Any], suite: str) -> str:
     if suite in (
         "v8-point-progress-ring", "v8-point-progress-cursor", "v8-cursor-direct-completion",
         "v8-cursor-singleton-submission", "v8-cursor-coalescing-budget", "v7-v8-point-preallocation",
-        "v8-point-resource-retirement",
+        "v8-point-resource-retirement", "v8-cursor-publication",
     ):
         return f"r{int(row['repetition'])}-w{int(row['writer'])}-{row['workload']}-{row['arm']}"
     if suite == "v8-small-ticket-profile":
@@ -1636,6 +1657,13 @@ def _expected_run_metadata(row: dict[str, Any], suite: str) -> dict[str, Any]:
                 "progress_cursor_enabled", "progress_counters_enabled", "cursor_direct_completion_enabled",
                 "cursor_singleton_submission_enabled", "point_buffer_preallocation_enabled",
                 "point_resource_retirement_mode",
+            )
+        elif suite == "v8-cursor-publication":
+            keys += (
+                "progress_cursor_enabled", "progress_counters_enabled", "cursor_direct_completion_enabled",
+                "cursor_singleton_submission_enabled", "point_buffer_preallocation_enabled",
+                "point_resource_retirement_mode", "admission_cursor_publish_fast_path_enabled",
+                "cursor_publication_dedup_enabled",
             )
         return {key: row[key] for key in keys}
     if suite == "v7-v8-point-preallocation":
@@ -1720,6 +1748,8 @@ def _verify_result_set(results: Path) -> dict[str, Any]:
             return verify_cursor_singleton_submission_results(results)
         if suite == "v8-cursor-coalescing-budget":
             return verify_cursor_coalescing_budget_results(results)
+        if suite == "v8-cursor-publication":
+            return verify_cursor_publication_results(results)
         if suite == "v7-v8-point-preallocation":
             return verify_point_preallocation_results(results)
         if suite == "v8-point-resource-retirement":
@@ -2933,6 +2963,7 @@ def provision_and_run(
     point_cursor_direct_completion_suite = getattr(args, "v8_cursor_direct_completion_ab", False)
     point_cursor_singleton_submission_suite = getattr(args, "v8_cursor_singleton_submission_ab", False)
     point_cursor_coalescing_budget_suite = getattr(args, "v8_cursor_coalescing_budget_ab", False)
+    point_cursor_publication_suite = getattr(args, "v8_cursor_publication_ab", False)
     point_preallocation_suite = getattr(args, "v7_v8_point_preallocation_ab", False)
     point_resource_retirement_stage_a_suite = getattr(args, "v8_point_resource_retirement_stage_a_ab", False)
     point_resource_retirement_suite = (
@@ -2942,6 +2973,7 @@ def provision_and_run(
     point_progress_suite = (
         point_progress_cursor_suite or point_cursor_direct_completion_suite
         or point_cursor_singleton_submission_suite or point_cursor_coalescing_budget_suite
+        or point_cursor_publication_suite
         or point_preallocation_suite or point_resource_retirement_suite or point_ack_d1_suite
     )
     extent_policy_storage_suite = getattr(args, "v8_extent_policy_storage_ab", False)
@@ -3278,6 +3310,8 @@ def provision_and_run(
                 remote_suite = "v8-cursor-singleton-submission"
             elif point_cursor_coalescing_budget_suite:
                 remote_suite = "v8-cursor-coalescing-budget"
+            elif point_cursor_publication_suite:
+                remote_suite = "v8-cursor-publication"
             elif point_preallocation_suite:
                 remote_suite = "v7-v8-point-preallocation"
             elif point_resource_retirement_suite:
@@ -3440,6 +3474,7 @@ def main(argv: list[str] | None = None) -> int:
     point_cursor_direct_completion_suite = args.v8_cursor_direct_completion_ab
     point_cursor_singleton_submission_suite = args.v8_cursor_singleton_submission_ab
     point_cursor_coalescing_budget_suite = args.v8_cursor_coalescing_budget_ab
+    point_cursor_publication_suite = args.v8_cursor_publication_ab
     point_preallocation_suite = args.v7_v8_point_preallocation_ab
     point_resource_retirement_stage_a_suite = args.v8_point_resource_retirement_stage_a_ab
     point_resource_retirement_suite = (
@@ -3449,6 +3484,7 @@ def main(argv: list[str] | None = None) -> int:
     point_progress_suite = (
         args.v8_point_progress_cursor_ab or point_cursor_direct_completion_suite
         or point_cursor_singleton_submission_suite or point_cursor_coalescing_budget_suite
+        or point_cursor_publication_suite
         or point_preallocation_suite or point_resource_retirement_suite or point_ack_d1_suite
     )
     if point_progress_suite:
@@ -3576,6 +3612,14 @@ def main(argv: list[str] | None = None) -> int:
         elif point_cursor_coalescing_budget_suite:
             report["benchmark_suite"] = "v8-cursor-coalescing-budget"
             report["benchmark_plan"] = build_cursor_coalescing_budget_plan(
+                machine_type=args.machine_type,
+                machine_spec=MACHINE_SPECS[args.machine_type],
+                commit=args.commit.lower(),
+            )
+        elif point_cursor_publication_suite:
+            report["benchmark_suite"] = "v8-cursor-publication"
+            report["benchmark_plan"] = build_cursor_publication_plan(
+                writers=args.writers,
                 machine_type=args.machine_type,
                 machine_spec=MACHINE_SPECS[args.machine_type],
                 commit=args.commit.lower(),

@@ -167,6 +167,11 @@ pub struct WalIoDiagnostics {
     /// Whether Cursor DATA submissions use the benchmark-only allocation-free group
     /// representation.
     pub cursor_singleton_submission_enabled: bool,
+    /// Whether V8 Parallel admission publishes the assigned ticket directly instead of
+    /// rereading the coordinator cursor and updating the legacy PITR reservation cursor.
+    pub admission_cursor_publish_fast_path_enabled: bool,
+    /// Whether post-durability cursor publication is deduplicated across covered waiters.
+    pub cursor_publication_dedup_enabled: bool,
     /// Whether Point batches attempt the bounded benchmark-only DATA-buffer preallocation.
     pub point_buffer_preallocation_enabled: bool,
     /// Number of Point DATA-buffer preallocation attempts during the run.
@@ -235,6 +240,46 @@ pub struct WalIoDiagnostics {
     pub point_resource_preclaim_promotion_cpu_ns: u64,
     pub point_resource_preclaim_promotion_cpu_samples: u64,
     pub progress_diagnostics: Option<WalV8ProgressDiagnostics>,
+}
+
+const V8_ADMISSION_CURSOR_PUBLISH_FAST_PATH_ENV: &str =
+    "TOYKV_BENCH_V8_ADMISSION_CURSOR_PUBLISH_FAST_PATH";
+const V8_CURSOR_PUBLICATION_DEDUP_ENV: &str = "TOYKV_BENCH_V8_CURSOR_PUBLICATION_DEDUP";
+
+/// Returns the bench-only D2a setting. The benchmark starts one process per arm, so this
+/// process-wide value is fixed before the first write and does not add environment parsing
+/// to the admission path.
+#[cfg(feature = "bench")]
+pub(crate) fn v8_admission_cursor_publish_fast_path_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var(V8_ADMISSION_CURSOR_PUBLISH_FAST_PATH_ENV)
+            .map(|value| value != "0")
+            .unwrap_or(true)
+    })
+}
+
+#[cfg(not(feature = "bench"))]
+pub(crate) const fn v8_admission_cursor_publish_fast_path_enabled() -> bool {
+    true
+}
+
+/// Returns the bench-only D2b setting. The benchmark starts one process per arm, so this
+/// process-wide value is fixed before the first write and does not add environment parsing
+/// to the publication path.
+#[cfg(feature = "bench")]
+pub(crate) fn v8_cursor_publication_dedup_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var(V8_CURSOR_PUBLICATION_DEDUP_ENV)
+            .map(|value| value != "0")
+            .unwrap_or(true)
+    })
+}
+
+#[cfg(not(feature = "bench"))]
+pub(crate) const fn v8_cursor_publication_dedup_enabled() -> bool {
+    true
 }
 
 /// Per-writer progress observations collected with lightweight counters or
@@ -949,18 +994,19 @@ fn publish_v8_parallel_cursor_snapshot(
     alloc_offset: &AtomicU64,
     preallocated_size: &AtomicU64,
     next_ticket: &AtomicU64,
+    deduplicate: bool,
     covered_ticket: Option<u64>,
     published_cursor: impl FnOnce() -> (u64, u64, u64),
 ) -> u64 {
-    if let Some(ticket) = covered_ticket {
+    if deduplicate && let Some(ticket) = covered_ticket {
         let durable_ticket_end = durable_ticket.load(Ordering::Acquire);
         if durable_ticket_end > ticket {
             return durable_ticket_end;
         }
     }
 
-    let _publish_guard = publish_gate.lock();
-    if let Some(ticket) = covered_ticket {
+    let _publish_guard = deduplicate.then(|| publish_gate.lock());
+    if deduplicate && let Some(ticket) = covered_ticket {
         let durable_ticket_end = durable_ticket.load(Ordering::Acquire);
         if durable_ticket_end > ticket {
             return durable_ticket_end;
@@ -2725,7 +2771,7 @@ impl Wal {
                 return Err(error);
             }
         };
-        self.finish_v8_parallel_admission(job)
+        self.finish_v8_parallel_admission(writer, job)
     }
 
     #[cfg(feature = "bench")]
@@ -2776,11 +2822,12 @@ impl Wal {
                 return Err(error);
             }
         };
-        self.finish_v8_parallel_admission(job)
+        self.finish_v8_parallel_admission(writer, job)
     }
 
     fn finish_v8_parallel_admission<'a>(
         &self,
+        writer: &v8::leader::WalV8ParallelWriter,
         job: v8::leader::WalV8FrameJob<'a>,
     ) -> Result<(u64, v8::leader::WalV8FrameJob<'a>)> {
         let assignment = job.assignment();
@@ -2792,13 +2839,24 @@ impl Wal {
             .segment_ticket
             .checked_add(1)
             .context("v8 Parallel ticket end overflows after admission")?;
-        // Publish this admission's end without reacquiring the Coordinator
-        // lock. Every admission publishes its own end before returning; V8
-        // durability and admission decisions read the Coordinator directly.
-        self.next_ticket.fetch_max(ticket_end, Ordering::Release);
+        let admission_fast_path_enabled = v8_admission_cursor_publish_fast_path_enabled();
+        if admission_fast_path_enabled {
+            // Publish this admission's end without reacquiring the Coordinator
+            // lock. Every admission publishes its own end before returning; V8
+            // durability and admission decisions read the Coordinator directly.
+            self.next_ticket.fetch_max(ticket_end, Ordering::Release);
+        } else {
+            // Preserve the pre-D2a behavior for the same-binary benchmark control.
+            self.next_ticket
+                .fetch_max(writer.next_ticket(), Ordering::Release);
+        }
         self.alloc_offset.fetch_max(data_end, Ordering::Release);
         self.preallocated_size
             .fetch_max(data_end, Ordering::Release);
+        if !admission_fast_path_enabled {
+            let mut reserved_end = self.pitr_reserved_end.lock();
+            *reserved_end = (*reserved_end).max(data_end);
+        }
 
         Ok((assignment.segment_ticket, job))
     }
@@ -2870,6 +2928,7 @@ impl Wal {
             &self.alloc_offset,
             &self.preallocated_size,
             &self.next_ticket,
+            v8_cursor_publication_dedup_enabled(),
             covered_ticket,
             || writer.published_cursor(),
         )
@@ -4946,6 +5005,7 @@ mod v8_wait_tests {
                 &alloc_offset,
                 &preallocated_size,
                 &next_ticket,
+                true,
                 Some(4),
                 || (5, 4096, 8),
             );
@@ -4985,6 +5045,7 @@ mod v8_wait_tests {
                     &alloc_offset,
                     &preallocated_size,
                     &next_ticket,
+                    true,
                     Some(0),
                     || {
                         snapshot_calls.fetch_add(1, Ordering::Relaxed);
@@ -5009,6 +5070,7 @@ mod v8_wait_tests {
                     &alloc_offset,
                     &preallocated_size,
                     &next_ticket,
+                    true,
                     Some(0),
                     || {
                         snapshot_calls.fetch_add(1, Ordering::Relaxed);
@@ -5047,6 +5109,7 @@ mod v8_wait_tests {
                 &alloc_offset,
                 &preallocated_size,
                 &next_ticket,
+                true,
                 Some(0),
                 || (1, 4096, 2),
             ),
@@ -5060,6 +5123,7 @@ mod v8_wait_tests {
             &alloc_offset,
             &preallocated_size,
             &next_ticket,
+            true,
             Some(1),
             || {
                 snapshot_calls.fetch_add(1, Ordering::Relaxed);
@@ -5090,6 +5154,7 @@ mod v8_wait_tests {
             &alloc_offset,
             &preallocated_size,
             &next_ticket,
+            true,
             None,
             || {
                 snapshot_called.store(true, Ordering::Relaxed);

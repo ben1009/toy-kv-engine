@@ -45,10 +45,15 @@ from gcp_wal_matrix import (
     CURSOR_COALESCING_BUDGET_ARMS,
     CURSOR_COALESCING_BUDGET_NUM,
     CURSOR_COALESCING_BUDGET_WRITERS,
+    CURSOR_PUBLICATION_ARMS,
+    CURSOR_PUBLICATION_NUM,
+    CURSOR_PUBLICATION_WRITERS,
     build_cursor_direct_completion_plan,
     build_cursor_direct_completion_schedule,
     build_cursor_coalescing_budget_plan,
     build_cursor_coalescing_budget_schedule,
+    build_cursor_publication_plan,
+    build_cursor_publication_schedule,
     build_cursor_singleton_submission_plan,
     build_cursor_singleton_submission_schedule,
     V8_EXTENT_POLICY_STORAGE_NUM,
@@ -108,6 +113,7 @@ from gcp_wal_matrix import (
     validate_cursor_direct_completion_rows,
     validate_cursor_singleton_submission_rows,
     validate_cursor_coalescing_budget_rows,
+    validate_cursor_publication_rows,
     validate_v8_extent_policy_storage_rows,
     validate_v8_mutex_diagnostic_rows,
     validate_v8_point_cpu_attribution_rows,
@@ -395,6 +401,13 @@ class PointProgressRingQualificationTests(unittest.TestCase):
                 "point_resource_retirement_detached_tickets": 0,
                 "point_resource_retirement_batched_prefixes": 0,
             })
+        for key in (
+            "admission_cursor_publish_fast_path_enabled",
+            "cursor_publication_dedup_enabled",
+        ):
+            if key in row:
+                start[key] = bool(row[key])
+                end[key] = bool(row[key])
         if "cursor_direct_completion_enabled" in row:
             start["cursor_direct_completion_enabled"] = bool(row["cursor_direct_completion_enabled"])
             end["cursor_direct_completion_enabled"] = bool(row["cursor_direct_completion_enabled"])
@@ -471,6 +484,7 @@ class PointProgressRingQualificationTests(unittest.TestCase):
         coalescing_budget: bool = False,
         retirement: bool = False,
         retirement_preallocation: bool = False,
+        cursor_publication: bool = False,
         cursor_schema_version: int | None = None,
         include_schema_version: bool = True,
     ) -> Path:
@@ -478,7 +492,10 @@ class PointProgressRingQualificationTests(unittest.TestCase):
         results.mkdir()
         commit = "a" * 40
         binary_sha = "b" * 64
-        if retirement:
+        if cursor_publication:
+            schedule_builder = build_cursor_publication_schedule
+            plan_builder = build_cursor_publication_plan
+        elif retirement:
             schedule_builder = lambda selected_writers: build_point_resource_retirement_schedule(
                 selected_writers,
                 point_buffer_preallocation_enabled=retirement_preallocation,
@@ -503,12 +520,21 @@ class PointProgressRingQualificationTests(unittest.TestCase):
             schedule_builder = build_point_progress_ring_schedule
             plan_builder = build_point_progress_ring_plan
         writers = (
+            CURSOR_PUBLICATION_WRITERS if cursor_publication else
             POINT_RESOURCE_RETIREMENT_WRITERS if retirement else
             CURSOR_COALESCING_BUDGET_WRITERS if coalescing_budget else
             POINT_PROGRESS_RING_WRITERS
         )
         schedule = schedule_builder(writers)
-        if retirement:
+        if cursor_publication:
+            plan = plan_builder(
+                writers=writers,
+                machine_type="c4-standard-16-lssd",
+                machine_spec=BENCH.MACHINE_SPECS["c4-standard-16-lssd"],
+                commit=commit,
+                binary_sha256=binary_sha,
+            )
+        elif retirement:
             plan = plan_builder(
                 machine_type="c4-standard-16-lssd",
                 machine_spec=BENCH.MACHINE_SPECS["c4-standard-16-lssd"],
@@ -537,6 +563,7 @@ class PointProgressRingQualificationTests(unittest.TestCase):
         (results / "write-perf.sha256").write_text(binary_sha + "\n", encoding="utf-8")
         schedule_name = (
             "point-resource-retirement-schedule.tsv" if retirement else
+            "cursor-publication-schedule.tsv" if cursor_publication else
             "cursor-coalescing-budget-schedule.tsv" if coalescing_budget else
             "cursor-singleton-submission-schedule.tsv" if singleton_submission else
             "cursor-direct-completion-schedule.tsv" if direct_completion else
@@ -555,6 +582,7 @@ class PointProgressRingQualificationTests(unittest.TestCase):
             run_dir.mkdir()
             raw = cls._raw_record(row)
             record_validator = (
+                progress_ring_runner._validate_cursor_publication_record if cursor_publication else
                 progress_ring_runner._validate_point_resource_retirement_stage_a_record
                 if retirement_preallocation else progress_ring_runner._validate_record
             )
@@ -575,14 +603,21 @@ class PointProgressRingQualificationTests(unittest.TestCase):
                     row.get("cursor_singleton_submission_enabled"),
                     row.get("coalescing_budget_us"),
                     point_buffer_preallocation_enabled=(
+                        bool(row["point_buffer_preallocation_enabled"]) if cursor_publication else
                         True if row.get("point_buffer_preallocation_enabled") is True else None
                     ),
                     point_resource_retirement_mode=row.get("point_resource_retirement_mode"),
+                    admission_cursor_publish_fast_path_enabled=row.get(
+                        "admission_cursor_publish_fast_path_enabled"
+                    ),
+                    cursor_publication_dedup_enabled=row.get("cursor_publication_dedup_enabled"),
                 ),
                 encoding="utf-8",
             )
             rows.append(metadata)
-        if retirement:
+        if cursor_publication:
+            summary = progress_ring_runner._cursor_publication_summary(rows, writers, len(schedule))
+        elif retirement:
             summary = progress_ring_runner._point_resource_retirement_summary(
                 rows, len(schedule),
                 point_buffer_preallocation_enabled=retirement_preallocation,
@@ -806,6 +841,74 @@ class PointProgressRingQualificationTests(unittest.TestCase):
             verification = progress_ring_runner.verify_coalescing_budget_results_directory(results)
             self.assertFalse(verification["verified"])
             self.assertTrue(any("metadata" in error or "matrix" in error for error in verification["errors"]))
+
+    def test_cursor_publication_fixture_verifies_four_isolated_d2_arms(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            results = self._make_fixture(Path(temporary), cursor_publication=True)
+            schedule = build_cursor_publication_schedule(CURSOR_PUBLICATION_WRITERS)
+            self.assertEqual(len(schedule), 80)
+            self.assertEqual({row["arm"] for row in schedule}, set(CURSOR_PUBLICATION_ARMS))
+            self.assertEqual({row["writer"] for row in schedule}, {1, 8, 16})
+            self.assertEqual(
+                validate_cursor_publication_rows(
+                    json.loads((results / "summary.json").read_text(encoding="utf-8"))["results"],
+                    CURSOR_PUBLICATION_WRITERS,
+                )["complete"],
+                True,
+            )
+            verification = progress_ring_runner.verify_cursor_publication_results_directory(results)
+            self.assertTrue(verification["verified"], verification["errors"])
+            self.assertTrue(BENCH._verify_result_set(results)["verified"])
+
+            plan = json.loads((results / "benchmark-plan.json").read_text(encoding="utf-8"))
+            self.assertEqual(plan["suite"], "v8-cursor-publication")
+            self.assertEqual(plan["runs_planned"], 80)
+            self.assertTrue(plan["point_buffer_preallocation_enabled"])
+            self.assertEqual(plan["point_resource_retirement_mode"], 0)
+            baseline = next(row for row in schedule if row["arm"] == "baseline")
+            admission = next(row for row in schedule if row["arm"] == "admission_only")
+            dedup = next(row for row in schedule if row["arm"] == "cursor_dedup_only")
+            self.assertFalse(baseline["admission_cursor_publish_fast_path_enabled"])
+            self.assertFalse(baseline["cursor_publication_dedup_enabled"])
+            self.assertTrue(admission["admission_cursor_publish_fast_path_enabled"])
+            self.assertFalse(admission["cursor_publication_dedup_enabled"])
+            self.assertFalse(dedup["admission_cursor_publish_fast_path_enabled"])
+            self.assertTrue(dedup["cursor_publication_dedup_enabled"])
+            environment = (
+                results / progress_ring_runner._run_id(admission) / "environment.txt"
+            ).read_text(encoding="utf-8")
+            self.assertIn("TOYKV_BENCH_V8_ADMISSION_CURSOR_PUBLISH_FAST_PATH=1\n", environment)
+            self.assertIn("TOYKV_BENCH_V8_CURSOR_PUBLICATION_DEDUP=0\n", environment)
+
+            raw_path = results / progress_ring_runner._run_id(admission) / "result.json"
+            raw = json.loads(raw_path.read_text(encoding="utf-8"))
+            raw["result"]["wal_pipeline"]["wal_io_end"][
+                "admission_cursor_publish_fast_path_enabled"
+            ] = False
+            raw_path.write_text(json.dumps(raw), encoding="utf-8")
+            invalid = progress_ring_runner.verify_cursor_publication_results_directory(results)
+            self.assertFalse(invalid["verified"])
+            self.assertTrue(any("raw result" in error for error in invalid["errors"]))
+
+    def test_cursor_publication_cli_uses_fixed_isolated_matrix(self) -> None:
+        args = BENCH.parse_args([
+            "--project", "test-project", "--zone", "us-east1-b", "--commit", "a" * 40,
+            "--network", "walbench-isolated", "--subnet", "walbench-subnet",
+            "--ssh-source-range", "192.0.2.10/32", "--max-runtime-minutes", "60",
+            "--estimated-hourly-cost-usd", "1.5", "--max-estimated-spend-usd", "2",
+            "--v8-cursor-publication-ab", "--preflight-only",
+        ])
+        self.assertEqual(args.writers, CURSOR_PUBLICATION_WRITERS)
+        self.assertEqual(args.num, CURSOR_PUBLICATION_NUM)
+        self.assertEqual(args.machine_type, "c4-standard-16-lssd")
+        with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
+            BENCH.parse_args([
+                "--project", "test-project", "--zone", "us-east1-b", "--commit", "a" * 40,
+                "--network", "walbench-isolated", "--subnet", "walbench-subnet",
+                "--ssh-source-range", "192.0.2.10/32", "--max-runtime-minutes", "60",
+                "--estimated-hourly-cost-usd", "1.5", "--max-estimated-spend-usd", "2",
+                "--v8-cursor-publication-ab", "--writers", "8", "--preflight-only",
+            ])
 
     def test_point_resource_retirement_fixture_proves_all_three_modes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -21,6 +21,8 @@ from typing import Any, Callable
 from gcp_wal_matrix import (
     CURSOR_DIRECT_COMPLETION_PLAN_SCHEMA_V1,
     CURSOR_SINGLETON_SUBMISSION_PLAN_SCHEMA_V1,
+    CURSOR_PUBLICATION_NUM,
+    CURSOR_PUBLICATION_WRITERS,
     POINT_LOOKAHEAD_WINDOW_BYTES,
     POINT_PROGRESS_PLAN_SCHEMA_V1,
     POINT_PROGRESS_PLAN_SCHEMA_V2,
@@ -37,6 +39,8 @@ from gcp_wal_matrix import (
     build_cursor_coalescing_budget_schedule,
     build_cursor_singleton_submission_plan,
     build_cursor_singleton_submission_schedule,
+    build_cursor_publication_plan,
+    build_cursor_publication_schedule,
     build_point_progress_cursor_v2_plan,
     build_point_progress_cursor_v2_schedule,
     build_point_progress_cursor_plan,
@@ -54,6 +58,7 @@ from gcp_wal_matrix import (
     validate_cursor_direct_completion_rows,
     validate_cursor_coalescing_budget_rows,
     validate_cursor_singleton_submission_rows,
+    validate_cursor_publication_rows,
 )
 
 RUN_TIMEOUT_SECONDS = 300
@@ -68,6 +73,8 @@ UNSET_EXPERIMENT_VARIABLES = (
     "TOYKV_BENCH_IOWQ_AFFINITY",
     "TOYKV_BENCH_WAL_IO_WORKER_CPU",
     "TOYKV_BENCH_V8_POINT_RESOURCE_RETIREMENT_MODE",
+    "TOYKV_BENCH_V8_ADMISSION_CURSOR_PUBLISH_FAST_PATH",
+    "TOYKV_BENCH_V8_CURSOR_PUBLICATION_DEDUP",
 )
 FIXED_ENVIRONMENT = {
     "TOYKV_BENCH_V8_EXTENT_PREP": "sliding-point-lookahead",
@@ -122,6 +129,13 @@ def _summary_fields(schedule: list[dict[str, Any]]) -> tuple[str, ...]:
             "point_resource_retirement_detached_prefixes", "point_resource_retirement_detached_tickets",
             "point_resource_retirement_batched_prefixes",
         )
+    if any("admission_cursor_publish_fast_path_enabled" in row for row in schedule):
+        fields += (
+            "admission_cursor_publish_fast_path_enabled_start",
+            "admission_cursor_publish_fast_path_enabled_end",
+            "cursor_publication_dedup_enabled_start",
+            "cursor_publication_dedup_enabled_end",
+        )
     return fields
 
 
@@ -134,6 +148,8 @@ def _environment(
     coalescing_budget_us: int | None = None,
     point_buffer_preallocation_enabled: bool | None = None,
     point_resource_retirement_mode: int | None = None,
+    admission_cursor_publish_fast_path_enabled: bool | None = None,
+    cursor_publication_dedup_enabled: bool | None = None,
 ) -> dict[str, str]:
     # An allowlist makes the selected experiment switches the only inherited variables.
     if progress_ring_enabled is not progress_cursor_enabled:
@@ -169,6 +185,14 @@ def _environment(
         if point_resource_retirement_mode not in (0, 1, 2):
             raise ValueError("Point resource-retirement mode must be 0, 1, or 2")
         environment["TOYKV_BENCH_V8_POINT_RESOURCE_RETIREMENT_MODE"] = str(point_resource_retirement_mode)
+    if admission_cursor_publish_fast_path_enabled is not None:
+        environment["TOYKV_BENCH_V8_ADMISSION_CURSOR_PUBLISH_FAST_PATH"] = (
+            "1" if admission_cursor_publish_fast_path_enabled else "0"
+        )
+    if cursor_publication_dedup_enabled is not None:
+        environment["TOYKV_BENCH_V8_CURSOR_PUBLICATION_DEDUP"] = (
+            "1" if cursor_publication_dedup_enabled else "0"
+        )
     return environment
 
 
@@ -211,6 +235,8 @@ def _expected_environment_text(
     coalescing_budget_us: int | None = None,
     point_buffer_preallocation_enabled: bool | None = None,
     point_resource_retirement_mode: int | None = None,
+    admission_cursor_publish_fast_path_enabled: bool | None = None,
+    cursor_publication_dedup_enabled: bool | None = None,
 ) -> str:
     if progress_ring_enabled and not progress_cursor_enabled:
         # Historical F0.5 archives used the now-retired mode 1. Keep their
@@ -227,6 +253,8 @@ def _expected_environment_text(
             cursor_direct_completion_enabled, cursor_singleton_submission_enabled, coalescing_budget_us,
             point_buffer_preallocation_enabled=point_buffer_preallocation_enabled,
             point_resource_retirement_mode=point_resource_retirement_mode,
+            admission_cursor_publish_fast_path_enabled=admission_cursor_publish_fast_path_enabled,
+            cursor_publication_dedup_enabled=cursor_publication_dedup_enabled,
         ).items()
         if key not in ("PATH", "HOME", "TMPDIR", "LC_ALL")
     }
@@ -235,6 +263,10 @@ def _expected_environment_text(
         if (key != "TOYKV_WAL_V8_COALESCE_BUDGET_US" or coalescing_budget_us is None)
         and (key != "TOYKV_BENCH_V8_POINT_RESOURCE_RETIREMENT_MODE"
              or point_resource_retirement_mode is None)
+        and (key != "TOYKV_BENCH_V8_ADMISSION_CURSOR_PUBLISH_FAST_PATH"
+             or admission_cursor_publish_fast_path_enabled is None)
+        and (key != "TOYKV_BENCH_V8_CURSOR_PUBLICATION_DEDUP"
+             or cursor_publication_dedup_enabled is None)
     })
     return "\n".join(f"{key}={value}" for key, value in sorted(controlled.items())) + "\n"
 
@@ -281,6 +313,12 @@ def _validate_record(record: dict[str, Any], row: dict[str, Any]) -> dict[str, A
             "cursor_singleton_submission_enabled", False
         ) is not bool(row["cursor_singleton_submission_enabled"]):
             raise ValueError(f"{boundary} singleton-submission mode differs from the planned arm")
+        for key in (
+            "admission_cursor_publish_fast_path_enabled",
+            "cursor_publication_dedup_enabled",
+        ):
+            if key in row and snapshot.get(key) is not bool(row[key]):
+                raise ValueError(f"{boundary} {key} differs from the planned arm")
         if snapshot.get("progress_diagnostics") is not None:
             raise ValueError(f"{boundary} progress diagnostics must be disabled for scored runs")
         preparation = _require_object(
@@ -397,6 +435,13 @@ def _validate_record(record: dict[str, Any], row: dict[str, Any]) -> dict[str, A
         metrics["cursor_singleton_submission_end"] = pipeline["wal_io_end"][
             "cursor_singleton_submission_enabled"
         ]
+    for key in (
+        "admission_cursor_publish_fast_path_enabled",
+        "cursor_publication_dedup_enabled",
+    ):
+        if key in row:
+            metrics[f"{key}_start"] = pipeline["wal_io_start"][key]
+            metrics[f"{key}_end"] = pipeline["wal_io_end"][key]
     if "point_resource_retirement_mode" in row:
         start = pipeline["wal_io_start"]
         end = pipeline["wal_io_end"]
@@ -483,6 +528,11 @@ def _validate_point_resource_retirement_stage_a_record(
         **deltas,
     })
     return metrics
+
+
+def _validate_cursor_publication_record(record: dict[str, Any], row: dict[str, Any]) -> dict[str, Any]:
+    """Validate D2 runtime flags, Stage A Point hits, and retirement mode 0."""
+    return _validate_point_resource_retirement_stage_a_record(record, row)
 
 
 def _validate_point_preallocation_record(record: dict[str, Any], row: dict[str, Any]) -> dict[str, Any]:
@@ -642,8 +692,12 @@ def _run_one(
     retirement_suite = candidate_mode in (
         "point-resource-retirement", "point-resource-retirement-stage-a",
     )
+    cursor_publication_suite = candidate_mode == "cursor-publication"
     retirement_preallocation = (
         True if retirement_suite and row.get("point_buffer_preallocation_enabled") is True else None
+    )
+    point_preallocation = (
+        bool(row["point_buffer_preallocation_enabled"]) if cursor_publication_suite else None
     )
     environment = (
         _point_preallocation_environment(row)
@@ -655,9 +709,17 @@ def _run_one(
             row.get("cursor_direct_completion_enabled"),
             row.get("cursor_singleton_submission_enabled"),
             row.get("coalescing_budget_us"),
-            point_buffer_preallocation_enabled=retirement_preallocation,
+            point_buffer_preallocation_enabled=(retirement_preallocation or point_preallocation),
             point_resource_retirement_mode=(
-                int(row["point_resource_retirement_mode"]) if retirement_suite else None
+                int(row["point_resource_retirement_mode"]) if retirement_suite else
+                0 if cursor_publication_suite else None
+            ),
+            admission_cursor_publish_fast_path_enabled=(
+                bool(row["admission_cursor_publish_fast_path_enabled"])
+                if cursor_publication_suite else None
+            ),
+            cursor_publication_dedup_enabled=(
+                bool(row["cursor_publication_dedup_enabled"]) if cursor_publication_suite else None
             ),
         )
     )
@@ -670,9 +732,17 @@ def _run_one(
             row.get("cursor_direct_completion_enabled"),
             row.get("cursor_singleton_submission_enabled"),
             row.get("coalescing_budget_us"),
-            point_buffer_preallocation_enabled=retirement_preallocation,
+            point_buffer_preallocation_enabled=(retirement_preallocation or point_preallocation),
             point_resource_retirement_mode=(
-                int(row["point_resource_retirement_mode"]) if retirement_suite else None
+                int(row["point_resource_retirement_mode"]) if retirement_suite else
+                0 if cursor_publication_suite else None
+            ),
+            admission_cursor_publish_fast_path_enabled=(
+                bool(row["admission_cursor_publish_fast_path_enabled"])
+                if cursor_publication_suite else None
+            ),
+            cursor_publication_dedup_enabled=(
+                bool(row["cursor_publication_dedup_enabled"]) if cursor_publication_suite else None
             ),
         ), encoding="utf-8",
     )
@@ -710,6 +780,7 @@ def _run_one(
             raise ValueError(f"write-perf exited with status {completed.returncode}")
         validator = (
             _validate_point_preallocation_record if preallocation_suite else
+            _validate_cursor_publication_record if cursor_publication_suite else
             _validate_point_resource_retirement_stage_a_record
             if candidate_mode == "point-resource-retirement-stage-a" else
             _validate_record
@@ -1396,6 +1467,97 @@ def _cursor_v2_summary(rows: list[dict[str, Any]], writers: tuple[int, ...], pla
     return summary
 
 
+def _cursor_publication_summary(
+    rows: list[dict[str, Any]], writers: tuple[int, ...], planned: int,
+) -> dict[str, Any]:
+    validation = validate_cursor_publication_rows(rows, writers)
+    cells = [(writer, "point") for writer in writers] + [(16, "batch64")]
+    comparisons: list[dict[str, Any]] = []
+    arms = ("baseline", "admission_only", "cursor_dedup_only", "admission_and_cursor_dedup")
+    metrics = ("puts_per_second", "cpu_us_per_put", "p50_ms", "p95_ms", "p99_ms", "sync_count", "puts_per_sync")
+    for writer, workload in cells:
+        selected = {
+            arm: [row for row in rows if row.get("writer") == writer and row.get("workload") == workload
+                  and row.get("arm") == arm and row.get("exit_code") == 0]
+            for arm in arms
+        }
+        stats = {
+            arm: {
+                "runs": len(arm_rows),
+                **{
+                    metric: median(float(row[metric]) for row in arm_rows)
+                    if arm_rows and all(row.get(metric) is not None for row in arm_rows) else None
+                    for metric in metrics
+                },
+            }
+            for arm, arm_rows in selected.items()
+        }
+        baseline_by_rep = {row["repetition"]: row for row in selected["baseline"]}
+        for arm in arms[1:]:
+            candidate_by_rep = {row["repetition"]: row for row in selected[arm]}
+            pairs = [
+                (baseline_by_rep[repetition], candidate_by_rep[repetition])
+                for repetition in sorted(baseline_by_rep.keys() & candidate_by_rep.keys())
+            ]
+            throughput_changes = [
+                (candidate["puts_per_second"] / baseline["puts_per_second"] - 1) * 100
+                for baseline, candidate in pairs
+            ]
+            comparisons.append({
+                "writer": writer,
+                "workload": workload,
+                "baseline": "baseline",
+                "candidate": arm,
+                "baseline_metrics": stats["baseline"],
+                "candidate_metrics": stats[arm],
+                "paired_runs": len(pairs),
+                "paired_throughput_changes_pct": throughput_changes,
+                "paired_throughput_change_median_pct": median(throughput_changes) if pairs else None,
+                "paired_throughput_wins": sum(change > 0 for change in throughput_changes),
+                "paired_cpu_us_per_put_change_median": median([
+                    candidate["cpu_us_per_put"] - baseline["cpu_us_per_put"]
+                    for baseline, candidate in pairs
+                ]) if pairs else None,
+                "paired_p99_change_median_pct": median([
+                    (candidate["p99_ms"] / baseline["p99_ms"] - 1) * 100
+                    for baseline, candidate in pairs
+                ]) if workload == "point" and pairs else None,
+                "paired_sync_count_change_median": median([
+                    candidate["sync_count"] - baseline["sync_count"]
+                    for baseline, candidate in pairs
+                ]) if pairs else None,
+                "paired_puts_per_sync_change_median": median([
+                    candidate["puts_per_sync"] - baseline["puts_per_sync"]
+                    for baseline, candidate in pairs
+                ]) if pairs else None,
+            })
+    by_cell = {
+        f"w{row['writer']}-{row['workload']}-{row['candidate']}": row for row in comparisons
+    }
+    return {
+        "suite": "v8-cursor-publication",
+        "complete": len(rows) == planned and validation["complete"],
+        "runs_started": len(rows),
+        "runs_completed": sum(row.get("exit_code") == 0 for row in rows),
+        "runs_planned": planned,
+        "writers": list(writers),
+        "workloads": ["point", "batch64"],
+        "arms": list(arms),
+        "results": rows,
+        "matrix_validation": validation,
+        "comparison": comparisons,
+        "comparison_by_cell": by_cell,
+        "qualification_gates": {
+            "point8_and_point16_at_least_5pct_improvement": False,
+            "note": "This factorial diagnostic reports D2a and D2b effects separately; it does not auto-promote either change.",
+        },
+        "qualification_note": (
+            "Same-host, same-source, same-release-binary four-arm factorial comparison. Stage A is enabled for Point, "
+            "retirement mode 0 is fixed, and only D2a/D2b vary. Batch64 is a regression guardrail."
+        ),
+    }
+
+
 def _cursor_plan_schema_version(plan: dict[str, Any]) -> int:
     """Read explicit schema versions and recognize only known pre-versioned archives."""
     version = plan.get("plan_schema_version")
@@ -1638,6 +1800,146 @@ def verify_point_resource_retirement_results_directory(results: Path) -> dict[st
         return {"verified": False, "errors": [str(error)]}
 
 
+def verify_cursor_publication_results_directory(results: Path) -> dict[str, Any]:
+    """Verify the four D2 arms, captured runtime flags, and every archived result."""
+    errors: list[str] = []
+    try:
+        summary = json.loads((results / "summary.json").read_text(encoding="utf-8"))
+        remote_exit = json.loads((results / "remote-exit.json").read_text(encoding="utf-8"))
+        plan = json.loads((results / "benchmark-plan.json").read_text(encoding="utf-8"))
+        commit = (results / "commit.txt").read_text(encoding="utf-8").strip()
+        binary_sha = (results / "write-perf.sha256").read_text(encoding="utf-8").strip()
+        if not all(isinstance(value, dict) for value in (summary, remote_exit, plan)):
+            raise ValueError("summary, remote-exit, and plan must be JSON objects")
+
+        schedule = build_cursor_publication_schedule(plan.get("writers", ()))
+        expected_plan = build_cursor_publication_plan(
+            writers=plan.get("writers", ()),
+            machine_type="c4-standard-16-lssd",
+            machine_spec={"vcpus": 16, "ssd_count": 2, "ssd_gib": 750},
+            commit=commit,
+            binary_sha256=binary_sha,
+        )
+        if plan != expected_plan:
+            errors.append("benchmark plan differs from the fixed Cursor publication suite")
+        if len(commit) != 40 or any(char not in "0123456789abcdef" for char in commit):
+            errors.append("source commit identity is invalid")
+        if len(binary_sha) != 64 or any(char not in "0123456789abcdef" for char in binary_sha):
+            errors.append("binary checksum is invalid")
+        if (
+            summary.get("suite") != "v8-cursor-publication"
+            or summary.get("source_commit") != commit
+            or summary.get("binary_sha256") != binary_sha
+            or summary.get("complete") is not True
+            or summary.get("runs_started") != len(schedule)
+            or summary.get("runs_attempted") != len(schedule)
+            or summary.get("runs_completed") != len(schedule)
+            or summary.get("runs_planned") != len(schedule)
+        ):
+            errors.append("summary identity or run counts do not confirm a complete matrix")
+        if (
+            remote_exit.get("failed") is not False
+            or remote_exit.get("runs_started") != len(schedule)
+            or remote_exit.get("runs_attempted") != len(schedule)
+        ):
+            errors.append("remote-exit does not confirm all planned runs")
+
+        schedule_path = results / "cursor-publication-schedule.tsv"
+        with schedule_path.open(encoding="utf-8", newline="") as stream:
+            actual_schedule = list(csv.DictReader(stream, delimiter="\t"))
+        expected_schedule = [
+            {
+                key: "none" if key == "batch_size" and value is None
+                else "" if value is None
+                else str(value)
+                for key, value in row.items()
+            }
+            for row in schedule
+        ]
+        if actual_schedule != expected_schedule:
+            errors.append("schedule file differs from the exact planned order/configuration")
+
+        rows = summary.get("results")
+        if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+            raise ValueError("summary results are missing or malformed")
+        validation = validate_cursor_publication_rows(rows, plan.get("writers", ()))
+        if validation.get("complete") is not True:
+            errors.append("run rows do not prove all four D2 arms and fixed guardrails")
+        recomputed = _cursor_publication_summary(rows, tuple(plan["writers"]), len(schedule))
+        for key in (
+            "suite", "complete", "runs_started", "runs_completed", "runs_planned", "writers", "workloads",
+            "arms", "matrix_validation", "comparison", "comparison_by_cell",
+        ):
+            if summary.get(key) != recomputed.get(key):
+                errors.append(f"summary field {key} differs from archived run rows")
+
+        expected_ids = {_run_id(row) for row in schedule}
+        actual_ids = {
+            path.name for path in results.iterdir()
+            if path.is_dir() and path.name.startswith(("r", "w"))
+        }
+        if actual_ids != expected_ids:
+            errors.append("run directories do not exactly match the schedule")
+        rows_by_id = {_run_id(row): row for row in rows}
+        if len(rows_by_id) != len(rows):
+            errors.append("summary contains duplicate run identifiers")
+        for row in schedule:
+            run_id = _run_id(row)
+            run_dir = results / run_id
+            result_path = run_dir / "result.json"
+            metadata_path = run_dir / "run-metadata.json"
+            if not result_path.is_file() or not metadata_path.is_file():
+                errors.append(f"{run_id} is missing its result or metadata")
+                continue
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            if metadata != rows_by_id.get(run_id):
+                errors.append(f"{run_id} metadata differs from its summary row")
+            identity = {**row, "source_commit": commit, "binary_sha256": binary_sha}
+            if any(metadata.get(key) != value for key, value in identity.items()):
+                errors.append(f"{run_id} metadata identity differs from the schedule")
+            expected_environment = _expected_environment_text(
+                True, True, False, True, False,
+                point_buffer_preallocation_enabled=bool(row["point_buffer_preallocation_enabled"]),
+                point_resource_retirement_mode=0,
+                admission_cursor_publish_fast_path_enabled=bool(
+                    row["admission_cursor_publish_fast_path_enabled"]
+                ),
+                cursor_publication_dedup_enabled=bool(row["cursor_publication_dedup_enabled"]),
+            )
+            environment_path = run_dir / "environment.txt"
+            if not environment_path.is_file() or environment_path.read_text(encoding="utf-8") != expected_environment:
+                errors.append(f"{run_id} environment differs from its planned D2 arm")
+            try:
+                raw = json.loads(result_path.read_text(encoding="utf-8"))
+                expected_metrics = _validate_cursor_publication_record(raw, row)
+                if any(metadata.get(key) != value for key, value in expected_metrics.items()):
+                    errors.append(f"{run_id} metrics differ from its raw result")
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+                errors.append(f"{run_id} raw result is invalid: {error}")
+
+        summary_tsv_path = results / "summary.tsv"
+        if not summary_tsv_path.is_file():
+            errors.append("summary.tsv is missing")
+        else:
+            with summary_tsv_path.open(encoding="utf-8", newline="") as stream:
+                actual_summary_tsv = list(csv.DictReader(stream, delimiter="\t"))
+            expected_summary_tsv = [
+                {
+                    key: json.dumps(rows_by_id[_run_id(row)][key], sort_keys=True)
+                    if isinstance(rows_by_id.get(_run_id(row), {}).get(key), dict)
+                    else "" if rows_by_id.get(_run_id(row), {}).get(key) is None
+                    else str(rows_by_id[_run_id(row)][key])
+                    for key in _summary_fields(schedule)
+                }
+                for row in schedule if _run_id(row) in rows_by_id
+            ]
+            if actual_summary_tsv != expected_summary_tsv:
+                errors.append("summary.tsv rows differ from run metadata")
+        return {"verified": not errors, "planned": len(schedule), "observed": len(rows), "errors": errors}
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+        return {"verified": False, "errors": [str(error)]}
+
+
 def _coalescing_budget_summary(
     rows: list[dict[str, Any]], writers: tuple[int, ...], planned: int,
 ) -> dict[str, Any]:
@@ -1720,6 +2022,7 @@ def run_suite(args: argparse.Namespace) -> int:
     writers = tuple(int(value) for value in args.writers.split(","))
     expected_writers = (
         POINT_PREALLOCATION_WRITERS if candidate_mode == "v7-v8-point-preallocation" else
+        CURSOR_PUBLICATION_WRITERS if candidate_mode == "cursor-publication" else
         POINT_RESOURCE_RETIREMENT_WRITERS if candidate_mode in (
             "point-resource-retirement", "point-resource-retirement-stage-a",
         ) else
@@ -1764,6 +2067,17 @@ def run_suite(args: argparse.Namespace) -> int:
         )
         schedule_filename = "cursor-singleton-submission-schedule.tsv"
         summarize = _singleton_submission_summary
+    elif candidate_mode == "cursor-publication":
+        schedule = build_cursor_publication_schedule(writers)
+        plan = build_cursor_publication_plan(
+            writers=writers,
+            machine_type=args.machine_type,
+            machine_spec={"vcpus": 16, "ssd_count": args.ssd_count, "ssd_gib": args.ssd_gib},
+            commit=args.commit,
+            binary_sha256=args.binary_sha256,
+        )
+        schedule_filename = "cursor-publication-schedule.tsv"
+        summarize = _cursor_publication_summary
     elif candidate_mode == "coalescing-budget":
         schedule = build_cursor_coalescing_budget_schedule(writers)
         plan = build_cursor_coalescing_budget_plan(
@@ -2568,7 +2882,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--candidate-mode",
         choices=(
-            "cursor", "direct-completion", "singleton-submission", "coalescing-budget",
+            "cursor", "direct-completion", "singleton-submission", "cursor-publication", "coalescing-budget",
             "v7-v8-point-preallocation", "point-resource-retirement", "point-resource-retirement-stage-a",
         ),
         default="cursor",
