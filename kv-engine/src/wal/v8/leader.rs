@@ -296,6 +296,8 @@ struct WalV8DedicatedDurabilityRequests {
     advance_attempt_count: AtomicU64,
     #[cfg(test)]
     before_wait_hook: Mutex<Option<WalV8DedicatedDriverBeforeWaitHook>>,
+    #[cfg(test)]
+    driver_joined_signal: Mutex<Option<Sender<()>>>,
 }
 
 #[cfg(feature = "bench")]
@@ -378,6 +380,10 @@ impl Drop for WalV8DedicatedDurabilityDriver {
             && join.join().is_err()
         {
             log::error!("v8 dedicated durability driver panicked during shutdown");
+        }
+        #[cfg(test)]
+        if let Some(signal) = self.requests.driver_joined_signal.lock().take() {
+            let _ = signal.send(());
         }
     }
 }
@@ -5801,6 +5807,8 @@ impl WalV8ParallelWriter {
             advance_attempt_count: AtomicU64::new(0),
             #[cfg(test)]
             before_wait_hook: Mutex::new(None),
+            #[cfg(test)]
+            driver_joined_signal: Mutex::new(None),
         });
         self.durability_mode = WalV8DurabilityMode::Dedicated;
         self.dedicated_durability_requests = Some(Arc::clone(&requests));
@@ -5983,10 +5991,8 @@ impl WalV8ParallelWriter {
         .expect("outstanding preallocation permits fit in u64");
         diagnostics.dedicated_durability_driver_enabled =
             self.durability_mode == WalV8DurabilityMode::Dedicated;
-        diagnostics.dedicated_durability_diagnostics_enabled = self
-            .dedicated_durability_requests
-            .as_ref()
-            .is_some_and(|requests| requests.diagnostics_enabled);
+        diagnostics.dedicated_durability_diagnostics_enabled =
+            self.durability_driver_diagnostics_enabled;
         if let Some(requests) = &self.dedicated_durability_requests {
             diagnostics.dedicated_durability_requests =
                 requests.request_count.load(Ordering::Relaxed);
@@ -7584,6 +7590,10 @@ impl WalV8ParallelWriter {
         Ok(observation)
     }
 
+    /// Wait for the current durable prefix. This writer-level operation does
+    /// not wait for post-publication retirement in Dedicated mode. Callers
+    /// implementing a whole-WAL close or rotation barrier must also call
+    /// `wait_for_post_publish_cleanup`; the outer `Wal` wrapper does so.
     pub(crate) fn sync(&self) -> Result<()> {
         ensure!(!self.is_poisoned(), "v8 Parallel WAL is poisoned");
         let ticket_end = self.coordinator.next_ticket();
@@ -7617,6 +7627,19 @@ impl WalV8ParallelWriter {
         hook: impl Fn() -> Result<()> + Send + Sync + 'static,
     ) {
         *self.post_publish_retirement_hook.lock() = Some(Arc::new(hook));
+    }
+
+    #[cfg(all(test, feature = "bench"))]
+    pub(crate) fn set_dedicated_driver_joined_signal_for_test(
+        &self,
+        signal: Sender<()>,
+    ) -> Result<()> {
+        let requests = self
+            .dedicated_durability_requests
+            .as_ref()
+            .context("v8 dedicated durability request state is missing")?;
+        *requests.driver_joined_signal.lock() = Some(signal);
+        Ok(())
     }
 
     pub(crate) fn wait_durable(&self, ticket: u64) -> Result<()> {
@@ -9012,6 +9035,41 @@ mod tests {
 
     #[cfg(feature = "bench")]
     #[test]
+    fn caller_driven_durability_diagnostics_are_reported_without_dedicated_driver() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory
+            .path()
+            .join("caller-driven-durability-diagnostics.wal");
+        let installed = install_empty(&path, header())?;
+        let leader = match open_writer(&path, &installed) {
+            Ok(writer) => writer,
+            Err(error) if is_io_uring_unavailable_error(&error) => {
+                eprintln!("skipping test (io_uring unavailable): {error:#}");
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        let mut writer = match leader.into_parallel() {
+            Ok(writer) => writer,
+            Err(error) if is_io_uring_unavailable_error(&error) => {
+                eprintln!("skipping test (io_uring unavailable): {error:#}");
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+
+        writer.set_durability_driver_diagnostics_enabled(true);
+        let diagnostics = writer.io_diagnostics();
+
+        assert!(!diagnostics.dedicated_durability_driver_enabled);
+        assert!(diagnostics.dedicated_durability_diagnostics_enabled);
+        assert_eq!(diagnostics.caller_durability_driver_election_attempts, 0);
+
+        Ok(())
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
     fn dedicated_durability_driver_coalesces_concurrent_waiters_and_recovers() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("dedicated-durability-driver.wal");
@@ -9090,10 +9148,19 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let request_deadline = Instant::now() + Duration::from_secs(5);
-        while requests.request_count.load(Ordering::Relaxed) < tickets.len() as u64 {
+        let expected_requests = tickets.len() as u64;
+        loop {
+            let request_count = requests.request_count.load(Ordering::Acquire);
+            let wake_notifications = requests
+                .wake_signal_count
+                .load(Ordering::Acquire)
+                .saturating_add(requests.coalesced_wake_count.load(Ordering::Acquire));
+            if request_count == expected_requests && wake_notifications == request_count {
+                break;
+            }
             ensure!(
                 Instant::now() < request_deadline,
-                "all dedicated waiters did not publish their requests"
+                "all dedicated waiters did not finish publishing their wake notifications"
             );
             thread::yield_now();
         }
@@ -9161,6 +9228,8 @@ mod tests {
             advance_attempt_count: AtomicU64::new(0),
             #[cfg(test)]
             before_wait_hook: Mutex::new(None),
+            #[cfg(test)]
+            driver_joined_signal: Mutex::new(None),
         };
 
         requests.request(1)?;

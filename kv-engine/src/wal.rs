@@ -2869,6 +2869,17 @@ impl Wal {
         Ok(())
     }
 
+    #[cfg(all(test, feature = "bench"))]
+    pub(crate) fn set_v8_dedicated_driver_joined_signal_for_test(
+        &self,
+        signal: crossbeam_channel::Sender<()>,
+    ) -> Result<()> {
+        self.v8_parallel
+            .as_ref()
+            .context("v8 WAL has no Parallel writer")?
+            .set_dedicated_driver_joined_signal_for_test(signal)
+    }
+
     #[cfg(feature = "bench")]
     pub(crate) fn admit_v8_prepared_parallel_point_batch<'a>(
         &self,

@@ -40266,6 +40266,8 @@ mod tests {
     #[cfg(all(target_os = "linux", feature = "bench"))]
     #[test]
     fn v8_dedicated_durability_driver_rotates_and_recovers() -> anyhow::Result<()> {
+        use anyhow::Context;
+
         const CHILD_ENV: &str = "TOYKV_TEST_V8_DEDICATED_ROTATION_CHILD";
 
         if std::env::var_os(CHILD_ENV).is_none() {
@@ -40333,6 +40335,8 @@ mod tests {
                 .is_some_and(|diagnostics| diagnostics.dedicated_durability_driver_enabled),
             "initial V8 WAL did not install a dedicated durability driver"
         );
+        let (driver_joined_tx, driver_joined_rx) = crossbeam_channel::bounded(1);
+        first_active.set_v8_dedicated_driver_joined_signal_for_test(driver_joined_tx)?;
         let first_active_id = first_active.id();
         engine.put(b"before-rotation", VALUE)?;
         anyhow::ensure!(matches!(
@@ -40354,6 +40358,17 @@ mod tests {
         engine.put(b"after-rotation", VALUE)?;
         engine.close()?;
         drop(engine);
+        anyhow::ensure!(
+            matches!(
+                driver_joined_rx.try_recv(),
+                Err(crossbeam_channel::TryRecvError::Empty)
+            ),
+            "old dedicated driver exited while the old memtable owner was still retained"
+        );
+        drop(first_active);
+        driver_joined_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .context("old V8 WAL owner dropped before its dedicated driver joined")?;
 
         let reopened = KvEngine::open_with_wal_io_mode(&database, options, WalIoMode::Parallel)?;
         assert_eq!(reopened.get(b"before-rotation")?.as_deref(), Some(VALUE));
