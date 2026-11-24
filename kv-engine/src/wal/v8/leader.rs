@@ -9707,6 +9707,18 @@ mod tests {
             expected.push(point);
         }
 
+        // Do not elect the driver until both Point tickets form one ready
+        // prefix. Otherwise the first completion can be retired as a
+        // singleton, which intentionally bypasses the C2 batch path.
+        let ready_deadline = Instant::now() + Duration::from_secs(10);
+        while writer.coordinator.frontier_ready_prefix().len() < expected.len() {
+            ensure!(
+                Instant::now() < ready_deadline,
+                "both Point tickets did not become frontier-ready"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+
         writer.advance_frontier_through(last_ticket)?;
         assert!(writer.io.completion_thread.lock().is_none());
         let diagnostics = writer.io_diagnostics();
