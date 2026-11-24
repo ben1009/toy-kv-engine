@@ -1933,6 +1933,7 @@ struct WalIoDiagnosticsRecord {
     cursor_singleton_submission_enabled: bool,
     admission_cursor_publish_fast_path_enabled: bool,
     point_buffer_preallocation_enabled: bool,
+    independent_ack_waiter_enabled: bool,
     dedicated_durability_driver_enabled: bool,
     dedicated_durability_diagnostics_enabled: bool,
     dedicated_durability_requests: u64,
@@ -2105,6 +2106,7 @@ impl From<WalIoDiagnostics> for WalIoDiagnosticsRecord {
             admission_cursor_publish_fast_path_enabled: diagnostics
                 .admission_cursor_publish_fast_path_enabled,
             point_buffer_preallocation_enabled: diagnostics.point_buffer_preallocation_enabled,
+            independent_ack_waiter_enabled: diagnostics.independent_ack_waiter_enabled,
             dedicated_durability_driver_enabled: diagnostics.dedicated_durability_driver_enabled,
             dedicated_durability_diagnostics_enabled: diagnostics
                 .dedicated_durability_diagnostics_enabled,
@@ -2196,6 +2198,7 @@ impl WalIoDiagnosticsRecord {
             && self.admission_cursor_publish_fast_path_enabled
                 == other.admission_cursor_publish_fast_path_enabled
             && self.point_buffer_preallocation_enabled == other.point_buffer_preallocation_enabled
+            && self.independent_ack_waiter_enabled == other.independent_ack_waiter_enabled
             && self.dedicated_durability_driver_enabled == other.dedicated_durability_driver_enabled
             && self.dedicated_durability_diagnostics_enabled
                 == other.dedicated_durability_diagnostics_enabled

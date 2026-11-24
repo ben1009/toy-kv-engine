@@ -67,7 +67,7 @@ use crate::wal::parallel_worker::DirectGroupWriteCompletion;
 #[cfg(feature = "bench")]
 use super::parallel::WalV8ProgressAdvanceTiming;
 #[cfg(feature = "bench")]
-use super::parallel::{WalV8ReadyPrefix, WalV8TicketProgress};
+use super::parallel::{WalV8DurabilityDriverElection, WalV8ReadyPrefix, WalV8TicketProgress};
 
 use super::{
     WAL_V8_HEADER_LEN,
@@ -409,6 +409,9 @@ pub(crate) struct WalV8ParallelWriter {
     io_diagnostics: WalIoDiagnostics,
     #[cfg(feature = "bench")]
     durability_mode: WalV8DurabilityMode,
+    /// Benchmark-only independent ACK waiter, disabled by default.
+    #[cfg(feature = "bench")]
+    independent_ack_waiter_enabled: bool,
     #[cfg(feature = "bench")]
     dedicated_durability_requests: Option<Arc<WalV8DedicatedDurabilityRequests>>,
     /// Benchmark-only budget for eligible coalescing calls, independent of
@@ -4779,6 +4782,7 @@ impl WalV8LeaderWriter {
             cursor_singleton_submission_enabled: false,
             admission_cursor_publish_fast_path_enabled: false,
             point_buffer_preallocation_enabled: false,
+            independent_ack_waiter_enabled: false,
             dedicated_durability_driver_enabled: false,
             dedicated_durability_diagnostics_enabled: false,
             dedicated_durability_requests: 0,
@@ -5191,6 +5195,8 @@ impl WalV8LeaderWriter {
             io_diagnostics,
             #[cfg(feature = "bench")]
             durability_mode: WalV8DurabilityMode::CallerDriven,
+            #[cfg(feature = "bench")]
+            independent_ack_waiter_enabled: false,
             #[cfg(feature = "bench")]
             dedicated_durability_requests: None,
             #[cfg(feature = "bench")]
@@ -5932,6 +5938,10 @@ impl WalV8ParallelWriter {
                 .dedicated_durability_requests
                 .as_ref()
                 .context("v8 dedicated durability request state is missing")?;
+            #[cfg(feature = "bench")]
+            if self.independent_ack_waiter_enabled && self.coordinator.try_ack_prefix(ticket_end)? {
+                return Ok(());
+            }
             if let Err(error) = requests.request(ticket_end) {
                 self.coordinator.poison();
                 return Err(requests
@@ -5939,15 +5949,21 @@ impl WalV8ParallelWriter {
                     .map(anyhow::Error::msg)
                     .unwrap_or(error));
             }
-            return self
-                .coordinator
-                .wait_for_durable_prefix(ticket_end)
-                .map_err(|error| {
-                    requests
-                        .terminal_error()
-                        .map(anyhow::Error::msg)
-                        .unwrap_or(error)
-                });
+            #[cfg(feature = "bench")]
+            let wait_result = if self.independent_ack_waiter_enabled {
+                self.coordinator
+                    .wait_for_durable_prefix_independent(ticket_end)
+            } else {
+                self.coordinator.wait_for_durable_prefix(ticket_end)
+            };
+            #[cfg(not(feature = "bench"))]
+            let wait_result = self.coordinator.wait_for_durable_prefix(ticket_end);
+            return wait_result.map_err(|error| {
+                requests
+                    .terminal_error()
+                    .map(anyhow::Error::msg)
+                    .unwrap_or(error)
+            });
         }
 
         #[cfg(feature = "bench")]
@@ -5971,11 +5987,20 @@ impl WalV8ParallelWriter {
     }
 
     #[cfg(feature = "bench")]
+    pub(crate) fn set_independent_ack_waiter_enabled(&mut self, enabled: bool) -> Result<()> {
+        self.coordinator
+            .set_independent_ack_waiter_enabled(enabled)?;
+        self.independent_ack_waiter_enabled = enabled;
+        Ok(())
+    }
+
+    #[cfg(feature = "bench")]
     pub(crate) fn io_diagnostics(&self) -> WalIoDiagnostics {
         let mut diagnostics = self.io_diagnostics;
         diagnostics.sliding_extent_preparation = self.io.extent_preparation_diagnostics();
         diagnostics.progress_ring_enabled = self.coordinator.progress_ring_enabled();
         diagnostics.progress_cursor_enabled = self.coordinator.progress_cursor_enabled();
+        diagnostics.independent_ack_waiter_enabled = self.independent_ack_waiter_enabled;
         diagnostics.progress_diagnostics = self.coordinator.progress_diagnostics();
         diagnostics.point_buffer_preallocation_attempts = self
             .point_buffer_preallocation_attempts
@@ -6428,6 +6453,12 @@ impl WalV8ParallelWriter {
         let ticket_end = ticket
             .checked_add(1)
             .context("v8 Parallel durable ticket end overflows")?;
+
+        #[cfg(feature = "bench")]
+        if self.independent_ack_waiter_enabled {
+            return self.advance_frontier_through_independent_ack(ticket_end);
+        }
+
         let Some(mut driver) = self.coordinator.acquire_durability_driver(ticket_end)? else {
             return Ok(());
         };
@@ -6437,6 +6468,30 @@ impl WalV8ParallelWriter {
         }
 
         result
+    }
+
+    #[cfg(feature = "bench")]
+    fn advance_frontier_through_independent_ack(&self, ticket_end: u64) -> Result<()> {
+        loop {
+            let observed_generation = self.coordinator.ack_waiter_generation();
+            if self.coordinator.try_ack_prefix(ticket_end)? {
+                return Ok(());
+            }
+
+            match self.coordinator.try_acquire_durability_driver(ticket_end)? {
+                WalV8DurabilityDriverElection::Durable => return Ok(()),
+                WalV8DurabilityDriverElection::Busy => self
+                    .coordinator
+                    .wait_for_ack_waiter_change(observed_generation),
+                WalV8DurabilityDriverElection::Driver(mut driver) => {
+                    let result = self.drive_frontier_through(ticket_end, &mut driver);
+                    if result.is_ok() {
+                        driver.complete();
+                    }
+                    return result;
+                }
+            }
+        }
     }
 
     fn drive_frontier_through(
@@ -7647,6 +7702,15 @@ impl WalV8ParallelWriter {
         let ticket_end = ticket
             .checked_add(1)
             .context("v8 Parallel durable ticket end overflows")?;
+
+        #[cfg(feature = "bench")]
+        if self.independent_ack_waiter_enabled {
+            if self.coordinator.try_ack_prefix(ticket_end)? {
+                return Ok(());
+            }
+            return self.wait_for_requested_durable_prefix(ticket_end);
+        }
+
         ensure!(!self.is_poisoned(), "v8 Parallel WAL is poisoned");
         ensure!(
             ticket_end <= self.coordinator.next_ticket(),

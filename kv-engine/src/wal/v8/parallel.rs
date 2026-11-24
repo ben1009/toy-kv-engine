@@ -153,6 +153,16 @@ struct CoordinatorInner {
     /// Followers need acknowledged durability or an available driver, not
     /// another producer's preparation or DATA-completion notification.
     durable_published: Condvar,
+    /// Benchmark-only independent ACK state. The durable watermark advances
+    /// monotonically and is published before waking ACK waiters; poison is
+    /// terminal and is published while holding `state`.
+    #[cfg(feature = "bench")]
+    ack_waiters: WalV8AckWaiters,
+    /// Frozen before admission; keeps ACK experiment coordination out of the
+    /// default CallerDriven path except for a cold, relaxed flag check at
+    /// publication boundaries.
+    #[cfg(feature = "bench")]
+    ack_waiters_enabled: AtomicBool,
     /// Published before releasing admission or returning a producer job. A
     /// DATA submitter can identify a lone admitted head without taking the
     /// coordinator lock under its submission lock.
@@ -183,6 +193,57 @@ struct CoordinatorInner {
     progress_token_attempts: AtomicU64,
     #[cfg(feature = "bench")]
     progress_token_accepts: AtomicU64,
+}
+
+/// Independent, benchmark-only ACK publication and wait channel. ACK readers
+/// can observe a durable prefix or poison without contending on Coordinator
+/// state. The event mutex is used only to close the check-to-sleep race and is
+/// never held while acquiring Coordinator state.
+#[cfg(feature = "bench")]
+struct WalV8AckWaiters {
+    durable_ticket_end: AtomicU64,
+    poisoned: AtomicBool,
+    event_generation: Mutex<u64>,
+    changed: Condvar,
+}
+
+#[cfg(feature = "bench")]
+impl WalV8AckWaiters {
+    fn new(durable_ticket_end: u64) -> Self {
+        Self {
+            durable_ticket_end: AtomicU64::new(durable_ticket_end),
+            poisoned: AtomicBool::new(false),
+            event_generation: Mutex::new(0),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn publish_durable_ticket_end(&self, durable_ticket_end: u64) {
+        self.durable_ticket_end
+            .fetch_max(durable_ticket_end, Ordering::SeqCst);
+    }
+
+    fn publish_poisoned(&self) {
+        self.poisoned.store(true, Ordering::SeqCst);
+        self.notify_all();
+    }
+
+    fn notify_all(&self) {
+        let mut generation = self.event_generation.lock();
+        *generation = generation.wrapping_add(1);
+        self.changed.notify_all();
+    }
+
+    fn generation(&self) -> u64 {
+        *self.event_generation.lock()
+    }
+
+    fn wait_for_change(&self, observed_generation: u64) {
+        let mut generation = self.event_generation.lock();
+        while *generation == observed_generation {
+            self.changed.wait(&mut generation);
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -997,6 +1058,71 @@ impl WalV8ParallelCoordinator {
         self.inner.progress_mode == WalV8ProgressMode::Cursor
     }
 
+    #[cfg(feature = "bench")]
+    pub(crate) fn independent_ack_waiter_enabled(&self) -> bool {
+        self.inner.ack_waiters_enabled.load(Ordering::Acquire)
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn set_independent_ack_waiter_enabled(&self, enabled: bool) -> Result<()> {
+        let state = self.inner.state.lock();
+        ensure!(
+            state.next_ticket == state.durable_ticket_end
+                && state.tickets.is_empty()
+                && !state.durability_driver_active
+                && !state.closed
+                && !state.poisoned,
+            "independent ACK waiter mode must be selected before admission"
+        );
+        self.inner
+            .ack_waiters_enabled
+            .store(enabled, Ordering::Release);
+        Ok(())
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn try_ack_prefix(&self, ticket_end: u64) -> Result<bool> {
+        ensure!(
+            self.independent_ack_waiter_enabled(),
+            "independent ACK waiter is disabled"
+        );
+        if self.inner.ack_waiters.poisoned.load(Ordering::SeqCst) {
+            anyhow::bail!("v8 Parallel coordinator is poisoned");
+        }
+        ensure!(
+            ticket_end <= self.inner.admitted_ticket_end.load(Ordering::Acquire),
+            "v8 durability wait names an unassigned ticket prefix"
+        );
+
+        Ok(self
+            .inner
+            .ack_waiters
+            .durable_ticket_end
+            .load(Ordering::SeqCst)
+            >= ticket_end)
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn ack_waiter_generation(&self) -> u64 {
+        self.inner.ack_waiters.generation()
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn wait_for_ack_waiter_change(&self, observed_generation: u64) {
+        self.inner.ack_waiters.wait_for_change(observed_generation);
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn wait_for_durable_prefix_independent(&self, ticket_end: u64) -> Result<()> {
+        loop {
+            let observed_generation = self.ack_waiter_generation();
+            if self.try_ack_prefix(ticket_end)? {
+                return Ok(());
+            }
+            self.wait_for_ack_waiter_change(observed_generation);
+        }
+    }
+
     pub(crate) fn take_progress_token_receiver(&self) -> Result<Option<Receiver<()>>> {
         let Some(receiver) = self.inner.progress_token_receiver.lock().take() else {
             if self.progress_ring_enabled() {
@@ -1218,6 +1344,10 @@ impl WalV8ParallelCoordinator {
                 changed: Condvar::new(),
                 durability_changed: Condvar::new(),
                 durable_published: Condvar::new(),
+                #[cfg(feature = "bench")]
+                ack_waiters: WalV8AckWaiters::new(config.next_ticket),
+                #[cfg(feature = "bench")]
+                ack_waiters_enabled: AtomicBool::new(false),
                 admitted_ticket_end: AtomicU64::new(config.next_ticket),
                 #[cfg(feature = "bench")]
                 data_completion_timestamps_enabled: std::sync::atomic::AtomicBool::new(false),
@@ -2500,6 +2630,8 @@ impl WalV8ParallelCoordinator {
         sample: bool,
     ) -> Result<WalV8DurabilityPublishMetrics> {
         #[cfg(feature = "bench")]
+        let independent_ack_waiter_enabled = self.independent_ack_waiter_enabled();
+        #[cfg(feature = "bench")]
         let publish_started = sample.then(Instant::now);
         #[cfg(feature = "bench")]
         let publish_cpu_started = sample.then(super::digest::thread_cpu_time_ns);
@@ -2641,6 +2773,12 @@ impl WalV8ParallelCoordinator {
         state.last_frontier_ticket_end = reservation.preceding_ticket_end;
         state.pending_frontier = None;
         #[cfg(feature = "bench")]
+        if independent_ack_waiter_enabled {
+            self.inner
+                .ack_waiters
+                .publish_durable_ticket_end(state.durable_ticket_end);
+        }
+        #[cfg(feature = "bench")]
         let durable_published_at = Instant::now();
         #[cfg(feature = "bench")]
         if let Some(profile) = self.inner.profile.load_full() {
@@ -2711,6 +2849,11 @@ impl WalV8ParallelCoordinator {
             .map(|started| started.elapsed().as_nanos().min(u64::MAX as u128) as u64)
             .unwrap_or_default();
         drop(state);
+
+        #[cfg(feature = "bench")]
+        if independent_ack_waiter_enabled {
+            self.inner.ack_waiters.notify_all();
+        }
 
         #[cfg(feature = "bench")]
         if let Some(profile) = self.inner.profile.load_full() {
@@ -2833,6 +2976,10 @@ impl WalV8ParallelCoordinator {
             #[cfg(feature = "bench")]
             record_durable_notification_for_waiters(&mut state);
             self.inner.durable_published.notify_all();
+            #[cfg(feature = "bench")]
+            if self.independent_ack_waiter_enabled() {
+                self.inner.ack_waiters.notify_all();
+            }
         }
         drop(state);
         self.signal_progress_token();
@@ -2951,6 +3098,42 @@ impl WalV8ParallelCoordinator {
     /// publication. This is independent of the on-disk FRONTIER generation.
     pub(crate) fn durability_generation(&self) -> u64 {
         self.inner.state.lock().durability_generation
+    }
+
+    /// Elect one caller to form FRONTIERs. Other callers wait for published
+    /// durability or driver handoff and can return at their own ticket end
+    /// without acquiring the driver's physical FRONTIER mutex.
+    #[cfg(feature = "bench")]
+    pub(crate) fn try_acquire_durability_driver(
+        &self,
+        ticket_end: u64,
+    ) -> Result<WalV8DurabilityDriverElection> {
+        let mut state = self.inner.state.lock();
+        ensure!(
+            ticket_end <= state.next_ticket,
+            "v8 durability driver names an unassigned ticket"
+        );
+        ensure!(!state.poisoned, "v8 Parallel coordinator is poisoned");
+        if state.durable_ticket_end >= ticket_end {
+            return Ok(WalV8DurabilityDriverElection::Durable);
+        }
+        if state.durability_driver_active {
+            return Ok(WalV8DurabilityDriverElection::Busy);
+        }
+
+        let completion_batch = state.completion_batch.take();
+        if self.progress_cursor_enabled() && completion_batch.is_none() {
+            poison_locked(&self.inner, &mut state);
+            anyhow::bail!("v8 durability driver completion buffer is missing");
+        }
+        state.durability_driver_active = true;
+        Ok(WalV8DurabilityDriverElection::Driver(
+            WalV8DurabilityDriver {
+                coordinator: self.clone(),
+                completed: false,
+                completion_batch,
+            },
+        ))
     }
 
     /// Elect one caller to form FRONTIERs. Other callers wait for published
@@ -3233,6 +3416,13 @@ pub(crate) struct WalV8DurabilityDriver {
     pub(super) completion_batch: Option<Vec<WalV8CompletedGroupEvent>>,
 }
 
+#[cfg(feature = "bench")]
+pub(crate) enum WalV8DurabilityDriverElection {
+    Durable,
+    Busy,
+    Driver(WalV8DurabilityDriver),
+}
+
 impl WalV8DurabilityDriver {
     pub(crate) fn complete(&mut self) {
         self.completed = true;
@@ -3253,6 +3443,13 @@ impl Drop for WalV8DurabilityDriver {
         #[cfg(feature = "bench")]
         record_durable_notification_for_waiters(&mut state);
         self.coordinator.inner.durable_published.notify_all();
+        #[cfg(feature = "bench")]
+        let notify_ack_waiters = self.coordinator.independent_ack_waiter_enabled();
+        drop(state);
+        #[cfg(feature = "bench")]
+        if notify_ack_waiters {
+            self.coordinator.inner.ack_waiters.notify_all();
+        }
     }
 }
 
@@ -4037,6 +4234,10 @@ fn poison_locked(inner: &CoordinatorInner, state: &mut CoordinatorState) {
         state.poisoned = true;
         if let Some(ring) = &inner.progress_ring {
             ring.poisoned.store(true, Ordering::Release);
+        }
+        #[cfg(feature = "bench")]
+        if inner.ack_waiters_enabled.load(Ordering::Relaxed) {
+            inner.ack_waiters.publish_poisoned();
         }
         signal_progress_token(inner);
         signal_change(inner, state);

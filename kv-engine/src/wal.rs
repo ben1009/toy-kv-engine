@@ -172,6 +172,8 @@ pub struct WalIoDiagnostics {
     pub admission_cursor_publish_fast_path_enabled: bool,
     /// Whether Point batches attempt the bounded benchmark-only DATA-buffer preallocation.
     pub point_buffer_preallocation_enabled: bool,
+    /// Whether ACK waiters use the independent benchmark-only watermark/condition variable.
+    pub independent_ack_waiter_enabled: bool,
     /// Whether durability advances are owned by a dedicated benchmark-only worker thread.
     pub dedicated_durability_driver_enabled: bool,
     /// Whether contended request/wake/advance counters were enabled for this run.
@@ -263,6 +265,8 @@ const V8_DEDICATED_DURABILITY_DRIVER_ENV: &str = "TOYKV_BENCH_V8_DEDICATED_DURAB
 #[cfg(feature = "bench")]
 const V8_DEDICATED_DURABILITY_DIAGNOSTICS_ENV: &str =
     "TOYKV_BENCH_V8_DURABILITY_DRIVER_DIAGNOSTICS";
+#[cfg(feature = "bench")]
+const V8_INDEPENDENT_ACK_WAITER_ENV: &str = "TOYKV_BENCH_V8_INDEPENDENT_ACK_WAITER";
 
 #[cfg(feature = "bench")]
 fn v8_admission_cursor_publish_fast_path_env_enabled(value: Option<&str>) -> bool {
@@ -324,6 +328,26 @@ fn v8_dedicated_durability_diagnostics_enabled() -> Result<bool> {
         }
         Err(error @ std::env::VarError::NotUnicode(_)) => {
             Err(error).context("read dedicated V8 durability diagnostics setting")
+        }
+    }
+}
+
+#[cfg(feature = "bench")]
+fn v8_independent_ack_waiter_enabled_from_value(value: Option<&str>) -> Result<bool> {
+    match value {
+        Some("1") => Ok(true),
+        Some("0") | None => Ok(false),
+        Some(_) => anyhow::bail!("{V8_INDEPENDENT_ACK_WAITER_ENV} must be `0` or `1`"),
+    }
+}
+
+#[cfg(feature = "bench")]
+fn v8_independent_ack_waiter_enabled() -> Result<bool> {
+    match std::env::var(V8_INDEPENDENT_ACK_WAITER_ENV) {
+        Ok(value) => v8_independent_ack_waiter_enabled_from_value(Some(&value)),
+        Err(std::env::VarError::NotPresent) => v8_independent_ack_waiter_enabled_from_value(None),
+        Err(error @ std::env::VarError::NotUnicode(_)) => {
+            Err(error).context("read independent V8 ACK waiter setting")
         }
     }
 }
@@ -1829,6 +1853,9 @@ impl Wal {
         #[cfg(feature = "bench")]
         let dedicated_durability_diagnostics_enabled =
             v8_dedicated_durability_diagnostics_enabled()?;
+
+        #[cfg(feature = "bench")]
+        writer.set_independent_ack_waiter_enabled(v8_independent_ack_waiter_enabled()?)?;
 
         #[cfg(feature = "bench")]
         writer.set_durability_driver_diagnostics_enabled(dedicated_durability_diagnostics_enabled);
