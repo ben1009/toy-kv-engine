@@ -58,7 +58,8 @@ if [[ "$SUITE" != "batch64" && "$SUITE" != "rfc026-full" \
      && "$SUITE" != "v7-v8-point-preallocation" \
      && "$SUITE" != "v8-point-resource-retirement" \
      && "$SUITE" != "v8-point-resource-retirement-stage-a" \
-     && "$SUITE" != "v8-point-ack-d1" ]]; then
+     && "$SUITE" != "v8-point-ack-d1" \
+     && "$SUITE" != "v8-dedicated-durability-driver" ]]; then
     echo "unsupported benchmark suite: $SUITE" >&2
     exit 64
 fi
@@ -147,6 +148,12 @@ if [[ "$SUITE" == "v8-point-ack-d1" ]] \
     && { [[ "$NUM" != "100000" ]] || [[ "$MACHINE_TYPE" != "c4-standard-16-lssd" ]] \
         || [[ "$WRITERS_CSV" != "8,16" ]]; }; then
     echo "v8-point-ack-d1 requires c4-standard-16-lssd, writers 8,16, and 100000 operations" >&2
+    exit 64
+fi
+if [[ "$SUITE" == "v8-dedicated-durability-driver" ]] \
+    && { [[ "$NUM" != "100000" ]] || [[ "$MACHINE_TYPE" != "c4-standard-16-lssd" ]] \
+        || [[ "$WRITERS_CSV" != "1,8,16" ]]; }; then
+    echo "D3a qualification requires c4-standard-16-lssd, writers 1,8,16, and 100000 operations" >&2
     exit 64
 fi
 if [[ "$SUITE" == "v8-point-cpu-attribution" ]] \
@@ -422,6 +429,24 @@ if [[ "$BENCH_SUITE" == "v8-point-ack-d1" ]]; then
         --source-patch-sha256 "$BENCH_SOURCE_PATCH_SHA256" \
         --baseline-binary-sha256 "$BASELINE_BINARY_SHA256" \
         --candidate-binary-sha256 "$BINARY_SHA256" \
+        --machine-type "$BENCH_MACHINE_TYPE" --ssd-count "$BENCH_SSD_COUNT" \
+        --ssd-gib "$BENCH_SSD_TOTAL_GIB"
+    exit $?
+fi
+
+if [[ "$BENCH_SUITE" == "v8-dedicated-durability-driver" ]]; then
+    if [[ ! -r /tmp/gcp-v8-dedicated-durability-runner.py ]]; then
+        echo "D3a dedicated durability runner was not uploaded" >&2
+        exit 1
+    fi
+    cp /tmp/gcp-v8-dedicated-durability-runner.py \
+        "$REPO/scripts/gcp_v8_dedicated_durability_runner.py"
+    echo "WAL_BENCHMARK_STARTED $(date --iso-8601=seconds)" | tee -a "$BENCH_BOOT_LOG"
+    PYTHONPATH="$REPO/scripts${PYTHONPATH:+:$PYTHONPATH}" \
+        python3 "$REPO/scripts/gcp_v8_dedicated_durability_runner.py" \
+        --binary "$BINARY" --binary-sha256 "$BINARY_SHA256" --commit "$ACTUAL_COMMIT" \
+        --results-dir "$BENCH_RESULTS" --db-root "$BENCH_WORK/databases" \
+        --writers "$BENCH_WRITERS" --safe-deadline-epoch "$BENCH_SAFE_DEADLINE_EPOCH" \
         --machine-type "$BENCH_MACHINE_TYPE" --ssd-count "$BENCH_SSD_COUNT" \
         --ssd-gib "$BENCH_SSD_TOTAL_GIB"
     exit $?

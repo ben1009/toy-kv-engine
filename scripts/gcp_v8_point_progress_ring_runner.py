@@ -76,6 +76,8 @@ UNSET_EXPERIMENT_VARIABLES = (
     "TOYKV_BENCH_WAL_IO_WORKER_CPU",
     "TOYKV_BENCH_V8_POINT_RESOURCE_RETIREMENT_MODE",
     "TOYKV_BENCH_V8_ADMISSION_CURSOR_PUBLISH_FAST_PATH",
+    "TOYKV_BENCH_V8_DEDICATED_DURABILITY_DRIVER",
+    "TOYKV_BENCH_V8_DURABILITY_DRIVER_DIAGNOSTICS",
 )
 FIXED_ENVIRONMENT = {
     "TOYKV_BENCH_V8_EXTENT_PREP": "sliding-point-lookahead",
@@ -99,6 +101,8 @@ def _sha256_file(path: Path) -> str:
 
 
 def _run_id(row: dict[str, Any]) -> str:
+    if row.get("phase") == "diagnostic":
+        return f"rdiag-w{row['writer']}-{row['workload']}-{row['arm']}"
     return f"r{row['repetition']}-w{row['writer']}-{row['workload']}-{row['arm']}"
 
 
@@ -135,6 +139,14 @@ def _summary_fields(schedule: list[dict[str, Any]]) -> tuple[str, ...]:
             "admission_cursor_publish_fast_path_enabled_start",
             "admission_cursor_publish_fast_path_enabled_end",
         )
+    if any("durability_driver_enabled" in row for row in schedule):
+        fields += (
+            "dedicated_durability_driver_enabled_start", "dedicated_durability_driver_enabled_end",
+            "dedicated_durability_diagnostics_enabled_start", "dedicated_durability_diagnostics_enabled_end",
+            "dedicated_durability_requests", "dedicated_durability_wake_signals",
+            "dedicated_durability_coalesced_wakes", "dedicated_durability_advance_attempts",
+            "caller_durability_driver_election_attempts",
+        )
     return fields
 
 
@@ -148,6 +160,8 @@ def _environment(
     point_buffer_preallocation_enabled: bool | None = None,
     point_resource_retirement_mode: int | None = None,
     admission_cursor_publish_fast_path_enabled: bool | None = None,
+    dedicated_durability_driver_enabled: bool | None = None,
+    dedicated_durability_diagnostics_enabled: bool | None = None,
 ) -> dict[str, str]:
     # An allowlist makes the selected experiment switches the only inherited variables.
     if progress_ring_enabled is not progress_cursor_enabled:
@@ -186,6 +200,14 @@ def _environment(
     if admission_cursor_publish_fast_path_enabled is not None:
         environment["TOYKV_BENCH_V8_ADMISSION_CURSOR_PUBLISH_FAST_PATH"] = (
             "1" if admission_cursor_publish_fast_path_enabled else "0"
+        )
+    if dedicated_durability_driver_enabled is not None:
+        environment["TOYKV_BENCH_V8_DEDICATED_DURABILITY_DRIVER"] = (
+            "1" if dedicated_durability_driver_enabled else "0"
+        )
+    if dedicated_durability_diagnostics_enabled is not None:
+        environment["TOYKV_BENCH_V8_DURABILITY_DRIVER_DIAGNOSTICS"] = (
+            "1" if dedicated_durability_diagnostics_enabled else "0"
         )
     return environment
 
@@ -230,6 +252,8 @@ def _expected_environment_text(
     point_buffer_preallocation_enabled: bool | None = None,
     point_resource_retirement_mode: int | None = None,
     admission_cursor_publish_fast_path_enabled: bool | None = None,
+    dedicated_durability_driver_enabled: bool | None = None,
+    dedicated_durability_diagnostics_enabled: bool | None = None,
 ) -> str:
     if progress_ring_enabled and not progress_cursor_enabled:
         # Historical F0.5 archives used the now-retired mode 1. Keep their
@@ -247,6 +271,8 @@ def _expected_environment_text(
             point_buffer_preallocation_enabled=point_buffer_preallocation_enabled,
             point_resource_retirement_mode=point_resource_retirement_mode,
             admission_cursor_publish_fast_path_enabled=admission_cursor_publish_fast_path_enabled,
+            dedicated_durability_driver_enabled=dedicated_durability_driver_enabled,
+            dedicated_durability_diagnostics_enabled=dedicated_durability_diagnostics_enabled,
         ).items()
         if key not in ("PATH", "HOME", "TMPDIR", "LC_ALL")
     }
@@ -257,6 +283,10 @@ def _expected_environment_text(
              or point_resource_retirement_mode is None)
         and (key != "TOYKV_BENCH_V8_ADMISSION_CURSOR_PUBLISH_FAST_PATH"
              or admission_cursor_publish_fast_path_enabled is None)
+        and (key != "TOYKV_BENCH_V8_DEDICATED_DURABILITY_DRIVER"
+             or dedicated_durability_driver_enabled is None)
+        and (key != "TOYKV_BENCH_V8_DURABILITY_DRIVER_DIAGNOSTICS"
+             or dedicated_durability_diagnostics_enabled is None)
     })
     return "\n".join(f"{key}={value}" for key, value in sorted(controlled.items())) + "\n"
 
@@ -523,6 +553,69 @@ def _validate_cursor_publication_record(record: dict[str, Any], row: dict[str, A
     return _validate_point_resource_retirement_stage_a_record(record, row)
 
 
+def _validate_dedicated_durability_record(
+    record: dict[str, Any], row: dict[str, Any],
+) -> dict[str, Any]:
+    """Validate D3a runtime flags and separate score/diagnostic instrumentation."""
+    metrics = _validate_point_resource_retirement_stage_a_record(record, row)
+    result = _require_object(record.get("result"), "benchmark result")
+    pipeline = _require_object(result.get("wal_pipeline"), "WAL pipeline metadata")
+    if pipeline.get("wal_io_stable") is not True:
+        raise ValueError("WAL diagnostics changed during the dedicated-driver run")
+    start = _require_object(pipeline.get("wal_io_start"), "WAL I/O start snapshot")
+    end = _require_object(pipeline.get("wal_io_end"), "WAL I/O end snapshot")
+    expected_driver = bool(row["durability_driver_enabled"])
+    expected_diagnostics = bool(row["durability_driver_diagnostics_enabled"])
+    for snapshot in (start, end):
+        if snapshot.get("dedicated_durability_driver_enabled") is not expected_driver:
+            raise ValueError("dedicated durability driver mode differs from the schedule")
+        if snapshot.get("dedicated_durability_diagnostics_enabled") is not expected_diagnostics:
+            raise ValueError("dedicated durability diagnostics mode differs from the schedule")
+
+    counter_names = (
+        "dedicated_durability_requests",
+        "dedicated_durability_wake_signals",
+        "dedicated_durability_coalesced_wakes",
+        "dedicated_durability_advance_attempts",
+        "caller_durability_driver_election_attempts",
+    )
+    counters: dict[str, int] = {}
+    for name in counter_names:
+        before, after = start.get(name), end.get(name)
+        if type(before) is not int or type(after) is not int or after < before:
+            raise ValueError(f"{name} counter is missing or moved backwards")
+        counters[name] = after - before
+    if expected_diagnostics:
+        if expected_driver:
+            if counters["dedicated_durability_requests"] <= 0:
+                raise ValueError("dedicated diagnostic run recorded no requests")
+            if counters["dedicated_durability_wake_signals"] + counters[
+                "dedicated_durability_coalesced_wakes"
+            ] != counters["dedicated_durability_requests"]:
+                raise ValueError("dedicated wake counters do not account for every request")
+            if counters["dedicated_durability_advance_attempts"] <= 0:
+                raise ValueError("dedicated diagnostic run recorded no driver advances")
+            if counters["caller_durability_driver_election_attempts"] != 0:
+                raise ValueError("Dedicated writers attempted caller-driven driver election")
+        elif counters["caller_durability_driver_election_attempts"] <= 0:
+            raise ValueError("CallerDriven diagnostic run recorded no driver elections")
+    elif any(counters.values()):
+        raise ValueError("scoring run unexpectedly enabled dedicated-driver counters")
+
+    metrics.update({
+        "dedicated_durability_driver_enabled_start": start["dedicated_durability_driver_enabled"],
+        "dedicated_durability_driver_enabled_end": end["dedicated_durability_driver_enabled"],
+        "dedicated_durability_diagnostics_enabled_start": start[
+            "dedicated_durability_diagnostics_enabled"
+        ],
+        "dedicated_durability_diagnostics_enabled_end": end[
+            "dedicated_durability_diagnostics_enabled"
+        ],
+        **counters,
+    })
+    return metrics
+
+
 def _validate_point_preallocation_record(record: dict[str, Any], row: dict[str, Any]) -> dict[str, Any]:
     """Validate the V7/V8/preallocation arms and prove V8 mode from WAL snapshots."""
     record = _require_object(record, "benchmark record")
@@ -681,11 +774,13 @@ def _run_one(
         "point-resource-retirement", "point-resource-retirement-stage-a",
     )
     cursor_publication_suite = candidate_mode == "cursor-publication"
+    dedicated_durability_suite = candidate_mode == "dedicated-durability"
     retirement_preallocation = (
         True if retirement_suite and row.get("point_buffer_preallocation_enabled") is True else None
     )
     point_preallocation = (
-        bool(row["point_buffer_preallocation_enabled"]) if cursor_publication_suite else None
+        bool(row["point_buffer_preallocation_enabled"])
+        if cursor_publication_suite or dedicated_durability_suite else None
     )
     environment = (
         _point_preallocation_environment(row)
@@ -700,11 +795,18 @@ def _run_one(
             point_buffer_preallocation_enabled=(retirement_preallocation or point_preallocation),
             point_resource_retirement_mode=(
                 int(row["point_resource_retirement_mode"]) if retirement_suite else
-                0 if cursor_publication_suite else None
+                0 if cursor_publication_suite or dedicated_durability_suite else None
             ),
             admission_cursor_publish_fast_path_enabled=(
                 bool(row["admission_cursor_publish_fast_path_enabled"])
                 if cursor_publication_suite else None
+            ),
+            dedicated_durability_driver_enabled=(
+                bool(row["durability_driver_enabled"]) if dedicated_durability_suite else None
+            ),
+            dedicated_durability_diagnostics_enabled=(
+                bool(row["durability_driver_diagnostics_enabled"])
+                if dedicated_durability_suite else None
             ),
         )
     )
@@ -720,11 +822,18 @@ def _run_one(
             point_buffer_preallocation_enabled=(retirement_preallocation or point_preallocation),
             point_resource_retirement_mode=(
                 int(row["point_resource_retirement_mode"]) if retirement_suite else
-                0 if cursor_publication_suite else None
+                0 if cursor_publication_suite or dedicated_durability_suite else None
             ),
             admission_cursor_publish_fast_path_enabled=(
                 bool(row["admission_cursor_publish_fast_path_enabled"])
                 if cursor_publication_suite else None
+            ),
+            dedicated_durability_driver_enabled=(
+                bool(row["durability_driver_enabled"]) if dedicated_durability_suite else None
+            ),
+            dedicated_durability_diagnostics_enabled=(
+                bool(row["durability_driver_diagnostics_enabled"])
+                if dedicated_durability_suite else None
             ),
         ), encoding="utf-8",
     )
@@ -763,6 +872,7 @@ def _run_one(
         validator = (
             _validate_point_preallocation_record if preallocation_suite else
             _validate_cursor_publication_record if cursor_publication_suite else
+            _validate_dedicated_durability_record if dedicated_durability_suite else
             _validate_point_resource_retirement_stage_a_record
             if candidate_mode == "point-resource-retirement-stage-a" else
             _validate_record

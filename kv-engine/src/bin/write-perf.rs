@@ -2197,6 +2197,8 @@ impl WalIoDiagnosticsRecord {
                 == other.admission_cursor_publish_fast_path_enabled
             && self.point_buffer_preallocation_enabled == other.point_buffer_preallocation_enabled
             && self.dedicated_durability_driver_enabled == other.dedicated_durability_driver_enabled
+            && self.dedicated_durability_diagnostics_enabled
+                == other.dedicated_durability_diagnostics_enabled
             && self.point_resource_retirement_mode == other.point_resource_retirement_mode
             && self.point_resource_preclaim_enabled == other.point_resource_preclaim_enabled
             && self.point_resource_preclaim_sum_cache_enabled
@@ -10887,6 +10889,10 @@ mod tests {
             ..WalIoDiagnosticsRecord::default()
         };
         let mut end = start.clone();
+        end.dedicated_durability_diagnostics_enabled = true;
+        assert!(!start.stable_with(&end));
+        end.dedicated_durability_diagnostics_enabled = false;
+
         let preparation = end
             .sliding_extent_preparation
             .as_mut()

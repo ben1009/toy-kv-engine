@@ -52,6 +52,8 @@ from gcp_wal_matrix import (
     POINT_RESOURCE_RETIREMENT_WRITERS,
     POINT_ACK_D1_NUM,
     POINT_ACK_D1_WRITERS,
+    DURABILITY_DRIVER_NUM,
+    DURABILITY_DRIVER_WRITERS,
     CURSOR_COALESCING_BUDGET_NUM,
     CURSOR_COALESCING_BUDGET_WRITERS,
     CURSOR_PUBLICATION_NUM,
@@ -82,6 +84,7 @@ from gcp_wal_matrix import (
     build_v7_v8_point_preallocation_plan,
     build_point_resource_retirement_plan,
     build_point_ack_d1_plan,
+    build_dedicated_durability_driver_plan,
     build_v8_extent_policy_storage_plan,
     build_v8_extent_policy_storage_schedule,
     build_v8_mutex_diagnostic_plan,
@@ -121,6 +124,7 @@ from gcp_v8_point_progress_ring_runner import (
     verify_point_resource_retirement_results_directory as verify_point_resource_retirement_results,
 )
 from gcp_v8_point_ack_d1_runner import verify_results_directory as verify_point_ack_d1_results
+from gcp_v8_dedicated_durability_runner import verify_results_directory as verify_dedicated_durability_results
 MACHINE_TYPE = "c4-standard-8-lssd"
 MACHINE_SPECS = {
     "c4-standard-8-lssd": {"vcpus": 8, "ssd_count": 1, "ssd_gb": 375, "ssd_gib": 375},
@@ -138,6 +142,7 @@ POINT_BORROWED_INPUT_RUNNER = Path(__file__).with_name("gcp_v8_point_borrowed_in
 POINT_DIRECT_FRAME_RUNNER = Path(__file__).with_name("gcp_v8_point_direct_frame_runner.py")
 POINT_PROGRESS_RING_RUNNER = Path(__file__).with_name("gcp_v8_point_progress_ring_runner.py")
 POINT_ACK_D1_RUNNER = Path(__file__).with_name("gcp_v8_point_ack_d1_runner.py")
+DEDICATED_DURABILITY_RUNNER = Path(__file__).with_name("gcp_v8_dedicated_durability_runner.py")
 POINT_PROGRESS_RING_VM_TAG = "walbench-point-progress-ring"
 V8_EXTENT_POLICY_STORAGE_RUNNER = Path(__file__).with_name("gcp_v8_extent_policy_storage_runner.py")
 REPO_URL = "https://github.com/ben1009/toy-kv-engine.git"
@@ -175,7 +180,7 @@ root_names = {
     "extent-policy-storage-schedule.tsv",
     "v7-v8-point-preallocation-schedule.tsv",
     "point-resource-retirement-schedule.tsv",
-    "point-ack-d1-schedule.tsv", "candidate-commit.txt", "source.patch",
+    "point-ack-d1-schedule.tsv", "dedicated-durability-schedule.tsv", "candidate-commit.txt", "source.patch",
     "commit-order-trace-analysis.json", "commit.txt", "remote-exit.json",
     "finished_utc.txt", "remote-finished-utc.txt", "remote-status.txt", "host.txt",
     "os-release.txt", "uname.txt", "lscpu.txt", "lsblk.txt", "findmnt.txt", "df.txt",
@@ -1218,6 +1223,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                              help="Repeat the retirement matrix with Point buffer preallocation enabled")
     suite_group.add_argument("--v8-point-ack-d1-ab", action="store_true",
                              help="Compare D1 Coordinator ACK checks with Stage A enabled and retirement mode 0")
+    suite_group.add_argument("--v8-dedicated-durability-driver-ab", action="store_true",
+                             help="Compare CallerDriven and Dedicated D3a with 40 score plus four diagnostic runs")
     parser.add_argument("--baseline-commit", help="Full source commit used as the source A/B baseline")
     parser.add_argument("--source-patch-sha256",
                         help="SHA-256 of the exact source patch used for a commit-order trace run")
@@ -1260,11 +1267,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         args.v8_point_resource_retirement_ab or point_resource_retirement_stage_a_suite
     )
     point_ack_d1_suite = args.v8_point_ack_d1_ab
+    dedicated_durability_suite = args.v8_dedicated_durability_driver_ab
     point_progress_suite = (
         args.v8_point_progress_cursor_ab or point_cursor_direct_completion_suite
         or point_cursor_singleton_submission_suite or point_cursor_coalescing_budget_suite
         or point_cursor_publication_suite
         or point_preallocation_suite or point_resource_retirement_suite or point_ack_d1_suite
+        or dedicated_durability_suite
     )
     explicit_network = args.network is not None
     if args.repetitions <= 0:
@@ -1293,6 +1302,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             POINT_PREALLOCATION_NUM if point_preallocation_suite else
             POINT_RESOURCE_RETIREMENT_NUM if point_resource_retirement_suite else
             POINT_ACK_D1_NUM if point_ack_d1_suite else
+            DURABILITY_DRIVER_NUM if dedicated_durability_suite else
             POINT_PROGRESS_RING_NUM if point_progress_suite else
             POINT_DIRECT_FRAME_NUM if args.v8_point_direct_frame_ab else
             V8_EXTENT_POLICY_STORAGE_NUM if args.v8_extent_policy_storage_ab else
@@ -1310,6 +1320,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             or point_preallocation_suite
             or point_resource_retirement_suite
             or point_ack_d1_suite
+            or dedicated_durability_suite
             or point_cursor_publication_suite
             or point_progress_suite
         ) else MACHINE_TYPE
@@ -1335,6 +1346,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             args.writers = POINT_RESOURCE_RETIREMENT_WRITERS
         elif point_ack_d1_suite:
             args.writers = POINT_ACK_D1_WRITERS
+        elif dedicated_durability_suite:
+            args.writers = DURABILITY_DRIVER_WRITERS
         elif point_cursor_coalescing_budget_suite:
             args.writers = CURSOR_COALESCING_BUDGET_WRITERS
         elif point_cursor_publication_suite:
@@ -1393,6 +1406,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error(f"--v8-point-ack-d1-ab requires writers {POINT_ACK_D1_WRITERS}")
     if point_ack_d1_suite and args.machine_type != "c4-standard-16-lssd":
         parser.error("--v8-point-ack-d1-ab requires c4-standard-16-lssd")
+    if dedicated_durability_suite and args.writers != DURABILITY_DRIVER_WRITERS:
+        parser.error(f"--v8-dedicated-durability-driver-ab requires writers {DURABILITY_DRIVER_WRITERS}")
+    if dedicated_durability_suite and args.machine_type != "c4-standard-16-lssd":
+        parser.error("--v8-dedicated-durability-driver-ab requires c4-standard-16-lssd")
     expected_progress_writers = (
         CURSOR_PUBLICATION_WRITERS
         if point_cursor_publication_suite else
@@ -1403,6 +1420,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         expected_progress_writers = POINT_RESOURCE_RETIREMENT_WRITERS
     if point_ack_d1_suite:
         expected_progress_writers = POINT_ACK_D1_WRITERS
+    if dedicated_durability_suite:
+        expected_progress_writers = DURABILITY_DRIVER_WRITERS
     if point_progress_suite and args.writers != expected_progress_writers:
         parser.error(f"Cursor qualification requires writers {expected_progress_writers}")
     if point_progress_suite and args.machine_type != "c4-standard-16-lssd":
@@ -1427,6 +1446,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error(f"--v8-point-resource-retirement-ab uses a fixed {POINT_RESOURCE_RETIREMENT_NUM}-put workload")
     if point_ack_d1_suite and args.num != POINT_ACK_D1_NUM:
         parser.error(f"--v8-point-ack-d1-ab uses a fixed {POINT_ACK_D1_NUM}-put workload")
+    if dedicated_durability_suite and args.num != DURABILITY_DRIVER_NUM:
+        parser.error(f"--v8-dedicated-durability-driver-ab uses a fixed {DURABILITY_DRIVER_NUM}-put workload")
     if args.v8_mutex_diagnostic and args.num != V8_MUTEX_DIAGNOSTIC_NUM:
         parser.error(f"--v8-mutex-diagnostic uses a fixed {V8_MUTEX_DIAGNOSTIC_NUM}-put workload")
     if args.v8_point_cpu_attribution and args.num != V8_POINT_CPU_ATTRIBUTION_NUM:
@@ -1755,6 +1776,8 @@ def _verify_result_set(results: Path) -> dict[str, Any]:
             return verify_point_resource_retirement_results(results)
         if suite == "v8-point-ack-d1":
             return verify_point_ack_d1_results(results)
+        if suite == "v8-dedicated-durability-driver":
+            return verify_dedicated_durability_results(results)
         if suite == "v8-small-ticket-profile":
             with (results / "profile-schedule.tsv").open(encoding="utf-8", newline="") as stream:
                 schedule_rows = list(csv.DictReader(stream, delimiter="\t"))
@@ -2969,11 +2992,13 @@ def provision_and_run(
         getattr(args, "v8_point_resource_retirement_ab", False) or point_resource_retirement_stage_a_suite
     )
     point_ack_d1_suite = getattr(args, "v8_point_ack_d1_ab", False)
+    dedicated_durability_suite = getattr(args, "v8_dedicated_durability_driver_ab", False)
     point_progress_suite = (
         point_progress_cursor_suite or point_cursor_direct_completion_suite
         or point_cursor_singleton_submission_suite or point_cursor_coalescing_budget_suite
         or point_cursor_publication_suite
         or point_preallocation_suite or point_resource_retirement_suite or point_ack_d1_suite
+        or dedicated_durability_suite
     )
     extent_policy_storage_suite = getattr(args, "v8_extent_policy_storage_ab", False)
     missing_tools = [tool for tool in ("ssh", "ssh-keygen") if not shutil.which(tool)]
@@ -3295,6 +3320,15 @@ def provision_and_run(
                 append_local_log(key_log, ack_copy.stdout + ack_copy.stderr)
                 if ack_copy.returncode:
                     raise BenchError(f"Could not copy D1 ACK A/B runner: {ack_copy.stderr.strip()}")
+            if dedicated_durability_suite:
+                if not DEDICATED_DURABILITY_RUNNER.is_file():
+                    raise BenchError(f"Dedicated durability runner is missing: {DEDICATED_DURABILITY_RUNNER}")
+                driver_copy = upload_to_vm(
+                    DEDICATED_DURABILITY_RUNNER, "/tmp/gcp-v8-dedicated-durability-runner.py"
+                )
+                append_local_log(key_log, driver_copy.stdout + driver_copy.stderr)
+                if driver_copy.returncode:
+                    raise BenchError(f"Could not copy dedicated durability runner: {driver_copy.stderr.strip()}")
 
             safe_deadline_epoch = int(deadline_epoch - 600)
             if profile_suite:
@@ -3320,6 +3354,8 @@ def provision_and_run(
                 )
             elif point_ack_d1_suite:
                 remote_suite = "v8-point-ack-d1"
+            elif dedicated_durability_suite:
+                remote_suite = "v8-dedicated-durability-driver"
             elif point_progress_cursor_suite:
                 remote_suite = "v8-point-progress-cursor"
             elif point_direct_frame_suite:
@@ -3480,11 +3516,13 @@ def main(argv: list[str] | None = None) -> int:
         args.v8_point_resource_retirement_ab or point_resource_retirement_stage_a_suite
     )
     point_ack_d1_suite = args.v8_point_ack_d1_ab
+    dedicated_durability_suite = args.v8_dedicated_durability_driver_ab
     point_progress_suite = (
         args.v8_point_progress_cursor_ab or point_cursor_direct_completion_suite
         or point_cursor_singleton_submission_suite or point_cursor_coalescing_budget_suite
         or point_cursor_publication_suite
         or point_preallocation_suite or point_resource_retirement_suite or point_ack_d1_suite
+        or dedicated_durability_suite
     )
     if point_progress_suite:
         args.progress_ring_vm_tag = f"{POINT_PROGRESS_RING_VM_TAG}-{uuid.uuid4().hex[:12]}"
@@ -3646,6 +3684,14 @@ def main(argv: list[str] | None = None) -> int:
                 baseline_commit=args.baseline_commit.lower(),
                 candidate_commit=args.commit.lower(),
                 source_patch_sha256=args.source_patch_sha256,
+            )
+        elif dedicated_durability_suite:
+            report["benchmark_suite"] = "v8-dedicated-durability-driver"
+            report["benchmark_plan"] = build_dedicated_durability_driver_plan(
+                writers=args.writers,
+                machine_type=args.machine_type,
+                machine_spec=MACHINE_SPECS[args.machine_type],
+                commit=args.commit.lower(),
             )
         elif args.v8_point_progress_cursor_ab:
             report["benchmark_suite"] = "v8-point-progress-cursor"

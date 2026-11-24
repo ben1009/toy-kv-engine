@@ -25,6 +25,10 @@ from unittest.mock import Mock, patch
 from gcp_wal_matrix import (
     COMMIT_ORDER_TRACE_NUM,
     COMMIT_ORDER_TRACE_WRITERS,
+    DURABILITY_DRIVER_ARMS,
+    DURABILITY_DRIVER_DIAGNOSTIC_ORDER,
+    DURABILITY_DRIVER_NUM,
+    DURABILITY_DRIVER_WRITERS,
     FULL_DEFAULT_WRITERS,
     LEGACY_DEFAULT_WRITERS,
     POINT_LOOKAHEAD_WRITERS,
@@ -97,6 +101,8 @@ from gcp_wal_matrix import (
     build_point_resource_retirement_schedule,
     build_point_ack_d1_plan,
     build_point_ack_d1_schedule,
+    build_dedicated_durability_driver_plan,
+    build_dedicated_durability_driver_schedule,
     build_v8_mutex_diagnostic_plan,
     build_v8_mutex_diagnostic_schedule,
     build_v8_point_cpu_attribution_plan,
@@ -110,6 +116,7 @@ from gcp_wal_matrix import (
     validate_point_progress_ring_rows,
     validate_point_resource_retirement_rows,
     validate_point_ack_d1_rows,
+    validate_dedicated_durability_driver_rows,
     validate_cursor_direct_completion_rows,
     validate_cursor_singleton_submission_rows,
     validate_cursor_coalescing_budget_rows,
@@ -145,6 +152,7 @@ from gcp_v8_point_borrowed_input_runner import _summary_fields
 import gcp_v8_point_cpu_attribution_runner as cpu_attribution_runner
 import gcp_v8_point_progress_ring_runner as progress_ring_runner
 import gcp_v8_point_ack_d1_runner as ack_d1_runner
+import gcp_v8_dedicated_durability_runner as dedicated_durability_runner
 from gcp_v8_point_cpu_attribution_runner import (
     _build_command as build_cpu_attribution_command,
     _completion_handoff_timeline_summary,
@@ -354,6 +362,140 @@ def fake_keygen(command, **_kwargs):
 
 
 class PointProgressRingQualificationTests(unittest.TestCase):
+    def test_dedicated_durability_plan_and_schedule_are_fixed(self) -> None:
+        schedule = build_dedicated_durability_driver_schedule()
+        self.assertEqual(len(schedule), 44)
+        score = [row for row in schedule if row["phase"] == "score"]
+        diagnostics = [row for row in schedule if row["phase"] == "diagnostic"]
+        self.assertEqual((len(score), len(diagnostics)), (40, 4))
+        self.assertEqual(
+            [(row["writer"], row["arm"]) for row in diagnostics],
+            list(DURABILITY_DRIVER_DIAGNOSTIC_ORDER),
+        )
+        for workload in ("point", "batch64"):
+            writers = DURABILITY_DRIVER_WRITERS if workload == "point" else (16,)
+            for writer in writers:
+                for repetition in range(1, 6):
+                    pair = [
+                        row for row in score
+                        if row["workload"] == workload
+                        and row["writer"] == writer
+                        and row["repetition"] == repetition
+                    ]
+                    expected_order = (
+                        ["caller_driven", "dedicated"]
+                        if repetition % 2
+                        else ["dedicated", "caller_driven"]
+                    )
+                    self.assertEqual([row["arm"] for row in pair], expected_order)
+        for row in schedule:
+            self.assertTrue(row["progress_cursor_enabled"])
+            self.assertTrue(row["cursor_direct_completion_enabled"])
+            self.assertFalse(row["cursor_singleton_submission_enabled"])
+            self.assertEqual(row["point_resource_retirement_mode"], 0)
+            self.assertEqual(row["point_buffer_preallocation_enabled"], row["workload"] == "point")
+            self.assertEqual(row["durability_driver_enabled"], row["arm"] == "dedicated")
+            self.assertEqual(row["durability_driver_diagnostics_enabled"], row["phase"] == "diagnostic")
+
+        plan = build_dedicated_durability_driver_plan(
+            writers=DURABILITY_DRIVER_WRITERS,
+            machine_type="c4-standard-16-lssd",
+            machine_spec={"vcpus": 16, "ssd_count": 2, "ssd_gib": 750},
+            commit="a" * 40,
+            binary_sha256="b" * 64,
+        )
+        self.assertEqual(plan["runs_planned"], 44)
+        self.assertEqual(plan["score_runs_planned"], 40)
+        self.assertEqual(plan["diagnostic_runs_planned"], 4)
+        self.assertEqual(plan["arms"], list(DURABILITY_DRIVER_ARMS))
+
+        rows = []
+        for row in schedule:
+            metrics = progress_ring_runner._validate_dedicated_durability_record(
+                self._raw_record(row), row,
+            )
+            rows.append({**row, **metrics, "ops": DURABILITY_DRIVER_NUM, "exit_code": 0})
+        self.assertTrue(validate_dedicated_durability_driver_rows(rows)["complete"])
+        rows[0]["ops"] -= 1
+        self.assertFalse(validate_dedicated_durability_driver_rows(rows)["complete"])
+
+    def test_dedicated_durability_runner_writes_verifiable_bundle(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            binary = root / "write-perf"
+            binary.write_bytes(b"synthetic release binary")
+            binary_sha = self._sha256(binary)
+
+            def fake_run_one(**kwargs: object) -> dict[str, object]:
+                row = kwargs["row"]
+                kwargs["on_subprocess_started"]()
+                run_dir = kwargs["results_dir"] / dedicated_durability_runner._run_id(row)
+                run_dir.mkdir()
+                raw = self._raw_record(row)
+                metrics = progress_ring_runner._validate_dedicated_durability_record(raw, row)
+                metadata = {
+                    **row,
+                    "binary_sha256": kwargs["binary_sha256"],
+                    "exit_code": 0,
+                    "duration_seconds": 1.0,
+                    **metrics,
+                }
+                (run_dir / "result.json").write_text(json.dumps(raw), encoding="utf-8")
+                (run_dir / "run-metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
+                (run_dir / "environment.txt").write_text(
+                    progress_ring_runner._expected_environment_text(
+                        True,
+                        True,
+                        False,
+                        True,
+                        False,
+                        point_buffer_preallocation_enabled=bool(row["point_buffer_preallocation_enabled"]),
+                        point_resource_retirement_mode=0,
+                        dedicated_durability_driver_enabled=bool(row["durability_driver_enabled"]),
+                        dedicated_durability_diagnostics_enabled=bool(
+                            row["durability_driver_diagnostics_enabled"]
+                        ),
+                    ),
+                    encoding="utf-8",
+                )
+                return metadata
+
+            results = root / "results"
+            args = SimpleNamespace(
+                binary=binary,
+                binary_sha256=binary_sha,
+                commit="a" * 40,
+                results_dir=results,
+                db_root=root / "db",
+                writers=",".join(str(writer) for writer in DURABILITY_DRIVER_WRITERS),
+                safe_deadline_epoch=4_000_000_000,
+                machine_type="c4-standard-16-lssd",
+                ssd_count=2,
+                ssd_gib=750,
+            )
+            with patch.object(dedicated_durability_runner, "_run_one", side_effect=fake_run_one):
+                self.assertEqual(dedicated_durability_runner.run_suite(args), 0)
+            verification = dedicated_durability_runner.verify_results_directory(results)
+            self.assertTrue(verification["verified"], verification["errors"])
+            summary = json.loads((results / "summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(summary["runs_completed"], 44)
+
+    def test_dedicated_durability_preflight_requires_fixed_isolated_matrix(self) -> None:
+        common = [
+            "--project", "test-project", "--zone", "us-central1-a", "--commit", "a" * 40,
+            "--machine-type", "c4-standard-16-lssd", "--writers", "1", "8", "16",
+            "--v8-dedicated-durability-driver-ab", "--ssh-source-range", "192.0.2.1/32",
+            "--max-runtime-minutes", "60", "--estimated-hourly-cost-usd", "1.50",
+            "--max-estimated-spend-usd", "2", "--preflight-only",
+        ]
+        args = BENCH.parse_args([*common, "--network", "d3a-isolated", "--subnet", "d3a-subnet"])
+        self.assertEqual(args.writers, DURABILITY_DRIVER_WRITERS)
+        self.assertEqual(args.num, DURABILITY_DRIVER_NUM)
+        self.assertTrue(args.v8_dedicated_durability_driver_ab)
+        for suffix in ([], ["--network", "default", "--subnet", "default"], ["--network", "d3a-isolated"]):
+            with self.subTest(suffix=suffix), redirect_stderr(StringIO()), self.assertRaises(SystemExit):
+                BENCH.parse_args([*common, *suffix])
+
     @staticmethod
     def _raw_record(row: dict[str, object]) -> dict[str, object]:
         ring_enabled = bool(row["progress_ring_enabled"])
@@ -423,6 +565,24 @@ class PointProgressRingQualificationTests(unittest.TestCase):
                 snapshot["point_buffer_preallocation_fallbacks"] = 0
             end["point_buffer_preallocation_attempts"] = attempts
             end["point_buffer_preallocation_hits"] = attempts
+        if "durability_driver_enabled" in row:
+            driver_enabled = bool(row["durability_driver_enabled"])
+            diagnostics_enabled = bool(row["durability_driver_diagnostics_enabled"])
+            for snapshot in (start, end):
+                snapshot["dedicated_durability_driver_enabled"] = driver_enabled
+                snapshot["dedicated_durability_diagnostics_enabled"] = diagnostics_enabled
+                snapshot["dedicated_durability_requests"] = 0
+                snapshot["dedicated_durability_wake_signals"] = 0
+                snapshot["dedicated_durability_coalesced_wakes"] = 0
+                snapshot["dedicated_durability_advance_attempts"] = 0
+                snapshot["caller_durability_driver_election_attempts"] = 0
+            if diagnostics_enabled and driver_enabled:
+                end["dedicated_durability_requests"] = 100
+                end["dedicated_durability_wake_signals"] = 40
+                end["dedicated_durability_coalesced_wakes"] = 60
+                end["dedicated_durability_advance_attempts"] = 20
+            elif diagnostics_enabled:
+                end["caller_durability_driver_election_attempts"] = 100
         point = row["workload"] == "point"
         speed = 100_000.0
         if ring_enabled and row["writer"] in (8, 16) and point:

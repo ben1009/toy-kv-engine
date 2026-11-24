@@ -5794,6 +5794,7 @@ impl WalV8ParallelWriter {
         mut self,
         diagnostics_enabled: bool,
     ) -> Result<(Arc<Self>, WalV8DedicatedDurabilityDriver)> {
+        self.durability_driver_diagnostics_enabled = diagnostics_enabled;
         let (wake_sender, wake_receiver) = crossbeam_channel::bounded(1);
         let requests = Arc::new(WalV8DedicatedDurabilityRequests {
             requested_ticket_end: AtomicU64::new(self.coordinator.durable_ticket_end()),
@@ -9181,6 +9182,7 @@ mod tests {
 
         let diagnostics = writer.io_diagnostics();
         assert!(diagnostics.dedicated_durability_driver_enabled);
+        assert!(diagnostics.dedicated_durability_diagnostics_enabled);
         assert_eq!(diagnostics.caller_durability_driver_election_attempts, 0);
         assert_eq!(
             diagnostics.dedicated_durability_requests,

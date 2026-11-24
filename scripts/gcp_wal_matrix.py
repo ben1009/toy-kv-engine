@@ -137,6 +137,23 @@ POINT_ACK_D1_ORDERS = (
     ("d1_before", "d1_after"),
     ("d1_after", "d1_before"),
 )
+DURABILITY_DRIVER_WRITERS = (1, 8, 16)
+DURABILITY_DRIVER_REPETITIONS = 5
+DURABILITY_DRIVER_NUM = 100_000
+DURABILITY_DRIVER_ARMS = ("caller_driven", "dedicated")
+DURABILITY_DRIVER_SCORE_ORDERS = (
+    ("caller_driven", "dedicated"),
+    ("dedicated", "caller_driven"),
+    ("caller_driven", "dedicated"),
+    ("dedicated", "caller_driven"),
+    ("caller_driven", "dedicated"),
+)
+DURABILITY_DRIVER_DIAGNOSTIC_ORDER = (
+    (8, "caller_driven"),
+    (8, "dedicated"),
+    (16, "dedicated"),
+    (16, "caller_driven"),
+)
 CURSOR_COALESCING_BUDGET_WRITERS = (8, 16)
 CURSOR_COALESCING_BUDGET_REPETITIONS = 5
 CURSOR_COALESCING_BUDGET_NUM = 100_000
@@ -1134,6 +1151,171 @@ def build_point_ack_d1_plan(
     if candidate_binary_sha256 is not None:
         plan["candidate_binary_sha256"] = candidate_binary_sha256
     return plan
+
+
+def build_dedicated_durability_driver_schedule() -> list[dict[str, object]]:
+    """Build 40 uninstrumented score runs plus four separate counter runs."""
+    cells = [
+        (writer, "point", "wal_concurrent", 1, None, 10)
+        for writer in DURABILITY_DRIVER_WRITERS
+    ]
+    cells.append((16, "batch64", "wal_batch_concurrent", 64, 64, None))
+    schedule: list[dict[str, object]] = []
+    for writer, workload, bench, batch_entries, batch_size, sample_every in cells:
+        for repetition in range(1, DURABILITY_DRIVER_REPETITIONS + 1):
+            for arm in DURABILITY_DRIVER_SCORE_ORDERS[(repetition - 1) % len(DURABILITY_DRIVER_SCORE_ORDERS)]:
+                schedule.append({
+                    "run_index": len(schedule) + 1,
+                    "phase": "score",
+                    "writer": writer,
+                    "workload": workload,
+                    "repetition": repetition,
+                    "arm": arm,
+                    "bench": bench,
+                    "batch_entries": batch_entries,
+                    "batch_size": batch_size,
+                    "num": DURABILITY_DRIVER_NUM,
+                    "sample_every": sample_every,
+                    "progress_ring_enabled": True,
+                    "progress_cursor_enabled": True,
+                    "progress_counters_enabled": False,
+                    "cursor_direct_completion_enabled": True,
+                    "cursor_singleton_submission_enabled": False,
+                    "point_buffer_preallocation_enabled": workload == "point",
+                    "point_resource_retirement_mode": 0,
+                    "durability_driver_enabled": arm == "dedicated",
+                    "durability_driver_diagnostics_enabled": False,
+                    "extent_mode": "sliding-point-lookahead",
+                    "extent_window_bytes": POINT_LOOKAHEAD_WINDOW_BYTES,
+                    "frontier_mode": "direct",
+                    "scan_diagnostics_enabled": False,
+                })
+    for writer, arm in DURABILITY_DRIVER_DIAGNOSTIC_ORDER:
+        schedule.append({
+            "run_index": len(schedule) + 1,
+            "phase": "diagnostic",
+            "writer": writer,
+            "workload": "point",
+            "repetition": 1,
+            "arm": arm,
+            "bench": "wal_concurrent",
+            "batch_entries": 1,
+            "batch_size": None,
+            "num": DURABILITY_DRIVER_NUM,
+            "sample_every": 10,
+            "progress_ring_enabled": True,
+            "progress_cursor_enabled": True,
+            "progress_counters_enabled": False,
+            "cursor_direct_completion_enabled": True,
+            "cursor_singleton_submission_enabled": False,
+            "point_buffer_preallocation_enabled": True,
+            "point_resource_retirement_mode": 0,
+            "durability_driver_enabled": arm == "dedicated",
+            "durability_driver_diagnostics_enabled": True,
+            "extent_mode": "sliding-point-lookahead",
+            "extent_window_bytes": POINT_LOOKAHEAD_WINDOW_BYTES,
+            "frontier_mode": "direct",
+            "scan_diagnostics_enabled": False,
+        })
+    return schedule
+
+
+def build_dedicated_durability_driver_plan(
+    *, writers: Iterable[int], machine_type: str, machine_spec: Mapping[str, int],
+    commit: str, binary_sha256: str | None = None,
+) -> dict[str, object]:
+    writer_counts = validate_writer_counts(writers)
+    if writer_counts != DURABILITY_DRIVER_WRITERS:
+        raise ValueError(f"dedicated durability qualification requires writers {DURABILITY_DRIVER_WRITERS}")
+    schedule = build_dedicated_durability_driver_schedule()
+    vcpus = int(machine_spec["vcpus"])
+    ssd_count = int(machine_spec["ssd_count"])
+    layout = "single Local SSD" if ssd_count == 1 else f"RAID0 over {ssd_count} Local SSDs"
+    plan: dict[str, object] = {
+        "plan_schema_version": 1,
+        "suite": "v8-dedicated-durability-driver",
+        "writers": list(writer_counts),
+        "workloads": [
+            {"writer": writer, "name": "point", "bench": "wal_concurrent", "batch_size": None,
+             "num": DURABILITY_DRIVER_NUM, "latency_sample_every": 10}
+            for writer in writer_counts
+        ] + [
+            {"writer": 16, "name": "batch64", "bench": "wal_batch_concurrent", "batch_size": 64,
+             "num": DURABILITY_DRIVER_NUM, "latency_sample_every": None}
+        ],
+        "arms": list(DURABILITY_DRIVER_ARMS),
+        "repetitions_per_cell": DURABILITY_DRIVER_REPETITIONS,
+        "arm_orders": [list(order) for order in DURABILITY_DRIVER_SCORE_ORDERS],
+        "runs_planned": len(schedule),
+        "score_runs_planned": 40,
+        "diagnostic_runs_planned": 4,
+        "counterbalanced": True,
+        "machine_type": machine_type,
+        "vcpus": vcpus,
+        "local_ssd_count": ssd_count,
+        "local_ssd_total_gib": int(machine_spec["ssd_gib"]),
+        "runtime_protocol": f"single {vcpus}-vCPU host; {layout}; same source and release binary for all arms",
+        "commit": commit,
+        "binary_sha256": binary_sha256,
+        "value_bytes": 1024,
+        "compaction": "none",
+        "progress_mode": "cursor (mode 2)",
+        "direct_completion_enabled": True,
+        "singleton_submission_enabled": False,
+        "point_buffer_preallocation_enabled": True,
+        "point_resource_retirement_mode": 0,
+        "extent_preparation": "sliding-point-lookahead, 1 MiB for Point; Batch64 remains fallocate-only",
+        "frontier_mode": "direct",
+        "coalescing": "dynamic",
+        "data_submit_order": "ordered",
+        "instrumentation": {
+            "score_runs": "dedicated-driver detailed counters disabled",
+            "diagnostic_runs": "dedicated-driver counters enabled; not throughput scores",
+            "diagnostic_schedule": [list(item) for item in DURABILITY_DRIVER_DIAGNOSTIC_ORDER],
+        },
+        "qualification_note": (
+            "Same-host, same-source, same-release-binary CallerDriven/Dedicated comparison. Stage A is enabled "
+            "for Point, retirement mode 0 is fixed, and D1/D2/C1/C2 remain disabled. Forty scoring runs are "
+            "unprofiled with five interleaved pairs for Point1/8/16 and Batch64. Four additional Point8/16 "
+            "diagnostic runs enable lightweight driver counters and are excluded from scoring summaries."
+        ),
+    }
+    if binary_sha256 is not None:
+        plan["binary_sha256"] = binary_sha256
+    return plan
+
+
+def validate_dedicated_durability_driver_rows(rows: list[Mapping[str, object]]) -> dict[str, object]:
+    schedule = build_dedicated_durability_driver_schedule()
+    fields = ("phase", "writer", "workload", "repetition", "arm")
+    expected = {tuple(row[field] for field in fields): row for row in schedule}
+    observed: Counter[tuple[object, ...]] = Counter()
+    failed: list[dict[str, object]] = []
+    invalid: list[dict[str, object]] = []
+    for row in rows:
+        try:
+            key = (str(row["phase"]), int(row["writer"]), str(row["workload"]), int(row["repetition"]), str(row["arm"]))
+        except (KeyError, TypeError, ValueError):
+            invalid.append({"row": dict(row)})
+            continue
+        observed[key] += 1
+        if key not in expected or row.get("exit_code") != 0 or row.get("ops") != DURABILITY_DRIVER_NUM:
+            failed.append({"cell": list(key), "exit_code": row.get("exit_code"), "ops": row.get("ops")})
+    expected_cells = set(expected)
+    observed_cells = set(observed)
+    missing = sorted(expected_cells - observed_cells, key=repr)
+    unexpected = sorted(observed_cells - expected_cells, key=repr)
+    duplicates = sorted((cell for cell, count in observed.items() if count > 1), key=repr)
+    return {
+        "complete": not (missing or unexpected or duplicates or failed or invalid),
+        "planned": len(expected),
+        "observed": sum(observed.values()) + len(invalid),
+        "missing_cells": [list(cell) for cell in missing],
+        "unexpected_cells": [list(cell) for cell in unexpected],
+        "duplicate_cells": [list(cell) for cell in duplicates],
+        "failed_cells": failed,
+        "invalid_rows": len(invalid),
+    }
 
 
 def validate_point_ack_d1_rows(rows: list[Mapping[str, object]]) -> dict[str, object]:
