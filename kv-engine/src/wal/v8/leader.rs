@@ -311,7 +311,8 @@ pub(crate) struct WalV8ParallelWriter {
     #[cfg(feature = "bench")]
     point_resource_retirement_detached_tickets: AtomicU64,
     #[cfg(all(test, feature = "bench"))]
-    point_resource_retirement_detached_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    point_resource_retirement_detached_hook:
+        Mutex<Option<WalV8PointResourceRetirementDetachedHook>>,
     #[cfg(feature = "bench")]
     point_buffer_preallocation_enabled: bool,
     #[cfg(all(test, feature = "bench"))]
@@ -341,6 +342,21 @@ enum WalV8PointResourceRetirementMode {
     #[default]
     PerTicket = 0,
     DetachPointPrefix = 1,
+    DetachAndBatchPointPrefix = 2,
+}
+
+#[cfg(feature = "bench")]
+impl WalV8PointResourceRetirementMode {
+    fn detaches_point_prefix(self) -> bool {
+        matches!(
+            self,
+            Self::DetachPointPrefix | Self::DetachAndBatchPointPrefix
+        )
+    }
+
+    fn batches_point_retirement(self) -> bool {
+        self == Self::DetachAndBatchPointPrefix
+    }
 }
 
 #[cfg(feature = "bench")]
@@ -355,8 +371,9 @@ impl WalV8PointResourceRetirementMode {
             None => Ok(Self::PerTicket),
             Some(value) if value == OsStr::new("0") => Ok(Self::PerTicket),
             Some(value) if value == OsStr::new("1") => Ok(Self::DetachPointPrefix),
+            Some(value) if value == OsStr::new("2") => Ok(Self::DetachAndBatchPointPrefix),
             Some(value) => anyhow::bail!(
-                "invalid {WAL_V8_POINT_RESOURCE_RETIREMENT_MODE_ENV} {value:?}; expected `0` or `1`"
+                "invalid {WAL_V8_POINT_RESOURCE_RETIREMENT_MODE_ENV} {value:?}; expected `0`, `1`, or `2`"
             ),
         }
     }
@@ -2939,6 +2956,9 @@ type WalV8CompletionReapHook = Arc<dyn Fn(WalV8CompletionReapTestEvent) + Send +
 
 #[cfg(test)]
 type WalV8SharedCompletionReapHook = Arc<Mutex<Option<WalV8CompletionReapHook>>>;
+
+#[cfg(all(test, feature = "bench"))]
+type WalV8PointResourceRetirementDetachedHook = Arc<dyn Fn() -> Result<()> + Send + Sync>;
 
 fn benchmark_submits_any_ready_ticket() -> Result<bool> {
     #[cfg(feature = "bench")]
@@ -6781,7 +6801,12 @@ impl WalV8ParallelWriter {
         // reservation owners, so their cleanup never re-enters the ledger
         // while `frontier_resources` is locked.
         #[cfg(feature = "bench")]
-        let mut detached_point_resources = Vec::new();
+        let mut detached_point_resources =
+            if expected > 1 && self.point_resource_retirement_mode.detaches_point_prefix() {
+                Vec::with_capacity(expected)
+            } else {
+                Vec::new()
+            };
         let mut resources = self.frontier_resources.lock();
         #[cfg(feature = "bench")]
         let lock_wait_wall_ns = lock_wait_started
@@ -6797,10 +6822,7 @@ impl WalV8ParallelWriter {
         let lock_hold_cpu_started = sample.then(digest::thread_cpu_time_ns);
 
         #[cfg(feature = "bench")]
-        if expected > 1
-            && self.point_resource_retirement_mode
-                == WalV8PointResourceRetirementMode::DetachPointPrefix
-        {
+        if expected > 1 && self.point_resource_retirement_mode.detaches_point_prefix() {
             #[cfg(feature = "bench")]
             let collect_started = sample.then(digest::thread_cpu_time_ns);
             let point_prefix = exact_prefix_is_eligible(
@@ -6816,7 +6838,6 @@ impl WalV8ParallelWriter {
                 .unwrap_or_default();
 
             if point_prefix {
-                detached_point_resources.reserve_exact(expected);
                 #[cfg(feature = "bench")]
                 let remove_started = sample.then(digest::thread_cpu_time_ns);
                 detach_validated_prefix_into(
@@ -6849,16 +6870,40 @@ impl WalV8ParallelWriter {
 
                 #[cfg(test)]
                 if let Some(hook) = self.point_resource_retirement_detached_hook.lock().clone() {
-                    hook();
+                    hook().context("injected failure after detaching Point resource prefix")?;
                 }
 
                 let mut detached = std::mem::take(&mut detached_point_resources);
-                let batch_point_frontier_credits =
-                    self.batch_point_frontier_credits && expected > 1;
+                let batch_point_frontier_credits = if self
+                    .point_resource_retirement_mode
+                    .batches_point_retirement()
+                {
+                    expected > 1
+                } else {
+                    self.batch_point_frontier_credits && expected > 1
+                };
                 #[cfg(feature = "bench")]
                 let (mut release_cpu_ns, mut finish_cpu_ns) = (0u64, 0u64);
 
-                if batch_point_frontier_credits {
+                if self
+                    .point_resource_retirement_mode
+                    .batches_point_retirement()
+                {
+                    #[cfg(feature = "bench")]
+                    let step_started = sample.then(digest::thread_cpu_time_ns);
+                    let mut reservations: Vec<&mut WalV7OwnedBatchReservation> = detached
+                        .iter_mut()
+                        .map(|resource| &mut resource.reservation)
+                        .collect();
+                    WalV7OwnedBatchReservation::retire_after_io_batch(&mut reservations, 1)
+                        .context("batch retire detached durable Point v8 resources")?;
+                    #[cfg(feature = "bench")]
+                    {
+                        finish_cpu_ns = step_started
+                            .map(|started| digest::thread_cpu_time_ns().saturating_sub(started))
+                            .unwrap_or_default();
+                    }
+                } else if batch_point_frontier_credits {
                     #[cfg(feature = "bench")]
                     let step_started = sample.then(digest::thread_cpu_time_ns);
                     let mut reservations: Vec<&mut WalV7OwnedBatchReservation> = detached
@@ -6880,17 +6925,37 @@ impl WalV8ParallelWriter {
                     }
                 }
 
-                for (index, resource) in detached.into_iter().enumerate() {
-                    let mut reservation = resource.reservation;
-                    if index > 0 && !batch_point_frontier_credits {
+                if !self
+                    .point_resource_retirement_mode
+                    .batches_point_retirement()
+                {
+                    for (index, resource) in detached.into_iter().enumerate() {
+                        let mut reservation = resource.reservation;
+                        if index > 0 && !batch_point_frontier_credits {
+                            #[cfg(feature = "bench")]
+                            let step_started = sample.then(digest::thread_cpu_time_ns);
+                            reservation
+                                .release_unused_frontier_credit()
+                                .context("release detached coalesced v8 FRONTIER reservation")?;
+                            #[cfg(feature = "bench")]
+                            {
+                                release_cpu_ns = release_cpu_ns.saturating_add(
+                                    step_started
+                                        .map(|started| {
+                                            digest::thread_cpu_time_ns().saturating_sub(started)
+                                        })
+                                        .unwrap_or_default(),
+                                );
+                            }
+                        }
                         #[cfg(feature = "bench")]
                         let step_started = sample.then(digest::thread_cpu_time_ns);
                         reservation
-                            .release_unused_frontier_credit()
-                            .context("release detached coalesced v8 FRONTIER reservation")?;
+                            .finish_after_io()
+                            .context("retire detached durable v8 batch resources")?;
                         #[cfg(feature = "bench")]
                         {
-                            release_cpu_ns = release_cpu_ns.saturating_add(
+                            finish_cpu_ns = finish_cpu_ns.saturating_add(
                                 step_started
                                     .map(|started| {
                                         digest::thread_cpu_time_ns().saturating_sub(started)
@@ -6898,19 +6963,6 @@ impl WalV8ParallelWriter {
                                     .unwrap_or_default(),
                             );
                         }
-                    }
-                    #[cfg(feature = "bench")]
-                    let step_started = sample.then(digest::thread_cpu_time_ns);
-                    reservation
-                        .finish_after_io()
-                        .context("retire detached durable v8 batch resources")?;
-                    #[cfg(feature = "bench")]
-                    {
-                        finish_cpu_ns = finish_cpu_ns.saturating_add(
-                            step_started
-                                .map(|started| digest::thread_cpu_time_ns().saturating_sub(started))
-                                .unwrap_or_default(),
-                        );
                     }
                 }
 
@@ -7452,7 +7504,11 @@ mod tests {
             WalV8PointResourceRetirementMode::from_value(Some(OsStr::new("1"))).unwrap(),
             WalV8PointResourceRetirementMode::DetachPointPrefix
         );
-        assert!(WalV8PointResourceRetirementMode::from_value(Some(OsStr::new("2"))).is_err());
+        assert_eq!(
+            WalV8PointResourceRetirementMode::from_value(Some(OsStr::new("2"))).unwrap(),
+            WalV8PointResourceRetirementMode::DetachAndBatchPointPrefix
+        );
+        assert!(WalV8PointResourceRetirementMode::from_value(Some(OsStr::new("3"))).is_err());
     }
 
     #[cfg(feature = "bench")]
@@ -9235,8 +9291,11 @@ mod tests {
         let (detached_tx, detached_rx) = crossbeam_channel::bounded(1);
         let (release_tx, release_rx) = crossbeam_channel::bounded(1);
         *writer.point_resource_retirement_detached_hook.lock() = Some(Arc::new(move || {
-            let _ = detached_tx.send(());
-            let _ = release_rx.recv_timeout(Duration::from_secs(5));
+            detached_tx.send(()).map_err(anyhow::Error::from)?;
+            release_rx
+                .recv()
+                .context("test did not release detached Point retirement")?;
+            Ok(())
         }));
 
         let first = batch(10);
@@ -9316,18 +9375,34 @@ mod tests {
             drop(resources);
 
             let third = batch(30);
-            let third_job = writer.admit_prepared_point_batch(
-                WalV8PointAdmissionScratch::new(writer.preflight_batch_with_write_class(
-                    &third,
-                    LIVE_WAL_V5_LIMITS,
-                    WalV8WriteClass::Point,
-                )?),
-                third.commit_ts,
-                third.recorded_at,
-            )?;
-            let third_ticket = third_job.assignment().segment_ticket;
+            let successor_writer = Arc::clone(&writer);
+            let (successor_result_tx, successor_result_rx) = mpsc::channel();
+            let successor = scope.spawn(move || {
+                let result = (|| -> Result<u64> {
+                    let third_job = successor_writer.admit_prepared_point_batch(
+                        WalV8PointAdmissionScratch::new(
+                            successor_writer.preflight_batch_with_write_class(
+                                &third,
+                                LIVE_WAL_V5_LIMITS,
+                                WalV8WriteClass::Point,
+                            )?,
+                        ),
+                        third.commit_ts,
+                        third.recorded_at,
+                    )?;
+                    let third_ticket = third_job.assignment().segment_ticket;
+                    third_job.finish()?;
+                    Ok(third_ticket)
+                })();
+                let _ = successor_result_tx.send(result);
+            });
+            let third_ticket = successor_result_rx
+                .recv_timeout(Duration::from_secs(5))
+                .context("successor admission blocked while retirement was detached")??;
+            successor
+                .join()
+                .map_err(|_| anyhow::anyhow!("successor admission thread panicked"))?;
             assert_eq!(third_ticket, 2);
-            third_job.finish()?;
 
             let resources = writer
                 .frontier_resources
@@ -9339,6 +9414,10 @@ mod tests {
             );
             drop(resources);
 
+            ensure!(
+                matches!(driver_result_rx.try_recv(), Err(mpsc::TryRecvError::Empty)),
+                "durability driver completed before detached retirement was released"
+            );
             hook_release.release();
             let driver_result = driver_result_rx.recv_timeout(Duration::from_secs(5));
             driver
@@ -9390,6 +9469,201 @@ mod tests {
             [first, second, batch(30)]
         );
 
+        Ok(())
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn point_resource_retirement_detaches_only_multi_ticket_point_prefixes() -> Result<()> {
+        const SEGMENT_LIMIT: u64 = 256 * 1024;
+        let cases: [(
+            &str,
+            &[WalV8WriteClass],
+            WalV8PointResourceRetirementMode,
+            u64,
+        ); 5] = [
+            (
+                "point-point",
+                &[WalV8WriteClass::Point, WalV8WriteClass::Point],
+                WalV8PointResourceRetirementMode::DetachPointPrefix,
+                1,
+            ),
+            (
+                "point-batch",
+                &[WalV8WriteClass::Point, WalV8WriteClass::Batch],
+                WalV8PointResourceRetirementMode::DetachPointPrefix,
+                0,
+            ),
+            (
+                "batch-batch",
+                &[WalV8WriteClass::Batch, WalV8WriteClass::Batch],
+                WalV8PointResourceRetirementMode::DetachPointPrefix,
+                0,
+            ),
+            (
+                "point-singleton",
+                &[WalV8WriteClass::Point],
+                WalV8PointResourceRetirementMode::DetachPointPrefix,
+                0,
+            ),
+            (
+                "point-point-c2",
+                &[WalV8WriteClass::Point, WalV8WriteClass::Point],
+                WalV8PointResourceRetirementMode::DetachAndBatchPointPrefix,
+                1,
+            ),
+        ];
+
+        for (name, classes, retirement_mode, expected_detached_prefixes) in cases {
+            let directory = tempfile::tempdir()?;
+            let path = directory
+                .path()
+                .join(format!("point-retirement-{name}.wal"));
+            let installed = install_empty(&path, header())?;
+            let (mut writer, _owner) = match open_accounted_parallel_writer(
+                &path,
+                &installed,
+                SEGMENT_LIMIT,
+                2 * SEGMENT_LIMIT,
+                4096,
+            ) {
+                Ok(writer) => writer,
+                Err(error) if is_io_uring_unavailable_error(&error) => {
+                    eprintln!("skipping test (io_uring unavailable): {error:#}");
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            };
+            writer.point_resource_retirement_mode = retirement_mode;
+
+            let mut last_ticket = 0;
+            for (index, write_class) in classes.iter().copied().enumerate() {
+                let batch = batch((index as u64 + 1) * 10);
+                let prepared = writer.preflight_batch_with_write_class(
+                    &batch,
+                    LIVE_WAL_V5_LIMITS,
+                    write_class,
+                )?;
+                let job =
+                    writer.admit_prepared_batch(prepared, batch.commit_ts, batch.recorded_at)?;
+                last_ticket = job.assignment().segment_ticket;
+                job.finish()?;
+            }
+
+            assert_eq!(last_ticket + 1, classes.len() as u64);
+            let ready_deadline = Instant::now() + Duration::from_secs(10);
+            while writer.coordinator.frontier_ready_prefix().len() < classes.len() {
+                ensure!(
+                    Instant::now() < ready_deadline,
+                    "{name}: all tickets did not become frontier-ready"
+                );
+                thread::sleep(Duration::from_millis(1));
+            }
+
+            writer.advance_frontier_through(last_ticket)?;
+            let diagnostics = writer.io_diagnostics();
+            assert_eq!(
+                diagnostics.point_resource_retirement_detached_prefixes, expected_detached_prefixes,
+                "unexpected detach count for {name}"
+            );
+            assert_eq!(
+                diagnostics.point_resource_retirement_detached_tickets,
+                if expected_detached_prefixes == 0 {
+                    0
+                } else {
+                    classes.len() as u64
+                },
+                "unexpected detached ticket count for {name}"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn point_resource_retirement_detach_failure_releases_buffers_and_poisons_writer() -> Result<()>
+    {
+        const SEGMENT_LIMIT: u64 = 256 * 1024;
+
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("point-retirement-detach-failure.wal");
+        let installed = install_empty(&path, header())?;
+        let (mut writer, owner) = match open_accounted_parallel_writer(
+            &path,
+            &installed,
+            SEGMENT_LIMIT,
+            2 * SEGMENT_LIMIT,
+            4096,
+        ) {
+            Ok(writer) => writer,
+            Err(error) if is_io_uring_unavailable_error(&error) => {
+                eprintln!("skipping test (io_uring unavailable): {error:#}");
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        let image_owner = owner.image_owner();
+        writer.point_resource_retirement_mode = WalV8PointResourceRetirementMode::DetachPointPrefix;
+        let baseline_buffer_memory = image_owner.snapshot().buffer_memory_bytes;
+        *writer.point_resource_retirement_detached_hook.lock() = Some(Arc::new(|| {
+            anyhow::bail!("injected post-detach retirement failure")
+        }));
+
+        let first = batch(10);
+        let first_job = writer.admit_prepared_point_batch(
+            WalV8PointAdmissionScratch::new(writer.preflight_batch_with_write_class(
+                &first,
+                LIVE_WAL_V5_LIMITS,
+                WalV8WriteClass::Point,
+            )?),
+            first.commit_ts,
+            first.recorded_at,
+        )?;
+        let first_ticket = first_job.assignment().segment_ticket;
+        first_job.finish()?;
+
+        let second = batch(20);
+        let second_job = writer.admit_prepared_point_batch(
+            WalV8PointAdmissionScratch::new(writer.preflight_batch_with_write_class(
+                &second,
+                LIVE_WAL_V5_LIMITS,
+                WalV8WriteClass::Point,
+            )?),
+            second.commit_ts,
+            second.recorded_at,
+        )?;
+        let second_ticket = second_job.assignment().segment_ticket;
+        second_job.finish()?;
+        assert_eq!((first_ticket, second_ticket), (0, 1));
+
+        let ready_deadline = Instant::now() + Duration::from_secs(10);
+        while writer.coordinator.frontier_ready_prefix().len() < 2 {
+            ensure!(
+                Instant::now() < ready_deadline,
+                "both Point tickets did not become frontier-ready"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        let error = writer
+            .advance_frontier_through(second_ticket)
+            .expect_err("injected failure after detachment must fail the durable advance");
+        assert!(
+            format!("{error:#}").contains("injected post-detach retirement failure"),
+            "unexpected retirement error: {error:#}"
+        );
+        assert!(writer.is_poisoned());
+        assert_eq!(writer.active_boundaries()?.1.ticket_end, 0);
+        assert!(!image_owner.has_in_flight_source_spool_work());
+        assert_eq!(
+            image_owner.snapshot().buffer_memory_bytes,
+            baseline_buffer_memory
+        );
+
+        drop(writer);
+        image_owner.retire_after_durable_cleanup()?;
+        assert_eq!(image_owner.snapshot().buffer_memory_bytes, 0);
         Ok(())
     }
 
