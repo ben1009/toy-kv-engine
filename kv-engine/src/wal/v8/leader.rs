@@ -310,6 +310,8 @@ pub(crate) struct WalV8ParallelWriter {
     point_resource_retirement_detached_prefixes: AtomicU64,
     #[cfg(feature = "bench")]
     point_resource_retirement_detached_tickets: AtomicU64,
+    #[cfg(feature = "bench")]
+    point_resource_retirement_batched_prefixes: AtomicU64,
     #[cfg(all(test, feature = "bench"))]
     point_resource_retirement_detached_hook:
         Mutex<Option<WalV8PointResourceRetirementDetachedHook>>,
@@ -4659,6 +4661,7 @@ impl WalV8LeaderWriter {
             point_resource_retirement_mode: WalV8PointResourceRetirementMode::PerTicket as u8,
             point_resource_retirement_detached_prefixes: 0,
             point_resource_retirement_detached_tickets: 0,
+            point_resource_retirement_batched_prefixes: 0,
             point_buffer_preallocations_in_flight: 0,
             point_resource_preclaim_enabled: false,
             point_resource_preclaim_sum_cache_enabled: false,
@@ -5063,6 +5066,8 @@ impl WalV8LeaderWriter {
             point_resource_retirement_detached_prefixes: AtomicU64::new(0),
             #[cfg(feature = "bench")]
             point_resource_retirement_detached_tickets: AtomicU64::new(0),
+            #[cfg(feature = "bench")]
+            point_resource_retirement_batched_prefixes: AtomicU64::new(0),
             #[cfg(all(test, feature = "bench"))]
             point_resource_retirement_detached_hook: Mutex::new(None),
             #[cfg(feature = "bench")]
@@ -5670,6 +5675,9 @@ impl WalV8ParallelWriter {
             .load(Ordering::Relaxed);
         diagnostics.point_resource_retirement_detached_tickets = self
             .point_resource_retirement_detached_tickets
+            .load(Ordering::Relaxed);
+        diagnostics.point_resource_retirement_batched_prefixes = self
+            .point_resource_retirement_batched_prefixes
             .load(Ordering::Relaxed);
         #[cfg(test)]
         {
@@ -6792,10 +6800,6 @@ impl WalV8ParallelWriter {
             .checked_sub(first_ticket)
             .context("v8 resource retirement range is reversed")?;
         let expected = usize::try_from(ticket_count)?;
-        #[cfg(feature = "bench")]
-        let lock_wait_started = sample.then(Instant::now);
-        #[cfg(feature = "bench")]
-        let lock_wait_cpu_started = sample.then(digest::thread_cpu_time_ns);
         // Declare the detached payload before the map guard. If an invariant
         // fails after removal, Rust drops the map guard before dropping these
         // reservation owners, so their cleanup never re-enters the ledger
@@ -6807,6 +6811,10 @@ impl WalV8ParallelWriter {
             } else {
                 Vec::new()
             };
+        #[cfg(feature = "bench")]
+        let lock_wait_cpu_started = sample.then(digest::thread_cpu_time_ns);
+        #[cfg(feature = "bench")]
+        let lock_wait_started = sample.then(Instant::now);
         let mut resources = self.frontier_resources.lock();
         #[cfg(feature = "bench")]
         let lock_wait_wall_ns = lock_wait_started
@@ -6897,6 +6905,8 @@ impl WalV8ParallelWriter {
                         .collect();
                     WalV7OwnedBatchReservation::retire_after_io_batch(&mut reservations, 1)
                         .context("batch retire detached durable Point v8 resources")?;
+                    self.point_resource_retirement_batched_prefixes
+                        .fetch_add(1, Ordering::Relaxed);
                     #[cfg(feature = "bench")]
                     {
                         finish_cpu_ns = step_started
@@ -6929,7 +6939,7 @@ impl WalV8ParallelWriter {
                     .point_resource_retirement_mode
                     .batches_point_retirement()
                 {
-                    for (index, resource) in detached.into_iter().enumerate() {
+                    for (index, resource) in detached.drain(..).enumerate() {
                         let mut reservation = resource.reservation;
                         if index > 0 && !batch_point_frontier_credits {
                             #[cfg(feature = "bench")]
@@ -6965,6 +6975,11 @@ impl WalV8ParallelWriter {
                         }
                     }
                 }
+
+                // Include the detached guards' final Drops in retirement
+                // timing. A DATA buffer pin that became the final remaining
+                // owner can finish its resource cleanup here.
+                drop(detached);
 
                 let observation = WalV8RetirementObservation {
                     wall_ns: started
@@ -9238,6 +9253,27 @@ mod tests {
         max_source_spool_bytes: u64,
         allocation_unit: u64,
     ) -> Result<(WalV8ParallelWriter, Arc<WalV8ReservationOwner>)> {
+        open_accounted_parallel_writer_with_progress_and_completion(
+            path,
+            installed,
+            max_file_size,
+            max_source_spool_bytes,
+            allocation_unit,
+            WalV8ProgressMode::Eager,
+            false,
+        )
+    }
+
+    #[cfg(feature = "bench")]
+    fn open_accounted_parallel_writer_with_progress_and_completion(
+        path: &Path,
+        installed: &WalV8InstalledRecovery,
+        max_file_size: u64,
+        max_source_spool_bytes: u64,
+        allocation_unit: u64,
+        progress_mode: WalV8ProgressMode,
+        direct_completion_enabled: bool,
+    ) -> Result<(WalV8ParallelWriter, Arc<WalV8ReservationOwner>)> {
         let sync_file = OpenOptions::new().read(true).write(true).open(path)?;
         let (leader, owner) = open_accounted_writer(
             path,
@@ -9252,9 +9288,12 @@ mod tests {
             .write(true)
             .custom_flags(libc::O_DIRECT)
             .open(path)?;
-        let mut writer = leader.into_parallel_with_worker_file_and_progress_mode(
+        let mut writer = leader.into_parallel_with_worker_file_progress_and_completion(
             worker_file,
-            WalV8ProgressMode::Eager,
+            progress_mode,
+            direct_completion_enabled,
+            false,
+            None,
         )?;
         writer.point_buffer_preallocation_enabled = true;
 
@@ -9481,17 +9520,20 @@ mod tests {
             &[WalV8WriteClass],
             WalV8PointResourceRetirementMode,
             u64,
-        ); 5] = [
+            u64,
+        ); 8] = [
             (
                 "point-point",
                 &[WalV8WriteClass::Point, WalV8WriteClass::Point],
                 WalV8PointResourceRetirementMode::DetachPointPrefix,
                 1,
+                0,
             ),
             (
                 "point-batch",
                 &[WalV8WriteClass::Point, WalV8WriteClass::Batch],
                 WalV8PointResourceRetirementMode::DetachPointPrefix,
+                0,
                 0,
             ),
             (
@@ -9499,11 +9541,13 @@ mod tests {
                 &[WalV8WriteClass::Batch, WalV8WriteClass::Batch],
                 WalV8PointResourceRetirementMode::DetachPointPrefix,
                 0,
+                0,
             ),
             (
                 "point-singleton",
                 &[WalV8WriteClass::Point],
                 WalV8PointResourceRetirementMode::DetachPointPrefix,
+                0,
                 0,
             ),
             (
@@ -9511,10 +9555,39 @@ mod tests {
                 &[WalV8WriteClass::Point, WalV8WriteClass::Point],
                 WalV8PointResourceRetirementMode::DetachAndBatchPointPrefix,
                 1,
+                1,
+            ),
+            (
+                "point-batch-c2",
+                &[WalV8WriteClass::Point, WalV8WriteClass::Batch],
+                WalV8PointResourceRetirementMode::DetachAndBatchPointPrefix,
+                0,
+                0,
+            ),
+            (
+                "batch-batch-c2",
+                &[WalV8WriteClass::Batch, WalV8WriteClass::Batch],
+                WalV8PointResourceRetirementMode::DetachAndBatchPointPrefix,
+                0,
+                0,
+            ),
+            (
+                "point-singleton-c2",
+                &[WalV8WriteClass::Point],
+                WalV8PointResourceRetirementMode::DetachAndBatchPointPrefix,
+                0,
+                0,
             ),
         ];
 
-        for (name, classes, retirement_mode, expected_detached_prefixes) in cases {
+        for (
+            name,
+            classes,
+            retirement_mode,
+            expected_detached_prefixes,
+            expected_batched_prefixes,
+        ) in cases
+        {
             let directory = tempfile::tempdir()?;
             let path = directory
                 .path()
@@ -9535,6 +9608,7 @@ mod tests {
                 Err(error) => return Err(error),
             };
             writer.point_resource_retirement_mode = retirement_mode;
+            writer.io_diagnostics.point_resource_retirement_mode = retirement_mode as u8;
 
             let mut last_ticket = 0;
             for (index, write_class) in classes.iter().copied().enumerate() {
@@ -9575,7 +9649,88 @@ mod tests {
                 },
                 "unexpected detached ticket count for {name}"
             );
+            assert_eq!(
+                diagnostics.point_resource_retirement_batched_prefixes, expected_batched_prefixes,
+                "unexpected batched retirement count for {name}"
+            );
         }
+
+        Ok(())
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn cursor_direct_completion_c2_retirement_recovers_point_prefix() -> Result<()> {
+        const SEGMENT_LIMIT: u64 = 256 * 1024;
+
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("cursor-direct-c2-retirement-v8.wal");
+        let wal_header = header();
+        let installed = install_empty(&path, wal_header)?;
+        let (mut writer, owner) = match open_accounted_parallel_writer_with_progress_and_completion(
+            &path,
+            &installed,
+            SEGMENT_LIMIT,
+            2 * SEGMENT_LIMIT,
+            4096,
+            WalV8ProgressMode::Cursor,
+            true,
+        ) {
+            Ok(writer) => writer,
+            Err(error) if is_io_uring_unavailable_error(&error) => {
+                eprintln!("skipping test (io_uring unavailable): {error:#}");
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        writer.point_resource_retirement_mode =
+            WalV8PointResourceRetirementMode::DetachAndBatchPointPrefix;
+        writer.io_diagnostics.point_resource_retirement_mode =
+            WalV8PointResourceRetirementMode::DetachAndBatchPointPrefix as u8;
+
+        let mut expected = Vec::new();
+        let mut last_ticket = 0;
+        for commit_ts in [10, 20] {
+            let point = batch(commit_ts);
+            let prepared = writer.preflight_batch_with_write_class(
+                &point,
+                LIVE_WAL_V5_LIMITS,
+                WalV8WriteClass::Point,
+            )?;
+            let job = writer.admit_prepared_point_batch(
+                WalV8PointAdmissionScratch::new(prepared),
+                point.commit_ts,
+                point.recorded_at,
+            )?;
+            last_ticket = job.assignment().segment_ticket;
+            job.finish()?;
+            expected.push(point);
+        }
+
+        writer.advance_frontier_through(last_ticket)?;
+        assert!(writer.io.completion_thread.lock().is_none());
+        let diagnostics = writer.io_diagnostics();
+        assert!(diagnostics.progress_cursor_enabled);
+        assert!(diagnostics.cursor_direct_completion_enabled);
+        assert_eq!(
+            diagnostics.point_resource_retirement_mode,
+            WalV8PointResourceRetirementMode::DetachAndBatchPointPrefix as u8
+        );
+        assert_eq!(diagnostics.point_resource_retirement_detached_prefixes, 1);
+        assert!(diagnostics.point_resource_retirement_batched_prefixes > 0);
+        let (_, boundary) = writer.active_boundaries()?;
+        assert_eq!(boundary.ticket_end, last_ticket + 1);
+        drop(writer);
+        drop(owner);
+
+        let recovered = super::super::install::recover_and_install_active(
+            &path,
+            &[boundary],
+            wal_header.predecessor,
+            LIVE_WAL_V5_LIMITS,
+            MAX_WAL_FILE_SIZE,
+        )?;
+        assert_eq!(replayed_batches(&path, &recovered)?, expected);
 
         Ok(())
     }

@@ -181,6 +181,8 @@ pub struct WalIoDiagnostics {
     pub point_resource_retirement_detached_prefixes: u64,
     /// Number of tickets retired from detached all-Point prefixes.
     pub point_resource_retirement_detached_tickets: u64,
+    /// Number of detached Point prefixes retired through the C2 batch path.
+    pub point_resource_retirement_batched_prefixes: u64,
     /// Outstanding speculative buffer permits for in-process lifecycle tests.
     /// This field is not serialized into benchmark results.
     pub point_buffer_preallocations_in_flight: u64,

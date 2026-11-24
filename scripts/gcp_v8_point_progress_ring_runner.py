@@ -29,6 +29,8 @@ from gcp_wal_matrix import (
     POINT_PROGRESS_RING_WRITERS,
     POINT_PREALLOCATION_NUM,
     POINT_PREALLOCATION_WRITERS,
+    POINT_RESOURCE_RETIREMENT_NUM,
+    POINT_RESOURCE_RETIREMENT_WRITERS,
     build_cursor_direct_completion_plan,
     build_cursor_direct_completion_schedule,
     build_cursor_coalescing_budget_plan,
@@ -43,9 +45,12 @@ from gcp_wal_matrix import (
     build_point_progress_ring_schedule,
     build_v7_v8_point_preallocation_plan,
     build_v7_v8_point_preallocation_schedule,
+    build_point_resource_retirement_plan,
+    build_point_resource_retirement_schedule,
     validate_point_progress_cursor_rows,
     validate_point_progress_cursor_v2_rows,
     validate_point_progress_ring_rows,
+    validate_point_resource_retirement_rows,
     validate_cursor_direct_completion_rows,
     validate_cursor_coalescing_budget_rows,
     validate_cursor_singleton_submission_rows,
@@ -62,6 +67,7 @@ UNSET_EXPERIMENT_VARIABLES = (
     "TOYKV_BENCH_AFFINITY_MODE",
     "TOYKV_BENCH_IOWQ_AFFINITY",
     "TOYKV_BENCH_WAL_IO_WORKER_CPU",
+    "TOYKV_BENCH_V8_POINT_RESOURCE_RETIREMENT_MODE",
 )
 FIXED_ENVIRONMENT = {
     "TOYKV_BENCH_V8_EXTENT_PREP": "sliding-point-lookahead",
@@ -110,6 +116,12 @@ def _summary_fields(schedule: list[dict[str, Any]]) -> tuple[str, ...]:
             "point_buffer_preallocation_attempts", "point_buffer_preallocation_hits",
             "point_buffer_preallocation_fallbacks",
         )
+    if any("point_resource_retirement_mode" in row for row in schedule):
+        fields += (
+            "point_resource_retirement_mode_start", "point_resource_retirement_mode_end",
+            "point_resource_retirement_detached_prefixes", "point_resource_retirement_detached_tickets",
+            "point_resource_retirement_batched_prefixes",
+        )
     return fields
 
 
@@ -121,6 +133,7 @@ def _environment(
     cursor_singleton_submission_enabled: bool | None = None,
     coalescing_budget_us: int | None = None,
     point_buffer_preallocation_enabled: bool | None = None,
+    point_resource_retirement_mode: int | None = None,
 ) -> dict[str, str]:
     # An allowlist makes the selected experiment switches the only inherited variables.
     if progress_ring_enabled is not progress_cursor_enabled:
@@ -152,6 +165,10 @@ def _environment(
         environment["TOYKV_BENCH_V8_POINT_BUFFER_PREALLOC"] = (
             "1" if point_buffer_preallocation_enabled else "0"
         )
+    if point_resource_retirement_mode is not None:
+        if point_resource_retirement_mode not in (0, 1, 2):
+            raise ValueError("Point resource-retirement mode must be 0, 1, or 2")
+        environment["TOYKV_BENCH_V8_POINT_RESOURCE_RETIREMENT_MODE"] = str(point_resource_retirement_mode)
     return environment
 
 
@@ -192,6 +209,7 @@ def _expected_environment_text(
     cursor_direct_completion_enabled: bool | None = None,
     cursor_singleton_submission_enabled: bool | None = None,
     coalescing_budget_us: int | None = None,
+    point_resource_retirement_mode: int | None = None,
 ) -> str:
     if progress_ring_enabled and not progress_cursor_enabled:
         # Historical F0.5 archives used the now-retired mode 1. Keep their
@@ -206,12 +224,15 @@ def _expected_environment_text(
         key: value for key, value in _environment(
             progress_ring_enabled, progress_cursor_enabled, progress_counters_enabled,
             cursor_direct_completion_enabled, cursor_singleton_submission_enabled, coalescing_budget_us,
+            point_resource_retirement_mode=point_resource_retirement_mode,
         ).items()
         if key not in ("PATH", "HOME", "TMPDIR", "LC_ALL")
     }
     controlled.update({
         key: "<unset>" for key in UNSET_EXPERIMENT_VARIABLES
-        if key != "TOYKV_WAL_V8_COALESCE_BUDGET_US" or coalescing_budget_us is None
+        if (key != "TOYKV_WAL_V8_COALESCE_BUDGET_US" or coalescing_budget_us is None)
+        and (key != "TOYKV_BENCH_V8_POINT_RESOURCE_RETIREMENT_MODE"
+             or point_resource_retirement_mode is None)
     })
     return "\n".join(f"{key}={value}" for key, value in sorted(controlled.items())) + "\n"
 
@@ -374,6 +395,45 @@ def _validate_record(record: dict[str, Any], row: dict[str, Any]) -> dict[str, A
         metrics["cursor_singleton_submission_end"] = pipeline["wal_io_end"][
             "cursor_singleton_submission_enabled"
         ]
+    if "point_resource_retirement_mode" in row:
+        start = pipeline["wal_io_start"]
+        end = pipeline["wal_io_end"]
+        expected_mode = row["point_resource_retirement_mode"]
+        if any(
+            snapshot.get("point_resource_retirement_mode") != expected_mode
+            for snapshot in (start, end)
+        ):
+            raise ValueError("Point resource-retirement mode differs from the planned arm")
+        counter_names = (
+            "point_resource_retirement_detached_prefixes",
+            "point_resource_retirement_detached_tickets",
+            "point_resource_retirement_batched_prefixes",
+        )
+        deltas: dict[str, int] = {}
+        for name in counter_names:
+            before, after = start.get(name), end.get(name)
+            if type(before) is not int or type(after) is not int or after < before:
+                raise ValueError(f"{name} counter is missing or moved backwards")
+            deltas[name] = after - before
+        detached = deltas["point_resource_retirement_detached_prefixes"]
+        detached_tickets = deltas["point_resource_retirement_detached_tickets"]
+        batched = deltas["point_resource_retirement_batched_prefixes"]
+        if batched > detached:
+            raise ValueError("C2 batch count exceeds detached-prefix count")
+        if row["workload"] == "point":
+            if expected_mode == 0 and any((detached, detached_tickets, batched)):
+                raise ValueError("mode 0 unexpectedly entered Point detach retirement")
+            if expected_mode == 1 and (detached == 0 or detached_tickets == 0 or batched != 0):
+                raise ValueError("mode 1 did not prove detached-only Point retirement")
+            if expected_mode == 2 and (detached == 0 or detached_tickets == 0 or batched == 0):
+                raise ValueError("mode 2 did not prove batched Point retirement")
+        elif any((detached, detached_tickets, batched)):
+            raise ValueError("Batch64 entered the Point-only retirement path")
+        metrics.update({
+            "point_resource_retirement_mode_start": start["point_resource_retirement_mode"],
+            "point_resource_retirement_mode_end": end["point_resource_retirement_mode"],
+            **deltas,
+        })
     return metrics
 
 
@@ -531,6 +591,7 @@ def _run_one(
     else:
         command.extend(("--wal-batch-size", str(row["batch_entries"])))
     preallocation_suite = candidate_mode == "v7-v8-point-preallocation"
+    retirement_suite = candidate_mode == "point-resource-retirement"
     environment = (
         _point_preallocation_environment(row)
         if preallocation_suite else
@@ -541,6 +602,9 @@ def _run_one(
             row.get("cursor_direct_completion_enabled"),
             row.get("cursor_singleton_submission_enabled"),
             row.get("coalescing_budget_us"),
+            point_resource_retirement_mode=(
+                int(row["point_resource_retirement_mode"]) if retirement_suite else None
+            ),
         )
     )
     (run_dir / "command.sh").write_text(shlex.join(command) + "\n", encoding="utf-8")
@@ -552,6 +616,9 @@ def _run_one(
             row.get("cursor_direct_completion_enabled"),
             row.get("cursor_singleton_submission_enabled"),
             row.get("coalescing_budget_us"),
+            point_resource_retirement_mode=(
+                int(row["point_resource_retirement_mode"]) if retirement_suite else None
+            ),
         ), encoding="utf-8",
     )
     (run_dir / "start_utc.txt").write_text(datetime.now(timezone.utc).isoformat() + "\n", encoding="utf-8")
@@ -1289,6 +1356,203 @@ def _cursor_plan_schema_version(plan: dict[str, Any]) -> int:
     raise ValueError("benchmark plan has no recognized progress plan schema")
 
 
+def _point_resource_retirement_summary(
+    rows: list[dict[str, Any]], planned: int,
+) -> dict[str, Any]:
+    schedule = build_point_resource_retirement_schedule()
+    validation = validate_point_resource_retirement_rows(rows)
+    comparisons: list[dict[str, Any]] = []
+    pairs = ((0, 1), (0, 2), (1, 2))
+    cells = [(writer, "point") for writer in POINT_RESOURCE_RETIREMENT_WRITERS] + [(16, "batch64")]
+    metrics = ("puts_per_second", "cpu_us_per_put", "p99_ms", "sync_count", "puts_per_sync")
+    for writer, workload in cells:
+        arms = {
+            mode: [
+                row for row in rows if row.get("writer") == writer and row.get("workload") == workload
+                and row.get("point_resource_retirement_mode") == mode and row.get("exit_code") == 0
+            ]
+            for mode in (0, 1, 2)
+        }
+        stats = {
+            str(mode): {
+                "runs": len(arm_rows),
+                **{
+                    metric: median(float(row[metric]) for row in arm_rows)
+                    if arm_rows and all(row.get(metric) is not None for row in arm_rows) else None
+                    for metric in metrics
+                },
+            }
+            for mode, arm_rows in arms.items()
+        }
+        paired: dict[str, Any] = {}
+        for baseline_mode, candidate_mode in pairs:
+            changes: list[float] = []
+            p99_changes: list[float] = []
+            wins = 0
+            for repetition in range(1, 6):
+                baseline = next((row for row in rows if row.get("writer") == writer
+                                 and row.get("workload") == workload and row.get("repetition") == repetition
+                                 and row.get("point_resource_retirement_mode") == baseline_mode
+                                 and row.get("exit_code") == 0), None)
+                candidate = next((row for row in rows if row.get("writer") == writer
+                                  and row.get("workload") == workload and row.get("repetition") == repetition
+                                  and row.get("point_resource_retirement_mode") == candidate_mode
+                                  and row.get("exit_code") == 0), None)
+                if baseline is None or candidate is None or baseline["puts_per_second"] <= 0:
+                    continue
+                change = (candidate["puts_per_second"] / baseline["puts_per_second"] - 1) * 100
+                changes.append(change)
+                wins += change > 0
+                if workload == "point" and baseline.get("p99_ms"):
+                    p99_changes.append((candidate["p99_ms"] / baseline["p99_ms"] - 1) * 100)
+            paired[f"mode_{baseline_mode}_vs_{candidate_mode}"] = {
+                "baseline_mode": baseline_mode,
+                "candidate_mode": candidate_mode,
+                "paired_throughput_changes_pct": changes,
+                "paired_throughput_change_median_pct": median(changes) if changes else None,
+                "candidate_pair_wins": wins,
+                "paired_p99_changes_pct": p99_changes,
+                "paired_p99_change_median_pct": median(p99_changes) if p99_changes else None,
+            }
+        comparisons.append({"writer": writer, "workload": workload, "modes": stats, "paired": paired})
+
+    return {
+        "suite": "v8-point-resource-retirement",
+        "complete": len(rows) == planned == len(schedule) and validation["complete"],
+        "runs_started": len(rows),
+        "runs_completed": sum(row.get("exit_code") == 0 for row in rows),
+        "runs_planned": planned,
+        "writers": list(POINT_RESOURCE_RETIREMENT_WRITERS),
+        "workloads": ["point", "batch64"],
+        "arms": ["per_ticket", "detach", "batch"],
+        "results": rows,
+        "matrix_validation": validation,
+        "comparison": comparisons,
+        "qualification_note": (
+            "Same-host, same-source, same-release-binary comparison of per-ticket retirement (mode 0), C1 detach "
+            "(mode 1), and C2 batch retirement (mode 2). Batch64 is a no-detach regression guardrail. Runtime "
+            "counter deltas must prove each planned Point path actually ran; this report does not change defaults."
+        ),
+    }
+
+
+def verify_point_resource_retirement_results_directory(results: Path) -> dict[str, Any]:
+    """Verify all C2 retirement-mode runs and their runtime path counters."""
+    errors: list[str] = []
+    try:
+        summary = json.loads((results / "summary.json").read_text(encoding="utf-8"))
+        remote_exit = json.loads((results / "remote-exit.json").read_text(encoding="utf-8"))
+        plan = json.loads((results / "benchmark-plan.json").read_text(encoding="utf-8"))
+        commit = (results / "commit.txt").read_text(encoding="utf-8").strip()
+        binary_sha = (results / "write-perf.sha256").read_text(encoding="utf-8").strip()
+        if not all(isinstance(value, dict) for value in (summary, remote_exit, plan)):
+            raise ValueError("summary, remote-exit, and plan must be JSON objects")
+        schedule = build_point_resource_retirement_schedule(plan.get("writers", ()))
+        expected_plan = build_point_resource_retirement_plan(
+            machine_type="c4-standard-16-lssd",
+            machine_spec={"vcpus": 16, "ssd_count": 2, "ssd_gib": 750},
+            commit=commit,
+            binary_sha256=binary_sha,
+        )
+        if plan != expected_plan:
+            errors.append("benchmark plan differs from the fixed Point resource-retirement suite")
+        if len(commit) != 40 or any(char not in "0123456789abcdef" for char in commit):
+            errors.append("source commit identity is invalid")
+        if len(binary_sha) != 64 or any(char not in "0123456789abcdef" for char in binary_sha):
+            errors.append("binary checksum is invalid")
+        if (
+            summary.get("suite") != "v8-point-resource-retirement"
+            or summary.get("source_commit") != commit
+            or summary.get("binary_sha256") != binary_sha
+            or summary.get("complete") is not True
+            or summary.get("runs_started") != len(schedule)
+            or summary.get("runs_attempted") != len(schedule)
+            or summary.get("runs_completed") != len(schedule)
+            or summary.get("runs_planned") != len(schedule)
+        ):
+            errors.append("summary metadata or run counts are incomplete")
+        if (
+            remote_exit.get("failed") is not False
+            or remote_exit.get("runs_started") != len(schedule)
+            or remote_exit.get("runs_attempted") != len(schedule)
+        ):
+            errors.append("remote-exit does not confirm all planned runs")
+        with (results / "point-resource-retirement-schedule.tsv").open(
+            encoding="utf-8", newline="",
+        ) as stream:
+            actual_schedule = list(csv.DictReader(stream, delimiter="\t"))
+        expected_schedule = [
+            {key: "none" if key == "batch_size" and value is None else "" if value is None else str(value)
+             for key, value in row.items()}
+            for row in schedule
+        ]
+        if actual_schedule != expected_schedule:
+            errors.append("schedule file differs from the exact planned order/configuration")
+        rows = summary.get("results")
+        if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+            raise ValueError("summary results are missing or malformed")
+        validation = validate_point_resource_retirement_rows(rows)
+        if validation["complete"] is not True:
+            errors.append("run rows do not prove all three retirement modes and guardrails")
+        recomputed = _point_resource_retirement_summary(rows, len(schedule))
+        for key in (
+            "suite", "complete", "runs_started", "runs_completed", "runs_planned", "writers", "workloads",
+            "arms", "matrix_validation", "comparison",
+        ):
+            if summary.get(key) != recomputed.get(key):
+                errors.append(f"summary field {key} differs from the archived rows")
+        expected_ids = {_run_id(row) for row in schedule}
+        actual_ids = {path.name for path in results.iterdir()
+                      if path.is_dir() and path.name.startswith(("r", "w"))}
+        if actual_ids != expected_ids:
+            errors.append("run directories do not exactly match the schedule")
+        rows_by_id = {_run_id(row): row for row in rows}
+        for row in schedule:
+            run_id = _run_id(row)
+            run_dir = results / run_id
+            result_path, metadata_path = run_dir / "result.json", run_dir / "run-metadata.json"
+            if not result_path.is_file() or not metadata_path.is_file():
+                errors.append(f"{run_id} is missing its result or metadata")
+                continue
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            if metadata != rows_by_id.get(run_id):
+                errors.append(f"{run_id} metadata differs from the summary row")
+            identity = {**row, "source_commit": commit, "binary_sha256": binary_sha}
+            if any(metadata.get(key) != value for key, value in identity.items()):
+                errors.append(f"{run_id} metadata identity differs from the schedule")
+            expected_environment = _expected_environment_text(
+                True, True, False, True, False,
+                point_resource_retirement_mode=int(row["point_resource_retirement_mode"]),
+            )
+            environment_path = run_dir / "environment.txt"
+            if not environment_path.is_file() or environment_path.read_text(encoding="utf-8") != expected_environment:
+                errors.append(f"{run_id} environment differs from the planned retirement mode")
+            try:
+                raw = json.loads(result_path.read_text(encoding="utf-8"))
+                expected_metrics = _validate_record(raw, row)
+                if any(metadata.get(key) != value for key, value in expected_metrics.items()):
+                    errors.append(f"{run_id} metrics differ from raw result")
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+                errors.append(f"{run_id} raw result is invalid: {error}")
+        summary_tsv = results / "summary.tsv"
+        if not summary_tsv.is_file():
+            errors.append("summary.tsv is missing")
+        else:
+            with summary_tsv.open(encoding="utf-8", newline="") as stream:
+                actual_summary = list(csv.DictReader(stream, delimiter="\t"))
+            expected_summary = [
+                {key: json.dumps(item[key], sort_keys=True) if isinstance(item.get(key), dict)
+                 else "" if item.get(key) is None else str(item.get(key))
+                 for key in _summary_fields(schedule)}
+                for item in (rows_by_id.get(_run_id(row), {}) for row in schedule)
+            ]
+            if actual_summary != expected_summary:
+                errors.append("summary.tsv rows differ from run metadata")
+        return {"verified": not errors, "planned": len(schedule), "observed": len(rows), "errors": errors}
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+        return {"verified": False, "errors": [str(error)]}
+
+
 def _coalescing_budget_summary(
     rows: list[dict[str, Any]], writers: tuple[int, ...], planned: int,
 ) -> dict[str, Any]:
@@ -1371,6 +1635,7 @@ def run_suite(args: argparse.Namespace) -> int:
     writers = tuple(int(value) for value in args.writers.split(","))
     expected_writers = (
         POINT_PREALLOCATION_WRITERS if candidate_mode == "v7-v8-point-preallocation" else
+        POINT_RESOURCE_RETIREMENT_WRITERS if candidate_mode == "point-resource-retirement" else
         (8, 16) if candidate_mode == "coalescing-budget" else POINT_PROGRESS_RING_WRITERS
     )
     if writers != expected_writers:
@@ -1431,6 +1696,16 @@ def run_suite(args: argparse.Namespace) -> int:
         )
         schedule_filename = "v7-v8-point-preallocation-schedule.tsv"
         summarize = lambda rows, _writers, planned: _point_preallocation_summary(rows, planned)
+    elif candidate_mode == "point-resource-retirement":
+        schedule = build_point_resource_retirement_schedule(writers)
+        plan = build_point_resource_retirement_plan(
+            machine_type=args.machine_type,
+            machine_spec={"vcpus": 16, "ssd_count": args.ssd_count, "ssd_gib": args.ssd_gib},
+            commit=args.commit,
+            binary_sha256=args.binary_sha256,
+        )
+        schedule_filename = "point-resource-retirement-schedule.tsv"
+        summarize = lambda rows, _writers, planned: _point_resource_retirement_summary(rows, planned)
     else:
         raise ValueError("unsupported Cursor candidate mode")
     (results_dir / "benchmark-plan.json").write_text(json.dumps(plan, indent=2) + "\n", encoding="utf-8")
@@ -2199,7 +2474,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--candidate-mode",
         choices=(
             "cursor", "direct-completion", "singleton-submission", "coalescing-budget",
-            "v7-v8-point-preallocation",
+            "v7-v8-point-preallocation", "point-resource-retirement",
         ),
         default="cursor",
     )

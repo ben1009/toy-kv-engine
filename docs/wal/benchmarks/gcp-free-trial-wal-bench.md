@@ -339,6 +339,33 @@ arm to report actual preallocation hits, verifies every run's result and
 metadata, and rejects incomplete archives before cleanup. The user-requested
 local SSD screening is skipped; this suite is the same-host GCP comparison.
 
+For the C1/C2 Point resource-retirement comparison, use
+`--v8-point-resource-retirement-ab`. It runs Point8 and Point16 plus a Batch64
+guardrail in five counterbalanced repetitions. The three same-binary modes are
+per-ticket retirement (0), detached Point-prefix retirement (1), and batched
+retirement (2). Cursor, Direct Completion, Direct FRONTIER, dynamic coalescing,
+and 1 MiB Point lookahead stay fixed. Runtime counters must prove that modes 1
+and 2 detached a Point prefix and that mode 2 actually used batch retirement;
+Batch64 must stay outside the Point-only path. The archive validator checks all
+45 planned runs, their result and metadata pairs, and the environment switch
+before the VM or isolated network is removed.
+
+```bash
+python3 scripts/gcp-free-trial-wal-bench.py \
+  --project YOUR_PROJECT_ID \
+  --zone YOUR_C4_ZONE \
+  --machine-type c4-standard-16-lssd \
+  --v8-point-resource-retirement-ab \
+  --commit 0123456789abcdef0123456789abcdef01234567 \
+  --network YOUR_ISOLATED_VPC \
+  --subnet YOUR_SUBNET \
+  --ssh-source-range YOUR_PUBLIC_IPV4/32 \
+  --estimated-hourly-cost-usd YOUR_CURRENT_ESTIMATE \
+  --max-estimated-spend-usd 2.00 \
+  --max-runtime-minutes 60 \
+  --confirm-free-trial
+```
+
 Replace the example commit, CIDR, and cost values. Use a full 40-character
 commit SHA. The two cost arguments are mandatory for a full run: look up
 current pricing for the selected region and estimate the VM, Local SSD, boot

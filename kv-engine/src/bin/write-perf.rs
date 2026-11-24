@@ -1938,6 +1938,7 @@ struct WalIoDiagnosticsRecord {
     point_resource_retirement_mode: u8,
     point_resource_retirement_detached_prefixes: u64,
     point_resource_retirement_detached_tickets: u64,
+    point_resource_retirement_batched_prefixes: u64,
     // Retired Stage B keys stay in benchmark JSON for archived-schema compatibility.
     point_resource_preclaim_enabled: bool,
     point_resource_preclaim_sum_cache_enabled: bool,
@@ -2102,6 +2103,8 @@ impl From<WalIoDiagnostics> for WalIoDiagnosticsRecord {
                 .point_resource_retirement_detached_prefixes,
             point_resource_retirement_detached_tickets: diagnostics
                 .point_resource_retirement_detached_tickets,
+            point_resource_retirement_batched_prefixes: diagnostics
+                .point_resource_retirement_batched_prefixes,
             point_resource_preclaim_enabled: diagnostics.point_resource_preclaim_enabled,
             point_resource_preclaim_sum_cache_enabled: diagnostics
                 .point_resource_preclaim_sum_cache_enabled,
@@ -12924,6 +12927,7 @@ mod tests {
                         point_resource_retirement_mode: 0,
                         point_resource_retirement_detached_prefixes: 0,
                         point_resource_retirement_detached_tickets: 0,
+                        point_resource_retirement_batched_prefixes: 0,
                         point_resource_preclaim_enabled: false,
                         point_resource_preclaim_sum_cache_enabled: false,
                         point_resource_preclaim_after_buffer_enabled: false,
@@ -12983,6 +12987,7 @@ mod tests {
                         point_resource_retirement_mode: 0,
                         point_resource_retirement_detached_prefixes: 0,
                         point_resource_retirement_detached_tickets: 0,
+                        point_resource_retirement_batched_prefixes: 0,
                         point_resource_preclaim_enabled: false,
                         point_resource_preclaim_sum_cache_enabled: false,
                         point_resource_preclaim_after_buffer_enabled: false,

@@ -979,7 +979,16 @@ impl WalV7OwnedBatchReservation {
             if !reservation.operation.admitted.load(Ordering::Acquire) {
                 return Err(WalV7ReservationError::ReservationMismatch);
             }
-            finish_operations.push(Arc::get_mut(&mut reservation.operation).is_some());
+            let finish_operation = match Arc::get_mut(&mut reservation.operation) {
+                Some(operation) => {
+                    if operation.finished {
+                        return Err(WalV7ReservationError::ReservationMismatch);
+                    }
+                    true
+                }
+                None => false,
+            };
+            finish_operations.push(finish_operation);
         }
         // Preserve the existing owner -> ledger lock order. All rejection
         // conditions are checked before mutating charges or operation state.
@@ -1670,8 +1679,6 @@ impl WalV7ResourceLedger {
     where
         F: Fn() -> bool,
     {
-        #[cfg(test)]
-        let _waiter = SourceSpoolWaiter::new(&self.inner.source_spool_waiters);
         let notification = self.inner.async_source_spool_changed.notified();
         tokio::pin!(notification);
         let closing_notification = closing.notified();
@@ -1691,6 +1698,11 @@ impl WalV7ResourceLedger {
             if !should_wait() {
                 return false;
             }
+            // Count only after the generation check has established that this
+            // task must wait. Tests can then release work after observing this
+            // count and know the notification future is already registered.
+            #[cfg(test)]
+            let _waiter = SourceSpoolWaiter::new(&self.inner.source_spool_waiters);
             tokio::select! {
                 () = notification.as_mut() => {
                     notification.set(self.inner.async_source_spool_changed.notified());
@@ -2209,6 +2221,53 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "bench")]
+    #[tokio::test]
+    async fn batched_point_retirement_notifies_registered_async_waiter() {
+        let ledger = WalV7ResourceLedger::new(batch_limits()).unwrap();
+        let owner = owner(ledger.clone());
+        let mut first = owner.reserve_batch(128).unwrap();
+        let mut second = owner.reserve_batch(128).unwrap();
+        first.mark_admitted();
+        second.mark_admitted();
+
+        let source_generation = owner.ledger.source_spool_generation();
+        let work_generation = owner.source_spool_work_generation();
+        let waiting_owner = Arc::clone(&owner);
+        let closing = Arc::new(tokio::sync::Notify::new());
+        let waiting_closing = Arc::clone(&closing);
+        let waiter = tokio::spawn(async move {
+            waiting_owner
+                .wait_for_source_spool_change_async_while(
+                    source_generation,
+                    work_generation,
+                    &waiting_closing,
+                    || true,
+                )
+                .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while owner.source_spool_waiter_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("async waiter did not register before batch retirement");
+
+        {
+            let mut reservations = [&mut first, &mut second];
+            WalV7OwnedBatchReservation::retire_after_io_batch(&mut reservations, 1).unwrap();
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), waiter)
+                .await
+                .expect("batched retirement did not notify the async waiter")
+                .unwrap()
+        );
+        assert_eq!(owner.source_spool_work_generation(), work_generation + 2);
+    }
+
     #[test]
     fn batch_completion_wakes_registered_source_spool_work_waiter() {
         let ledger = WalV7ResourceLedger::new(batch_limits()).unwrap();
@@ -2357,6 +2416,168 @@ mod tests {
 
         owner.retire_after_durable_cleanup().unwrap();
         assert_eq!(ledger.snapshot(), WalV7ResourceCharge::default());
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn batched_point_retirement_rejects_finished_operations_without_mutation() {
+        let limits = WalV7ResourceLimits {
+            max_logical_wal_bytes: 24_576,
+            max_source_spool_bytes: 30_720,
+            max_seal_index_bytes: 24,
+            ..batch_limits()
+        };
+        let ledger = WalV7ResourceLedger::new(limits).unwrap();
+        let owner = owner(ledger.clone());
+        let mut first = owner.reserve_batch(49).unwrap();
+        let mut second = owner.reserve_batch(49).unwrap();
+        let mut third = owner.reserve_batch(49).unwrap();
+        first.mark_admitted();
+        second.mark_admitted();
+        third.mark_admitted();
+
+        {
+            let mut reservations = [&mut first, &mut second];
+            WalV7OwnedBatchReservation::retire_after_io_batch(&mut reservations, 1).unwrap();
+        }
+        assert_eq!(owner.state.lock().active_batch_operations, 1);
+        let charged_after_first_retirement = ledger.snapshot();
+        let source_generation_after_first_retirement = owner.ledger.source_spool_generation();
+        let work_generation_after_first_retirement = owner.source_spool_work_generation();
+
+        let repeated = {
+            let mut reservations = [&mut first, &mut third];
+            WalV7OwnedBatchReservation::retire_after_io_batch(&mut reservations, 1)
+        };
+        assert!(matches!(
+            repeated,
+            Err(WalV7ReservationError::ReservationMismatch)
+        ));
+        assert_eq!(owner.state.lock().active_batch_operations, 1);
+        assert_eq!(ledger.snapshot(), charged_after_first_retirement);
+        assert_eq!(
+            owner.ledger.source_spool_generation(),
+            source_generation_after_first_retirement
+        );
+        assert_eq!(
+            owner.source_spool_work_generation(),
+            work_generation_after_first_retirement
+        );
+        assert!(third.frontier_credit_held);
+
+        {
+            let mut reservations = [&mut third];
+            WalV7OwnedBatchReservation::retire_after_io_batch(&mut reservations, 0).unwrap();
+        }
+        assert_eq!(owner.state.lock().active_batch_operations, 0);
+        owner.retire_after_durable_cleanup().unwrap();
+        assert_eq!(ledger.snapshot(), WalV7ResourceCharge::default());
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn batched_point_retirement_validation_failure_is_atomic() {
+        let ledger = WalV7ResourceLedger::new(batch_limits()).unwrap();
+        let owner = owner(ledger.clone());
+        let mut first = owner.reserve_batch(49).unwrap();
+        let mut second = owner.reserve_batch(49).unwrap();
+        first.mark_admitted();
+        second.mark_admitted();
+
+        let second_id = second.operation.id;
+        let original_token_charge = {
+            let mut state = owner.state.lock();
+            let token = state.reservations.get_mut(&second_id).unwrap();
+            let original = token.charge;
+            token.charge = original.checked_add(charge(1, 0, 0, 0, 0)).unwrap();
+            original
+        };
+        let ledger_before = ledger.snapshot();
+        let (active_before, owner_token_before) = {
+            let state = owner.state.lock();
+            (
+                state.active_batch_operations,
+                state.reservations.get(&second_id).unwrap().charge,
+            )
+        };
+        let source_generation_before = owner.ledger.source_spool_generation();
+        let work_generation_before = owner.source_spool_work_generation();
+
+        let result = {
+            let mut reservations = [&mut first, &mut second];
+            WalV7OwnedBatchReservation::retire_after_io_batch(&mut reservations, 1)
+        };
+        assert!(matches!(
+            result,
+            Err(WalV7ReservationError::ReservationMismatch)
+        ));
+        assert_eq!(ledger.snapshot(), ledger_before);
+        let state = owner.state.lock();
+        assert_eq!(state.active_batch_operations, active_before);
+        assert_eq!(
+            state.reservations.get(&second_id).unwrap().charge,
+            owner_token_before
+        );
+        drop(state);
+        assert!(first.frontier_credit_held);
+        assert!(second.frontier_credit_held);
+        assert_eq!(
+            owner.ledger.source_spool_generation(),
+            source_generation_before
+        );
+        assert_eq!(owner.source_spool_work_generation(), work_generation_before);
+
+        owner
+            .state
+            .lock()
+            .reservations
+            .get_mut(&second_id)
+            .unwrap()
+            .charge = original_token_charge;
+        {
+            let mut reservations = [&mut first, &mut second];
+            WalV7OwnedBatchReservation::retire_after_io_batch(&mut reservations, 1).unwrap();
+        }
+        owner.retire_after_durable_cleanup().unwrap();
+        assert_eq!(ledger.snapshot(), WalV7ResourceCharge::default());
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn batched_point_retirement_races_owner_retirement_without_leaking_quota() {
+        for _ in 0..16 {
+            let ledger = WalV7ResourceLedger::new(batch_limits()).unwrap();
+            let owner = owner(ledger.clone());
+            let mut first = owner.reserve_batch(49).unwrap();
+            let mut second = owner.reserve_batch(49).unwrap();
+            first.mark_admitted();
+            second.mark_admitted();
+            let start = Arc::new(Barrier::new(3));
+            let retiring_owner = Arc::clone(&owner);
+            let retirement_start = Arc::clone(&start);
+            let batch_start = Arc::clone(&start);
+
+            std::thread::scope(|scope| {
+                let owner_retirement = scope.spawn(move || {
+                    retirement_start.wait();
+                    retiring_owner.retire_after_durable_cleanup()
+                });
+                let batch_retirement = scope.spawn(move || {
+                    batch_start.wait();
+                    let mut reservations = [&mut first, &mut second];
+                    WalV7OwnedBatchReservation::retire_after_io_batch(&mut reservations, 1)
+                });
+                start.wait();
+                owner_retirement.join().unwrap().unwrap();
+                batch_retirement.join().unwrap().unwrap();
+            });
+
+            let state = owner.state.lock();
+            assert_eq!(state.active_batch_operations, 0);
+            assert!(state.reservations.is_empty());
+            drop(state);
+            assert_eq!(ledger.snapshot(), WalV7ResourceCharge::default());
+        }
     }
 
     #[test]

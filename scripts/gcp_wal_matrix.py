@@ -108,6 +108,18 @@ POINT_PROGRESS_CURSOR_ARMS = ("eager", "cursor")
 POINT_PROGRESS_CURSOR_V2_ARMS = ("eager", "progress_ring", "cursor")
 CURSOR_DIRECT_COMPLETION_ARMS = ("cursor_relay", "cursor_direct")
 CURSOR_SINGLETON_SUBMISSION_ARMS = ("cursor_control", "cursor_singleton")
+POINT_RESOURCE_RETIREMENT_WRITERS = (8, 16)
+POINT_RESOURCE_RETIREMENT_REPETITIONS = 5
+POINT_RESOURCE_RETIREMENT_NUM = 100_000
+POINT_RESOURCE_RETIREMENT_ARMS = ("per_ticket", "detach", "batch")
+POINT_RESOURCE_RETIREMENT_MODES = {"per_ticket": 0, "detach": 1, "batch": 2}
+POINT_RESOURCE_RETIREMENT_ORDERS = (
+    ("per_ticket", "detach", "batch"),
+    ("detach", "batch", "per_ticket"),
+    ("batch", "per_ticket", "detach"),
+    ("per_ticket", "batch", "detach"),
+    ("batch", "detach", "per_ticket"),
+)
 CURSOR_COALESCING_BUDGET_WRITERS = (8, 16)
 CURSOR_COALESCING_BUDGET_REPETITIONS = 5
 CURSOR_COALESCING_BUDGET_NUM = 100_000
@@ -772,6 +784,122 @@ def build_cursor_singleton_submission_schedule(
     return schedule
 
 
+def build_point_resource_retirement_schedule(
+    writers: Iterable[int] = POINT_RESOURCE_RETIREMENT_WRITERS,
+) -> list[dict[str, object]]:
+    """Build the same-binary Cursor Direct comparison for retirement modes 0/1/2."""
+    writer_counts = validate_writer_counts(writers)
+    if writer_counts != POINT_RESOURCE_RETIREMENT_WRITERS:
+        raise ValueError(
+            f"Point resource-retirement qualification requires writers {POINT_RESOURCE_RETIREMENT_WRITERS}"
+        )
+
+    cells = [
+        (writer, "point", "wal_concurrent", 1, None, 10)
+        for writer in writer_counts
+    ]
+    cells.append((16, "batch64", "wal_batch_concurrent", 64, 64, None))
+    schedule: list[dict[str, object]] = []
+    for writer, workload, bench, batch_entries, batch_size, sample_every in cells:
+        for repetition in range(1, POINT_RESOURCE_RETIREMENT_REPETITIONS + 1):
+            order = POINT_RESOURCE_RETIREMENT_ORDERS[(repetition - 1) % len(POINT_RESOURCE_RETIREMENT_ORDERS)]
+            for arm in order:
+                schedule.append({
+                    "run_index": len(schedule) + 1,
+                    "writer": writer,
+                    "workload": workload,
+                    "repetition": repetition,
+                    "arm": arm,
+                    "bench": bench,
+                    "batch_entries": batch_entries,
+                    "batch_size": batch_size,
+                    "num": POINT_RESOURCE_RETIREMENT_NUM,
+                    "sample_every": sample_every,
+                    "point_resource_retirement_mode": POINT_RESOURCE_RETIREMENT_MODES[arm],
+                    "extent_mode": "sliding-point-lookahead",
+                    "extent_window_bytes": POINT_LOOKAHEAD_WINDOW_BYTES,
+                    "frontier_mode": "direct",
+                    "progress_ring_enabled": True,
+                    "progress_cursor_enabled": True,
+                    "progress_counters_enabled": False,
+                    "cursor_direct_completion_enabled": True,
+                    "cursor_singleton_submission_enabled": False,
+                    "point_buffer_preallocation_enabled": False,
+                    "scan_diagnostics_enabled": False,
+                })
+    return schedule
+
+
+def build_point_resource_retirement_plan(
+    *, machine_type: str, machine_spec: Mapping[str, int], commit: str,
+    binary_sha256: str | None = None,
+) -> dict[str, object]:
+    """Describe the strict C1/C2 score matrix and its runtime mode proof."""
+    schedule = build_point_resource_retirement_schedule()
+    vcpus = int(machine_spec["vcpus"])
+    ssd_count = int(machine_spec["ssd_count"])
+    layout = "single Local SSD" if ssd_count == 1 else f"RAID0 over {ssd_count} Local SSDs"
+    plan: dict[str, object] = {
+        "plan_schema_version": 1,
+        "suite": "v8-point-resource-retirement",
+        "writers": list(POINT_RESOURCE_RETIREMENT_WRITERS),
+        "workloads": [
+            {"writer": writer, "name": workload, "bench": bench,
+             "batch_entries": entries, "batch_size": batch_size,
+             "num": POINT_RESOURCE_RETIREMENT_NUM, "sample_every": sample_every}
+            for writer, workload, bench, entries, batch_size, sample_every in (
+                *[(writer, "point", "wal_concurrent", 1, None, 10)
+                  for writer in POINT_RESOURCE_RETIREMENT_WRITERS],
+                (16, "batch64", "wal_batch_concurrent", 64, 64, None),
+            )
+        ],
+        "arms": list(POINT_RESOURCE_RETIREMENT_ARMS),
+        "mode_values": dict(POINT_RESOURCE_RETIREMENT_MODES),
+        "repetitions_per_cell": POINT_RESOURCE_RETIREMENT_REPETITIONS,
+        "arm_orders": [list(order) for order in POINT_RESOURCE_RETIREMENT_ORDERS],
+        "runs_planned": len(schedule),
+        "score_runs_planned": len(schedule),
+        "counterbalanced": True,
+        "machine_type": machine_type,
+        "vcpus": vcpus,
+        "local_ssd_count": ssd_count,
+        "local_ssd_total_gib": int(machine_spec["ssd_gib"]),
+        "runtime_protocol": f"single {vcpus}-vCPU host; {layout}; same source and binary for all arms",
+        "value_bytes": 1024,
+        "compaction": "none",
+        "commit": commit,
+        "binary_sha256": binary_sha256,
+        "progress_mode": "cursor (mode 2)",
+        "direct_completion_enabled": True,
+        "point_buffer_preallocation_enabled": False,
+        "point_frontier_credit_batch_enabled": False,
+        "singleton_submission_enabled": False,
+        "extent_preparation": "sliding-point-lookahead, 1 MiB; Point-only policy keeps Batch64 on fallocate",
+        "frontier_mode": "direct",
+        "coalescing": "dynamic",
+        "extent_policy_storage": "vec",
+        "data_submit_order": "ordered",
+        "latency_sample_every": 10,
+        "resource_retirement_ab": {
+            "environment_variable": "TOYKV_BENCH_V8_POINT_RESOURCE_RETIREMENT_MODE",
+            "values": {"per_ticket": "0", "detach": "1", "batch": "2"},
+            "runtime_proof_fields": [
+                "point_resource_retirement_mode",
+                "point_resource_retirement_detached_prefixes",
+                "point_resource_retirement_batched_prefixes",
+            ],
+        },
+        "qualification_note": (
+            "Same-host, same-source, same-release-binary comparison of per-ticket retirement (mode 0), "
+            "C1 detached Point prefixes (mode 1), and C2 batch retirement (mode 2). All arms use Cursor, "
+            "Direct Completion, Direct FRONTIER, dynamic coalescing, 1 MiB Point lookahead, and no Point "
+            "buffer preallocation or legacy credit batching. Batch64 is a no-detach regression guardrail. "
+            "Scored runs have no detailed profiling, and mode 2 must report successful batch-prefix counts."
+        ),
+    }
+    return plan
+
+
 def build_cursor_coalescing_budget_schedule(
     writers: Iterable[int] = CURSOR_COALESCING_BUDGET_WRITERS,
 ) -> list[dict[str, object]]:
@@ -1326,6 +1454,50 @@ def validate_cursor_singleton_submission_rows(
     if invalid_mode_flags:
         validation["complete"] = False
         validation["invalid_rows"].extend(dict(row) for row in invalid_mode_flags)
+    return validation
+
+
+def validate_point_resource_retirement_rows(
+    rows: list[Mapping[str, object]],
+    writers: Iterable[int] = POINT_RESOURCE_RETIREMENT_WRITERS,
+) -> dict[str, object]:
+    """Validate mode selection and prove C1/C2 were actually exercised."""
+    schedule = build_point_resource_retirement_schedule(writers)
+    validation = _validate_point_progress_rows(rows, schedule)
+    expected = {
+        (row["writer"], row["workload"], row["repetition"], row["arm"]): row
+        for row in schedule
+    }
+    invalid: list[Mapping[str, object]] = []
+    for row in rows:
+        identity = tuple(row.get(key) for key in ("writer", "workload", "repetition", "arm"))
+        planned = expected.get(identity)
+        mode = row.get("point_resource_retirement_mode")
+        detached = row.get("point_resource_retirement_detached_prefixes")
+        detached_tickets = row.get("point_resource_retirement_detached_tickets")
+        batched = row.get("point_resource_retirement_batched_prefixes")
+        valid = (
+            planned is not None
+            and mode == planned["point_resource_retirement_mode"]
+            and type(detached) is int and detached >= 0
+            and type(detached_tickets) is int and detached_tickets >= 0
+            and type(batched) is int and batched >= 0
+            and batched <= detached
+        )
+        if valid and row.get("workload") == "point":
+            expected_mode = int(planned["point_resource_retirement_mode"])
+            valid = (
+                (expected_mode == 0 and detached == 0 and detached_tickets == 0 and batched == 0)
+                or (expected_mode == 1 and detached > 0 and detached_tickets > 0 and batched == 0)
+                or (expected_mode == 2 and detached > 0 and detached_tickets > 0 and batched > 0)
+            )
+        elif valid:
+            valid = detached == 0 and detached_tickets == 0 and batched == 0
+        if not valid:
+            invalid.append(row)
+    if invalid:
+        validation["complete"] = False
+        validation["invalid_rows"].extend(dict(row) for row in invalid)
     return validation
 
 
