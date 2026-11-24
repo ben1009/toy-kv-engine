@@ -86,6 +86,11 @@ The [Point Resource Preclaim final A/B](benchmarks/rfc-028-v8-point-resource-pre
 compares Stage A with the optimized Stage A+B3 across five paired Point8,
 Point16, and Batch64 runs. B3 missed both Point throughput gates; keep Stage A
 and stop the preclaim optimization.
+The [Resource Retirement Ledger lock A/B](benchmarks/rfc-028-v8-resource-retirement-lock-gcp-20261124.md)
+compares the pre- and post-lock-merge implementations across V8 Point1/8/16,
+V7 Point16, and Batch64. Point16's paired throughput gain was 0.36% (3/5 wins),
+with unchanged Puts/Sync; the experiment did not establish a stable performance
+benefit. Its report documents the custom-plan validation and artifact recovery.
 The [coalescing-budget A/B](benchmarks/rfc-028-v8-cursor-coalescing-budget-gcp-20261123.md)
 found fixed 400 μs consistently ahead of Dynamic at 8 and 16 writers, but its
 paired throughput gains stayed below the 5% qualification threshold. Dynamic
