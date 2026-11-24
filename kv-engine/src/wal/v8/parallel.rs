@@ -1115,6 +1115,15 @@ impl WalV8ParallelCoordinator {
 
     #[cfg(feature = "bench")]
     pub(crate) fn try_ack_prefix(&self, ticket_end: u64) -> Result<bool> {
+        self.try_ack_prefix_after_durable_sample(ticket_end, || {})
+    }
+
+    #[cfg(feature = "bench")]
+    fn try_ack_prefix_after_durable_sample(
+        &self,
+        ticket_end: u64,
+        after_durable_sample: impl FnOnce(),
+    ) -> Result<bool> {
         ensure!(
             self.independent_ack_waiter_enabled(),
             "independent ACK waiter is disabled"
@@ -1124,21 +1133,28 @@ impl WalV8ParallelCoordinator {
             "v8 durability wait names an unassigned ticket prefix"
         );
 
-        if self
+        // Keep the independent path's failure semantics aligned with driver
+        // election: poison is terminal even if a concurrent publication
+        // advances the internal watermark. The outer WAL's already-published
+        // durable watermark remains the authority for ACKs that have escaped
+        // this coordinator.
+        ensure!(
+            !self.inner.ack_waiters.poisoned.load(Ordering::SeqCst),
+            "v8 Parallel coordinator is poisoned"
+        );
+        let durable = self
             .inner
             .ack_waiters
             .durable_ticket_end
             .load(Ordering::SeqCst)
-            >= ticket_end
-        {
-            return Ok(true);
-        }
+            >= ticket_end;
+        after_durable_sample();
         ensure!(
             !self.inner.ack_waiters.poisoned.load(Ordering::SeqCst),
             "v8 Parallel coordinator is poisoned"
         );
 
-        Ok(false)
+        Ok(durable)
     }
 
     #[cfg(feature = "bench")]
@@ -4581,7 +4597,7 @@ mod tests {
         partial_coordinator.poison();
         assert!(waiter_rx.recv_timeout(Duration::from_secs(1))?.is_err());
         waiter.join().expect("poisoned ACK waiter panicked");
-        assert!(partial_coordinator.try_ack_prefix(1)?);
+        assert!(partial_coordinator.try_ack_prefix(1).is_err());
         assert!(partial_coordinator.try_ack_prefix(2).is_err());
 
         // A later Driver Drop must wake a waiting caller so it can retry
@@ -4616,6 +4632,92 @@ mod tests {
         successor.complete();
         drop(successor);
         assert!(handoff_coordinator.try_ack_prefix(1)?);
+
+        Ok(())
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn independent_ack_poison_after_durable_sample_wins() -> Result<()> {
+        let coordinator = coordinator(4)?;
+        coordinator.set_independent_ack_waiter_enabled(true)?;
+        let pending = batch(40);
+        let mut encoded = admit(&pending, &coordinator)?.encode()?;
+        mark_producer_ready(&mut encoded, &coordinator, true)?;
+
+        let waiting = coordinator.clone();
+        let (sampled_tx, sampled_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            waiting.try_ack_prefix_after_durable_sample(1, || {
+                sampled_tx
+                    .send(())
+                    .expect("test receiver remains connected");
+                resume_rx.recv().expect("test sender remains connected");
+            })
+        });
+
+        sampled_rx.recv_timeout(Duration::from_secs(1))?;
+        let mut driver = coordinator
+            .acquire_durability_driver(1)?
+            .context("missing durability driver for concurrent publication")?;
+        let frontier = coordinator.reserve_frontier(1)?;
+        coordinator.publish_durable_frontier(frontier)?;
+        encoded.disarm_after_durable();
+        driver.complete();
+        drop(driver);
+        coordinator.poison();
+        resume_tx
+            .send(())
+            .expect("ACK sample waiter remains connected");
+
+        assert!(waiter.join().expect("ACK sample waiter panicked").is_err());
+        assert!(coordinator.try_ack_prefix(1).is_err());
+
+        Ok(())
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn independent_ack_poison_between_fast_path_and_driver_election_wins() -> Result<()> {
+        let coordinator = coordinator(4)?;
+        coordinator.set_independent_ack_waiter_enabled(true)?;
+        let pending = batch(50);
+        let mut encoded = admit(&pending, &coordinator)?.encode()?;
+        mark_producer_ready(&mut encoded, &coordinator, true)?;
+
+        let waiting = coordinator.clone();
+        let (fast_path_tx, fast_path_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || -> Result<()> {
+            ensure!(!waiting.try_ack_prefix(1)?, "ticket unexpectedly durable");
+            fast_path_tx
+                .send(())
+                .expect("test receiver remains connected");
+            resume_rx.recv().expect("test sender remains connected");
+            waiting.try_acquire_durability_driver(1).map(|_| ())
+        });
+
+        fast_path_rx.recv_timeout(Duration::from_secs(1))?;
+        let mut driver = coordinator
+            .acquire_durability_driver(1)?
+            .context("missing durability driver for concurrent publication")?;
+        let frontier = coordinator.reserve_frontier(1)?;
+        coordinator.publish_durable_frontier(frontier)?;
+        encoded.disarm_after_durable();
+        driver.complete();
+        drop(driver);
+        coordinator.poison();
+        resume_tx
+            .send(())
+            .expect("ACK fast-path waiter remains connected");
+
+        assert!(
+            waiter
+                .join()
+                .expect("ACK fast-path waiter panicked")
+                .is_err()
+        );
 
         Ok(())
     }

@@ -40264,22 +40264,34 @@ mod tests {
     }
 
     #[cfg(all(target_os = "linux", feature = "bench"))]
-    #[test]
-    fn v8_dedicated_durability_driver_rotates_and_recovers() -> anyhow::Result<()> {
+    fn v8_ack_mode_rotates_and_recovers(
+        test_name: &str,
+        child_env: &str,
+        dedicated_driver_enabled: bool,
+        independent_ack_waiter_enabled: bool,
+    ) -> anyhow::Result<()> {
         use anyhow::Context;
 
-        const CHILD_ENV: &str = "TOYKV_TEST_V8_DEDICATED_ROTATION_CHILD";
-
-        if std::env::var_os(CHILD_ENV).is_none() {
+        if std::env::var_os(child_env).is_none() {
             let status = std::process::Command::new(std::env::current_exe()?)
                 .arg("--nocapture")
-                .arg("v8_dedicated_durability_driver_rotates_and_recovers")
-                .env(CHILD_ENV, "1")
-                .env("TOYKV_BENCH_V8_DEDICATED_DURABILITY_DRIVER", "1")
+                .arg(test_name)
+                .env(child_env, "1")
+                .env(
+                    "TOYKV_BENCH_V8_DEDICATED_DURABILITY_DRIVER",
+                    if dedicated_driver_enabled { "1" } else { "0" },
+                )
                 .env("TOYKV_BENCH_V8_DURABILITY_DRIVER_DIAGNOSTICS", "0")
-                .env("TOYKV_BENCH_V8_INDEPENDENT_ACK_WAITER", "1")
+                .env(
+                    "TOYKV_BENCH_V8_INDEPENDENT_ACK_WAITER",
+                    if independent_ack_waiter_enabled {
+                        "1"
+                    } else {
+                        "0"
+                    },
+                )
                 .status()?;
-            anyhow::ensure!(status.success(), "dedicated-driver rotation child failed");
+            anyhow::ensure!(status.success(), "V8 ACK-mode rotation child failed");
             return Ok(());
         }
 
@@ -40334,13 +40346,19 @@ mod tests {
             first_active
                 .benchmark_wal_io_diagnostics()
                 .is_some_and(|diagnostics| {
-                    diagnostics.dedicated_durability_driver_enabled
+                    diagnostics.dedicated_durability_driver_enabled == dedicated_driver_enabled
                         && diagnostics.independent_ack_waiter_enabled
+                            == independent_ack_waiter_enabled
                 }),
-            "initial V8 WAL did not install the dedicated driver and independent ACK waiter"
+            "initial V8 WAL did not install the requested durability and ACK modes"
         );
-        let (driver_joined_tx, driver_joined_rx) = crossbeam_channel::bounded(1);
-        first_active.set_v8_dedicated_driver_joined_signal_for_test(driver_joined_tx)?;
+        let driver_joined_rx = if dedicated_driver_enabled {
+            let (driver_joined_tx, driver_joined_rx) = crossbeam_channel::bounded(1);
+            first_active.set_v8_dedicated_driver_joined_signal_for_test(driver_joined_tx)?;
+            Some(driver_joined_rx)
+        } else {
+            None
+        };
         let first_active_id = first_active.id();
         engine.put(b"before-rotation", VALUE)?;
         anyhow::ensure!(matches!(
@@ -40355,27 +40373,32 @@ mod tests {
             successor
                 .benchmark_wal_io_diagnostics()
                 .is_some_and(|diagnostics| {
-                    diagnostics.dedicated_durability_driver_enabled
+                    diagnostics.dedicated_durability_driver_enabled == dedicated_driver_enabled
                         && diagnostics.independent_ack_waiter_enabled
+                            == independent_ack_waiter_enabled
                 }),
-            "rotated V8 WAL did not install the dedicated driver and independent ACK waiter"
+            "rotated V8 WAL did not preserve the requested durability and ACK modes"
         );
         drop(successor);
 
         engine.put(b"after-rotation", VALUE)?;
         engine.close()?;
         drop(engine);
-        anyhow::ensure!(
-            matches!(
-                driver_joined_rx.try_recv(),
-                Err(crossbeam_channel::TryRecvError::Empty)
-            ),
-            "old dedicated driver exited while the old memtable owner was still retained"
-        );
+        if let Some(driver_joined_rx) = driver_joined_rx.as_ref() {
+            anyhow::ensure!(
+                matches!(
+                    driver_joined_rx.try_recv(),
+                    Err(crossbeam_channel::TryRecvError::Empty)
+                ),
+                "old dedicated driver exited while the old memtable owner was still retained"
+            );
+        }
         drop(first_active);
-        driver_joined_rx
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .context("old V8 WAL owner dropped before its dedicated driver joined")?;
+        if let Some(driver_joined_rx) = driver_joined_rx {
+            driver_joined_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .context("old V8 WAL owner dropped before its dedicated driver joined")?;
+        }
 
         let reopened = KvEngine::open_with_wal_io_mode(&database, options, WalIoMode::Parallel)?;
         let recovered_active = reopened.inner.state.load().memtable.clone();
@@ -40384,16 +40407,50 @@ mod tests {
             recovered_active
                 .benchmark_wal_io_diagnostics()
                 .is_some_and(|diagnostics| {
-                    diagnostics.dedicated_durability_driver_enabled
+                    diagnostics.dedicated_durability_driver_enabled == dedicated_driver_enabled
                         && diagnostics.independent_ack_waiter_enabled
+                            == independent_ack_waiter_enabled
                 }),
-            "recovered V8 WAL did not install the dedicated driver and independent ACK waiter"
+            "recovered V8 WAL did not preserve the requested durability and ACK modes"
         );
         assert_eq!(reopened.get(b"before-rotation")?.as_deref(), Some(VALUE));
         assert_eq!(reopened.get(b"after-rotation")?.as_deref(), Some(VALUE));
         reopened.close()?;
 
         Ok(())
+    }
+
+    #[cfg(all(target_os = "linux", feature = "bench"))]
+    #[test]
+    fn v8_dedicated_durability_driver_rotates_and_recovers() -> anyhow::Result<()> {
+        v8_ack_mode_rotates_and_recovers(
+            "v8_dedicated_durability_driver_rotates_and_recovers",
+            "TOYKV_TEST_V8_DEDICATED_ROTATION_CHILD",
+            true,
+            false,
+        )
+    }
+
+    #[cfg(all(target_os = "linux", feature = "bench"))]
+    #[test]
+    fn v8_caller_driven_independent_ack_rotates_and_recovers() -> anyhow::Result<()> {
+        v8_ack_mode_rotates_and_recovers(
+            "v8_caller_driven_independent_ack_rotates_and_recovers",
+            "TOYKV_TEST_V8_CALLER_ACK_ROTATION_CHILD",
+            false,
+            true,
+        )
+    }
+
+    #[cfg(all(target_os = "linux", feature = "bench"))]
+    #[test]
+    fn v8_dedicated_independent_ack_rotates_and_recovers() -> anyhow::Result<()> {
+        v8_ack_mode_rotates_and_recovers(
+            "v8_dedicated_independent_ack_rotates_and_recovers",
+            "TOYKV_TEST_V8_DEDICATED_ACK_ROTATION_CHILD",
+            true,
+            true,
+        )
     }
 
     #[cfg(all(target_os = "linux", feature = "bench"))]
