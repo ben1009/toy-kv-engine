@@ -501,17 +501,14 @@ impl WalV7ReservationOwner {
         {
             return Err(WalV7ReservationError::InvalidBatchLength);
         }
-        self.reserve_owned_batch(frontier_source_credit, || {
-            self.ledger.reserve(charge).map(Some)
-        })?
-        .ok_or(WalV7ReservationError::UnknownReservation)
+        self.reserve_owned_batch(frontier_source_credit, charge)
     }
 
     fn reserve_owned_batch(
         self: &Arc<Self>,
         frontier_source_credit: u64,
-        reserve: impl FnOnce() -> Result<Option<WalV7Reservation>, WalV7ReservationError>,
-    ) -> Result<Option<WalV7OwnedBatchReservation>, WalV7ReservationError> {
+        charge: WalV7ResourceCharge,
+    ) -> Result<WalV7OwnedBatchReservation, WalV7ReservationError> {
         let (_owner_lock_timer, mut state) =
             mutex_diagnostics::lock(&self.state, MutexLockKind::ReservationOwner);
         if state.retired {
@@ -521,15 +518,13 @@ impl WalV7ReservationOwner {
             .active_batch_operations
             .checked_add(1)
             .ok_or(WalV7ReservationError::ArithmeticOverflow)?;
-        let Some(reservation) = reserve()? else {
-            return Ok(None);
-        };
+        let reservation = self.ledger.reserve(charge)?;
         let id = reservation.id;
         state.reservations.insert(id, reservation);
         state.active_batch_operations = active_batch_operations;
         drop(state);
 
-        Ok(Some(WalV7OwnedBatchReservation {
+        Ok(WalV7OwnedBatchReservation {
             operation: Arc::new(WalV7BatchOperation {
                 owner: Arc::clone(self),
                 id,
@@ -538,7 +533,7 @@ impl WalV7ReservationOwner {
             }),
             frontier_credit_held: true,
             frontier_source_credit,
-        }))
+        })
     }
 
     /// Reserve source-spool bytes for an extent allocated ahead of admitted
@@ -2097,6 +2092,111 @@ mod tests {
     }
 
     #[test]
+    fn batch_completion_wakes_registered_source_spool_work_waiter() {
+        let ledger = WalV7ResourceLedger::new(batch_limits()).unwrap();
+        let owner = owner(ledger.clone());
+        let mut batch = owner.reserve_batch(128).unwrap();
+        batch.mark_admitted();
+        let source_generation = owner.ledger.source_spool_generation();
+        let work_generation = owner.source_spool_work_generation();
+        let waiting_owner = Arc::clone(&owner);
+        let waiter_deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let waiter = std::thread::spawn(move || {
+            waiting_owner.wait_for_source_spool_change_while(
+                source_generation,
+                work_generation,
+                || std::time::Instant::now() < waiter_deadline,
+            )
+        });
+
+        let registration_deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while owner.source_spool_waiter_count() == 0
+            && std::time::Instant::now() < registration_deadline
+        {
+            std::thread::yield_now();
+        }
+        let registered = owner.source_spool_waiter_count() > 0;
+
+        batch.finish_after_io().unwrap();
+        assert!(
+            waiter.join().unwrap(),
+            "batch completion did not wake the waiter"
+        );
+        assert!(registered, "the source-spool waiter was not registered");
+        assert!(!owner.source_spool_generation_changed(source_generation));
+        assert_eq!(
+            owner.source_spool_work_generation(),
+            work_generation.wrapping_add(1)
+        );
+        assert_eq!(
+            ledger.snapshot(),
+            charge(8192, 8192, 0, 0, 8),
+            "batch completion releases temporary memory without releasing source quota"
+        );
+    }
+
+    #[test]
+    fn concurrent_batch_retirement_releases_each_charge_once() {
+        let ledger = WalV7ResourceLedger::new(batch_limits()).unwrap();
+        let owner = owner(ledger.clone());
+        let mut first = owner.reserve_batch(128).unwrap();
+        let mut second = owner.reserve_batch(128).unwrap();
+        first.mark_admitted();
+        second.mark_admitted();
+        let start = Arc::new(Barrier::new(3));
+        let first_start = Arc::clone(&start);
+        let first_retirement = std::thread::spawn(move || {
+            first_start.wait();
+            first.finish_after_io()
+        });
+        let second_start = Arc::clone(&start);
+        let second_retirement = std::thread::spawn(move || {
+            second_start.wait();
+            second.finish_after_io()
+        });
+
+        start.wait();
+        first_retirement.join().unwrap().unwrap();
+        second_retirement.join().unwrap().unwrap();
+
+        let state = owner.state.lock();
+        assert_eq!(state.active_batch_operations, 0);
+        assert_eq!(state.reservations.len(), 2);
+        drop(state);
+        assert_eq!(owner.source_spool_work_generation(), 2);
+        assert_eq!(owner.ledger.source_spool_generation(), 0);
+        assert_eq!(ledger.snapshot(), charge(16384, 16384, 0, 0, 16));
+
+        owner.retire_after_durable_cleanup().unwrap();
+        assert_eq!(ledger.snapshot(), WalV7ResourceCharge::default());
+    }
+
+    #[test]
+    fn retired_owner_releases_reservations_after_last_batch_pin_drops() {
+        let ledger = WalV7ResourceLedger::new(batch_limits()).unwrap();
+        let owner = owner(ledger.clone());
+        let mut pinned = owner.reserve_batch(128).unwrap();
+        let mut final_operation = owner.reserve_batch(128).unwrap();
+        pinned.mark_admitted();
+        final_operation.mark_admitted();
+        let pin = pinned.pin_buffer();
+
+        pinned.finish_after_io().unwrap();
+        owner.retire_after_durable_cleanup().unwrap();
+        final_operation.finish_after_io().unwrap();
+
+        assert_eq!(owner.state.lock().active_batch_operations, 1);
+        assert_eq!(ledger.snapshot(), charge(16384, 16384, 0, 8320, 16));
+        drop(pin);
+
+        let state = owner.state.lock();
+        assert_eq!(state.active_batch_operations, 0);
+        assert!(state.reservations.is_empty());
+        drop(state);
+        assert_eq!(ledger.snapshot(), WalV7ResourceCharge::default());
+    }
+
+    #[test]
     fn batch_operation_hint_includes_preparation_and_lingering_pins() {
         let ledger = WalV7ResourceLedger::new(batch_limits()).unwrap();
         let owner = Arc::new(WalV7ReservationOwner {
@@ -2233,6 +2333,21 @@ mod tests {
             max_buffer_memory_bytes: 32768,
             max_seal_index_bytes: 16,
         }
+    }
+
+    fn owner(ledger: WalV7ResourceLedger) -> Arc<WalV7ReservationOwner> {
+        Arc::new(WalV7ReservationOwner {
+            ledger,
+            retained_resources: None,
+            installed_dev: 0,
+            installed_ino: 0,
+            state: Mutex::new(WalV7ReservationOwnerState {
+                retired: false,
+                active_batch_operations: 0,
+                active_source_spool_preparations: 0,
+                reservations: AHashMap::new(),
+            }),
+        })
     }
 
     #[test]
