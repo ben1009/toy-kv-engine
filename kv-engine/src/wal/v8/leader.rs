@@ -8961,7 +8961,7 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("point-prealloc-order-v8.wal");
         let installed = install_empty(&path, header())?;
-        let (mut writer, owner) = match open_accounted_parallel_writer(
+        let (writer, owner) = match open_accounted_parallel_writer(
             &path,
             &installed,
             SEGMENT_LIMIT,
@@ -9039,7 +9039,7 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("point-prealloc-bound-v8.wal");
         let installed = install_empty(&path, header())?;
-        let (mut writer, _owner) = match open_accounted_parallel_writer(
+        let (writer, _owner) = match open_accounted_parallel_writer(
             &path,
             &installed,
             SEGMENT_LIMIT,
