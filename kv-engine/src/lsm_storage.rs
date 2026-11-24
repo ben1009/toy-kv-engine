@@ -40436,6 +40436,27 @@ mod tests {
         const MAX_SEGMENT_BYTES: u64 = 4 * 1024 * 1024;
         const VALUE: &[u8] = &[0x5a; 1024];
 
+        fn put_through_transient_pitr_barrier(
+            engine: &KvEngine,
+            key: &[u8],
+            value: &[u8],
+        ) -> anyhow::Result<()> {
+            const PITR_BARRIER_ERROR: &str = "commit admission is stopped at a PITR barrier";
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                match engine.put(key, value) {
+                    Ok(()) => return Ok(()),
+                    Err(error)
+                        if format!("{error:#}").contains(PITR_BARRIER_ERROR)
+                            && std::time::Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+
         let directory = tempdir()?;
         let database = directory.path().join("db");
         let repository = directory.path().join("repository");
@@ -40498,7 +40519,8 @@ mod tests {
                         start_phase.wait();
                         for write in 0..WRITES_BEFORE_ROTATION {
                             let key = format!("writer-{writer}-phase-{phase}-put-{write}");
-                            let result = engine.put(key.as_bytes(), VALUE);
+                            let result =
+                                put_through_transient_pitr_barrier(&engine, key.as_bytes(), VALUE);
                             if let Err(error) = result {
                                 let mut first_error = first_error.lock();
                                 if first_error.is_none() {
@@ -40510,7 +40532,8 @@ mod tests {
                         after_rotation.wait();
                         for write in WRITES_BEFORE_ROTATION..WRITES_PER_PHASE {
                             let key = format!("writer-{writer}-phase-{phase}-put-{write}");
-                            let result = engine.put(key.as_bytes(), VALUE);
+                            let result =
+                                put_through_transient_pitr_barrier(&engine, key.as_bytes(), VALUE);
                             if let Err(error) = result {
                                 let mut first_error = first_error.lock();
                                 if first_error.is_none() {

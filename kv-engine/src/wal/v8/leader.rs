@@ -9707,17 +9707,32 @@ mod tests {
             expected.push(point);
         }
 
-        // Do not elect the driver until both Point tickets form one ready
-        // prefix. Otherwise the first completion can be retired as a
-        // singleton, which intentionally bypasses the C2 batch path.
+        // Cursor mode advances readiness only when the active driver drains
+        // completion events. Prime that cursor before the durability advance
+        // so both tickets are available to the C2 batch path together.
+        let ticket_end = last_ticket
+            .checked_add(1)
+            .context("C2 recovery test ticket end overflows")?;
+        let mut readiness_driver = writer
+            .coordinator
+            .acquire_durability_driver(ticket_end)?
+            .context("C2 recovery test could not acquire the readiness driver")?;
         let ready_deadline = Instant::now() + Duration::from_secs(10);
-        while writer.coordinator.frontier_ready_prefix().len() < expected.len() {
+        loop {
+            let snapshot = writer
+                .io
+                .advance_and_snapshot(&mut readiness_driver, false)?;
+            if snapshot.ready_prefix.len() >= expected.len() {
+                break;
+            }
             ensure!(
                 Instant::now() < ready_deadline,
                 "both Point tickets did not become frontier-ready"
             );
             thread::sleep(Duration::from_millis(1));
         }
+        readiness_driver.complete();
+        drop(readiness_driver);
 
         writer.advance_frontier_through(last_ticket)?;
         assert!(writer.io.completion_thread.lock().is_none());
