@@ -8460,7 +8460,7 @@ mod tests {
 
     #[cfg(feature = "chaos-testing")]
     #[test]
-    fn compact_catalog_corrupt_successor_fails_reopen() {
+    fn failpoint_compact_catalog_corrupt_successor_fails_reopen() {
         use crate::chaos::failpoint::{self, FailScenario};
         let _test_lock = BACKUP_FAILPOINT_TEST_LOCK.lock();
         let scenario = FailScenario::setup();
@@ -8505,7 +8505,7 @@ mod tests {
 
     #[cfg(feature = "chaos-testing")]
     #[test]
-    fn purge_successor_with_invalid_or_missing_metadata_preserves_primary() {
+    fn failpoint_purge_successor_with_invalid_or_missing_metadata_preserves_primary() {
         use crate::chaos::failpoint::{self, FailScenario};
         let _test_lock = BACKUP_FAILPOINT_TEST_LOCK.lock();
         let scenario = FailScenario::setup();
@@ -8906,7 +8906,7 @@ mod tests {
 
     #[cfg(feature = "chaos-testing")]
     #[test]
-    fn purge_io_failure_invalidates_same_handle() {
+    fn failpoint_purge_io_failure_invalidates_same_handle() {
         use crate::chaos::failpoint::{self, FailScenario};
         let _test_lock = BACKUP_FAILPOINT_TEST_LOCK.lock();
         let scenario = FailScenario::setup();
@@ -9665,7 +9665,7 @@ mod tests {
 
     #[cfg(all(target_os = "linux", feature = "chaos-testing"))]
     #[test]
-    fn restore_releases_repository_lock_while_materializing() {
+    fn failpoint_restore_releases_repository_lock_while_materializing() {
         use crate::chaos::failpoint::FailScenario;
         use std::{sync::mpsc, time::Duration};
 
@@ -9735,7 +9735,7 @@ mod tests {
 
     #[cfg(all(target_os = "linux", feature = "chaos-testing"))]
     #[test]
-    fn restore_invalidates_same_handle_before_unlock() {
+    fn failpoint_restore_invalidates_same_handle_before_unlock() {
         use crate::chaos::failpoint::FailScenario;
         use std::{sync::mpsc, time::Duration};
 
@@ -9804,7 +9804,7 @@ mod tests {
 
     #[cfg(all(target_os = "linux", feature = "chaos-testing"))]
     #[test]
-    fn restore_serializes_same_handle_purge_through_relock() {
+    fn failpoint_restore_serializes_same_handle_purge_through_relock() {
         use crate::chaos::failpoint::FailScenario;
         use std::{sync::mpsc, time::Duration};
 
@@ -9919,7 +9919,7 @@ mod tests {
 
     #[cfg(all(target_os = "linux", feature = "chaos-testing"))]
     #[test]
-    fn restore_panic_after_unlock_reacquires_repository_lock() {
+    fn failpoint_restore_panic_after_unlock_reacquires_repository_lock() {
         use crate::chaos::failpoint::{self, FailScenario};
         use std::{sync::mpsc, time::Duration};
 

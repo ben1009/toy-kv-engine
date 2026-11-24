@@ -9266,6 +9266,18 @@ mod tests {
         second_job.finish()?;
         assert_eq!((first_ticket, second_ticket), (0, 1));
 
+        // Wait until both tickets are simultaneously eligible before electing
+        // the driver. Otherwise the first completion may form a singleton
+        // durability advance, which intentionally does not use the detach path.
+        let ready_deadline = Instant::now() + Duration::from_secs(10);
+        while writer.coordinator.frontier_ready_prefix().len() < 2 {
+            ensure!(
+                Instant::now() < ready_deadline,
+                "both Point tickets did not become frontier-ready"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+
         let (driver_result_tx, driver_result_rx) = mpsc::channel();
         thread::scope(|scope| -> Result<()> {
             struct ReleaseDetachedPrefixHook(Option<crossbeam_channel::Sender<()>>);

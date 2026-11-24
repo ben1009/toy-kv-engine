@@ -589,7 +589,7 @@ fn checkpoint_concurrent_calls_serialize() {
 
 #[test]
 #[cfg(feature = "chaos-testing")]
-fn checkpoint_blocks_force_flush_until_checkpoint_boundary_finishes() {
+fn failpoint_checkpoint_blocks_force_flush_until_checkpoint_boundary_finishes() {
     let _test_guard = checkpoint_test_guard();
     let scenario = FailScenario::setup();
     failpoint::cfg("checkpoint.after_in_progress_marker", "pause").unwrap();
@@ -644,7 +644,7 @@ fn checkpoint_blocks_force_flush_until_checkpoint_boundary_finishes() {
 
 #[test]
 #[cfg(feature = "chaos-testing")]
-fn checkpoint_blocks_drain_flush_async_until_checkpoint_boundary_finishes() {
+fn failpoint_checkpoint_blocks_drain_flush_async_until_checkpoint_boundary_finishes() {
     let _test_guard = checkpoint_test_guard();
     let scenario = FailScenario::setup();
     failpoint::cfg("checkpoint.after_in_progress_marker", "pause").unwrap();
@@ -698,7 +698,7 @@ fn checkpoint_blocks_drain_flush_async_until_checkpoint_boundary_finishes() {
 
 #[test]
 #[cfg(feature = "chaos-testing")]
-fn checkpoint_pins_ssts_until_copy_finishes_during_compaction() {
+fn failpoint_checkpoint_pins_ssts_until_copy_finishes_during_compaction() {
     let _test_guard = checkpoint_test_guard();
     let scenario = FailScenario::setup();
     failpoint::cfg("checkpoint.after_sst_pin_before_copy", "pause").unwrap();
@@ -757,7 +757,7 @@ fn checkpoint_pins_ssts_until_copy_finishes_during_compaction() {
 
 #[test]
 #[cfg(feature = "chaos-testing")]
-fn checkpoint_pins_vlogs_until_copy_finishes_during_reclaim() {
+fn failpoint_checkpoint_pins_vlogs_until_copy_finishes_during_reclaim() {
     let _test_guard = checkpoint_test_guard();
     let scenario = FailScenario::setup();
     failpoint::cfg("checkpoint.after_sst_pin_before_copy", "pause").unwrap();
@@ -824,56 +824,56 @@ fn checkpoint_pins_vlogs_until_copy_finishes_during_reclaim() {
 
 #[test]
 #[cfg(feature = "chaos-testing")]
-fn checkpoint_crash_after_in_progress_marker_leaves_target_reusable() {
+fn failpoint_checkpoint_crash_after_in_progress_marker_leaves_target_reusable() {
     let _test_guard = checkpoint_test_guard();
     run_checkpoint_marker_failpoint("checkpoint.after_in_progress_marker");
 }
 
 #[test]
 #[cfg(feature = "chaos-testing")]
-fn checkpoint_crash_after_tmp_dir_create_leaves_target_reusable() {
+fn failpoint_checkpoint_crash_after_tmp_dir_create_leaves_target_reusable() {
     let _test_guard = checkpoint_test_guard();
     run_checkpoint_marker_failpoint("checkpoint.after_tmp_dir_create");
 }
 
 #[test]
 #[cfg(feature = "chaos-testing")]
-fn checkpoint_crash_after_file_copy_leaves_target_reusable() {
+fn failpoint_checkpoint_crash_after_file_copy_leaves_target_reusable() {
     let _test_guard = checkpoint_test_guard();
     run_checkpoint_marker_failpoint("checkpoint.after_file_copy");
 }
 
 #[test]
 #[cfg(feature = "chaos-testing")]
-fn checkpoint_crash_after_manifest_write_leaves_target_reusable() {
+fn failpoint_checkpoint_crash_after_manifest_write_leaves_target_reusable() {
     let _test_guard = checkpoint_test_guard();
     run_checkpoint_marker_failpoint("checkpoint.after_manifest_write");
 }
 
 #[test]
 #[cfg(feature = "chaos-testing")]
-fn checkpoint_crash_after_ready_marker_leaves_target_reusable() {
+fn failpoint_checkpoint_crash_after_ready_marker_leaves_target_reusable() {
     let _test_guard = checkpoint_test_guard();
     run_checkpoint_marker_failpoint("checkpoint.after_ready_marker");
 }
 
 #[test]
 #[cfg(feature = "chaos-testing")]
-fn checkpoint_crash_after_checkpoint_marker_leaves_target_reusable() {
+fn failpoint_checkpoint_crash_after_checkpoint_marker_leaves_target_reusable() {
     let _test_guard = checkpoint_test_guard();
     run_checkpoint_marker_failpoint("checkpoint.after_checkpoint_marker");
 }
 
 #[test]
 #[cfg(feature = "chaos-testing")]
-fn checkpoint_crash_before_publish_rename_leaves_target_reusable() {
+fn failpoint_checkpoint_crash_before_publish_rename_leaves_target_reusable() {
     let _test_guard = checkpoint_test_guard();
     run_checkpoint_marker_failpoint("checkpoint.before_publish_rename");
 }
 
 #[test]
 #[cfg(feature = "chaos-testing")]
-fn checkpoint_crash_after_publish_rename_publishes_checkpoint() {
+fn failpoint_checkpoint_crash_after_publish_rename_publishes_checkpoint() {
     let _test_guard = checkpoint_test_guard();
     let scenario = FailScenario::setup();
     failpoint::cfg("checkpoint.after_publish_rename_before_dir_sync", "panic").unwrap();

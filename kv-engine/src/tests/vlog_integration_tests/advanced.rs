@@ -441,7 +441,7 @@ fn test_vlog_retire_replay_keeps_shared_file_live() {
 
 #[cfg(feature = "chaos-testing")]
 #[test]
-fn test_vlog_retirement_manifest_failure_retries_on_gc() {
+fn failpoint_test_vlog_retirement_manifest_failure_retries_on_gc() {
     use std::sync::OnceLock;
 
     use crate::chaos::failpoint::{self, FailScenario};

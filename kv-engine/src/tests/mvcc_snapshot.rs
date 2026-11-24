@@ -447,7 +447,7 @@ fn snapshot_get_async_outlives_snapshot_drop() {
 /// the snapshot pin live until that closure completes.
 #[cfg(feature = "chaos-testing")]
 #[test]
-fn cancelled_dispatched_snapshot_get_keeps_close_waiting() {
+fn failpoint_cancelled_dispatched_snapshot_get_keeps_close_waiting() {
     static LOCK: OnceLock<parking_lot::Mutex<()>> = OnceLock::new();
     let _lock = LOCK.get_or_init(|| parking_lot::Mutex::new(())).lock();
     let scenario = FailScenario::setup();
@@ -495,7 +495,7 @@ fn cancelled_dispatched_snapshot_get_keeps_close_waiting() {
 /// snapshot pin until its blocking cursor construction completes.
 #[cfg(feature = "chaos-testing")]
 #[test]
-fn cancelled_dispatched_snapshot_scan_keeps_close_waiting() {
+fn failpoint_cancelled_dispatched_snapshot_scan_keeps_close_waiting() {
     static LOCK: OnceLock<parking_lot::Mutex<()>> = OnceLock::new();
     let _lock = LOCK.get_or_init(|| parking_lot::Mutex::new(())).lock();
     let scenario = FailScenario::setup();
@@ -695,7 +695,7 @@ fn snapshot_prefix_parallel_scan_async_filters_prefix() {
 /// worker-held snapshot pin live until those blocking reads stop.
 #[cfg(feature = "chaos-testing")]
 #[test]
-fn cancelled_dispatched_parallel_snapshot_scan_keeps_close_waiting() {
+fn failpoint_cancelled_dispatched_parallel_snapshot_scan_keeps_close_waiting() {
     static LOCK: OnceLock<parking_lot::Mutex<()>> = OnceLock::new();
     let _lock = LOCK.get_or_init(|| parking_lot::Mutex::new(())).lock();
     let scenario = FailScenario::setup();

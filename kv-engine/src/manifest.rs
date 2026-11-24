@@ -213,7 +213,7 @@ mod manifest_revalidation_tests {
     }
 
     #[test]
-    fn recovery_discards_an_incomplete_segment_sealed_after_its_intent() {
+    fn failpoint_recovery_discards_an_incomplete_segment_sealed_after_its_intent() {
         use super::ManifestRecord;
         use crate::pitr::manifest::{PersistedChainAnchor, PitrManifestRecord};
 
@@ -277,7 +277,7 @@ mod manifest_revalidation_tests {
     }
 
     #[test]
-    fn recovery_discards_an_incomplete_segment_sealed_after_migration_intent() {
+    fn failpoint_recovery_discards_an_incomplete_segment_sealed_after_migration_intent() {
         use super::ManifestRecord;
         use crate::pitr::manifest::{ActiveBoundary, PersistedChainAnchor, PitrManifestRecord};
 
@@ -349,7 +349,7 @@ mod manifest_revalidation_tests {
     }
 
     #[test]
-    fn recovery_retains_sealing_intent_across_unrelated_progress() {
+    fn failpoint_recovery_retains_sealing_intent_across_unrelated_progress() {
         use crate::pitr::manifest::{PersistedRecordedAt, PitrManifestRecord};
 
         for (progress, recoverable) in [
