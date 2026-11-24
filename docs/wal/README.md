@@ -95,6 +95,10 @@ The [V8 Point Resource Retirement C2 A/B](benchmarks/rfc-028-v8-point-resource-r
 compares per-ticket retirement, C1 detach, and C2 batch retirement across Point8,
 Point16, and Batch64. C2 improved paired Point throughput by 2.07% and 3.27%,
 below the 5% retention gate; it is not performance-qualified for default use.
+The [Stage A plus C2 follow-up](benchmarks/rfc-028-v8-point-resource-retirement-stage-a-c2-gcp-20261124.md)
+repeats the three-way comparison with Point buffer preallocation enabled. The
+combined C2 gain was 4.70% at Point8 and 1.25% at Point16, still below the 5%
+gate; Batch64 remained effectively unchanged.
 The [coalescing-budget A/B](benchmarks/rfc-028-v8-cursor-coalescing-budget-gcp-20261123.md)
 found fixed 400 μs consistently ahead of Dynamic at 8 and 16 writers, but its
 paired throughput gains stayed below the 5% qualification threshold. Dynamic

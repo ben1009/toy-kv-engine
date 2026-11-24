@@ -34,6 +34,7 @@ and do not define the current writer selection.
 - [RFC 028 V7/V8 Point buffer preallocation same-host GCP qualification, 2026-11-23](wal/benchmarks/rfc-028-v7-v8-point-preallocation-same-host-gcp-20261123.md)
 - [RFC 028 V8 Point resource preclaim Stage B GCP A/B — throughput gate failed, 2026-11-23](wal/benchmarks/rfc-028-v8-point-resource-preclaim-stage-b-gcp-20261123.md)
 - [RFC 028 V8 Point Resource Preclaim final GCP A/B — Stage B3 missed the Point throughput gate, 2026-11-24](wal/benchmarks/rfc-028-v8-point-resource-preclaim-final-gcp-20261124.md)
+- [RFC 028 V8 Point Resource Retirement with Stage A GCP A/B, 2026-11-24](wal/benchmarks/rfc-028-v8-point-resource-retirement-stage-a-c2-gcp-20261124.md)
 
 ## Benchmark reports
 
