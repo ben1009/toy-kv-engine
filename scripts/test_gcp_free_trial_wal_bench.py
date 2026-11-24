@@ -393,6 +393,16 @@ class PointProgressRingQualificationTests(unittest.TestCase):
         if "cursor_singleton_submission_enabled" in row:
             start["cursor_singleton_submission_enabled"] = bool(row["cursor_singleton_submission_enabled"])
             end["cursor_singleton_submission_enabled"] = bool(row["cursor_singleton_submission_enabled"])
+        if "point_buffer_preallocation_enabled" in row:
+            enabled = bool(row["point_buffer_preallocation_enabled"])
+            attempts = POINT_RESOURCE_RETIREMENT_NUM if enabled and row["workload"] == "point" else 0
+            for snapshot in (start, end):
+                snapshot["point_buffer_preallocation_enabled"] = enabled
+                snapshot["point_buffer_preallocation_attempts"] = 0
+                snapshot["point_buffer_preallocation_hits"] = 0
+                snapshot["point_buffer_preallocation_fallbacks"] = 0
+            end["point_buffer_preallocation_attempts"] = attempts
+            end["point_buffer_preallocation_hits"] = attempts
         point = row["workload"] == "point"
         speed = 100_000.0
         if ring_enabled and row["writer"] in (8, 16) and point:
@@ -452,6 +462,7 @@ class PointProgressRingQualificationTests(unittest.TestCase):
         singleton_submission: bool = False,
         coalescing_budget: bool = False,
         retirement: bool = False,
+        retirement_preallocation: bool = False,
         cursor_schema_version: int | None = None,
         include_schema_version: bool = True,
     ) -> Path:
@@ -460,7 +471,10 @@ class PointProgressRingQualificationTests(unittest.TestCase):
         commit = "a" * 40
         binary_sha = "b" * 64
         if retirement:
-            schedule_builder = build_point_resource_retirement_schedule
+            schedule_builder = lambda selected_writers: build_point_resource_retirement_schedule(
+                selected_writers,
+                point_buffer_preallocation_enabled=retirement_preallocation,
+            )
             plan_builder = build_point_resource_retirement_plan
         elif coalescing_budget:
             schedule_builder = build_cursor_coalescing_budget_schedule
@@ -492,6 +506,7 @@ class PointProgressRingQualificationTests(unittest.TestCase):
                 machine_spec=BENCH.MACHINE_SPECS["c4-standard-16-lssd"],
                 commit=commit,
                 binary_sha256=binary_sha,
+                point_buffer_preallocation_enabled=retirement_preallocation,
             )
         elif coalescing_budget:
             plan = plan_builder(
@@ -531,13 +546,17 @@ class PointProgressRingQualificationTests(unittest.TestCase):
             run_dir = results / run_id
             run_dir.mkdir()
             raw = cls._raw_record(row)
+            record_validator = (
+                progress_ring_runner._validate_point_resource_retirement_stage_a_record
+                if retirement_preallocation else progress_ring_runner._validate_record
+            )
             metadata = {
                 **row,
                 "source_commit": commit,
                 "binary_sha256": binary_sha,
                 "exit_code": 0,
                 "duration_seconds": 5.0,
-                **progress_ring_runner._validate_record(raw, row),
+                **record_validator(raw, row),
             }
             (run_dir / "result.json").write_text(json.dumps(raw), encoding="utf-8")
             (run_dir / "run-metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
@@ -547,13 +566,19 @@ class PointProgressRingQualificationTests(unittest.TestCase):
                     row.get("progress_counters_enabled"), row.get("cursor_direct_completion_enabled"),
                     row.get("cursor_singleton_submission_enabled"),
                     row.get("coalescing_budget_us"),
+                    point_buffer_preallocation_enabled=(
+                        True if row.get("point_buffer_preallocation_enabled") is True else None
+                    ),
                     point_resource_retirement_mode=row.get("point_resource_retirement_mode"),
                 ),
                 encoding="utf-8",
             )
             rows.append(metadata)
         if retirement:
-            summary = progress_ring_runner._point_resource_retirement_summary(rows, len(schedule))
+            summary = progress_ring_runner._point_resource_retirement_summary(
+                rows, len(schedule),
+                point_buffer_preallocation_enabled=retirement_preallocation,
+            )
         elif coalescing_budget:
             summary = progress_ring_runner._coalescing_budget_summary(rows, writers, len(schedule))
         elif singleton_submission:
@@ -804,6 +829,38 @@ class PointProgressRingQualificationTests(unittest.TestCase):
             self.assertFalse(verification["verified"])
             self.assertTrue(any("raw result" in error for error in verification["errors"]))
 
+    def test_point_resource_retirement_stage_a_proves_preallocation_hits(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            results = self._make_fixture(
+                Path(temporary), retirement=True, retirement_preallocation=True,
+            )
+            verification = progress_ring_runner.verify_point_resource_retirement_results_directory(results)
+            self.assertTrue(verification["verified"], verification["errors"])
+            plan = json.loads((results / "benchmark-plan.json").read_text(encoding="utf-8"))
+            self.assertTrue(plan["point_buffer_preallocation_enabled"])
+            summary = json.loads((results / "summary.json").read_text(encoding="utf-8"))
+            point_rows = [row for row in summary["results"] if row["workload"] == "point"]
+            batch_rows = [row for row in summary["results"] if row["workload"] == "batch64"]
+            self.assertTrue(all(row["point_buffer_preallocation_hits"] > 0 for row in point_rows))
+            self.assertTrue(all(row["point_buffer_preallocation_attempts"] == 0 for row in batch_rows))
+            point_env = (results / progress_ring_runner._run_id(point_rows[0]) / "environment.txt").read_text(
+                encoding="utf-8",
+            )
+            batch_env = (results / progress_ring_runner._run_id(batch_rows[0]) / "environment.txt").read_text(
+                encoding="utf-8",
+            )
+            self.assertIn("TOYKV_BENCH_V8_POINT_BUFFER_PREALLOC=1\n", point_env)
+            self.assertNotIn("TOYKV_BENCH_V8_POINT_BUFFER_PREALLOC", batch_env)
+
+            run_id = progress_ring_runner._run_id(point_rows[0])
+            raw_path = results / run_id / "result.json"
+            raw = json.loads(raw_path.read_text(encoding="utf-8"))
+            raw["result"]["wal_pipeline"]["wal_io_end"]["point_buffer_preallocation_hits"] = 0
+            raw_path.write_text(json.dumps(raw), encoding="utf-8")
+            verification = progress_ring_runner.verify_point_resource_retirement_results_directory(results)
+            self.assertFalse(verification["verified"])
+            self.assertTrue(any("preallocation" in error for error in verification["errors"]))
+
     def test_point_resource_retirement_cli_uses_fixed_matrix(self) -> None:
         args = BENCH.parse_args([
             "--commit", "a" * 40, "--project", "test-project", "--zone", "us-central1-a",
@@ -815,22 +872,34 @@ class PointProgressRingQualificationTests(unittest.TestCase):
         self.assertEqual(args.writers, POINT_RESOURCE_RETIREMENT_WRITERS)
         self.assertEqual(args.num, POINT_RESOURCE_RETIREMENT_NUM)
 
+    def test_point_resource_retirement_stage_a_cli_uses_fixed_matrix(self) -> None:
+        args = BENCH.parse_args([
+            "--commit", "a" * 40, "--project", "test-project", "--zone", "us-central1-a",
+            "--network", "isolated-bench", "--subnet", "isolated-subnet", "--ssh-source-range", "192.0.2.1/32",
+            "--machine-type", "c4-standard-16-lssd", "--v8-point-resource-retirement-stage-a-ab",
+            "--max-runtime-minutes", "60", "--estimated-hourly-cost-usd", "0.01",
+            "--max-estimated-spend-usd", "1", "--preflight-only",
+        ])
+        self.assertEqual(args.writers, POINT_RESOURCE_RETIREMENT_WRITERS)
+        self.assertEqual(args.num, POINT_RESOURCE_RETIREMENT_NUM)
+
     def test_remote_runner_accepts_point_resource_retirement_suite(self) -> None:
         remote_script = Path(__file__).with_name("gcp-free-trial-wal-bench-remote.sh")
-        completed = subprocess.run(
-            [
-                "bash", str(remote_script), "a" * 40, "100000", "test-project", "us-central1-a",
-                "wal-test", "4102444800", "c4-standard-16-lssd", "8,16",
-                "v8-point-resource-retirement", "-", "-",
-            ],
-            cwd=Path(__file__).resolve().parents[1],
-            capture_output=True,
-            check=False,
-            text=True,
-            timeout=5,
-        )
-        self.assertNotEqual(completed.returncode, 64)
-        self.assertNotIn("unsupported benchmark suite", completed.stderr)
+        for suite in ("v8-point-resource-retirement", "v8-point-resource-retirement-stage-a"):
+            with self.subTest(suite=suite):
+                completed = subprocess.run(
+                    [
+                        "bash", str(remote_script), "a" * 40, "100000", "test-project", "us-central1-a",
+                        "wal-test", "4102444800", "c4-standard-16-lssd", "8,16", suite, "-", "-",
+                    ],
+                    cwd=Path(__file__).resolve().parents[1],
+                    capture_output=True,
+                    check=False,
+                    text=True,
+                    timeout=5,
+                )
+                self.assertNotEqual(completed.returncode, 64)
+                self.assertNotIn("unsupported benchmark suite", completed.stderr)
 
     def test_run_suite_writes_separate_direct_completion_plan_and_schedule(self) -> None:
         binary = Path("scripts/gcp_v8_point_progress_ring_runner.py")

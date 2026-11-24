@@ -209,6 +209,7 @@ def _expected_environment_text(
     cursor_direct_completion_enabled: bool | None = None,
     cursor_singleton_submission_enabled: bool | None = None,
     coalescing_budget_us: int | None = None,
+    point_buffer_preallocation_enabled: bool | None = None,
     point_resource_retirement_mode: int | None = None,
 ) -> str:
     if progress_ring_enabled and not progress_cursor_enabled:
@@ -224,6 +225,7 @@ def _expected_environment_text(
         key: value for key, value in _environment(
             progress_ring_enabled, progress_cursor_enabled, progress_counters_enabled,
             cursor_direct_completion_enabled, cursor_singleton_submission_enabled, coalescing_budget_us,
+            point_buffer_preallocation_enabled=point_buffer_preallocation_enabled,
             point_resource_retirement_mode=point_resource_retirement_mode,
         ).items()
         if key not in ("PATH", "HOME", "TMPDIR", "LC_ALL")
@@ -437,6 +439,52 @@ def _validate_record(record: dict[str, Any], row: dict[str, Any]) -> dict[str, A
     return metrics
 
 
+def _validate_point_resource_retirement_stage_a_record(
+    record: dict[str, Any], row: dict[str, Any],
+) -> dict[str, Any]:
+    """Validate retirement-mode V8 runs and prove Stage A on Point only."""
+    metrics = _validate_record(record, row)
+    result = _require_object(record.get("result"), "benchmark result")
+    pipeline = _require_object(result.get("wal_pipeline"), "WAL pipeline metadata")
+    start = _require_object(pipeline.get("wal_io_start"), "WAL I/O start snapshot")
+    end = _require_object(pipeline.get("wal_io_end"), "WAL I/O end snapshot")
+    expected_enabled = row.get("point_buffer_preallocation_enabled") is True
+    if any(snapshot.get("point_buffer_preallocation_enabled") is not expected_enabled for snapshot in (start, end)):
+        raise ValueError("Point buffer preallocation differs from the Stage A retirement plan")
+
+    counter_names = (
+        "point_buffer_preallocation_attempts",
+        "point_buffer_preallocation_hits",
+        "point_buffer_preallocation_fallbacks",
+    )
+    deltas: dict[str, int] = {}
+    for name in counter_names:
+        before, after = start.get(name), end.get(name)
+        if type(before) is not int or type(after) is not int or after < before:
+            raise ValueError(f"{name} is missing or moved backwards")
+        deltas[name] = after - before
+
+    attempts = deltas["point_buffer_preallocation_attempts"]
+    hits = deltas["point_buffer_preallocation_hits"]
+    fallbacks = deltas["point_buffer_preallocation_fallbacks"]
+    if attempts != hits + fallbacks:
+        raise ValueError("Point buffer preallocation attempts do not equal hits plus fallbacks")
+    if row["workload"] == "point":
+        if expected_enabled and hits <= 0:
+            raise ValueError("Stage A Point run recorded no preallocation hits")
+        if not expected_enabled and any(deltas.values()):
+            raise ValueError("disabled Point arm entered the preallocation path")
+    elif any(deltas.values()):
+        raise ValueError("Batch64 entered the Point preallocation path")
+
+    metrics.update({
+        "point_buffer_preallocation_enabled_start": start["point_buffer_preallocation_enabled"],
+        "point_buffer_preallocation_enabled_end": end["point_buffer_preallocation_enabled"],
+        **deltas,
+    })
+    return metrics
+
+
 def _validate_point_preallocation_record(record: dict[str, Any], row: dict[str, Any]) -> dict[str, Any]:
     """Validate the V7/V8/preallocation arms and prove V8 mode from WAL snapshots."""
     record = _require_object(record, "benchmark record")
@@ -591,7 +639,12 @@ def _run_one(
     else:
         command.extend(("--wal-batch-size", str(row["batch_entries"])))
     preallocation_suite = candidate_mode == "v7-v8-point-preallocation"
-    retirement_suite = candidate_mode == "point-resource-retirement"
+    retirement_suite = candidate_mode in (
+        "point-resource-retirement", "point-resource-retirement-stage-a",
+    )
+    retirement_preallocation = (
+        True if retirement_suite and row.get("point_buffer_preallocation_enabled") is True else None
+    )
     environment = (
         _point_preallocation_environment(row)
         if preallocation_suite else
@@ -602,6 +655,7 @@ def _run_one(
             row.get("cursor_direct_completion_enabled"),
             row.get("cursor_singleton_submission_enabled"),
             row.get("coalescing_budget_us"),
+            point_buffer_preallocation_enabled=retirement_preallocation,
             point_resource_retirement_mode=(
                 int(row["point_resource_retirement_mode"]) if retirement_suite else None
             ),
@@ -616,6 +670,7 @@ def _run_one(
             row.get("cursor_direct_completion_enabled"),
             row.get("cursor_singleton_submission_enabled"),
             row.get("coalescing_budget_us"),
+            point_buffer_preallocation_enabled=retirement_preallocation,
             point_resource_retirement_mode=(
                 int(row["point_resource_retirement_mode"]) if retirement_suite else None
             ),
@@ -653,7 +708,12 @@ def _run_one(
     try:
         if completed.returncode != 0:
             raise ValueError(f"write-perf exited with status {completed.returncode}")
-        validator = _validate_point_preallocation_record if preallocation_suite else _validate_record
+        validator = (
+            _validate_point_preallocation_record if preallocation_suite else
+            _validate_point_resource_retirement_stage_a_record
+            if candidate_mode == "point-resource-retirement-stage-a" else
+            _validate_record
+        )
         metadata.update(validator(json.loads(completed.stdout), row))
     except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
         metadata["exit_code"] = 65 if completed.returncode == 0 else completed.returncode
@@ -1357,10 +1417,15 @@ def _cursor_plan_schema_version(plan: dict[str, Any]) -> int:
 
 
 def _point_resource_retirement_summary(
-    rows: list[dict[str, Any]], planned: int,
+    rows: list[dict[str, Any]], planned: int, *, point_buffer_preallocation_enabled: bool = False,
 ) -> dict[str, Any]:
-    schedule = build_point_resource_retirement_schedule()
-    validation = validate_point_resource_retirement_rows(rows)
+    schedule = build_point_resource_retirement_schedule(
+        point_buffer_preallocation_enabled=point_buffer_preallocation_enabled,
+    )
+    validation = validate_point_resource_retirement_rows(
+        rows,
+        point_buffer_preallocation_enabled=point_buffer_preallocation_enabled,
+    )
     comparisons: list[dict[str, Any]] = []
     pairs = ((0, 1), (0, 2), (1, 2))
     cells = [(writer, "point") for writer in POINT_RESOURCE_RETIREMENT_WRITERS] + [(16, "batch64")]
@@ -1431,7 +1496,8 @@ def _point_resource_retirement_summary(
         "qualification_note": (
             "Same-host, same-source, same-release-binary comparison of per-ticket retirement (mode 0), C1 detach "
             "(mode 1), and C2 batch retirement (mode 2). Batch64 is a no-detach regression guardrail. Runtime "
-            "counter deltas must prove each planned Point path actually ran; this report does not change defaults."
+            "counter deltas must prove each planned Point path actually ran; Point buffer preallocation is "
+            f"{'enabled' if point_buffer_preallocation_enabled else 'disabled'}; this report does not change defaults."
         ),
     }
 
@@ -1447,12 +1513,19 @@ def verify_point_resource_retirement_results_directory(results: Path) -> dict[st
         binary_sha = (results / "write-perf.sha256").read_text(encoding="utf-8").strip()
         if not all(isinstance(value, dict) for value in (summary, remote_exit, plan)):
             raise ValueError("summary, remote-exit, and plan must be JSON objects")
-        schedule = build_point_resource_retirement_schedule(plan.get("writers", ()))
+        point_buffer_preallocation_enabled = plan.get("point_buffer_preallocation_enabled", False)
+        if type(point_buffer_preallocation_enabled) is not bool:
+            raise ValueError("point_buffer_preallocation_enabled must be a boolean")
+        schedule = build_point_resource_retirement_schedule(
+            plan.get("writers", ()),
+            point_buffer_preallocation_enabled=point_buffer_preallocation_enabled,
+        )
         expected_plan = build_point_resource_retirement_plan(
             machine_type="c4-standard-16-lssd",
             machine_spec={"vcpus": 16, "ssd_count": 2, "ssd_gib": 750},
             commit=commit,
             binary_sha256=binary_sha,
+            point_buffer_preallocation_enabled=point_buffer_preallocation_enabled,
         )
         if plan != expected_plan:
             errors.append("benchmark plan differs from the fixed Point resource-retirement suite")
@@ -1491,10 +1564,16 @@ def verify_point_resource_retirement_results_directory(results: Path) -> dict[st
         rows = summary.get("results")
         if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
             raise ValueError("summary results are missing or malformed")
-        validation = validate_point_resource_retirement_rows(rows)
+        validation = validate_point_resource_retirement_rows(
+            rows,
+            point_buffer_preallocation_enabled=point_buffer_preallocation_enabled,
+        )
         if validation["complete"] is not True:
             errors.append("run rows do not prove all three retirement modes and guardrails")
-        recomputed = _point_resource_retirement_summary(rows, len(schedule))
+        recomputed = _point_resource_retirement_summary(
+            rows, len(schedule),
+            point_buffer_preallocation_enabled=point_buffer_preallocation_enabled,
+        )
         for key in (
             "suite", "complete", "runs_started", "runs_completed", "runs_planned", "writers", "workloads",
             "arms", "matrix_validation", "comparison",
@@ -1522,6 +1601,9 @@ def verify_point_resource_retirement_results_directory(results: Path) -> dict[st
                 errors.append(f"{run_id} metadata identity differs from the schedule")
             expected_environment = _expected_environment_text(
                 True, True, False, True, False,
+                point_buffer_preallocation_enabled=(
+                    True if row.get("point_buffer_preallocation_enabled") is True else None
+                ),
                 point_resource_retirement_mode=int(row["point_resource_retirement_mode"]),
             )
             environment_path = run_dir / "environment.txt"
@@ -1529,7 +1611,10 @@ def verify_point_resource_retirement_results_directory(results: Path) -> dict[st
                 errors.append(f"{run_id} environment differs from the planned retirement mode")
             try:
                 raw = json.loads(result_path.read_text(encoding="utf-8"))
-                expected_metrics = _validate_record(raw, row)
+                expected_metrics = (
+                    _validate_point_resource_retirement_stage_a_record(raw, row)
+                    if point_buffer_preallocation_enabled else _validate_record(raw, row)
+                )
                 if any(metadata.get(key) != value for key, value in expected_metrics.items()):
                     errors.append(f"{run_id} metrics differ from raw result")
             except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
@@ -1635,7 +1720,9 @@ def run_suite(args: argparse.Namespace) -> int:
     writers = tuple(int(value) for value in args.writers.split(","))
     expected_writers = (
         POINT_PREALLOCATION_WRITERS if candidate_mode == "v7-v8-point-preallocation" else
-        POINT_RESOURCE_RETIREMENT_WRITERS if candidate_mode == "point-resource-retirement" else
+        POINT_RESOURCE_RETIREMENT_WRITERS if candidate_mode in (
+            "point-resource-retirement", "point-resource-retirement-stage-a",
+        ) else
         (8, 16) if candidate_mode == "coalescing-budget" else POINT_PROGRESS_RING_WRITERS
     )
     if writers != expected_writers:
@@ -1696,16 +1783,24 @@ def run_suite(args: argparse.Namespace) -> int:
         )
         schedule_filename = "v7-v8-point-preallocation-schedule.tsv"
         summarize = lambda rows, _writers, planned: _point_preallocation_summary(rows, planned)
-    elif candidate_mode == "point-resource-retirement":
-        schedule = build_point_resource_retirement_schedule(writers)
+    elif candidate_mode in ("point-resource-retirement", "point-resource-retirement-stage-a"):
+        point_buffer_preallocation_enabled = candidate_mode == "point-resource-retirement-stage-a"
+        schedule = build_point_resource_retirement_schedule(
+            writers,
+            point_buffer_preallocation_enabled=point_buffer_preallocation_enabled,
+        )
         plan = build_point_resource_retirement_plan(
             machine_type=args.machine_type,
             machine_spec={"vcpus": 16, "ssd_count": args.ssd_count, "ssd_gib": args.ssd_gib},
             commit=args.commit,
             binary_sha256=args.binary_sha256,
+            point_buffer_preallocation_enabled=point_buffer_preallocation_enabled,
         )
         schedule_filename = "point-resource-retirement-schedule.tsv"
-        summarize = lambda rows, _writers, planned: _point_resource_retirement_summary(rows, planned)
+        summarize = lambda rows, _writers, planned: _point_resource_retirement_summary(
+            rows, planned,
+            point_buffer_preallocation_enabled=point_buffer_preallocation_enabled,
+        )
     else:
         raise ValueError("unsupported Cursor candidate mode")
     (results_dir / "benchmark-plan.json").write_text(json.dumps(plan, indent=2) + "\n", encoding="utf-8")
@@ -2474,7 +2569,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--candidate-mode",
         choices=(
             "cursor", "direct-completion", "singleton-submission", "coalescing-budget",
-            "v7-v8-point-preallocation", "point-resource-retirement",
+            "v7-v8-point-preallocation", "point-resource-retirement", "point-resource-retirement-stage-a",
         ),
         default="cursor",
     )

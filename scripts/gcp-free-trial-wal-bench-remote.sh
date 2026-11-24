@@ -55,7 +55,8 @@ if [[ "$SUITE" != "batch64" && "$SUITE" != "rfc026-full" \
      && "$SUITE" != "v8-cursor-singleton-submission" \
      && "$SUITE" != "v8-cursor-coalescing-budget" \
      && "$SUITE" != "v7-v8-point-preallocation" \
-     && "$SUITE" != "v8-point-resource-retirement" ]]; then
+     && "$SUITE" != "v8-point-resource-retirement" \
+     && "$SUITE" != "v8-point-resource-retirement-stage-a" ]]; then
     echo "unsupported benchmark suite: $SUITE" >&2
     exit 64
 fi
@@ -128,7 +129,7 @@ if [[ "$SUITE" == "v7-v8-point-preallocation" ]] \
     echo "v7-v8-point-preallocation requires c4-standard-16-lssd, writers 1,8,16, and 100000 operations" >&2
     exit 64
 fi
-if [[ "$SUITE" == "v8-point-resource-retirement" ]] \
+if [[ "$SUITE" == "v8-point-resource-retirement" || "$SUITE" == "v8-point-resource-retirement-stage-a" ]] \
     && { [[ "$NUM" != "100000" ]] || [[ "$MACHINE_TYPE" != "c4-standard-16-lssd" ]] \
         || [[ "$WRITERS_CSV" != "8,16" ]]; }; then
     echo "point resource-retirement qualification requires c4-standard-16-lssd, writers 8,16, and 100000 operations" >&2
@@ -450,13 +451,18 @@ if [[ "$BENCH_SUITE" == "v7-v8-point-preallocation" ]]; then
     exit $?
 fi
 
-if [[ "$BENCH_SUITE" == "v8-point-resource-retirement" ]]; then
+if [[ "$BENCH_SUITE" == "v8-point-resource-retirement" || \
+    "$BENCH_SUITE" == "v8-point-resource-retirement-stage-a" ]]; then
     if [[ ! -r /tmp/gcp-v8-point-progress-ring-runner.py ]]; then
         echo "point resource-retirement runner was not uploaded" >&2
         exit 1
     fi
     cp /tmp/gcp-v8-point-progress-ring-runner.py "$REPO/scripts/gcp_v8_point_progress_ring_runner.py"
     echo "WAL_BENCHMARK_STARTED $(date --iso-8601=seconds)" | tee -a "$BENCH_BOOT_LOG"
+    RETIREMENT_CANDIDATE_MODE="point-resource-retirement"
+    if [[ "$BENCH_SUITE" == "v8-point-resource-retirement-stage-a" ]]; then
+        RETIREMENT_CANDIDATE_MODE="point-resource-retirement-stage-a"
+    fi
     PYTHONPATH="$REPO/scripts${PYTHONPATH:+:$PYTHONPATH}" \
         python3 "$REPO/scripts/gcp_v8_point_progress_ring_runner.py" \
         --binary "$BINARY" \
@@ -469,7 +475,7 @@ if [[ "$BENCH_SUITE" == "v8-point-resource-retirement" ]]; then
         --machine-type "$BENCH_MACHINE_TYPE" \
         --ssd-count "$BENCH_SSD_COUNT" \
         --ssd-gib "$BENCH_SSD_TOTAL_GIB" \
-        --candidate-mode point-resource-retirement
+        --candidate-mode "$RETIREMENT_CANDIDATE_MODE"
     exit $?
 fi
 

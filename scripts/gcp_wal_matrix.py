@@ -786,6 +786,8 @@ def build_cursor_singleton_submission_schedule(
 
 def build_point_resource_retirement_schedule(
     writers: Iterable[int] = POINT_RESOURCE_RETIREMENT_WRITERS,
+    *,
+    point_buffer_preallocation_enabled: bool = False,
 ) -> list[dict[str, object]]:
     """Build the same-binary Cursor Direct comparison for retirement modes 0/1/2."""
     writer_counts = validate_writer_counts(writers)
@@ -824,7 +826,7 @@ def build_point_resource_retirement_schedule(
                     "progress_counters_enabled": False,
                     "cursor_direct_completion_enabled": True,
                     "cursor_singleton_submission_enabled": False,
-                    "point_buffer_preallocation_enabled": False,
+                    "point_buffer_preallocation_enabled": point_buffer_preallocation_enabled and workload == "point",
                     "scan_diagnostics_enabled": False,
                 })
     return schedule
@@ -833,9 +835,12 @@ def build_point_resource_retirement_schedule(
 def build_point_resource_retirement_plan(
     *, machine_type: str, machine_spec: Mapping[str, int], commit: str,
     binary_sha256: str | None = None,
+    point_buffer_preallocation_enabled: bool = False,
 ) -> dict[str, object]:
     """Describe the strict C1/C2 score matrix and its runtime mode proof."""
-    schedule = build_point_resource_retirement_schedule()
+    schedule = build_point_resource_retirement_schedule(
+        point_buffer_preallocation_enabled=point_buffer_preallocation_enabled,
+    )
     vcpus = int(machine_spec["vcpus"])
     ssd_count = int(machine_spec["ssd_count"])
     layout = "single Local SSD" if ssd_count == 1 else f"RAID0 over {ssd_count} Local SSDs"
@@ -871,7 +876,7 @@ def build_point_resource_retirement_plan(
         "binary_sha256": binary_sha256,
         "progress_mode": "cursor (mode 2)",
         "direct_completion_enabled": True,
-        "point_buffer_preallocation_enabled": False,
+        "point_buffer_preallocation_enabled": point_buffer_preallocation_enabled,
         "point_frontier_credit_batch_enabled": False,
         "singleton_submission_enabled": False,
         "extent_preparation": "sliding-point-lookahead, 1 MiB; Point-only policy keeps Batch64 on fallocate",
@@ -892,8 +897,13 @@ def build_point_resource_retirement_plan(
         "qualification_note": (
             "Same-host, same-source, same-release-binary comparison of per-ticket retirement (mode 0), "
             "C1 detached Point prefixes (mode 1), and C2 batch retirement (mode 2). All arms use Cursor, "
-            "Direct Completion, Direct FRONTIER, dynamic coalescing, 1 MiB Point lookahead, and no Point "
-            "buffer preallocation or legacy credit batching. Batch64 is a no-detach regression guardrail. "
+            "Direct Completion, Direct FRONTIER, dynamic coalescing, 1 MiB Point lookahead, "
+            + (
+                "Point buffer preallocation for Point runs, and no legacy credit batching. "
+                if point_buffer_preallocation_enabled else
+                "and no Point buffer preallocation or legacy credit batching. "
+            )
+            + "Batch64 is a no-detach regression guardrail. "
             "Scored runs have no detailed profiling, and mode 2 must report successful batch-prefix counts."
         ),
     }
@@ -1460,9 +1470,14 @@ def validate_cursor_singleton_submission_rows(
 def validate_point_resource_retirement_rows(
     rows: list[Mapping[str, object]],
     writers: Iterable[int] = POINT_RESOURCE_RETIREMENT_WRITERS,
+    *,
+    point_buffer_preallocation_enabled: bool = False,
 ) -> dict[str, object]:
     """Validate mode selection and prove C1/C2 were actually exercised."""
-    schedule = build_point_resource_retirement_schedule(writers)
+    schedule = build_point_resource_retirement_schedule(
+        writers,
+        point_buffer_preallocation_enabled=point_buffer_preallocation_enabled,
+    )
     validation = _validate_point_progress_rows(rows, schedule)
     expected = {
         (row["writer"], row["workload"], row["repetition"], row["arm"]): row

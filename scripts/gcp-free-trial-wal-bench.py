@@ -1199,6 +1199,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                              help="Compare V7, V8 Point preallocation off/on, and Batch64 regression guardrail")
     suite_group.add_argument("--v8-point-resource-retirement-ab", action="store_true",
                              help="Compare V8 Point per-ticket, detached, and batched resource retirement")
+    suite_group.add_argument("--v8-point-resource-retirement-stage-a-ab", action="store_true",
+                             help="Repeat the retirement matrix with Point buffer preallocation enabled")
     parser.add_argument("--baseline-commit", help="Full source commit used as the borrowed-input A/B baseline")
     parser.add_argument("--source-patch-sha256",
                         help="SHA-256 of the exact source patch used for a commit-order trace run")
@@ -1235,7 +1237,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     point_cursor_singleton_submission_suite = args.v8_cursor_singleton_submission_ab
     point_cursor_coalescing_budget_suite = args.v8_cursor_coalescing_budget_ab
     point_preallocation_suite = args.v7_v8_point_preallocation_ab
-    point_resource_retirement_suite = args.v8_point_resource_retirement_ab
+    point_resource_retirement_stage_a_suite = args.v8_point_resource_retirement_stage_a_ab
+    point_resource_retirement_suite = (
+        args.v8_point_resource_retirement_ab or point_resource_retirement_stage_a_suite
+    )
     point_progress_suite = (
         args.v8_point_progress_cursor_ab or point_cursor_direct_completion_suite
         or point_cursor_singleton_submission_suite or point_cursor_coalescing_budget_suite
@@ -2899,7 +2904,10 @@ def provision_and_run(
     point_cursor_singleton_submission_suite = getattr(args, "v8_cursor_singleton_submission_ab", False)
     point_cursor_coalescing_budget_suite = getattr(args, "v8_cursor_coalescing_budget_ab", False)
     point_preallocation_suite = getattr(args, "v7_v8_point_preallocation_ab", False)
-    point_resource_retirement_suite = getattr(args, "v8_point_resource_retirement_ab", False)
+    point_resource_retirement_stage_a_suite = getattr(args, "v8_point_resource_retirement_stage_a_ab", False)
+    point_resource_retirement_suite = (
+        getattr(args, "v8_point_resource_retirement_ab", False) or point_resource_retirement_stage_a_suite
+    )
     point_progress_suite = (
         point_progress_cursor_suite or point_cursor_direct_completion_suite
         or point_cursor_singleton_submission_suite or point_cursor_coalescing_budget_suite
@@ -3235,7 +3243,10 @@ def provision_and_run(
             elif point_preallocation_suite:
                 remote_suite = "v7-v8-point-preallocation"
             elif point_resource_retirement_suite:
-                remote_suite = "v8-point-resource-retirement"
+                remote_suite = (
+                    "v8-point-resource-retirement-stage-a"
+                    if point_resource_retirement_stage_a_suite else "v8-point-resource-retirement"
+                )
             elif point_progress_cursor_suite:
                 remote_suite = "v8-point-progress-cursor"
             elif point_direct_frame_suite:
@@ -3390,7 +3401,10 @@ def main(argv: list[str] | None = None) -> int:
     point_cursor_singleton_submission_suite = args.v8_cursor_singleton_submission_ab
     point_cursor_coalescing_budget_suite = args.v8_cursor_coalescing_budget_ab
     point_preallocation_suite = args.v7_v8_point_preallocation_ab
-    point_resource_retirement_suite = args.v8_point_resource_retirement_ab
+    point_resource_retirement_stage_a_suite = args.v8_point_resource_retirement_stage_a_ab
+    point_resource_retirement_suite = (
+        args.v8_point_resource_retirement_ab or point_resource_retirement_stage_a_suite
+    )
     point_progress_suite = (
         args.v8_point_progress_cursor_ab or point_cursor_direct_completion_suite
         or point_cursor_singleton_submission_suite or point_cursor_coalescing_budget_suite
@@ -3538,6 +3552,7 @@ def main(argv: list[str] | None = None) -> int:
                 machine_type=args.machine_type,
                 machine_spec=MACHINE_SPECS[args.machine_type],
                 commit=args.commit.lower(),
+                point_buffer_preallocation_enabled=point_resource_retirement_stage_a_suite,
             )
         elif args.v8_point_progress_cursor_ab:
             report["benchmark_suite"] = "v8-point-progress-cursor"
