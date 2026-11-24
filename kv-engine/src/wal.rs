@@ -244,6 +244,11 @@ pub struct WalIoDiagnostics {
 const V8_ADMISSION_CURSOR_PUBLISH_FAST_PATH_ENV: &str =
     "TOYKV_BENCH_V8_ADMISSION_CURSOR_PUBLISH_FAST_PATH";
 
+#[cfg(feature = "bench")]
+fn v8_admission_cursor_publish_fast_path_env_enabled(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
 /// Returns the bench-only D2a setting. The benchmark starts one process per arm, so this
 /// process-wide value is fixed before the first write and does not add environment parsing
 /// to the admission path.
@@ -251,9 +256,11 @@ const V8_ADMISSION_CURSOR_PUBLISH_FAST_PATH_ENV: &str =
 pub(crate) fn v8_admission_cursor_publish_fast_path_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var(V8_ADMISSION_CURSOR_PUBLISH_FAST_PATH_ENV)
-            .map(|value| value != "0")
-            .unwrap_or(false)
+        v8_admission_cursor_publish_fast_path_env_enabled(
+            std::env::var(V8_ADMISSION_CURSOR_PUBLISH_FAST_PATH_ENV)
+                .ok()
+                .as_deref(),
+        )
     })
 }
 
@@ -2837,6 +2844,7 @@ impl Wal {
         self.alloc_offset.store(append_offset, Ordering::Release);
         self.preallocated_size
             .store(append_offset, Ordering::Release);
+        *self.pitr_reserved_end.lock() = append_offset;
         self.completion_state
             .durable_ticket
             .store(ticket_end, Ordering::Release);
@@ -4948,5 +4956,21 @@ mod v8_wait_tests {
         assert_eq!(preallocated_size.load(Ordering::Acquire), 8192);
         assert_eq!(*pitr_reserved_end.lock(), 8192);
         assert_eq!(next_ticket.load(Ordering::Acquire), 14);
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn d2a_environment_value_requires_exact_one() {
+        assert!(v8_admission_cursor_publish_fast_path_env_enabled(Some("1")));
+        assert!(!v8_admission_cursor_publish_fast_path_env_enabled(None));
+        assert!(!v8_admission_cursor_publish_fast_path_env_enabled(Some(
+            "0"
+        )));
+        assert!(!v8_admission_cursor_publish_fast_path_env_enabled(Some(
+            "true"
+        )));
+        assert!(!v8_admission_cursor_publish_fast_path_env_enabled(Some(
+            "yes"
+        )));
     }
 }
