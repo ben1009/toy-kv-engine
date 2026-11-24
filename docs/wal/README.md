@@ -82,6 +82,10 @@ shows progress-token waiting dominates the sampled coalescing wall time, while
 completion drain and coordinator-lock wait remain small. It also records a
 stale availability flag despite populated phase fields; these single-run
 diagnostics do not establish a performance winner.
+The [Point Resource Preclaim final A/B](benchmarks/rfc-028-v8-point-resource-preclaim-final-gcp-20261124.md)
+compares Stage A with the optimized Stage A+B3 across five paired Point8,
+Point16, and Batch64 runs. B3 missed both Point throughput gates; keep Stage A
+and stop the preclaim optimization.
 The [coalescing-budget A/B](benchmarks/rfc-028-v8-cursor-coalescing-budget-gcp-20261123.md)
 found fixed 400 μs consistently ahead of Dynamic at 8 and 16 writers, but its
 paired throughput gains stayed below the 5% qualification threshold. Dynamic
