@@ -175,6 +175,12 @@ pub struct WalIoDiagnostics {
     pub point_buffer_preallocation_hits: u64,
     /// Number of attempts that used the regular in-sequencer allocation path.
     pub point_buffer_preallocation_fallbacks: u64,
+    /// Benchmark-only Point resource retirement mode: 0 is per-ticket, 1 detaches Point prefixes.
+    pub point_resource_retirement_mode: u8,
+    /// Number of all-Point durable prefixes detached before resource retirement.
+    pub point_resource_retirement_detached_prefixes: u64,
+    /// Number of tickets retired from detached all-Point prefixes.
+    pub point_resource_retirement_detached_tickets: u64,
     /// Outstanding speculative buffer permits for in-process lifecycle tests.
     /// This field is not serialized into benchmark results.
     pub point_buffer_preallocations_in_flight: u64,

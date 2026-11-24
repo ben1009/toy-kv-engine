@@ -693,42 +693,8 @@ impl WalV7ReservationOwner {
     }
 
     fn finish_batch_operation(&self, id: u64, admitted: bool) -> Result<(), WalV7ReservationError> {
-        let (owner_lock_timer, mut state) =
+        let (_owner_lock_timer, mut state) =
             mutex_diagnostics::lock(&self.state, MutexLockKind::ReservationOwner);
-        if admitted
-            && !state.retired
-            && let Some(reservation) = state.reservations.get_mut(&id)
-        {
-            // Retire the temporary buffer charge and advance the work
-            // generation under one Ledger lock. Publish the generation
-            // only after decrementing the owner-side completion count, so
-            // pressure retries cannot mistake this for active work.
-            let (ledger_lock_timer, mut ledger_state) =
-                mutex_diagnostics::lock(&self.ledger.inner.state, MutexLockKind::ResourceLedger);
-            let result = self
-                .ledger
-                .release_buffer_memory_locked(&mut ledger_state, reservation);
-            let operation_result = state
-                .active_batch_operations
-                .checked_sub(1)
-                .map(|active_batch_operations| {
-                    state.active_batch_operations = active_batch_operations;
-                })
-                .ok_or(WalV7ReservationError::AccountingUnderflow);
-            ledger_state.source_spool_work_generation =
-                ledger_state.source_spool_work_generation.wrapping_add(1);
-            drop(ledger_state);
-            drop(ledger_lock_timer);
-            drop(state);
-            drop(owner_lock_timer);
-            self.ledger.notify_source_spool_waiters();
-
-            return result.and(operation_result);
-        }
-
-        // Preserve the original completion ordering for pre-admission failure,
-        // missing reservations, and already-retired owners. Retired owners may
-        // drop their reservation map here, which itself takes the Ledger lock.
         let result = if admitted {
             match state.reservations.get_mut(&id) {
                 Some(reservation) => self.ledger.release_buffer_memory(reservation),
@@ -752,7 +718,6 @@ impl WalV7ReservationOwner {
             .ok_or(WalV7ReservationError::AccountingUnderflow);
         release_retired_reservations(&mut state);
         drop(state);
-        drop(owner_lock_timer);
         self.ledger.notify_source_spool_work_finished();
 
         result.and(operation_result)

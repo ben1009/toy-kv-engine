@@ -1362,8 +1362,16 @@ impl LsmMvccInner {
         #[cfg(feature = "bench")]
         let mut point_scratch = crate::wal::v8::leader::WalV8PointAdmissionScratch::new(prepared);
         #[cfg(feature = "bench")]
+        let phase_timer = WalCpuPhaseTimer::start(cpu_attribution.is_some());
+        #[cfg(feature = "bench")]
         let point_buffer_preallocated =
             memtable.try_preallocate_prepared_v8_point_buffer_only(&mut point_scratch);
+        #[cfg(feature = "bench")]
+        if let Some(sample) = cpu_attribution.as_mut() {
+            let (wall_ns, cpu_ns) = phase_timer.finish();
+            sample.observation.point_buffer_preallocation_wall_ns = wall_ns;
+            sample.observation.point_buffer_preallocation_cpu_ns = cpu_ns;
+        }
 
         #[cfg(feature = "bench")]
         let phase_timer = WalCpuPhaseTimer::start(cpu_attribution.is_some());

@@ -1652,6 +1652,7 @@ struct WalV8DurabilityPhaseRecord {
     resource_retire_before_publish_release_cpu_ns: u64,
     resource_retire_before_publish_finish_cpu_ns: u64,
     resource_retire_before_publish_batched_point_credits: bool,
+    resource_retire_before_publish_point_prefix_detached: bool,
     resource_retire_after_publish_wall_ns: u64,
     resource_retire_after_publish_cpu_ns: u64,
     resource_retire_after_publish_lock_wait_wall_ns: u64,
@@ -1808,6 +1809,8 @@ impl From<kv_engine_wrapper::mem_table::WalV8DurabilityPhaseObservation>
                 .resource_retire_before_publish_finish_cpu_ns,
             resource_retire_before_publish_batched_point_credits: observation
                 .resource_retire_before_publish_batched_point_credits,
+            resource_retire_before_publish_point_prefix_detached: observation
+                .resource_retire_before_publish_point_prefix_detached,
             resource_retire_after_publish_wall_ns: observation
                 .resource_retire_after_publish_wall_ns,
             resource_retire_after_publish_cpu_ns: observation.resource_retire_after_publish_cpu_ns,
@@ -1932,6 +1935,9 @@ struct WalIoDiagnosticsRecord {
     point_buffer_preallocation_attempts: u64,
     point_buffer_preallocation_hits: u64,
     point_buffer_preallocation_fallbacks: u64,
+    point_resource_retirement_mode: u8,
+    point_resource_retirement_detached_prefixes: u64,
+    point_resource_retirement_detached_tickets: u64,
     // Retired Stage B keys stay in benchmark JSON for archived-schema compatibility.
     point_resource_preclaim_enabled: bool,
     point_resource_preclaim_sum_cache_enabled: bool,
@@ -2091,6 +2097,11 @@ impl From<WalIoDiagnostics> for WalIoDiagnosticsRecord {
             point_buffer_preallocation_attempts: diagnostics.point_buffer_preallocation_attempts,
             point_buffer_preallocation_hits: diagnostics.point_buffer_preallocation_hits,
             point_buffer_preallocation_fallbacks: diagnostics.point_buffer_preallocation_fallbacks,
+            point_resource_retirement_mode: diagnostics.point_resource_retirement_mode,
+            point_resource_retirement_detached_prefixes: diagnostics
+                .point_resource_retirement_detached_prefixes,
+            point_resource_retirement_detached_tickets: diagnostics
+                .point_resource_retirement_detached_tickets,
             point_resource_preclaim_enabled: diagnostics.point_resource_preclaim_enabled,
             point_resource_preclaim_sum_cache_enabled: diagnostics
                 .point_resource_preclaim_sum_cache_enabled,
@@ -2160,6 +2171,7 @@ impl WalIoDiagnosticsRecord {
             && self.cursor_direct_completion_enabled == other.cursor_direct_completion_enabled
             && self.cursor_singleton_submission_enabled == other.cursor_singleton_submission_enabled
             && self.point_buffer_preallocation_enabled == other.point_buffer_preallocation_enabled
+            && self.point_resource_retirement_mode == other.point_resource_retirement_mode
             && self.point_resource_preclaim_enabled == other.point_resource_preclaim_enabled
             && self.point_resource_preclaim_sum_cache_enabled
                 == other.point_resource_preclaim_sum_cache_enabled
@@ -12909,6 +12921,9 @@ mod tests {
                         point_buffer_preallocation_attempts: 0,
                         point_buffer_preallocation_hits: 0,
                         point_buffer_preallocation_fallbacks: 0,
+                        point_resource_retirement_mode: 0,
+                        point_resource_retirement_detached_prefixes: 0,
+                        point_resource_retirement_detached_tickets: 0,
                         point_resource_preclaim_enabled: false,
                         point_resource_preclaim_sum_cache_enabled: false,
                         point_resource_preclaim_after_buffer_enabled: false,
@@ -12965,6 +12980,9 @@ mod tests {
                         point_buffer_preallocation_attempts: 0,
                         point_buffer_preallocation_hits: 0,
                         point_buffer_preallocation_fallbacks: 0,
+                        point_resource_retirement_mode: 0,
+                        point_resource_retirement_detached_prefixes: 0,
+                        point_resource_retirement_detached_tickets: 0,
                         point_resource_preclaim_enabled: false,
                         point_resource_preclaim_sum_cache_enabled: false,
                         point_resource_preclaim_after_buffer_enabled: false,
