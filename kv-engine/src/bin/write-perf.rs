@@ -1932,6 +1932,7 @@ struct WalIoDiagnosticsRecord {
     point_buffer_preallocation_attempts: u64,
     point_buffer_preallocation_hits: u64,
     point_buffer_preallocation_fallbacks: u64,
+    // Retired Stage B keys stay in benchmark JSON for archived-schema compatibility.
     point_resource_preclaim_enabled: bool,
     point_resource_preclaim_sum_cache_enabled: bool,
     point_resource_preclaim_after_buffer_enabled: bool,

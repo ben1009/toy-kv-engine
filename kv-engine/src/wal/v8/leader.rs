@@ -64,9 +64,6 @@ use crate::wal::{
 use crate::wal::parallel_worker::DirectGroupWriteCompletion;
 
 #[cfg(feature = "bench")]
-use crate::wal::v7::admission::{PointPreclaimDeclineReason, PointPreclaimLifecycleCounters};
-
-#[cfg(feature = "bench")]
 use super::parallel::WalV8ProgressAdvanceTiming;
 #[cfg(feature = "bench")]
 use super::parallel::{WalV8ReadyPrefix, WalV8TicketProgress};
@@ -123,22 +120,12 @@ fn data_completion_to_frontier_start_ns(
 pub(crate) type WalV8PreparedBatch<'a> = PreparedWalV8Batch<'a, WalV8PreflightReservation>;
 
 /// Point-owned preparation state created before entering the MVCC sequencer.
-/// The optional DATA buffer is uncharged and bounded. A quota preclaim
-/// remains revocable until serialized admission promotes it.
+/// The optional DATA buffer is uncharged and bounded; serialized admission
+/// still performs the resource reservation in ticket order.
 #[cfg(feature = "bench")]
 pub(crate) struct WalV8PointAdmissionScratch<'a> {
     prepared: WalV8PreparedBatch<'a>,
     preallocated_buffer: Option<WalV8PointBufferPreallocation>,
-    quota_preclaim: Option<super::resource::WalV8PointQuotaPreclaim>,
-    resource_preclaim_attempted: bool,
-    resource_preclaim_sampled: bool,
-}
-
-#[cfg(feature = "bench")]
-#[derive(Clone, Copy, Default)]
-struct WalV8PointPreclaimDiagnostics {
-    attempted: bool,
-    sampled: bool,
 }
 
 /// A bounded speculative DATA buffer allocation. It has no quota reservation;
@@ -183,18 +170,7 @@ impl<'a> WalV8PointAdmissionScratch<'a> {
         Self {
             prepared,
             preallocated_buffer: None,
-            quota_preclaim: None,
-            resource_preclaim_attempted: false,
-            resource_preclaim_sampled: false,
         }
-    }
-
-    pub(crate) fn has_quota_preclaim(&self) -> bool {
-        self.quota_preclaim.is_some()
-    }
-
-    pub(crate) fn resource_preclaim_attempted(&self) -> bool {
-        self.resource_preclaim_attempted
     }
 
     pub(crate) fn into_prepared(self) -> WalV8PreparedBatch<'a> {
@@ -328,58 +304,6 @@ pub(crate) struct WalV8ParallelWriter {
     batch_point_frontier_credits: bool,
     #[cfg(feature = "bench")]
     point_buffer_preallocation_enabled: bool,
-    #[cfg(feature = "bench")]
-    point_resource_preclaim_enabled: bool,
-    #[cfg(feature = "bench")]
-    point_resource_preclaim_sum_cache_enabled: bool,
-    #[cfg(feature = "bench")]
-    point_resource_preclaim_after_buffer: bool,
-    #[cfg(feature = "bench")]
-    point_resource_preclaim_attempts: AtomicU64,
-    #[cfg(feature = "bench")]
-    point_resource_preclaim_granted: AtomicU64,
-    #[cfg(feature = "bench")]
-    point_resource_preclaim_promoted: AtomicU64,
-    #[cfg(feature = "bench")]
-    point_resource_preclaim_invalidated: AtomicU64,
-    #[cfg(feature = "bench")]
-    point_resource_preclaim_owner_trylock_busy: AtomicU64,
-    #[cfg(feature = "bench")]
-    point_resource_preclaim_owner_retired: AtomicU64,
-    #[cfg(feature = "bench")]
-    point_resource_preclaim_ledger_trylock_busy: AtomicU64,
-    #[cfg(feature = "bench")]
-    point_resource_preclaim_max_preclaims: AtomicU64,
-    #[cfg(feature = "bench")]
-    point_resource_preclaim_max_live: AtomicU64,
-    #[cfg(feature = "bench")]
-    point_resource_preclaim_logical_quota_rejected: AtomicU64,
-    #[cfg(feature = "bench")]
-    point_resource_preclaim_source_spool_quota_rejected: AtomicU64,
-    #[cfg(feature = "bench")]
-    point_resource_preclaim_buffer_quota_rejected: AtomicU64,
-    #[cfg(feature = "bench")]
-    point_resource_preclaim_seal_index_quota_rejected: AtomicU64,
-    #[cfg(feature = "bench")]
-    point_resource_preclaim_recovery_workspace_rejected: AtomicU64,
-    #[cfg(feature = "bench")]
-    point_resource_preclaim_arithmetic_rejected: AtomicU64,
-    #[cfg(feature = "bench")]
-    point_resource_preclaim_invalid_charge_rejected: AtomicU64,
-    #[cfg(feature = "bench")]
-    point_resource_preclaim_fallbacks: AtomicU64,
-    #[cfg(feature = "bench")]
-    point_resource_preclaim_lifecycle: Arc<PointPreclaimLifecycleCounters>,
-    #[cfg(feature = "bench")]
-    point_resource_preclaim_sample_every: u64,
-    #[cfg(feature = "bench")]
-    point_resource_preclaim_cpu_ns: AtomicU64,
-    #[cfg(feature = "bench")]
-    point_resource_preclaim_cpu_samples: AtomicU64,
-    #[cfg(feature = "bench")]
-    point_resource_preclaim_promotion_cpu_ns: AtomicU64,
-    #[cfg(feature = "bench")]
-    point_resource_preclaim_promotion_cpu_samples: AtomicU64,
     #[cfg(all(test, feature = "bench"))]
     point_buffer_preallocation_test_override: AtomicBool,
     #[cfg(feature = "bench")]
@@ -2805,71 +2729,6 @@ fn point_buffer_preallocation_from_environment() -> Result<bool> {
     }
 }
 
-#[cfg(feature = "bench")]
-fn point_resource_preclaim_from_environment() -> Result<bool> {
-    let Some(value) = std::env::var_os("TOYKV_BENCH_V8_POINT_RESOURCE_PRECLAIM") else {
-        return Ok(false);
-    };
-    let value = value
-        .to_str()
-        .context("TOYKV_BENCH_V8_POINT_RESOURCE_PRECLAIM is not valid UTF-8")?;
-    match value {
-        "0" => Ok(false),
-        "1" => Ok(true),
-        _ => anyhow::bail!(
-            "invalid TOYKV_BENCH_V8_POINT_RESOURCE_PRECLAIM {value:?}; expected `0` or `1`"
-        ),
-    }
-}
-
-#[cfg(feature = "bench")]
-fn point_resource_preclaim_sum_cache_from_environment() -> Result<bool> {
-    let Some(value) = std::env::var_os("TOYKV_BENCH_V8_POINT_RESOURCE_PRECLAIM_SUM_CACHE") else {
-        return Ok(false);
-    };
-    let value = value
-        .to_str()
-        .context("TOYKV_BENCH_V8_POINT_RESOURCE_PRECLAIM_SUM_CACHE is not valid UTF-8")?;
-    match value {
-        "0" => Ok(false),
-        "1" => Ok(true),
-        _ => anyhow::bail!(
-            "invalid TOYKV_BENCH_V8_POINT_RESOURCE_PRECLAIM_SUM_CACHE {value:?}; expected `0` or `1`"
-        ),
-    }
-}
-
-#[cfg(feature = "bench")]
-fn point_resource_preclaim_after_buffer_from_environment() -> Result<bool> {
-    let Some(value) = std::env::var_os("TOYKV_BENCH_V8_POINT_RESOURCE_PRECLAIM_AFTER_BUFFER")
-    else {
-        return Ok(false);
-    };
-    let value = value
-        .to_str()
-        .context("TOYKV_BENCH_V8_POINT_RESOURCE_PRECLAIM_AFTER_BUFFER is not valid UTF-8")?;
-    match value {
-        "0" => Ok(false),
-        "1" => Ok(true),
-        _ => anyhow::bail!(
-            "invalid TOYKV_BENCH_V8_POINT_RESOURCE_PRECLAIM_AFTER_BUFFER {value:?}; expected `0` or `1`"
-        ),
-    }
-}
-
-#[cfg(feature = "bench")]
-fn point_resource_preclaim_sample_every_from_environment() -> Result<u64> {
-    let Some(value) = std::env::var_os("TOYKV_BENCH_V8_POINT_RESOURCE_PRECLAIM_SAMPLE_EVERY")
-    else {
-        return Ok(0);
-    };
-    value
-        .to_str()
-        .context("TOYKV_BENCH_V8_POINT_RESOURCE_PRECLAIM_SAMPLE_EVERY is not valid UTF-8")?
-        .parse::<u64>()
-        .context("TOYKV_BENCH_V8_POINT_RESOURCE_PRECLAIM_SAMPLE_EVERY must be an integer")
-}
-
 struct WalV8ParallelFrontier {
     frontier: WalV8Frontier,
     offset: u64,
@@ -4861,41 +4720,13 @@ impl WalV8LeaderWriter {
         #[cfg(feature = "bench")]
         let point_buffer_preallocation_enabled = point_buffer_preallocation_from_environment()?;
         #[cfg(feature = "bench")]
-        let point_resource_preclaim_enabled = point_resource_preclaim_from_environment()?;
-        #[cfg(feature = "bench")]
-        let point_resource_preclaim_sum_cache_enabled =
-            point_resource_preclaim_sum_cache_from_environment()?;
-        #[cfg(feature = "bench")]
-        let point_resource_preclaim_after_buffer_enabled =
-            point_resource_preclaim_after_buffer_from_environment()?;
-        #[cfg(feature = "bench")]
-        ensure!(
-            point_resource_preclaim_enabled
-                || (!point_resource_preclaim_sum_cache_enabled
-                    && !point_resource_preclaim_after_buffer_enabled),
-            "Point resource preclaim variants require TOYKV_BENCH_V8_POINT_RESOURCE_PRECLAIM=1"
-        );
-        #[cfg(feature = "bench")]
-        let point_resource_preclaim_sample_every =
-            point_resource_preclaim_sample_every_from_environment()?;
-        #[cfg(feature = "bench")]
         {
-            if let Some(owner) = &self.reservation_owner {
-                owner.set_point_preclaim_sum_cache_enabled(
-                    point_resource_preclaim_sum_cache_enabled,
-                )?;
-            }
             io_diagnostics.data = WalIoHandleMetadata::from_file(&worker_file)?;
             io_diagnostics.progress_ring_enabled = progress_mode.uses_ring();
             io_diagnostics.progress_cursor_enabled = self.coordinator.progress_cursor_enabled();
             io_diagnostics.cursor_direct_completion_enabled = direct_completion_enabled;
             io_diagnostics.cursor_singleton_submission_enabled = singleton_submission_enabled;
             io_diagnostics.point_buffer_preallocation_enabled = point_buffer_preallocation_enabled;
-            io_diagnostics.point_resource_preclaim_enabled = point_resource_preclaim_enabled;
-            io_diagnostics.point_resource_preclaim_sum_cache_enabled =
-                point_resource_preclaim_sum_cache_enabled;
-            io_diagnostics.point_resource_preclaim_after_buffer_enabled =
-                point_resource_preclaim_after_buffer_enabled;
         }
         #[cfg(feature = "bench")]
         let (extent_preallocator, extent_preparation) =
@@ -5099,58 +4930,6 @@ impl WalV8LeaderWriter {
             batch_point_frontier_credits,
             #[cfg(feature = "bench")]
             point_buffer_preallocation_enabled,
-            #[cfg(feature = "bench")]
-            point_resource_preclaim_enabled,
-            #[cfg(feature = "bench")]
-            point_resource_preclaim_sum_cache_enabled,
-            #[cfg(feature = "bench")]
-            point_resource_preclaim_after_buffer: point_resource_preclaim_after_buffer_enabled,
-            #[cfg(feature = "bench")]
-            point_resource_preclaim_sample_every,
-            #[cfg(feature = "bench")]
-            point_resource_preclaim_attempts: AtomicU64::new(0),
-            #[cfg(feature = "bench")]
-            point_resource_preclaim_granted: AtomicU64::new(0),
-            #[cfg(feature = "bench")]
-            point_resource_preclaim_promoted: AtomicU64::new(0),
-            #[cfg(feature = "bench")]
-            point_resource_preclaim_invalidated: AtomicU64::new(0),
-            #[cfg(feature = "bench")]
-            point_resource_preclaim_owner_trylock_busy: AtomicU64::new(0),
-            #[cfg(feature = "bench")]
-            point_resource_preclaim_owner_retired: AtomicU64::new(0),
-            #[cfg(feature = "bench")]
-            point_resource_preclaim_ledger_trylock_busy: AtomicU64::new(0),
-            #[cfg(feature = "bench")]
-            point_resource_preclaim_max_preclaims: AtomicU64::new(0),
-            #[cfg(feature = "bench")]
-            point_resource_preclaim_max_live: AtomicU64::new(0),
-            #[cfg(feature = "bench")]
-            point_resource_preclaim_logical_quota_rejected: AtomicU64::new(0),
-            #[cfg(feature = "bench")]
-            point_resource_preclaim_source_spool_quota_rejected: AtomicU64::new(0),
-            #[cfg(feature = "bench")]
-            point_resource_preclaim_buffer_quota_rejected: AtomicU64::new(0),
-            #[cfg(feature = "bench")]
-            point_resource_preclaim_seal_index_quota_rejected: AtomicU64::new(0),
-            #[cfg(feature = "bench")]
-            point_resource_preclaim_recovery_workspace_rejected: AtomicU64::new(0),
-            #[cfg(feature = "bench")]
-            point_resource_preclaim_arithmetic_rejected: AtomicU64::new(0),
-            #[cfg(feature = "bench")]
-            point_resource_preclaim_invalid_charge_rejected: AtomicU64::new(0),
-            #[cfg(feature = "bench")]
-            point_resource_preclaim_fallbacks: AtomicU64::new(0),
-            #[cfg(feature = "bench")]
-            point_resource_preclaim_lifecycle: Arc::new(PointPreclaimLifecycleCounters::default()),
-            #[cfg(feature = "bench")]
-            point_resource_preclaim_cpu_ns: AtomicU64::new(0),
-            #[cfg(feature = "bench")]
-            point_resource_preclaim_cpu_samples: AtomicU64::new(0),
-            #[cfg(feature = "bench")]
-            point_resource_preclaim_promotion_cpu_ns: AtomicU64::new(0),
-            #[cfg(feature = "bench")]
-            point_resource_preclaim_promotion_cpu_samples: AtomicU64::new(0),
             #[cfg(all(test, feature = "bench"))]
             point_buffer_preallocation_test_override: AtomicBool::new(false),
             #[cfg(feature = "bench")]
@@ -5736,78 +5515,6 @@ impl WalV8ParallelWriter {
         diagnostics.progress_ring_enabled = self.coordinator.progress_ring_enabled();
         diagnostics.progress_cursor_enabled = self.coordinator.progress_cursor_enabled();
         diagnostics.progress_diagnostics = self.coordinator.progress_diagnostics();
-        diagnostics.point_resource_preclaim_enabled = self.point_resource_preclaim_enabled;
-        diagnostics.point_resource_preclaim_sum_cache_enabled =
-            self.point_resource_preclaim_sum_cache_enabled;
-        diagnostics.point_resource_preclaim_after_buffer_enabled =
-            self.point_resource_preclaim_after_buffer;
-        diagnostics.point_resource_preclaim_attempts = self
-            .point_resource_preclaim_attempts
-            .load(Ordering::Relaxed);
-        diagnostics.point_resource_preclaim_granted =
-            self.point_resource_preclaim_granted.load(Ordering::Relaxed);
-        diagnostics.point_resource_preclaim_promoted = self
-            .point_resource_preclaim_promoted
-            .load(Ordering::Relaxed);
-        diagnostics.point_resource_preclaim_invalidated = self
-            .point_resource_preclaim_invalidated
-            .load(Ordering::Relaxed);
-        diagnostics.point_resource_preclaim_owner_trylock_busy = self
-            .point_resource_preclaim_owner_trylock_busy
-            .load(Ordering::Relaxed);
-        diagnostics.point_resource_preclaim_owner_retired = self
-            .point_resource_preclaim_owner_retired
-            .load(Ordering::Relaxed);
-        diagnostics.point_resource_preclaim_ledger_trylock_busy = self
-            .point_resource_preclaim_ledger_trylock_busy
-            .load(Ordering::Relaxed);
-        diagnostics.point_resource_preclaim_max_preclaims = self
-            .point_resource_preclaim_max_preclaims
-            .load(Ordering::Relaxed);
-        diagnostics.point_resource_preclaim_max_live = self
-            .point_resource_preclaim_max_live
-            .load(Ordering::Relaxed);
-        diagnostics.point_resource_preclaim_logical_quota_rejected = self
-            .point_resource_preclaim_logical_quota_rejected
-            .load(Ordering::Relaxed);
-        diagnostics.point_resource_preclaim_source_spool_quota_rejected = self
-            .point_resource_preclaim_source_spool_quota_rejected
-            .load(Ordering::Relaxed);
-        diagnostics.point_resource_preclaim_buffer_quota_rejected = self
-            .point_resource_preclaim_buffer_quota_rejected
-            .load(Ordering::Relaxed);
-        diagnostics.point_resource_preclaim_seal_index_quota_rejected = self
-            .point_resource_preclaim_seal_index_quota_rejected
-            .load(Ordering::Relaxed);
-        diagnostics.point_resource_preclaim_recovery_workspace_rejected = self
-            .point_resource_preclaim_recovery_workspace_rejected
-            .load(Ordering::Relaxed);
-        diagnostics.point_resource_preclaim_arithmetic_rejected = self
-            .point_resource_preclaim_arithmetic_rejected
-            .load(Ordering::Relaxed);
-        diagnostics.point_resource_preclaim_invalid_charge_rejected = self
-            .point_resource_preclaim_invalid_charge_rejected
-            .load(Ordering::Relaxed);
-        diagnostics.point_resource_preclaim_fallbacks = self
-            .point_resource_preclaim_fallbacks
-            .load(Ordering::Relaxed);
-        diagnostics.point_resource_preclaim_revoked =
-            self.point_resource_preclaim_lifecycle.revoked();
-        diagnostics.point_resource_preclaim_abandoned =
-            self.point_resource_preclaim_lifecycle.abandoned();
-        diagnostics.point_resource_preclaim_cpu_sample_every =
-            self.point_resource_preclaim_sample_every;
-        diagnostics.point_resource_preclaim_cpu_ns =
-            self.point_resource_preclaim_cpu_ns.load(Ordering::Relaxed);
-        diagnostics.point_resource_preclaim_cpu_samples = self
-            .point_resource_preclaim_cpu_samples
-            .load(Ordering::Relaxed);
-        diagnostics.point_resource_preclaim_promotion_cpu_ns = self
-            .point_resource_preclaim_promotion_cpu_ns
-            .load(Ordering::Relaxed);
-        diagnostics.point_resource_preclaim_promotion_cpu_samples = self
-            .point_resource_preclaim_promotion_cpu_samples
-            .load(Ordering::Relaxed);
         diagnostics.point_buffer_preallocation_attempts = self
             .point_buffer_preallocation_attempts
             .load(Ordering::Relaxed);
@@ -5829,43 +5536,6 @@ impl WalV8ParallelWriter {
         }
 
         diagnostics
-    }
-
-    #[cfg(feature = "bench")]
-    fn record_point_preclaim_decline(&self, reason: PointPreclaimDeclineReason) {
-        let counter = match reason {
-            PointPreclaimDeclineReason::InvalidCharge => {
-                &self.point_resource_preclaim_invalid_charge_rejected
-            }
-            PointPreclaimDeclineReason::OwnerTryLockBusy => {
-                &self.point_resource_preclaim_owner_trylock_busy
-            }
-            PointPreclaimDeclineReason::OwnerRetired => &self.point_resource_preclaim_owner_retired,
-            PointPreclaimDeclineReason::LedgerTryLockBusy => {
-                &self.point_resource_preclaim_ledger_trylock_busy
-            }
-            PointPreclaimDeclineReason::MaxPreclaims => &self.point_resource_preclaim_max_preclaims,
-            PointPreclaimDeclineReason::ArithmeticOverflow
-            | PointPreclaimDeclineReason::ReservationIdExhausted => {
-                &self.point_resource_preclaim_arithmetic_rejected
-            }
-            PointPreclaimDeclineReason::LogicalWalLimit => {
-                &self.point_resource_preclaim_logical_quota_rejected
-            }
-            PointPreclaimDeclineReason::SourceSpoolLimit => {
-                &self.point_resource_preclaim_source_spool_quota_rejected
-            }
-            PointPreclaimDeclineReason::RecoveryWorkspaceLimit => {
-                &self.point_resource_preclaim_recovery_workspace_rejected
-            }
-            PointPreclaimDeclineReason::BufferMemoryLimit => {
-                &self.point_resource_preclaim_buffer_quota_rejected
-            }
-            PointPreclaimDeclineReason::SealIndexLimit => {
-                &self.point_resource_preclaim_seal_index_quota_rejected
-            }
-        };
-        counter.fetch_add(1, Ordering::Relaxed);
     }
 
     #[cfg(all(test, feature = "bench"))]
@@ -6061,59 +5731,7 @@ impl WalV8ParallelWriter {
         &self,
         scratch: &mut WalV8PointAdmissionScratch<'_>,
     ) -> bool {
-        if self.point_resource_preclaim_after_buffer {
-            let preallocated = self.try_preallocate_point_buffer_only(scratch);
-            self.try_preclaim_point_resources(scratch);
-            preallocated
-        } else {
-            self.try_preclaim_point_resources(scratch);
-            self.try_preallocate_point_buffer_only(scratch)
-        }
-    }
-
-    #[cfg(feature = "bench")]
-    fn try_preclaim_point_resources(&self, scratch: &mut WalV8PointAdmissionScratch<'_>) {
-        if self.point_resource_preclaim_enabled
-            && scratch.prepared.frame_buffer_bytes() == WAL_V8_FRAME_LEN
-            && let Some(owner) = &self.reservation_owner
-            && let Ok(logical_bytes) = u64::try_from(scratch.prepared.logical_batch_bytes())
-        {
-            scratch.resource_preclaim_attempted = true;
-            let attempt = self
-                .point_resource_preclaim_attempts
-                .fetch_add(1, Ordering::Relaxed)
-                .wrapping_add(1);
-            scratch.resource_preclaim_sampled = self.point_resource_preclaim_sample_every > 0
-                && attempt.is_multiple_of(self.point_resource_preclaim_sample_every);
-            let cpu_started = scratch
-                .resource_preclaim_sampled
-                .then(digest::thread_cpu_time_ns);
-            let outcome = owner.try_preclaim_batch(
-                logical_bytes,
-                WAL_V8_FRAME_LEN as u64,
-                Arc::clone(&self.point_resource_preclaim_lifecycle),
-            );
-            if let Some(cpu_started) = cpu_started {
-                self.point_resource_preclaim_cpu_ns.fetch_add(
-                    digest::thread_cpu_time_ns().saturating_sub(cpu_started),
-                    Ordering::Relaxed,
-                );
-                self.point_resource_preclaim_cpu_samples
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            match outcome {
-                Ok(preclaim) => {
-                    self.point_resource_preclaim_max_live.fetch_max(
-                        preclaim.claim_active_preclaims_at_issue(),
-                        Ordering::Relaxed,
-                    );
-                    scratch.quota_preclaim = Some(preclaim);
-                    self.point_resource_preclaim_granted
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-                Err(reason) => self.record_point_preclaim_decline(reason),
-            }
-        }
+        self.try_preallocate_point_buffer_only(scratch)
     }
 
     #[cfg(feature = "bench")]
@@ -6152,8 +5770,8 @@ impl WalV8ParallelWriter {
         true
     }
 
-    /// Admit a Point scratch object, promoting its quota preclaim or using
-    /// the ordinary reservation path before consuming the DATA buffer.
+    /// Admit a Point scratch object using ordered quota reservation and then
+    /// consume its optional speculative DATA buffer.
     #[cfg(feature = "bench")]
     pub(crate) fn admit_prepared_point_batch<'a>(
         &self,
@@ -6164,9 +5782,6 @@ impl WalV8ParallelWriter {
         let WalV8PointAdmissionScratch {
             prepared,
             preallocated_buffer,
-            quota_preclaim,
-            resource_preclaim_attempted,
-            resource_preclaim_sampled,
         } = scratch;
         ensure!(!self.is_poisoned(), "v8 Parallel WAL is poisoned");
         let logical_bytes = u64::try_from(prepared.logical_batch_bytes())?;
@@ -6177,11 +5792,6 @@ impl WalV8ParallelWriter {
             frame_bytes,
             prepared.frame_buffer_bytes(),
             preallocated_buffer,
-            quota_preclaim,
-            WalV8PointPreclaimDiagnostics {
-                attempted: resource_preclaim_attempted,
-                sampled: resource_preclaim_sampled,
-            },
         )?;
         #[cfg(not(feature = "bench"))]
         let resources = self.reserve_and_allocate_batch_resources(
@@ -6237,8 +5847,6 @@ impl WalV8ParallelWriter {
             frame_bytes,
             prepared.frame_buffer_bytes(),
             None,
-            None,
-            WalV8PointPreclaimDiagnostics::default(),
         )?;
         #[cfg(not(feature = "bench"))]
         let resources = self.reserve_and_allocate_batch_resources(
@@ -6261,48 +5869,8 @@ impl WalV8ParallelWriter {
         frame_bytes: u64,
         buffer_bytes: usize,
         #[cfg(feature = "bench")] preallocated_buffer: Option<WalV8PointBufferPreallocation>,
-        #[cfg(feature = "bench")] quota_preclaim: Option<super::resource::WalV8PointQuotaPreclaim>,
-        #[cfg(feature = "bench")] preclaim_diagnostics: WalV8PointPreclaimDiagnostics,
     ) -> Result<WalV8AdmissionResources> {
-        #[cfg(feature = "bench")]
-        let promoted = if let Some(claim) = quota_preclaim {
-            let cpu_started = preclaim_diagnostics
-                .sampled
-                .then(digest::thread_cpu_time_ns);
-            let promotion = match &self.reservation_owner {
-                Some(owner) => owner.promote_preclaim(claim),
-                None => Ok(None),
-            };
-            if let Some(cpu_started) = cpu_started {
-                self.point_resource_preclaim_promotion_cpu_ns.fetch_add(
-                    digest::thread_cpu_time_ns().saturating_sub(cpu_started),
-                    Ordering::Relaxed,
-                );
-                self.point_resource_preclaim_promotion_cpu_samples
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            let result = promotion?;
-            let counter = if result.is_some() {
-                &self.point_resource_preclaim_promoted
-            } else {
-                &self.point_resource_preclaim_invalidated
-            };
-            counter.fetch_add(1, Ordering::Relaxed);
-            result
-        } else {
-            None
-        };
-        #[cfg(not(feature = "bench"))]
-        let promoted = None;
-        #[cfg(feature = "bench")]
-        if preclaim_diagnostics.attempted && promoted.is_none() {
-            self.point_resource_preclaim_fallbacks
-                .fetch_add(1, Ordering::Relaxed);
-        }
-        let reservation = match promoted {
-            Some(reservation) => Some(reservation),
-            None => self.reserve_batch_resources(logical_bytes, frame_bytes)?,
-        };
+        let reservation = self.reserve_batch_resources(logical_bytes, frame_bytes)?;
         #[cfg(feature = "bench")]
         let data_buffer = preallocated_buffer
             .map(WalV8PointBufferPreallocation::into_data_buffer)
@@ -8829,31 +8397,6 @@ mod tests {
             };
             #[cfg(not(feature = "bench"))]
             let value = batch(10);
-            #[cfg(feature = "bench")]
-            if std::env::var_os(EXTENT_PREPARATION_ENV).as_deref()
-                == Some(OsStr::new("sliding-point-lookahead"))
-            {
-                let mut writer = writer;
-                writer.point_resource_preclaim_enabled = true;
-                let mut scratch =
-                    WalV8PointAdmissionScratch::new(writer.preflight_batch_with_write_class(
-                        &value,
-                        LIVE_WAL_V5_LIMITS,
-                        WalV8WriteClass::Point,
-                    )?);
-                writer.try_preallocate_point_buffer(&mut scratch);
-                ensure!(
-                    scratch.has_quota_preclaim(),
-                    "crash child failed to get a claim"
-                );
-                let job = writer.admit_prepared_point_batch(scratch, 10, value.recorded_at)?;
-                let ticket = job.assignment().segment_ticket;
-                ensure!(writer.io_diagnostics().point_resource_preclaim_promoted == 1);
-                job.finish()?;
-                writer.wait_durable(ticket)?;
-                std::fs::write(ack_path, b"acknowledged")?;
-                anyhow::bail!("configured V8 writer crash point did not stop the child");
-            }
             writer.append_prepared_batch(
                 writer.preflight_batch(&value, LIVE_WAL_V5_LIMITS)?,
                 10,
@@ -9403,93 +8946,12 @@ mod tests {
 
     #[cfg(feature = "bench")]
     #[test]
-    fn speculative_point_buffer_does_not_steal_quota_from_earlier_admission() -> Result<()> {
-        point_scratch_does_not_steal_quota_from_earlier_admission(false, 0)
+    fn point_buffer_preallocation_does_not_consume_quota_before_admission() -> Result<()> {
+        point_buffer_preallocation_preserves_ordered_quota_admission()
     }
 
     #[cfg(feature = "bench")]
-    #[test]
-    fn point_resource_preclaim_yields_to_earlier_v8_admission() -> Result<()> {
-        point_scratch_does_not_steal_quota_from_earlier_admission(true, 1)
-    }
-
-    #[cfg(feature = "bench")]
-    #[test]
-    fn point_resource_preclaim_cpu_sampling_can_be_disabled() -> Result<()> {
-        point_scratch_does_not_steal_quota_from_earlier_admission(true, 0)
-    }
-
-    #[cfg(feature = "bench")]
-    #[test]
-    fn point_resource_preclaim_is_bound_to_live_image_owner() -> Result<()> {
-        let directory = tempfile::tempdir()?;
-        let path = directory.path().join("point-preclaim-owner.wal");
-        let installed = install_empty(&path, header())?;
-        let ledger = crate::wal::v7::admission::WalV7ResourceLedger::new(
-            crate::wal::v7::admission::WalV7ResourceLimits {
-                max_logical_wal_bytes: 64 * 1024,
-                max_source_spool_bytes: 256 * 1024,
-                max_recovery_workspace_bytes: 128 * 1024,
-                max_buffer_memory_bytes: 64 * 1024,
-                max_seal_index_bytes: 1024,
-            },
-        )?;
-        let retained = crate::wal::v7::admission::WalV7RetainedResources::new(ledger.clone());
-        let open_owner = || -> Result<_> {
-            Ok(Arc::new(
-                WalV8ReservationOwner::new_with_retained_resources(
-                    retained.clone(),
-                    &installed,
-                    HEADER_LEN_U64 + FRAME_LEN_U64,
-                    64 * 1024,
-                    FRAME_LEN_U64,
-                )?,
-            ))
-        };
-        let owner = open_owner()?;
-        let other = open_owner()?;
-        let lifecycle = Arc::new(PointPreclaimLifecycleCounters::default());
-        let baseline = ledger.snapshot();
-        let claim = owner
-            .try_preclaim_batch(128, FRAME_LEN_U64, Arc::clone(&lifecycle))
-            .unwrap();
-        assert!(other.promote_preclaim(claim)?.is_none());
-        assert_eq!(ledger.snapshot(), baseline);
-
-        let claim = owner
-            .try_preclaim_batch(128, FRAME_LEN_U64, Arc::clone(&lifecycle))
-            .unwrap();
-        let reservation = owner.promote_preclaim(claim)?.unwrap();
-        assert_eq!(
-            ledger.snapshot().logical_wal_bytes,
-            baseline.logical_wal_bytes + 2 * FRAME_LEN_U64
-        );
-        drop(reservation);
-        assert_eq!(ledger.snapshot(), baseline);
-
-        let claim = owner
-            .try_preclaim_batch(128, FRAME_LEN_U64, Arc::clone(&lifecycle))
-            .unwrap();
-        owner.image_owner().retire_after_durable_cleanup()?;
-        let after_retirement = ledger.snapshot();
-        assert!(matches!(
-            owner.promote_preclaim(claim),
-            Err(WalV7ReservationError::ReservationOwnerRetired)
-        ));
-        assert!(
-            owner
-                .try_preclaim_batch(128, FRAME_LEN_U64, Arc::clone(&lifecycle))
-                .is_err()
-        );
-        assert_eq!(ledger.snapshot(), after_retirement);
-        Ok(())
-    }
-
-    #[cfg(feature = "bench")]
-    fn point_scratch_does_not_steal_quota_from_earlier_admission(
-        preclaim: bool,
-        sample_every: u64,
-    ) -> Result<()> {
+    fn point_buffer_preallocation_preserves_ordered_quota_admission() -> Result<()> {
         const SEGMENT_LIMIT: u64 = 64 * 1024;
         const INITIAL_SOURCE_CHARGE: u64 = HEADER_LEN_U64 + FRAME_LEN_U64;
         const ONE_BATCH_SOURCE_CHARGE: u64 = 2 * WAL_V8_FRAME_LEN as u64;
@@ -9513,8 +8975,6 @@ mod tests {
             }
             Err(error) => return Err(error),
         };
-        writer.point_resource_preclaim_enabled = preclaim;
-        writer.point_resource_preclaim_sample_every = sample_every;
         let earlier = batch(10);
         let later = batch(20);
         let earlier_scratch =
@@ -9532,7 +8992,6 @@ mod tests {
 
         let quota_before_admission = owner.image_owner().snapshot();
         assert!(writer.try_preallocate_point_buffer(&mut later_scratch));
-        assert_eq!(later_scratch.quota_preclaim.is_some(), preclaim);
         assert_eq!(owner.image_owner().snapshot(), quota_before_admission);
 
         let earlier_job = writer.admit_prepared_point_batch(
@@ -9565,46 +9024,6 @@ mod tests {
                 .load(Ordering::Relaxed),
             0,
             "failed later admission releases its speculative buffer permit"
-        );
-        let diagnostics = writer.io_diagnostics();
-        assert_eq!(
-            diagnostics.point_resource_preclaim_attempts,
-            u64::from(preclaim)
-        );
-        assert_eq!(
-            diagnostics.point_resource_preclaim_granted,
-            u64::from(preclaim)
-        );
-        assert_eq!(
-            diagnostics.point_resource_preclaim_invalidated,
-            u64::from(preclaim)
-        );
-        assert_eq!(diagnostics.point_resource_preclaim_promoted, 0);
-        assert_eq!(
-            diagnostics.point_resource_preclaim_fallbacks,
-            u64::from(preclaim)
-        );
-        assert_eq!(
-            diagnostics.point_resource_preclaim_revoked,
-            u64::from(preclaim)
-        );
-        assert_eq!(diagnostics.point_resource_preclaim_abandoned, 0);
-        assert_eq!(
-            diagnostics.point_resource_preclaim_max_live,
-            u64::from(preclaim)
-        );
-        assert_eq!(
-            diagnostics.point_resource_preclaim_cpu_sample_every,
-            sample_every
-        );
-        let expected_cpu_samples = u64::from(preclaim && sample_every != 0);
-        assert_eq!(
-            diagnostics.point_resource_preclaim_cpu_samples,
-            expected_cpu_samples
-        );
-        assert_eq!(
-            diagnostics.point_resource_preclaim_promotion_cpu_samples,
-            expected_cpu_samples
         );
 
         Ok(())
@@ -9639,13 +9058,9 @@ mod tests {
             .collect::<Vec<_>>();
         let mut scratches = Vec::with_capacity(BATCH_COUNT);
 
+        // Keep the first 16 buffers live so the next Point falls back to the
+        // ordinary in-sequencer allocation path.
         for (index, point) in batches.iter().enumerate() {
-            if index == MAX_POINT_BUFFER_PREALLOCATIONS {
-                // Keep the first 16 buffers live so Stage A falls back for
-                // this Point, then verify Stage B still runs independently.
-                writer.point_resource_preclaim_enabled = true;
-                writer.point_resource_preclaim_after_buffer = true;
-            }
             let prepared = writer.preflight_batch_with_write_class(
                 point,
                 LIVE_WAL_V5_LIMITS,
@@ -9658,12 +9073,6 @@ mod tests {
                 index < MAX_POINT_BUFFER_PREALLOCATIONS,
                 "the bounded permit pool should fall back after its configured limit"
             );
-            if index == MAX_POINT_BUFFER_PREALLOCATIONS {
-                assert!(
-                    scratch.quota_preclaim.is_some(),
-                    "a failed buffer preallocation must not suppress the independent quota preclaim"
-                );
-            }
             scratches.push(scratch);
         }
 
@@ -9709,15 +9118,6 @@ mod tests {
             MAX_POINT_BUFFER_PREALLOCATIONS as u64
         );
         assert_eq!(diagnostics.point_buffer_preallocation_fallbacks, 1);
-        assert!(diagnostics.point_resource_preclaim_enabled);
-        assert_eq!(
-            diagnostics.point_resource_preclaim_sum_cache_enabled,
-            writer.point_resource_preclaim_sum_cache_enabled
-        );
-        assert!(diagnostics.point_resource_preclaim_after_buffer_enabled);
-        assert_eq!(diagnostics.point_resource_preclaim_attempts, 1);
-        assert_eq!(diagnostics.point_resource_preclaim_granted, 1);
-        assert_eq!(diagnostics.point_resource_preclaim_promoted, 1);
 
         Ok(())
     }

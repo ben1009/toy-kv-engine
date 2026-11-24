@@ -40421,36 +40421,11 @@ mod tests {
     #[test]
     fn v8_point_buffer_preallocation_survives_concurrent_rotation_and_recovery()
     -> anyhow::Result<()> {
-        exercise_point_preallocation_rotation(8, false)
+        exercise_point_preallocation_rotation(8)
     }
 
     #[cfg(all(target_os = "linux", feature = "bench"))]
-    #[test]
-    fn v8_point_resource_preclaim_survives_mixed_rotation_and_recovery() -> anyhow::Result<()> {
-        const CHILD: &str = "TOYKV_TEST_POINT_PRECLAIM_MIXED_CHILD";
-        if std::env::var_os(CHILD).is_some() {
-            return exercise_point_preallocation_rotation(16, true);
-        }
-        let output = std::process::Command::new(std::env::current_exe()?)
-            .args(["--exact", "lsm_storage::tests::v8_point_resource_preclaim_survives_mixed_rotation_and_recovery", "--nocapture"])
-            .env(CHILD, "1")
-            .env("TOYKV_BENCH_V8_POINT_RESOURCE_PRECLAIM", "1")
-            .output()?;
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            output.status.success() && stdout.contains("1 passed"),
-            "{stdout}\n{stderr}"
-        );
-        eprint!("{stderr}");
-        Ok(())
-    }
-
-    #[cfg(all(target_os = "linux", feature = "bench"))]
-    fn exercise_point_preallocation_rotation(
-        writer_count: usize,
-        mixed: bool,
-    ) -> anyhow::Result<()> {
+    fn exercise_point_preallocation_rotation(writer_count: usize) -> anyhow::Result<()> {
         use crate::pitr::api::{PersistedPitrConfig, PitrOptions, PitrRuntimeOptions};
         use crate::tests::harness::is_io_uring_unavailable_error;
         use crate::wal::WalIoMode;
@@ -40523,11 +40498,7 @@ mod tests {
                         start_phase.wait();
                         for write in 0..WRITES_BEFORE_ROTATION {
                             let key = format!("writer-{writer}-phase-{phase}-put-{write}");
-                            let result = if mixed && writer % 8 == 0 {
-                                engine.write_batch(&[WriteBatchRecord::Put(key.as_bytes(), VALUE)])
-                            } else {
-                                engine.put(key.as_bytes(), VALUE)
-                            };
+                            let result = engine.put(key.as_bytes(), VALUE);
                             if let Err(error) = result {
                                 let mut first_error = first_error.lock();
                                 if first_error.is_none() {
@@ -40539,11 +40510,7 @@ mod tests {
                         after_rotation.wait();
                         for write in WRITES_BEFORE_ROTATION..WRITES_PER_PHASE {
                             let key = format!("writer-{writer}-phase-{phase}-put-{write}");
-                            let result = if mixed && writer % 8 == 0 {
-                                engine.write_batch(&[WriteBatchRecord::Put(key.as_bytes(), VALUE)])
-                            } else {
-                                engine.put(key.as_bytes(), VALUE)
-                            };
+                            let result = engine.put(key.as_bytes(), VALUE);
                             if let Err(error) = result {
                                 let mut first_error = first_error.lock();
                                 if first_error.is_none() {
@@ -40632,19 +40599,6 @@ mod tests {
             item.point_buffer_preallocation_attempts
                 == item.point_buffer_preallocation_hits + item.point_buffer_preallocation_fallbacks
         }));
-        if mixed {
-            assert!(
-                diagnostics
-                    .iter()
-                    .all(|item| item.point_resource_preclaim_promoted > 0)
-            );
-            assert!(
-                diagnostics
-                    .iter()
-                    .all(|item| item.point_resource_preclaim_attempts
-                        <= ((writer_count - writer_count.div_ceil(8)) * WRITES_PER_PHASE) as u64)
-            );
-        }
         drop(test_memtables);
 
         engine.close()?;

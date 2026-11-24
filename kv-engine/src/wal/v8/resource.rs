@@ -10,9 +10,6 @@ use crate::wal::v7::admission::{
     WalV7ReservationError, WalV7ReservationOwner, WalV7ResourceCharge, WalV7RetainedResources,
 };
 
-#[cfg(feature = "bench")]
-use crate::wal::v7::admission::{PointPreclaimDeclineReason, PointPreclaimLifecycleCounters};
-
 use super::{WAL_V8_HEADER_LEN, codec::WAL_V8_FRAME_LEN, install::WalV8InstalledRecovery};
 
 const FIXED_IMAGE_BYTES: u64 = (WAL_V8_HEADER_LEN + WAL_V8_FRAME_LEN) as u64;
@@ -25,20 +22,6 @@ pub(crate) struct WalV8ReservationOwner {
     recovery_workspace: Mutex<Option<WalV7Reservation>>,
     recovery_workspace_bytes: u64,
     source_allocation_unit: u64,
-}
-
-#[cfg(feature = "bench")]
-pub(crate) struct WalV8PointQuotaPreclaim {
-    claim: crate::wal::v7::admission::PointQuotaPreclaim,
-    owner: Arc<WalV8ReservationOwner>,
-    marker_source_bytes: u64,
-}
-
-#[cfg(feature = "bench")]
-impl WalV8PointQuotaPreclaim {
-    pub(crate) fn claim_active_preclaims_at_issue(&self) -> u64 {
-        self.claim.active_preclaims_at_issue()
-    }
 }
 
 impl WalV8ReservationOwner {
@@ -145,15 +128,6 @@ impl WalV8ReservationOwner {
         Arc::clone(&self.image_owner)
     }
 
-    #[cfg(feature = "bench")]
-    pub(crate) fn set_point_preclaim_sum_cache_enabled(
-        &self,
-        enabled: bool,
-    ) -> std::result::Result<(), WalV7ReservationError> {
-        self.image_owner
-            .set_point_preclaim_sum_cache_enabled(enabled)
-    }
-
     /// Release the fresh-inode workspace after this image has become a strict
     /// Sealed source. Its immutable image and source-spool charges remain owned
     /// until archive cleanup, while the workspace can move to the new Active
@@ -221,43 +195,6 @@ impl WalV8ReservationOwner {
         self.image_owner
             .reserve_batch_charge(charge, marker_source_bytes)
             .map_err(Into::into)
-    }
-
-    #[cfg(feature = "bench")]
-    pub(crate) fn try_preclaim_batch(
-        self: &Arc<Self>,
-        logical_bytes: u64,
-        frame_bytes: u64,
-        lifecycle: Arc<PointPreclaimLifecycleCounters>,
-    ) -> std::result::Result<WalV8PointQuotaPreclaim, PointPreclaimDeclineReason> {
-        let (charge, marker_source_bytes) =
-            self.batch_charge(logical_bytes, frame_bytes)
-                .map_err(|error| {
-                    error
-                        .downcast_ref::<WalV7ReservationError>()
-                        .copied()
-                        .map(PointPreclaimDeclineReason::from_reservation_error)
-                        .unwrap_or(PointPreclaimDeclineReason::InvalidCharge)
-                })?;
-        Ok(WalV8PointQuotaPreclaim {
-            claim: self
-                .image_owner
-                .try_preclaim_batch_charge(charge, lifecycle)?,
-            owner: Arc::clone(self),
-            marker_source_bytes,
-        })
-    }
-
-    #[cfg(feature = "bench")]
-    pub(crate) fn promote_preclaim(
-        self: &Arc<Self>,
-        mut preclaim: WalV8PointQuotaPreclaim,
-    ) -> Result<Option<WalV7OwnedBatchReservation>, WalV7ReservationError> {
-        if !Arc::ptr_eq(self, &preclaim.owner) {
-            return Ok(None);
-        }
-        self.image_owner
-            .promote_batch_preclaim(&mut preclaim.claim, preclaim.marker_source_bytes)
     }
 
     fn batch_charge(

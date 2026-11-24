@@ -178,6 +178,8 @@ pub struct WalIoDiagnostics {
     /// Outstanding speculative buffer permits for in-process lifecycle tests.
     /// This field is not serialized into benchmark results.
     pub point_buffer_preallocations_in_flight: u64,
+    // Retired Stage B fields remain in benchmark output for result-schema
+    // compatibility. Current writers report false and zero for this group.
     /// Whether this writer tries speculative Point quota preclaims.
     pub point_resource_preclaim_enabled: bool,
     /// Whether speculative Point quota checks use the cached aggregate charge.
