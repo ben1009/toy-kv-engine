@@ -22,6 +22,8 @@ from gcp_wal_matrix import (
     CURSOR_DIRECT_COMPLETION_PLAN_SCHEMA_V1,
     CURSOR_SINGLETON_SUBMISSION_PLAN_SCHEMA_V1,
     CURSOR_PUBLICATION_NUM,
+    CURSOR_PUBLICATION_PLAN_SCHEMA_V2,
+    CURSOR_PUBLICATION_ARMS,
     CURSOR_PUBLICATION_WRITERS,
     POINT_LOOKAHEAD_WINDOW_BYTES,
     POINT_PROGRESS_PLAN_SCHEMA_V1,
@@ -74,7 +76,6 @@ UNSET_EXPERIMENT_VARIABLES = (
     "TOYKV_BENCH_WAL_IO_WORKER_CPU",
     "TOYKV_BENCH_V8_POINT_RESOURCE_RETIREMENT_MODE",
     "TOYKV_BENCH_V8_ADMISSION_CURSOR_PUBLISH_FAST_PATH",
-    "TOYKV_BENCH_V8_CURSOR_PUBLICATION_DEDUP",
 )
 FIXED_ENVIRONMENT = {
     "TOYKV_BENCH_V8_EXTENT_PREP": "sliding-point-lookahead",
@@ -133,8 +134,6 @@ def _summary_fields(schedule: list[dict[str, Any]]) -> tuple[str, ...]:
         fields += (
             "admission_cursor_publish_fast_path_enabled_start",
             "admission_cursor_publish_fast_path_enabled_end",
-            "cursor_publication_dedup_enabled_start",
-            "cursor_publication_dedup_enabled_end",
         )
     return fields
 
@@ -149,7 +148,6 @@ def _environment(
     point_buffer_preallocation_enabled: bool | None = None,
     point_resource_retirement_mode: int | None = None,
     admission_cursor_publish_fast_path_enabled: bool | None = None,
-    cursor_publication_dedup_enabled: bool | None = None,
 ) -> dict[str, str]:
     # An allowlist makes the selected experiment switches the only inherited variables.
     if progress_ring_enabled is not progress_cursor_enabled:
@@ -188,10 +186,6 @@ def _environment(
     if admission_cursor_publish_fast_path_enabled is not None:
         environment["TOYKV_BENCH_V8_ADMISSION_CURSOR_PUBLISH_FAST_PATH"] = (
             "1" if admission_cursor_publish_fast_path_enabled else "0"
-        )
-    if cursor_publication_dedup_enabled is not None:
-        environment["TOYKV_BENCH_V8_CURSOR_PUBLICATION_DEDUP"] = (
-            "1" if cursor_publication_dedup_enabled else "0"
         )
     return environment
 
@@ -236,7 +230,6 @@ def _expected_environment_text(
     point_buffer_preallocation_enabled: bool | None = None,
     point_resource_retirement_mode: int | None = None,
     admission_cursor_publish_fast_path_enabled: bool | None = None,
-    cursor_publication_dedup_enabled: bool | None = None,
 ) -> str:
     if progress_ring_enabled and not progress_cursor_enabled:
         # Historical F0.5 archives used the now-retired mode 1. Keep their
@@ -254,7 +247,6 @@ def _expected_environment_text(
             point_buffer_preallocation_enabled=point_buffer_preallocation_enabled,
             point_resource_retirement_mode=point_resource_retirement_mode,
             admission_cursor_publish_fast_path_enabled=admission_cursor_publish_fast_path_enabled,
-            cursor_publication_dedup_enabled=cursor_publication_dedup_enabled,
         ).items()
         if key not in ("PATH", "HOME", "TMPDIR", "LC_ALL")
     }
@@ -265,8 +257,6 @@ def _expected_environment_text(
              or point_resource_retirement_mode is None)
         and (key != "TOYKV_BENCH_V8_ADMISSION_CURSOR_PUBLISH_FAST_PATH"
              or admission_cursor_publish_fast_path_enabled is None)
-        and (key != "TOYKV_BENCH_V8_CURSOR_PUBLICATION_DEDUP"
-             or cursor_publication_dedup_enabled is None)
     })
     return "\n".join(f"{key}={value}" for key, value in sorted(controlled.items())) + "\n"
 
@@ -315,7 +305,6 @@ def _validate_record(record: dict[str, Any], row: dict[str, Any]) -> dict[str, A
             raise ValueError(f"{boundary} singleton-submission mode differs from the planned arm")
         for key in (
             "admission_cursor_publish_fast_path_enabled",
-            "cursor_publication_dedup_enabled",
         ):
             if key in row and snapshot.get(key) is not bool(row[key]):
                 raise ValueError(f"{boundary} {key} differs from the planned arm")
@@ -437,7 +426,6 @@ def _validate_record(record: dict[str, Any], row: dict[str, Any]) -> dict[str, A
         ]
     for key in (
         "admission_cursor_publish_fast_path_enabled",
-        "cursor_publication_dedup_enabled",
     ):
         if key in row:
             metrics[f"{key}_start"] = pipeline["wal_io_start"][key]
@@ -718,9 +706,6 @@ def _run_one(
                 bool(row["admission_cursor_publish_fast_path_enabled"])
                 if cursor_publication_suite else None
             ),
-            cursor_publication_dedup_enabled=(
-                bool(row["cursor_publication_dedup_enabled"]) if cursor_publication_suite else None
-            ),
         )
     )
     (run_dir / "command.sh").write_text(shlex.join(command) + "\n", encoding="utf-8")
@@ -740,9 +725,6 @@ def _run_one(
             admission_cursor_publish_fast_path_enabled=(
                 bool(row["admission_cursor_publish_fast_path_enabled"])
                 if cursor_publication_suite else None
-            ),
-            cursor_publication_dedup_enabled=(
-                bool(row["cursor_publication_dedup_enabled"]) if cursor_publication_suite else None
             ),
         ), encoding="utf-8",
     )
@@ -1473,7 +1455,7 @@ def _cursor_publication_summary(
     validation = validate_cursor_publication_rows(rows, writers)
     cells = [(writer, "point") for writer in writers] + [(16, "batch64")]
     comparisons: list[dict[str, Any]] = []
-    arms = ("baseline", "admission_only", "cursor_dedup_only", "admission_and_cursor_dedup")
+    arms = CURSOR_PUBLICATION_ARMS
     metrics = ("puts_per_second", "cpu_us_per_put", "p50_ms", "p95_ms", "p99_ms", "sync_count", "puts_per_sync")
     for writer, workload in cells:
         selected = {
@@ -1534,6 +1516,32 @@ def _cursor_publication_summary(
     by_cell = {
         f"w{row['writer']}-{row['workload']}-{row['candidate']}": row for row in comparisons
     }
+    point_qualification = [
+        by_cell[f"w{writer}-point-admission_fast_path"] for writer in (8, 16)
+    ]
+    tail_qualification = [
+        by_cell[f"w{writer}-point-admission_fast_path"] for writer in (8, 16)
+    ]
+    guardrail_qualification = [
+        by_cell["w1-point-admission_fast_path"],
+        by_cell["w16-batch64-admission_fast_path"],
+    ]
+    point_gate = all(
+        item["paired_throughput_change_median_pct"] is not None
+        and item["paired_throughput_change_median_pct"] >= 5
+        and item["paired_throughput_wins"] >= 4
+        for item in point_qualification
+    )
+    p99_gate = all(
+        item["paired_p99_change_median_pct"] is not None
+        and item["paired_p99_change_median_pct"] <= 5
+        for item in tail_qualification
+    )
+    guardrail_gate = all(
+        item["paired_throughput_change_median_pct"] is not None
+        and item["paired_throughput_change_median_pct"] >= -2
+        for item in guardrail_qualification
+    )
     return {
         "suite": "v8-cursor-publication",
         "complete": len(rows) == planned and validation["complete"],
@@ -1548,12 +1556,16 @@ def _cursor_publication_summary(
         "comparison": comparisons,
         "comparison_by_cell": by_cell,
         "qualification_gates": {
-            "point8_and_point16_at_least_5pct_improvement": False,
-            "note": "This factorial diagnostic reports D2a and D2b effects separately; it does not auto-promote either change.",
+            "point8_and_point16_each_gain_at_least_5pct_and_win_4_of_5": point_gate,
+            "point8_and_point16_p99_regression_at_most_5pct": p99_gate,
+            "point1_and_batch64_paired_median_regression_at_most_2pct": guardrail_gate,
+            "candidate_qualified": bool(
+                validation["complete"] and point_gate and p99_gate and guardrail_gate
+            ),
         },
         "qualification_note": (
-            "Same-host, same-source, same-release-binary four-arm factorial comparison. Stage A is enabled for Point, "
-            "retirement mode 0 is fixed, and only D2a/D2b vary. Batch64 is a regression guardrail."
+            "Same-host, same-source, same-release-binary D2a-only two-arm comparison. Stage A is enabled for Point, "
+            "retirement mode 0, D1 off, and D2b removed. Batch64 is a regression guardrail."
         ),
     }
 
@@ -1801,7 +1813,7 @@ def verify_point_resource_retirement_results_directory(results: Path) -> dict[st
 
 
 def verify_cursor_publication_results_directory(results: Path) -> dict[str, Any]:
-    """Verify the four D2 arms, captured runtime flags, and every archived result."""
+    """Verify the D2a-only matrix, captured runtime flags, and every archived result."""
     errors: list[str] = []
     try:
         summary = json.loads((results / "summary.json").read_text(encoding="utf-8"))
@@ -1811,6 +1823,8 @@ def verify_cursor_publication_results_directory(results: Path) -> dict[str, Any]
         binary_sha = (results / "write-perf.sha256").read_text(encoding="utf-8").strip()
         if not all(isinstance(value, dict) for value in (summary, remote_exit, plan)):
             raise ValueError("summary, remote-exit, and plan must be JSON objects")
+        if plan.get("plan_schema_version") != CURSOR_PUBLICATION_PLAN_SCHEMA_V2:
+            raise ValueError("unsupported Cursor publication plan schema")
 
         schedule = build_cursor_publication_schedule(plan.get("writers", ()))
         expected_plan = build_cursor_publication_plan(
@@ -1864,7 +1878,7 @@ def verify_cursor_publication_results_directory(results: Path) -> dict[str, Any]
             raise ValueError("summary results are missing or malformed")
         validation = validate_cursor_publication_rows(rows, plan.get("writers", ()))
         if validation.get("complete") is not True:
-            errors.append("run rows do not prove all four D2 arms and fixed guardrails")
+            errors.append("run rows do not prove both D2a arms and fixed guardrails")
         recomputed = _cursor_publication_summary(rows, tuple(plan["writers"]), len(schedule))
         for key in (
             "suite", "complete", "runs_started", "runs_completed", "runs_planned", "writers", "workloads",
@@ -1904,7 +1918,6 @@ def verify_cursor_publication_results_directory(results: Path) -> dict[str, Any]
                 admission_cursor_publish_fast_path_enabled=bool(
                     row["admission_cursor_publish_fast_path_enabled"]
                 ),
-                cursor_publication_dedup_enabled=bool(row["cursor_publication_dedup_enabled"]),
             )
             environment_path = run_dir / "environment.txt"
             if not environment_path.is_file() or environment_path.read_text(encoding="utf-8") != expected_environment:

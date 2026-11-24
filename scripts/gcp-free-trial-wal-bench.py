@@ -1207,7 +1207,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     suite_group.add_argument("--v8-cursor-coalescing-budget-ab", action="store_true",
                              help="Compare Cursor Direct Point Dynamic, 100, and 400 μs coalescing budgets")
     suite_group.add_argument("--v8-cursor-publication-ab", action="store_true",
-                             help="Compare D2a admission publication and D2b cursor deduplication in four arms")
+                             help="Requalify D2a admission publication with a two-arm, 40-run Point/Batch matrix")
     suite_group.add_argument("--v8-extent-policy-storage-ab", action="store_true",
                              help="Compare V8 BTreeMap and Vec extent-policy storage with Point/Batch guardrails")
     suite_group.add_argument("--v7-v8-point-preallocation-ab", action="store_true",
@@ -1663,7 +1663,6 @@ def _expected_run_metadata(row: dict[str, Any], suite: str) -> dict[str, Any]:
                 "progress_cursor_enabled", "progress_counters_enabled", "cursor_direct_completion_enabled",
                 "cursor_singleton_submission_enabled", "point_buffer_preallocation_enabled",
                 "point_resource_retirement_mode", "admission_cursor_publish_fast_path_enabled",
-                "cursor_publication_dedup_enabled",
             )
         return {key: row[key] for key in keys}
     if suite == "v7-v8-point-preallocation":

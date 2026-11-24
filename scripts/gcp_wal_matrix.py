@@ -111,12 +111,11 @@ CURSOR_SINGLETON_SUBMISSION_ARMS = ("cursor_control", "cursor_singleton")
 CURSOR_PUBLICATION_WRITERS = (1, 8, 16)
 CURSOR_PUBLICATION_REPETITIONS = 5
 CURSOR_PUBLICATION_NUM = 100_000
-CURSOR_PUBLICATION_ARMS = ("baseline", "admission_only", "cursor_dedup_only", "admission_and_cursor_dedup")
+CURSOR_PUBLICATION_PLAN_SCHEMA_V2 = 2
+CURSOR_PUBLICATION_ARMS = ("baseline", "admission_fast_path")
 CURSOR_PUBLICATION_ORDERS = (
-    ("baseline", "admission_only", "cursor_dedup_only", "admission_and_cursor_dedup"),
-    ("admission_only", "cursor_dedup_only", "admission_and_cursor_dedup", "baseline"),
-    ("cursor_dedup_only", "admission_and_cursor_dedup", "baseline", "admission_only"),
-    ("admission_and_cursor_dedup", "baseline", "admission_only", "cursor_dedup_only"),
+    ("baseline", "admission_fast_path"),
+    ("admission_fast_path", "baseline"),
 )
 POINT_RESOURCE_RETIREMENT_WRITERS = (8, 16)
 POINT_RESOURCE_RETIREMENT_REPETITIONS = 5
@@ -805,23 +804,18 @@ def build_cursor_singleton_submission_schedule(
 def build_cursor_publication_schedule(
     writers: Iterable[int] = CURSOR_PUBLICATION_WRITERS,
 ) -> list[dict[str, object]]:
-    """Build a four-arm same-binary D2a/D2b cursor-publication matrix."""
+    """Build the final 40-run D2a-only, same-binary cursor-publication matrix."""
     writer_counts = validate_writer_counts(writers)
     if writer_counts != CURSOR_PUBLICATION_WRITERS:
         raise ValueError(f"cursor-publication qualification requires writers {CURSOR_PUBLICATION_WRITERS}")
 
-    switches = {
-        "baseline": (False, False),
-        "admission_only": (True, False),
-        "cursor_dedup_only": (False, True),
-        "admission_and_cursor_dedup": (True, True),
-    }
+    switches = {"baseline": False, "admission_fast_path": True}
     schedule: list[dict[str, object]] = []
     for writer, workload, bench, batch_entries, batch_size, sample_every in POINT_PROGRESS_RING_CELLS:
         for repetition in range(1, CURSOR_PUBLICATION_REPETITIONS + 1):
             order = CURSOR_PUBLICATION_ORDERS[(repetition - 1) % len(CURSOR_PUBLICATION_ORDERS)]
             for arm in order:
-                admission_fast_path, cursor_dedup = switches[arm]
+                admission_fast_path = switches[arm]
                 schedule.append({
                     "run_index": len(schedule) + 1,
                     "writer": writer,
@@ -845,7 +839,6 @@ def build_cursor_publication_schedule(
                     "point_buffer_preallocation_enabled": workload == "point",
                     "point_resource_retirement_mode": 0,
                     "admission_cursor_publish_fast_path_enabled": admission_fast_path,
-                    "cursor_publication_dedup_enabled": cursor_dedup,
                 })
     return schedule
 
@@ -854,14 +847,14 @@ def build_cursor_publication_plan(
     *, writers: Iterable[int], machine_type: str, machine_spec: Mapping[str, int],
     commit: str, binary_sha256: str | None = None,
 ) -> dict[str, object]:
-    """Describe the isolated D2a/D2b experiment with Stage A and retirement fixed."""
+    """Describe the isolated D2a requalification with Stage A and retirement fixed."""
     writer_counts = validate_writer_counts(writers)
     schedule = build_cursor_publication_schedule(writer_counts)
     vcpus = int(machine_spec["vcpus"])
     ssd_count = int(machine_spec["ssd_count"])
     layout = "single Local SSD" if ssd_count == 1 else f"RAID0 over {ssd_count} Local SSDs"
     return {
-        "plan_schema_version": 1,
+        "plan_schema_version": CURSOR_PUBLICATION_PLAN_SCHEMA_V2,
         "suite": "v8-cursor-publication",
         "writers": list(writer_counts),
         "workloads": [
@@ -897,21 +890,20 @@ def build_cursor_publication_plan(
         "extent_policy_storage": "vec",
         "extent_policy_scan_diagnostics_enabled": False,
         "latency_sample_every": 10,
-        "d2_ab": {
+        "d2a": {
             "admission_fast_path_env": "TOYKV_BENCH_V8_ADMISSION_CURSOR_PUBLISH_FAST_PATH",
-            "cursor_publication_dedup_env": "TOYKV_BENCH_V8_CURSOR_PUBLICATION_DEDUP",
-            "runtime_proof_fields": [
-                "admission_cursor_publish_fast_path_enabled",
-                "cursor_publication_dedup_enabled",
-            ],
+            "runtime_proof_field": "admission_cursor_publish_fast_path_enabled",
+            "default": False,
             "stage_a_preallocation": "enabled for Point, disabled for Batch64",
             "retirement_mode": 0,
+            "d1": False,
+            "d2b": "removed",
         },
         "qualification_note": (
-            "Four-arm same-host, same-source, same-release-binary factorial comparison of D2a admission cursor "
-            "publication and D2b post-durability cursor deduplication. Cursor, Direct Completion, Direct FRONTIER, "
-            "dynamic coalescing, 1 MiB Point lookahead, Stage A Point preallocation, and retirement mode 0 are fixed. "
-            "Point1/8/16 and Batch64 each have five counterbalanced repetitions; latency is sampled every 10 Point puts."
+            "Two-arm same-host, same-source, same-release-binary D2a-only comparison. Cursor, Direct Completion, "
+            "Direct FRONTIER, dynamic coalescing, 1 MiB Point lookahead, Stage A Point preallocation, retirement "
+            "mode 0, and D1 disabled are fixed. D2b was removed. Point1/8/16 and Batch64 each have five paired "
+            "repetitions; latency is sampled every 10 Point puts."
         ),
     }
 
@@ -1783,7 +1775,6 @@ def validate_cursor_publication_rows(
             "progress_cursor_enabled", "progress_counters_enabled", "cursor_direct_completion_enabled",
             "cursor_singleton_submission_enabled", "point_buffer_preallocation_enabled",
             "point_resource_retirement_mode", "admission_cursor_publish_fast_path_enabled",
-            "cursor_publication_dedup_enabled",
         ):
             if row.get(key) != planned[key]:
                 invalid.append(row)

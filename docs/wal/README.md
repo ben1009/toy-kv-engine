@@ -304,7 +304,7 @@ experiments. Each report records its own outcome and measurement limits.
 - [RFC 027 V8 Cursor singleton-submission GCP qualification — throughput gate failed, 2026-11-22](benchmarks/rfc-027-v8-cursor-singleton-submission-gcp-20261122.md)
 - [RFC 028 V8 Point critical-path GCP diagnostic — no single bottleneck established, 2026-11-22](benchmarks/rfc-028-v8-point16-critical-path-gcp-20261122.md)
 - [RFC 028 V8 Point D1 ACK-check GCP A/B — no stable throughput gain, 2026-11-24](benchmarks/rfc-028-v8-point-ack-d1-gcp-20261124.md)
-- [RFC 028 V8 cursor publication D2a/D2b GCP A/B — no candidate passed the throughput gate, 2026-11-24](benchmarks/rfc-028-v8-cursor-publication-d2-gcp-20261124.md)
+- [RFC 028 V8 cursor publication D2a/D2b historical GCP A/B — baseline was not a full pre-D2 restore, 2026-11-24](benchmarks/rfc-028-v8-cursor-publication-d2-gcp-20261124.md)
 - [RFC 028 V8 Cursor coalescing GCP diagnostic — progress-token wait dominates sampled coalescing wall time, 2026-11-23](benchmarks/rfc-028-v8-cursor-coalescing-gcp-20261123.md)
 - [RFC 028 V8 Cursor coalescing-budget A/B — fixed 400 μs wins consistently but misses the throughput gate, 2026-11-23](benchmarks/rfc-028-v8-cursor-coalescing-budget-gcp-20261123.md)
 - [RFC 028 V8 Point buffer preallocation GCP A/B — Point8 +9.59%, Point16 +3.88%, 2026-11-23](benchmarks/rfc-028-v8-point-buffer-preallocation-gcp-20261123.md)

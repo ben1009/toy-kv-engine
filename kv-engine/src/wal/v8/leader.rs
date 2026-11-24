@@ -58,7 +58,7 @@ use crate::{
 use crate::wal::{
     WalExtentPreparationDiagnostics, WalExtentPreparationMode, WalIoDiagnostics,
     WalIoHandleMetadata, WalV8SlidingExtentPreparationDiagnostics,
-    v8_admission_cursor_publish_fast_path_enabled, v8_cursor_publication_dedup_enabled,
+    v8_admission_cursor_publish_fast_path_enabled,
 };
 
 #[cfg(feature = "bench")]
@@ -4655,8 +4655,7 @@ impl WalV8LeaderWriter {
             progress_cursor_enabled: false,
             cursor_direct_completion_enabled: false,
             cursor_singleton_submission_enabled: false,
-            admission_cursor_publish_fast_path_enabled: true,
-            cursor_publication_dedup_enabled: true,
+            admission_cursor_publish_fast_path_enabled: false,
             point_buffer_preallocation_enabled: false,
             point_buffer_preallocation_attempts: 0,
             point_buffer_preallocation_hits: 0,
@@ -4862,7 +4861,6 @@ impl WalV8LeaderWriter {
             io_diagnostics.cursor_singleton_submission_enabled = singleton_submission_enabled;
             io_diagnostics.admission_cursor_publish_fast_path_enabled =
                 v8_admission_cursor_publish_fast_path_enabled();
-            io_diagnostics.cursor_publication_dedup_enabled = v8_cursor_publication_dedup_enabled();
             io_diagnostics.point_buffer_preallocation_enabled = point_buffer_preallocation_enabled;
             io_diagnostics.point_resource_retirement_mode = point_resource_retirement_mode as u8;
         }

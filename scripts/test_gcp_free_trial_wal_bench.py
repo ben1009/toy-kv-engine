@@ -403,7 +403,6 @@ class PointProgressRingQualificationTests(unittest.TestCase):
             })
         for key in (
             "admission_cursor_publish_fast_path_enabled",
-            "cursor_publication_dedup_enabled",
         ):
             if key in row:
                 start[key] = bool(row[key])
@@ -610,7 +609,6 @@ class PointProgressRingQualificationTests(unittest.TestCase):
                     admission_cursor_publish_fast_path_enabled=row.get(
                         "admission_cursor_publish_fast_path_enabled"
                     ),
-                    cursor_publication_dedup_enabled=row.get("cursor_publication_dedup_enabled"),
                 ),
                 encoding="utf-8",
             )
@@ -842,11 +840,11 @@ class PointProgressRingQualificationTests(unittest.TestCase):
             self.assertFalse(verification["verified"])
             self.assertTrue(any("metadata" in error or "matrix" in error for error in verification["errors"]))
 
-    def test_cursor_publication_fixture_verifies_four_isolated_d2_arms(self) -> None:
+    def test_cursor_publication_fixture_verifies_d2a_only_requalification(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             results = self._make_fixture(Path(temporary), cursor_publication=True)
             schedule = build_cursor_publication_schedule(CURSOR_PUBLICATION_WRITERS)
-            self.assertEqual(len(schedule), 80)
+            self.assertEqual(len(schedule), 40)
             self.assertEqual({row["arm"] for row in schedule}, set(CURSOR_PUBLICATION_ARMS))
             self.assertEqual({row["writer"] for row in schedule}, {1, 8, 16})
             self.assertEqual(
@@ -862,23 +860,20 @@ class PointProgressRingQualificationTests(unittest.TestCase):
 
             plan = json.loads((results / "benchmark-plan.json").read_text(encoding="utf-8"))
             self.assertEqual(plan["suite"], "v8-cursor-publication")
-            self.assertEqual(plan["runs_planned"], 80)
+            self.assertEqual(plan["plan_schema_version"], 2)
+            self.assertEqual(plan["runs_planned"], 40)
             self.assertTrue(plan["point_buffer_preallocation_enabled"])
             self.assertEqual(plan["point_resource_retirement_mode"], 0)
             baseline = next(row for row in schedule if row["arm"] == "baseline")
-            admission = next(row for row in schedule if row["arm"] == "admission_only")
-            dedup = next(row for row in schedule if row["arm"] == "cursor_dedup_only")
+            admission = next(row for row in schedule if row["arm"] == "admission_fast_path")
             self.assertFalse(baseline["admission_cursor_publish_fast_path_enabled"])
-            self.assertFalse(baseline["cursor_publication_dedup_enabled"])
+            self.assertNotIn("cursor_publication_dedup_enabled", baseline)
             self.assertTrue(admission["admission_cursor_publish_fast_path_enabled"])
-            self.assertFalse(admission["cursor_publication_dedup_enabled"])
-            self.assertFalse(dedup["admission_cursor_publish_fast_path_enabled"])
-            self.assertTrue(dedup["cursor_publication_dedup_enabled"])
             environment = (
                 results / progress_ring_runner._run_id(admission) / "environment.txt"
             ).read_text(encoding="utf-8")
             self.assertIn("TOYKV_BENCH_V8_ADMISSION_CURSOR_PUBLISH_FAST_PATH=1\n", environment)
-            self.assertIn("TOYKV_BENCH_V8_CURSOR_PUBLICATION_DEDUP=0\n", environment)
+            self.assertNotIn("TOYKV_BENCH_V8_CURSOR_PUBLICATION_DEDUP", environment)
 
             raw_path = results / progress_ring_runner._run_id(admission) / "result.json"
             raw = json.loads(raw_path.read_text(encoding="utf-8"))

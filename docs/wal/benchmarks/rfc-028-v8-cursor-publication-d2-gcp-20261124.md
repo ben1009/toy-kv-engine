@@ -60,6 +60,12 @@ D2b alone regressed Point16 by 5.39% (0/5 wins) and increased CPU/Put by 4.78 μ
 
 No production default was changed. These results are a same-host factorial comparison of the two bench-only switches, not a V7 comparison or a cross-host qualification.
 
+## Baseline limitation and follow-up
+
+The `baseline` arm above is the D2a/D2b-off arm from the experimental source revision, not a full restoration of the pre-D2 cursor-publication implementation. With both switches off, that revision still omitted the legacy `pitr_reserved_end` update and used a changed `next_ticket` / `durable_ticket` publication order. Therefore, the reported D2a result is only its marginal effect against that experimental base; it must not be presented as a clean before/after comparison against the complete pre-D2 implementation.
+
+The historical 80-run archive is retained as recorded. A separate D2a-only requalification uses the restored legacy publication sequence as its baseline, keeps Stage A enabled for Point only, fixes retirement mode 0 and D1 off, and removes D2b. See the follow-up report linked from the WAL index.
+
 ## Verification and cleanup
 
 - `summary.json`: `complete=true`, 80 planned / 80 started / 80 attempted / 80 completed.

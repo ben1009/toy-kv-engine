@@ -1932,7 +1932,6 @@ struct WalIoDiagnosticsRecord {
     cursor_direct_completion_enabled: bool,
     cursor_singleton_submission_enabled: bool,
     admission_cursor_publish_fast_path_enabled: bool,
-    cursor_publication_dedup_enabled: bool,
     point_buffer_preallocation_enabled: bool,
     point_buffer_preallocation_attempts: u64,
     point_buffer_preallocation_hits: u64,
@@ -2098,7 +2097,6 @@ impl From<WalIoDiagnostics> for WalIoDiagnosticsRecord {
             cursor_singleton_submission_enabled: diagnostics.cursor_singleton_submission_enabled,
             admission_cursor_publish_fast_path_enabled: diagnostics
                 .admission_cursor_publish_fast_path_enabled,
-            cursor_publication_dedup_enabled: diagnostics.cursor_publication_dedup_enabled,
             point_buffer_preallocation_enabled: diagnostics.point_buffer_preallocation_enabled,
             point_buffer_preallocation_attempts: diagnostics.point_buffer_preallocation_attempts,
             point_buffer_preallocation_hits: diagnostics.point_buffer_preallocation_hits,
@@ -2180,7 +2178,6 @@ impl WalIoDiagnosticsRecord {
             && self.cursor_singleton_submission_enabled == other.cursor_singleton_submission_enabled
             && self.admission_cursor_publish_fast_path_enabled
                 == other.admission_cursor_publish_fast_path_enabled
-            && self.cursor_publication_dedup_enabled == other.cursor_publication_dedup_enabled
             && self.point_buffer_preallocation_enabled == other.point_buffer_preallocation_enabled
             && self.point_resource_retirement_mode == other.point_resource_retirement_mode
             && self.point_resource_preclaim_enabled == other.point_resource_preclaim_enabled
@@ -12929,7 +12926,6 @@ mod tests {
                         cursor_direct_completion_enabled: false,
                         cursor_singleton_submission_enabled: false,
                         admission_cursor_publish_fast_path_enabled: false,
-                        cursor_publication_dedup_enabled: false,
                         point_buffer_preallocation_enabled: false,
                         point_buffer_preallocation_attempts: 0,
                         point_buffer_preallocation_hits: 0,
@@ -12991,7 +12987,6 @@ mod tests {
                         cursor_direct_completion_enabled: false,
                         cursor_singleton_submission_enabled: false,
                         admission_cursor_publish_fast_path_enabled: false,
-                        cursor_publication_dedup_enabled: false,
                         point_buffer_preallocation_enabled: false,
                         point_buffer_preallocation_attempts: 0,
                         point_buffer_preallocation_hits: 0,
