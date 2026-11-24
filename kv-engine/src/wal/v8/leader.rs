@@ -6089,17 +6089,9 @@ impl WalV8ParallelWriter {
         let ticket_end = ticket
             .checked_add(1)
             .context("v8 Parallel durable ticket end overflows")?;
-        let Some(driver) = self.coordinator.acquire_durability_driver(ticket_end)? else {
+        let Some(mut driver) = self.coordinator.acquire_durability_driver(ticket_end)? else {
             return Ok(());
         };
-        self.drive_frontier_with_driver(ticket_end, driver)
-    }
-
-    fn drive_frontier_with_driver(
-        &self,
-        ticket_end: u64,
-        mut driver: WalV8DurabilityDriver,
-    ) -> Result<()> {
         let result = self.drive_frontier_through(ticket_end, &mut driver);
         if result.is_ok() {
             driver.complete();
@@ -7271,13 +7263,15 @@ impl WalV8ParallelWriter {
     }
 
     pub(crate) fn wait_durable(&self, ticket: u64) -> Result<()> {
-        let ticket_end = ticket
-            .checked_add(1)
-            .context("v8 Parallel durable ticket end overflows")?;
-        let Some(driver) = self.coordinator.acquire_durability_driver(ticket_end)? else {
+        ensure!(!self.is_poisoned(), "v8 Parallel WAL is poisoned");
+        ensure!(
+            ticket < self.coordinator.next_ticket(),
+            "v8 Parallel durability wait names an unassigned ticket"
+        );
+        if self.coordinator.durable_ticket_end() > ticket {
             return Ok(());
-        };
-        if let Err(error) = self.drive_frontier_with_driver(ticket_end, driver) {
+        }
+        if let Err(error) = self.advance_frontier_through(ticket) {
             self.coordinator.poison();
             return Err(error);
         }
@@ -8654,7 +8648,7 @@ mod tests {
         let error = writer
             .wait_durable(0)
             .expect_err("poison must take precedence over ticket assignment");
-        assert!(format!("{error:#}").contains("coordinator is poisoned"));
+        assert!(format!("{error:#}").contains("v8 Parallel WAL is poisoned"));
         assert!(writer.is_poisoned());
 
         Ok(())

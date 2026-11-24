@@ -782,6 +782,8 @@ pub struct Wal {
     preallocated_size: AtomicU64,
     /// Shared completion state for the fate-sharing barrier.
     completion_state: CompletionState,
+    /// Serializes mirroring a V8 Parallel durable cursor into the outer WAL cursors.
+    v8_parallel_cursor_publish: Mutex<()>,
     /// Atomic leader-election flag for submit_and_commit. Replaces a mutex so
     /// threads that are not the leader never block on a lock — they either
     /// become the leader (CAS wins) or wait on the completion condvar.
@@ -792,7 +794,7 @@ pub struct Wal {
     /// Set to true on I/O error to fail-fast future writes.
     /// Once poisoned, the WAL is unusable — callers must create a new WAL.
     poisoned: AtomicBool,
-    /// PITR admission bounds and the ticket-ordered logical end reserved by queued batches.
+    /// PITR admission bounds and the end tracked by V5/V6 reservations and V7 publication.
     pitr_max_segment_bytes: AtomicU64,
     pitr_max_unarchived_bytes: AtomicU64,
     /// File offset where the current PITR segment started appending.
@@ -939,6 +941,39 @@ fn wait_for_v8_parallel_if_needed(
     wait()?;
 
     Ok(true)
+}
+
+fn publish_v8_parallel_cursor_snapshot(
+    durable_ticket: &AtomicU64,
+    publish_gate: &Mutex<()>,
+    alloc_offset: &AtomicU64,
+    preallocated_size: &AtomicU64,
+    next_ticket: &AtomicU64,
+    covered_ticket: Option<u64>,
+    published_cursor: impl FnOnce() -> (u64, u64, u64),
+) -> u64 {
+    if let Some(ticket) = covered_ticket {
+        let durable_ticket_end = durable_ticket.load(Ordering::Acquire);
+        if durable_ticket_end > ticket {
+            return durable_ticket_end;
+        }
+    }
+
+    let _publish_guard = publish_gate.lock();
+    if let Some(ticket) = covered_ticket {
+        let durable_ticket_end = durable_ticket.load(Ordering::Acquire);
+        if durable_ticket_end > ticket {
+            return durable_ticket_end;
+        }
+    }
+
+    let (ticket_end, append_offset, admitted_ticket_end) = published_cursor();
+    alloc_offset.fetch_max(append_offset, Ordering::Release);
+    preallocated_size.fetch_max(append_offset, Ordering::Release);
+    next_ticket.fetch_max(admitted_ticket_end, Ordering::Release);
+    let previous_durable_ticket_end = durable_ticket.fetch_max(ticket_end, Ordering::Release);
+
+    ticket_end.max(previous_durable_ticket_end)
 }
 
 impl Wal {
@@ -1126,6 +1161,7 @@ impl Wal {
                 alloc_offset: AtomicU64::new(alloc_offset),
                 preallocated_size: AtomicU64::new(alloc_offset),
                 completion_state: CompletionState::new(),
+                v8_parallel_cursor_publish: Mutex::new(()),
                 submitting: AtomicBool::new(false),
                 #[cfg(feature = "bench")]
                 last_release_ns: AtomicU64::new(0),
@@ -1159,6 +1195,7 @@ impl Wal {
                 alloc_offset: AtomicU64::new(0),
                 preallocated_size: AtomicU64::new(0),
                 completion_state: CompletionState::new(),
+                v8_parallel_cursor_publish: Mutex::new(()),
                 submitting: AtomicBool::new(false),
                 #[cfg(feature = "bench")]
                 last_release_ns: AtomicU64::new(0),
@@ -1501,6 +1538,7 @@ impl Wal {
             alloc_offset: AtomicU64::new(alloc_offset),
             preallocated_size: AtomicU64::new(alloc_offset),
             completion_state: CompletionState::new(),
+            v8_parallel_cursor_publish: Mutex::new(()),
             submitting: AtomicBool::new(false),
             #[cfg(feature = "bench")]
             last_release_ns: AtomicU64::new(0),
@@ -1560,6 +1598,7 @@ impl Wal {
             alloc_offset: AtomicU64::new(alloc_offset),
             preallocated_size: AtomicU64::new(alloc_offset),
             completion_state: CompletionState::new(),
+            v8_parallel_cursor_publish: Mutex::new(()),
             submitting: AtomicBool::new(false),
             #[cfg(feature = "bench")]
             last_release_ns: AtomicU64::new(0),
@@ -1606,6 +1645,7 @@ impl Wal {
             alloc_offset: AtomicU64::new(seed.append_offset),
             preallocated_size: AtomicU64::new(seed.append_offset),
             completion_state: CompletionState::with_durable_ticket(seed.next_ticket),
+            v8_parallel_cursor_publish: Mutex::new(()),
             submitting: AtomicBool::new(false),
             #[cfg(feature = "bench")]
             last_release_ns: AtomicU64::new(0),
@@ -1658,6 +1698,7 @@ impl Wal {
             alloc_offset: AtomicU64::new(append_offset),
             preallocated_size: AtomicU64::new(append_offset),
             completion_state: CompletionState::with_durable_ticket(next_ticket),
+            v8_parallel_cursor_publish: Mutex::new(()),
             submitting: AtomicBool::new(false),
             #[cfg(feature = "bench")]
             last_release_ns: AtomicU64::new(0),
@@ -1707,6 +1748,7 @@ impl Wal {
             alloc_offset: AtomicU64::new(append_offset),
             preallocated_size: AtomicU64::new(append_offset),
             completion_state: CompletionState::with_durable_ticket(next_ticket),
+            v8_parallel_cursor_publish: Mutex::new(()),
             submitting: AtomicBool::new(false),
             #[cfg(feature = "bench")]
             last_release_ns: AtomicU64::new(0),
@@ -1786,6 +1828,7 @@ impl Wal {
             alloc_offset: AtomicU64::new(append_offset),
             preallocated_size: AtomicU64::new(append_offset),
             completion_state: CompletionState::with_durable_ticket(next_ticket),
+            v8_parallel_cursor_publish: Mutex::new(()),
             submitting: AtomicBool::new(false),
             #[cfg(feature = "bench")]
             last_release_ns: AtomicU64::new(0),
@@ -2682,7 +2725,7 @@ impl Wal {
                 return Err(error);
             }
         };
-        self.finish_v8_parallel_admission(writer, job)
+        self.finish_v8_parallel_admission(job)
     }
 
     #[cfg(feature = "bench")]
@@ -2733,12 +2776,11 @@ impl Wal {
                 return Err(error);
             }
         };
-        self.finish_v8_parallel_admission(writer, job)
+        self.finish_v8_parallel_admission(job)
     }
 
     fn finish_v8_parallel_admission<'a>(
         &self,
-        writer: &v8::leader::WalV8ParallelWriter,
         job: v8::leader::WalV8FrameJob<'a>,
     ) -> Result<(u64, v8::leader::WalV8FrameJob<'a>)> {
         let assignment = job.assignment();
@@ -2746,13 +2788,17 @@ impl Wal {
             .first_data_offset
             .checked_add(u64::try_from(job.frame_buffer_bytes())?)
             .context("v8 Parallel DATA allocation end overflows after admission")?;
-        self.next_ticket
-            .fetch_max(writer.next_ticket(), Ordering::Release);
+        let ticket_end = assignment
+            .segment_ticket
+            .checked_add(1)
+            .context("v8 Parallel ticket end overflows after admission")?;
+        // Publish this admission's end without reacquiring the Coordinator
+        // lock. Every admission publishes its own end before returning; V8
+        // durability and admission decisions read the Coordinator directly.
+        self.next_ticket.fetch_max(ticket_end, Ordering::Release);
         self.alloc_offset.fetch_max(data_end, Ordering::Release);
         self.preallocated_size
             .fetch_max(data_end, Ordering::Release);
-        let mut reserved_end = self.pitr_reserved_end.lock();
-        *reserved_end = (*reserved_end).max(data_end);
 
         Ok((assignment.segment_ticket, job))
     }
@@ -2778,7 +2824,6 @@ impl Wal {
         self.alloc_offset.store(append_offset, Ordering::Release);
         self.preallocated_size
             .store(append_offset, Ordering::Release);
-        *self.pitr_reserved_end.lock() = append_offset;
         self.completion_state
             .durable_ticket
             .store(ticket_end, Ordering::Release);
@@ -2793,7 +2838,7 @@ impl Wal {
         ticket: u64,
     ) -> Result<u64> {
         let result = (|| {
-            let durable_ticket_end = self.refresh_v8_parallel_cursor(writer);
+            let durable_ticket_end = self.refresh_v8_parallel_cursor(writer, Some(ticket));
             ensure!(
                 ticket < durable_ticket_end,
                 "v8 Parallel append returned before its ticket became durable"
@@ -2808,24 +2853,26 @@ impl Wal {
         result
     }
 
-    fn refresh_v8_parallel_cursor(&self, writer: &v8::leader::WalV8ParallelWriter) -> u64 {
+    fn refresh_v8_parallel_cursor(
+        &self,
+        writer: &v8::leader::WalV8ParallelWriter,
+        covered_ticket: Option<u64>,
+    ) -> u64 {
         // The coordinator publishes this cursor only after the covering sync.
         // A completed caller must not join a later physical FRONTIER cycle
         // merely to rebuild an ActiveBoundary and read the completed image end.
-        let (ticket_end, append_offset, admitted_ticket_end) = writer.published_cursor();
-        self.alloc_offset
-            .fetch_max(append_offset, Ordering::Release);
-        self.preallocated_size
-            .fetch_max(append_offset, Ordering::Release);
-        let mut reserved_end = self.pitr_reserved_end.lock();
-        *reserved_end = (*reserved_end).max(append_offset);
-        self.completion_state
-            .durable_ticket
-            .fetch_max(ticket_end, Ordering::Release);
-        self.next_ticket
-            .fetch_max(admitted_ticket_end, Ordering::Release);
-
-        ticket_end
+        // Serialize cursor mirroring independently of PITR admission accounting.
+        // Take the Coordinator snapshot only after acquiring this gate so racing
+        // waiters publish one outer cursor before the durable watermark exposes it.
+        publish_v8_parallel_cursor_snapshot(
+            &self.completion_state.durable_ticket,
+            &self.v8_parallel_cursor_publish,
+            &self.alloc_offset,
+            &self.preallocated_size,
+            &self.next_ticket,
+            covered_ticket,
+            || writer.published_cursor(),
+        )
     }
 
     fn record_v8_parallel_error(
@@ -2959,7 +3006,7 @@ impl Wal {
             }
         };
         if waited {
-            self.refresh_v8_parallel_cursor(writer);
+            self.refresh_v8_parallel_cursor(writer, ticket);
         }
 
         Ok(())
@@ -4868,5 +4915,193 @@ mod v8_wait_tests {
         // Assert
         assert!(waited);
         assert!(sync_called.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn cursor_snapshot_publishes_outer_cursors_before_durable_watermark() {
+        let durable_ticket = AtomicU64::new(0);
+        let publish_gate = Mutex::new(());
+        let alloc_offset = AtomicU64::new(100);
+        let preallocated_size = AtomicU64::new(200);
+        let next_ticket = AtomicU64::new(0);
+
+        std::thread::scope(|scope| {
+            let reader = scope.spawn(|| {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while durable_ticket.load(Ordering::Acquire) <= 4
+                    && std::time::Instant::now() < deadline
+                {
+                    std::thread::yield_now();
+                }
+
+                assert!(durable_ticket.load(Ordering::Acquire) > 4);
+                assert_eq!(alloc_offset.load(Ordering::Acquire), 4096);
+                assert_eq!(preallocated_size.load(Ordering::Acquire), 4096);
+                assert_eq!(next_ticket.load(Ordering::Acquire), 8);
+            });
+
+            let durable_end = publish_v8_parallel_cursor_snapshot(
+                &durable_ticket,
+                &publish_gate,
+                &alloc_offset,
+                &preallocated_size,
+                &next_ticket,
+                Some(4),
+                || (5, 4096, 8),
+            );
+
+            reader.join().unwrap();
+            assert_eq!(durable_end, 5);
+        });
+    }
+
+    #[test]
+    fn concurrent_cursor_refreshes_publish_one_snapshot_for_covered_waiters() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::{Arc, Barrier};
+
+        let durable_ticket = Arc::new(AtomicU64::new(0));
+        let publish_gate = Arc::new(Mutex::new(()));
+        let alloc_offset = Arc::new(AtomicU64::new(0));
+        let preallocated_size = Arc::new(AtomicU64::new(0));
+        let next_ticket = Arc::new(AtomicU64::new(0));
+        let snapshot_calls = Arc::new(AtomicUsize::new(0));
+        let start = Arc::new(Barrier::new(3));
+
+        let publish_guard = publish_gate.lock();
+        let first = {
+            let durable_ticket = Arc::clone(&durable_ticket);
+            let publish_gate = Arc::clone(&publish_gate);
+            let alloc_offset = Arc::clone(&alloc_offset);
+            let preallocated_size = Arc::clone(&preallocated_size);
+            let next_ticket = Arc::clone(&next_ticket);
+            let snapshot_calls = Arc::clone(&snapshot_calls);
+            let start = Arc::clone(&start);
+            std::thread::spawn(move || {
+                start.wait();
+                publish_v8_parallel_cursor_snapshot(
+                    &durable_ticket,
+                    &publish_gate,
+                    &alloc_offset,
+                    &preallocated_size,
+                    &next_ticket,
+                    Some(0),
+                    || {
+                        snapshot_calls.fetch_add(1, Ordering::Relaxed);
+                        (1, 4096, 1)
+                    },
+                )
+            })
+        };
+        let second = {
+            let durable_ticket = Arc::clone(&durable_ticket);
+            let publish_gate = Arc::clone(&publish_gate);
+            let alloc_offset = Arc::clone(&alloc_offset);
+            let preallocated_size = Arc::clone(&preallocated_size);
+            let next_ticket = Arc::clone(&next_ticket);
+            let snapshot_calls = Arc::clone(&snapshot_calls);
+            let start = Arc::clone(&start);
+            std::thread::spawn(move || {
+                start.wait();
+                publish_v8_parallel_cursor_snapshot(
+                    &durable_ticket,
+                    &publish_gate,
+                    &alloc_offset,
+                    &preallocated_size,
+                    &next_ticket,
+                    Some(0),
+                    || {
+                        snapshot_calls.fetch_add(1, Ordering::Relaxed);
+                        (1, 4096, 1)
+                    },
+                )
+            })
+        };
+
+        start.wait();
+        drop(publish_guard);
+        assert_eq!(first.join().unwrap(), 1);
+        assert_eq!(second.join().unwrap(), 1);
+        assert_eq!(snapshot_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(durable_ticket.load(Ordering::Acquire), 1);
+        assert_eq!(alloc_offset.load(Ordering::Acquire), 4096);
+        assert_eq!(preallocated_size.load(Ordering::Acquire), 4096);
+        assert_eq!(next_ticket.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn cursor_refresh_at_watermark_equal_to_target_reads_new_snapshot() {
+        use std::sync::atomic::AtomicUsize;
+
+        let durable_ticket = AtomicU64::new(0);
+        let publish_gate = Mutex::new(());
+        let alloc_offset = AtomicU64::new(0);
+        let preallocated_size = AtomicU64::new(0);
+        let next_ticket = AtomicU64::new(0);
+        let snapshot_calls = AtomicUsize::new(0);
+
+        assert_eq!(
+            publish_v8_parallel_cursor_snapshot(
+                &durable_ticket,
+                &publish_gate,
+                &alloc_offset,
+                &preallocated_size,
+                &next_ticket,
+                Some(0),
+                || (1, 4096, 2),
+            ),
+            1
+        );
+        assert_eq!(durable_ticket.load(Ordering::Acquire), 1);
+
+        let durable_end = publish_v8_parallel_cursor_snapshot(
+            &durable_ticket,
+            &publish_gate,
+            &alloc_offset,
+            &preallocated_size,
+            &next_ticket,
+            Some(1),
+            || {
+                snapshot_calls.fetch_add(1, Ordering::Relaxed);
+                (2, 8192, 2)
+            },
+        );
+
+        assert_eq!(durable_end, 2);
+        assert_eq!(snapshot_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(durable_ticket.load(Ordering::Acquire), 2);
+        assert_eq!(alloc_offset.load(Ordering::Acquire), 8192);
+        assert_eq!(preallocated_size.load(Ordering::Acquire), 8192);
+        assert_eq!(next_ticket.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn whole_wal_cursor_refresh_is_not_skipped_by_durable_ticket_watermark() {
+        let durable_ticket = AtomicU64::new(10);
+        let publish_gate = Mutex::new(());
+        let alloc_offset = AtomicU64::new(1024);
+        let preallocated_size = AtomicU64::new(1024);
+        let next_ticket = AtomicU64::new(10);
+        let snapshot_called = AtomicBool::new(false);
+
+        let durable_end = publish_v8_parallel_cursor_snapshot(
+            &durable_ticket,
+            &publish_gate,
+            &alloc_offset,
+            &preallocated_size,
+            &next_ticket,
+            None,
+            || {
+                snapshot_called.store(true, Ordering::Relaxed);
+                (12, 8192, 14)
+            },
+        );
+
+        assert!(snapshot_called.load(Ordering::Relaxed));
+        assert_eq!(durable_end, 12);
+        assert_eq!(durable_ticket.load(Ordering::Acquire), 12);
+        assert_eq!(alloc_offset.load(Ordering::Acquire), 8192);
+        assert_eq!(preallocated_size.load(Ordering::Acquire), 8192);
+        assert_eq!(next_ticket.load(Ordering::Acquire), 14);
     }
 }

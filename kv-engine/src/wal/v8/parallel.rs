@@ -2975,7 +2975,6 @@ impl WalV8ParallelCoordinator {
         let coordinator_lock_wait_cpu_ns = lock_wait_cpu_started
             .map(|started| super::digest::thread_cpu_time_ns().saturating_sub(started))
             .unwrap_or_default();
-        ensure!(!state.poisoned, "v8 Parallel coordinator is poisoned");
         ensure!(
             ticket_end <= state.next_ticket,
             "v8 durability driver names an unassigned ticket"

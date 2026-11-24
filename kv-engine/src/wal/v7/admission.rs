@@ -1134,6 +1134,10 @@ impl WalV7OwnedBatchReservation {
 
 impl WalV7BatchOperation {
     fn finish(mut self) -> Result<(), WalV7ReservationError> {
+        if self.finished {
+            return Ok(());
+        }
+
         let result = self
             .owner
             .finish_batch_operation(self.id, self.admitted.load(Ordering::Acquire));
@@ -2470,6 +2474,41 @@ mod tests {
             WalV7OwnedBatchReservation::retire_after_io_batch(&mut reservations, 0).unwrap();
         }
         assert_eq!(owner.state.lock().active_batch_operations, 0);
+        owner.retire_after_durable_cleanup().unwrap();
+        assert_eq!(ledger.snapshot(), WalV7ResourceCharge::default());
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn batched_point_retirement_then_regular_finish_does_not_retire_twice() {
+        let ledger = WalV7ResourceLedger::new(batch_limits()).unwrap();
+        let owner = owner(ledger.clone());
+        let mut reservation = owner.reserve_batch(49).unwrap();
+        reservation.mark_admitted();
+
+        {
+            let mut reservations = [&mut reservation];
+            WalV7OwnedBatchReservation::retire_after_io_batch(&mut reservations, 0).unwrap();
+        }
+
+        let charge_after_batch_retirement = ledger.snapshot();
+        let work_generation_after_batch_retirement = owner.source_spool_work_generation();
+        let source_generation_after_batch_retirement = owner.ledger.source_spool_generation();
+        assert_eq!(owner.state.lock().active_batch_operations, 0);
+
+        reservation.finish_after_io().unwrap();
+
+        assert_eq!(owner.state.lock().active_batch_operations, 0);
+        assert_eq!(ledger.snapshot(), charge_after_batch_retirement);
+        assert_eq!(
+            owner.source_spool_work_generation(),
+            work_generation_after_batch_retirement
+        );
+        assert_eq!(
+            owner.ledger.source_spool_generation(),
+            source_generation_after_batch_retirement
+        );
+
         owner.retire_after_durable_cleanup().unwrap();
         assert_eq!(ledger.snapshot(), WalV7ResourceCharge::default());
     }
