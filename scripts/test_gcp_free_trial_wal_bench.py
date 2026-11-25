@@ -45,6 +45,7 @@ from gcp_wal_matrix import (
     POINT_PROGRESS_RING_NUM,
     POINT_PROGRESS_RING_WRITERS,
     CURSOR_DIRECT_COMPLETION_ARMS,
+    CURSOR_DIRECT_COMPLETION_WAKE_ARMS,
     CURSOR_SINGLETON_SUBMISSION_ARMS,
     CURSOR_COALESCING_BUDGET_ARMS,
     CURSOR_COALESCING_BUDGET_NUM,
@@ -54,6 +55,8 @@ from gcp_wal_matrix import (
     CURSOR_PUBLICATION_WRITERS,
     build_cursor_direct_completion_plan,
     build_cursor_direct_completion_schedule,
+    build_cursor_direct_completion_wake_plan,
+    build_cursor_direct_completion_wake_schedule,
     build_cursor_coalescing_budget_plan,
     build_cursor_coalescing_budget_schedule,
     build_cursor_publication_plan,
@@ -572,6 +575,10 @@ class PointProgressRingQualificationTests(unittest.TestCase):
         if "cursor_direct_completion_enabled" in row:
             start["cursor_direct_completion_enabled"] = bool(row["cursor_direct_completion_enabled"])
             end["cursor_direct_completion_enabled"] = bool(row["cursor_direct_completion_enabled"])
+        if "cursor_direct_completion_wake_mode" in row:
+            select_enabled = row["cursor_direct_completion_wake_mode"] == "select"
+            start["cursor_direct_completion_select_wake_enabled"] = select_enabled
+            end["cursor_direct_completion_select_wake_enabled"] = select_enabled
         if "cursor_singleton_submission_enabled" in row:
             start["cursor_singleton_submission_enabled"] = bool(row["cursor_singleton_submission_enabled"])
             end["cursor_singleton_submission_enabled"] = bool(row["cursor_singleton_submission_enabled"])
@@ -661,6 +668,7 @@ class PointProgressRingQualificationTests(unittest.TestCase):
         *,
         cursor: bool = False,
         direct_completion: bool = False,
+        completion_wake: bool = False,
         singleton_submission: bool = False,
         coalescing_budget: bool = False,
         retirement: bool = False,
@@ -685,6 +693,9 @@ class PointProgressRingQualificationTests(unittest.TestCase):
         elif coalescing_budget:
             schedule_builder = build_cursor_coalescing_budget_schedule
             plan_builder = build_cursor_coalescing_budget_plan
+        elif completion_wake:
+            schedule_builder = build_cursor_direct_completion_wake_schedule
+            plan_builder = build_cursor_direct_completion_wake_plan
         elif singleton_submission:
             schedule_builder = build_cursor_singleton_submission_schedule
             plan_builder = build_cursor_singleton_submission_plan
@@ -712,6 +723,14 @@ class PointProgressRingQualificationTests(unittest.TestCase):
                 writers=writers,
                 machine_type="c4-standard-16-lssd",
                 machine_spec=BENCH.MACHINE_SPECS["c4-standard-16-lssd"],
+                commit=commit,
+                binary_sha256=binary_sha,
+            )
+        elif completion_wake:
+            plan = plan_builder(
+                writers=writers,
+                machine_type="c4-standard-16-lssd",
+                machine_spec={"vcpus": 16, "ssd_count": 2, "ssd_gib": 750},
                 commit=commit,
                 binary_sha256=binary_sha,
             )
@@ -747,6 +766,7 @@ class PointProgressRingQualificationTests(unittest.TestCase):
             "cursor-publication-schedule.tsv" if cursor_publication else
             "cursor-coalescing-budget-schedule.tsv" if coalescing_budget else
             "cursor-singleton-submission-schedule.tsv" if singleton_submission else
+            "cursor-direct-completion-wake-schedule.tsv" if completion_wake else
             "cursor-direct-completion-schedule.tsv" if direct_completion else
             "point-progress-cursor-schedule.tsv" if cursor else
             "point-progress-ring-schedule.tsv"
@@ -764,6 +784,7 @@ class PointProgressRingQualificationTests(unittest.TestCase):
             raw = cls._raw_record(row)
             record_validator = (
                 progress_ring_runner._validate_cursor_publication_record if cursor_publication else
+                progress_ring_runner._validate_point_resource_retirement_stage_a_record if completion_wake else
                 progress_ring_runner._validate_point_resource_retirement_stage_a_record
                 if retirement_preallocation else progress_ring_runner._validate_record
             )
@@ -784,19 +805,23 @@ class PointProgressRingQualificationTests(unittest.TestCase):
                     row.get("cursor_singleton_submission_enabled"),
                     row.get("coalescing_budget_us"),
                     point_buffer_preallocation_enabled=(
-                        bool(row["point_buffer_preallocation_enabled"]) if cursor_publication else
+                        bool(row["point_buffer_preallocation_enabled"])
+                        if cursor_publication or completion_wake else
                         True if row.get("point_buffer_preallocation_enabled") is True else None
                     ),
                     point_resource_retirement_mode=row.get("point_resource_retirement_mode"),
                     admission_cursor_publish_fast_path_enabled=row.get(
                         "admission_cursor_publish_fast_path_enabled"
                     ),
+                    cursor_direct_completion_wake_mode=row.get("cursor_direct_completion_wake_mode"),
                 ),
                 encoding="utf-8",
             )
             rows.append(metadata)
         if cursor_publication:
             summary = progress_ring_runner._cursor_publication_summary(rows, writers, len(schedule))
+        elif completion_wake:
+            summary = progress_ring_runner._completion_wake_summary(rows, writers, len(schedule))
         elif retirement:
             summary = progress_ring_runner._point_resource_retirement_summary(
                 rows, len(schedule),
@@ -939,6 +964,40 @@ class PointProgressRingQualificationTests(unittest.TestCase):
             verification = progress_ring_runner.verify_direct_completion_results_directory(results)
             self.assertFalse(verification["verified"])
             self.assertTrue(any("metadata" in error or "matrix" in error for error in verification["errors"]))
+
+    def test_cursor_direct_completion_wake_fixture_verifies_token_select_and_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            results = self._make_fixture(Path(temporary), completion_wake=True)
+            schedule = build_cursor_direct_completion_wake_schedule(POINT_PROGRESS_RING_WRITERS)
+            self.assertEqual(len(schedule), 40)
+            self.assertEqual({row["arm"] for row in schedule}, set(CURSOR_DIRECT_COMPLETION_WAKE_ARMS))
+            verification = progress_ring_runner.verify_cursor_direct_completion_wake_results_directory(results)
+            self.assertTrue(verification["verified"], verification["errors"])
+            self.assertTrue(BENCH._verify_result_set(results)["verified"])
+            plan = json.loads((results / "benchmark-plan.json").read_text(encoding="utf-8"))
+            self.assertEqual(plan["suite"], "v8-cursor-direct-completion-wake")
+            self.assertEqual(plan["arms"], list(CURSOR_DIRECT_COMPLETION_WAKE_ARMS))
+            self.assertEqual(plan["runs_planned"], 40)
+            token = next(row for row in schedule if row["arm"] == "token")
+            select = next(row for row in schedule if row["arm"] == "select")
+            self.assertTrue(token["cursor_direct_completion_enabled"])
+            self.assertEqual(token["cursor_direct_completion_wake_mode"], "token")
+            self.assertEqual(select["cursor_direct_completion_wake_mode"], "select")
+            self.assertTrue(token["point_buffer_preallocation_enabled"])
+            self.assertIn(
+                "TOYKV_BENCH_V8_DIRECT_COMPLETION_WAKE=select\n",
+                (results / progress_ring_runner._run_id(select) / "environment.txt").read_text(
+                    encoding="utf-8",
+                ),
+            )
+
+            summary_path = results / "summary.json"
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            summary["comparison"][0]["select_pair_wins"] += 1
+            summary_path.write_text(json.dumps(summary), encoding="utf-8")
+            verification = progress_ring_runner.verify_cursor_direct_completion_wake_results_directory(results)
+            self.assertFalse(verification["verified"])
+            self.assertTrue(any("comparison" in error for error in verification["errors"]))
 
     def test_cursor_singleton_submission_fixture_verifies_actual_arm_switch(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -5112,8 +5171,8 @@ print('[hotpath] diagnostic report follows')
                 )
 
             self.assertEqual(result, 1)
-            cleanup.assert_not_called()
             lifecycle = json.loads((results / "lifecycle.json").read_text(encoding="utf-8"))
+            self.assertFalse(cleanup.called, f"unexpected cleanup after lifecycle {lifecycle!r}")
             self.assertTrue(lifecycle["benchmark_attempted"])
             self.assertTrue(lifecycle["retained"])
             self.assertTrue((results / "retained-ssh-key").is_file())
@@ -5161,8 +5220,8 @@ print('[hotpath] diagnostic report follows')
                 )
 
             self.assertEqual(result, 1)
-            cleanup.assert_not_called()
             lifecycle = json.loads((results / "lifecycle.json").read_text(encoding="utf-8"))
+            self.assertFalse(cleanup.called, f"unexpected cleanup after lifecycle {lifecycle!r}")
             self.assertTrue(lifecycle["retained"])
             self.assertTrue((results / "retained-ssh-key").is_file())
             self.assertFalse((results / "reconnect.txt").exists())

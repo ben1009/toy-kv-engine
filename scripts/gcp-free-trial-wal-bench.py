@@ -60,6 +60,7 @@ from gcp_wal_matrix import (
     CURSOR_PUBLICATION_NUM,
     CURSOR_PUBLICATION_WRITERS,
     build_cursor_direct_completion_plan,
+    build_cursor_direct_completion_wake_plan,
     build_cursor_singleton_submission_plan,
     build_cursor_coalescing_budget_plan,
     build_cursor_publication_plan,
@@ -108,6 +109,9 @@ from gcp_v8_point_progress_ring_runner import verify_results_directory as verify
 from gcp_v8_point_progress_ring_runner import verify_cursor_results_directory as verify_progress_cursor_results
 from gcp_v8_point_progress_ring_runner import (
     verify_direct_completion_results_directory as verify_cursor_direct_completion_results,
+)
+from gcp_v8_point_progress_ring_runner import (
+    verify_cursor_direct_completion_wake_results_directory as verify_cursor_direct_completion_wake_results,
 )
 from gcp_v8_point_progress_ring_runner import (
     verify_singleton_submission_results_directory as verify_cursor_singleton_submission_results,
@@ -200,6 +204,7 @@ root_names = {
     "point-progress-ring-schedule.tsv",
     "point-progress-cursor-schedule.tsv",
     "cursor-direct-completion-schedule.tsv",
+    "cursor-direct-completion-wake-schedule.tsv",
     "cursor-singleton-submission-schedule.tsv",
     "cursor-coalescing-budget-schedule.tsv",
     "cursor-publication-schedule.tsv",
@@ -1235,6 +1240,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                              help="Compare V8 Eager and Cursor progress modes with Point/Batch guardrails")
     suite_group.add_argument("--v8-cursor-direct-completion-ab", action="store_true",
                              help="Compare Cursor relay and direct completion with Point/Batch guardrails")
+    suite_group.add_argument("--v8-cursor-direct-completion-wake-ab", action="store_true",
+                             help="Compare Token and Select wake modes with Cursor Direct Completion")
     suite_group.add_argument("--v8-cursor-singleton-submission-ab", action="store_true",
                              help="Compare allocation-free singleton DATA submission with Point/Batch guardrails")
     suite_group.add_argument("--v8-cursor-coalescing-budget-ab", action="store_true",
@@ -1294,6 +1301,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             "their archived results remain verifiable but cannot be executed"
         )
     point_cursor_direct_completion_suite = args.v8_cursor_direct_completion_ab
+    point_cursor_direct_completion_wake_suite = args.v8_cursor_direct_completion_wake_ab
     point_cursor_singleton_submission_suite = args.v8_cursor_singleton_submission_ab
     point_cursor_coalescing_budget_suite = args.v8_cursor_coalescing_budget_ab
     point_cursor_publication_suite = args.v8_cursor_publication_ab
@@ -1307,6 +1315,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     args.runner_bundle_sha256 = _d3b_runner_bundle_sha256() if dedicated_durability_suite else None
     point_progress_suite = (
         args.v8_point_progress_cursor_ab or point_cursor_direct_completion_suite
+        or point_cursor_direct_completion_wake_suite
         or point_cursor_singleton_submission_suite or point_cursor_coalescing_budget_suite
         or point_cursor_publication_suite
         or point_preallocation_suite or point_resource_retirement_suite or point_ack_d1_suite
@@ -1626,6 +1635,7 @@ def gcloud_base(project: str, zone: str) -> list[str]:
 def _run_identifier(row: dict[str, Any], suite: str) -> str:
     if suite in (
         "v8-point-progress-ring", "v8-point-progress-cursor", "v8-cursor-direct-completion",
+        "v8-cursor-direct-completion-wake",
         "v8-cursor-singleton-submission", "v8-cursor-coalescing-budget", "v7-v8-point-preallocation",
         "v8-point-resource-retirement", "v8-cursor-publication",
     ):
@@ -1654,6 +1664,7 @@ def _run_identifier(row: dict[str, Any], suite: str) -> str:
 def _summary_row_identifier(row: dict[str, Any], suite: str) -> str:
     if suite in (
         "v8-point-progress-ring", "v8-point-progress-cursor", "v8-cursor-direct-completion",
+        "v8-cursor-direct-completion-wake",
         "v8-cursor-singleton-submission", "v8-cursor-coalescing-budget", "v7-v8-point-preallocation",
         "v8-point-resource-retirement", "v8-cursor-publication",
     ):
@@ -1686,6 +1697,7 @@ def _summary_row_identifier(row: dict[str, Any], suite: str) -> str:
 def _expected_run_metadata(row: dict[str, Any], suite: str) -> dict[str, Any]:
     if suite in (
         "v8-point-progress-ring", "v8-point-progress-cursor", "v8-cursor-direct-completion",
+        "v8-cursor-direct-completion-wake",
         "v8-cursor-singleton-submission", "v8-cursor-coalescing-budget", "v8-point-resource-retirement",
     ):
         keys = (
@@ -1699,6 +1711,11 @@ def _expected_run_metadata(row: dict[str, Any], suite: str) -> dict[str, Any]:
         elif suite == "v8-cursor-direct-completion":
             keys += (
                 "progress_cursor_enabled", "progress_counters_enabled", "cursor_direct_completion_enabled",
+            )
+        elif suite == "v8-cursor-direct-completion-wake":
+            keys += (
+                "progress_cursor_enabled", "progress_counters_enabled", "cursor_direct_completion_enabled",
+                "cursor_direct_completion_wake_mode", "point_buffer_preallocation_enabled",
             )
         elif suite == "v8-cursor-singleton-submission":
             keys += (
@@ -1801,6 +1818,8 @@ def _verify_result_set(results: Path) -> dict[str, Any]:
             return verify_progress_cursor_results(results)
         if suite == "v8-cursor-direct-completion":
             return verify_cursor_direct_completion_results(results)
+        if suite == "v8-cursor-direct-completion-wake":
+            return verify_cursor_direct_completion_wake_results(results)
         if suite == "v8-cursor-singleton-submission":
             return verify_cursor_singleton_submission_results(results)
         if suite == "v8-cursor-coalescing-budget":
@@ -3020,6 +3039,9 @@ def provision_and_run(
     point_direct_frame_suite = getattr(args, "v8_point_direct_frame_ab", False)
     point_progress_cursor_suite = getattr(args, "v8_point_progress_cursor_ab", False)
     point_cursor_direct_completion_suite = getattr(args, "v8_cursor_direct_completion_ab", False)
+    point_cursor_direct_completion_wake_suite = getattr(
+        args, "v8_cursor_direct_completion_wake_ab", False,
+    )
     point_cursor_singleton_submission_suite = getattr(args, "v8_cursor_singleton_submission_ab", False)
     point_cursor_coalescing_budget_suite = getattr(args, "v8_cursor_coalescing_budget_ab", False)
     point_cursor_publication_suite = getattr(args, "v8_cursor_publication_ab", False)
@@ -3033,6 +3055,7 @@ def provision_and_run(
     runner_bundle_sha256 = getattr(args, "runner_bundle_sha256", None)
     point_progress_suite = (
         point_progress_cursor_suite or point_cursor_direct_completion_suite
+        or point_cursor_direct_completion_wake_suite
         or point_cursor_singleton_submission_suite or point_cursor_coalescing_budget_suite
         or point_cursor_publication_suite
         or point_preallocation_suite or point_resource_retirement_suite or point_ack_d1_suite
@@ -3383,6 +3406,8 @@ def provision_and_run(
                 remote_suite = "v8-extent-policy-storage"
             elif point_cursor_direct_completion_suite:
                 remote_suite = "v8-cursor-direct-completion"
+            elif point_cursor_direct_completion_wake_suite:
+                remote_suite = "v8-cursor-direct-completion-wake"
             elif point_cursor_singleton_submission_suite:
                 remote_suite = "v8-cursor-singleton-submission"
             elif point_cursor_coalescing_budget_suite:
@@ -3552,6 +3577,7 @@ def provision_and_run(
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(sys.argv[1:] if argv is None else argv)
     point_cursor_direct_completion_suite = args.v8_cursor_direct_completion_ab
+    point_cursor_direct_completion_wake_suite = args.v8_cursor_direct_completion_wake_ab
     point_cursor_singleton_submission_suite = args.v8_cursor_singleton_submission_ab
     point_cursor_coalescing_budget_suite = args.v8_cursor_coalescing_budget_ab
     point_cursor_publication_suite = args.v8_cursor_publication_ab
@@ -3564,6 +3590,7 @@ def main(argv: list[str] | None = None) -> int:
     dedicated_durability_suite = args.v8_dedicated_durability_driver_ab
     point_progress_suite = (
         args.v8_point_progress_cursor_ab or point_cursor_direct_completion_suite
+        or point_cursor_direct_completion_wake_suite
         or point_cursor_singleton_submission_suite or point_cursor_coalescing_budget_suite
         or point_cursor_publication_suite
         or point_preallocation_suite or point_resource_retirement_suite or point_ack_d1_suite
@@ -3678,6 +3705,14 @@ def main(argv: list[str] | None = None) -> int:
         elif point_cursor_direct_completion_suite:
             report["benchmark_suite"] = "v8-cursor-direct-completion"
             report["benchmark_plan"] = build_cursor_direct_completion_plan(
+                writers=args.writers,
+                machine_type=args.machine_type,
+                machine_spec=MACHINE_SPECS[args.machine_type],
+                commit=args.commit.lower(),
+            )
+        elif point_cursor_direct_completion_wake_suite:
+            report["benchmark_suite"] = "v8-cursor-direct-completion-wake"
+            report["benchmark_plan"] = build_cursor_direct_completion_wake_plan(
                 writers=args.writers,
                 machine_type=args.machine_type,
                 machine_spec=MACHINE_SPECS[args.machine_type],

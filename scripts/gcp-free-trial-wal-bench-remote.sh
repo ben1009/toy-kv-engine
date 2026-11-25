@@ -58,6 +58,7 @@ if [[ "$SUITE" != "batch64" && "$SUITE" != "rfc026-full" \
     && "$SUITE" != "v8-extent-policy-storage" && "$SUITE" != "v8-point-cpu-attribution" \
     && "$SUITE" != "v8-point-progress-cursor" \
     && "$SUITE" != "v8-cursor-direct-completion" \
+     && "$SUITE" != "v8-cursor-direct-completion-wake" \
      && "$SUITE" != "v8-cursor-singleton-submission" \
      && "$SUITE" != "v8-cursor-coalescing-budget" \
      && "$SUITE" != "v8-cursor-publication" \
@@ -110,6 +111,12 @@ if [[ "$SUITE" == "v8-cursor-direct-completion" ]] \
     && { [[ "$NUM" != "100000" ]] || [[ "$MACHINE_TYPE" != "c4-standard-16-lssd" ]] \
         || [[ "$WRITERS_CSV" != "1,8,16" ]]; }; then
     echo "cursor direct-completion qualification requires c4-standard-16-lssd, writers 1,8,16, and 100000 operations" >&2
+    exit 64
+fi
+if [[ "$SUITE" == "v8-cursor-direct-completion-wake" ]] \
+    && { [[ "$NUM" != "100000" ]] || [[ "$MACHINE_TYPE" != "c4-standard-16-lssd" ]] \
+        || [[ "$WRITERS_CSV" != "1,8,16" ]]; }; then
+    echo "cursor direct-completion wake qualification requires c4-standard-16-lssd, writers 1,8,16, and 100000 operations" >&2
     exit 64
 fi
 if [[ "$SUITE" == "v8-cursor-singleton-submission" ]] \
@@ -689,6 +696,29 @@ if [[ "$BENCH_SUITE" == "v8-cursor-direct-completion" ]]; then
         --ssd-count "$BENCH_SSD_COUNT" \
         --ssd-gib "$BENCH_SSD_TOTAL_GIB" \
         --candidate-mode direct-completion
+    exit $?
+fi
+
+if [[ "$BENCH_SUITE" == "v8-cursor-direct-completion-wake" ]]; then
+    if [[ ! -r /tmp/gcp-v8-point-progress-ring-runner.py ]]; then
+        echo "cursor direct-completion wake runner was not uploaded" >&2
+        exit 1
+    fi
+    cp /tmp/gcp-v8-point-progress-ring-runner.py "$REPO/scripts/gcp_v8_point_progress_ring_runner.py"
+    echo "WAL_BENCHMARK_STARTED $(date --iso-8601=seconds)" | tee -a "$BENCH_BOOT_LOG"
+    PYTHONPATH="$REPO/scripts${PYTHONPATH:+:$PYTHONPATH}" \
+        python3 "$REPO/scripts/gcp_v8_point_progress_ring_runner.py" \
+        --binary "$BINARY" \
+        --results-dir "$BENCH_RESULTS" \
+        --db-root "$BENCH_WORK/databases" \
+        --writers "$BENCH_WRITERS" \
+        --safe-deadline-epoch "$BENCH_SAFE_DEADLINE_EPOCH" \
+        --commit "$ACTUAL_COMMIT" \
+        --binary-sha256 "$BINARY_SHA256" \
+        --machine-type "$BENCH_MACHINE_TYPE" \
+        --ssd-count "$BENCH_SSD_COUNT" \
+        --ssd-gib "$BENCH_SSD_TOTAL_GIB" \
+        --candidate-mode completion-wake
     exit $?
 fi
 

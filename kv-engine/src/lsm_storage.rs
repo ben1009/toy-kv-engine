@@ -40441,6 +40441,115 @@ mod tests {
 
     #[cfg(all(target_os = "linux", feature = "bench"))]
     #[test]
+    fn v8_cursor_select_mode_is_inherited_across_engine_rotation_and_recovery() -> anyhow::Result<()>
+    {
+        crate::wal::v8::leader::with_cursor_direct_completion_select_for_test(|| {
+            use crate::pitr::api::{PersistedPitrConfig, PitrOptions, PitrRuntimeOptions};
+            use crate::tests::harness::is_io_uring_unavailable_error;
+            use crate::wal::WalIoMode;
+
+            const MAX_SEGMENT_BYTES: u64 = 4 * 1024 * 1024;
+            const VALUE: &[u8] = &[0x72; 1024];
+            const BEFORE_ROTATION: &[u8] = b"select-before-rotation";
+            const AFTER_ROTATION: &[u8] = b"select-after-rotation";
+
+            let directory = tempdir()?;
+            let database = directory.path().join("db");
+            let repository = directory.path().join("repository");
+            let mut options = LsmStorageOptions {
+                enable_wal: true,
+                target_sst_size: 1 << 30,
+                ..LsmStorageOptions::default_for_test()
+            };
+            let engine = match KvEngine::open_with_wal_io_mode(
+                &database,
+                options.clone(),
+                WalIoMode::Parallel,
+            ) {
+                Ok(engine) => engine,
+                Err(error) if is_io_uring_unavailable_error(&error) => {
+                    eprintln!("skipping test (io_uring unavailable): {error:#}");
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            };
+            if let Err(error) = engine.enable_pitr(PitrOptions {
+                repository: repository.clone(),
+                config: PersistedPitrConfig {
+                    archive_interval: std::time::Duration::from_secs(3600),
+                    max_segment_bytes: MAX_SEGMENT_BYTES,
+                    max_unarchived_bytes: 8 * 1024 * 1024,
+                    max_source_spool_bytes: 32 * 1024 * 1024,
+                },
+                runtime: PitrRuntimeOptions::default(),
+            }) {
+                if is_io_uring_unavailable_error(&error) {
+                    eprintln!("skipping test (io_uring unavailable): {error:#}");
+                    engine.close()?;
+                    return Ok(());
+                }
+                return Err(error);
+            }
+
+            let first_memtable = engine.inner.state.load().memtable.clone();
+            assert!(first_memtable.uses_v8_wal());
+            assert!(
+                first_memtable
+                    .benchmark_wal_io_diagnostics()
+                    .is_some_and(
+                        |diagnostics| diagnostics.cursor_direct_completion_select_wake_enabled
+                    )
+            );
+            engine.put(BEFORE_ROTATION, VALUE)?;
+            assert!(matches!(
+                engine.create_recovery_point()?,
+                crate::pitr::api::RecoveryPointOutcome::Durable(_)
+            ));
+
+            let second_memtable = engine.inner.state.load().memtable.clone();
+            assert!(second_memtable.uses_v8_wal());
+            assert!(!Arc::ptr_eq(&first_memtable, &second_memtable));
+            assert!(
+                second_memtable
+                    .benchmark_wal_io_diagnostics()
+                    .is_some_and(
+                        |diagnostics| diagnostics.cursor_direct_completion_select_wake_enabled
+                    )
+            );
+            engine.put(AFTER_ROTATION, VALUE)?;
+            engine.sync()?;
+            assert_eq!(engine.get(BEFORE_ROTATION)?.as_deref(), Some(VALUE));
+            assert_eq!(engine.get(AFTER_ROTATION)?.as_deref(), Some(VALUE));
+
+            engine.close()?;
+            drop(second_memtable);
+            drop(first_memtable);
+            drop(engine);
+
+            options.pitr_repository = Some(repository);
+            let reopened =
+                KvEngine::open_with_wal_io_mode(&database, options, WalIoMode::Parallel)?;
+            assert!(
+                reopened
+                    .inner
+                    .state
+                    .load()
+                    .memtable
+                    .benchmark_wal_io_diagnostics()
+                    .is_some_and(
+                        |diagnostics| diagnostics.cursor_direct_completion_select_wake_enabled
+                    )
+            );
+            assert_eq!(reopened.get(BEFORE_ROTATION)?.as_deref(), Some(VALUE));
+            assert_eq!(reopened.get(AFTER_ROTATION)?.as_deref(), Some(VALUE));
+            reopened.close()?;
+
+            Ok(())
+        })
+    }
+
+    #[cfg(all(target_os = "linux", feature = "bench"))]
+    #[test]
     fn v8_point_buffer_preallocation_survives_concurrent_rotation_and_recovery()
     -> anyhow::Result<()> {
         exercise_point_preallocation_rotation(8)

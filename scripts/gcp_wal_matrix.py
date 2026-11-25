@@ -102,6 +102,7 @@ POINT_PROGRESS_PLAN_SCHEMA_V1 = 1
 POINT_PROGRESS_PLAN_SCHEMA_V2 = 2
 POINT_PROGRESS_PLAN_SCHEMA_V3 = 3
 CURSOR_DIRECT_COMPLETION_PLAN_SCHEMA_V1 = 1
+CURSOR_DIRECT_COMPLETION_WAKE_PLAN_SCHEMA_V1 = 1
 CURSOR_SINGLETON_SUBMISSION_PLAN_SCHEMA_V1 = 1
 POINT_PROGRESS_RING_ARMS = ("eager", "progress_ring")
 POINT_PROGRESS_CURSOR_ARMS = ("eager", "cursor")
@@ -180,6 +181,11 @@ POINT_PROGRESS_CURSOR_ORDERS = tuple(
 CURSOR_DIRECT_COMPLETION_ORDERS = (
     ("cursor_relay", "cursor_direct"),
     ("cursor_direct", "cursor_relay"),
+)
+CURSOR_DIRECT_COMPLETION_WAKE_ARMS = ("token", "select")
+CURSOR_DIRECT_COMPLETION_WAKE_ORDERS = (
+    ("token", "select"),
+    ("select", "token"),
 )
 CURSOR_SINGLETON_SUBMISSION_ORDERS = (
     ("cursor_control", "cursor_singleton"),
@@ -774,6 +780,46 @@ def build_cursor_direct_completion_schedule(
                     "progress_cursor_enabled": True,
                     "progress_counters_enabled": False,
                     "cursor_direct_completion_enabled": arm == "cursor_direct",
+                })
+    return schedule
+
+
+def build_cursor_direct_completion_wake_schedule(
+    writers: Iterable[int] = POINT_PROGRESS_RING_WRITERS,
+) -> list[dict[str, object]]:
+    """Build a same-binary Token/Select wake-mode score matrix."""
+    writer_counts = validate_writer_counts(writers)
+    if writer_counts != POINT_PROGRESS_RING_WRITERS:
+        raise ValueError(
+            f"Cursor direct-completion wake qualification requires writers {POINT_PROGRESS_RING_WRITERS}"
+        )
+
+    schedule: list[dict[str, object]] = []
+    for writer, workload, bench, batch_entries, batch_size, sample_every in POINT_PROGRESS_RING_CELLS:
+        for repetition in range(1, POINT_PROGRESS_RING_REPETITIONS + 1):
+            order = CURSOR_DIRECT_COMPLETION_WAKE_ORDERS[(repetition - 1) % len(CURSOR_DIRECT_COMPLETION_WAKE_ORDERS)]
+            for arm in order:
+                schedule.append({
+                    "run_index": len(schedule) + 1,
+                    "writer": writer,
+                    "workload": workload,
+                    "repetition": repetition,
+                    "arm": arm,
+                    "bench": bench,
+                    "batch_entries": batch_entries,
+                    "batch_size": batch_size,
+                    "num": POINT_PROGRESS_RING_NUM,
+                    "sample_every": sample_every,
+                    "extent_mode": "sliding-point-lookahead",
+                    "extent_window_bytes": POINT_LOOKAHEAD_WINDOW_BYTES,
+                    "frontier_mode": "direct",
+                    "scan_diagnostics_enabled": False,
+                    "progress_ring_enabled": True,
+                    "progress_cursor_enabled": True,
+                    "progress_counters_enabled": False,
+                    "cursor_direct_completion_enabled": True,
+                    "cursor_direct_completion_wake_mode": arm,
+                    "point_buffer_preallocation_enabled": workload == "point",
                 })
     return schedule
 
@@ -1671,6 +1717,70 @@ def build_cursor_direct_completion_plan(
     }
 
 
+def build_cursor_direct_completion_wake_plan(
+    *, writers: Iterable[int], machine_type: str, machine_spec: Mapping[str, int],
+    commit: str, binary_sha256: str | None = None,
+) -> dict[str, object]:
+    """Build the isolated same-binary Token/Select direct-completion plan."""
+    writer_counts = validate_writer_counts(writers)
+    schedule = build_cursor_direct_completion_wake_schedule(writer_counts)
+    vcpus = int(machine_spec["vcpus"])
+    ssd_count = int(machine_spec["ssd_count"])
+    layout = "single Local SSD" if ssd_count == 1 else f"RAID0 over {ssd_count} Local SSDs"
+    return {
+        "plan_schema_version": CURSOR_DIRECT_COMPLETION_WAKE_PLAN_SCHEMA_V1,
+        "suite": "v8-cursor-direct-completion-wake",
+        "writers": list(writer_counts),
+        "workloads": [
+            {"writer": writer, "name": workload, "bench": bench,
+             "batch_entries": batch_entries, "batch_size": batch_size,
+             "num": POINT_PROGRESS_RING_NUM, "sample_every": sample_every}
+            for writer, workload, bench, batch_entries, batch_size, sample_every in POINT_PROGRESS_RING_CELLS
+        ],
+        "arms": list(CURSOR_DIRECT_COMPLETION_WAKE_ARMS),
+        "repetitions_per_cell": POINT_PROGRESS_RING_REPETITIONS,
+        "arm_orders": [list(order) for order in CURSOR_DIRECT_COMPLETION_WAKE_ORDERS],
+        "runs_planned": len(schedule),
+        "score_runs_planned": len(schedule),
+        "counterbalanced": True,
+        "machine_type": machine_type,
+        "vcpus": vcpus,
+        "local_ssd_count": ssd_count,
+        "local_ssd_total_gib": int(machine_spec["ssd_gib"]),
+        "runtime_protocol": f"single {vcpus}-vCPU host; {layout}; same source and binary for both arms",
+        "value_bytes": 1024,
+        "compaction": "none",
+        "commit": commit,
+        "binary_sha256": binary_sha256,
+        "extent_preparation": "sliding-point-lookahead, 1 MiB for both arms; Point-only policy keeps Batch64 on fallocate",
+        "frontier_mode": "direct",
+        "coalescing": "dynamic",
+        "progress_mode": "cursor (mode 2) for both arms",
+        "direct_completion_enabled": True,
+        "completion_wake_ab": {
+            "environment_variable": "TOYKV_BENCH_V8_DIRECT_COMPLETION_WAKE",
+            "baseline_value": "token",
+            "candidate_value": "select",
+        },
+        "point_buffer_preallocation": "enabled for Point only (Stage A); disabled for Batch64",
+        "point_direct_frame_enabled": False,
+        "point_frontier_credit_batch_enabled": False,
+        "extent_policy_storage": "vec",
+        "extent_policy_scan_diagnostics_enabled": False,
+        "data_submit_order": "ordered",
+        "latency_sample_every": 10,
+        "hash_cpu_sample_every": 64,
+        "worker_group_histogram": "disabled for score runs; opt-in diagnostics only",
+        "qualification_note": (
+            "Same-host, same-source, same-release-binary E1 wake-mode comparison. Both arms use Cursor progress, "
+            "Direct Completion, CallerDriven durability, Legacy ACK, Stage A Point buffer preallocation, dynamic "
+            "coalescing, Direct FRONTIER, and 1 MiB Point lookahead. Only direct-completion wake delivery changes "
+            "from control token to select over the completion queue and control channel. Scored runs disable detailed "
+            "diagnostics; Batch64 is a regression guardrail. This experiment does not change production defaults."
+        ),
+    }
+
+
 def build_cursor_singleton_submission_plan(
     *, writers: Iterable[int], machine_type: str, machine_spec: Mapping[str, int],
     commit: str, binary_sha256: str | None = None,
@@ -1889,6 +1999,40 @@ def validate_cursor_direct_completion_rows(
     if invalid_mode_flags:
         validation["complete"] = False
         validation["invalid_rows"].extend(dict(row) for row in invalid_mode_flags)
+    return validation
+
+
+def validate_cursor_direct_completion_wake_rows(
+    rows: list[Mapping[str, object]], writers: Iterable[int] = POINT_PROGRESS_RING_WRITERS,
+) -> dict[str, object]:
+    """Validate Token/Select mode flags and the Stage A Point-only setting."""
+    schedule = build_cursor_direct_completion_wake_schedule(writers)
+    validation = _validate_point_progress_rows(rows, schedule)
+    expected = {
+        (row["writer"], row["workload"], row["repetition"], row["arm"]): row
+        for row in schedule
+    }
+    invalid: list[Mapping[str, object]] = []
+    for row in rows:
+        identity = tuple(row.get(key) for key in ("writer", "workload", "repetition", "arm"))
+        planned = expected.get(identity)
+        if planned is None:
+            invalid.append(row)
+            continue
+        expected_select = planned["arm"] == "select"
+        if any((
+            row.get("progress_cursor_enabled") is not True,
+            row.get("progress_counters_enabled") is not False,
+            row.get("cursor_direct_completion_enabled") is not True,
+            row.get("cursor_direct_completion_wake_mode") != planned["arm"],
+            row.get("cursor_direct_completion_select_wake_enabled_start") is not expected_select,
+            row.get("cursor_direct_completion_select_wake_enabled_end") is not expected_select,
+            row.get("point_buffer_preallocation_enabled") is not planned["point_buffer_preallocation_enabled"],
+        )):
+            invalid.append(row)
+    if invalid:
+        validation["complete"] = False
+        validation["invalid_rows"].extend(dict(row) for row in invalid)
     return validation
 
 

@@ -484,6 +484,44 @@ const WAL_V8_CURSOR_SINGLETON_SUBMISSION_ENV: &str = "TOYKV_BENCH_V8_CURSOR_SING
 const WAL_V8_PROGRESS_MODE_ENV: &str = "TOYKV_WAL_V8_PROGRESS_MODE";
 const WAL_V8_EXTENT_PREPARATION_CHUNK_BYTES: usize = 128 * 1024;
 
+#[cfg(all(test, feature = "bench"))]
+#[derive(Clone, Copy)]
+struct WalV8TestModeOverride {
+    progress_mode: WalV8ProgressMode,
+    direct_completion_enabled: bool,
+    direct_completion_wake_mode: WalV8DirectCompletionWakeMode,
+}
+
+#[cfg(all(test, feature = "bench"))]
+thread_local! {
+    static WAL_V8_TEST_MODE_OVERRIDE: std::cell::Cell<Option<WalV8TestModeOverride>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+/// Run an engine-level test with the benchmark-only Cursor Select mode without
+/// mutating process-wide environment variables observed by parallel tests.
+#[cfg(all(test, feature = "bench"))]
+pub(crate) fn with_cursor_direct_completion_select_for_test<T>(run: impl FnOnce() -> T) -> T {
+    struct Restore(Option<WalV8TestModeOverride>);
+
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            WAL_V8_TEST_MODE_OVERRIDE.with(|current| current.set(self.0));
+        }
+    }
+
+    let previous = WAL_V8_TEST_MODE_OVERRIDE.with(|current| {
+        current.replace(Some(WalV8TestModeOverride {
+            progress_mode: WalV8ProgressMode::Cursor,
+            direct_completion_enabled: true,
+            direct_completion_wake_mode: WalV8DirectCompletionWakeMode::Select,
+        }))
+    });
+    let _restore = Restore(previous);
+    run()
+}
+
 #[cfg(not(feature = "bench"))]
 fn production_progress_mode_from_value(value: Option<&OsStr>) -> Result<WalV8ProgressMode> {
     match value {
@@ -525,6 +563,10 @@ fn progress_mode_from_value(value: Option<&OsStr>) -> Result<WalV8ProgressMode> 
 
 #[cfg(feature = "bench")]
 fn progress_mode_from_environment() -> Result<WalV8ProgressMode> {
+    #[cfg(test)]
+    if let Some(override_mode) = WAL_V8_TEST_MODE_OVERRIDE.with(std::cell::Cell::get) {
+        return Ok(override_mode.progress_mode);
+    }
     progress_mode_from_value(std::env::var_os(WAL_V8_POINT_PROGRESS_RING_ENV).as_deref())
 }
 
@@ -585,6 +627,11 @@ fn cursor_direct_completion_enabled_from_value(
 fn cursor_direct_completion_enabled_from_environment(
     progress_mode: WalV8ProgressMode,
 ) -> Result<bool> {
+    #[cfg(test)]
+    if let Some(override_mode) = WAL_V8_TEST_MODE_OVERRIDE.with(std::cell::Cell::get) {
+        ensure!(progress_mode == override_mode.progress_mode);
+        return Ok(override_mode.direct_completion_enabled);
+    }
     cursor_direct_completion_enabled_from_value(
         std::env::var_os(WAL_V8_CURSOR_DIRECT_COMPLETION_ENV).as_deref(),
         progress_mode,
@@ -618,6 +665,12 @@ fn direct_completion_wake_mode_from_environment(
     progress_mode: WalV8ProgressMode,
     direct_completion_enabled: bool,
 ) -> Result<WalV8DirectCompletionWakeMode> {
+    #[cfg(test)]
+    if let Some(override_mode) = WAL_V8_TEST_MODE_OVERRIDE.with(std::cell::Cell::get) {
+        ensure!(progress_mode == override_mode.progress_mode);
+        ensure!(direct_completion_enabled == override_mode.direct_completion_enabled);
+        return Ok(override_mode.direct_completion_wake_mode);
+    }
     direct_completion_wake_mode_from_value(
         std::env::var_os(WAL_V8_DIRECT_COMPLETION_WAKE_ENV).as_deref(),
         progress_mode,
@@ -11213,7 +11266,7 @@ mod tests {
 
     #[cfg(feature = "bench")]
     #[test]
-    fn direct_completion_select_wakes_a_waiting_driver_for_data_and_control() -> Result<()> {
+    fn direct_completion_select_consumes_events_queued_before_select() -> Result<()> {
         let (_control_tx, control_rx) = crossbeam_channel::bounded(1);
         let (completion_tx, completion_rx) = crossbeam_channel::bounded(1);
         let (registered_tx, registered_rx) = mpsc::channel();
@@ -11287,6 +11340,96 @@ mod tests {
 
     #[cfg(feature = "bench")]
     #[test]
+    fn direct_completion_select_wakes_after_waiting_for_data_and_control() -> Result<()> {
+        fn assert_delayed_completion_wakes_select() -> Result<()> {
+            let (_control_tx, control_rx) = crossbeam_channel::bounded(1);
+            let (completion_tx, completion_rx) = crossbeam_channel::bounded(1);
+            let (started_tx, started_rx) = mpsc::channel();
+            let (wake_tx, wake_rx) = mpsc::channel();
+            let driver = thread::spawn(move || {
+                started_tx
+                    .send(())
+                    .expect("test receiver remains connected");
+                let wake = wait_for_direct_completion_or_control(
+                    &control_rx,
+                    &completion_rx,
+                    Duration::from_secs(2),
+                );
+                let _ = wake_tx.send(wake);
+            });
+
+            started_rx.recv_timeout(Duration::from_secs(1))?;
+            thread::sleep(Duration::from_millis(50));
+            ensure!(
+                matches!(wake_rx.try_recv(), Err(mpsc::TryRecvError::Empty)),
+                "select waiter returned before a completion arrived"
+            );
+            let completion = DirectGroupWriteCompletion {
+                result: GroupWriteResult {
+                    group_id: 12,
+                    tickets: 6..7,
+                    write_count: 1,
+                    write_bytes: FRAME_LEN_U64,
+                    error: None,
+                },
+                completion_observed_at: Some(Instant::now()),
+            };
+            completion_tx.send(completion.clone())?;
+            let wake = wake_rx
+                .recv_timeout(Duration::from_secs(1))
+                .context("select waiter did not wake for a delayed completion")?
+                .map_err(|closed| anyhow::anyhow!("completion wait disconnected: {closed:?}"))?;
+            ensure!(
+                matches!(wake, WalV8ProgressWake::Completion(event) if event == completion),
+                "delayed completion did not reach the select waiter"
+            );
+            driver.join().expect("select completion thread panicked");
+            Ok(())
+        }
+
+        fn assert_delayed_control_wakes_select() -> Result<()> {
+            let (control_tx, control_rx) = crossbeam_channel::bounded(1);
+            let (_completion_tx, completion_rx) = crossbeam_channel::bounded(1);
+            let (started_tx, started_rx) = mpsc::channel();
+            let (wake_tx, wake_rx) = mpsc::channel();
+            let driver = thread::spawn(move || {
+                started_tx
+                    .send(())
+                    .expect("test receiver remains connected");
+                let wake = wait_for_direct_completion_or_control(
+                    &control_rx,
+                    &completion_rx,
+                    Duration::from_secs(2),
+                );
+                let _ = wake_tx.send(wake);
+            });
+
+            started_rx.recv_timeout(Duration::from_secs(1))?;
+            thread::sleep(Duration::from_millis(50));
+            ensure!(
+                matches!(wake_rx.try_recv(), Err(mpsc::TryRecvError::Empty)),
+                "select waiter returned before a control token arrived"
+            );
+            control_tx.send(())?;
+            let wake = wake_rx
+                .recv_timeout(Duration::from_secs(1))
+                .context("select waiter did not wake for a delayed control token")?
+                .map_err(|closed| anyhow::anyhow!("control wait disconnected: {closed:?}"))?;
+            ensure!(
+                matches!(wake, WalV8ProgressWake::Control),
+                "delayed control token did not reach the select waiter"
+            );
+            driver.join().expect("select control thread panicked");
+            Ok(())
+        }
+
+        assert_delayed_completion_wakes_select()?;
+        assert_delayed_control_wakes_select()?;
+        Ok(())
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
     fn direct_completion_select_seed_and_batch_drain_preserve_capacity_and_order() -> Result<()> {
         let (completion_tx, completion_rx) = crossbeam_channel::bounded(3);
         let observed_at = Instant::now();
@@ -11332,7 +11475,7 @@ mod tests {
 
     #[cfg(feature = "bench")]
     #[test]
-    fn direct_completion_select_poison_wakes_a_waiting_driver() -> Result<()> {
+    fn direct_completion_select_consumes_poison_queued_before_select() -> Result<()> {
         let (coordinator, tokens) = cursor_completion_coordinator()?;
         let (_completion_tx, completions) = crossbeam_channel::bounded(1);
         let (registered_tx, registered_rx) = mpsc::channel();
@@ -11368,7 +11511,7 @@ mod tests {
 
     #[cfg(feature = "bench")]
     #[test]
-    fn direct_completion_select_close_wakes_a_waiting_driver() -> Result<()> {
+    fn direct_completion_select_consumes_close_queued_before_select() -> Result<()> {
         let (coordinator, tokens) = cursor_completion_coordinator()?;
         let (_completion_tx, completions) = crossbeam_channel::bounded(1);
         let (registered_tx, registered_rx) = mpsc::channel();

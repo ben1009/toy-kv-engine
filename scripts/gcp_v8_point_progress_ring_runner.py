@@ -20,6 +20,7 @@ from typing import Any, Callable
 
 from gcp_wal_matrix import (
     CURSOR_DIRECT_COMPLETION_PLAN_SCHEMA_V1,
+    CURSOR_DIRECT_COMPLETION_WAKE_PLAN_SCHEMA_V1,
     CURSOR_SINGLETON_SUBMISSION_PLAN_SCHEMA_V1,
     CURSOR_PUBLICATION_NUM,
     CURSOR_PUBLICATION_PLAN_SCHEMA_V2,
@@ -37,6 +38,8 @@ from gcp_wal_matrix import (
     POINT_RESOURCE_RETIREMENT_WRITERS,
     build_cursor_direct_completion_plan,
     build_cursor_direct_completion_schedule,
+    build_cursor_direct_completion_wake_plan,
+    build_cursor_direct_completion_wake_schedule,
     build_cursor_coalescing_budget_plan,
     build_cursor_coalescing_budget_schedule,
     build_cursor_singleton_submission_plan,
@@ -58,6 +61,7 @@ from gcp_wal_matrix import (
     validate_point_progress_ring_rows,
     validate_point_resource_retirement_rows,
     validate_cursor_direct_completion_rows,
+    validate_cursor_direct_completion_wake_rows,
     validate_cursor_coalescing_budget_rows,
     validate_cursor_singleton_submission_rows,
     validate_cursor_publication_rows,
@@ -79,6 +83,7 @@ UNSET_EXPERIMENT_VARIABLES = (
     "TOYKV_BENCH_V8_DEDICATED_DURABILITY_DRIVER",
     "TOYKV_BENCH_V8_DURABILITY_DRIVER_DIAGNOSTICS",
     "TOYKV_BENCH_V8_INDEPENDENT_ACK_WAITER",
+    "TOYKV_BENCH_V8_DIRECT_COMPLETION_WAKE",
 )
 FIXED_ENVIRONMENT = {
     "TOYKV_BENCH_V8_EXTENT_PREP": "sliding-point-lookahead",
@@ -121,6 +126,11 @@ def _summary_fields(schedule: list[dict[str, Any]]) -> tuple[str, ...]:
         fields += ("progress_cursor_start", "progress_cursor_end")
     if any("cursor_direct_completion_enabled" in row for row in schedule):
         fields += ("cursor_direct_completion_start", "cursor_direct_completion_end")
+    if any("cursor_direct_completion_wake_mode" in row for row in schedule):
+        fields += (
+            "cursor_direct_completion_select_wake_enabled_start",
+            "cursor_direct_completion_select_wake_enabled_end",
+        )
     if any("cursor_singleton_submission_enabled" in row for row in schedule):
         fields += ("cursor_singleton_submission_start", "cursor_singleton_submission_end")
     if any("point_buffer_preallocation_enabled" in row for row in schedule):
@@ -165,6 +175,7 @@ def _environment(
     dedicated_durability_driver_enabled: bool | None = None,
     dedicated_durability_diagnostics_enabled: bool | None = None,
     independent_ack_waiter_enabled: bool | None = None,
+    cursor_direct_completion_wake_mode: str | None = None,
 ) -> dict[str, str]:
     # An allowlist makes the selected experiment switches the only inherited variables.
     if progress_ring_enabled is not progress_cursor_enabled:
@@ -184,6 +195,12 @@ def _environment(
         environment["TOYKV_BENCH_V8_CURSOR_DIRECT_COMPLETION"] = (
             "1" if cursor_direct_completion_enabled else "0"
         )
+    if cursor_direct_completion_wake_mode is not None:
+        if cursor_direct_completion_wake_mode not in ("token", "select"):
+            raise ValueError("direct-completion wake mode must be token or select")
+        if cursor_direct_completion_enabled is not True:
+            raise ValueError("direct-completion wake mode requires direct completion")
+        environment["TOYKV_BENCH_V8_DIRECT_COMPLETION_WAKE"] = cursor_direct_completion_wake_mode
     if cursor_singleton_submission_enabled is not None:
         environment["TOYKV_BENCH_V8_CURSOR_SINGLETON_SUBMISSION"] = (
             "1" if cursor_singleton_submission_enabled else "0"
@@ -262,6 +279,7 @@ def _expected_environment_text(
     dedicated_durability_driver_enabled: bool | None = None,
     dedicated_durability_diagnostics_enabled: bool | None = None,
     independent_ack_waiter_enabled: bool | None = None,
+    cursor_direct_completion_wake_mode: str | None = None,
 ) -> str:
     if progress_ring_enabled and not progress_cursor_enabled:
         # Historical F0.5 archives used the now-retired mode 1. Keep their
@@ -282,6 +300,7 @@ def _expected_environment_text(
             dedicated_durability_driver_enabled=dedicated_durability_driver_enabled,
             dedicated_durability_diagnostics_enabled=dedicated_durability_diagnostics_enabled,
             independent_ack_waiter_enabled=independent_ack_waiter_enabled,
+            cursor_direct_completion_wake_mode=cursor_direct_completion_wake_mode,
         ).items()
         if key not in ("PATH", "HOME", "TMPDIR", "LC_ALL")
     }
@@ -298,6 +317,8 @@ def _expected_environment_text(
              or dedicated_durability_diagnostics_enabled is None)
         and (key != "TOYKV_BENCH_V8_INDEPENDENT_ACK_WAITER"
              or independent_ack_waiter_enabled is None)
+        and (key != "TOYKV_BENCH_V8_DIRECT_COMPLETION_WAKE"
+             or cursor_direct_completion_wake_mode is None)
     })
     return "\n".join(f"{key}={value}" for key, value in sorted(controlled.items())) + "\n"
 
@@ -340,6 +361,10 @@ def _validate_record(record: dict[str, Any], row: dict[str, Any]) -> dict[str, A
             "cursor_direct_completion_enabled", False
         ) is not bool(row["cursor_direct_completion_enabled"]):
             raise ValueError(f"{boundary} direct-completion mode differs from the planned arm")
+        if "cursor_direct_completion_wake_mode" in row and snapshot.get(
+            "cursor_direct_completion_select_wake_enabled", False
+        ) is not (row["cursor_direct_completion_wake_mode"] == "select"):
+            raise ValueError(f"{boundary} direct-completion wake mode differs from the planned arm")
         if "cursor_singleton_submission_enabled" in row and snapshot.get(
             "cursor_singleton_submission_enabled", False
         ) is not bool(row["cursor_singleton_submission_enabled"]):
@@ -457,6 +482,13 @@ def _validate_record(record: dict[str, Any], row: dict[str, Any]) -> dict[str, A
         ]
         metrics["cursor_direct_completion_end"] = pipeline["wal_io_end"][
             "cursor_direct_completion_enabled"
+        ]
+    if "cursor_direct_completion_wake_mode" in row:
+        metrics["cursor_direct_completion_select_wake_enabled_start"] = pipeline["wal_io_start"][
+            "cursor_direct_completion_select_wake_enabled"
+        ]
+        metrics["cursor_direct_completion_select_wake_enabled_end"] = pipeline["wal_io_end"][
+            "cursor_direct_completion_select_wake_enabled"
         ]
     if "cursor_singleton_submission_enabled" in row:
         metrics["cursor_singleton_submission_start"] = pipeline["wal_io_start"][
@@ -796,7 +828,7 @@ def _run_one(
     )
     point_preallocation = (
         bool(row["point_buffer_preallocation_enabled"])
-        if cursor_publication_suite or dedicated_durability_suite else None
+        if cursor_publication_suite or dedicated_durability_suite or candidate_mode == "completion-wake" else None
     )
     environment = (
         _point_preallocation_environment(row)
@@ -827,6 +859,10 @@ def _run_one(
             independent_ack_waiter_enabled=(
                 bool(row["independent_ack_waiter_enabled"]) if dedicated_durability_suite else None
             ),
+            cursor_direct_completion_wake_mode=(
+                str(row["cursor_direct_completion_wake_mode"])
+                if candidate_mode == "completion-wake" else None
+            ),
         )
     )
     (run_dir / "command.sh").write_text(shlex.join(command) + "\n", encoding="utf-8")
@@ -856,6 +892,10 @@ def _run_one(
             ),
             independent_ack_waiter_enabled=(
                 bool(row["independent_ack_waiter_enabled"]) if dedicated_durability_suite else None
+            ),
+            cursor_direct_completion_wake_mode=(
+                str(row["cursor_direct_completion_wake_mode"])
+                if candidate_mode == "completion-wake" else None
             ),
         ), encoding="utf-8",
     )
@@ -895,6 +935,8 @@ def _run_one(
             _validate_point_preallocation_record if preallocation_suite else
             _validate_cursor_publication_record if cursor_publication_suite else
             _validate_dedicated_durability_record if dedicated_durability_suite else
+            _validate_point_resource_retirement_stage_a_record
+            if candidate_mode == "completion-wake" else
             _validate_point_resource_retirement_stage_a_record
             if candidate_mode == "point-resource-retirement-stage-a" else
             _validate_record
@@ -999,6 +1041,7 @@ def _summary(rows: list[dict[str, Any]], writers: tuple[int, ...], planned: int)
         "suite": "v8-point-progress-ring",
         "complete": len(rows) == planned and validation["complete"],
         "runs_started": len(rows),
+        "runs_attempted": len(rows),
         "runs_completed": sum(row.get("exit_code") == 0 for row in rows),
         "runs_planned": planned,
         "writers": list(writers),
@@ -1398,6 +1441,83 @@ def _direct_completion_summary(
             "Same-host, same-source, same-release-binary Cursor-only comparison. Both arms use progress mode 2; "
             "only direct completion delivery differs. Scored runs disable detailed diagnostics. Passing this "
             "experiment does not change production defaults."
+        ),
+    }
+
+
+def _completion_wake_summary(
+    rows: list[dict[str, Any]], writers: tuple[int, ...], planned: int,
+) -> dict[str, Any]:
+    validation = validate_cursor_direct_completion_wake_rows(rows, writers)
+    cells = [(writer, "point") for writer in writers] + [(16, "batch64")]
+    metrics = (
+        "puts_per_second", "cpu_us_per_put", "p50_ms", "p95_ms", "p99_ms", "sync_count",
+        "puts_per_sync",
+    )
+    comparisons: list[dict[str, Any]] = []
+    for writer, workload in cells:
+        arms = {
+            arm: [row for row in rows if row.get("writer") == writer and row.get("workload") == workload
+                  and row.get("arm") == arm and row.get("exit_code") == 0]
+            for arm in ("token", "select")
+        }
+        stats = {
+            arm: {
+                "runs": len(arm_rows),
+                **{
+                    metric: median(float(row[metric]) for row in arm_rows)
+                    if arm_rows and all(row.get(metric) is not None for row in arm_rows) else None
+                    for metric in metrics
+                },
+            }
+            for arm, arm_rows in arms.items()
+        }
+        throughput_changes: list[float] = []
+        p99_changes: list[float] = []
+        for repetition in range(1, 6):
+            pair = {
+                arm: next((row for row in rows if row.get("writer") == writer
+                           and row.get("workload") == workload and row.get("repetition") == repetition
+                           and row.get("arm") == arm and row.get("exit_code") == 0), None)
+                for arm in ("token", "select")
+            }
+            baseline, candidate = pair["token"], pair["select"]
+            if baseline and candidate and baseline["puts_per_second"] > 0:
+                throughput_changes.append((candidate["puts_per_second"] / baseline["puts_per_second"] - 1) * 100)
+                if workload == "point":
+                    p99_changes.append((candidate["p99_ms"] / baseline["p99_ms"] - 1) * 100)
+        baseline_median = stats["token"]["puts_per_second"]
+        candidate_median = stats["select"]["puts_per_second"]
+        comparisons.append({
+            "writer": writer,
+            "workload": workload,
+            "token": stats["token"],
+            "select": stats["select"],
+            "paired_throughput_changes_pct": throughput_changes,
+            "paired_throughput_change_median_pct": median(throughput_changes) if throughput_changes else None,
+            "select_pair_wins": sum(change > 0 for change in throughput_changes),
+            "paired_p99_changes_pct": p99_changes,
+            "paired_p99_change_median_pct": median(p99_changes) if p99_changes else None,
+            "median_throughput_change_pct": (
+                (candidate_median / baseline_median - 1) * 100
+                if baseline_median and candidate_median else None
+            ),
+        })
+    return {
+        "suite": "v8-cursor-direct-completion-wake",
+        "complete": len(rows) == planned and validation["complete"],
+        "runs_started": len(rows),
+        "runs_completed": sum(row.get("exit_code") == 0 for row in rows),
+        "runs_planned": planned,
+        "writers": list(writers),
+        "workloads": ["point", "batch64"],
+        "arms": ["token", "select"],
+        "results": rows,
+        "matrix_validation": validation,
+        "comparison": comparisons,
+        "qualification_note": (
+            "Same-host, same-source, same-release-binary Cursor Direct Completion comparison. Both arms use Stage A "
+            "on for Point only; only the completion wake mode differs. Scored runs disable detailed diagnostics."
         ),
     }
 
@@ -2206,6 +2326,17 @@ def run_suite(args: argparse.Namespace) -> int:
         )
         schedule_filename = "cursor-direct-completion-schedule.tsv"
         summarize = _direct_completion_summary
+    elif candidate_mode == "completion-wake":
+        schedule = build_cursor_direct_completion_wake_schedule(writers)
+        plan = build_cursor_direct_completion_wake_plan(
+            writers=writers,
+            machine_type=args.machine_type,
+            machine_spec={"vcpus": 16, "ssd_count": args.ssd_count, "ssd_gib": args.ssd_gib},
+            commit=args.commit,
+            binary_sha256=args.binary_sha256,
+        )
+        schedule_filename = "cursor-direct-completion-wake-schedule.tsv"
+        summarize = _completion_wake_summary
     elif candidate_mode == "singleton-submission":
         schedule = build_cursor_singleton_submission_schedule(writers)
         plan = build_cursor_singleton_submission_plan(
@@ -2762,6 +2893,129 @@ def verify_direct_completion_results_directory(results: Path) -> dict[str, Any]:
         return {"verified": False, "errors": [str(error)]}
 
 
+def verify_cursor_direct_completion_wake_results_directory(results: Path) -> dict[str, Any]:
+    """Strictly verify Token/Select runtime flags, Stage A, raw results, and summary."""
+    errors: list[str] = []
+    try:
+        summary = json.loads((results / "summary.json").read_text(encoding="utf-8"))
+        remote_exit = json.loads((results / "remote-exit.json").read_text(encoding="utf-8"))
+        plan = json.loads((results / "benchmark-plan.json").read_text(encoding="utf-8"))
+        commit = (results / "commit.txt").read_text(encoding="utf-8").strip()
+        binary_sha = (results / "write-perf.sha256").read_text(encoding="utf-8").strip()
+        if not all(isinstance(value, dict) for value in (summary, remote_exit, plan)):
+            raise ValueError("summary, remote-exit, and plan must be JSON objects")
+        writers = tuple(plan.get("writers", ()))
+        schedule = build_cursor_direct_completion_wake_schedule(writers)
+        expected_plan = build_cursor_direct_completion_wake_plan(
+            writers=writers,
+            machine_type="c4-standard-16-lssd",
+            machine_spec={"vcpus": 16, "ssd_count": 2, "ssd_gib": 750},
+            commit=commit,
+            binary_sha256=binary_sha,
+        )
+        if plan != expected_plan:
+            errors.append("benchmark plan differs from the fixed completion-wake suite")
+        if (
+            summary.get("suite") != "v8-cursor-direct-completion-wake"
+            or summary.get("source_commit") != commit
+            or summary.get("binary_sha256") != binary_sha
+            or summary.get("complete") is not True
+            or summary.get("runs_started") != len(schedule)
+            or summary.get("runs_attempted") != len(schedule)
+            or summary.get("runs_completed") != len(schedule)
+            or summary.get("runs_planned") != len(schedule)
+        ):
+            errors.append("summary metadata or run counts are incomplete")
+        if (
+            remote_exit.get("failed") is not False
+            or remote_exit.get("runs_started") != len(schedule)
+            or remote_exit.get("runs_attempted") != len(schedule)
+        ):
+            errors.append("remote-exit does not confirm all planned runs")
+        with (results / "cursor-direct-completion-wake-schedule.tsv").open(
+            encoding="utf-8", newline="",
+        ) as stream:
+            actual_schedule = list(csv.DictReader(stream, delimiter="\t"))
+        expected_schedule = [
+            {key: ("none" if key == "batch_size" and value is None else "" if value is None else str(value))
+             for key, value in row.items()}
+            for row in schedule
+        ]
+        if actual_schedule != expected_schedule:
+            errors.append("schedule file differs from the fixed Token/Select plan")
+        rows = summary.get("results")
+        if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+            raise ValueError("summary results are missing or malformed")
+        validation = validate_cursor_direct_completion_wake_rows(rows, writers)
+        if validation.get("complete") is not True:
+            errors.append("run rows do not match the Token/Select matrix")
+        recomputed = _completion_wake_summary(rows, writers, len(schedule))
+        for key in (
+            "suite", "complete", "runs_started", "runs_completed", "runs_planned", "writers",
+            "workloads", "arms", "matrix_validation", "comparison",
+        ):
+            if summary.get(key) != recomputed.get(key):
+                errors.append(f"summary field {key} differs from recomputed run results")
+        expected_ids = {_run_id(row) for row in schedule}
+        actual_ids = {
+            path.name for path in results.iterdir()
+            if path.is_dir() and path.name.startswith(("r", "w"))
+        }
+        if actual_ids != expected_ids:
+            errors.append("run directories do not exactly match the 40-run schedule")
+        rows_by_id = {_run_id(row): row for row in rows}
+        for row in schedule:
+            run_id = _run_id(row)
+            run_dir = results / run_id
+            result_path, metadata_path = run_dir / "result.json", run_dir / "run-metadata.json"
+            if not result_path.is_file() or not metadata_path.is_file():
+                errors.append(f"{run_id} is missing result.json or run-metadata.json")
+                continue
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            if metadata != rows_by_id.get(run_id):
+                errors.append(f"{run_id} metadata differs from the summary row")
+            identity = {**row, "source_commit": commit, "binary_sha256": binary_sha}
+            if any(metadata.get(key) != value for key, value in identity.items()):
+                errors.append(f"{run_id} metadata identity differs from the schedule")
+            expected_environment = _expected_environment_text(
+                True, True, False, True,
+                point_buffer_preallocation_enabled=bool(row["point_buffer_preallocation_enabled"]),
+                cursor_direct_completion_wake_mode=str(row["cursor_direct_completion_wake_mode"]),
+            )
+            environment_path = run_dir / "environment.txt"
+            if (
+                not environment_path.is_file()
+                or environment_path.read_text(encoding="utf-8") != expected_environment
+            ):
+                errors.append(f"{run_id} environment differs from its planned wake mode")
+            try:
+                raw = json.loads(result_path.read_text(encoding="utf-8"))
+                metrics = _validate_point_resource_retirement_stage_a_record(raw, row)
+                if any(metadata.get(key) != value for key, value in metrics.items()):
+                    errors.append(f"{run_id} metrics differ from result.json")
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+                errors.append(f"{run_id} result is invalid: {error}")
+        summary_tsv = results / "summary.tsv"
+        if not summary_tsv.is_file():
+            errors.append("summary.tsv is missing")
+        else:
+            with summary_tsv.open(encoding="utf-8", newline="") as stream:
+                actual_tsv = list(csv.DictReader(stream, delimiter="\t"))
+            expected_tsv = []
+            for row in schedule:
+                metadata = rows_by_id.get(_run_id(row), {})
+                expected_tsv.append({
+                    key: json.dumps(metadata[key], sort_keys=True) if isinstance(metadata.get(key), dict)
+                    else "" if metadata.get(key) is None else str(metadata.get(key))
+                    for key in _summary_fields(schedule)
+                })
+            if actual_tsv != expected_tsv:
+                errors.append("summary.tsv rows differ from per-run metadata")
+        return {"verified": not errors, "planned": len(schedule), "observed": len(rows), "errors": errors}
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError, csv.Error) as error:
+        return {"verified": False, "errors": [str(error)]}
+
+
 def verify_singleton_submission_results_directory(results: Path) -> dict[str, Any]:
     """Strictly verify the Cursor singleton-submission experiment archive."""
     errors: list[str] = []
@@ -3032,7 +3286,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--candidate-mode",
         choices=(
-            "cursor", "direct-completion", "singleton-submission", "cursor-publication", "coalescing-budget",
+            "cursor", "direct-completion", "completion-wake", "singleton-submission", "cursor-publication",
+            "coalescing-budget",
             "v7-v8-point-preallocation",
         ),
         default="cursor",
