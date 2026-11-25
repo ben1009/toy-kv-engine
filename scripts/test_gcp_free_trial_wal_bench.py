@@ -1394,6 +1394,36 @@ class PointProgressRingQualificationTests(unittest.TestCase):
             self.assertFalse(verification["verified"])
             self.assertTrue(any("comparison differs" in error for error in verification["errors"]))
 
+    def test_ready_target_final_live_v7_run_uses_v7_v8_validator(self) -> None:
+        row = next(
+            row for row in build_v7_v8_ready_target_final_schedule()
+            if row["format_version"] == 7 and row["workload"] == "point"
+        )
+        row = {**row, "source_commit": "a" * 40}
+        process = Mock()
+        process.args = ["write-perf"]
+        process.returncode = 0
+        process.communicate.return_value = (json.dumps(self._raw_v7_record(row)), "")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with patch.object(progress_ring_runner.subprocess, "Popen", return_value=process):
+                metadata = progress_ring_runner._run_one(
+                    binary=Path("write-perf"),
+                    binary_sha256="b" * 64,
+                    row=row,
+                    results_dir=root / "results",
+                    db_root=root / "db",
+                    safe_deadline_epoch=int(time.time()) + 3600,
+                    candidate_mode="v7-v8-ready-target-final",
+                )
+            run_dir = root / "results" / progress_ring_runner._run_id(row)
+            self.assertFalse((run_dir / "validation-error.txt").exists())
+
+        self.assertEqual(metadata["exit_code"], 0)
+        self.assertEqual(metadata["format_version"], 7)
+        self.assertEqual(metadata["sync_count"], 1000)
+
     def test_run_suite_writes_ready_target_scan_plan_and_schedule(self) -> None:
         binary = Path("scripts/gcp_v8_point_progress_ring_runner.py")
         binary_sha256 = self._sha256(binary)

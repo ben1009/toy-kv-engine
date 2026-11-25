@@ -1078,7 +1078,7 @@ def _run_one(
         if completed.returncode != 0:
             raise ValueError(f"write-perf exited with status {completed.returncode}")
         validator = (
-            _validate_point_preallocation_record if preallocation_suite else
+            _validate_point_preallocation_record if preallocation_suite or ready_target_final_suite else
             _validate_cursor_publication_record if cursor_publication_suite else
             _validate_dedicated_durability_record if dedicated_durability_suite else
             _validate_point_resource_retirement_stage_a_record
