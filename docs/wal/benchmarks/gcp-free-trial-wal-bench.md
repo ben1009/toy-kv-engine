@@ -404,6 +404,33 @@ The [V8 Point Progress Ring plan](../../../rfcs/027-v8-point-progress-ring.md#8-
 describes the candidate's proposed Point1, Point8, Point16 and Batch64 test
 after prototype and recovery verification.
 
+For the E3 Cursor coalescing ready-prefix target comparison, use
+`--v8-cursor-coalescing-ready-target-ab`. The fixed 60-run plan compares
+Dynamic, Target8, and Target12 at Point1, Point8, Point16, and Batch64/16, with
+five counterbalanced repetitions. Stage A buffer preallocation is enabled for
+Point runs and disabled for Batch64. Detailed tracing and diagnostics stay off.
+The runner validates the configured target in both WAL snapshots and checks
+the target-hit counter delta for every run; Dynamic and Point1 target-hit
+deltas must be zero. The summary reports target hits relative to sync count,
+paired throughput, CPU/Put, p99, sync count, and puts/sync. Target8/12 remain
+bench-only settings; this suite does not change runtime defaults.
+
+```bash
+python3 scripts/gcp-free-trial-wal-bench.py \
+  --project YOUR_PROJECT_ID \
+  --zone YOUR_C4_ZONE \
+  --machine-type c4-standard-16-lssd \
+  --v8-cursor-coalescing-ready-target-ab \
+  --commit 0123456789abcdef0123456789abcdef01234567 \
+  --network YOUR_ISOLATED_VPC \
+  --subnet YOUR_SUBNET \
+  --ssh-source-range YOUR_PUBLIC_IPV4/32 \
+  --estimated-hourly-cost-usd YOUR_CURRENT_ESTIMATE \
+  --max-estimated-spend-usd 2.00 \
+  --max-runtime-minutes 60 \
+  --confirm-free-trial
+```
+
 ## Collected artifacts
 
 The local result directory includes the preflight quota report, GCP command

@@ -57,12 +57,15 @@ from gcp_wal_matrix import (
     DURABILITY_DRIVER_WRITERS,
     CURSOR_COALESCING_BUDGET_NUM,
     CURSOR_COALESCING_BUDGET_WRITERS,
+    CURSOR_COALESCING_READY_TARGET_NUM,
+    CURSOR_COALESCING_READY_TARGET_WRITERS,
     CURSOR_PUBLICATION_NUM,
     CURSOR_PUBLICATION_WRITERS,
     build_cursor_direct_completion_plan,
     build_cursor_direct_completion_wake_plan,
     build_cursor_singleton_submission_plan,
     build_cursor_coalescing_budget_plan,
+    build_cursor_coalescing_ready_target_plan,
     build_cursor_publication_plan,
     V8_EXTENT_POLICY_STORAGE_NUM,
     V8_EXTENT_POLICY_STORAGE_WRITERS,
@@ -118,6 +121,9 @@ from gcp_v8_point_progress_ring_runner import (
 )
 from gcp_v8_point_progress_ring_runner import (
     verify_coalescing_budget_results_directory as verify_cursor_coalescing_budget_results,
+)
+from gcp_v8_point_progress_ring_runner import (
+    verify_coalescing_ready_target_results_directory as verify_cursor_coalescing_ready_target_results,
 )
 from gcp_v8_point_progress_ring_runner import (
     verify_cursor_publication_results_directory as verify_cursor_publication_results,
@@ -1246,6 +1252,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                              help="Compare allocation-free singleton DATA submission with Point/Batch guardrails")
     suite_group.add_argument("--v8-cursor-coalescing-budget-ab", action="store_true",
                              help="Compare Cursor Direct Point Dynamic, 100, and 400 μs coalescing budgets")
+    suite_group.add_argument("--v8-cursor-coalescing-ready-target-ab", action="store_true",
+                             help="Compare Dynamic, Target8, and Target12 for Point1/8/16 and Batch64")
     suite_group.add_argument("--v8-cursor-publication-ab", action="store_true",
                              help="Requalify D2a admission publication with a two-arm, 40-run Point/Batch matrix")
     suite_group.add_argument("--v8-extent-policy-storage-ab", action="store_true",
@@ -1304,6 +1312,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     point_cursor_direct_completion_wake_suite = args.v8_cursor_direct_completion_wake_ab
     point_cursor_singleton_submission_suite = args.v8_cursor_singleton_submission_ab
     point_cursor_coalescing_budget_suite = args.v8_cursor_coalescing_budget_ab
+    point_cursor_coalescing_ready_target_suite = args.v8_cursor_coalescing_ready_target_ab
     point_cursor_publication_suite = args.v8_cursor_publication_ab
     point_preallocation_suite = args.v7_v8_point_preallocation_ab
     point_resource_retirement_stage_a_suite = args.v8_point_resource_retirement_stage_a_ab
@@ -1317,6 +1326,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         args.v8_point_progress_cursor_ab or point_cursor_direct_completion_suite
         or point_cursor_direct_completion_wake_suite
         or point_cursor_singleton_submission_suite or point_cursor_coalescing_budget_suite
+        or point_cursor_coalescing_ready_target_suite
         or point_cursor_publication_suite
         or point_preallocation_suite or point_resource_retirement_suite or point_ack_d1_suite
         or dedicated_durability_suite
@@ -1343,6 +1353,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             parser.error("Cursor/preallocation qualification requires --ssh-source-range, including for preflight")
     if args.num is None:
         args.num = (
+            CURSOR_COALESCING_READY_TARGET_NUM if point_cursor_coalescing_ready_target_suite else
             CURSOR_COALESCING_BUDGET_NUM if point_cursor_coalescing_budget_suite else
             CURSOR_PUBLICATION_NUM if point_cursor_publication_suite else
             POINT_PREALLOCATION_NUM if point_preallocation_suite else
@@ -1396,6 +1407,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             args.writers = DURABILITY_DRIVER_WRITERS
         elif point_cursor_coalescing_budget_suite:
             args.writers = CURSOR_COALESCING_BUDGET_WRITERS
+        elif point_cursor_coalescing_ready_target_suite:
+            args.writers = CURSOR_COALESCING_READY_TARGET_WRITERS
         elif point_cursor_publication_suite:
             args.writers = CURSOR_PUBLICATION_WRITERS
         elif point_progress_suite:
@@ -1412,6 +1425,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error("--commit-order-trace requires exactly 16 writers")
     if point_cursor_coalescing_budget_suite and args.writers != CURSOR_COALESCING_BUDGET_WRITERS:
         parser.error(f"--v8-cursor-coalescing-budget-ab requires writers {CURSOR_COALESCING_BUDGET_WRITERS}")
+    if point_cursor_coalescing_ready_target_suite and args.writers != CURSOR_COALESCING_READY_TARGET_WRITERS:
+        parser.error(
+            f"--v8-cursor-coalescing-ready-target-ab requires writers {CURSOR_COALESCING_READY_TARGET_WRITERS}"
+        )
     if point_cursor_publication_suite and args.writers != CURSOR_PUBLICATION_WRITERS:
         parser.error(f"--v8-cursor-publication-ab requires writers {CURSOR_PUBLICATION_WRITERS}")
     if point_cursor_publication_suite and args.machine_type != "c4-standard-16-lssd":
@@ -1459,6 +1476,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     expected_progress_writers = (
         CURSOR_PUBLICATION_WRITERS
         if point_cursor_publication_suite else
+        CURSOR_COALESCING_READY_TARGET_WRITERS
+        if point_cursor_coalescing_ready_target_suite else
         CURSOR_COALESCING_BUDGET_WRITERS
         if point_cursor_coalescing_budget_suite else POINT_PROGRESS_RING_WRITERS
     )
@@ -1636,7 +1655,8 @@ def _run_identifier(row: dict[str, Any], suite: str) -> str:
     if suite in (
         "v8-point-progress-ring", "v8-point-progress-cursor", "v8-cursor-direct-completion",
         "v8-cursor-direct-completion-wake",
-        "v8-cursor-singleton-submission", "v8-cursor-coalescing-budget", "v7-v8-point-preallocation",
+        "v8-cursor-singleton-submission", "v8-cursor-coalescing-budget",
+        "v8-cursor-coalescing-ready-target", "v7-v8-point-preallocation",
         "v8-point-resource-retirement", "v8-cursor-publication",
     ):
         return f"r{row['repetition']}-w{row['writer']}-{row['workload']}-{row['arm']}"
@@ -1665,7 +1685,8 @@ def _summary_row_identifier(row: dict[str, Any], suite: str) -> str:
     if suite in (
         "v8-point-progress-ring", "v8-point-progress-cursor", "v8-cursor-direct-completion",
         "v8-cursor-direct-completion-wake",
-        "v8-cursor-singleton-submission", "v8-cursor-coalescing-budget", "v7-v8-point-preallocation",
+        "v8-cursor-singleton-submission", "v8-cursor-coalescing-budget",
+        "v8-cursor-coalescing-ready-target", "v7-v8-point-preallocation",
         "v8-point-resource-retirement", "v8-cursor-publication",
     ):
         return f"r{int(row['repetition'])}-w{int(row['writer'])}-{row['workload']}-{row['arm']}"
@@ -1698,7 +1719,8 @@ def _expected_run_metadata(row: dict[str, Any], suite: str) -> dict[str, Any]:
     if suite in (
         "v8-point-progress-ring", "v8-point-progress-cursor", "v8-cursor-direct-completion",
         "v8-cursor-direct-completion-wake",
-        "v8-cursor-singleton-submission", "v8-cursor-coalescing-budget", "v8-point-resource-retirement",
+        "v8-cursor-singleton-submission", "v8-cursor-coalescing-budget",
+        "v8-cursor-coalescing-ready-target", "v8-point-resource-retirement",
     ):
         keys = (
             "run_index", "writer", "workload", "repetition", "arm", "bench",
@@ -1726,6 +1748,12 @@ def _expected_run_metadata(row: dict[str, Any], suite: str) -> dict[str, Any]:
             keys += (
                 "progress_cursor_enabled", "progress_counters_enabled", "cursor_direct_completion_enabled",
                 "cursor_singleton_submission_enabled", "coalescing_budget_us",
+            )
+        elif suite == "v8-cursor-coalescing-ready-target":
+            keys += (
+                "progress_cursor_enabled", "progress_counters_enabled", "cursor_direct_completion_enabled",
+                "cursor_singleton_submission_enabled", "coalescing_ready_target",
+                "point_buffer_preallocation_enabled",
             )
         elif suite == "v8-point-resource-retirement":
             keys += (
@@ -1824,6 +1852,8 @@ def _verify_result_set(results: Path) -> dict[str, Any]:
             return verify_cursor_singleton_submission_results(results)
         if suite == "v8-cursor-coalescing-budget":
             return verify_cursor_coalescing_budget_results(results)
+        if suite == "v8-cursor-coalescing-ready-target":
+            return verify_cursor_coalescing_ready_target_results(results)
         if suite == "v8-cursor-publication":
             return verify_cursor_publication_results(results)
         if suite == "v7-v8-point-preallocation":
@@ -3044,6 +3074,7 @@ def provision_and_run(
     )
     point_cursor_singleton_submission_suite = getattr(args, "v8_cursor_singleton_submission_ab", False)
     point_cursor_coalescing_budget_suite = getattr(args, "v8_cursor_coalescing_budget_ab", False)
+    point_cursor_coalescing_ready_target_suite = getattr(args, "v8_cursor_coalescing_ready_target_ab", False)
     point_cursor_publication_suite = getattr(args, "v8_cursor_publication_ab", False)
     point_preallocation_suite = getattr(args, "v7_v8_point_preallocation_ab", False)
     point_resource_retirement_stage_a_suite = getattr(args, "v8_point_resource_retirement_stage_a_ab", False)
@@ -3057,6 +3088,7 @@ def provision_and_run(
         point_progress_cursor_suite or point_cursor_direct_completion_suite
         or point_cursor_direct_completion_wake_suite
         or point_cursor_singleton_submission_suite or point_cursor_coalescing_budget_suite
+        or point_cursor_coalescing_ready_target_suite
         or point_cursor_publication_suite
         or point_preallocation_suite or point_resource_retirement_suite or point_ack_d1_suite
         or dedicated_durability_suite
@@ -3412,6 +3444,8 @@ def provision_and_run(
                 remote_suite = "v8-cursor-singleton-submission"
             elif point_cursor_coalescing_budget_suite:
                 remote_suite = "v8-cursor-coalescing-budget"
+            elif point_cursor_coalescing_ready_target_suite:
+                remote_suite = "v8-cursor-coalescing-ready-target"
             elif point_cursor_publication_suite:
                 remote_suite = "v8-cursor-publication"
             elif point_preallocation_suite:
@@ -3580,6 +3614,7 @@ def main(argv: list[str] | None = None) -> int:
     point_cursor_direct_completion_wake_suite = args.v8_cursor_direct_completion_wake_ab
     point_cursor_singleton_submission_suite = args.v8_cursor_singleton_submission_ab
     point_cursor_coalescing_budget_suite = args.v8_cursor_coalescing_budget_ab
+    point_cursor_coalescing_ready_target_suite = args.v8_cursor_coalescing_ready_target_ab
     point_cursor_publication_suite = args.v8_cursor_publication_ab
     point_preallocation_suite = args.v7_v8_point_preallocation_ab
     point_resource_retirement_stage_a_suite = args.v8_point_resource_retirement_stage_a_ab
@@ -3592,6 +3627,7 @@ def main(argv: list[str] | None = None) -> int:
         args.v8_point_progress_cursor_ab or point_cursor_direct_completion_suite
         or point_cursor_direct_completion_wake_suite
         or point_cursor_singleton_submission_suite or point_cursor_coalescing_budget_suite
+        or point_cursor_coalescing_ready_target_suite
         or point_cursor_publication_suite
         or point_preallocation_suite or point_resource_retirement_suite or point_ack_d1_suite
         or dedicated_durability_suite
@@ -3729,6 +3765,13 @@ def main(argv: list[str] | None = None) -> int:
         elif point_cursor_coalescing_budget_suite:
             report["benchmark_suite"] = "v8-cursor-coalescing-budget"
             report["benchmark_plan"] = build_cursor_coalescing_budget_plan(
+                machine_type=args.machine_type,
+                machine_spec=MACHINE_SPECS[args.machine_type],
+                commit=args.commit.lower(),
+            )
+        elif point_cursor_coalescing_ready_target_suite:
+            report["benchmark_suite"] = "v8-cursor-coalescing-ready-target"
+            report["benchmark_plan"] = build_cursor_coalescing_ready_target_plan(
                 machine_type=args.machine_type,
                 machine_spec=MACHINE_SPECS[args.machine_type],
                 commit=args.commit.lower(),
