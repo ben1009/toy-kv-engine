@@ -1930,6 +1930,7 @@ struct WalIoDiagnosticsRecord {
     progress_ring_enabled: bool,
     progress_cursor_enabled: bool,
     cursor_direct_completion_enabled: bool,
+    cursor_direct_completion_select_wake_enabled: bool,
     cursor_singleton_submission_enabled: bool,
     admission_cursor_publish_fast_path_enabled: bool,
     point_buffer_preallocation_enabled: bool,
@@ -2102,6 +2103,8 @@ impl From<WalIoDiagnostics> for WalIoDiagnosticsRecord {
             progress_ring_enabled: diagnostics.progress_ring_enabled,
             progress_cursor_enabled: diagnostics.progress_cursor_enabled,
             cursor_direct_completion_enabled: diagnostics.cursor_direct_completion_enabled,
+            cursor_direct_completion_select_wake_enabled: diagnostics
+                .cursor_direct_completion_select_wake_enabled,
             cursor_singleton_submission_enabled: diagnostics.cursor_singleton_submission_enabled,
             admission_cursor_publish_fast_path_enabled: diagnostics
                 .admission_cursor_publish_fast_path_enabled,
@@ -2194,6 +2197,8 @@ impl WalIoDiagnosticsRecord {
             && self.progress_ring_enabled == other.progress_ring_enabled
             && self.progress_cursor_enabled == other.progress_cursor_enabled
             && self.cursor_direct_completion_enabled == other.cursor_direct_completion_enabled
+            && self.cursor_direct_completion_select_wake_enabled
+                == other.cursor_direct_completion_select_wake_enabled
             && self.cursor_singleton_submission_enabled == other.cursor_singleton_submission_enabled
             && self.admission_cursor_publish_fast_path_enabled
                 == other.admission_cursor_publish_fast_path_enabled
@@ -12951,6 +12956,7 @@ mod tests {
                         progress_ring_enabled: false,
                         progress_cursor_enabled: false,
                         cursor_direct_completion_enabled: false,
+                        cursor_direct_completion_select_wake_enabled: false,
                         cursor_singleton_submission_enabled: false,
                         admission_cursor_publish_fast_path_enabled: false,
                         point_buffer_preallocation_enabled: false,
@@ -13020,6 +13026,7 @@ mod tests {
                         progress_ring_enabled: false,
                         progress_cursor_enabled: false,
                         cursor_direct_completion_enabled: false,
+                        cursor_direct_completion_select_wake_enabled: false,
                         cursor_singleton_submission_enabled: false,
                         admission_cursor_publish_fast_path_enabled: false,
                         point_buffer_preallocation_enabled: false,

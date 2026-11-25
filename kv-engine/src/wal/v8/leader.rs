@@ -89,6 +89,9 @@ use super::{
     resource::WalV8ReservationOwner,
 };
 
+#[cfg(feature = "bench")]
+use super::parallel::WalV8DirectCompletionWakeMode;
+
 const FRAME_LEN_U64: u64 = WAL_V8_FRAME_LEN as u64;
 const HEADER_LEN_U64: u64 = WAL_V8_HEADER_LEN as u64;
 const MAX_GROUP_TICKETS: usize = 8;
@@ -474,6 +477,8 @@ const WAL_V8_POINT_PROGRESS_COUNTERS_ENV: &str = "TOYKV_BENCH_V8_PROGRESS_COUNTE
 #[cfg(feature = "bench")]
 const WAL_V8_CURSOR_DIRECT_COMPLETION_ENV: &str = "TOYKV_BENCH_V8_CURSOR_DIRECT_COMPLETION";
 #[cfg(feature = "bench")]
+const WAL_V8_DIRECT_COMPLETION_WAKE_ENV: &str = "TOYKV_BENCH_V8_DIRECT_COMPLETION_WAKE";
+#[cfg(feature = "bench")]
 const WAL_V8_CURSOR_SINGLETON_SUBMISSION_ENV: &str = "TOYKV_BENCH_V8_CURSOR_SINGLETON_SUBMISSION";
 #[cfg(not(feature = "bench"))]
 const WAL_V8_PROGRESS_MODE_ENV: &str = "TOYKV_WAL_V8_PROGRESS_MODE";
@@ -583,6 +588,39 @@ fn cursor_direct_completion_enabled_from_environment(
     cursor_direct_completion_enabled_from_value(
         std::env::var_os(WAL_V8_CURSOR_DIRECT_COMPLETION_ENV).as_deref(),
         progress_mode,
+    )
+}
+
+#[cfg(feature = "bench")]
+fn direct_completion_wake_mode_from_value(
+    value: Option<&OsStr>,
+    progress_mode: WalV8ProgressMode,
+    direct_completion_enabled: bool,
+) -> Result<WalV8DirectCompletionWakeMode> {
+    let mode = match value.and_then(OsStr::to_str) {
+        None | Some("token") => WalV8DirectCompletionWakeMode::Token,
+        Some("select") => WalV8DirectCompletionWakeMode::Select,
+        Some(value) => anyhow::bail!(
+            "invalid {WAL_V8_DIRECT_COMPLETION_WAKE_ENV} {value:?}; expected `token` or `select`"
+        ),
+    };
+    ensure!(
+        mode != WalV8DirectCompletionWakeMode::Select
+            || (progress_mode == WalV8ProgressMode::Cursor && direct_completion_enabled),
+        "{WAL_V8_DIRECT_COMPLETION_WAKE_ENV}=select requires Cursor progress mode and direct completion"
+    );
+    Ok(mode)
+}
+
+#[cfg(feature = "bench")]
+fn direct_completion_wake_mode_from_environment(
+    progress_mode: WalV8ProgressMode,
+    direct_completion_enabled: bool,
+) -> Result<WalV8DirectCompletionWakeMode> {
+    direct_completion_wake_mode_from_value(
+        std::env::var_os(WAL_V8_DIRECT_COMPLETION_WAKE_ENV).as_deref(),
+        progress_mode,
+        direct_completion_enabled,
     )
 }
 
@@ -2796,6 +2834,76 @@ struct WalV8SubmissionState {
     data_submit_hol: Option<WalV8DataSubmitHol>,
 }
 
+enum WalV8ProgressWake {
+    Control,
+    TimedOut,
+    #[cfg(feature = "bench")]
+    Completion(DirectGroupWriteCompletion),
+}
+
+impl WalV8ProgressWake {
+    fn is_signaled(&self) -> bool {
+        match self {
+            Self::Control => true,
+            Self::TimedOut => false,
+            #[cfg(feature = "bench")]
+            Self::Completion(_) => true,
+        }
+    }
+
+    fn wait_status(&self) -> WalV8ProgressTokenWait {
+        if self.is_signaled() {
+            WalV8ProgressTokenWait::Signaled
+        } else {
+            WalV8ProgressTokenWait::TimedOut
+        }
+    }
+}
+
+#[cfg(feature = "bench")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WalV8ProgressChannelClosed {
+    Control,
+    Completion,
+}
+
+/// Prefer a queued control token before looking at the DATA queue. If DATA is
+/// selected first while a control token races in, the token remains available
+/// for the pre-scan drain and subsequent wait.
+#[cfg(feature = "bench")]
+fn wait_for_direct_completion_or_control(
+    tokens: &Receiver<()>,
+    completions: &Receiver<DirectGroupWriteCompletion>,
+    timeout: Duration,
+) -> std::result::Result<WalV8ProgressWake, WalV8ProgressChannelClosed> {
+    let control_disconnected = match tokens.try_recv() {
+        Ok(()) => return Ok(WalV8ProgressWake::Control),
+        Err(crossbeam_channel::TryRecvError::Empty) => false,
+        Err(crossbeam_channel::TryRecvError::Disconnected) => true,
+    };
+
+    match completions.try_recv() {
+        Ok(completion) => return Ok(WalV8ProgressWake::Completion(completion)),
+        Err(crossbeam_channel::TryRecvError::Disconnected) => {
+            return Err(WalV8ProgressChannelClosed::Completion);
+        }
+        Err(crossbeam_channel::TryRecvError::Empty) => {}
+    }
+    if control_disconnected {
+        return Err(WalV8ProgressChannelClosed::Control);
+    }
+
+    crossbeam_channel::select! {
+        recv(tokens) -> result => result
+            .map(|()| WalV8ProgressWake::Control)
+            .map_err(|_| WalV8ProgressChannelClosed::Control),
+        recv(completions) -> result => result
+            .map(WalV8ProgressWake::Completion)
+            .map_err(|_| WalV8ProgressChannelClosed::Completion),
+        default(timeout) => Ok(WalV8ProgressWake::TimedOut),
+    }
+}
+
 #[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct WalV8SubmittedGroupSnapshot {
@@ -2884,6 +2992,8 @@ struct WalV8ParallelIo {
     completion_events: Option<Receiver<WalV8CompletedGroupEvent>>,
     #[cfg(feature = "bench")]
     direct_completions: Option<Receiver<DirectGroupWriteCompletion>>,
+    #[cfg(feature = "bench")]
+    select_completion_wake: bool,
     #[cfg(test)]
     progress_wait_hook: Mutex<Option<WalV8ProgressWaitHook>>,
     #[cfg(test)]
@@ -2897,6 +3007,8 @@ struct WalV8ParallelIoConfig {
     #[cfg(feature = "bench")]
     extent_preparation: Option<Arc<WalV8SlidingExtentPreparation>>,
     direct_completion_enabled: bool,
+    #[cfg(feature = "bench")]
+    direct_completion_wake_mode: WalV8DirectCompletionWakeMode,
     singleton_submission_enabled: bool,
     #[cfg(all(test, feature = "bench"))]
     worker_group_limit: Option<usize>,
@@ -2913,6 +3025,11 @@ impl WalV8ParallelIo {
         #[cfg(feature = "bench")]
         let extent_preparation = config.extent_preparation;
         let direct_completion_enabled = config.direct_completion_enabled;
+        #[cfg(feature = "bench")]
+        let direct_completion_wake_mode = config.direct_completion_wake_mode;
+        #[cfg(feature = "bench")]
+        let select_completion_wake =
+            direct_completion_wake_mode == WalV8DirectCompletionWakeMode::Select;
         let singleton_submission_enabled = config.singleton_submission_enabled;
         #[cfg(all(test, feature = "bench"))]
         let worker_group_limit = config.worker_group_limit;
@@ -2924,6 +3041,12 @@ impl WalV8ParallelIo {
         ensure!(
             !singleton_submission_enabled || coordinator.progress_cursor_enabled(),
             "Cursor singleton submission requires Cursor progress mode"
+        );
+        #[cfg(feature = "bench")]
+        ensure!(
+            !select_completion_wake
+                || (direct_completion_enabled && coordinator.progress_cursor_enabled()),
+            "select completion wake requires Cursor direct completion"
         );
         #[cfg(not(feature = "bench"))]
         ensure!(
@@ -2946,6 +3069,9 @@ impl WalV8ParallelIo {
         let worker_file = Arc::new(worker_file);
         let buffer_pool = Arc::new(ArrayQueue::<WalV8DataBuffer>::new(1));
         #[cfg(feature = "bench")]
+        let direct_completion_handle =
+            coordinator.worker_completion_handle_with_wake_mode(direct_completion_wake_mode);
+        #[cfg(feature = "bench")]
         let (mut worker, direct_completions) = if direct_completion_enabled {
             let capacity = coordinator.completion_queue_capacity();
             ensure!(capacity > 0, "v8 direct completion queue capacity is empty");
@@ -2958,7 +3084,7 @@ impl WalV8ParallelIo {
                     None,
                     submit_any_ready_ticket,
                     sender,
-                    coordinator.worker_completion_handle(),
+                    direct_completion_handle,
                     group_limit,
                 )?
             } else {
@@ -2968,7 +3094,7 @@ impl WalV8ParallelIo {
                     None,
                     submit_any_ready_ticket,
                     sender,
-                    coordinator.worker_completion_handle(),
+                    direct_completion_handle,
                 )?
             };
             #[cfg(not(test))]
@@ -2978,7 +3104,7 @@ impl WalV8ParallelIo {
                 None,
                 submit_any_ready_ticket,
                 sender,
-                coordinator.worker_completion_handle(),
+                direct_completion_handle,
             )?;
             (worker, Some(receiver))
         } else {
@@ -3142,6 +3268,8 @@ impl WalV8ParallelIo {
             completion_events,
             #[cfg(feature = "bench")]
             direct_completions,
+            #[cfg(feature = "bench")]
+            select_completion_wake,
             #[cfg(test)]
             progress_wait_hook: Mutex::new(None),
             #[cfg(test)]
@@ -3157,9 +3285,23 @@ impl WalV8ParallelIo {
         driver: &mut WalV8DurabilityDriver,
         capture_monotonic_ns: bool,
     ) -> Result<WalV8FrontierReadySnapshot> {
+        self.advance_and_snapshot_after_wake(
+            driver,
+            capture_monotonic_ns,
+            WalV8ProgressWake::Control,
+        )
+    }
+
+    fn advance_and_snapshot_after_wake(
+        &self,
+        driver: &mut WalV8DurabilityDriver,
+        capture_monotonic_ns: bool,
+        wake: WalV8ProgressWake,
+    ) -> Result<WalV8FrontierReadySnapshot> {
         self.advance_and_snapshot_inner(
             driver,
             capture_monotonic_ns,
+            wake,
             #[cfg(feature = "bench")]
             None,
         )
@@ -3172,15 +3314,34 @@ impl WalV8ParallelIo {
         capture_monotonic_ns: bool,
         timing: &mut WalV8CursorCoalescingTiming,
     ) -> Result<WalV8FrontierReadySnapshot> {
-        self.advance_and_snapshot_inner(driver, capture_monotonic_ns, Some(timing))
+        self.advance_and_snapshot_after_wake_with_timing(
+            driver,
+            capture_monotonic_ns,
+            WalV8ProgressWake::Control,
+            timing,
+        )
+    }
+
+    #[cfg(feature = "bench")]
+    fn advance_and_snapshot_after_wake_with_timing(
+        &self,
+        driver: &mut WalV8DurabilityDriver,
+        capture_monotonic_ns: bool,
+        wake: WalV8ProgressWake,
+        timing: &mut WalV8CursorCoalescingTiming,
+    ) -> Result<WalV8FrontierReadySnapshot> {
+        self.advance_and_snapshot_inner(driver, capture_monotonic_ns, wake, Some(timing))
     }
 
     fn advance_and_snapshot_inner(
         &self,
         driver: &mut WalV8DurabilityDriver,
         capture_monotonic_ns: bool,
+        wake: WalV8ProgressWake,
         #[cfg(feature = "bench")] mut timing: Option<&mut WalV8CursorCoalescingTiming>,
     ) -> Result<WalV8FrontierReadySnapshot> {
+        #[cfg(not(feature = "bench"))]
+        let _ = wake;
         ensure!(
             self.coordinator.owns_durability_driver(driver),
             "v8 progress scan is not owned by the active durability driver"
@@ -3219,22 +3380,34 @@ impl WalV8ParallelIo {
         let completion_drain_wall_started = timing.as_ref().map(|_| Instant::now());
         #[cfg(feature = "bench")]
         let completion_drain_cpu_started = timing.as_ref().map(|_| digest::thread_cpu_time_ns());
-        let drain_result = if let Some(receiver) = &self.completion_events {
-            self.drain_completion_events(receiver, &mut batch)
-        } else {
+        let drain_result = (|| -> Result<()> {
             #[cfg(feature = "bench")]
-            {
-                let receiver = self
-                    .direct_completions
-                    .as_ref()
-                    .context("Cursor direct completion queue is missing")?;
-                self.drain_direct_completion_events(receiver, &mut batch)
+            if let WalV8ProgressWake::Completion(completion) = wake {
+                self.push_direct_completion_event(completion, &mut batch)?;
             }
-            #[cfg(not(feature = "bench"))]
-            {
-                anyhow::bail!("Cursor direct completion is unavailable without bench feature")
+
+            let capacity = self.coordinator.completion_queue_capacity();
+            ensure!(
+                batch.len() <= capacity,
+                "cursor completion seed exceeds the reusable batch capacity"
+            );
+            let remaining_capacity = capacity - batch.len();
+            if let Some(receiver) = &self.completion_events {
+                self.drain_completion_events(receiver, &mut batch, remaining_capacity)
+            } else {
+                #[cfg(feature = "bench")]
+                {
+                    let Some(receiver) = self.direct_completions.as_ref() else {
+                        anyhow::bail!("Cursor direct completion queue is missing")
+                    };
+                    self.drain_direct_completion_events(receiver, &mut batch, remaining_capacity)
+                }
+                #[cfg(not(feature = "bench"))]
+                {
+                    anyhow::bail!("Cursor direct completion is unavailable without bench feature")
+                }
             }
-        };
+        })();
         #[cfg(feature = "bench")]
         if let Some(timing) = timing.as_deref_mut() {
             timing.completion_drain_wall_ns = timing.completion_drain_wall_ns.saturating_add(
@@ -3281,8 +3454,9 @@ impl WalV8ParallelIo {
         &self,
         receiver: &Receiver<WalV8CompletedGroupEvent>,
         batch: &mut Vec<WalV8CompletedGroupEvent>,
+        limit: usize,
     ) -> Result<()> {
-        for _ in 0..self.coordinator.completion_queue_capacity() {
+        for _ in 0..limit {
             match receiver.try_recv() {
                 Ok(event) => batch.push(event),
                 Err(crossbeam_channel::TryRecvError::Empty) => break,
@@ -3303,24 +3477,11 @@ impl WalV8ParallelIo {
         &self,
         receiver: &Receiver<DirectGroupWriteCompletion>,
         batch: &mut Vec<WalV8CompletedGroupEvent>,
+        limit: usize,
     ) -> Result<()> {
-        for _ in 0..self.coordinator.completion_queue_capacity() {
+        for _ in 0..limit {
             match receiver.try_recv() {
-                Ok(completion) => {
-                    if let Some(error) = completion.result.error.as_deref() {
-                        self.coordinator.poison();
-                        anyhow::bail!(
-                            "Cursor direct completion queue received failed DATA result: {error}"
-                        );
-                    }
-                    batch.push(WalV8CompletedGroupEvent {
-                        group_id: completion.result.group_id,
-                        tickets: completion.result.tickets,
-                        write_count: completion.result.write_count,
-                        write_bytes: completion.result.write_bytes,
-                        completion_observed_at: completion.completion_observed_at,
-                    });
-                }
+                Ok(completion) => self.push_direct_completion_event(completion, batch)?,
                 Err(crossbeam_channel::TryRecvError::Empty) => break,
                 Err(crossbeam_channel::TryRecvError::Disconnected) => {
                     if !self.shutdown_started.load(Ordering::Acquire) {
@@ -3336,6 +3497,26 @@ impl WalV8ParallelIo {
         Ok(())
     }
 
+    #[cfg(feature = "bench")]
+    fn push_direct_completion_event(
+        &self,
+        completion: DirectGroupWriteCompletion,
+        batch: &mut Vec<WalV8CompletedGroupEvent>,
+    ) -> Result<()> {
+        if let Some(error) = completion.result.error.as_deref() {
+            self.coordinator.poison();
+            anyhow::bail!("Cursor direct completion queue received failed DATA result: {error}");
+        }
+        batch.push(WalV8CompletedGroupEvent {
+            group_id: completion.result.group_id,
+            tickets: completion.result.tickets,
+            write_count: completion.result.write_count,
+            write_bytes: completion.result.write_bytes,
+            completion_observed_at: completion.completion_observed_at,
+        });
+        Ok(())
+    }
+
     fn coalesce_progress_ring(
         &self,
         driver: &mut WalV8DurabilityDriver,
@@ -3344,9 +3525,6 @@ impl WalV8ParallelIo {
         capture_monotonic_ns: bool,
         #[cfg(feature = "bench")] mut timing: Option<&mut WalV8CursorCoalescingTiming>,
     ) -> Result<bool> {
-        #[cfg(not(feature = "bench"))]
-        let _ = (driver, capture_monotonic_ns);
-
         let deadline = Instant::now() + budget;
         let mut waited = false;
         while !snapshot.closed
@@ -3361,7 +3539,8 @@ impl WalV8ParallelIo {
             let wait_wall_started = timing.as_ref().map(|_| Instant::now());
             #[cfg(feature = "bench")]
             let wait_cpu_started = timing.as_ref().map(|_| digest::thread_cpu_time_ns());
-            let signaled = self.wait_for_progress(remaining)?;
+            let wake = self.wait_for_progress(remaining)?;
+            let signaled = wake.is_signaled();
             #[cfg(feature = "bench")]
             if let Some(timing) = timing.as_deref_mut() {
                 timing.progress_wait_wall_ns = timing.progress_wait_wall_ns.saturating_add(
@@ -3379,10 +3558,15 @@ impl WalV8ParallelIo {
             let ready_before = snapshot.ready_prefix.len();
             #[cfg(feature = "bench")]
             if let Some(timing) = timing.as_deref_mut() {
-                *snapshot =
-                    self.advance_and_snapshot_with_timing(driver, capture_monotonic_ns, timing)?;
+                *snapshot = self.advance_and_snapshot_after_wake_with_timing(
+                    driver,
+                    capture_monotonic_ns,
+                    wake,
+                    timing,
+                )?;
             } else {
-                *snapshot = self.advance_and_snapshot(driver, capture_monotonic_ns)?;
+                *snapshot =
+                    self.advance_and_snapshot_after_wake(driver, capture_monotonic_ns, wake)?;
             }
             #[cfg(feature = "bench")]
             if let Some(timing) = timing.as_deref_mut() {
@@ -3390,6 +3574,11 @@ impl WalV8ParallelIo {
                     timing.ready_tickets_gained.saturating_add(
                         snapshot.ready_prefix.len().saturating_sub(ready_before) as u64,
                     );
+            }
+            #[cfg(not(feature = "bench"))]
+            {
+                *snapshot =
+                    self.advance_and_snapshot_after_wake(driver, capture_monotonic_ns, wake)?;
             }
             if !signaled
                 || snapshot.ready_prefix.is_empty()
@@ -3401,7 +3590,7 @@ impl WalV8ParallelIo {
         Ok(waited)
     }
 
-    fn wait_for_progress(&self, timeout: Duration) -> Result<bool> {
+    fn wait_for_progress(&self, timeout: Duration) -> Result<WalV8ProgressWake> {
         let Some(tokens) = &self.progress_tokens else {
             anyhow::bail!("v8 progress wait requested while the ring is disabled");
         };
@@ -3412,25 +3601,74 @@ impl WalV8ParallelIo {
                 hook(WalV8ProgressWaitTestEvent::BeforeWait);
             }
         }
-        let result = wait_for_progress_token(tokens, timeout);
+        #[cfg(feature = "bench")]
+        let result = if self.select_completion_wake {
+            let Some(completions) = self.direct_completions.as_ref() else {
+                self.coordinator.poison();
+                anyhow::bail!("select completion wake requires a direct completion queue");
+            };
+            match wait_for_direct_completion_or_control(tokens, completions, timeout) {
+                Ok(wake) => Ok(wake),
+                Err(closed) if self.shutdown_started.load(Ordering::Acquire) => {
+                    let _ = closed;
+                    Ok(WalV8ProgressWake::Control)
+                }
+                Err(WalV8ProgressChannelClosed::Control) => {
+                    self.coordinator.poison();
+                    anyhow::bail!("v8 progress token channel disconnected before teardown");
+                }
+                Err(WalV8ProgressChannelClosed::Completion) => {
+                    self.coordinator.poison();
+                    anyhow::bail!("v8 direct DATA completion queue disconnected before teardown");
+                }
+            }
+        } else {
+            match wait_for_progress_token(tokens, timeout) {
+                WalV8ProgressTokenWait::Signaled => Ok(WalV8ProgressWake::Control),
+                WalV8ProgressTokenWait::TimedOut => Ok(WalV8ProgressWake::TimedOut),
+                WalV8ProgressTokenWait::Disconnected
+                    if self.shutdown_started.load(Ordering::Acquire) =>
+                {
+                    Ok(WalV8ProgressWake::Control)
+                }
+                WalV8ProgressTokenWait::Disconnected => {
+                    self.coordinator.poison();
+                    anyhow::bail!("v8 progress token channel disconnected before teardown");
+                }
+            }
+        };
+        #[cfg(not(feature = "bench"))]
+        let result = match wait_for_progress_token(tokens, timeout) {
+            WalV8ProgressTokenWait::Signaled => Ok(WalV8ProgressWake::Control),
+            WalV8ProgressTokenWait::TimedOut => Ok(WalV8ProgressWake::TimedOut),
+            WalV8ProgressTokenWait::Disconnected
+                if self.shutdown_started.load(Ordering::Acquire) =>
+            {
+                Ok(WalV8ProgressWake::Control)
+            }
+            WalV8ProgressTokenWait::Disconnected => {
+                self.coordinator.poison();
+                anyhow::bail!("v8 progress token channel disconnected before teardown");
+            }
+        };
         #[cfg(test)]
         {
             let hook = self.progress_wait_hook.lock().clone();
             if let Some(hook) = hook {
-                hook(WalV8ProgressWaitTestEvent::AfterWait(result));
+                #[cfg(feature = "bench")]
+                let status = match &result {
+                    Ok(wake) => wake.wait_status(),
+                    Err(_) => WalV8ProgressTokenWait::Disconnected,
+                };
+                #[cfg(not(feature = "bench"))]
+                let status = match &result {
+                    Ok(wake) => wake.wait_status(),
+                    Err(_) => WalV8ProgressTokenWait::Disconnected,
+                };
+                hook(WalV8ProgressWaitTestEvent::AfterWait(status));
             }
         }
-        match result {
-            WalV8ProgressTokenWait::Signaled => Ok(true),
-            WalV8ProgressTokenWait::TimedOut => Ok(false),
-            WalV8ProgressTokenWait::Disconnected => {
-                if !self.shutdown_started.load(Ordering::Acquire) {
-                    self.coordinator.poison();
-                    anyhow::bail!("v8 progress token channel disconnected before teardown");
-                }
-                Ok(false)
-            }
-        }
+        result
     }
 
     #[cfg(test)]
@@ -4528,6 +4766,7 @@ impl WalV8LeaderWriter {
             progress_ring_enabled: false,
             progress_cursor_enabled: false,
             cursor_direct_completion_enabled: false,
+            cursor_direct_completion_select_wake_enabled: false,
             cursor_singleton_submission_enabled: false,
             admission_cursor_publish_fast_path_enabled: false,
             point_buffer_preallocation_enabled: false,
@@ -4669,6 +4908,9 @@ impl WalV8LeaderWriter {
         let direct_completion_enabled =
             cursor_direct_completion_enabled_from_environment(progress_mode)?;
         #[cfg(feature = "bench")]
+        let direct_completion_wake_mode =
+            direct_completion_wake_mode_from_environment(progress_mode, direct_completion_enabled)?;
+        #[cfg(feature = "bench")]
         let singleton_submission_enabled =
             cursor_singleton_submission_enabled_from_environment(progress_mode)?;
         #[cfg(not(feature = "bench"))]
@@ -4680,6 +4922,8 @@ impl WalV8LeaderWriter {
             worker_file,
             progress_mode,
             direct_completion_enabled,
+            #[cfg(feature = "bench")]
+            direct_completion_wake_mode,
             singleton_submission_enabled,
             #[cfg(all(test, feature = "bench"))]
             None,
@@ -4691,6 +4935,7 @@ impl WalV8LeaderWriter {
         worker_file: File,
         progress_mode: WalV8ProgressMode,
         direct_completion_enabled: bool,
+        #[cfg(feature = "bench")] direct_completion_wake_mode: WalV8DirectCompletionWakeMode,
         singleton_submission_enabled: bool,
         #[cfg(all(test, feature = "bench"))] worker_group_limit: Option<usize>,
     ) -> Result<WalV8ParallelWriter> {
@@ -4738,6 +4983,8 @@ impl WalV8LeaderWriter {
             io_diagnostics.progress_ring_enabled = progress_mode.uses_ring();
             io_diagnostics.progress_cursor_enabled = self.coordinator.progress_cursor_enabled();
             io_diagnostics.cursor_direct_completion_enabled = direct_completion_enabled;
+            io_diagnostics.cursor_direct_completion_select_wake_enabled =
+                direct_completion_wake_mode == WalV8DirectCompletionWakeMode::Select;
             io_diagnostics.cursor_singleton_submission_enabled = singleton_submission_enabled;
             io_diagnostics.point_buffer_preallocation_enabled = point_buffer_preallocation_enabled;
         }
@@ -4903,6 +5150,8 @@ impl WalV8LeaderWriter {
                 #[cfg(feature = "bench")]
                 extent_preparation,
                 direct_completion_enabled,
+                #[cfg(feature = "bench")]
+                direct_completion_wake_mode,
                 singleton_submission_enabled,
                 #[cfg(all(test, feature = "bench"))]
                 worker_group_limit,
@@ -5968,6 +6217,7 @@ impl WalV8ParallelWriter {
         driver: &mut WalV8DurabilityDriver,
     ) -> Result<()> {
         let progress_ring_enabled = self.coordinator.progress_ring_enabled();
+        let mut pending_progress_wake = None;
         loop {
             if self.coordinator.is_poisoned() {
                 anyhow::bail!("v8 Parallel WAL is poisoned");
@@ -6021,9 +6271,13 @@ impl WalV8ParallelWriter {
             let mut coalescing_cpu_ns = 0_u64;
             #[cfg(feature = "bench")]
             let mut coalescing_budget_us = None;
+            let scan_wake = pending_progress_wake
+                .take()
+                .unwrap_or(WalV8ProgressWake::Control);
             #[cfg(feature = "bench")]
             let mut snapshot = if progress_ring_enabled {
-                self.io.advance_and_snapshot(driver, diagnostics_enabled)?
+                self.io
+                    .advance_and_snapshot_after_wake(driver, diagnostics_enabled, scan_wake)?
             } else if diagnostics_enabled {
                 self.coordinator.frontier_ready_snapshot_with_monotonic_ns()
             } else {
@@ -6031,7 +6285,8 @@ impl WalV8ParallelWriter {
             };
             #[cfg(not(feature = "bench"))]
             let mut snapshot = if progress_ring_enabled {
-                self.io.advance_and_snapshot(driver, false)?
+                self.io
+                    .advance_and_snapshot_after_wake(driver, false, scan_wake)?
             } else {
                 self.coordinator.frontier_ready_snapshot()
             };
@@ -6197,14 +6452,10 @@ impl WalV8ParallelWriter {
                     if snapshot.closed {
                         anyhow::bail!("v8 Parallel WAL closed before the ticket became durable");
                     }
-                    let _ = self.io.wait_for_progress(Duration::from_secs(1))?;
+                    pending_progress_wake =
+                        Some(self.io.wait_for_progress(Duration::from_secs(1))?);
                     if self.coordinator.is_poisoned() {
                         anyhow::bail!("v8 Parallel WAL was poisoned while waiting for durability");
-                    }
-                    if self.coordinator.is_closed()
-                        && self.coordinator.durable_ticket_end() < ticket_end
-                    {
-                        anyhow::bail!("v8 Parallel WAL closed before the ticket became durable");
                     }
                 }
                 continue;
@@ -7973,6 +8224,113 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn direct_completion_wake_mode_is_opt_in_and_requires_cursor_direct_completion() {
+        assert_eq!(
+            direct_completion_wake_mode_from_value(None, WalV8ProgressMode::Cursor, true,).unwrap(),
+            WalV8DirectCompletionWakeMode::Token
+        );
+        assert_eq!(
+            direct_completion_wake_mode_from_value(
+                Some(OsStr::new("token")),
+                WalV8ProgressMode::Cursor,
+                true,
+            )
+            .unwrap(),
+            WalV8DirectCompletionWakeMode::Token
+        );
+        assert_eq!(
+            direct_completion_wake_mode_from_value(
+                Some(OsStr::new("select")),
+                WalV8ProgressMode::Cursor,
+                true,
+            )
+            .unwrap(),
+            WalV8DirectCompletionWakeMode::Select
+        );
+        assert!(
+            direct_completion_wake_mode_from_value(
+                Some(OsStr::new("select")),
+                WalV8ProgressMode::Eager,
+                true,
+            )
+            .is_err()
+        );
+        assert!(
+            direct_completion_wake_mode_from_value(
+                Some(OsStr::new("select")),
+                WalV8ProgressMode::Cursor,
+                false,
+            )
+            .is_err()
+        );
+        assert!(
+            direct_completion_wake_mode_from_value(
+                Some(OsStr::new("invalid")),
+                WalV8ProgressMode::Cursor,
+                true,
+            )
+            .is_err()
+        );
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn direct_completion_select_checks_control_first_and_delivers_each_event_once() -> Result<()> {
+        let (control_tx, control_rx) = crossbeam_channel::bounded(1);
+        let (completion_tx, completion_rx) = crossbeam_channel::bounded(1);
+        let completion = DirectGroupWriteCompletion {
+            result: GroupWriteResult {
+                group_id: 7,
+                tickets: 3..4,
+                write_count: 1,
+                write_bytes: FRAME_LEN_U64,
+                error: None,
+            },
+            completion_observed_at: Some(Instant::now()),
+        };
+        completion_tx.send(completion.clone())?;
+        control_tx.send(())?;
+
+        let control = wait_for_direct_completion_or_control(
+            &control_rx,
+            &completion_rx,
+            Duration::from_secs(1),
+        )
+        .map_err(|closed| anyhow::anyhow!("unexpected closed channel: {closed:?}"))?;
+        assert!(matches!(control, WalV8ProgressWake::Control));
+        assert_eq!(
+            completion_rx.len(),
+            1,
+            "control wake consumed the DATA event"
+        );
+
+        let data = wait_for_direct_completion_or_control(
+            &control_rx,
+            &completion_rx,
+            Duration::from_secs(1),
+        )
+        .map_err(|closed| anyhow::anyhow!("unexpected closed channel: {closed:?}"))?;
+        match data {
+            WalV8ProgressWake::Completion(observed) => assert_eq!(observed, completion),
+            WalV8ProgressWake::Control | WalV8ProgressWake::TimedOut => {
+                anyhow::bail!("queued DATA completion was not selected")
+            }
+        }
+        assert!(
+            completion_rx.is_empty(),
+            "DATA completion was delivered more than once"
+        );
+
+        let timeout =
+            wait_for_direct_completion_or_control(&control_rx, &completion_rx, Duration::ZERO)
+                .map_err(|closed| anyhow::anyhow!("unexpected closed channel: {closed:?}"))?;
+        assert!(matches!(timeout, WalV8ProgressWake::TimedOut));
+
+        Ok(())
     }
 
     #[cfg(feature = "bench")]
@@ -10714,6 +11072,8 @@ mod tests {
             worker_file,
             mode,
             false,
+            #[cfg(feature = "bench")]
+            WalV8DirectCompletionWakeMode::Token,
             singleton_submission_enabled,
             worker_group_limit,
         )
@@ -10726,6 +11086,23 @@ mod tests {
         mode: WalV8ProgressMode,
         worker_group_limit: Option<usize>,
     ) -> Result<WalV8ParallelWriter> {
+        open_parallel_with_direct_completion_wake_mode(
+            path,
+            installed,
+            mode,
+            WalV8DirectCompletionWakeMode::Token,
+            worker_group_limit,
+        )
+    }
+
+    #[cfg(feature = "bench")]
+    fn open_parallel_with_direct_completion_wake_mode(
+        path: &Path,
+        installed: &WalV8InstalledRecovery,
+        mode: WalV8ProgressMode,
+        wake_mode: WalV8DirectCompletionWakeMode,
+        worker_group_limit: Option<usize>,
+    ) -> Result<WalV8ParallelWriter> {
         let worker_file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -10735,6 +11112,7 @@ mod tests {
             worker_file,
             mode,
             true,
+            wake_mode,
             false,
             worker_group_limit,
         )
@@ -10743,14 +11121,148 @@ mod tests {
     #[cfg(feature = "bench")]
     #[test]
     fn cursor_direct_completion_writes_reopens_and_recovers_without_reaper() -> Result<()> {
+        check_cursor_direct_completion_writes_reopens_and_recovers(
+            WalV8DirectCompletionWakeMode::Token,
+        )
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn cursor_direct_completion_select_wake_writes_reopens_and_recovers() -> Result<()> {
+        check_cursor_direct_completion_writes_reopens_and_recovers(
+            WalV8DirectCompletionWakeMode::Select,
+        )
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn cursor_direct_completion_select_wakes_driver_after_empty_scan() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("cursor-select-scan-to-park-v8.wal");
+        let wal_header = header();
+        let installed = install_empty(&path, wal_header)?;
+        let writer = match open_parallel_with_direct_completion_wake_mode(
+            &path,
+            &installed,
+            WalV8ProgressMode::Cursor,
+            WalV8DirectCompletionWakeMode::Select,
+            None,
+        ) {
+            Ok(writer) => Arc::new(writer),
+            Err(error) if is_io_uring_unavailable_error(&error) => {
+                eprintln!("skipping test (io_uring unavailable): {error:#}");
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+
+        let input = batch(10);
+        let job = writer.admit_prepared_batch(
+            writer.preflight_batch(&input, LIVE_WAL_V5_LIMITS)?,
+            input.commit_ts,
+            input.recorded_at,
+        )?;
+        let ticket = job.assignment().segment_ticket;
+        let (wait_entered_tx, wait_entered_rx) = crossbeam_channel::bounded(1);
+        let (release_wait_tx, release_wait_rx) = crossbeam_channel::bounded(1);
+        let first_wait = Arc::new(AtomicBool::new(false));
+        writer.io.set_progress_wait_hook(Arc::new({
+            let first_wait = Arc::clone(&first_wait);
+            move |event| {
+                if matches!(event, WalV8ProgressWaitTestEvent::BeforeWait)
+                    && !first_wait.swap(true, Ordering::AcqRel)
+                {
+                    let _ = wait_entered_tx.send(());
+                    let _ = release_wait_rx.recv_timeout(Duration::from_secs(5));
+                }
+            }
+        }));
+
+        let (driver_result_tx, driver_result_rx) = mpsc::channel();
+        let (finish_result_tx, finish_result_rx) = mpsc::channel();
+        thread::scope(|scope| -> Result<()> {
+            let driver_writer = Arc::clone(&writer);
+            let driver = scope.spawn(move || {
+                let _ = driver_result_tx.send(driver_writer.advance_frontier_through(ticket));
+            });
+            wait_entered_rx
+                .recv_timeout(Duration::from_secs(5))
+                .context("durability driver did not reach its empty-prefix wait")?;
+
+            let finish = scope.spawn(move || {
+                let _ = finish_result_tx.send(job.finish().map(|_| ()));
+            });
+            let completion_deadline = Instant::now() + Duration::from_secs(5);
+            while writer
+                .io
+                .direct_completions
+                .as_ref()
+                .is_none_or(|completions| completions.is_empty())
+                && Instant::now() < completion_deadline
+            {
+                thread::yield_now();
+            }
+            ensure!(
+                writer
+                    .io
+                    .direct_completions
+                    .as_ref()
+                    .is_some_and(|completions| !completions.is_empty()),
+                "worker did not enqueue the DATA completion while the driver was paused"
+            );
+            ensure!(
+                writer
+                    .io
+                    .progress_tokens
+                    .as_ref()
+                    .is_some_and(Receiver::is_empty),
+                "select-mode DATA completion emitted a progress token"
+            );
+
+            release_wait_tx.send(())?;
+            driver_result_rx
+                .recv_timeout(Duration::from_secs(5))
+                .context("select-mode driver did not receive its queued completion")??;
+            finish_result_rx
+                .recv_timeout(Duration::from_secs(5))
+                .context("Point waiter did not receive its durable ACK")??;
+            driver
+                .join()
+                .map_err(|_| anyhow::anyhow!("select-mode durability driver panicked"))?;
+            finish
+                .join()
+                .map_err(|_| anyhow::anyhow!("select-mode Point finisher panicked"))?;
+            Ok(())
+        })?;
+
+        assert_eq!(writer.active_boundaries()?.1.ticket_end, 1);
+        drop(writer);
+        let recovered = super::super::install::recover_and_install_active(
+            &path,
+            &[installed.active_boundary],
+            wal_header.predecessor,
+            LIVE_WAL_V5_LIMITS,
+            MAX_WAL_FILE_SIZE,
+        )?;
+        assert_eq!(recovered.active_boundary.ticket_end, 1);
+        assert_eq!(replayed_batches(&path, &recovered)?, [input]);
+
+        Ok(())
+    }
+
+    #[cfg(feature = "bench")]
+    fn check_cursor_direct_completion_writes_reopens_and_recovers(
+        wake_mode: WalV8DirectCompletionWakeMode,
+    ) -> Result<()> {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("cursor-direct-completion-v8.wal");
         let wal_header = header();
         let installed = install_empty(&path, wal_header)?;
-        let writer = match open_parallel_with_direct_completion(
+        let writer = match open_parallel_with_direct_completion_wake_mode(
             &path,
             &installed,
             WalV8ProgressMode::Cursor,
+            wake_mode,
             None,
         ) {
             Ok(writer) => writer,
@@ -10765,6 +11277,12 @@ mod tests {
         assert!(writer.io.completion_events.is_none());
         assert!(writer.io.direct_completions.is_some());
         assert!(writer.io_diagnostics().cursor_direct_completion_enabled);
+        assert_eq!(
+            writer
+                .io_diagnostics()
+                .cursor_direct_completion_select_wake_enabled,
+            wake_mode == WalV8DirectCompletionWakeMode::Select
+        );
 
         let first_batch = batch(10);
         writer.append_prepared_batch(
@@ -10794,10 +11312,11 @@ mod tests {
             [first_batch.clone(), second_batch.clone()]
         );
 
-        let reopened = open_parallel_with_direct_completion(
+        let reopened = open_parallel_with_direct_completion_wake_mode(
             &path,
             &recovered,
             WalV8ProgressMode::Cursor,
+            wake_mode,
             None,
         )?;
         let third_batch = batch(30);

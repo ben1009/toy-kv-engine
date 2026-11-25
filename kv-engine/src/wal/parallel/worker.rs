@@ -5090,6 +5090,43 @@ mod tests {
 
     #[cfg(feature = "bench")]
     #[test]
+    fn cursor_direct_completion_select_wake_enqueues_without_progress_token() -> anyhow::Result<()>
+    {
+        use crate::wal::v8::parallel::WalV8DirectCompletionWakeMode;
+
+        let (coordinator, progress_tokens) = cursor_completion_coordinator()?;
+        let (completion_tx, completion_rx) = bounded(1);
+        let completion_sender = WorkerCompletionSender::CursorDirect {
+            sender: completion_tx,
+            handle: coordinator
+                .worker_completion_handle_with_wake_mode(WalV8DirectCompletionWakeMode::Select),
+        };
+        let slots = direct_completion_slots();
+        let drops = Arc::new(AtomicUsize::new(0));
+
+        process_one_direct_completion(&completion_sender, &slots, &drops)?;
+
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+        assert_eq!(slots.state.lock().active_groups, 0);
+        assert!(
+            matches!(
+                progress_tokens.try_recv(),
+                Err(crossbeam_channel::TryRecvError::Empty)
+            ),
+            "select-mode DATA completion sent a redundant progress token"
+        );
+        let completion = completion_rx.try_recv()?;
+        assert_eq!(completion.result, direct_completion_result(1, 1));
+        assert!(
+            completion_rx.is_empty(),
+            "worker duplicated the DATA completion"
+        );
+
+        Ok(())
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
     fn cursor_direct_completion_disconnect_cleans_up_and_poisons() -> anyhow::Result<()> {
         let (coordinator, _progress_tokens) = cursor_completion_coordinator()?;
         let (completion_tx, completion_rx) = bounded(1);
