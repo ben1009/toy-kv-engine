@@ -11110,13 +11110,20 @@ mod tests {
                 let _ = finish_result_tx.send(job.finish().map(|_| ()));
             });
             let completion_deadline = Instant::now() + Duration::from_secs(5);
-            while writer
-                .io
-                .direct_completions
-                .as_ref()
-                .is_none_or(|completions| completions.is_empty())
-                && Instant::now() < completion_deadline
-            {
+            while Instant::now() < completion_deadline {
+                let completion_queued = writer
+                    .io
+                    .direct_completions
+                    .as_ref()
+                    .is_some_and(|completions| !completions.is_empty());
+                let progress_signaled = writer
+                    .io
+                    .progress_tokens
+                    .as_ref()
+                    .is_some_and(|tokens| !tokens.is_empty());
+                if completion_queued && progress_signaled {
+                    break;
+                }
                 thread::yield_now();
             }
             ensure!(
