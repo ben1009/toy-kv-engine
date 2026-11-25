@@ -3582,6 +3582,9 @@ impl WalV8ParallelIo {
         capture_monotonic_ns: bool,
         #[cfg(feature = "bench")] mut timing: Option<&mut WalV8CursorCoalescingTiming>,
     ) -> Result<bool> {
+        #[cfg(not(feature = "bench"))]
+        let _ = (driver, capture_monotonic_ns);
+
         #[cfg(feature = "bench")]
         let ready_target = self.coalesce_ready_target;
         #[cfg(not(feature = "bench"))]
@@ -3632,17 +3635,14 @@ impl WalV8ParallelIo {
                     *snapshot =
                         self.advance_and_snapshot_after_wake(driver, capture_monotonic_ns)?;
                 }
-                #[cfg(not(feature = "bench"))]
-                {
-                    *snapshot =
-                        self.advance_and_snapshot_after_wake(driver, capture_monotonic_ns)?;
-                }
                 #[cfg(feature = "bench")]
                 if let Some(timing) = timing.as_deref_mut() {
                     timing.ready_tickets_gained = timing.ready_tickets_gained.saturating_add(
                         snapshot.ready_prefix.len().saturating_sub(ready_before) as u64,
                     );
                 }
+                #[cfg(not(feature = "bench"))]
+                let _ = snapshot;
                 Ok(signaled)
             },
         )?;
