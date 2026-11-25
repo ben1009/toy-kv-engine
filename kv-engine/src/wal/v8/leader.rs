@@ -3033,6 +3033,8 @@ struct WalV8ParallelIo {
     direct_completions: Option<Receiver<DirectGroupWriteCompletion>>,
     #[cfg(feature = "bench")]
     coalesce_ready_target: Option<usize>,
+    #[cfg(feature = "bench")]
+    coalesce_ready_target_hits: AtomicU64,
     #[cfg(test)]
     progress_wait_hook: Mutex<Option<WalV8ProgressWaitHook>>,
     #[cfg(test)]
@@ -3040,6 +3042,13 @@ struct WalV8ParallelIo {
     progress_tokens: Option<Receiver<()>>,
     shutdown_started: Arc<AtomicBool>,
     completion_thread: Mutex<Option<thread::JoinHandle<()>>>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct WalV8CoalesceOutcome {
+    waited: bool,
+    #[cfg(feature = "bench")]
+    target_hit: bool,
 }
 
 struct WalV8ParallelIoConfig {
@@ -3299,6 +3308,8 @@ impl WalV8ParallelIo {
             direct_completions,
             #[cfg(feature = "bench")]
             coalesce_ready_target,
+            #[cfg(feature = "bench")]
+            coalesce_ready_target_hits: AtomicU64::new(0),
             #[cfg(test)]
             progress_wait_hook: Mutex::new(None),
             #[cfg(test)]
@@ -3522,72 +3533,34 @@ impl WalV8ParallelIo {
         target.is_some_and(|target| ready_prefix_len >= target)
     }
 
-    fn coalesce_progress_ring(
-        &self,
-        driver: &mut WalV8DurabilityDriver,
+    fn coalesce_ready_prefix_with(
         snapshot: &mut WalV8FrontierReadySnapshot,
         budget: Duration,
-        capture_monotonic_ns: bool,
-        #[cfg(feature = "bench")] mut timing: Option<&mut WalV8CursorCoalescingTiming>,
-    ) -> Result<bool> {
-        #[cfg(not(feature = "bench"))]
-        let _ = (driver, capture_monotonic_ns);
-
-        #[cfg(feature = "bench")]
-        let ready_target = self.coalesce_ready_target;
-        #[cfg(not(feature = "bench"))]
-        let ready_target: Option<usize> = None;
-
+        ready_target: Option<usize>,
+        mut wait_and_advance: impl FnMut(Duration, &mut WalV8FrontierReadySnapshot) -> Result<bool>,
+    ) -> Result<WalV8CoalesceOutcome> {
         let deadline = Instant::now() + budget;
-        let mut waited = false;
+        let mut outcome = WalV8CoalesceOutcome {
+            waited: false,
+            #[cfg(feature = "bench")]
+            target_hit: !snapshot.closed
+                && snapshot.ready_prefix.len() < snapshot.admitted_ticket_count
+                && Self::coalesce_ready_target_reached(snapshot.ready_prefix.len(), ready_target),
+        };
+
         while !snapshot.closed
             && !Self::coalesce_ready_target_reached(snapshot.ready_prefix.len(), ready_target)
             && let Some(remaining) = deadline.checked_duration_since(Instant::now())
         {
-            waited = true;
+            outcome.waited = true;
+            let signaled = wait_and_advance(remaining, snapshot)?;
             #[cfg(feature = "bench")]
-            if let Some(timing) = timing.as_deref_mut() {
-                timing.iterations = timing.iterations.saturating_add(1);
-            }
-            #[cfg(feature = "bench")]
-            let wait_wall_started = timing.as_ref().map(|_| Instant::now());
-            #[cfg(feature = "bench")]
-            let wait_cpu_started = timing.as_ref().map(|_| digest::thread_cpu_time_ns());
-            let wake = self.wait_for_progress(remaining)?;
-            let signaled = wake.is_signaled();
-            #[cfg(not(feature = "bench"))]
-            let _ = wake;
-            #[cfg(feature = "bench")]
-            if let Some(timing) = timing.as_deref_mut() {
-                timing.progress_wait_wall_ns = timing.progress_wait_wall_ns.saturating_add(
-                    wait_wall_started
-                        .map(|started| started.elapsed().as_nanos().min(u64::MAX as u128) as u64)
-                        .unwrap_or_default(),
-                );
-                timing.progress_wait_cpu_ns = timing.progress_wait_cpu_ns.saturating_add(
-                    wait_cpu_started
-                        .map(|started| digest::thread_cpu_time_ns().saturating_sub(started))
-                        .unwrap_or_default(),
-                );
-            }
-            #[cfg(feature = "bench")]
-            let ready_before = snapshot.ready_prefix.len();
-            #[cfg(feature = "bench")]
-            if let Some(timing) = timing.as_deref_mut() {
-                *snapshot = self.advance_and_snapshot_after_wake_with_timing(
-                    driver,
-                    capture_monotonic_ns,
-                    timing,
-                )?;
-            } else {
-                *snapshot = self.advance_and_snapshot_after_wake(driver, capture_monotonic_ns)?;
-            }
-            #[cfg(feature = "bench")]
-            if let Some(timing) = timing.as_deref_mut() {
-                timing.ready_tickets_gained =
-                    timing.ready_tickets_gained.saturating_add(
-                        snapshot.ready_prefix.len().saturating_sub(ready_before) as u64,
-                    );
+            if signaled
+                && !snapshot.closed
+                && snapshot.ready_prefix.len() < snapshot.admitted_ticket_count
+                && Self::coalesce_ready_target_reached(snapshot.ready_prefix.len(), ready_target)
+            {
+                outcome.target_hit = true;
             }
             if !signaled
                 || snapshot.ready_prefix.is_empty()
@@ -3597,7 +3570,88 @@ impl WalV8ParallelIo {
                 break;
             }
         }
-        Ok(waited)
+
+        Ok(outcome)
+    }
+
+    fn coalesce_progress_ring(
+        &self,
+        driver: &mut WalV8DurabilityDriver,
+        snapshot: &mut WalV8FrontierReadySnapshot,
+        budget: Duration,
+        capture_monotonic_ns: bool,
+        #[cfg(feature = "bench")] mut timing: Option<&mut WalV8CursorCoalescingTiming>,
+    ) -> Result<bool> {
+        #[cfg(feature = "bench")]
+        let ready_target = self.coalesce_ready_target;
+        #[cfg(not(feature = "bench"))]
+        let ready_target: Option<usize> = None;
+
+        let outcome = Self::coalesce_ready_prefix_with(
+            snapshot,
+            budget,
+            ready_target,
+            |remaining, snapshot| {
+                #[cfg(feature = "bench")]
+                if let Some(timing) = timing.as_deref_mut() {
+                    timing.iterations = timing.iterations.saturating_add(1);
+                }
+                #[cfg(feature = "bench")]
+                let wait_wall_started = timing.as_ref().map(|_| Instant::now());
+                #[cfg(feature = "bench")]
+                let wait_cpu_started = timing.as_ref().map(|_| digest::thread_cpu_time_ns());
+                let wake = self.wait_for_progress(remaining)?;
+                let signaled = wake.is_signaled();
+                #[cfg(not(feature = "bench"))]
+                let _ = wake;
+                #[cfg(feature = "bench")]
+                if let Some(timing) = timing.as_deref_mut() {
+                    timing.progress_wait_wall_ns = timing.progress_wait_wall_ns.saturating_add(
+                        wait_wall_started
+                            .map(|started| {
+                                started.elapsed().as_nanos().min(u64::MAX as u128) as u64
+                            })
+                            .unwrap_or_default(),
+                    );
+                    timing.progress_wait_cpu_ns = timing.progress_wait_cpu_ns.saturating_add(
+                        wait_cpu_started
+                            .map(|started| digest::thread_cpu_time_ns().saturating_sub(started))
+                            .unwrap_or_default(),
+                    );
+                }
+                #[cfg(feature = "bench")]
+                let ready_before = snapshot.ready_prefix.len();
+                #[cfg(feature = "bench")]
+                if let Some(timing) = timing.as_deref_mut() {
+                    *snapshot = self.advance_and_snapshot_after_wake_with_timing(
+                        driver,
+                        capture_monotonic_ns,
+                        timing,
+                    )?;
+                } else {
+                    *snapshot =
+                        self.advance_and_snapshot_after_wake(driver, capture_monotonic_ns)?;
+                }
+                #[cfg(not(feature = "bench"))]
+                {
+                    *snapshot =
+                        self.advance_and_snapshot_after_wake(driver, capture_monotonic_ns)?;
+                }
+                #[cfg(feature = "bench")]
+                if let Some(timing) = timing.as_deref_mut() {
+                    timing.ready_tickets_gained = timing.ready_tickets_gained.saturating_add(
+                        snapshot.ready_prefix.len().saturating_sub(ready_before) as u64,
+                    );
+                }
+                Ok(signaled)
+            },
+        )?;
+        #[cfg(feature = "bench")]
+        if outcome.target_hit {
+            self.coalesce_ready_target_hits
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(outcome.waited)
     }
 
     fn wait_for_progress(&self, timeout: Duration) -> Result<WalV8ProgressWake> {
@@ -4740,6 +4794,8 @@ impl WalV8LeaderWriter {
             progress_cursor_enabled: false,
             cursor_direct_completion_enabled: false,
             cursor_direct_completion_select_wake_enabled: false,
+            coalesce_ready_target: None,
+            coalesce_ready_target_hits: 0,
             cursor_singleton_submission_enabled: false,
             admission_cursor_publish_fast_path_enabled: false,
             point_buffer_preallocation_enabled: false,
@@ -5745,6 +5801,9 @@ impl WalV8ParallelWriter {
         diagnostics.sliding_extent_preparation = self.io.extent_preparation_diagnostics();
         diagnostics.progress_ring_enabled = self.coordinator.progress_ring_enabled();
         diagnostics.progress_cursor_enabled = self.coordinator.progress_cursor_enabled();
+        diagnostics.coalesce_ready_target = self.io.coalesce_ready_target;
+        diagnostics.coalesce_ready_target_hits =
+            self.io.coalesce_ready_target_hits.load(Ordering::Relaxed);
         diagnostics.progress_diagnostics = self.coordinator.progress_diagnostics();
         diagnostics.point_buffer_preallocation_attempts = self
             .point_buffer_preallocation_attempts
@@ -8255,6 +8314,159 @@ mod tests {
             Some(12)
         ));
         assert!(!WalV8ParallelIo::coalesce_ready_target_reached(16, None));
+    }
+
+    #[cfg(feature = "bench")]
+    fn coalescing_test_snapshot(ready: usize, admitted: usize) -> WalV8FrontierReadySnapshot {
+        WalV8FrontierReadySnapshot {
+            ready_prefix: WalV8ReadyPrefix::Cursor {
+                ticket_count: ready,
+                tail: None,
+                data_bytes: 0,
+            },
+            admitted_ticket_count: admitted,
+            closed: false,
+            frames_ready_prefix_count: ready,
+            data_complete_prefix_count: ready,
+            reserved_preparation_bytes: 0,
+            next_not_ready: None,
+            data_hol_blocker: None,
+            snapshot_monotonic_ns: None,
+        }
+    }
+
+    #[cfg(feature = "bench")]
+    fn set_coalescing_test_ready(snapshot: &mut WalV8FrontierReadySnapshot, ready: usize) {
+        snapshot.ready_prefix = WalV8ReadyPrefix::Cursor {
+            ticket_count: ready,
+            tail: None,
+            data_bytes: 0,
+        };
+        snapshot.frames_ready_prefix_count = ready;
+        snapshot.data_complete_prefix_count = ready;
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn coalescing_target_skips_wait_and_keeps_the_full_ready_prefix() -> Result<()> {
+        let mut at_target = coalescing_test_snapshot(8, 16);
+        let outcome = WalV8ParallelIo::coalesce_ready_prefix_with(
+            &mut at_target,
+            Duration::from_millis(100),
+            Some(8),
+            |_, _| anyhow::bail!("coalescing should not wait after reaching the target"),
+        )?;
+
+        assert!(!outcome.waited);
+        assert!(outcome.target_hit);
+        assert_eq!(at_target.ready_prefix.len(), 8);
+
+        let mut beyond_target = coalescing_test_snapshot(10, 16);
+        let outcome = WalV8ParallelIo::coalesce_ready_prefix_with(
+            &mut beyond_target,
+            Duration::from_millis(100),
+            Some(8),
+            |_, _| anyhow::bail!("coalescing should preserve an already-ready prefix"),
+        )?;
+
+        assert!(!outcome.waited);
+        assert!(outcome.target_hit);
+        assert_eq!(beyond_target.ready_prefix.len(), 10);
+
+        let mut complete_prefix = coalescing_test_snapshot(16, 16);
+        let outcome = WalV8ParallelIo::coalesce_ready_prefix_with(
+            &mut complete_prefix,
+            Duration::from_millis(100),
+            Some(8),
+            |_, _| anyhow::bail!("coalescing should not wait when the full prefix is ready"),
+        )?;
+
+        assert!(!outcome.waited);
+        assert!(!outcome.target_hit);
+        assert_eq!(complete_prefix.ready_prefix.len(), 16);
+        Ok(())
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn coalescing_target_stops_after_wait_without_truncating_ready_prefix() -> Result<()> {
+        let mut snapshot = coalescing_test_snapshot(4, 16);
+        let mut calls = 0;
+        let outcome = WalV8ParallelIo::coalesce_ready_prefix_with(
+            &mut snapshot,
+            Duration::from_millis(100),
+            Some(8),
+            |_, snapshot| {
+                calls += 1;
+                set_coalescing_test_ready(snapshot, 10);
+                Ok(true)
+            },
+        )?;
+
+        assert_eq!(calls, 1);
+        assert!(outcome.waited);
+        assert!(outcome.target_hit);
+        assert_eq!(snapshot.ready_prefix.len(), 10);
+        Ok(())
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn coalescing_below_target_keeps_the_original_deadline() -> Result<()> {
+        let mut snapshot = coalescing_test_snapshot(4, 16);
+        let budget = Duration::from_millis(100);
+        let mut calls = 0;
+        let mut second_remaining = None;
+        let outcome = WalV8ParallelIo::coalesce_ready_prefix_with(
+            &mut snapshot,
+            budget,
+            Some(8),
+            |remaining, snapshot| {
+                calls += 1;
+                if calls == 1 {
+                    thread::sleep(Duration::from_millis(20));
+                    set_coalescing_test_ready(snapshot, 6);
+                    Ok(true)
+                } else {
+                    second_remaining = Some(remaining);
+                    set_coalescing_test_ready(snapshot, 7);
+                    Ok(false)
+                }
+            },
+        )?;
+
+        assert_eq!(calls, 2);
+        assert!(
+            second_remaining
+                .is_some_and(|remaining| remaining < budget - Duration::from_millis(10))
+        );
+        assert!(outcome.waited);
+        assert!(!outcome.target_hit);
+        assert_eq!(snapshot.ready_prefix.len(), 7);
+        Ok(())
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn coalescing_without_target_preserves_deadline_behavior() -> Result<()> {
+        let mut snapshot = coalescing_test_snapshot(4, 16);
+        let mut calls = 0;
+        let outcome = WalV8ParallelIo::coalesce_ready_prefix_with(
+            &mut snapshot,
+            Duration::from_millis(100),
+            None,
+            |_, snapshot| {
+                calls += 1;
+                set_coalescing_test_ready(snapshot, 5);
+                Ok(false)
+            },
+        )?;
+
+        assert_eq!(calls, 1);
+        assert!(outcome.waited);
+        assert!(!outcome.target_hit);
+        assert_eq!(snapshot.ready_prefix.len(), 5);
+        Ok(())
     }
 
     #[cfg(feature = "bench")]

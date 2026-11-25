@@ -1931,6 +1931,8 @@ struct WalIoDiagnosticsRecord {
     progress_cursor_enabled: bool,
     cursor_direct_completion_enabled: bool,
     cursor_direct_completion_select_wake_enabled: bool,
+    coalesce_ready_target: Option<usize>,
+    coalesce_ready_target_hits: u64,
     cursor_singleton_submission_enabled: bool,
     admission_cursor_publish_fast_path_enabled: bool,
     point_buffer_preallocation_enabled: bool,
@@ -2105,6 +2107,8 @@ impl From<WalIoDiagnostics> for WalIoDiagnosticsRecord {
             cursor_direct_completion_enabled: diagnostics.cursor_direct_completion_enabled,
             cursor_direct_completion_select_wake_enabled: diagnostics
                 .cursor_direct_completion_select_wake_enabled,
+            coalesce_ready_target: diagnostics.coalesce_ready_target,
+            coalesce_ready_target_hits: diagnostics.coalesce_ready_target_hits,
             cursor_singleton_submission_enabled: diagnostics.cursor_singleton_submission_enabled,
             admission_cursor_publish_fast_path_enabled: diagnostics
                 .admission_cursor_publish_fast_path_enabled,
@@ -2199,6 +2203,7 @@ impl WalIoDiagnosticsRecord {
             && self.cursor_direct_completion_enabled == other.cursor_direct_completion_enabled
             && self.cursor_direct_completion_select_wake_enabled
                 == other.cursor_direct_completion_select_wake_enabled
+            && self.coalesce_ready_target == other.coalesce_ready_target
             && self.cursor_singleton_submission_enabled == other.cursor_singleton_submission_enabled
             && self.admission_cursor_publish_fast_path_enabled
                 == other.admission_cursor_publish_fast_path_enabled
@@ -12957,6 +12962,8 @@ mod tests {
                         progress_cursor_enabled: false,
                         cursor_direct_completion_enabled: false,
                         cursor_direct_completion_select_wake_enabled: false,
+                        coalesce_ready_target: Some(8),
+                        coalesce_ready_target_hits: 0,
                         cursor_singleton_submission_enabled: false,
                         admission_cursor_publish_fast_path_enabled: false,
                         point_buffer_preallocation_enabled: false,
@@ -13027,6 +13034,8 @@ mod tests {
                         progress_cursor_enabled: false,
                         cursor_direct_completion_enabled: false,
                         cursor_direct_completion_select_wake_enabled: false,
+                        coalesce_ready_target: Some(8),
+                        coalesce_ready_target_hits: 2,
                         cursor_singleton_submission_enabled: false,
                         admission_cursor_publish_fast_path_enabled: false,
                         point_buffer_preallocation_enabled: false,
@@ -13103,6 +13112,22 @@ mod tests {
             assert_eq!(
                 json["result"]["wal_pipeline"]["sync_coalesce_wait_ns"],
                 9000
+            );
+            assert_eq!(
+                json["result"]["wal_pipeline"]["wal_io_start"]["coalesce_ready_target"],
+                8
+            );
+            assert_eq!(
+                json["result"]["wal_pipeline"]["wal_io_start"]["coalesce_ready_target_hits"],
+                0
+            );
+            assert_eq!(
+                json["result"]["wal_pipeline"]["wal_io_end"]["coalesce_ready_target"],
+                8
+            );
+            assert_eq!(
+                json["result"]["wal_pipeline"]["wal_io_end"]["coalesce_ready_target_hits"],
+                2
             );
             assert_eq!(
                 json["result"]["wal_pipeline"]["wal_io_start"]["data"]["o_direct"],

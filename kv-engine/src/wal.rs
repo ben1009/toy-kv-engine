@@ -167,6 +167,12 @@ pub struct WalIoDiagnostics {
     /// Whether direct DATA completion waits select on the completion queue
     /// instead of using the capacity-one progress token.
     pub cursor_direct_completion_select_wake_enabled: bool,
+    /// Ready-prefix threshold configured for the benchmark-only coalescing experiment.
+    /// The setting applies to the writer's coalescing path; benchmark plans decide which
+    /// workload arms run with the target enabled.
+    pub coalesce_ready_target: Option<usize>,
+    /// Number of coalescing cycles ended at the target before the full admitted prefix was ready.
+    pub coalesce_ready_target_hits: u64,
     /// Whether Cursor DATA submissions use the benchmark-only allocation-free group
     /// representation.
     pub cursor_singleton_submission_enabled: bool,
