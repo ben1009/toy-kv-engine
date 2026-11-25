@@ -1274,16 +1274,24 @@ impl WorkerCompletionSender {
 struct WorkerCompletionExitGuard {
     slots: Arc<GroupSlots>,
     failure_handle: Option<WalV8WorkerCompletionHandle>,
+    // Keep the direct completion channel connected until failure cleanup and
+    // terminal poison publication have completed.
+    _completion_sender_keepalive: Option<WorkerCompletionSender>,
     completed: bool,
     failure_reported: bool,
 }
 
 #[cfg(feature = "bench")]
 impl WorkerCompletionExitGuard {
-    fn new(slots: Arc<GroupSlots>, failure_handle: Option<WalV8WorkerCompletionHandle>) -> Self {
+    fn new(
+        slots: Arc<GroupSlots>,
+        failure_handle: Option<WalV8WorkerCompletionHandle>,
+        completion_sender_keepalive: Option<WorkerCompletionSender>,
+    ) -> Self {
         Self {
             slots,
             failure_handle,
+            _completion_sender_keepalive: completion_sender_keepalive,
             completed: false,
             failure_reported: false,
         }
@@ -2503,8 +2511,15 @@ impl<B: WorkerBuffer> IoWorker<B> {
             .name("wal-io-worker".to_owned())
             .spawn(move || {
                 #[cfg(feature = "bench")]
-                let mut exit_guard =
-                    WorkerCompletionExitGuard::new(failure_slots, worker_failure_handle.clone());
+                let completion_sender_keepalive = worker_failure_handle
+                    .as_ref()
+                    .map(|_| completion_sender.clone());
+                #[cfg(feature = "bench")]
+                let mut exit_guard = WorkerCompletionExitGuard::new(
+                    failure_slots,
+                    worker_failure_handle.clone(),
+                    completion_sender_keepalive,
+                );
                 #[cfg(all(feature = "bench", target_os = "linux"))]
                 let bench_io_affinity = match configure_bench_io_worker_affinity() {
                     Ok(affinity) => affinity,
@@ -5073,6 +5088,7 @@ mod tests {
         let exit_guard = WorkerCompletionExitGuard::new(
             Arc::clone(&slots),
             Some(coordinator.worker_completion_handle()),
+            None,
         );
         let error = process_one_direct_completion(&completion_sender, &slots, &drops)
             .expect_err("full direct-completion queue must fail the worker");
@@ -5140,6 +5156,7 @@ mod tests {
         let exit_guard = WorkerCompletionExitGuard::new(
             Arc::clone(&slots),
             Some(coordinator.worker_completion_handle()),
+            None,
         );
         let error = process_one_direct_completion(&completion_sender, &slots, &drops)
             .expect_err("disconnected direct-completion queue must fail the worker");
@@ -5147,6 +5164,42 @@ mod tests {
         assert!(error.to_string().contains("queue overflow or disconnect"));
         assert_delivery_failure_cleanup(&coordinator, slots, &drops, error, exit_guard);
 
+        Ok(())
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn cursor_direct_worker_failure_publishes_poison_before_queue_disconnect() -> anyhow::Result<()> {
+        let (coordinator, progress_tokens) = cursor_completion_coordinator()?;
+        let (completion_tx, completion_rx) = bounded(1);
+        let completion_sender = WorkerCompletionSender::CursorDirect {
+            sender: completion_tx,
+            handle: coordinator.worker_completion_handle(),
+        };
+        let slots = direct_completion_slots();
+        let exit_guard = WorkerCompletionExitGuard::new(
+            Arc::clone(&slots),
+            Some(coordinator.worker_completion_handle()),
+            Some(completion_sender.clone()),
+        );
+
+        // Model run_worker returning and dropping its sender before the
+        // thread entry point publishes terminal worker failure.
+        drop(completion_sender);
+        assert!(matches!(
+            completion_rx.try_recv(),
+            Err(crossbeam_channel::TryRecvError::Empty)
+        ));
+        assert!(!coordinator.is_poisoned());
+
+        finish_failed_direct_worker(&coordinator, &slots, exit_guard);
+
+        assert!(coordinator.is_poisoned());
+        assert!(progress_tokens.try_recv().is_ok());
+        assert!(matches!(
+            completion_rx.try_recv(),
+            Err(crossbeam_channel::TryRecvError::Disconnected)
+        ));
         Ok(())
     }
 
@@ -5165,6 +5218,7 @@ mod tests {
         let exit_guard = WorkerCompletionExitGuard::new(
             Arc::clone(&slots),
             Some(coordinator.worker_completion_handle()),
+            None,
         );
         let error = process_one_direct_completion(&completion_sender, &slots, &drops)
             .expect_err("disconnected progress-token receiver must fail the worker");
@@ -5211,6 +5265,7 @@ mod tests {
         let exit_guard = WorkerCompletionExitGuard::new(
             Arc::clone(&slots),
             Some(coordinator.worker_completion_handle()),
+            None,
         );
         drop(exit_guard);
         closed_rx
@@ -5227,6 +5282,7 @@ mod tests {
         let mut clean_guard = WorkerCompletionExitGuard::new(
             Arc::clone(&clean_slots),
             Some(clean_coordinator.worker_completion_handle()),
+            None,
         );
         clean_guard.complete();
         drop(clean_guard);

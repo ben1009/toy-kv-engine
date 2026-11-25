@@ -597,9 +597,10 @@ fn direct_completion_wake_mode_from_value(
     progress_mode: WalV8ProgressMode,
     direct_completion_enabled: bool,
 ) -> Result<WalV8DirectCompletionWakeMode> {
-    let mode = match value.and_then(OsStr::to_str) {
-        None | Some("token") => WalV8DirectCompletionWakeMode::Token,
-        Some("select") => WalV8DirectCompletionWakeMode::Select,
+    let mode = match value {
+        None => WalV8DirectCompletionWakeMode::Token,
+        Some(value) if value.to_str() == Some("token") => WalV8DirectCompletionWakeMode::Token,
+        Some(value) if value.to_str() == Some("select") => WalV8DirectCompletionWakeMode::Select,
         Some(value) => anyhow::bail!(
             "invalid {WAL_V8_DIRECT_COMPLETION_WAKE_ENV} {value:?}; expected `token` or `select`"
         ),
@@ -2871,10 +2872,56 @@ enum WalV8ProgressChannelClosed {
 /// selected first while a control token races in, the token remains available
 /// for the pre-scan drain and subsequent wait.
 #[cfg(feature = "bench")]
+fn direct_completion_event(
+    completion: DirectGroupWriteCompletion,
+) -> Result<WalV8CompletedGroupEvent> {
+    if let Some(error) = completion.result.error.as_deref() {
+        anyhow::bail!("Cursor direct completion queue received failed DATA result: {error}");
+    }
+    Ok(WalV8CompletedGroupEvent {
+        group_id: completion.result.group_id,
+        tickets: completion.result.tickets,
+        write_count: completion.result.write_count,
+        write_bytes: completion.result.write_bytes,
+        completion_observed_at: completion.completion_observed_at,
+    })
+}
+
+#[cfg(feature = "bench")]
+fn drain_direct_completion_queue(
+    receiver: &Receiver<DirectGroupWriteCompletion>,
+    batch: &mut Vec<WalV8CompletedGroupEvent>,
+    limit: usize,
+    shutdown_started: bool,
+) -> Result<()> {
+    for _ in 0..limit {
+        match receiver.try_recv() {
+            Ok(completion) => batch.push(direct_completion_event(completion)?),
+            Err(crossbeam_channel::TryRecvError::Empty) => break,
+            Err(crossbeam_channel::TryRecvError::Disconnected) if shutdown_started => break,
+            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                anyhow::bail!("v8 direct DATA completion queue disconnected before teardown");
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "bench")]
 fn wait_for_direct_completion_or_control(
     tokens: &Receiver<()>,
     completions: &Receiver<DirectGroupWriteCompletion>,
     timeout: Duration,
+) -> std::result::Result<WalV8ProgressWake, WalV8ProgressChannelClosed> {
+    wait_for_direct_completion_or_control_with_hook(tokens, completions, timeout, || {})
+}
+
+#[cfg(feature = "bench")]
+fn wait_for_direct_completion_or_control_with_hook(
+    tokens: &Receiver<()>,
+    completions: &Receiver<DirectGroupWriteCompletion>,
+    timeout: Duration,
+    before_select: impl FnOnce(),
 ) -> std::result::Result<WalV8ProgressWake, WalV8ProgressChannelClosed> {
     let control_disconnected = match tokens.try_recv() {
         Ok(()) => return Ok(WalV8ProgressWake::Control),
@@ -2893,14 +2940,25 @@ fn wait_for_direct_completion_or_control(
         return Err(WalV8ProgressChannelClosed::Control);
     }
 
-    crossbeam_channel::select! {
-        recv(tokens) -> result => result
+    let mut selection = crossbeam_channel::Select::new();
+    let control_operation = selection.recv(tokens);
+    let completion_operation = selection.recv(completions);
+    before_select();
+    let selected = match selection.select_timeout(timeout) {
+        Ok(selected) => selected,
+        Err(_) => return Ok(WalV8ProgressWake::TimedOut),
+    };
+    if selected.index() == control_operation {
+        selected
+            .recv(tokens)
             .map(|()| WalV8ProgressWake::Control)
-            .map_err(|_| WalV8ProgressChannelClosed::Control),
-        recv(completions) -> result => result
+            .map_err(|_| WalV8ProgressChannelClosed::Control)
+    } else {
+        debug_assert_eq!(selected.index(), completion_operation);
+        selected
+            .recv(completions)
             .map(WalV8ProgressWake::Completion)
-            .map_err(|_| WalV8ProgressChannelClosed::Completion),
-        default(timeout) => Ok(WalV8ProgressWake::TimedOut),
+            .map_err(|_| WalV8ProgressChannelClosed::Completion)
     }
 }
 
@@ -3479,22 +3537,16 @@ impl WalV8ParallelIo {
         batch: &mut Vec<WalV8CompletedGroupEvent>,
         limit: usize,
     ) -> Result<()> {
-        for _ in 0..limit {
-            match receiver.try_recv() {
-                Ok(completion) => self.push_direct_completion_event(completion, batch)?,
-                Err(crossbeam_channel::TryRecvError::Empty) => break,
-                Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                    if !self.shutdown_started.load(Ordering::Acquire) {
-                        self.coordinator.poison();
-                        anyhow::bail!(
-                            "v8 direct DATA completion queue disconnected before teardown"
-                        );
-                    }
-                    break;
-                }
-            }
+        let result = drain_direct_completion_queue(
+            receiver,
+            batch,
+            limit,
+            self.shutdown_started.load(Ordering::Acquire),
+        );
+        if result.is_err() {
+            self.coordinator.poison();
         }
-        Ok(())
+        result
     }
 
     #[cfg(feature = "bench")]
@@ -3503,18 +3555,16 @@ impl WalV8ParallelIo {
         completion: DirectGroupWriteCompletion,
         batch: &mut Vec<WalV8CompletedGroupEvent>,
     ) -> Result<()> {
-        if let Some(error) = completion.result.error.as_deref() {
-            self.coordinator.poison();
-            anyhow::bail!("Cursor direct completion queue received failed DATA result: {error}");
+        match direct_completion_event(completion) {
+            Ok(event) => {
+                batch.push(event);
+                Ok(())
+            }
+            Err(error) => {
+                self.coordinator.poison();
+                Err(error)
+            }
         }
-        batch.push(WalV8CompletedGroupEvent {
-            group_id: completion.result.group_id,
-            tickets: completion.result.tickets,
-            write_count: completion.result.write_count,
-            write_bytes: completion.result.write_bytes,
-            completion_observed_at: completion.completion_observed_at,
-        });
-        Ok(())
     }
 
     fn coalesce_progress_ring(
@@ -3525,6 +3575,9 @@ impl WalV8ParallelIo {
         capture_monotonic_ns: bool,
         #[cfg(feature = "bench")] mut timing: Option<&mut WalV8CursorCoalescingTiming>,
     ) -> Result<bool> {
+        #[cfg(not(feature = "bench"))]
+        let _ = (driver, capture_monotonic_ns);
+
         let deadline = Instant::now() + budget;
         let mut waited = false;
         while !snapshot.closed
@@ -3541,6 +3594,8 @@ impl WalV8ParallelIo {
             let wait_cpu_started = timing.as_ref().map(|_| digest::thread_cpu_time_ns());
             let wake = self.wait_for_progress(remaining)?;
             let signaled = wake.is_signaled();
+            #[cfg(not(feature = "bench"))]
+            let _ = wake;
             #[cfg(feature = "bench")]
             if let Some(timing) = timing.as_deref_mut() {
                 timing.progress_wait_wall_ns = timing.progress_wait_wall_ns.saturating_add(
@@ -3575,11 +3630,6 @@ impl WalV8ParallelIo {
                         snapshot.ready_prefix.len().saturating_sub(ready_before) as u64,
                     );
             }
-            #[cfg(not(feature = "bench"))]
-            {
-                *snapshot =
-                    self.advance_and_snapshot_after_wake(driver, capture_monotonic_ns, wake)?;
-            }
             if !signaled
                 || snapshot.ready_prefix.is_empty()
                 || snapshot.ready_prefix.len() >= snapshot.admitted_ticket_count
@@ -3609,9 +3659,8 @@ impl WalV8ParallelIo {
             };
             match wait_for_direct_completion_or_control(tokens, completions, timeout) {
                 Ok(wake) => Ok(wake),
-                Err(closed) if self.shutdown_started.load(Ordering::Acquire) => {
-                    let _ = closed;
-                    Ok(WalV8ProgressWake::Control)
+                Err(_closed) if self.shutdown_started.load(Ordering::Acquire) => {
+                    Ok(WalV8ProgressWake::TimedOut)
                 }
                 Err(WalV8ProgressChannelClosed::Control) => {
                     self.coordinator.poison();
@@ -3629,7 +3678,7 @@ impl WalV8ParallelIo {
                 WalV8ProgressTokenWait::Disconnected
                     if self.shutdown_started.load(Ordering::Acquire) =>
                 {
-                    Ok(WalV8ProgressWake::Control)
+                    Ok(WalV8ProgressWake::TimedOut)
                 }
                 WalV8ProgressTokenWait::Disconnected => {
                     self.coordinator.poison();
@@ -3644,7 +3693,7 @@ impl WalV8ParallelIo {
             WalV8ProgressTokenWait::Disconnected
                 if self.shutdown_started.load(Ordering::Acquire) =>
             {
-                Ok(WalV8ProgressWake::Control)
+                Ok(WalV8ProgressWake::TimedOut)
             }
             WalV8ProgressTokenWait::Disconnected => {
                 self.coordinator.poison();
@@ -8277,6 +8326,22 @@ mod tests {
         );
     }
 
+    #[cfg(all(feature = "bench", unix))]
+    #[test]
+    fn direct_completion_wake_mode_rejects_non_utf8_values() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let invalid = OsStr::from_bytes(b"select\xff");
+        assert!(
+            direct_completion_wake_mode_from_value(
+                Some(invalid),
+                WalV8ProgressMode::Cursor,
+                true,
+            )
+            .is_err()
+        );
+    }
+
     #[cfg(feature = "bench")]
     #[test]
     fn direct_completion_select_checks_control_first_and_delivers_each_event_once() -> Result<()> {
@@ -11124,6 +11189,189 @@ mod tests {
         check_cursor_direct_completion_writes_reopens_and_recovers(
             WalV8DirectCompletionWakeMode::Token,
         )
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn direct_completion_select_wakes_a_waiting_driver_for_data_and_control() -> Result<()> {
+        let (_control_tx, control_rx) = crossbeam_channel::bounded(1);
+        let (completion_tx, completion_rx) = crossbeam_channel::bounded(1);
+        let (registered_tx, registered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+        let (wake_tx, wake_rx) = mpsc::channel();
+        let driver = thread::spawn(move || {
+            let wake = wait_for_direct_completion_or_control_with_hook(
+                &control_rx,
+                &completion_rx,
+                Duration::from_secs(2),
+                || {
+                    registered_tx.send(()).expect("test receiver remains connected");
+                    let _ = release_rx.recv();
+                },
+            );
+            let _ = wake_tx.send(wake);
+        });
+        registered_rx.recv_timeout(Duration::from_secs(1))?;
+        let completion = DirectGroupWriteCompletion {
+            result: GroupWriteResult {
+                group_id: 8,
+                tickets: 4..5,
+                write_count: 1,
+                write_bytes: FRAME_LEN_U64,
+                error: None,
+            },
+            completion_observed_at: Some(Instant::now()),
+        };
+        completion_tx.send(completion.clone())?;
+        release_tx.send(())?;
+        let wake = wake_rx
+            .recv_timeout(Duration::from_secs(1))
+            .context("completion waiter did not wake")?
+            .map_err(|closed| anyhow::anyhow!("completion wait disconnected: {closed:?}"))?;
+        assert!(matches!(wake, WalV8ProgressWake::Completion(event) if event == completion));
+        driver.join().expect("completion wait thread panicked");
+
+        let (control_coordinator, control_rx) = cursor_completion_coordinator()?;
+        let (_completion_tx, completion_rx) = crossbeam_channel::bounded(1);
+        let (registered_tx, registered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+        let (wake_tx, wake_rx) = mpsc::channel();
+        let driver = thread::spawn(move || {
+            let wake = wait_for_direct_completion_or_control_with_hook(
+                &control_rx,
+                &completion_rx,
+                Duration::from_secs(2),
+                || {
+                    registered_tx.send(()).expect("test receiver remains connected");
+                    let _ = release_rx.recv();
+                },
+            );
+            let _ = wake_tx.send(wake);
+        });
+        registered_rx.recv_timeout(Duration::from_secs(1))?;
+        control_coordinator.signal_progress_token();
+        release_tx.send(())?;
+        let wake = wake_rx
+            .recv_timeout(Duration::from_secs(1))
+            .context("control waiter did not wake")?
+            .map_err(|closed| anyhow::anyhow!("control wait disconnected: {closed:?}"))?;
+        assert!(matches!(wake, WalV8ProgressWake::Control));
+        driver.join().expect("control wait thread panicked");
+
+        Ok(())
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn direct_completion_select_seed_and_batch_drain_preserve_capacity_and_order() -> Result<()> {
+        let (completion_tx, completion_rx) = crossbeam_channel::bounded(3);
+        let observed_at = Instant::now();
+        for ticket in 1..=3 {
+            completion_tx.send(DirectGroupWriteCompletion {
+                result: GroupWriteResult {
+                    group_id: ticket,
+                    tickets: ticket..ticket + 1,
+                    write_count: 1,
+                    write_bytes: FRAME_LEN_U64,
+                    error: None,
+                },
+                completion_observed_at: Some(observed_at),
+            })?;
+        }
+
+        let first = completion_rx.try_recv()?;
+        let mut batch = vec![direct_completion_event(first)?];
+        let capacity = 3;
+        let remaining_capacity = capacity - batch.len();
+        drain_direct_completion_queue(
+            &completion_rx,
+            &mut batch,
+            remaining_capacity,
+            false,
+        )?;
+        assert_eq!(batch.len(), capacity);
+        assert!(completion_rx.is_empty());
+        assert_eq!(
+            batch.iter().map(|event| event.group_id).collect::<Vec<_>>(),
+            [1, 2, 3]
+        );
+        assert_eq!(
+            batch.iter().map(|event| event.tickets.clone()).collect::<Vec<_>>(),
+            [1..2, 2..3, 3..4]
+        );
+        assert!(
+            batch.iter().all(|event| event.completion_observed_at == Some(observed_at))
+        );
+
+        Ok(())
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn direct_completion_select_poison_wakes_a_waiting_driver() -> Result<()> {
+        let (coordinator, tokens) = cursor_completion_coordinator()?;
+        let (_completion_tx, completions) = crossbeam_channel::bounded(1);
+        let (registered_tx, registered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+        let (wake_tx, wake_rx) = mpsc::channel();
+        let driver = thread::spawn(move || {
+            let wake = wait_for_direct_completion_or_control_with_hook(
+                &tokens,
+                &completions,
+                Duration::from_secs(2),
+                || {
+                    registered_tx.send(()).expect("test receiver remains connected");
+                    let _ = release_rx.recv();
+                },
+            );
+            let _ = wake_tx.send(wake);
+        });
+        registered_rx.recv_timeout(Duration::from_secs(1))?;
+        coordinator.poison();
+        release_tx.send(())?;
+        let wake = wake_rx
+            .recv_timeout(Duration::from_secs(1))
+            .context("poison did not wake select waiter")?
+            .map_err(|closed| anyhow::anyhow!("poison wait disconnected: {closed:?}"))?;
+        assert!(matches!(wake, WalV8ProgressWake::Control));
+        assert!(coordinator.is_poisoned());
+        driver.join().expect("poison wait thread panicked");
+
+        Ok(())
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn direct_completion_select_close_wakes_a_waiting_driver() -> Result<()> {
+        let (coordinator, tokens) = cursor_completion_coordinator()?;
+        let (_completion_tx, completions) = crossbeam_channel::bounded(1);
+        let (registered_tx, registered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+        let (wake_tx, wake_rx) = mpsc::channel();
+        let driver = thread::spawn(move || {
+            let wake = wait_for_direct_completion_or_control_with_hook(
+                &tokens,
+                &completions,
+                Duration::from_secs(2),
+                || {
+                    registered_tx.send(()).expect("test receiver remains connected");
+                    let _ = release_rx.recv();
+                },
+            );
+            let _ = wake_tx.send(wake);
+        });
+        registered_rx.recv_timeout(Duration::from_secs(1))?;
+        coordinator.close();
+        release_tx.send(())?;
+        let wake = wake_rx
+            .recv_timeout(Duration::from_secs(1))
+            .context("close did not wake select waiter")?
+            .map_err(|closed| anyhow::anyhow!("close wait disconnected: {closed:?}"))?;
+        assert!(matches!(wake, WalV8ProgressWake::Control));
+        assert!(coordinator.is_closed());
+        driver.join().expect("close wait thread panicked");
+
+        Ok(())
     }
 
     #[cfg(feature = "bench")]
