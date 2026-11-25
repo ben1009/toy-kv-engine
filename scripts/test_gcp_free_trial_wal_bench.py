@@ -58,6 +58,11 @@ from gcp_wal_matrix import (
     CURSOR_COALESCING_READY_TARGET_SCAN_NUM,
     CURSOR_COALESCING_READY_TARGET_SCAN_ORDERS,
     CURSOR_COALESCING_READY_TARGET_SCAN_WRITERS,
+    CURSOR_COALESCING_READY_TARGET_SMALL_SCAN_ARMS,
+    CURSOR_COALESCING_READY_TARGET_SMALL_SCAN_CASES,
+    CURSOR_COALESCING_READY_TARGET_SMALL_SCAN_NUM,
+    CURSOR_COALESCING_READY_TARGET_SMALL_SCAN_ORDERS,
+    CURSOR_COALESCING_READY_TARGET_SMALL_SCAN_WRITERS,
     CURSOR_PUBLICATION_ARMS,
     CURSOR_PUBLICATION_NUM,
     CURSOR_PUBLICATION_WRITERS,
@@ -71,6 +76,8 @@ from gcp_wal_matrix import (
     build_cursor_coalescing_ready_target_schedule,
     build_cursor_coalescing_ready_target_scan_plan,
     build_cursor_coalescing_ready_target_scan_schedule,
+    build_cursor_coalescing_ready_target_small_scan_plan,
+    build_cursor_coalescing_ready_target_small_scan_schedule,
     build_cursor_publication_plan,
     build_cursor_publication_schedule,
     build_cursor_singleton_submission_plan,
@@ -694,6 +701,7 @@ class PointProgressRingQualificationTests(unittest.TestCase):
         coalescing_budget: bool = False,
         coalescing_ready_target: bool = False,
         coalescing_ready_target_scan: bool = False,
+        coalescing_ready_target_small_scan: bool = False,
         retirement: bool = False,
         retirement_preallocation: bool = False,
         cursor_publication: bool = False,
@@ -704,7 +712,10 @@ class PointProgressRingQualificationTests(unittest.TestCase):
         results.mkdir()
         commit = "a" * 40
         binary_sha = "b" * 64
-        if coalescing_ready_target_scan:
+        if coalescing_ready_target_small_scan:
+            schedule_builder = lambda _selected_writers: build_cursor_coalescing_ready_target_small_scan_schedule()
+            plan_builder = build_cursor_coalescing_ready_target_small_scan_plan
+        elif coalescing_ready_target_scan:
             schedule_builder = lambda _selected_writers: build_cursor_coalescing_ready_target_scan_schedule()
             plan_builder = build_cursor_coalescing_ready_target_scan_plan
         elif coalescing_ready_target:
@@ -741,6 +752,7 @@ class PointProgressRingQualificationTests(unittest.TestCase):
             schedule_builder = build_point_progress_ring_schedule
             plan_builder = build_point_progress_ring_plan
         writers = (
+            CURSOR_COALESCING_READY_TARGET_SMALL_SCAN_WRITERS if coalescing_ready_target_small_scan else
             CURSOR_COALESCING_READY_TARGET_SCAN_WRITERS if coalescing_ready_target_scan else
             CURSOR_COALESCING_READY_TARGET_WRITERS if coalescing_ready_target else
             CURSOR_PUBLICATION_WRITERS if cursor_publication else
@@ -749,7 +761,7 @@ class PointProgressRingQualificationTests(unittest.TestCase):
             POINT_PROGRESS_RING_WRITERS
         )
         schedule = schedule_builder(writers)
-        if coalescing_ready_target_scan or coalescing_ready_target:
+        if coalescing_ready_target_small_scan or coalescing_ready_target_scan or coalescing_ready_target:
             plan = plan_builder(
                 machine_type="c4-standard-16-lssd",
                 machine_spec={"vcpus": 16, "ssd_count": 2, "ssd_gib": 750},
@@ -799,6 +811,7 @@ class PointProgressRingQualificationTests(unittest.TestCase):
         (results / "commit.txt").write_text(commit + "\n", encoding="utf-8")
         (results / "write-perf.sha256").write_text(binary_sha + "\n", encoding="utf-8")
         schedule_name = (
+            "cursor-coalescing-ready-target-small-scan-schedule.tsv" if coalescing_ready_target_small_scan else
             "cursor-coalescing-ready-target-scan-schedule.tsv" if coalescing_ready_target_scan else
             "cursor-coalescing-ready-target-schedule.tsv" if coalescing_ready_target else
             "point-resource-retirement-schedule.tsv" if retirement else
@@ -823,7 +836,7 @@ class PointProgressRingQualificationTests(unittest.TestCase):
             raw = cls._raw_record(row)
             record_validator = (
                 progress_ring_runner._validate_record
-                if coalescing_ready_target_scan or coalescing_ready_target else
+                if coalescing_ready_target_small_scan or coalescing_ready_target_scan or coalescing_ready_target else
                 progress_ring_runner._validate_cursor_publication_record if cursor_publication else
                 progress_ring_runner._validate_point_resource_retirement_stage_a_record if completion_wake else
                 progress_ring_runner._validate_point_resource_retirement_stage_a_record
@@ -847,7 +860,7 @@ class PointProgressRingQualificationTests(unittest.TestCase):
                     row.get("coalescing_budget_us"),
                     point_buffer_preallocation_enabled=(
                         bool(row["point_buffer_preallocation_enabled"])
-                        if coalescing_ready_target_scan or coalescing_ready_target
+                        if coalescing_ready_target_small_scan or coalescing_ready_target_scan or coalescing_ready_target
                         or cursor_publication or completion_wake else
                         True if row.get("point_buffer_preallocation_enabled") is True else None
                     ),
@@ -858,13 +871,18 @@ class PointProgressRingQualificationTests(unittest.TestCase):
                     cursor_direct_completion_wake_mode=row.get("cursor_direct_completion_wake_mode"),
                     coalescing_ready_target=(
                         row.get("coalescing_ready_target")
-                        if coalescing_ready_target_scan or coalescing_ready_target else None
+                        if coalescing_ready_target_small_scan or coalescing_ready_target_scan
+                        or coalescing_ready_target else None
                     ),
                 ),
                 encoding="utf-8",
             )
             rows.append(metadata)
-        if coalescing_ready_target_scan:
+        if coalescing_ready_target_small_scan:
+            summary = progress_ring_runner._coalescing_ready_target_small_scan_summary(
+                rows, writers, len(schedule),
+            )
+        elif coalescing_ready_target_scan:
             summary = progress_ring_runner._coalescing_ready_target_scan_summary(rows, writers, len(schedule))
         elif coalescing_ready_target:
             summary = progress_ring_runner._coalescing_ready_target_summary(rows, writers, len(schedule))
@@ -1231,6 +1249,48 @@ class PointProgressRingQualificationTests(unittest.TestCase):
             usage = next(item for item in summary["target_usage"] if item["arm"] == "target_4")
             self.assertEqual(usage["configured_target"], 4)
 
+    def test_cursor_coalescing_ready_target_small_scan_schedule_is_counterbalanced(self) -> None:
+        schedule = build_cursor_coalescing_ready_target_small_scan_schedule()
+        self.assertEqual(len(schedule), 50)
+        self.assertEqual({row["arm"] for row in schedule}, set(CURSOR_COALESCING_READY_TARGET_SMALL_SCAN_ARMS))
+        self.assertEqual({row["writer"] for row in schedule}, {8, 16})
+        self.assertEqual({row["workload"] for row in schedule}, {"point"})
+        for writer, workload in CURSOR_COALESCING_READY_TARGET_SMALL_SCAN_CASES:
+            observed_orders = [
+                tuple(
+                    row["arm"] for row in schedule
+                    if row["writer"] == writer
+                    and row["workload"] == workload
+                    and row["repetition"] == repetition
+                )
+                for repetition in range(1, len(CURSOR_COALESCING_READY_TARGET_SMALL_SCAN_ORDERS) + 1)
+            ]
+            self.assertEqual(
+                set(observed_orders),
+                set(CURSOR_COALESCING_READY_TARGET_SMALL_SCAN_ORDERS),
+            )
+
+    def test_cursor_coalescing_ready_target_small_scan_fixture_verifies_all_50_runs(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            results = self._make_fixture(Path(temporary), coalescing_ready_target_small_scan=True)
+            schedule = build_cursor_coalescing_ready_target_small_scan_schedule()
+            self.assertEqual(len(schedule), 50)
+            self.assertTrue(BENCH._verify_result_set(results)["verified"])
+            verification = progress_ring_runner.verify_coalescing_ready_target_small_scan_results_directory(
+                results,
+            )
+            self.assertTrue(verification["verified"], verification["errors"])
+            summary = json.loads((results / "summary.json").read_text(encoding="utf-8"))
+            plan = json.loads((results / "benchmark-plan.json").read_text(encoding="utf-8"))
+            self.assertEqual(summary["suite"], "v8-cursor-coalescing-ready-target-small-scan")
+            self.assertEqual(plan["runs_planned"], 50)
+            self.assertEqual(plan["arms"], list(CURSOR_COALESCING_READY_TARGET_SMALL_SCAN_ARMS))
+            target1 = next(row for row in schedule if row["arm"] == "target_1")
+            target1_environment = (
+                results / progress_ring_runner._run_id(target1) / "environment.txt"
+            ).read_text(encoding="utf-8")
+            self.assertIn("TOYKV_BENCH_V8_COALESCE_READY_TARGET=1\n", target1_environment)
+
     def test_run_suite_writes_ready_target_scan_plan_and_schedule(self) -> None:
         binary = Path("scripts/gcp_v8_point_progress_ring_runner.py")
         binary_sha256 = self._sha256(binary)
@@ -1280,6 +1340,53 @@ class PointProgressRingQualificationTests(unittest.TestCase):
             self.assertEqual(plan["runs_planned"], 40)
             self.assertEqual(summary["suite"], "v8-cursor-coalescing-ready-target-scan")
             self.assertTrue(summary["complete"])
+
+    def test_run_suite_writes_ready_target_small_scan_plan_and_schedule(self) -> None:
+        binary = Path("scripts/gcp_v8_point_progress_ring_runner.py")
+        binary_sha256 = self._sha256(binary)
+        commit = "a" * 40
+
+        def fake_run_one(**kwargs: object) -> dict[str, object]:
+            row = kwargs["row"]
+            kwargs["on_subprocess_started"]()
+            raw = self._raw_record(row)
+            return {
+                **row,
+                "source_commit": commit,
+                "binary_sha256": binary_sha256,
+                "exit_code": 0,
+                "duration_seconds": 5.0,
+                **progress_ring_runner._validate_record(raw, row),
+            }
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args = SimpleNamespace(
+                commit=commit,
+                binary=binary,
+                binary_sha256=binary_sha256,
+                machine_type="c4-standard-16-lssd",
+                ssd_count=2,
+                ssd_gib=750,
+                writers="8,16",
+                results_dir=root / "results",
+                db_root=root / "db",
+                safe_deadline_epoch=4_000_000_000,
+                candidate_mode="coalescing-ready-target-small-scan",
+            )
+            with patch.object(progress_ring_runner, "_run_one", side_effect=fake_run_one):
+                self.assertEqual(progress_ring_runner.run_suite(args), 0)
+            plan = json.loads((args.results_dir / "benchmark-plan.json").read_text(encoding="utf-8"))
+            schedule_path = args.results_dir / "cursor-coalescing-ready-target-small-scan-schedule.tsv"
+            with schedule_path.open(encoding="utf-8", newline="") as stream:
+                rows = list(csv.DictReader(stream, delimiter="\t"))
+            self.assertEqual(plan["suite"], "v8-cursor-coalescing-ready-target-small-scan")
+            self.assertEqual(plan["runs_planned"], 50)
+            self.assertEqual(len(rows), 50)
+            summary = json.loads((args.results_dir / "summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(summary["suite"], plan["suite"])
+            self.assertTrue(summary["complete"])
+            self.assertEqual(summary["runs_completed"], 50)
 
     def test_cursor_publication_fixture_verifies_d2a_only_requalification(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1929,6 +2036,49 @@ class PointProgressRingQualificationTests(unittest.TestCase):
         with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
             BENCH.parse_args([*valid, "--num", "100001"])
 
+    def test_coalescing_ready_target_small_scan_cli_selects_fixed_50_run_matrix(self) -> None:
+        valid = [
+            "--project", "test-project", "--zone", "us-east1-b", "--commit", "a" * 40,
+            "--network", "walbench-isolated", "--subnet", "walbench-subnet",
+            "--ssh-source-range", "192.0.2.10/32", "--max-runtime-minutes", "60",
+            "--estimated-hourly-cost-usd", "1.5", "--max-estimated-spend-usd", "2",
+            "--v8-cursor-coalescing-ready-target-small-scan-ab", "--preflight-only",
+        ]
+        args = BENCH.parse_args(valid)
+        self.assertEqual(args.writers, CURSOR_COALESCING_READY_TARGET_SMALL_SCAN_WRITERS)
+        self.assertEqual(args.num, CURSOR_COALESCING_READY_TARGET_SMALL_SCAN_NUM)
+        self.assertEqual(args.machine_type, "c4-standard-16-lssd")
+        self.assertTrue(args.v8_cursor_coalescing_ready_target_small_scan_ab)
+        with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
+            BENCH.parse_args([*valid, "--writers", "16"])
+        with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
+            BENCH.parse_args([*valid, "--num", "100001"])
+
+    def test_ready_target_small_scan_preflight_records_the_fixed_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            results = Path(temporary) / "preflight"
+            with (
+                patch.object(BENCH, "Gcloud", return_value=Mock()),
+                patch.object(BENCH, "preflight", return_value={"zone": "us-east1-b"}),
+                patch.object(BENCH, "audit_ssh_firewall_rules"),
+            ):
+                status = BENCH.main([
+                    "--project", "test-project", "--zone", "us-east1-b", "--commit", "a" * 40,
+                    "--network", "walbench-isolated", "--subnet", "walbench-subnet",
+                    "--ssh-source-range", "192.0.2.10/32", "--skip-ssh-egress-check",
+                    "--max-runtime-minutes", "60", "--estimated-hourly-cost-usd", "1.5",
+                    "--max-estimated-spend-usd", "2", "--v8-cursor-coalescing-ready-target-small-scan-ab",
+                    "--preflight-only", "--results-dir", str(results),
+                ])
+            self.assertEqual(status, 0)
+            report = json.loads((results / "preflight.json").read_text(encoding="utf-8"))
+            self.assertEqual(report["benchmark_suite"], "v8-cursor-coalescing-ready-target-small-scan")
+            self.assertEqual(report["writer_counts"], [8, 16])
+            self.assertEqual(report["benchmark_plan"]["runs_planned"], 50)
+            self.assertEqual(
+                report["benchmark_plan"]["arms"], list(CURSOR_COALESCING_READY_TARGET_SMALL_SCAN_ARMS),
+            )
+
     def test_ready_target_scan_preflight_records_the_fixed_plan(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             results = Path(temporary) / "preflight"
@@ -2020,6 +2170,26 @@ class PointProgressRingQualificationTests(unittest.TestCase):
             "bash", str(remote_script), "a" * 40, "100000", "test-project", "us-central1-a",
             "wal-test", "4102444800", "c4-standard-16-lssd", "8,16",
             "v8-cursor-coalescing-ready-target-scan", "-", "-",
+        ]
+        accepted = subprocess.run(
+            command, cwd=Path(__file__).resolve().parents[1], capture_output=True,
+            check=False, text=True, timeout=5,
+            env={**os.environ, "TOYKV_GCP_BENCH_VALIDATE_ONLY": "1"},
+        )
+        self.assertNotEqual(accepted.returncode, 64, accepted.stderr)
+        rejected = subprocess.run(
+            [*command[:9], "16", *command[10:]], cwd=Path(__file__).resolve().parents[1],
+            capture_output=True, check=False, text=True, timeout=5,
+        )
+        self.assertEqual(rejected.returncode, 64)
+        self.assertIn("writers 8,16", rejected.stderr)
+
+    def test_remote_runner_accepts_small_ready_target_scan_only_for_fixed_matrix(self) -> None:
+        remote_script = Path(__file__).with_name("gcp-free-trial-wal-bench-remote.sh")
+        command = [
+            "bash", str(remote_script), "a" * 40, "100000", "test-project", "us-central1-a",
+            "wal-test", "4102444800", "c4-standard-16-lssd", "8,16",
+            "v8-cursor-coalescing-ready-target-small-scan", "-", "-",
         ]
         accepted = subprocess.run(
             command, cwd=Path(__file__).resolve().parents[1], capture_output=True,

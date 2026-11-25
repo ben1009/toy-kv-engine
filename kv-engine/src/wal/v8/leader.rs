@@ -2756,13 +2756,13 @@ fn coalesce_ready_target_from_value(
         .to_str()
         .with_context(|| format!("{WAL_V8_COALESCE_READY_TARGET_ENV} is not valid UTF-8"))?;
     let target = value.parse::<usize>().with_context(|| {
-        format!(
-            "invalid {WAL_V8_COALESCE_READY_TARGET_ENV} {value:?}; expected `4`, `6`, `8`, or `12`"
-        )
+            format!(
+                "invalid {WAL_V8_COALESCE_READY_TARGET_ENV} {value:?}; expected `1`, `2`, `3`, `4`, `6`, `8`, or `12`"
+            )
     })?;
     ensure!(
-        matches!(target, 4 | 6 | 8 | 12),
-        "invalid {WAL_V8_COALESCE_READY_TARGET_ENV} {value:?}; expected `4`, `6`, `8`, or `12`"
+        matches!(target, 1 | 2 | 3 | 4 | 6 | 8 | 12),
+        "invalid {WAL_V8_COALESCE_READY_TARGET_ENV} {value:?}; expected `1`, `2`, `3`, `4`, `6`, `8`, or `12`"
     );
     ensure!(
         progress_mode == WalV8ProgressMode::Cursor && direct_completion_enabled,
@@ -8257,7 +8257,7 @@ mod tests {
             coalesce_ready_target_from_value(None, WalV8ProgressMode::Cursor, true).unwrap(),
             None
         );
-        for value in ["4", "6", "8", "12"] {
+        for value in ["1", "2", "3", "4", "6", "8", "12"] {
             assert!(
                 coalesce_ready_target_from_value(
                     Some(OsStr::new(value)),
@@ -8268,7 +8268,7 @@ mod tests {
                 .is_some()
             );
         }
-        for value in ["0", "1", "100", "400", "invalid"] {
+        for value in ["0", "5", "100", "400", "invalid"] {
             assert!(
                 coalesce_ready_target_from_value(
                     Some(OsStr::new(value)),
@@ -8305,7 +8305,13 @@ mod tests {
     }
 
     #[test]
-    fn point1_prefix_does_not_reach_coalescing_targets() {
+    fn ready_target_one_uses_current_prefix_without_waiting_for_successors() {
+        assert!(!WalV8ParallelIo::coalesce_ready_target_reached(0, Some(1)));
+        assert!(WalV8ParallelIo::coalesce_ready_target_reached(1, Some(1)));
+        assert!(WalV8ParallelIo::coalesce_ready_target_reached(2, Some(1)));
+        assert!(!WalV8ParallelIo::coalesce_ready_target_reached(0, Some(2)));
+        assert!(!WalV8ParallelIo::coalesce_ready_target_reached(1, Some(2)));
+        assert!(WalV8ParallelIo::coalesce_ready_target_reached(2, Some(2)));
         assert!(!WalV8ParallelIo::coalesce_ready_target_reached(0, Some(8)));
         assert!(!WalV8ParallelIo::coalesce_ready_target_reached(1, Some(8)));
         assert!(!WalV8ParallelIo::coalesce_ready_target_reached(1, Some(12)));

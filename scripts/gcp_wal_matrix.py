@@ -189,6 +189,20 @@ CURSOR_COALESCING_READY_TARGET_SCAN_ORDERS = (
     ("target_8", "dynamic", "target_4", "target_6"),
 )
 CURSOR_COALESCING_READY_TARGET_SCAN_CASES = ((8, "point"), (16, "point"))
+CURSOR_COALESCING_READY_TARGET_SMALL_SCAN_WRITERS = (8, 16)
+CURSOR_COALESCING_READY_TARGET_SMALL_SCAN_REPETITIONS = 5
+CURSOR_COALESCING_READY_TARGET_SMALL_SCAN_NUM = 100_000
+CURSOR_COALESCING_READY_TARGET_SMALL_SCAN_ARMS = (
+    "dynamic", "target_1", "target_2", "target_3", "target_4",
+)
+CURSOR_COALESCING_READY_TARGET_SMALL_SCAN_ORDERS = (
+    ("dynamic", "target_1", "target_2", "target_3", "target_4"),
+    ("target_1", "target_2", "target_3", "target_4", "dynamic"),
+    ("target_2", "target_3", "target_4", "dynamic", "target_1"),
+    ("target_3", "target_4", "dynamic", "target_1", "target_2"),
+    ("target_4", "dynamic", "target_1", "target_2", "target_3"),
+)
+CURSOR_COALESCING_READY_TARGET_SMALL_SCAN_CASES = ((8, "point"), (16, "point"))
 POINT_PROGRESS_RING_ORDERS = (
     ("eager", "progress_ring"),
     ("progress_ring", "eager"),
@@ -1736,6 +1750,118 @@ def validate_cursor_coalescing_ready_target_scan_rows(
     rows: list[Mapping[str, object]],
 ) -> dict[str, object]:
     schedule = build_cursor_coalescing_ready_target_scan_schedule()
+    validation = _validate_point_progress_rows(rows, schedule)
+    expected_by_index = {row["run_index"]: row for row in schedule}
+    invalid_rows: list[Mapping[str, object]] = []
+    for row in rows:
+        expected = expected_by_index.get(row.get("run_index"))
+        if (
+            expected is None
+            or row.get("progress_cursor_enabled") is not True
+            or row.get("progress_counters_enabled") is not False
+            or row.get("cursor_direct_completion_enabled") is not True
+            or row.get("cursor_singleton_submission_enabled") is not False
+            or row.get("coalescing_ready_target") != expected["coalescing_ready_target"]
+            or row.get("point_buffer_preallocation_enabled") is not True
+        ):
+            invalid_rows.append(row)
+    if invalid_rows:
+        validation["complete"] = False
+        validation["invalid_rows"].extend(dict(row) for row in invalid_rows)
+    return validation
+
+
+def build_cursor_coalescing_ready_target_small_scan_schedule() -> list[dict[str, object]]:
+    """Build a 50-run Point8/16 Dynamic/Target1–4 parameter scan."""
+    schedule: list[dict[str, object]] = []
+    cases = CURSOR_COALESCING_READY_TARGET_SMALL_SCAN_CASES
+    for repetition in range(1, CURSOR_COALESCING_READY_TARGET_SMALL_SCAN_REPETITIONS + 1):
+        ordered_cases = cases if repetition % 2 else tuple(reversed(cases))
+        for writer, workload in ordered_cases:
+            case_index = cases.index((writer, workload))
+            order_index = (repetition - 1 + case_index) % len(
+                CURSOR_COALESCING_READY_TARGET_SMALL_SCAN_ORDERS
+            )
+            for arm in CURSOR_COALESCING_READY_TARGET_SMALL_SCAN_ORDERS[order_index]:
+                schedule.append({
+                    "run_index": len(schedule) + 1,
+                    "writer": writer,
+                    "workload": workload,
+                    "repetition": repetition,
+                    "arm": arm,
+                    "bench": "wal_concurrent",
+                    "batch_entries": 1,
+                    "batch_size": None,
+                    "num": CURSOR_COALESCING_READY_TARGET_SMALL_SCAN_NUM,
+                    "sample_every": 10,
+                    "coalescing_ready_target": {
+                        "dynamic": None,
+                        "target_1": 1,
+                        "target_2": 2,
+                        "target_3": 3,
+                        "target_4": 4,
+                    }[arm],
+                    "extent_mode": "sliding-point-lookahead",
+                    "extent_window_bytes": POINT_LOOKAHEAD_WINDOW_BYTES,
+                    "frontier_mode": "direct",
+                    "progress_ring_enabled": True,
+                    "progress_cursor_enabled": True,
+                    "progress_counters_enabled": False,
+                    "cursor_direct_completion_enabled": True,
+                    "cursor_singleton_submission_enabled": False,
+                    "point_buffer_preallocation_enabled": True,
+                    "scan_diagnostics_enabled": False,
+                })
+    return schedule
+
+
+def build_cursor_coalescing_ready_target_small_scan_plan(
+    *, machine_type: str, machine_spec: Mapping[str, int], commit: str,
+) -> dict[str, object]:
+    schedule = build_cursor_coalescing_ready_target_small_scan_schedule()
+    return {
+        "plan_schema_version": 1,
+        "suite": "v8-cursor-coalescing-ready-target-small-scan",
+        "commit": commit,
+        "machine_type": machine_type,
+        "machine_spec": dict(machine_spec),
+        "writers": list(CURSOR_COALESCING_READY_TARGET_SMALL_SCAN_WRITERS),
+        "workloads": ["point8", "point16"],
+        "arms": list(CURSOR_COALESCING_READY_TARGET_SMALL_SCAN_ARMS),
+        "repetitions": CURSOR_COALESCING_READY_TARGET_SMALL_SCAN_REPETITIONS,
+        "runs_planned": len(schedule),
+        "num": CURSOR_COALESCING_READY_TARGET_SMALL_SCAN_NUM,
+        "value_size_bytes": 1024,
+        "latency_sample_every": 10,
+        "runtime_protocol": {
+            "progress_mode": "cursor (2)",
+            "completion": "direct",
+            "singleton_submission": False,
+            "frontier_mode": "direct",
+            "extent_preparation": "1 MiB sliding-point-lookahead",
+            "extent_policy_scan_diagnostics": False,
+            "point_buffer_preallocation": "on",
+            "coalescing_ready_target": {
+                "dynamic": "unset; preserve runtime adaptive policy",
+                "target_1": 1,
+                "target_2": 2,
+                "target_3": 3,
+                "target_4": 4,
+            },
+        },
+        "qualification_note": (
+            "Same-host, same-source, same-release-binary exploratory Point8/Point16 scan. Five counterbalanced "
+            "repetitions compare Dynamic and ready-prefix targets 1–4 without profiling. Target1 exits once the "
+            "current ready prefix is nonempty and still submits the entire ready prefix; it does not force "
+            "single-ticket groups. Runtime target-hit counters prove the selected arm."
+        ),
+    }
+
+
+def validate_cursor_coalescing_ready_target_small_scan_rows(
+    rows: list[Mapping[str, object]],
+) -> dict[str, object]:
+    schedule = build_cursor_coalescing_ready_target_small_scan_schedule()
     validation = _validate_point_progress_rows(rows, schedule)
     expected_by_index = {row["run_index"]: row for row in schedule}
     invalid_rows: list[Mapping[str, object]] = []

@@ -33,6 +33,10 @@ from gcp_wal_matrix import (
     CURSOR_COALESCING_READY_TARGET_SCAN_CASES,
     CURSOR_COALESCING_READY_TARGET_SCAN_REPETITIONS,
     CURSOR_COALESCING_READY_TARGET_SCAN_WRITERS,
+    CURSOR_COALESCING_READY_TARGET_SMALL_SCAN_ARMS,
+    CURSOR_COALESCING_READY_TARGET_SMALL_SCAN_CASES,
+    CURSOR_COALESCING_READY_TARGET_SMALL_SCAN_REPETITIONS,
+    CURSOR_COALESCING_READY_TARGET_SMALL_SCAN_WRITERS,
     POINT_LOOKAHEAD_WINDOW_BYTES,
     POINT_PROGRESS_PLAN_SCHEMA_V1,
     POINT_PROGRESS_PLAN_SCHEMA_V2,
@@ -53,6 +57,8 @@ from gcp_wal_matrix import (
     build_cursor_coalescing_ready_target_schedule,
     build_cursor_coalescing_ready_target_scan_plan,
     build_cursor_coalescing_ready_target_scan_schedule,
+    build_cursor_coalescing_ready_target_small_scan_plan,
+    build_cursor_coalescing_ready_target_small_scan_schedule,
     build_cursor_singleton_submission_plan,
     build_cursor_singleton_submission_schedule,
     build_cursor_publication_plan,
@@ -76,6 +82,7 @@ from gcp_wal_matrix import (
     validate_cursor_coalescing_budget_rows,
     validate_cursor_coalescing_ready_target_rows,
     validate_cursor_coalescing_ready_target_scan_rows,
+    validate_cursor_coalescing_ready_target_small_scan_rows,
     validate_cursor_singleton_submission_rows,
     validate_cursor_publication_rows,
 )
@@ -230,8 +237,8 @@ def _environment(
             raise ValueError("coalescing budget override must be 100 or 400 μs")
         environment["TOYKV_WAL_V8_COALESCE_BUDGET_US"] = str(coalescing_budget_us)
     if coalescing_ready_target is not None:
-        if coalescing_ready_target not in (4, 6, 8, 12):
-            raise ValueError("coalescing ready target must be 4, 6, 8, or 12")
+        if coalescing_ready_target not in (1, 2, 3, 4, 6, 8, 12):
+            raise ValueError("coalescing ready target must be 1, 2, 3, 4, 6, 8, or 12")
         environment["TOYKV_BENCH_V8_COALESCE_READY_TARGET"] = str(coalescing_ready_target)
     if point_buffer_preallocation_enabled is not None:
         environment["TOYKV_BENCH_V8_POINT_BUFFER_PREALLOC"] = (
@@ -913,6 +920,7 @@ def _run_one(
         bool(row["point_buffer_preallocation_enabled"])
         if cursor_publication_suite or dedicated_durability_suite or candidate_mode in (
             "completion-wake", "coalescing-ready-target", "coalescing-ready-target-scan",
+            "coalescing-ready-target-small-scan",
         ) else None
     )
     environment = (
@@ -950,7 +958,10 @@ def _run_one(
             ),
             coalescing_ready_target=(
                 row["coalescing_ready_target"]
-                if candidate_mode in ("coalescing-ready-target", "coalescing-ready-target-scan") else None
+                if candidate_mode in (
+                    "coalescing-ready-target", "coalescing-ready-target-scan",
+                    "coalescing-ready-target-small-scan",
+                ) else None
             ),
         )
     )
@@ -988,7 +999,10 @@ def _run_one(
             ),
             coalescing_ready_target=(
                 row["coalescing_ready_target"]
-                if candidate_mode in ("coalescing-ready-target", "coalescing-ready-target-scan") else None
+                if candidate_mode in (
+                    "coalescing-ready-target", "coalescing-ready-target-scan",
+                    "coalescing-ready-target-small-scan",
+                ) else None
             ),
         ), encoding="utf-8",
     )
@@ -2565,6 +2579,109 @@ def _coalescing_ready_target_scan_summary(
     }
 
 
+def _coalescing_ready_target_small_scan_summary(
+    rows: list[dict[str, Any]], writers: tuple[int, ...], planned: int,
+) -> dict[str, Any]:
+    validation = validate_cursor_coalescing_ready_target_small_scan_rows(rows)
+    arms = CURSOR_COALESCING_READY_TARGET_SMALL_SCAN_ARMS
+    cases = tuple(
+        (writer, workload)
+        for writer, workload in CURSOR_COALESCING_READY_TARGET_SMALL_SCAN_CASES
+        if writer in writers
+    )
+    comparisons: list[dict[str, Any]] = []
+    for writer, workload in cases:
+        by_repetition = {
+            repetition: {
+                row["arm"]: row for row in rows
+                if row.get("writer") == writer and row.get("workload") == workload
+                and row.get("repetition") == repetition
+            }
+            for repetition in range(1, CURSOR_COALESCING_READY_TARGET_SMALL_SCAN_REPETITIONS + 1)
+        }
+        for arm in arms[1:]:
+            paired = [
+                (pair["dynamic"], pair[arm]) for pair in by_repetition.values()
+                if "dynamic" in pair and arm in pair
+                and pair["dynamic"].get("exit_code") == 0 and pair[arm].get("exit_code") == 0
+            ]
+            throughput_changes = [
+                (candidate["puts_per_second"] / baseline["puts_per_second"] - 1.0) * 100.0
+                for baseline, candidate in paired
+            ]
+            p99_changes = [
+                (candidate["p99_ms"] / baseline["p99_ms"] - 1.0) * 100.0
+                for baseline, candidate in paired
+            ]
+            comparisons.append({
+                "writer": writer,
+                "workload": workload,
+                "baseline": "dynamic",
+                "candidate": arm,
+                "paired_runs": len(paired),
+                "paired_throughput_change_pct_median": median(throughput_changes) if paired else None,
+                "paired_throughput_wins": sum(change > 0 for change in throughput_changes),
+                "paired_cpu_us_per_put_change_median": median([
+                    candidate["cpu_us_per_put"] - baseline["cpu_us_per_put"]
+                    for baseline, candidate in paired
+                ]) if paired else None,
+                "paired_p99_change_pct_median": median(p99_changes) if paired else None,
+                "paired_sync_count_change_median": median([
+                    candidate["sync_count"] - baseline["sync_count"]
+                    for baseline, candidate in paired
+                ]) if paired else None,
+                "paired_puts_per_sync_change_median": median([
+                    candidate["puts_per_sync"] - baseline["puts_per_sync"]
+                    for baseline, candidate in paired
+                ]) if paired else None,
+                "candidate_ready_target_hits": sum(
+                    int(candidate["coalescing_ready_target_hits"]) for _, candidate in paired
+                ),
+                "candidate_sync_count": sum(int(candidate["sync_count"]) for _, candidate in paired),
+            })
+
+    target_usage: list[dict[str, Any]] = []
+    for writer, workload in cases:
+        for arm in arms:
+            matching = [
+                row for row in rows
+                if row.get("writer") == writer and row.get("workload") == workload
+                and row.get("arm") == arm
+            ]
+            sync_count = sum(int(row["sync_count"]) for row in matching)
+            hits = sum(int(row["coalescing_ready_target_hits"]) for row in matching)
+            target_usage.append({
+                "writer": writer,
+                "workload": workload,
+                "arm": arm,
+                "configured_target": matching[0]["coalescing_ready_target"] if matching else None,
+                "runs": len(matching),
+                "target_hits": hits,
+                "sync_count": sync_count,
+                "target_hits_per_sync": hits / sync_count if sync_count else None,
+            })
+    return {
+        "suite": "v8-cursor-coalescing-ready-target-small-scan",
+        "complete": len(rows) == planned and validation["complete"],
+        "runs_started": len(rows),
+        "runs_completed": sum(row.get("exit_code") == 0 for row in rows),
+        "runs_planned": planned,
+        "writers": list(writers),
+        "workloads": ["point8", "point16"],
+        "arms": list(arms),
+        "results": rows,
+        "matrix_validation": validation,
+        "target_usage": target_usage,
+        "comparison": comparisons,
+        "qualification_note": (
+            "Same-host, same-source, same-release-binary exploratory Point8/Point16 scan. Dynamic and ready-prefix "
+            "targets 1–4 are counterbalanced. Target1 exits with the current nonempty ready prefix and preserves "
+            "the entire prefix; it does not force single-ticket groups. Target hits are reported against sync count; "
+            "scoring runs have no profiling."
+        ),
+    }
+
+
 def run_suite(args: argparse.Namespace) -> int:
     if len(args.commit) != 40 or any(char not in "0123456789abcdef" for char in args.commit):
         raise ValueError("commit must be a full lowercase 40-character SHA")
@@ -2588,6 +2705,8 @@ def run_suite(args: argparse.Namespace) -> int:
         POINT_RESOURCE_RETIREMENT_WRITERS if candidate_mode in (
             "point-resource-retirement", "point-resource-retirement-stage-a",
         ) else
+        CURSOR_COALESCING_READY_TARGET_SMALL_SCAN_WRITERS
+        if candidate_mode == "coalescing-ready-target-small-scan" else
         CURSOR_COALESCING_READY_TARGET_SCAN_WRITERS
         if candidate_mode == "coalescing-ready-target-scan" else
         CURSOR_COALESCING_READY_TARGET_WRITERS if candidate_mode == "coalescing-ready-target" else
@@ -2681,6 +2800,15 @@ def run_suite(args: argparse.Namespace) -> int:
         )
         schedule_filename = "cursor-coalescing-ready-target-scan-schedule.tsv"
         summarize = _coalescing_ready_target_scan_summary
+    elif candidate_mode == "coalescing-ready-target-small-scan":
+        schedule = build_cursor_coalescing_ready_target_small_scan_schedule()
+        plan = build_cursor_coalescing_ready_target_small_scan_plan(
+            machine_type=args.machine_type,
+            machine_spec={"vcpus": 16, "ssd_count": args.ssd_count, "ssd_gib": args.ssd_gib},
+            commit=args.commit,
+        )
+        schedule_filename = "cursor-coalescing-ready-target-small-scan-schedule.tsv"
+        summarize = _coalescing_ready_target_small_scan_summary
     elif candidate_mode == "v7-v8-point-preallocation":
         schedule = build_v7_v8_point_preallocation_schedule()
         plan = build_v7_v8_point_preallocation_plan(
@@ -3594,9 +3722,16 @@ def verify_coalescing_ready_target_scan_results_directory(results: Path) -> dict
     return _verify_coalescing_ready_target_results_directory(results, scan=True)
 
 
+def verify_coalescing_ready_target_small_scan_results_directory(results: Path) -> dict[str, Any]:
+    """Strictly verify the 50-run Point8/16 Dynamic/Target1–4 archive."""
+    return _verify_coalescing_ready_target_results_directory(results, small_scan=True)
+
+
 def _verify_coalescing_ready_target_results_directory(
-    results: Path, *, scan: bool,
+    results: Path, *, scan: bool = False, small_scan: bool = False,
 ) -> dict[str, Any]:
+    if scan and small_scan:
+        return {"verified": False, "errors": ["select at most one ready-target scan schema"]}
     errors: list[str] = []
     try:
         summary = json.loads((results / "summary.json").read_text(encoding="utf-8"))
@@ -3607,29 +3742,45 @@ def _verify_coalescing_ready_target_results_directory(
         if not all(isinstance(value, dict) for value in (summary, remote_exit, plan)):
             raise ValueError("summary, remote-exit, and plan must be JSON objects")
         schedule = (
-            build_cursor_coalescing_ready_target_scan_schedule()
-            if scan else build_cursor_coalescing_ready_target_schedule()
+            build_cursor_coalescing_ready_target_small_scan_schedule() if small_scan else
+            build_cursor_coalescing_ready_target_scan_schedule() if scan else
+            build_cursor_coalescing_ready_target_schedule()
         )
         plan_builder = (
-            build_cursor_coalescing_ready_target_scan_plan
-            if scan else build_cursor_coalescing_ready_target_plan
+            build_cursor_coalescing_ready_target_small_scan_plan if small_scan else
+            build_cursor_coalescing_ready_target_scan_plan if scan else
+            build_cursor_coalescing_ready_target_plan
         )
         expected_plan = plan_builder(
             machine_type="c4-standard-16-lssd",
             machine_spec={"vcpus": 16, "ssd_count": 2, "ssd_gib": 750},
             commit=commit,
         )
-        suite = "v8-cursor-coalescing-ready-target-scan" if scan else "v8-cursor-coalescing-ready-target"
+        suite = (
+            "v8-cursor-coalescing-ready-target-small-scan" if small_scan else
+            "v8-cursor-coalescing-ready-target-scan" if scan else
+            "v8-cursor-coalescing-ready-target"
+        )
         schedule_filename = (
-            "cursor-coalescing-ready-target-scan-schedule.tsv"
-            if scan else "cursor-coalescing-ready-target-schedule.tsv"
+            "cursor-coalescing-ready-target-small-scan-schedule.tsv" if small_scan else
+            "cursor-coalescing-ready-target-scan-schedule.tsv" if scan else
+            "cursor-coalescing-ready-target-schedule.tsv"
         )
-        writers = CURSOR_COALESCING_READY_TARGET_SCAN_WRITERS if scan else CURSOR_COALESCING_READY_TARGET_WRITERS
+        writers = (
+            CURSOR_COALESCING_READY_TARGET_SMALL_SCAN_WRITERS if small_scan else
+            CURSOR_COALESCING_READY_TARGET_SCAN_WRITERS if scan else
+            CURSOR_COALESCING_READY_TARGET_WRITERS
+        )
         validate_rows = (
-            validate_cursor_coalescing_ready_target_scan_rows
-            if scan else validate_cursor_coalescing_ready_target_rows
+            validate_cursor_coalescing_ready_target_small_scan_rows if small_scan else
+            validate_cursor_coalescing_ready_target_scan_rows if scan else
+            validate_cursor_coalescing_ready_target_rows
         )
-        summarize = _coalescing_ready_target_scan_summary if scan else _coalescing_ready_target_summary
+        summarize = (
+            _coalescing_ready_target_small_scan_summary if small_scan else
+            _coalescing_ready_target_scan_summary if scan else
+            _coalescing_ready_target_summary
+        )
         if plan != expected_plan:
             errors.append("benchmark plan differs from the fixed coalescing ready-target suite")
         if len(commit) != 40 or any(char not in "0123456789abcdef" for char in commit):
@@ -3761,6 +3912,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "cursor", "direct-completion", "completion-wake", "singleton-submission", "cursor-publication",
             "coalescing-budget", "coalescing-ready-target",
             "coalescing-ready-target-scan",
+            "coalescing-ready-target-small-scan",
             "v7-v8-point-preallocation",
         ),
         default="cursor",
