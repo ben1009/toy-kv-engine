@@ -109,6 +109,9 @@ remains the default.
 The [ready-target A/B](benchmarks/rfc-028-v8-cursor-coalescing-ready-target-gcp-20261125.md)
 missed the overall gate: Target8 gained 7.57% at Point16, but lost 3.44% at
 Point8; Target12 stayed below the Point16 threshold. Dynamic remains the default.
+The [ready-target parameter scan](benchmarks/rfc-028-v8-cursor-coalescing-ready-target-scan-gcp-20261125.md)
+found Target4 ahead at Point16 (+10.02%) and Point8 (+3.03%), but it missed the
+5% gate at Point8. CPU/Put rose and Puts/Sync fell; Dynamic remains the default.
 The [D1 ACK-check A/B](benchmarks/rfc-028-v8-point-ack-d1-gcp-20261124.md)
 found no stable throughput gain from consolidating the Coordinator ACK checks;
 Point16 was 1.86% slower in paired median.
@@ -318,6 +321,7 @@ experiments. Each report records its own outcome and measurement limits.
 - [RFC 028 V8 Cursor coalescing GCP diagnostic — progress-token wait dominates sampled coalescing wall time, 2026-11-23](benchmarks/rfc-028-v8-cursor-coalescing-gcp-20261123.md)
 - [RFC 028 V8 Cursor coalescing-budget A/B — fixed 400 μs wins consistently but misses the throughput gate, 2026-11-23](benchmarks/rfc-028-v8-cursor-coalescing-budget-gcp-20261123.md)
 - [RFC 028 V8 Cursor coalescing ready-target A/B — Point16 Target8 gain, overall gate failed, 2026-11-25](benchmarks/rfc-028-v8-cursor-coalescing-ready-target-gcp-20261125.md)
+- [RFC 028 V8 Cursor coalescing ready-target parameter scan — Target4 led Point16, Point8 gate missed, 2026-11-25](benchmarks/rfc-028-v8-cursor-coalescing-ready-target-scan-gcp-20261125.md)
 - [RFC 028 V8 Point buffer preallocation GCP A/B — Point8 +9.59%, Point16 +3.88%, 2026-11-23](benchmarks/rfc-028-v8-point-buffer-preallocation-gcp-20261123.md)
 - [RFC 028 V7/V8 Point buffer preallocation same-host qualification — Point8 +9.78%, Point16 +4.15%, 2026-11-23](benchmarks/rfc-028-v7-v8-point-preallocation-same-host-gcp-20261123.md)
 - [RFC 028 V8 Point resource preclaim Stage B A/B — throughput gate failed, 2026-11-23](benchmarks/rfc-028-v8-point-resource-preclaim-stage-b-gcp-20261123.md)
