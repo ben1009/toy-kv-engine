@@ -40441,9 +40441,9 @@ mod tests {
 
     #[cfg(all(target_os = "linux", feature = "bench"))]
     #[test]
-    fn v8_cursor_select_mode_is_inherited_across_engine_rotation_and_recovery() -> anyhow::Result<()>
-    {
-        crate::wal::v8::leader::with_cursor_direct_completion_select_for_test(|| {
+    fn v8_cursor_direct_completion_mode_is_inherited_across_engine_rotation_and_recovery()
+    -> anyhow::Result<()> {
+        crate::wal::v8::leader::with_cursor_direct_completion_for_test(|| {
             use crate::pitr::api::{PersistedPitrConfig, PitrOptions, PitrRuntimeOptions};
             use crate::tests::harness::is_io_uring_unavailable_error;
             use crate::wal::WalIoMode;
@@ -40497,7 +40497,7 @@ mod tests {
                 first_memtable
                     .benchmark_wal_io_diagnostics()
                     .is_some_and(
-                        |diagnostics| diagnostics.cursor_direct_completion_select_wake_enabled
+                        |diagnostics| !diagnostics.cursor_direct_completion_select_wake_enabled
                     )
             );
             engine.put(BEFORE_ROTATION, VALUE)?;
@@ -40513,7 +40513,7 @@ mod tests {
                 second_memtable
                     .benchmark_wal_io_diagnostics()
                     .is_some_and(
-                        |diagnostics| diagnostics.cursor_direct_completion_select_wake_enabled
+                        |diagnostics| !diagnostics.cursor_direct_completion_select_wake_enabled
                     )
             );
             engine.put(AFTER_ROTATION, VALUE)?;
@@ -40537,7 +40537,7 @@ mod tests {
                     .memtable
                     .benchmark_wal_io_diagnostics()
                     .is_some_and(
-                        |diagnostics| diagnostics.cursor_direct_completion_select_wake_enabled
+                        |diagnostics| !diagnostics.cursor_direct_completion_select_wake_enabled
                     )
             );
             assert_eq!(reopened.get(BEFORE_ROTATION)?.as_deref(), Some(VALUE));

@@ -75,17 +75,6 @@ pub(crate) enum WalV8ProgressMode {
     Cursor,
 }
 
-/// Selects whether direct DATA completion also posts the capacity-one
-/// progress token. `Select` keeps the token for control progress and waits on
-/// the completion queue directly.
-#[cfg(feature = "bench")]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) enum WalV8DirectCompletionWakeMode {
-    #[default]
-    Token,
-    Select,
-}
-
 impl WalV8ProgressMode {
     pub(crate) fn uses_ring(self) -> bool {
         self == Self::Cursor
@@ -127,7 +116,6 @@ pub(crate) struct WalV8ParallelCoordinator {
 #[derive(Clone)]
 pub(crate) struct WalV8WorkerCompletionHandle {
     coordinator: WalV8ParallelCoordinator,
-    completion_token_wake_enabled: bool,
 }
 
 impl WalV8WorkerCompletionHandle {
@@ -136,11 +124,7 @@ impl WalV8WorkerCompletionHandle {
             self.coordinator.progress_ring_enabled(),
             "direct completion notification requires Cursor progress mode"
         );
-        if self.completion_token_wake_enabled {
-            try_signal_progress_token(&self.coordinator.inner)
-        } else {
-            Ok(())
-        }
+        try_signal_progress_token(&self.coordinator.inner)
     }
 
     #[cfg(feature = "bench")]
@@ -951,18 +935,6 @@ impl WalV8ParallelCoordinator {
     pub(crate) fn worker_completion_handle(&self) -> WalV8WorkerCompletionHandle {
         WalV8WorkerCompletionHandle {
             coordinator: self.clone(),
-            completion_token_wake_enabled: true,
-        }
-    }
-
-    #[cfg(feature = "bench")]
-    pub(crate) fn worker_completion_handle_with_wake_mode(
-        &self,
-        mode: WalV8DirectCompletionWakeMode,
-    ) -> WalV8WorkerCompletionHandle {
-        WalV8WorkerCompletionHandle {
-            coordinator: self.clone(),
-            completion_token_wake_enabled: mode == WalV8DirectCompletionWakeMode::Token,
         }
     }
 
