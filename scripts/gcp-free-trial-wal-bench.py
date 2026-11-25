@@ -1246,9 +1246,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     suite_group.add_argument("--v7-v8-point-preallocation-ab", action="store_true",
                              help="Compare V7, V8 Point preallocation off/on, and Batch64 regression guardrail")
     suite_group.add_argument("--v8-point-resource-retirement-ab", action="store_true",
-                             help="Compare V8 Point per-ticket, detached, and batched resource retirement")
+                             help="Retired historical suite; kept only to provide an explanatory error")
     suite_group.add_argument("--v8-point-resource-retirement-stage-a-ab", action="store_true",
-                             help="Repeat the retirement matrix with Point buffer preallocation enabled")
+                             help="Retired historical suite; kept only to provide an explanatory error")
     suite_group.add_argument("--v8-point-ack-d1-ab", action="store_true",
                              help="Compare D1 Coordinator ACK checks with Stage A enabled and retirement mode 0")
     suite_group.add_argument(
@@ -1288,6 +1288,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Use a manually verified SSH source CIDR when the HTTPS lookup cannot verify that route",
     )
     args = parser.parse_args(argv)
+    if args.v8_point_resource_retirement_ab or args.v8_point_resource_retirement_stage_a_ab:
+        parser.error(
+            "Point resource-retirement suites are retired historical experiments; "
+            "their archived results remain verifiable but cannot be executed"
+        )
     point_cursor_direct_completion_suite = args.v8_cursor_direct_completion_ab
     point_cursor_singleton_submission_suite = args.v8_cursor_singleton_submission_ab
     point_cursor_coalescing_budget_suite = args.v8_cursor_coalescing_budget_ab

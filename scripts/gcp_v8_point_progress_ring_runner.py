@@ -2162,6 +2162,11 @@ def run_suite(args: argparse.Namespace) -> int:
     if _sha256_file(binary) != args.binary_sha256:
         raise ValueError("write-perf binary SHA-256 does not match its recorded identity")
     candidate_mode = getattr(args, "candidate_mode", "cursor")
+    if candidate_mode in ("point-resource-retirement", "point-resource-retirement-stage-a"):
+        raise ValueError(
+            "Point resource-retirement modes are retired historical experiments; "
+            "archived results may be verified but the suite cannot be executed"
+        )
     if args.machine_type != "c4-standard-16-lssd" or args.ssd_count != 2 or args.ssd_gib != 750:
         raise ValueError("Cursor qualification requires c4-standard-16-lssd and two Local SSDs")
     writers = tuple(int(value) for value in args.writers.split(","))
@@ -3028,7 +3033,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--candidate-mode",
         choices=(
             "cursor", "direct-completion", "singleton-submission", "cursor-publication", "coalescing-budget",
-            "v7-v8-point-preallocation", "point-resource-retirement", "point-resource-retirement-stage-a",
+            "v7-v8-point-preallocation",
         ),
         default="cursor",
     )

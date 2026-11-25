@@ -19,6 +19,11 @@ SOURCE_PATCH_SHA256="${10}"
 BASELINE_COMMIT="${11}"
 REPETITIONS="${12:-1}"
 RUNNER_BUNDLE_SHA256="${13:--}"
+if [[ "$SUITE" == "v8-point-resource-retirement" || \
+    "$SUITE" == "v8-point-resource-retirement-stage-a" ]]; then
+    echo "retired historical benchmark suite; archived results remain verifiable but cannot be executed: $SUITE" >&2
+    exit 64
+fi
 if [[ ! "$REPETITIONS" =~ ^[1-9][0-9]*$ ]]; then
     echo "repetitions must be a positive integer: $REPETITIONS" >&2
     exit 64
@@ -57,8 +62,6 @@ if [[ "$SUITE" != "batch64" && "$SUITE" != "rfc026-full" \
      && "$SUITE" != "v8-cursor-coalescing-budget" \
      && "$SUITE" != "v8-cursor-publication" \
      && "$SUITE" != "v7-v8-point-preallocation" \
-     && "$SUITE" != "v8-point-resource-retirement" \
-     && "$SUITE" != "v8-point-resource-retirement-stage-a" \
      && "$SUITE" != "v8-point-ack-d1" \
      && "$SUITE" != "v8-dedicated-durability-driver" ]]; then
     echo "unsupported benchmark suite: $SUITE" >&2

@@ -1149,29 +1149,45 @@ class PointProgressRingQualificationTests(unittest.TestCase):
             self.assertFalse(verification["verified"])
             self.assertTrue(any("preallocation" in error for error in verification["errors"]))
 
-    def test_point_resource_retirement_cli_uses_fixed_matrix(self) -> None:
-        args = BENCH.parse_args([
+    def test_point_resource_retirement_cli_is_retired(self) -> None:
+        base_args = [
             "--commit", "a" * 40, "--project", "test-project", "--zone", "us-central1-a",
             "--network", "isolated-bench", "--subnet", "isolated-subnet", "--ssh-source-range", "192.0.2.1/32",
-            "--machine-type", "c4-standard-16-lssd", "--v8-point-resource-retirement-ab",
-            "--max-runtime-minutes", "60", "--estimated-hourly-cost-usd", "0.01",
-            "--max-estimated-spend-usd", "1", "--preflight-only",
-        ])
-        self.assertEqual(args.writers, POINT_RESOURCE_RETIREMENT_WRITERS)
-        self.assertEqual(args.num, POINT_RESOURCE_RETIREMENT_NUM)
+            "--machine-type", "c4-standard-16-lssd", "--max-runtime-minutes", "60",
+            "--estimated-hourly-cost-usd", "0.01", "--max-estimated-spend-usd", "1", "--preflight-only",
+        ]
+        for flag in ("--v8-point-resource-retirement-ab", "--v8-point-resource-retirement-stage-a-ab"):
+            stderr = StringIO()
+            with self.subTest(flag=flag), redirect_stderr(stderr), self.assertRaises(SystemExit) as raised:
+                BENCH.parse_args([*base_args, flag])
+            self.assertEqual(raised.exception.code, 2)
+            self.assertIn("retired historical experiments", stderr.getvalue())
 
-    def test_point_resource_retirement_stage_a_cli_uses_fixed_matrix(self) -> None:
-        args = BENCH.parse_args([
-            "--commit", "a" * 40, "--project", "test-project", "--zone", "us-central1-a",
-            "--network", "isolated-bench", "--subnet", "isolated-subnet", "--ssh-source-range", "192.0.2.1/32",
-            "--machine-type", "c4-standard-16-lssd", "--v8-point-resource-retirement-stage-a-ab",
-            "--max-runtime-minutes", "60", "--estimated-hourly-cost-usd", "0.01",
-            "--max-estimated-spend-usd", "1", "--preflight-only",
-        ])
-        self.assertEqual(args.writers, POINT_RESOURCE_RETIREMENT_WRITERS)
-        self.assertEqual(args.num, POINT_RESOURCE_RETIREMENT_NUM)
+        runner_args = [
+            "--binary", "/tmp/write-perf",
+            "--results-dir", "/tmp/results",
+            "--db-root", "/tmp/db",
+            "--writers", "8,16",
+            "--safe-deadline-epoch", "4102444800",
+            "--commit", "a" * 40,
+            "--binary-sha256", "b" * 64,
+            "--machine-type", "c4-standard-16-lssd",
+            "--ssd-count", "2",
+            "--ssd-gib", "750",
+        ]
+        for candidate_mode in ("point-resource-retirement", "point-resource-retirement-stage-a"):
+            stderr = StringIO()
+            with (
+                self.subTest(candidate_mode=candidate_mode),
+                redirect_stderr(stderr),
+                self.assertRaises(SystemExit) as raised,
+            ):
+                progress_ring_runner.parse_args([
+                    *runner_args, "--candidate-mode", candidate_mode,
+                ])
+            self.assertEqual(raised.exception.code, 2)
 
-    def test_remote_runner_accepts_point_resource_retirement_suite(self) -> None:
+    def test_remote_runner_rejects_retired_point_resource_retirement_suite(self) -> None:
         remote_script = Path(__file__).with_name("gcp-free-trial-wal-bench-remote.sh")
         for suite in ("v8-point-resource-retirement", "v8-point-resource-retirement-stage-a"):
             with self.subTest(suite=suite):
@@ -1186,8 +1202,8 @@ class PointProgressRingQualificationTests(unittest.TestCase):
                     text=True,
                     timeout=5,
                 )
-                self.assertNotEqual(completed.returncode, 64)
-                self.assertNotIn("unsupported benchmark suite", completed.stderr)
+                self.assertEqual(completed.returncode, 64)
+                self.assertIn("retired historical benchmark suite", completed.stderr)
 
     def test_run_suite_writes_separate_direct_completion_plan_and_schedule(self) -> None:
         binary = Path("scripts/gcp_v8_point_progress_ring_runner.py")
