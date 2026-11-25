@@ -309,6 +309,7 @@ experiments. Each report records its own outcome and measurement limits.
 - [RFC 028 V8 Point D1 ACK-check GCP A/B — no stable throughput gain, 2026-11-24](benchmarks/rfc-028-v8-point-ack-d1-gcp-20261124.md)
 - [RFC 028 V8 Dedicated Durability Driver D3a GCP A/B — no broad throughput win, 2026-11-24](benchmarks/rfc-028-v8-dedicated-durability-driver-gcp-20261124.md)
 - [RFC 028 V8 Independent ACK Waiter D3b GCP A/B — no throughput win, 2026-11-25](benchmarks/rfc-028-v8-independent-ack-gcp-20261125.md)
+- [RFC 028 V8 Cursor Direct Completion Wake Token/Select GCP A/B — no throughput win, 2026-11-25](benchmarks/rfc-028-v8-cursor-direct-completion-wake-gcp-20261125.md)
 - [RFC 028 V8 cursor publication D2a/D2b historical GCP A/B — baseline was not a full pre-D2 restore, 2026-11-24](benchmarks/rfc-028-v8-cursor-publication-d2-gcp-20261124.md)
 - [RFC 028 V8 cursor publication D2a requalification — below throughput gate, 2026-11-24](benchmarks/rfc-028-v8-cursor-publication-d2a-gcp-requalification-20261124.md)
 - [RFC 028 V8 Cursor coalescing GCP diagnostic — progress-token wait dominates sampled coalescing wall time, 2026-11-23](benchmarks/rfc-028-v8-cursor-coalescing-gcp-20261123.md)
