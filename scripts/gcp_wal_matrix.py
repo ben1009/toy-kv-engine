@@ -1654,9 +1654,10 @@ def build_cursor_coalescing_ready_target_scan_schedule() -> list[dict[str, objec
             if repetition % 2
             else tuple(reversed(CURSOR_COALESCING_READY_TARGET_SCAN_CASES))
         )
-        for case_index, (writer, workload) in enumerate(cases):
+        for writer, workload in cases:
+            case_index = CURSOR_COALESCING_READY_TARGET_SCAN_CASES.index((writer, workload))
             order = CURSOR_COALESCING_READY_TARGET_SCAN_ORDERS[
-                (repetition + case_index - 1) % len(CURSOR_COALESCING_READY_TARGET_SCAN_ORDERS)
+                (repetition - 1 + case_index) % len(CURSOR_COALESCING_READY_TARGET_SCAN_ORDERS)
             ]
             for arm in order:
                 schedule.append({

@@ -54,7 +54,9 @@ from gcp_wal_matrix import (
     CURSOR_COALESCING_READY_TARGET_NUM,
     CURSOR_COALESCING_READY_TARGET_WRITERS,
     CURSOR_COALESCING_READY_TARGET_SCAN_ARMS,
+    CURSOR_COALESCING_READY_TARGET_SCAN_CASES,
     CURSOR_COALESCING_READY_TARGET_SCAN_NUM,
+    CURSOR_COALESCING_READY_TARGET_SCAN_ORDERS,
     CURSOR_COALESCING_READY_TARGET_SCAN_WRITERS,
     CURSOR_PUBLICATION_ARMS,
     CURSOR_PUBLICATION_NUM,
@@ -1182,6 +1184,19 @@ class PointProgressRingQualificationTests(unittest.TestCase):
             verification = progress_ring_runner.verify_coalescing_ready_target_results_directory(results)
             self.assertFalse(verification["verified"])
             self.assertTrue(any("metrics differ" in error for error in verification["errors"]))
+
+    def test_ready_target_scan_rotates_every_workload_through_all_arm_orders(self) -> None:
+        schedule = build_cursor_coalescing_ready_target_scan_schedule()
+        for writer, workload in CURSOR_COALESCING_READY_TARGET_SCAN_CASES:
+            observed_orders = []
+            for repetition in range(1, len(CURSOR_COALESCING_READY_TARGET_SCAN_ORDERS) + 1):
+                observed_orders.append(tuple(
+                    row["arm"] for row in schedule
+                    if row["writer"] == writer
+                    and row["workload"] == workload
+                    and row["repetition"] == repetition
+                ))
+            self.assertEqual(set(observed_orders), set(CURSOR_COALESCING_READY_TARGET_SCAN_ORDERS))
 
     def test_cursor_coalescing_ready_target_scan_fixture_verifies_all_40_runs(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
