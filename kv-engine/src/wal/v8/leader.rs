@@ -13183,6 +13183,7 @@ mod tests {
             Err(error) => return Err(error),
         };
         let profile = Arc::new(crate::mem_table::WriteProfile::default());
+        writer.coordinator.set_progress_counters_enabled(true)?;
         writer.set_write_profile(Arc::clone(&profile))?;
         writer.set_wal_sync_diagnostics_enabled(&profile, true)?;
 
@@ -13204,12 +13205,32 @@ mod tests {
             .context("warm writer lost progress diagnostics")?;
 
         append(20)?;
-        let end = writer
+        // The wakeup can let the driver finish before the sender records its
+        // diagnostic counter, so wait for that trailing update before checking.
+        let token_deadline = Instant::now() + Duration::from_secs(5);
+        let mut end = writer
             .io_diagnostics()
             .progress_diagnostics
             .context("timed writer lost progress diagnostics")?;
-        assert!(end.token_attempts > start.token_attempts, "{mode:?}");
-        assert!(end.owner_scans > start.owner_scans, "{mode:?}");
+        while end.token_attempts <= start.token_attempts && Instant::now() < token_deadline {
+            std::thread::yield_now();
+            end = writer
+                .io_diagnostics()
+                .progress_diagnostics
+                .context("timed writer lost progress diagnostics")?;
+        }
+        assert!(
+            end.token_attempts > start.token_attempts,
+            "{mode:?}: progress token attempts did not advance ({} -> {})",
+            start.token_attempts,
+            end.token_attempts
+        );
+        assert!(
+            end.owner_scans > start.owner_scans,
+            "{mode:?}: owner scans did not advance ({} -> {})",
+            start.owner_scans,
+            end.owner_scans
+        );
         assert_eq!(
             end.completion_events_drained - start.completion_events_drained,
             1,
