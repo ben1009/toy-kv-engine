@@ -66,6 +66,7 @@ if [[ "$SUITE" != "batch64" && "$SUITE" != "rfc026-full" \
      && "$SUITE" != "v8-cursor-coalescing-ready-target-small-scan" \
      && "$SUITE" != "v8-cursor-publication" \
      && "$SUITE" != "v7-v8-point-preallocation" \
+     && "$SUITE" != "v7-v8-ready-target-final" \
      && "$SUITE" != "v8-point-ack-d1" \
      && "$SUITE" != "v8-dedicated-durability-driver" ]]; then
     echo "unsupported benchmark suite: $SUITE" >&2
@@ -168,6 +169,12 @@ if [[ "$SUITE" == "v7-v8-point-preallocation" ]] \
     && { [[ "$NUM" != "100000" ]] || [[ "$MACHINE_TYPE" != "c4-standard-16-lssd" ]] \
         || [[ "$WRITERS_CSV" != "1,8,16" ]]; }; then
     echo "v7-v8-point-preallocation requires c4-standard-16-lssd, writers 1,8,16, and 100000 operations" >&2
+    exit 64
+fi
+if [[ "$SUITE" == "v7-v8-ready-target-final" ]] \
+    && { [[ "$NUM" != "100000" ]] || [[ "$MACHINE_TYPE" != "c4-standard-16-lssd" ]] \
+        || [[ "$WRITERS_CSV" != "1,8,16" ]]; }; then
+    echo "v7-v8-ready-target-final requires c4-standard-16-lssd, writers 1,8,16, and 100000 operations" >&2
     exit 64
 fi
 if [[ "$SUITE" == "v8-point-resource-retirement" || "$SUITE" == "v8-point-resource-retirement-stage-a" ]] \
@@ -643,6 +650,29 @@ if [[ "$BENCH_SUITE" == "v7-v8-point-preallocation" ]]; then
         --ssd-count "$BENCH_SSD_COUNT" \
         --ssd-gib "$BENCH_SSD_TOTAL_GIB" \
         --candidate-mode v7-v8-point-preallocation
+    exit $?
+fi
+
+if [[ "$BENCH_SUITE" == "v7-v8-ready-target-final" ]]; then
+    if [[ ! -r /tmp/gcp-v8-point-progress-ring-runner.py ]]; then
+        echo "V7/V8 ready-target final runner was not uploaded" >&2
+        exit 1
+    fi
+    cp /tmp/gcp-v8-point-progress-ring-runner.py "$REPO/scripts/gcp_v8_point_progress_ring_runner.py"
+    echo "WAL_BENCHMARK_STARTED $(date --iso-8601=seconds)" | tee -a "$BENCH_BOOT_LOG"
+    PYTHONPATH="$REPO/scripts${PYTHONPATH:+:$PYTHONPATH}" \
+        python3 "$REPO/scripts/gcp_v8_point_progress_ring_runner.py" \
+        --binary "$BINARY" \
+        --results-dir "$BENCH_RESULTS" \
+        --db-root "$BENCH_WORK/databases" \
+        --writers "$BENCH_WRITERS" \
+        --safe-deadline-epoch "$BENCH_SAFE_DEADLINE_EPOCH" \
+        --commit "$ACTUAL_COMMIT" \
+        --binary-sha256 "$BINARY_SHA256" \
+        --machine-type "$BENCH_MACHINE_TYPE" \
+        --ssd-count "$BENCH_SSD_COUNT" \
+        --ssd-gib "$BENCH_SSD_TOTAL_GIB" \
+        --candidate-mode v7-v8-ready-target-final
     exit $?
 fi
 

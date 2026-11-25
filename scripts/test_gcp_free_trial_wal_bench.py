@@ -87,6 +87,11 @@ from gcp_wal_matrix import (
     POINT_PREALLOCATION_NUM,
     POINT_PREALLOCATION_POINT_ORDERS,
     POINT_PREALLOCATION_WRITERS,
+    V7_V8_READY_TARGET_FINAL_ARMS,
+    V7_V8_READY_TARGET_FINAL_CASES,
+    V7_V8_READY_TARGET_FINAL_NUM,
+    V7_V8_READY_TARGET_FINAL_ORDERS,
+    V7_V8_READY_TARGET_FINAL_WRITERS,
     POINT_RESOURCE_RETIREMENT_NUM,
     POINT_RESOURCE_RETIREMENT_WRITERS,
     POINT_ACK_D1_ARMS,
@@ -119,6 +124,8 @@ from gcp_wal_matrix import (
     build_v8_extent_policy_storage_schedule,
     build_v7_v8_point_preallocation_plan,
     build_v7_v8_point_preallocation_schedule,
+    build_v7_v8_ready_target_final_plan,
+    build_v7_v8_ready_target_final_schedule,
     build_point_resource_retirement_plan,
     build_point_resource_retirement_schedule,
     build_point_ack_d1_plan,
@@ -690,6 +697,17 @@ class PointProgressRingQualificationTests(unittest.TestCase):
         return record
 
     @classmethod
+    def _raw_v7_record(cls, row: dict[str, object]) -> dict[str, object]:
+        """Build V7-shaped output for the mixed-format final comparison fixture."""
+        record = cls._raw_record(row)
+        record["params"]["wal_format_version"] = 7
+        pipeline = record["result"]["wal_pipeline"]
+        for key in ("wal_io_stable", "wal_io_start", "wal_io_end"):
+            pipeline.pop(key, None)
+        record.pop("wal_v8_digest", None)
+        return record
+
+    @classmethod
     def _make_fixture(
         cls,
         root: Path,
@@ -705,6 +723,7 @@ class PointProgressRingQualificationTests(unittest.TestCase):
         retirement: bool = False,
         retirement_preallocation: bool = False,
         cursor_publication: bool = False,
+        ready_target_final: bool = False,
         cursor_schema_version: int | None = None,
         include_schema_version: bool = True,
     ) -> Path:
@@ -724,6 +743,9 @@ class PointProgressRingQualificationTests(unittest.TestCase):
         elif cursor_publication:
             schedule_builder = build_cursor_publication_schedule
             plan_builder = build_cursor_publication_plan
+        elif ready_target_final:
+            schedule_builder = lambda _selected_writers: build_v7_v8_ready_target_final_schedule()
+            plan_builder = build_v7_v8_ready_target_final_plan
         elif retirement:
             schedule_builder = lambda selected_writers: build_point_resource_retirement_schedule(
                 selected_writers,
@@ -756,12 +778,20 @@ class PointProgressRingQualificationTests(unittest.TestCase):
             CURSOR_COALESCING_READY_TARGET_SCAN_WRITERS if coalescing_ready_target_scan else
             CURSOR_COALESCING_READY_TARGET_WRITERS if coalescing_ready_target else
             CURSOR_PUBLICATION_WRITERS if cursor_publication else
+            V7_V8_READY_TARGET_FINAL_WRITERS if ready_target_final else
             POINT_RESOURCE_RETIREMENT_WRITERS if retirement else
             CURSOR_COALESCING_BUDGET_WRITERS if coalescing_budget else
             POINT_PROGRESS_RING_WRITERS
         )
         schedule = schedule_builder(writers)
-        if coalescing_ready_target_small_scan or coalescing_ready_target_scan or coalescing_ready_target:
+        if ready_target_final:
+            plan = plan_builder(
+                machine_type="c4-standard-16-lssd",
+                machine_spec=BENCH.MACHINE_SPECS["c4-standard-16-lssd"],
+                commit=commit,
+                binary_sha256=binary_sha,
+            )
+        elif coalescing_ready_target_small_scan or coalescing_ready_target_scan or coalescing_ready_target:
             plan = plan_builder(
                 machine_type="c4-standard-16-lssd",
                 machine_spec={"vcpus": 16, "ssd_count": 2, "ssd_gib": 750},
@@ -812,6 +842,7 @@ class PointProgressRingQualificationTests(unittest.TestCase):
         (results / "write-perf.sha256").write_text(binary_sha + "\n", encoding="utf-8")
         schedule_name = (
             "cursor-coalescing-ready-target-small-scan-schedule.tsv" if coalescing_ready_target_small_scan else
+            "v7-v8-ready-target-final-schedule.tsv" if ready_target_final else
             "cursor-coalescing-ready-target-scan-schedule.tsv" if coalescing_ready_target_scan else
             "cursor-coalescing-ready-target-schedule.tsv" if coalescing_ready_target else
             "point-resource-retirement-schedule.tsv" if retirement else
@@ -833,8 +864,9 @@ class PointProgressRingQualificationTests(unittest.TestCase):
             run_id = progress_ring_runner._run_id(row)
             run_dir = results / run_id
             run_dir.mkdir()
-            raw = cls._raw_record(row)
+            raw = cls._raw_v7_record(row) if ready_target_final and row["format_version"] == 7 else cls._raw_record(row)
             record_validator = (
+                progress_ring_runner._validate_point_preallocation_record if ready_target_final else
                 progress_ring_runner._validate_record
                 if coalescing_ready_target_small_scan or coalescing_ready_target_scan or coalescing_ready_target else
                 progress_ring_runner._validate_cursor_publication_record if cursor_publication else
@@ -853,6 +885,7 @@ class PointProgressRingQualificationTests(unittest.TestCase):
             (run_dir / "result.json").write_text(json.dumps(raw), encoding="utf-8")
             (run_dir / "run-metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
             (run_dir / "environment.txt").write_text(
+                progress_ring_runner._v7_v8_ready_target_final_environment_text(row) if ready_target_final else
                 progress_ring_runner._expected_environment_text(
                     bool(row["progress_ring_enabled"]), bool(row.get("progress_cursor_enabled", False)),
                     row.get("progress_counters_enabled"), row.get("cursor_direct_completion_enabled"),
@@ -878,7 +911,9 @@ class PointProgressRingQualificationTests(unittest.TestCase):
                 encoding="utf-8",
             )
             rows.append(metadata)
-        if coalescing_ready_target_small_scan:
+        if ready_target_final:
+            summary = progress_ring_runner._v7_v8_ready_target_final_summary(rows, len(schedule))
+        elif coalescing_ready_target_small_scan:
             summary = progress_ring_runner._coalescing_ready_target_small_scan_summary(
                 rows, writers, len(schedule),
             )
@@ -1290,6 +1325,74 @@ class PointProgressRingQualificationTests(unittest.TestCase):
                 results / progress_ring_runner._run_id(target1) / "environment.txt"
             ).read_text(encoding="utf-8")
             self.assertIn("TOYKV_BENCH_V8_COALESCE_READY_TARGET=1\n", target1_environment)
+
+    def test_v7_v8_ready_target_final_schedule_is_counterbalanced_and_fixed(self) -> None:
+        schedule = build_v7_v8_ready_target_final_schedule()
+        self.assertEqual(len(schedule), 80)
+        self.assertEqual({row["arm"] for row in schedule}, set(V7_V8_READY_TARGET_FINAL_ARMS))
+        self.assertEqual({(row["writer"], row["workload"]) for row in schedule},
+                         set(V7_V8_READY_TARGET_FINAL_CASES))
+        for writer, workload in V7_V8_READY_TARGET_FINAL_CASES:
+            for repetition in range(1, 6):
+                cell = [row for row in schedule if row["writer"] == writer
+                        and row["workload"] == workload and row["repetition"] == repetition]
+                self.assertEqual(len(cell), len(V7_V8_READY_TARGET_FINAL_ARMS))
+                self.assertEqual({row["arm"] for row in cell}, set(V7_V8_READY_TARGET_FINAL_ARMS))
+            observed_orders = {
+                tuple(row["arm"] for row in schedule if row["writer"] == writer
+                      and row["workload"] == workload and row["repetition"] == repetition)
+                for repetition in range(1, 6)
+            }
+            self.assertEqual(observed_orders, set(V7_V8_READY_TARGET_FINAL_ORDERS))
+
+        for row in schedule:
+            if row["arm"] == "v7_parallel":
+                self.assertEqual(row["format_version"], 7)
+                self.assertIsNone(row["point_buffer_preallocation_enabled"])
+                self.assertIsNone(row["coalescing_ready_target"])
+            else:
+                self.assertEqual(row["format_version"], 8)
+                self.assertEqual(row["progress_cursor_enabled"], True)
+                self.assertEqual(row["cursor_direct_completion_enabled"], True)
+                self.assertEqual(row["point_buffer_preallocation_enabled"], row["workload"] == "point")
+                expected_target = {
+                    "v8_dynamic": None,
+                    "v8_target4": 4,
+                    "v8_target8": 8,
+                }[row["arm"]]
+                self.assertEqual(row["coalescing_ready_target"], expected_target)
+
+        plan = build_v7_v8_ready_target_final_plan(
+            machine_type="c4-standard-16-lssd",
+            machine_spec=BENCH.MACHINE_SPECS["c4-standard-16-lssd"],
+            commit="a" * 40,
+            binary_sha256="b" * 64,
+        )
+        self.assertEqual(plan["runs_planned"], 80)
+        self.assertEqual(plan["score_runs_planned"], 80)
+        self.assertEqual(plan["arms"], list(V7_V8_READY_TARGET_FINAL_ARMS))
+
+    def test_v7_v8_ready_target_final_fixture_verifies_all_80_runs_and_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            results = self._make_fixture(Path(temporary), ready_target_final=True)
+            verification = progress_ring_runner.verify_v7_v8_ready_target_final_results_directory(results)
+            self.assertTrue(verification["verified"], verification["errors"])
+            self.assertEqual(verification["planned"], 80)
+            self.assertEqual(verification["observed"], 80)
+            self.assertTrue(BENCH._verify_result_set(results)["verified"])
+            summary = json.loads((results / "summary.json").read_text(encoding="utf-8"))
+            self.assertTrue(summary["complete"])
+            self.assertEqual(summary["runs_completed"], 80)
+            self.assertEqual(summary["runs_attempted"], 80)
+            plan = json.loads((results / "benchmark-plan.json").read_text(encoding="utf-8"))
+            self.assertEqual(plan["suite"], "v7-v8-ready-target-final")
+            self.assertEqual(plan["runs_planned"], 80)
+
+            summary["comparison"][0]["arms"]["v8_target4"]["puts_per_second"] += 1
+            (results / "summary.json").write_text(json.dumps(summary), encoding="utf-8")
+            verification = progress_ring_runner.verify_v7_v8_ready_target_final_results_directory(results)
+            self.assertFalse(verification["verified"])
+            self.assertTrue(any("comparison differs" in error for error in verification["errors"]))
 
     def test_run_suite_writes_ready_target_scan_plan_and_schedule(self) -> None:
         binary = Path("scripts/gcp_v8_point_progress_ring_runner.py")
@@ -2787,6 +2890,47 @@ class PointProgressRingQualificationTests(unittest.TestCase):
 
 
 class GcpFreeTrialWalBenchTests(unittest.TestCase):
+    def test_v7_v8_ready_target_final_preflight_requires_fixed_isolated_matrix(self) -> None:
+        common = [
+            "--project", "test-project", "--zone", "us-central1-b", "--commit", "a" * 40,
+            "--machine-type", "c4-standard-16-lssd", "--writers", "1", "8", "16",
+            "--v7-v8-ready-target-final-ab", "--ssh-source-range", "192.0.2.1/32",
+            "--max-runtime-minutes", "60", "--estimated-hourly-cost-usd", "1.50",
+            "--max-estimated-spend-usd", "2", "--preflight-only",
+        ]
+        args = BENCH.parse_args([*common, "--network", "final-isolated", "--subnet", "final-subnet"])
+        self.assertEqual(args.writers, V7_V8_READY_TARGET_FINAL_WRITERS)
+        self.assertEqual(args.num, V7_V8_READY_TARGET_FINAL_NUM)
+        self.assertTrue(args.v7_v8_ready_target_final_ab)
+        for suffix in (
+            ["--network", "default", "--subnet", "default"],
+            ["--network", "final-isolated"],
+            ["--writers", "8", "16"],
+            ["--num", "99999"],
+        ):
+            with self.subTest(suffix=suffix), redirect_stderr(StringIO()), self.assertRaises(SystemExit):
+                BENCH.parse_args([*common, *suffix])
+
+    def test_remote_runner_accepts_only_the_fixed_final_ready_target_matrix(self) -> None:
+        remote_script = Path(__file__).with_name("gcp-free-trial-wal-bench-remote.sh")
+        environment = {**os.environ, "TOYKV_GCP_BENCH_VALIDATE_ONLY": "1"}
+        valid = [
+            "bash", str(remote_script), "a" * 40, str(V7_V8_READY_TARGET_FINAL_NUM), "test-project",
+            "us-central1-b", "wal-test", "4102444800", "c4-standard-16-lssd", "1,8,16",
+            "v7-v8-ready-target-final", "-", "-",
+        ]
+        accepted = subprocess.run(valid, cwd=Path(__file__).resolve().parents[1], env=environment,
+                                  capture_output=True, text=True, timeout=5)
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+
+        for index, value in ((3, "99999"), (8, "c4-standard-8-lssd"), (9, "16,8,1")):
+            with self.subTest(argument=index, value=value):
+                invalid = list(valid)
+                invalid[index] = value
+                rejected = subprocess.run(invalid, cwd=Path(__file__).resolve().parents[1], env=environment,
+                                          capture_output=True, text=True, timeout=5)
+                self.assertEqual(rejected.returncode, 64)
+
     def test_ssh_readiness_retries_within_a_fixed_deadline(self) -> None:
         now = [0.0]
         timeouts = []

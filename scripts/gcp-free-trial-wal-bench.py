@@ -49,6 +49,8 @@ from gcp_wal_matrix import (
     POINT_PROGRESS_RING_WRITERS,
     POINT_PREALLOCATION_NUM,
     POINT_PREALLOCATION_WRITERS,
+    V7_V8_READY_TARGET_FINAL_NUM,
+    V7_V8_READY_TARGET_FINAL_WRITERS,
     POINT_RESOURCE_RETIREMENT_NUM,
     POINT_RESOURCE_RETIREMENT_WRITERS,
     POINT_ACK_D1_NUM,
@@ -93,6 +95,7 @@ from gcp_wal_matrix import (
     build_point_direct_frame_schedule,
     build_point_progress_cursor_plan,
     build_v7_v8_point_preallocation_plan,
+    build_v7_v8_ready_target_final_plan,
     build_point_resource_retirement_plan,
     build_point_ack_d1_plan,
     build_dedicated_durability_driver_plan,
@@ -143,6 +146,9 @@ from gcp_v8_point_progress_ring_runner import (
 )
 from gcp_v8_point_progress_ring_runner import (
     verify_point_preallocation_results_directory as verify_point_preallocation_results,
+)
+from gcp_v8_point_progress_ring_runner import (
+    verify_v7_v8_ready_target_final_results_directory as verify_v7_v8_ready_target_final_results,
 )
 from gcp_v8_point_progress_ring_runner import (
     verify_point_resource_retirement_results_directory as verify_point_resource_retirement_results,
@@ -232,6 +238,7 @@ root_names = {
     "cursor-publication-schedule.tsv",
     "extent-policy-storage-schedule.tsv",
     "v7-v8-point-preallocation-schedule.tsv",
+    "v7-v8-ready-target-final-schedule.tsv",
     "point-resource-retirement-schedule.tsv",
     "point-ack-d1-schedule.tsv", "dedicated-durability-schedule.tsv", "runner-bundle.sha256",
     "runner-bundle-verification.json",
@@ -1280,6 +1287,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                              help="Compare V8 BTreeMap and Vec extent-policy storage with Point/Batch guardrails")
     suite_group.add_argument("--v7-v8-point-preallocation-ab", action="store_true",
                              help="Compare V7, V8 Point preallocation off/on, and Batch64 regression guardrail")
+    suite_group.add_argument("--v7-v8-ready-target-final-ab", action="store_true",
+                             help="Compare V7 and V8 Dynamic/Target4/Target8 for Point1/8/16 and Batch64 (80 runs)")
     suite_group.add_argument("--v8-point-resource-retirement-ab", action="store_true",
                              help="Retired historical suite; kept only to provide an explanatory error")
     suite_group.add_argument("--v8-point-resource-retirement-stage-a-ab", action="store_true",
@@ -1339,6 +1348,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     point_cursor_publication_suite = args.v8_cursor_publication_ab
     point_preallocation_suite = args.v7_v8_point_preallocation_ab
+    point_ready_target_final_suite = args.v7_v8_ready_target_final_ab
     point_resource_retirement_stage_a_suite = args.v8_point_resource_retirement_stage_a_ab
     point_resource_retirement_suite = (
         args.v8_point_resource_retirement_ab or point_resource_retirement_stage_a_suite
@@ -1355,6 +1365,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         or point_cursor_coalescing_ready_target_small_scan_suite
         or point_cursor_publication_suite
         or point_preallocation_suite or point_resource_retirement_suite or point_ack_d1_suite
+        or point_ready_target_final_suite
         or dedicated_durability_suite
     )
     explicit_network = args.network is not None
@@ -1386,6 +1397,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             CURSOR_COALESCING_BUDGET_NUM if point_cursor_coalescing_budget_suite else
             CURSOR_PUBLICATION_NUM if point_cursor_publication_suite else
             POINT_PREALLOCATION_NUM if point_preallocation_suite else
+            V7_V8_READY_TARGET_FINAL_NUM if point_ready_target_final_suite else
             POINT_RESOURCE_RETIREMENT_NUM if point_resource_retirement_suite else
             POINT_ACK_D1_NUM if point_ack_d1_suite else
             DURABILITY_DRIVER_NUM if dedicated_durability_suite else
@@ -1404,6 +1416,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             or args.v8_point_borrowed_input_ab or args.v8_point_direct_frame_ab
             or args.v8_extent_policy_storage_ab
             or point_preallocation_suite
+            or point_ready_target_final_suite
             or point_resource_retirement_suite
             or point_ack_d1_suite
             or dedicated_durability_suite
@@ -1428,6 +1441,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             args.writers = V8_EXTENT_POLICY_STORAGE_WRITERS
         elif point_preallocation_suite:
             args.writers = POINT_PREALLOCATION_WRITERS
+        elif point_ready_target_final_suite:
+            args.writers = V7_V8_READY_TARGET_FINAL_WRITERS
         elif point_resource_retirement_suite:
             args.writers = POINT_RESOURCE_RETIREMENT_WRITERS
         elif point_ack_d1_suite:
@@ -1507,6 +1522,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error(f"--v7-v8-point-preallocation-ab requires writers {POINT_PREALLOCATION_WRITERS}")
     if point_preallocation_suite and args.machine_type != "c4-standard-16-lssd":
         parser.error("--v7-v8-point-preallocation-ab requires c4-standard-16-lssd")
+    if point_ready_target_final_suite and args.writers != V7_V8_READY_TARGET_FINAL_WRITERS:
+        parser.error(
+            f"--v7-v8-ready-target-final-ab requires writers {V7_V8_READY_TARGET_FINAL_WRITERS}"
+        )
+    if point_ready_target_final_suite and args.machine_type != "c4-standard-16-lssd":
+        parser.error("--v7-v8-ready-target-final-ab requires c4-standard-16-lssd")
     if point_resource_retirement_suite and args.writers != POINT_RESOURCE_RETIREMENT_WRITERS:
         parser.error(f"--v8-point-resource-retirement-ab requires writers {POINT_RESOURCE_RETIREMENT_WRITERS}")
     if point_resource_retirement_suite and args.machine_type != "c4-standard-16-lssd":
@@ -1555,6 +1576,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error(f"--v8-extent-policy-storage-ab uses a fixed {V8_EXTENT_POLICY_STORAGE_NUM}-put workload")
     if point_progress_suite and args.num != POINT_PROGRESS_RING_NUM:
         parser.error(f"Cursor qualification uses a fixed {POINT_PROGRESS_RING_NUM}-put workload")
+    if point_ready_target_final_suite and args.num != V7_V8_READY_TARGET_FINAL_NUM:
+        parser.error(f"--v7-v8-ready-target-final-ab uses a fixed {V7_V8_READY_TARGET_FINAL_NUM}-put workload")
     if point_preallocation_suite and args.num != POINT_PREALLOCATION_NUM:
         parser.error(f"--v7-v8-point-preallocation-ab uses a fixed {POINT_PREALLOCATION_NUM}-put workload")
     if point_resource_retirement_suite and args.num != POINT_RESOURCE_RETIREMENT_NUM:
@@ -1709,6 +1732,7 @@ def _run_identifier(row: dict[str, Any], suite: str) -> str:
         "v8-cursor-coalescing-ready-target", "v8-cursor-coalescing-ready-target-scan",
         "v8-cursor-coalescing-ready-target-small-scan",
         "v7-v8-point-preallocation",
+        "v7-v8-ready-target-final",
         "v8-point-resource-retirement", "v8-cursor-publication",
     ):
         return f"r{row['repetition']}-w{row['writer']}-{row['workload']}-{row['arm']}"
@@ -1741,6 +1765,7 @@ def _summary_row_identifier(row: dict[str, Any], suite: str) -> str:
         "v8-cursor-coalescing-ready-target", "v8-cursor-coalescing-ready-target-scan",
         "v8-cursor-coalescing-ready-target-small-scan",
         "v7-v8-point-preallocation",
+        "v7-v8-ready-target-final",
         "v8-point-resource-retirement", "v8-cursor-publication",
     ):
         return f"r{int(row['repetition'])}-w{int(row['writer'])}-{row['workload']}-{row['arm']}"
@@ -1930,6 +1955,8 @@ def _verify_result_set(results: Path) -> dict[str, Any]:
             return verify_cursor_publication_results(results)
         if suite == "v7-v8-point-preallocation":
             return verify_point_preallocation_results(results)
+        if suite == "v7-v8-ready-target-final":
+            return verify_v7_v8_ready_target_final_results(results)
         if suite == "v8-point-resource-retirement":
             return verify_point_resource_retirement_results(results)
         if suite == "v8-point-ack-d1":
@@ -3155,6 +3182,7 @@ def provision_and_run(
     )
     point_cursor_publication_suite = getattr(args, "v8_cursor_publication_ab", False)
     point_preallocation_suite = getattr(args, "v7_v8_point_preallocation_ab", False)
+    point_ready_target_final_suite = getattr(args, "v7_v8_ready_target_final_ab", False)
     point_resource_retirement_stage_a_suite = getattr(args, "v8_point_resource_retirement_stage_a_ab", False)
     point_resource_retirement_suite = (
         getattr(args, "v8_point_resource_retirement_ab", False) or point_resource_retirement_stage_a_suite
@@ -3171,6 +3199,7 @@ def provision_and_run(
         or point_cursor_coalescing_ready_target_small_scan_suite
         or point_cursor_publication_suite
         or point_preallocation_suite or point_resource_retirement_suite or point_ack_d1_suite
+        or point_ready_target_final_suite
         or dedicated_durability_suite
     )
     extent_policy_storage_suite = getattr(args, "v8_extent_policy_storage_ab", False)
@@ -3534,6 +3563,8 @@ def provision_and_run(
                 remote_suite = "v8-cursor-publication"
             elif point_preallocation_suite:
                 remote_suite = "v7-v8-point-preallocation"
+            elif point_ready_target_final_suite:
+                remote_suite = "v7-v8-ready-target-final"
             elif point_resource_retirement_suite:
                 remote_suite = (
                     "v8-point-resource-retirement-stage-a"
@@ -3705,6 +3736,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     point_cursor_publication_suite = args.v8_cursor_publication_ab
     point_preallocation_suite = args.v7_v8_point_preallocation_ab
+    point_ready_target_final_suite = args.v7_v8_ready_target_final_ab
     point_resource_retirement_stage_a_suite = args.v8_point_resource_retirement_stage_a_ab
     point_resource_retirement_suite = (
         args.v8_point_resource_retirement_ab or point_resource_retirement_stage_a_suite
@@ -3720,6 +3752,7 @@ def main(argv: list[str] | None = None) -> int:
         or point_cursor_coalescing_ready_target_small_scan_suite
         or point_cursor_publication_suite
         or point_preallocation_suite or point_resource_retirement_suite or point_ack_d1_suite
+        or point_ready_target_final_suite
         or dedicated_durability_suite
     )
     if point_progress_suite:
@@ -3891,6 +3924,13 @@ def main(argv: list[str] | None = None) -> int:
         elif point_preallocation_suite:
             report["benchmark_suite"] = "v7-v8-point-preallocation"
             report["benchmark_plan"] = build_v7_v8_point_preallocation_plan(
+                machine_type=args.machine_type,
+                machine_spec=MACHINE_SPECS[args.machine_type],
+                commit=args.commit.lower(),
+            )
+        elif point_ready_target_final_suite:
+            report["benchmark_suite"] = "v7-v8-ready-target-final"
+            report["benchmark_plan"] = build_v7_v8_ready_target_final_plan(
                 machine_type=args.machine_type,
                 machine_spec=MACHINE_SPECS[args.machine_type],
                 commit=args.commit.lower(),

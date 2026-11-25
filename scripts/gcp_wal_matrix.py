@@ -98,6 +98,23 @@ POINT_PREALLOCATION_BATCH_ORDERS = (
     ("v8_prealloc_off", "v8_prealloc_on"),
     ("v8_prealloc_on", "v8_prealloc_off"),
 )
+V7_V8_READY_TARGET_FINAL_WRITERS = (1, 8, 16)
+V7_V8_READY_TARGET_FINAL_REPETITIONS = 5
+V7_V8_READY_TARGET_FINAL_NUM = 100_000
+V7_V8_READY_TARGET_FINAL_ARMS = ("v7_parallel", "v8_dynamic", "v8_target4", "v8_target8")
+V7_V8_READY_TARGET_FINAL_ORDERS = (
+    ("v7_parallel", "v8_dynamic", "v8_target4", "v8_target8"),
+    ("v8_dynamic", "v8_target4", "v8_target8", "v7_parallel"),
+    ("v8_target4", "v8_target8", "v7_parallel", "v8_dynamic"),
+    ("v8_target8", "v7_parallel", "v8_dynamic", "v8_target4"),
+    ("v8_target8", "v8_target4", "v8_dynamic", "v7_parallel"),
+)
+V7_V8_READY_TARGET_FINAL_CASES = (
+    (1, "point"),
+    (8, "point"),
+    (16, "point"),
+    (16, "batch64"),
+)
 POINT_PROGRESS_PLAN_SCHEMA_V1 = 1
 POINT_PROGRESS_PLAN_SCHEMA_V2 = 2
 POINT_PROGRESS_PLAN_SCHEMA_V3 = 3
@@ -782,6 +799,102 @@ def build_v7_v8_point_preallocation_plan(
             "counterbalanced repetitions. Batch64 is a five-pair V8 off/on regression guardrail. Same host, "
             "source commit, release bench binary, and V8 settings are used throughout. Point latency is sampled "
             "every 10 puts; Batch64 latency sampling is disabled."
+        ),
+    }
+
+
+def build_v7_v8_ready_target_final_schedule() -> list[dict[str, object]]:
+    """Build the final same-binary V7/V8 Dynamic/Target4/Target8 matrix."""
+    schedule: list[dict[str, object]] = []
+    for repetition in range(1, V7_V8_READY_TARGET_FINAL_REPETITIONS + 1):
+        case_order = V7_V8_READY_TARGET_FINAL_CASES[repetition % len(V7_V8_READY_TARGET_FINAL_CASES):] + (
+            V7_V8_READY_TARGET_FINAL_CASES[:repetition % len(V7_V8_READY_TARGET_FINAL_CASES)]
+        )
+        for writer, workload in case_order:
+            case_index = V7_V8_READY_TARGET_FINAL_CASES.index((writer, workload))
+            arm_order = V7_V8_READY_TARGET_FINAL_ORDERS[(repetition - 1 + case_index) % len(
+                V7_V8_READY_TARGET_FINAL_ORDERS
+            )]
+            is_batch = workload == "batch64"
+            bench = "wal_batch_concurrent" if is_batch else "wal_concurrent"
+            batch_entries = 64 if is_batch else 1
+            batch_size = 64 if is_batch else None
+            sample_every = None if is_batch else 10
+            for arm in arm_order:
+                is_v7 = arm == "v7_parallel"
+                target = 4 if arm == "v8_target4" else 8 if arm == "v8_target8" else None
+                schedule.append({
+                    "run_index": len(schedule) + 1,
+                    "writer": writer,
+                    "workload": workload,
+                    "repetition": repetition,
+                    "arm": arm,
+                    "bench": bench,
+                    "batch_entries": batch_entries,
+                    "batch_size": batch_size,
+                    "num": V7_V8_READY_TARGET_FINAL_NUM,
+                    "sample_every": sample_every,
+                    "format_version": 7 if is_v7 else 8,
+                    "coalescing_ready_target": target,
+                    "point_buffer_preallocation_enabled": None if is_v7 else not is_batch,
+                    "progress_ring_enabled": not is_v7,
+                    "progress_cursor_enabled": not is_v7,
+                    "progress_counters_enabled": False if not is_v7 else None,
+                    "cursor_direct_completion_enabled": True if not is_v7 else None,
+                    "cursor_singleton_submission_enabled": False if not is_v7 else None,
+                    "extent_mode": "sliding-point-lookahead" if not is_v7 else None,
+                    "extent_window_bytes": POINT_LOOKAHEAD_WINDOW_BYTES if not is_v7 else 0,
+                    "frontier_mode": "direct" if not is_v7 else None,
+                })
+    return schedule
+
+
+def build_v7_v8_ready_target_final_plan(
+    *, machine_type: str, machine_spec: Mapping[str, int], commit: str,
+    binary_sha256: str | None = None,
+) -> dict[str, object]:
+    schedule = build_v7_v8_ready_target_final_schedule()
+    return {
+        "plan_schema_version": 1,
+        "suite": "v7-v8-ready-target-final",
+        "writers": list(V7_V8_READY_TARGET_FINAL_WRITERS),
+        "workloads": [
+            {"writer": writer, "name": workload, "bench": "wal_concurrent" if workload == "point"
+             else "wal_batch_concurrent", "batch_size": 64 if workload == "batch64" else None,
+             "num": V7_V8_READY_TARGET_FINAL_NUM, "latency_sample_every": 10 if workload == "point" else None}
+            for writer, workload in V7_V8_READY_TARGET_FINAL_CASES
+        ],
+        "arms": list(V7_V8_READY_TARGET_FINAL_ARMS),
+        "repetitions_per_cell": V7_V8_READY_TARGET_FINAL_REPETITIONS,
+        "arm_orders": [list(order) for order in V7_V8_READY_TARGET_FINAL_ORDERS],
+        "runs_planned": len(schedule),
+        "score_runs_planned": len(schedule),
+        "counterbalanced": True,
+        "machine_type": machine_type,
+        "vcpus": int(machine_spec["vcpus"]),
+        "local_ssd_count": int(machine_spec["ssd_count"]),
+        "local_ssd_total_gib": int(machine_spec["ssd_gib"]),
+        "runtime_protocol": "single C4 Local SSD host; same source commit and release binary for all four arms",
+        "value_bytes": 1024,
+        "compaction": "none",
+        "commit": commit,
+        "binary_sha256": binary_sha256,
+        "v8_configuration": {
+            "progress_mode": "cursor (mode 2)",
+            "completion": "direct",
+            "frontier": "direct",
+            "driver": "caller-driven",
+            "ack": "legacy",
+            "coalescing": "dynamic deadline with ready target unset, or explicit target 4/8",
+            "extent_preparation": "1 MiB sliding-point-lookahead for Point; Batch64 remains fallocate-only",
+            "singleton_submission": False,
+            "point_buffer_preallocation": "enabled for all V8 Point arms only",
+        },
+        "v7_configuration": "V7 Parallel; no V8-only environment variables",
+        "qualification_note": (
+            "Point1, Point8, Point16, and Batch64/w16 each run five counterbalanced repetitions across V7 Parallel, "
+            "V8 Dynamic, V8 Target4, and V8 Target8. Stage A is enabled for all V8 Point arms and disabled for "
+            "Batch64. All arms use the same source commit and release binary; Point latency is sampled every 10 puts."
         ),
     }
 
