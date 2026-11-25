@@ -147,16 +147,29 @@ DEDICATED_DURABILITY_RUNNER = Path(__file__).with_name("gcp_v8_dedicated_durabil
 POINT_PROGRESS_RING_VM_TAG = "walbench-point-progress-ring"
 V8_EXTENT_POLICY_STORAGE_RUNNER = Path(__file__).with_name("gcp_v8_extent_policy_storage_runner.py")
 REPO_URL = "https://github.com/ben1009/toy-kv-engine.git"
+D3B_RUNNER_BUNDLE_COMPONENTS = (
+    ("gcp-free-trial-wal-bench-remote.sh", RUNNERS),
+    ("gcp_wal_matrix.py", MATRIX_MODULE),
+    ("gcp_v8_point_progress_ring_runner.py", POINT_PROGRESS_RING_RUNNER),
+    ("gcp_v8_dedicated_durability_runner.py", DEDICATED_DURABILITY_RUNNER),
+)
+
+
+def _d3b_runner_bundle_manifest() -> dict[str, Any]:
+    digest = hashlib.sha256()
+    components: dict[str, str] = {}
+    for name, path in D3B_RUNNER_BUNDLE_COMPONENTS:
+        contents = path.read_bytes()
+        components[name] = hashlib.sha256(contents).hexdigest()
+        digest.update(name.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(contents)
+        digest.update(b"\0")
+    return {"schema_version": 1, "bundle_sha256": digest.hexdigest(), "components": components}
 
 
 def _d3b_runner_bundle_sha256() -> str:
-    digest = hashlib.sha256()
-    for path in (Path(__file__), RUNNERS, MATRIX_MODULE, POINT_PROGRESS_RING_RUNNER, DEDICATED_DURABILITY_RUNNER):
-        digest.update(path.name.encode("utf-8"))
-        digest.update(b"\0")
-        digest.update(path.read_bytes())
-        digest.update(b"\0")
-    return digest.hexdigest()
+    return str(_d3b_runner_bundle_manifest()["bundle_sha256"])
 
 
 MAX_RUNTIME_MINUTES = 180
@@ -194,6 +207,7 @@ root_names = {
     "v7-v8-point-preallocation-schedule.tsv",
     "point-resource-retirement-schedule.tsv",
     "point-ack-d1-schedule.tsv", "dedicated-durability-schedule.tsv", "runner-bundle.sha256",
+    "runner-bundle-verification.json",
     "candidate-commit.txt", "source.patch",
     "commit-order-trace-analysis.json", "commit.txt", "remote-exit.json",
     "finished_utc.txt", "remote-finished-utc.txt", "remote-status.txt", "host.txt",

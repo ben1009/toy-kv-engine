@@ -1205,7 +1205,7 @@ def build_dedicated_durability_driver_plan(
     ssd_count = int(machine_spec["ssd_count"])
     layout = "single Local SSD" if ssd_count == 1 else f"RAID0 over {ssd_count} Local SSDs"
     plan: dict[str, object] = {
-        "plan_schema_version": 2,
+        "plan_schema_version": 3,
         "suite": "v8-d3b-independent-ack",
         "writers": list(writer_counts),
         "workloads": [
@@ -1251,6 +1251,7 @@ def build_dedicated_durability_driver_plan(
             "diagnostic_runs": "none",
         },
         "runner_bundle_sha256": runner_bundle_sha256,
+        "runner_bundle_verification": "remote-component-bytes-v1",
         "qualification_note": (
             "Same-host, same-source, same-release-binary comparison of CallerDriven + legacy ACK, "
             "CallerDriven + independent ACK, and Dedicated Driver + independent ACK. Stage A is enabled "

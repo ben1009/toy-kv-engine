@@ -203,6 +203,46 @@ if [[ "${TOYKV_GCP_BENCH_VALIDATE_ONLY:-0}" == "1" ]]; then
     exit 0
 fi
 
+if [[ "$SUITE" == "v8-dedicated-durability-driver" ]]; then
+    python3 - "$RUNNER_BUNDLE_SHA256" "$0" /tmp/gcp-v8-d3b-runner-bundle-verification.json <<'PY'
+import hashlib
+import json
+from pathlib import Path
+import sys
+
+expected_bundle_sha256, remote_script, receipt_path = sys.argv[1:]
+components = (
+    ("gcp-free-trial-wal-bench-remote.sh", remote_script),
+    ("gcp_wal_matrix.py", "/tmp/gcp_wal_matrix.py"),
+    ("gcp_v8_point_progress_ring_runner.py", "/tmp/gcp-v8-point-progress-ring-runner.py"),
+    ("gcp_v8_dedicated_durability_runner.py", "/tmp/gcp-v8-dedicated-durability-runner.py"),
+)
+bundle = hashlib.sha256()
+component_sha256 = {}
+for name, path_text in components:
+    path = Path(path_text)
+    contents = path.read_bytes()
+    component_sha256[name] = hashlib.sha256(contents).hexdigest()
+    bundle.update(name.encode("utf-8"))
+    bundle.update(b"\0")
+    bundle.update(contents)
+    bundle.update(b"\0")
+actual_bundle_sha256 = bundle.hexdigest()
+if actual_bundle_sha256 != expected_bundle_sha256:
+    raise SystemExit(
+        f"uploaded D3b runner bundle SHA-256 mismatch: expected {expected_bundle_sha256}, "
+        f"got {actual_bundle_sha256}"
+    )
+Path(receipt_path).write_text(json.dumps({
+    "schema_version": 1,
+    "verified": True,
+    "expected_bundle_sha256": expected_bundle_sha256,
+    "actual_bundle_sha256": actual_bundle_sha256,
+    "components": component_sha256,
+}, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+PY
+fi
+
 BOOT_LOG=/var/log/gcp-free-trial-wal-bench.log
 exec > >(tee -a "$BOOT_LOG") 2>&1
 echo "[$(date --iso-8601=seconds)] starting GCP WAL benchmark setup"
@@ -279,6 +319,10 @@ mkfs.ext4 -F -m 0 -E lazy_itable_init=0,lazy_journal_init=0 "$WAL_DEVICE"
 mount -o noatime "$WAL_DEVICE" /mnt/gcp-wal-bench
 mkdir -p "$RESULTS" "$WORK"
 chown -R bench:bench /mnt/gcp-wal-bench
+if [[ "$SUITE" == "v8-dedicated-durability-driver" ]]; then
+    install -o bench -g bench -m 0644 /tmp/gcp-v8-d3b-runner-bundle-verification.json \
+        "$RESULTS/runner-bundle-verification.json"
+fi
 exec > >(tee -a "$RESULTS/setup.log") 2>&1
 
 cat >"$RESULTS/host.txt" <<EOF

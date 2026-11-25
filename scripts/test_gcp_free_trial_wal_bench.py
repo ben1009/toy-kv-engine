@@ -403,6 +403,8 @@ class PointProgressRingQualificationTests(unittest.TestCase):
         self.assertEqual(plan["diagnostic_runs_planned"], 0)
         self.assertEqual(plan["arms"], list(DURABILITY_DRIVER_ARMS))
         self.assertEqual(plan["runner_bundle_sha256"], "c" * 64)
+        self.assertEqual(plan["plan_schema_version"], 3)
+        self.assertEqual(plan["runner_bundle_verification"], "remote-component-bytes-v1")
 
         rows = []
         for row in schedule:
@@ -470,6 +472,20 @@ class PointProgressRingQualificationTests(unittest.TestCase):
                 ssd_gib=750,
                 runner_bundle_sha256="c" * 64,
             )
+            results.mkdir()
+            (results / "runner-bundle-verification.json").write_text(
+                json.dumps({
+                    "schema_version": 1,
+                    "verified": True,
+                    "expected_bundle_sha256": "c" * 64,
+                    "actual_bundle_sha256": "c" * 64,
+                    "components": {
+                        name: "d" * 64
+                        for name in dedicated_durability_runner.D3B_RUNNER_BUNDLE_COMPONENT_NAMES
+                    },
+                }),
+                encoding="utf-8",
+            )
             with patch.object(dedicated_durability_runner, "_run_one", side_effect=fake_run_one):
                 self.assertEqual(dedicated_durability_runner.run_suite(args), 0)
             verification = dedicated_durability_runner.verify_results_directory(results)
@@ -477,6 +493,12 @@ class PointProgressRingQualificationTests(unittest.TestCase):
             summary = json.loads((results / "summary.json").read_text(encoding="utf-8"))
             self.assertEqual(summary["runs_completed"], 60)
             self.assertEqual(summary["runner_bundle_sha256"], "c" * 64)
+
+            summary["comparison"][0]["arms"]["caller_legacy_ack"]["puts_per_second"] += 1.0
+            (results / "summary.json").write_text(json.dumps(summary), encoding="utf-8")
+            verification = dedicated_durability_runner.verify_results_directory(results)
+            self.assertFalse(verification["verified"])
+            self.assertTrue(any("comparison differs from recomputed" in error for error in verification["errors"]))
 
     def test_dedicated_durability_preflight_requires_fixed_isolated_matrix(self) -> None:
         common = [

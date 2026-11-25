@@ -30,6 +30,40 @@ from gcp_wal_matrix import (
     validate_dedicated_durability_driver_rows,
 )
 
+D3B_RUNNER_BUNDLE_COMPONENT_NAMES = {
+    "gcp-free-trial-wal-bench-remote.sh",
+    "gcp_wal_matrix.py",
+    "gcp_v8_point_progress_ring_runner.py",
+    "gcp_v8_dedicated_durability_runner.py",
+}
+
+
+def _validate_runner_bundle_verification(results: Path, expected_sha256: str) -> list[str]:
+    errors: list[str] = []
+    try:
+        receipt = json.loads((results / "runner-bundle-verification.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        return [f"remote runner bundle verification receipt is missing or invalid: {error}"]
+    if not isinstance(receipt, dict):
+        return ["remote runner bundle verification receipt must be a JSON object"]
+    if receipt.get("schema_version") != 1 or receipt.get("verified") is not True:
+        errors.append("remote runner bundle receipt does not report a successful verification")
+    if receipt.get("expected_bundle_sha256") != expected_sha256:
+        errors.append("remote runner bundle receipt has a different expected checksum")
+    if receipt.get("actual_bundle_sha256") != expected_sha256:
+        errors.append("remote uploaded runner bundle checksum differs from the plan")
+    components = receipt.get("components")
+    if not isinstance(components, dict) or set(components) != D3B_RUNNER_BUNDLE_COMPONENT_NAMES:
+        errors.append("remote runner bundle receipt has an unexpected component set")
+    elif any(
+        not isinstance(checksum, str)
+        or len(checksum) != 64
+        or any(character not in "0123456789abcdef" for character in checksum)
+        for checksum in components.values()
+    ):
+        errors.append("remote runner bundle receipt contains a malformed component checksum")
+    return errors
+
 
 def _summary(rows: list[dict[str, Any]], planned: int) -> dict[str, Any]:
     validation = validate_dedicated_durability_driver_rows(rows)
@@ -152,6 +186,9 @@ def run_suite(args: argparse.Namespace) -> int:
     ):
         raise ValueError("runner bundle checksum must be a full lowercase SHA-256 identity")
     results_dir, db_root = args.results_dir, args.db_root
+    receipt_errors = _validate_runner_bundle_verification(results_dir, runner_bundle_sha256)
+    if receipt_errors:
+        raise ValueError("; ".join(receipt_errors))
     results_dir.mkdir(parents=True, exist_ok=True)
     db_root.mkdir(parents=True, exist_ok=True)
     binary_digest = hashlib.sha256(args.binary.read_bytes()).hexdigest()
@@ -264,6 +301,7 @@ def verify_results_directory(results: Path) -> dict[str, Any]:
                 errors.append("runner bundle checksum sidecar differs from summary")
         except OSError as error:
             errors.append(f"runner bundle checksum sidecar is missing: {error}")
+        errors.extend(_validate_runner_bundle_verification(results, runner_bundle_sha256))
         if any(summary.get(key) != len(schedule) for key in ("runs_started", "runs_attempted", "runs_planned", "runs_completed")):
             errors.append("summary run counts differ from the planned 60")
         if summary.get("score_runs_planned") != 60 or summary.get("score_runs_completed") != 60:
@@ -326,6 +364,9 @@ def verify_results_directory(results: Path) -> dict[str, Any]:
                         break
             except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
                 errors.append(f"{run_dir.name} could not be revalidated: {error}")
+        recomputed = _summary(rows, len(schedule))
+        if summary.get("comparison") != recomputed["comparison"]:
+            errors.append("summary comparison differs from recomputed run results")
     except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
         errors.append(f"could not load D3b result bundle: {error}")
     return {"verified": not errors, "errors": errors}
