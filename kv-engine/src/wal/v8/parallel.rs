@@ -153,19 +153,6 @@ struct CoordinatorInner {
     /// Followers need acknowledged durability or an available driver, not
     /// another producer's preparation or DATA-completion notification.
     durable_published: Condvar,
-    /// Benchmark-only independent ACK state. The durable watermark advances
-    /// monotonically and is published before waking ACK waiters; poison is
-    /// terminal and is published while holding `state`.
-    #[cfg(feature = "bench")]
-    ack_waiters: WalV8AckWaiters,
-    /// Frozen before admission; keeps ACK experiment coordination out of the
-    /// default CallerDriven path except for a cold, relaxed flag check at
-    /// publication boundaries.
-    #[cfg(feature = "bench")]
-    ack_waiters_enabled: AtomicBool,
-    /// The ACK experiment mode is selected exactly once during WAL setup.
-    #[cfg(feature = "bench")]
-    ack_waiters_mode_configured: AtomicBool,
     /// Published before releasing admission or returning a producer job. A
     /// DATA submitter can identify a lone admitted head without taking the
     /// coordinator lock under its submission lock.
@@ -196,77 +183,6 @@ struct CoordinatorInner {
     progress_token_attempts: AtomicU64,
     #[cfg(feature = "bench")]
     progress_token_accepts: AtomicU64,
-}
-
-/// Independent, benchmark-only ACK publication and wait channel. ACK readers
-/// can observe a durable prefix or poison without contending on Coordinator
-/// state. The park mutex is used only to close the check-to-sleep race and is
-/// never held while acquiring Coordinator state.
-#[cfg(feature = "bench")]
-struct WalV8AckWaiters {
-    durable_ticket_end: AtomicU64,
-    poisoned: AtomicBool,
-    event_generation: AtomicU64,
-    park_lock: Mutex<()>,
-    changed: Condvar,
-    #[cfg(test)]
-    waiting: AtomicU64,
-}
-
-#[cfg(feature = "bench")]
-impl WalV8AckWaiters {
-    fn new(durable_ticket_end: u64) -> Self {
-        Self {
-            durable_ticket_end: AtomicU64::new(durable_ticket_end),
-            poisoned: AtomicBool::new(false),
-            event_generation: AtomicU64::new(0),
-            park_lock: Mutex::new(()),
-            changed: Condvar::new(),
-            #[cfg(test)]
-            waiting: AtomicU64::new(0),
-        }
-    }
-
-    fn publish_durable_ticket_end(&self, durable_ticket_end: u64) {
-        self.durable_ticket_end
-            .fetch_max(durable_ticket_end, Ordering::SeqCst);
-    }
-
-    fn publish_poisoned(&self) {
-        self.poisoned.store(true, Ordering::SeqCst);
-        self.notify_all();
-    }
-
-    fn notify_all(&self) {
-        let _park = self.park_lock.lock();
-        self.event_generation.fetch_add(1, Ordering::Release);
-        self.changed.notify_all();
-    }
-
-    fn generation(&self) -> u64 {
-        self.event_generation.load(Ordering::Acquire)
-    }
-
-    fn wait_for_change(
-        &self,
-        observed_generation: u64,
-        mut should_wait: impl FnMut() -> Result<bool>,
-    ) -> Result<()> {
-        let mut park = self.park_lock.lock();
-        loop {
-            if self.event_generation.load(Ordering::Acquire) != observed_generation
-                || !should_wait()?
-            {
-                return Ok(());
-            }
-
-            #[cfg(test)]
-            self.waiting.fetch_add(1, Ordering::Relaxed);
-            self.changed.wait(&mut park);
-            #[cfg(test)]
-            self.waiting.fetch_sub(1, Ordering::Relaxed);
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -574,10 +490,6 @@ struct CoordinatorState {
     durability_waiters: usize,
     #[cfg(test)]
     durable_followers: usize,
-    #[cfg(test)]
-    durable_wait_only_waiters: usize,
-    #[cfg(feature = "bench")]
-    admissions_started: bool,
     #[cfg(feature = "bench")]
     ordered_link_hash_cpu_ns: u64,
     #[cfg(feature = "bench")]
@@ -1083,109 +995,6 @@ impl WalV8ParallelCoordinator {
         self.inner.progress_mode == WalV8ProgressMode::Cursor
     }
 
-    #[cfg(feature = "bench")]
-    pub(crate) fn independent_ack_waiter_enabled(&self) -> bool {
-        self.inner.ack_waiters_enabled.load(Ordering::Acquire)
-    }
-
-    #[cfg(feature = "bench")]
-    pub(crate) fn set_independent_ack_waiter_enabled(&self, enabled: bool) -> Result<()> {
-        let state = self.inner.state.lock();
-        ensure!(
-            state.next_ticket == state.durable_ticket_end
-                && state.tickets.is_empty()
-                && !state.durability_driver_active
-                && !state.closed
-                && !state.poisoned
-                && !state.admissions_started,
-            "independent ACK waiter mode must be selected before admission"
-        );
-        ensure!(
-            self.inner
-                .ack_waiters_mode_configured
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok(),
-            "independent ACK waiter mode can only be selected once during initialization"
-        );
-        self.inner
-            .ack_waiters_enabled
-            .store(enabled, Ordering::Release);
-        Ok(())
-    }
-
-    #[cfg(feature = "bench")]
-    pub(crate) fn try_ack_prefix(&self, ticket_end: u64) -> Result<bool> {
-        self.try_ack_prefix_after_durable_sample(ticket_end, || {})
-    }
-
-    #[cfg(feature = "bench")]
-    fn try_ack_prefix_after_durable_sample(
-        &self,
-        ticket_end: u64,
-        after_durable_sample: impl FnOnce(),
-    ) -> Result<bool> {
-        ensure!(
-            self.independent_ack_waiter_enabled(),
-            "independent ACK waiter is disabled"
-        );
-        ensure!(
-            ticket_end <= self.inner.admitted_ticket_end.load(Ordering::Acquire),
-            "v8 durability wait names an unassigned ticket prefix"
-        );
-
-        // Keep the independent path's failure semantics aligned with driver
-        // election: poison is terminal even if a concurrent publication
-        // advances the internal watermark. The outer WAL's already-published
-        // durable watermark remains the authority for ACKs that have escaped
-        // this coordinator.
-        ensure!(
-            !self.inner.ack_waiters.poisoned.load(Ordering::SeqCst),
-            "v8 Parallel coordinator is poisoned"
-        );
-        let durable = self
-            .inner
-            .ack_waiters
-            .durable_ticket_end
-            .load(Ordering::SeqCst)
-            >= ticket_end;
-        after_durable_sample();
-        ensure!(
-            !self.inner.ack_waiters.poisoned.load(Ordering::SeqCst),
-            "v8 Parallel coordinator is poisoned"
-        );
-
-        Ok(durable)
-    }
-
-    #[cfg(feature = "bench")]
-    pub(crate) fn ack_waiter_generation(&self) -> u64 {
-        self.inner.ack_waiters.generation()
-    }
-
-    #[cfg(feature = "bench")]
-    pub(crate) fn wait_for_ack_waiter_change(
-        &self,
-        observed_generation: u64,
-        ticket_end: u64,
-    ) -> Result<()> {
-        self.inner
-            .ack_waiters
-            .wait_for_change(observed_generation, || {
-                self.try_ack_prefix(ticket_end).map(|durable| !durable)
-            })
-    }
-
-    #[cfg(feature = "bench")]
-    pub(crate) fn wait_for_durable_prefix_independent(&self, ticket_end: u64) -> Result<()> {
-        loop {
-            let observed_generation = self.ack_waiter_generation();
-            if self.try_ack_prefix(ticket_end)? {
-                return Ok(());
-            }
-            self.wait_for_ack_waiter_change(observed_generation, ticket_end)?;
-        }
-    }
-
     pub(crate) fn take_progress_token_receiver(&self) -> Result<Option<Receiver<()>>> {
         let Some(receiver) = self.inner.progress_token_receiver.lock().take() else {
             if self.progress_ring_enabled() {
@@ -1387,10 +1196,6 @@ impl WalV8ParallelCoordinator {
                     durability_waiters: 0,
                     #[cfg(test)]
                     durable_followers: 0,
-                    #[cfg(test)]
-                    durable_wait_only_waiters: 0,
-                    #[cfg(feature = "bench")]
-                    admissions_started: false,
                     #[cfg(feature = "bench")]
                     ordered_link_hash_cpu_ns: 0,
                     #[cfg(feature = "bench")]
@@ -1409,12 +1214,6 @@ impl WalV8ParallelCoordinator {
                 changed: Condvar::new(),
                 durability_changed: Condvar::new(),
                 durable_published: Condvar::new(),
-                #[cfg(feature = "bench")]
-                ack_waiters: WalV8AckWaiters::new(config.next_ticket),
-                #[cfg(feature = "bench")]
-                ack_waiters_enabled: AtomicBool::new(false),
-                #[cfg(feature = "bench")]
-                ack_waiters_mode_configured: AtomicBool::new(false),
                 admitted_ticket_end: AtomicU64::new(config.next_ticket),
                 #[cfg(feature = "bench")]
                 data_completion_timestamps_enabled: std::sync::atomic::AtomicBool::new(false),
@@ -2697,8 +2496,6 @@ impl WalV8ParallelCoordinator {
         sample: bool,
     ) -> Result<WalV8DurabilityPublishMetrics> {
         #[cfg(feature = "bench")]
-        let independent_ack_waiter_enabled = self.independent_ack_waiter_enabled();
-        #[cfg(feature = "bench")]
         let publish_started = sample.then(Instant::now);
         #[cfg(feature = "bench")]
         let publish_cpu_started = sample.then(super::digest::thread_cpu_time_ns);
@@ -2840,12 +2637,6 @@ impl WalV8ParallelCoordinator {
         state.last_frontier_ticket_end = reservation.preceding_ticket_end;
         state.pending_frontier = None;
         #[cfg(feature = "bench")]
-        if independent_ack_waiter_enabled {
-            self.inner
-                .ack_waiters
-                .publish_durable_ticket_end(state.durable_ticket_end);
-        }
-        #[cfg(feature = "bench")]
         let durable_published_at = Instant::now();
         #[cfg(feature = "bench")]
         if let Some(profile) = self.inner.profile.load_full() {
@@ -2916,11 +2707,6 @@ impl WalV8ParallelCoordinator {
             .map(|started| started.elapsed().as_nanos().min(u64::MAX as u128) as u64)
             .unwrap_or_default();
         drop(state);
-
-        #[cfg(feature = "bench")]
-        if independent_ack_waiter_enabled {
-            self.inner.ack_waiters.notify_all();
-        }
 
         #[cfg(feature = "bench")]
         if let Some(profile) = self.inner.profile.load_full() {
@@ -3043,10 +2829,6 @@ impl WalV8ParallelCoordinator {
             #[cfg(feature = "bench")]
             record_durable_notification_for_waiters(&mut state);
             self.inner.durable_published.notify_all();
-            #[cfg(feature = "bench")]
-            if self.independent_ack_waiter_enabled() {
-                self.inner.ack_waiters.notify_all();
-            }
         }
         drop(state);
         self.signal_progress_token();
@@ -3165,42 +2947,6 @@ impl WalV8ParallelCoordinator {
     /// publication. This is independent of the on-disk FRONTIER generation.
     pub(crate) fn durability_generation(&self) -> u64 {
         self.inner.state.lock().durability_generation
-    }
-
-    /// Elect one caller to form FRONTIERs. Other callers wait for published
-    /// durability or driver handoff and can return at their own ticket end
-    /// without acquiring the driver's physical FRONTIER mutex.
-    #[cfg(feature = "bench")]
-    pub(crate) fn try_acquire_durability_driver(
-        &self,
-        ticket_end: u64,
-    ) -> Result<WalV8DurabilityDriverElection> {
-        let mut state = self.inner.state.lock();
-        ensure!(
-            ticket_end <= state.next_ticket,
-            "v8 durability driver names an unassigned ticket"
-        );
-        ensure!(!state.poisoned, "v8 Parallel coordinator is poisoned");
-        if state.durable_ticket_end >= ticket_end {
-            return Ok(WalV8DurabilityDriverElection::Durable);
-        }
-        if state.durability_driver_active {
-            return Ok(WalV8DurabilityDriverElection::Busy);
-        }
-
-        let completion_batch = state.completion_batch.take();
-        if self.progress_cursor_enabled() && completion_batch.is_none() {
-            poison_locked(&self.inner, &mut state);
-            anyhow::bail!("v8 durability driver completion buffer is missing");
-        }
-        state.durability_driver_active = true;
-        Ok(WalV8DurabilityDriverElection::Driver(
-            WalV8DurabilityDriver {
-                coordinator: self.clone(),
-                completed: false,
-                completion_batch,
-            },
-        ))
     }
 
     /// Elect one caller to form FRONTIERs. Other callers wait for published
@@ -3352,38 +3098,6 @@ impl WalV8ParallelCoordinator {
         }
     }
 
-    /// Wait for an exclusive ticket prefix to become durable without taking
-    /// ownership of the durability driver. Dedicated-driver mode uses this
-    /// after publishing a coalesced request to its background owner.
-    pub(crate) fn wait_for_durable_prefix(&self, ticket_end: u64) -> Result<()> {
-        let mut state = self.inner.state.lock();
-        ensure!(
-            ticket_end <= state.next_ticket,
-            "v8 durability wait names an unassigned ticket prefix"
-        );
-        #[cfg(test)]
-        {
-            state.durable_wait_only_waiters += 1;
-        }
-
-        let result = loop {
-            if state.poisoned {
-                break Err(anyhow::anyhow!("v8 Parallel coordinator is poisoned"));
-            }
-            if state.durable_ticket_end >= ticket_end {
-                break Ok(());
-            }
-            self.inner.durable_published.wait(&mut state);
-        };
-
-        #[cfg(test)]
-        {
-            state.durable_wait_only_waiters -= 1;
-        }
-
-        result
-    }
-
     /// Wait for durability progress without subscribing to producer
     /// preparation notifications. The locked predicate prevents lost wakes;
     /// one deadline bounds the wait even after a spurious notification.
@@ -3483,13 +3197,6 @@ pub(crate) struct WalV8DurabilityDriver {
     pub(super) completion_batch: Option<Vec<WalV8CompletedGroupEvent>>,
 }
 
-#[cfg(feature = "bench")]
-pub(crate) enum WalV8DurabilityDriverElection {
-    Durable,
-    Busy,
-    Driver(WalV8DurabilityDriver),
-}
-
 impl WalV8DurabilityDriver {
     pub(crate) fn complete(&mut self) {
         self.completed = true;
@@ -3510,13 +3217,6 @@ impl Drop for WalV8DurabilityDriver {
         #[cfg(feature = "bench")]
         record_durable_notification_for_waiters(&mut state);
         self.coordinator.inner.durable_published.notify_all();
-        #[cfg(feature = "bench")]
-        let notify_ack_waiters = self.coordinator.independent_ack_waiter_enabled();
-        drop(state);
-        #[cfg(feature = "bench")]
-        if notify_ack_waiters {
-            self.coordinator.inner.ack_waiters.notify_all();
-        }
     }
 }
 
@@ -3669,10 +3369,6 @@ impl WalV8AdmissionPublisher for WalV8ParallelCoordinator {
             data_completion_hol_started_at: None,
         });
         state.next_ticket = next_ticket;
-        #[cfg(feature = "bench")]
-        {
-            state.admissions_started = true;
-        }
         state.next_data_offset = data_end;
         state.last_commit_ts = plan.commit_ts;
         state.last_recorded_at = Some(recorded_at);
@@ -4306,10 +4002,6 @@ fn poison_locked(inner: &CoordinatorInner, state: &mut CoordinatorState) {
         if let Some(ring) = &inner.progress_ring {
             ring.poisoned.store(true, Ordering::Release);
         }
-        #[cfg(feature = "bench")]
-        if inner.ack_waiters_enabled.load(Ordering::Relaxed) {
-            inner.ack_waiters.publish_poisoned();
-        }
         signal_progress_token(inner);
         signal_change(inner, state);
         signal_durability_progress(inner, state);
@@ -4412,314 +4104,6 @@ mod tests {
 
     fn coordinator(max_inflight_tickets: usize) -> Result<WalV8ParallelCoordinator> {
         coordinator_with_byte_limit(max_inflight_tickets, 64 * 1024 * 1024)
-    }
-
-    #[cfg(feature = "bench")]
-    fn wait_for_ack_waiter(coordinator: &WalV8ParallelCoordinator) -> Result<()> {
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while coordinator
-            .inner
-            .ack_waiters
-            .waiting
-            .load(Ordering::Acquire)
-            == 0
-        {
-            ensure!(
-                Instant::now() < deadline,
-                "ACK waiter did not begin parking"
-            );
-            std::thread::yield_now();
-        }
-
-        Ok(())
-    }
-
-    #[cfg(feature = "bench")]
-    #[test]
-    fn independent_ack_waiter_mode_is_fixed_during_initialization() -> Result<()> {
-        let configured_coordinator = coordinator(4)?;
-        configured_coordinator.set_independent_ack_waiter_enabled(true)?;
-        assert!(configured_coordinator.independent_ack_waiter_enabled());
-        assert!(
-            configured_coordinator
-                .set_independent_ack_waiter_enabled(false)
-                .is_err()
-        );
-
-        let admitted_coordinator = coordinator(4)?;
-        let _admitted = admit(&batch(10), &admitted_coordinator)?;
-        assert!(
-            admitted_coordinator
-                .set_independent_ack_waiter_enabled(true)
-                .is_err()
-        );
-
-        let idle_after_admission = coordinator(4)?;
-        let durable_batch = batch(20);
-        let admitted = admit(&durable_batch, &idle_after_admission)?;
-        let mut encoded = admitted.encode()?;
-        mark_producer_ready(&mut encoded, &idle_after_admission, true)?;
-        let frontier = idle_after_admission.reserve_frontier(1)?;
-        idle_after_admission.publish_durable_frontier(frontier)?;
-        encoded.disarm_after_durable();
-        {
-            let state = idle_after_admission.inner.state.lock();
-            assert_eq!(state.next_ticket, state.durable_ticket_end);
-            assert!(state.tickets.is_empty());
-        }
-        assert!(
-            idle_after_admission
-                .set_independent_ack_waiter_enabled(true)
-                .is_err()
-        );
-
-        Ok(())
-    }
-
-    #[cfg(feature = "bench")]
-    #[test]
-    fn independent_ack_fast_path_does_not_take_coordinator_lock() -> Result<()> {
-        let coordinator = coordinator(4)?;
-        coordinator.set_independent_ack_waiter_enabled(true)?;
-        {
-            let mut state = coordinator.inner.state.lock();
-            state.next_ticket = 1;
-            coordinator
-                .inner
-                .admitted_ticket_end
-                .store(1, Ordering::Release);
-        }
-        coordinator.inner.ack_waiters.publish_durable_ticket_end(1);
-
-        let state_guard = coordinator.inner.state.lock();
-        let waiting = coordinator.clone();
-        let (started_tx, started_rx) = std::sync::mpsc::channel();
-        let (result_tx, result_rx) = std::sync::mpsc::channel();
-        let caller = std::thread::spawn(move || {
-            started_tx
-                .send(())
-                .expect("test receiver remains connected");
-            result_tx
-                .send(waiting.try_ack_prefix(1))
-                .expect("test receiver remains connected");
-        });
-        started_rx.recv_timeout(Duration::from_secs(1))?;
-        let result = result_rx.recv_timeout(Duration::from_secs(1));
-        drop(state_guard);
-        assert!(result.is_ok(), "durable ACK waited on Coordinator state");
-        assert!(result??);
-        caller.join().expect("ACK fast-path caller panicked");
-
-        Ok(())
-    }
-
-    #[cfg(feature = "bench")]
-    #[test]
-    fn independent_ack_park_rechecks_generation_and_predicate() -> Result<()> {
-        let ack_waiters = Arc::new(WalV8AckWaiters::new(0));
-
-        // A publication can race after the caller snapshots the generation
-        // but before it acquires the park lock. It must not sleep on the stale
-        // generation after the publisher's notification has already passed.
-        let observed_generation = ack_waiters.generation();
-        let park = ack_waiters.park_lock.lock();
-        let waiting_ack = Arc::clone(&ack_waiters);
-        let (started_tx, started_rx) = std::sync::mpsc::channel();
-        let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let waiter = std::thread::spawn(move || {
-            started_tx
-                .send(())
-                .expect("test receiver remains connected");
-            let _ = done_tx.send(waiting_ack.wait_for_change(observed_generation, || Ok(true)));
-        });
-        started_rx.recv_timeout(Duration::from_secs(1))?;
-        ack_waiters.event_generation.fetch_add(1, Ordering::Release);
-        ack_waiters.changed.notify_all();
-        drop(park);
-        done_rx
-            .recv_timeout(Duration::from_secs(1))
-            .context("ACK waiter missed a generation change before parking")??;
-        waiter.join().expect("ACK generation-race waiter panicked");
-
-        // Durable publication precedes the notifier's acquisition of the
-        // park lock. Rechecking the predicate under that lock lets the waiter
-        // return even while the notification is still pending.
-        let ready = Arc::new(AtomicBool::new(false));
-        let observed_generation = ack_waiters.generation();
-        let park = ack_waiters.park_lock.lock();
-        let waiting_ack = Arc::clone(&ack_waiters);
-        let waiting_ready = Arc::clone(&ready);
-        let (started_tx, started_rx) = std::sync::mpsc::channel();
-        let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let waiter = std::thread::spawn(move || {
-            started_tx
-                .send(())
-                .expect("test receiver remains connected");
-            let _ = done_tx.send(waiting_ack.wait_for_change(observed_generation, || {
-                Ok(!waiting_ready.load(Ordering::Acquire))
-            }));
-        });
-        started_rx.recv_timeout(Duration::from_secs(1))?;
-        ready.store(true, Ordering::Release);
-        drop(park);
-        done_rx
-            .recv_timeout(Duration::from_secs(1))
-            .context("ACK waiter did not recheck its predicate before parking")??;
-        waiter.join().expect("ACK predicate-race waiter panicked");
-
-        Ok(())
-    }
-
-    #[cfg(feature = "bench")]
-    #[test]
-    fn independent_ack_partial_prefix_poison_and_driver_handoff() -> Result<()> {
-        let partial_coordinator = coordinator(4)?;
-        partial_coordinator.set_independent_ack_waiter_enabled(true)?;
-        let first_batch = batch(10);
-        let second_batch = batch(20);
-        let mut first = admit(&first_batch, &partial_coordinator)?.encode()?;
-        let mut second = admit(&second_batch, &partial_coordinator)?.encode()?;
-        mark_producer_ready(&mut first, &partial_coordinator, true)?;
-        mark_producer_ready(&mut second, &partial_coordinator, false)?;
-
-        let frontier = partial_coordinator.reserve_frontier(1)?;
-        partial_coordinator.publish_durable_frontier(frontier)?;
-        first.disarm_after_durable();
-        assert!(partial_coordinator.try_ack_prefix(1)?);
-        assert!(!partial_coordinator.try_ack_prefix(2)?);
-
-        let waiting = partial_coordinator.clone();
-        let (waiter_tx, waiter_rx) = std::sync::mpsc::channel();
-        let waiter = std::thread::spawn(move || {
-            let _ = waiter_tx.send(waiting.wait_for_durable_prefix_independent(2));
-        });
-        wait_for_ack_waiter(&partial_coordinator)?;
-        partial_coordinator.poison();
-        assert!(waiter_rx.recv_timeout(Duration::from_secs(1))?.is_err());
-        waiter.join().expect("poisoned ACK waiter panicked");
-        assert!(partial_coordinator.try_ack_prefix(1).is_err());
-        assert!(partial_coordinator.try_ack_prefix(2).is_err());
-
-        // A later Driver Drop must wake a waiting caller so it can retry
-        // election. Use a fresh coordinator because Poison is terminal.
-        let handoff_coordinator = coordinator(4)?;
-        handoff_coordinator.set_independent_ack_waiter_enabled(true)?;
-        let pending = batch(30);
-        let mut encoded = admit(&pending, &handoff_coordinator)?.encode()?;
-        mark_producer_ready(&mut encoded, &handoff_coordinator, true)?;
-        let mut driver = handoff_coordinator
-            .acquire_durability_driver(1)?
-            .context("missing initial durability driver")?;
-        let observed_generation = handoff_coordinator.ack_waiter_generation();
-        let waiting = handoff_coordinator.clone();
-        let (handoff_tx, handoff_rx) = std::sync::mpsc::channel();
-        let follower = std::thread::spawn(move || {
-            let _ = handoff_tx.send(waiting.wait_for_ack_waiter_change(observed_generation, 1));
-        });
-        wait_for_ack_waiter(&handoff_coordinator)?;
-        driver.complete();
-        drop(driver);
-        handoff_rx
-            .recv_timeout(Duration::from_secs(1))
-            .context("Driver Drop did not wake the ACK waiter")??;
-        follower.join().expect("Driver handoff ACK waiter panicked");
-        let mut successor = handoff_coordinator
-            .acquire_durability_driver(1)?
-            .context("Driver Drop did not release election ownership")?;
-        let frontier = handoff_coordinator.reserve_frontier(1)?;
-        handoff_coordinator.publish_durable_frontier(frontier)?;
-        encoded.disarm_after_durable();
-        successor.complete();
-        drop(successor);
-        assert!(handoff_coordinator.try_ack_prefix(1)?);
-
-        Ok(())
-    }
-
-    #[cfg(feature = "bench")]
-    #[test]
-    fn independent_ack_poison_after_durable_sample_wins() -> Result<()> {
-        let coordinator = coordinator(4)?;
-        coordinator.set_independent_ack_waiter_enabled(true)?;
-        let pending = batch(40);
-        let mut encoded = admit(&pending, &coordinator)?.encode()?;
-        mark_producer_ready(&mut encoded, &coordinator, true)?;
-
-        let waiting = coordinator.clone();
-        let (sampled_tx, sampled_rx) = std::sync::mpsc::channel();
-        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
-        let waiter = std::thread::spawn(move || {
-            waiting.try_ack_prefix_after_durable_sample(1, || {
-                sampled_tx
-                    .send(())
-                    .expect("test receiver remains connected");
-                resume_rx.recv().expect("test sender remains connected");
-            })
-        });
-
-        sampled_rx.recv_timeout(Duration::from_secs(1))?;
-        let mut driver = coordinator
-            .acquire_durability_driver(1)?
-            .context("missing durability driver for concurrent publication")?;
-        let frontier = coordinator.reserve_frontier(1)?;
-        coordinator.publish_durable_frontier(frontier)?;
-        encoded.disarm_after_durable();
-        driver.complete();
-        drop(driver);
-        coordinator.poison();
-        resume_tx
-            .send(())
-            .expect("ACK sample waiter remains connected");
-
-        assert!(waiter.join().expect("ACK sample waiter panicked").is_err());
-        assert!(coordinator.try_ack_prefix(1).is_err());
-
-        Ok(())
-    }
-
-    #[cfg(feature = "bench")]
-    #[test]
-    fn independent_ack_poison_between_fast_path_and_driver_election_wins() -> Result<()> {
-        let coordinator = coordinator(4)?;
-        coordinator.set_independent_ack_waiter_enabled(true)?;
-        let pending = batch(50);
-        let mut encoded = admit(&pending, &coordinator)?.encode()?;
-        mark_producer_ready(&mut encoded, &coordinator, true)?;
-
-        let waiting = coordinator.clone();
-        let (fast_path_tx, fast_path_rx) = std::sync::mpsc::channel();
-        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
-        let waiter = std::thread::spawn(move || -> Result<()> {
-            ensure!(!waiting.try_ack_prefix(1)?, "ticket unexpectedly durable");
-            fast_path_tx
-                .send(())
-                .expect("test receiver remains connected");
-            resume_rx.recv().expect("test sender remains connected");
-            waiting.try_acquire_durability_driver(1).map(|_| ())
-        });
-
-        fast_path_rx.recv_timeout(Duration::from_secs(1))?;
-        let mut driver = coordinator
-            .acquire_durability_driver(1)?
-            .context("missing durability driver for concurrent publication")?;
-        let frontier = coordinator.reserve_frontier(1)?;
-        coordinator.publish_durable_frontier(frontier)?;
-        encoded.disarm_after_durable();
-        driver.complete();
-        drop(driver);
-        coordinator.poison();
-        resume_tx
-            .send(())
-            .expect("ACK fast-path waiter remains connected");
-
-        assert!(
-            waiter
-                .join()
-                .expect("ACK fast-path waiter panicked")
-                .is_err()
-        );
-
-        Ok(())
     }
 
     #[test]
@@ -7064,51 +6448,6 @@ mod tests {
             );
             std::thread::yield_now();
         }
-
-        Ok(())
-    }
-
-    fn wait_for_durable_wait_only_follower(coordinator: &WalV8ParallelCoordinator) -> Result<()> {
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while coordinator.inner.state.lock().durable_wait_only_waiters == 0 {
-            ensure!(
-                Instant::now() < deadline,
-                "wait-only durability caller did not start waiting"
-            );
-            std::thread::yield_now();
-        }
-
-        Ok(())
-    }
-
-    #[test]
-    fn wait_for_durable_prefix_never_elects_a_driver() -> Result<()> {
-        let coordinator = coordinator(8)?;
-        let first = batch(10);
-        let mut encoded = admit(&first, &coordinator)?.encode()?;
-        mark_producer_ready(&mut encoded, &coordinator, true)?;
-
-        let waiting = coordinator.clone();
-        let (tx, rx) = std::sync::mpsc::channel();
-        let follower = std::thread::spawn(move || {
-            let _ = tx.send(waiting.wait_for_durable_prefix(1));
-        });
-        wait_for_durable_wait_only_follower(&coordinator)?;
-        assert!(!coordinator.inner.state.lock().durability_driver_active);
-
-        let mut driver = coordinator
-            .acquire_durability_driver(1)?
-            .context("wait-only follower unexpectedly elected the driver")?;
-        let frontier = coordinator.reserve_frontier(1)?;
-        coordinator.publish_durable_frontier(frontier)?;
-        encoded.disarm_after_durable();
-        driver.complete();
-        drop(driver);
-
-        rx.recv_timeout(Duration::from_secs(1))??;
-        follower.join().expect("wait-only follower panicked");
-        assert_eq!(coordinator.durable_ticket_end(), 1);
-        assert!(!coordinator.is_poisoned());
 
         Ok(())
     }

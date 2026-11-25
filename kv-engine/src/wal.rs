@@ -167,26 +167,18 @@ pub struct WalIoDiagnostics {
     /// Whether Cursor DATA submissions use the benchmark-only allocation-free group
     /// representation.
     pub cursor_singleton_submission_enabled: bool,
-    /// Whether V8 Parallel admission publishes the assigned ticket directly instead of
-    /// rereading the coordinator cursor and updating the legacy PITR reservation cursor.
+    // Retired D2/D3 and C1/C2 experiment fields remain in benchmark output so
+    // historical result readers can continue to consume the same schema.
     pub admission_cursor_publish_fast_path_enabled: bool,
     /// Whether Point batches attempt the bounded benchmark-only DATA-buffer preallocation.
     pub point_buffer_preallocation_enabled: bool,
-    /// Whether ACK waiters use the independent benchmark-only watermark/condition variable.
     pub independent_ack_waiter_enabled: bool,
-    /// Whether durability advances are owned by a dedicated benchmark-only worker thread.
     pub dedicated_durability_driver_enabled: bool,
-    /// Whether contended request/wake/advance counters were enabled for this run.
     pub dedicated_durability_diagnostics_enabled: bool,
-    /// Number of writer durability requests submitted to the dedicated driver.
     pub dedicated_durability_requests: u64,
-    /// Number of wake tokens sent to the dedicated driver.
     pub dedicated_durability_wake_signals: u64,
-    /// Number of wake requests coalesced because the capacity-one channel was already full.
     pub dedicated_durability_coalesced_wakes: u64,
-    /// Number of driver advance attempts, including calls that returned an error.
     pub dedicated_durability_advance_attempts: u64,
-    /// Number of durability advances initiated by caller-driven writers.
     pub caller_durability_driver_election_attempts: u64,
     /// Number of Point DATA-buffer preallocation attempts during the run.
     pub point_buffer_preallocation_attempts: u64,
@@ -194,13 +186,9 @@ pub struct WalIoDiagnostics {
     pub point_buffer_preallocation_hits: u64,
     /// Number of attempts that used the regular in-sequencer allocation path.
     pub point_buffer_preallocation_fallbacks: u64,
-    /// Benchmark-only Point resource retirement mode: 0 is per-ticket, 1 detaches Point prefixes.
     pub point_resource_retirement_mode: u8,
-    /// Number of all-Point durable prefixes detached before resource retirement.
     pub point_resource_retirement_detached_prefixes: u64,
-    /// Number of tickets retired from detached all-Point prefixes.
     pub point_resource_retirement_detached_tickets: u64,
-    /// Number of detached Point prefixes retired through the C2 batch path.
     pub point_resource_retirement_batched_prefixes: u64,
     /// Outstanding speculative buffer permits for in-process lifecycle tests.
     /// This field is not serialized into benchmark results.
@@ -254,107 +242,6 @@ pub struct WalIoDiagnostics {
     pub point_resource_preclaim_promotion_cpu_ns: u64,
     pub point_resource_preclaim_promotion_cpu_samples: u64,
     pub progress_diagnostics: Option<WalV8ProgressDiagnostics>,
-}
-
-#[cfg(feature = "bench")]
-const V8_ADMISSION_CURSOR_PUBLISH_FAST_PATH_ENV: &str =
-    "TOYKV_BENCH_V8_ADMISSION_CURSOR_PUBLISH_FAST_PATH";
-
-#[cfg(feature = "bench")]
-const V8_DEDICATED_DURABILITY_DRIVER_ENV: &str = "TOYKV_BENCH_V8_DEDICATED_DURABILITY_DRIVER";
-#[cfg(feature = "bench")]
-const V8_DEDICATED_DURABILITY_DIAGNOSTICS_ENV: &str =
-    "TOYKV_BENCH_V8_DURABILITY_DRIVER_DIAGNOSTICS";
-#[cfg(feature = "bench")]
-const V8_INDEPENDENT_ACK_WAITER_ENV: &str = "TOYKV_BENCH_V8_INDEPENDENT_ACK_WAITER";
-
-#[cfg(feature = "bench")]
-fn v8_admission_cursor_publish_fast_path_env_enabled(value: Option<&str>) -> bool {
-    value == Some("1")
-}
-
-/// Returns the bench-only D2a setting. The benchmark starts one process per arm, so this
-/// process-wide value is fixed before the first write and does not add environment parsing
-/// to the admission path.
-#[cfg(feature = "bench")]
-pub(crate) fn v8_admission_cursor_publish_fast_path_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        v8_admission_cursor_publish_fast_path_env_enabled(
-            std::env::var(V8_ADMISSION_CURSOR_PUBLISH_FAST_PATH_ENV)
-                .ok()
-                .as_deref(),
-        )
-    })
-}
-
-#[cfg(feature = "bench")]
-fn v8_dedicated_durability_driver_enabled_from_value(value: Option<&str>) -> Result<bool> {
-    match value {
-        Some("1") => Ok(true),
-        Some("0") | None => Ok(false),
-        Some(_) => anyhow::bail!("{V8_DEDICATED_DURABILITY_DRIVER_ENV} must be `0` or `1`"),
-    }
-}
-
-#[cfg(feature = "bench")]
-fn v8_dedicated_durability_driver_enabled() -> Result<bool> {
-    match std::env::var(V8_DEDICATED_DURABILITY_DRIVER_ENV) {
-        Ok(value) => v8_dedicated_durability_driver_enabled_from_value(Some(&value)),
-        Err(std::env::VarError::NotPresent) => {
-            v8_dedicated_durability_driver_enabled_from_value(None)
-        }
-        Err(error @ std::env::VarError::NotUnicode(_)) => {
-            Err(error).context("read dedicated V8 durability driver setting")
-        }
-    }
-}
-
-#[cfg(feature = "bench")]
-fn v8_dedicated_durability_diagnostics_enabled_from_value(value: Option<&str>) -> Result<bool> {
-    match value {
-        Some("1") => Ok(true),
-        Some("0") | None => Ok(false),
-        Some(_) => anyhow::bail!("{V8_DEDICATED_DURABILITY_DIAGNOSTICS_ENV} must be `0` or `1`"),
-    }
-}
-
-#[cfg(feature = "bench")]
-fn v8_dedicated_durability_diagnostics_enabled() -> Result<bool> {
-    match std::env::var(V8_DEDICATED_DURABILITY_DIAGNOSTICS_ENV) {
-        Ok(value) => v8_dedicated_durability_diagnostics_enabled_from_value(Some(&value)),
-        Err(std::env::VarError::NotPresent) => {
-            v8_dedicated_durability_diagnostics_enabled_from_value(None)
-        }
-        Err(error @ std::env::VarError::NotUnicode(_)) => {
-            Err(error).context("read dedicated V8 durability diagnostics setting")
-        }
-    }
-}
-
-#[cfg(feature = "bench")]
-fn v8_independent_ack_waiter_enabled_from_value(value: Option<&str>) -> Result<bool> {
-    match value {
-        Some("1") => Ok(true),
-        Some("0") | None => Ok(false),
-        Some(_) => anyhow::bail!("{V8_INDEPENDENT_ACK_WAITER_ENV} must be `0` or `1`"),
-    }
-}
-
-#[cfg(feature = "bench")]
-fn v8_independent_ack_waiter_enabled() -> Result<bool> {
-    match std::env::var(V8_INDEPENDENT_ACK_WAITER_ENV) {
-        Ok(value) => v8_independent_ack_waiter_enabled_from_value(Some(&value)),
-        Err(std::env::VarError::NotPresent) => v8_independent_ack_waiter_enabled_from_value(None),
-        Err(error @ std::env::VarError::NotUnicode(_)) => {
-            Err(error).context("read independent V8 ACK waiter setting")
-        }
-    }
-}
-
-#[cfg(not(feature = "bench"))]
-pub(crate) const fn v8_admission_cursor_publish_fast_path_enabled() -> bool {
-    false
 }
 
 /// Per-writer progress observations collected with lightweight counters or
@@ -875,14 +762,7 @@ pub struct Wal {
     v7_leader: Option<Mutex<WalV7LeaderWriter>>,
     /// V8 Leader control writer, retained for serialized comparisons.
     v8_leader: Option<Mutex<v8::leader::WalV8LeaderWriter>>,
-    /// Dropped before `v8_parallel`, so its worker is joined before the writer
-    /// and its segment resources are released.
-    #[cfg(feature = "bench")]
-    dedicated_durability_driver: Option<v8::leader::WalV8DedicatedDurabilityDriver>,
     /// Concurrent v8 writer for the embedded-frontier Parallel pipeline.
-    #[cfg(feature = "bench")]
-    v8_parallel: Option<Arc<v8::leader::WalV8ParallelWriter>>,
-    #[cfg(not(feature = "bench"))]
     v8_parallel: Option<v8::leader::WalV8ParallelWriter>,
     /// Whether this WAL uses v3 typed entries (kind prefix).
     /// Only meaningful when `mvcc_format` is true. When false, the WAL uses v2
@@ -919,7 +799,7 @@ pub struct Wal {
     /// Set to true on I/O error to fail-fast future writes.
     /// Once poisoned, the WAL is unusable — callers must create a new WAL.
     poisoned: AtomicBool,
-    /// PITR admission bounds and the end tracked by V5/V6 reservations and V7 publication.
+    /// PITR admission bounds and the ticket-ordered logical end reserved by queued batches.
     pitr_max_segment_bytes: AtomicU64,
     pitr_max_unarchived_bytes: AtomicU64,
     /// File offset where the current PITR segment started appending.
@@ -1066,25 +946,6 @@ fn wait_for_v8_parallel_if_needed(
     wait()?;
 
     Ok(true)
-}
-
-fn publish_v8_parallel_cursor_snapshot(
-    durable_ticket: &AtomicU64,
-    alloc_offset: &AtomicU64,
-    preallocated_size: &AtomicU64,
-    next_ticket: &AtomicU64,
-    pitr_reserved_end: &Mutex<u64>,
-    published_cursor: impl FnOnce() -> (u64, u64, u64),
-) -> u64 {
-    let (ticket_end, append_offset, admitted_ticket_end) = published_cursor();
-    alloc_offset.fetch_max(append_offset, Ordering::Release);
-    preallocated_size.fetch_max(append_offset, Ordering::Release);
-    let mut reserved_end = pitr_reserved_end.lock();
-    *reserved_end = (*reserved_end).max(append_offset);
-    durable_ticket.fetch_max(ticket_end, Ordering::Release);
-    next_ticket.fetch_max(admitted_ticket_end, Ordering::Release);
-
-    ticket_end
 }
 
 impl Wal {
@@ -1262,8 +1123,6 @@ impl Wal {
                 parallel_runtime,
                 v7_leader: None,
                 v8_leader: None,
-                #[cfg(feature = "bench")]
-                dedicated_durability_driver: None,
                 v8_parallel: None,
                 is_v3,
                 direct_file: Some(direct_file),
@@ -1297,8 +1156,6 @@ impl Wal {
                 parallel_runtime: None,
                 v7_leader: None,
                 v8_leader: None,
-                #[cfg(feature = "bench")]
-                dedicated_durability_driver: None,
                 v8_parallel: None,
                 is_v3,
                 direct_file: None,
@@ -1641,8 +1498,6 @@ impl Wal {
             parallel_runtime,
             v7_leader: None,
             v8_leader: None,
-            #[cfg(feature = "bench")]
-            dedicated_durability_driver: None,
             v8_parallel: None,
             is_v3: true,
             direct_file: Some(direct_file),
@@ -1702,8 +1557,6 @@ impl Wal {
             parallel_runtime: None,
             v7_leader: None,
             v8_leader: None,
-            #[cfg(feature = "bench")]
-            dedicated_durability_driver: None,
             v8_parallel: None,
             is_v3: true,
             direct_file: Some(direct_file),
@@ -1750,8 +1603,6 @@ impl Wal {
             parallel_runtime: None,
             v7_leader: Some(Mutex::new(writer)),
             v8_leader: None,
-            #[cfg(feature = "bench")]
-            dedicated_durability_driver: None,
             v8_parallel: None,
             is_v3: true,
             direct_file: None,
@@ -1804,8 +1655,6 @@ impl Wal {
             parallel_runtime: None,
             v7_leader: None,
             v8_leader: Some(Mutex::new(writer)),
-            #[cfg(feature = "bench")]
-            dedicated_durability_driver: None,
             v8_parallel: None,
             is_v3: true,
             direct_file: None,
@@ -1847,28 +1696,6 @@ impl Wal {
         let append_offset = installed.image_len;
         let data_start = u64::try_from(v8::WAL_V8_HEADER_LEN + v8::codec::WAL_V8_FRAME_LEN)?;
 
-        #[cfg(feature = "bench")]
-        let mut writer = writer;
-
-        #[cfg(feature = "bench")]
-        let dedicated_durability_diagnostics_enabled =
-            v8_dedicated_durability_diagnostics_enabled()?;
-
-        #[cfg(feature = "bench")]
-        writer.set_independent_ack_waiter_enabled(v8_independent_ack_waiter_enabled()?)?;
-
-        #[cfg(feature = "bench")]
-        writer.set_durability_driver_diagnostics_enabled(dedicated_durability_diagnostics_enabled);
-
-        #[cfg(feature = "bench")]
-        let (writer, dedicated_durability_driver) = if v8_dedicated_durability_driver_enabled()? {
-            let (writer, driver) = writer
-                .into_dedicated_durability_driver(dedicated_durability_diagnostics_enabled)?;
-            (writer, Some(driver))
-        } else {
-            (Arc::new(writer), None)
-        };
-
         Ok(Self {
             buffered_file: Arc::new(Mutex::new(BufWriter::new(buffered_file))),
             mvcc_format: true,
@@ -1877,8 +1704,6 @@ impl Wal {
             parallel_runtime: None,
             v7_leader: None,
             v8_leader: None,
-            #[cfg(feature = "bench")]
-            dedicated_durability_driver,
             v8_parallel: Some(writer),
             is_v3: true,
             direct_file: None,
@@ -1958,8 +1783,6 @@ impl Wal {
             parallel_runtime: Some(parallel_runtime),
             v7_leader: None,
             v8_leader: None,
-            #[cfg(feature = "bench")]
-            dedicated_durability_driver: None,
             v8_parallel: None,
             is_v3: true,
             direct_file: Some(direct_file),
@@ -2016,7 +1839,7 @@ impl Wal {
         let parallel_poisoned = self
             .v8_parallel
             .as_ref()
-            .is_some_and(|writer| writer.is_poisoned());
+            .is_some_and(v8::leader::WalV8ParallelWriter::is_poisoned);
         if leader_poisoned || parallel_poisoned {
             self.poisoned.store(true, Ordering::Release);
         }
@@ -2304,20 +2127,14 @@ impl Wal {
 
     #[cfg(feature = "bench")]
     pub(crate) fn benchmark_io_diagnostics(&self) -> Option<WalIoDiagnostics> {
-        let mut diagnostics = self
-            .v8_leader
+        self.v8_leader
             .as_ref()
             .map(|writer| writer.lock().io_diagnostics())
             .or_else(|| {
                 self.v8_parallel
                     .as_ref()
-                    .map(|writer| writer.io_diagnostics())
-            });
-        if let Some(diagnostics) = &mut diagnostics {
-            diagnostics.dedicated_durability_driver_enabled =
-                self.dedicated_durability_driver.is_some();
-        }
-        diagnostics
+                    .map(v8::leader::WalV8ParallelWriter::io_diagnostics)
+            })
     }
 
     #[cfg(feature = "bench")]
@@ -2359,7 +2176,7 @@ impl Wal {
     pub(crate) fn v8_progress_ring_enabled(&self) -> bool {
         self.v8_parallel
             .as_ref()
-            .is_some_and(|writer| writer.progress_ring_enabled())
+            .is_some_and(v8::leader::WalV8ParallelWriter::progress_ring_enabled)
     }
 
     pub(crate) fn pitr_rotation_needed(&self) -> bool {
@@ -2896,17 +2713,6 @@ impl Wal {
         Ok(())
     }
 
-    #[cfg(all(test, feature = "bench"))]
-    pub(crate) fn set_v8_dedicated_driver_joined_signal_for_test(
-        &self,
-        signal: crossbeam_channel::Sender<()>,
-    ) -> Result<()> {
-        self.v8_parallel
-            .as_ref()
-            .context("v8 WAL has no Parallel writer")?
-            .set_dedicated_driver_joined_signal_for_test(signal)
-    }
-
     #[cfg(feature = "bench")]
     pub(crate) fn admit_v8_prepared_parallel_point_batch<'a>(
         &self,
@@ -2947,28 +2753,13 @@ impl Wal {
             .first_data_offset
             .checked_add(u64::try_from(job.frame_buffer_bytes())?)
             .context("v8 Parallel DATA allocation end overflows after admission")?;
-        let ticket_end = assignment
-            .segment_ticket
-            .checked_add(1)
-            .context("v8 Parallel ticket end overflows after admission")?;
-        let admission_fast_path_enabled = v8_admission_cursor_publish_fast_path_enabled();
-        if admission_fast_path_enabled {
-            // Publish this admission's end without reacquiring the Coordinator
-            // lock. Every admission publishes its own end before returning; V8
-            // durability and admission decisions read the Coordinator directly.
-            self.next_ticket.fetch_max(ticket_end, Ordering::Release);
-        } else {
-            // Preserve the pre-D2a behavior for the same-binary benchmark control.
-            self.next_ticket
-                .fetch_max(writer.next_ticket(), Ordering::Release);
-        }
+        self.next_ticket
+            .fetch_max(writer.next_ticket(), Ordering::Release);
         self.alloc_offset.fetch_max(data_end, Ordering::Release);
         self.preallocated_size
             .fetch_max(data_end, Ordering::Release);
-        if !admission_fast_path_enabled {
-            let mut reserved_end = self.pitr_reserved_end.lock();
-            *reserved_end = (*reserved_end).max(data_end);
-        }
+        let mut reserved_end = self.pitr_reserved_end.lock();
+        *reserved_end = (*reserved_end).max(data_end);
 
         Ok((assignment.segment_ticket, job))
     }
@@ -3025,15 +2816,23 @@ impl Wal {
     }
 
     fn refresh_v8_parallel_cursor(&self, writer: &v8::leader::WalV8ParallelWriter) -> u64 {
-        // Preserve the pre-D2 cursor publication order and PITR reservation update.
-        publish_v8_parallel_cursor_snapshot(
-            &self.completion_state.durable_ticket,
-            &self.alloc_offset,
-            &self.preallocated_size,
-            &self.next_ticket,
-            &self.pitr_reserved_end,
-            || writer.published_cursor(),
-        )
+        // The coordinator publishes this cursor only after the covering sync.
+        // A completed caller must not join a later physical FRONTIER cycle
+        // merely to rebuild an ActiveBoundary and read the completed image end.
+        let (ticket_end, append_offset, admitted_ticket_end) = writer.published_cursor();
+        self.alloc_offset
+            .fetch_max(append_offset, Ordering::Release);
+        self.preallocated_size
+            .fetch_max(append_offset, Ordering::Release);
+        let mut reserved_end = self.pitr_reserved_end.lock();
+        *reserved_end = (*reserved_end).max(append_offset);
+        self.completion_state
+            .durable_ticket
+            .fetch_max(ticket_end, Ordering::Release);
+        self.next_ticket
+            .fetch_max(admitted_ticket_end, Ordering::Release);
+
+        ticket_end
     }
 
     fn record_v8_parallel_error(
@@ -3166,12 +2965,6 @@ impl Wal {
                 return Err(error);
             }
         };
-        if ticket.is_none()
-            && let Err(error) = writer.wait_for_post_publish_cleanup()
-        {
-            self.record_v8_parallel_error(writer, &error);
-            return Err(error);
-        }
         if waited {
             self.refresh_v8_parallel_cursor(writer);
         }
@@ -5008,141 +4801,6 @@ impl Wal {
 #[cfg(test)]
 mod v8_wait_tests {
     use super::*;
-    #[cfg(feature = "bench")]
-    use std::{fs::OpenOptions, thread, time::Duration};
-
-    #[cfg(feature = "bench")]
-    #[test]
-    fn dedicated_durability_driver_is_strictly_opt_in() {
-        assert!(!v8_dedicated_durability_driver_enabled_from_value(None).unwrap());
-        assert!(!v8_dedicated_durability_driver_enabled_from_value(Some("0")).unwrap());
-        assert!(v8_dedicated_durability_driver_enabled_from_value(Some("1")).unwrap());
-        assert!(v8_dedicated_durability_driver_enabled_from_value(Some("true")).is_err());
-        assert!(v8_dedicated_durability_driver_enabled_from_value(Some("2")).is_err());
-    }
-
-    #[cfg(feature = "bench")]
-    #[test]
-    fn dedicated_durability_diagnostics_are_opt_in() {
-        assert!(!v8_dedicated_durability_diagnostics_enabled_from_value(None).unwrap());
-        assert!(!v8_dedicated_durability_diagnostics_enabled_from_value(Some("0")).unwrap());
-        assert!(v8_dedicated_durability_diagnostics_enabled_from_value(Some("1")).unwrap());
-        assert!(v8_dedicated_durability_diagnostics_enabled_from_value(Some("true")).is_err());
-        assert!(v8_dedicated_durability_diagnostics_enabled_from_value(Some("2")).is_err());
-    }
-
-    #[cfg(feature = "bench")]
-    #[test]
-    fn dedicated_wal_close_waits_for_post_publish_retirement() -> Result<()> {
-        use crate::pitr::{ArchiveEpochId, ChainAnchor, RecordedAt, SegmentId, TimelineId};
-        use crate::wal::v8::codec::WalV8Header;
-
-        let directory = tempfile::tempdir()?;
-        let path = directory.path().join("dedicated-wal-close-barrier.wal");
-        let archive_epoch_id = ArchiveEpochId([0x22; 16]);
-        let header = WalV8Header {
-            timeline_id: TimelineId([0x11; 16]),
-            archive_epoch_id,
-            segment_id: SegmentId(7),
-            predecessor: ChainAnchor::Genesis { archive_epoch_id },
-            incarnation: [0x44; 16],
-        };
-        let boundary = v8::install::create_empty_active_image(&path, header)?;
-        let installed = v8::install::recover_and_install_active(
-            &path,
-            &[boundary],
-            header.predecessor,
-            crate::pitr::LIVE_WAL_V5_LIMITS,
-            MAX_WAL_FILE_SIZE,
-        )?;
-        let open_file = || OpenOptions::new().read(true).write(true).open(&path);
-        let leader = v8::leader::WalV8LeaderWriter::new(
-            open_file()?,
-            open_file()?,
-            &installed,
-            MAX_WAL_FILE_SIZE,
-        )?;
-        let parallel = match leader.into_parallel() {
-            Ok(writer) => writer,
-            Err(error) if crate::tests::harness::is_io_uring_unavailable_error(&error) => {
-                eprintln!("skipping test (io_uring unavailable): {error:#}");
-                return Ok(());
-            }
-            Err(error) => return Err(error),
-        };
-
-        let batch = crate::pitr::WalBatch {
-            commit_ts: 1,
-            recorded_at: RecordedAt { secs: 1, nanos: 0 },
-            entries: vec![crate::pitr::WalEntry::Put {
-                key: b"k".to_vec(),
-                value: b"value".to_vec(),
-            }],
-        };
-        let prepared = parallel.preflight_batch(&batch, crate::pitr::LIVE_WAL_V5_LIMITS)?;
-        let mut wal = Wal::from_v8_parallel(parallel, &installed)?;
-        if wal.dedicated_durability_driver.is_none() {
-            let writer = Arc::try_unwrap(
-                wal.v8_parallel
-                    .take()
-                    .context("v8 Parallel test writer is missing")?,
-            )
-            .map_err(|_| anyhow::anyhow!("v8 Parallel test writer has unexpected owners"))?;
-            let (writer, driver) = writer.into_dedicated_durability_driver(false)?;
-            wal.v8_parallel = Some(writer);
-            wal.dedicated_durability_driver = Some(driver);
-        }
-
-        let writer = Arc::clone(
-            wal.v8_parallel
-                .as_ref()
-                .context("v8 Parallel test writer is missing")?,
-        );
-        let (retirement_tx, retirement_rx) = crossbeam_channel::bounded(1);
-        let (release_tx, release_rx) = crossbeam_channel::bounded(1);
-        writer.set_post_publish_retirement_hook_for_test(move || {
-            retirement_tx.send(()).map_err(anyhow::Error::from)?;
-            release_rx
-                .recv_timeout(Duration::from_secs(5))
-                .context("test did not release post-publish retirement")?;
-            Ok(())
-        });
-
-        let (_, job) =
-            wal.admit_v8_prepared_parallel_batch(prepared, batch.commit_ts, batch.recorded_at)?;
-        job.finish()?;
-
-        let wal = Arc::new(wal);
-        let close_wal = Arc::clone(&wal);
-        let (close_tx, close_rx) = crossbeam_channel::bounded(1);
-        let close_thread = thread::spawn(move || {
-            let _ = close_tx.send(close_wal.close());
-        });
-
-        retirement_rx
-            .recv_timeout(Duration::from_secs(5))
-            .context("Wal::close did not reach post-publish retirement")?;
-        assert!(
-            matches!(
-                close_rx.recv_timeout(Duration::from_millis(100)),
-                Err(crossbeam_channel::RecvTimeoutError::Timeout)
-            ),
-            "Wal::close returned while post-publish retirement was paused"
-        );
-
-        release_tx
-            .send(())
-            .context("release post-publish retirement")?;
-        close_rx
-            .recv_timeout(Duration::from_secs(3))
-            .context("Wal::close did not finish after post-publish retirement")??;
-        close_thread.join().expect("Wal::close thread panicked");
-
-        drop(writer);
-        drop(wal);
-
-        Ok(())
-    }
 
     #[test]
     fn already_durable_ticket_succeeds_after_wal_poison() {
@@ -5217,51 +4875,5 @@ mod v8_wait_tests {
         // Assert
         assert!(waited);
         assert!(sync_called.load(Ordering::Relaxed));
-    }
-
-    #[test]
-    fn cursor_refresh_restores_pitr_reservation_and_legacy_publication_order() {
-        let durable_ticket = AtomicU64::new(10);
-        let alloc_offset = AtomicU64::new(1024);
-        let preallocated_size = AtomicU64::new(1024);
-        let next_ticket = AtomicU64::new(10);
-        let pitr_reserved_end = Mutex::new(1024);
-        let snapshot_called = AtomicBool::new(false);
-
-        let durable_end = publish_v8_parallel_cursor_snapshot(
-            &durable_ticket,
-            &alloc_offset,
-            &preallocated_size,
-            &next_ticket,
-            &pitr_reserved_end,
-            || {
-                snapshot_called.store(true, Ordering::Relaxed);
-                (12, 8192, 14)
-            },
-        );
-
-        assert!(snapshot_called.load(Ordering::Relaxed));
-        assert_eq!(durable_end, 12);
-        assert_eq!(durable_ticket.load(Ordering::Acquire), 12);
-        assert_eq!(alloc_offset.load(Ordering::Acquire), 8192);
-        assert_eq!(preallocated_size.load(Ordering::Acquire), 8192);
-        assert_eq!(*pitr_reserved_end.lock(), 8192);
-        assert_eq!(next_ticket.load(Ordering::Acquire), 14);
-    }
-
-    #[cfg(feature = "bench")]
-    #[test]
-    fn d2a_environment_value_requires_exact_one() {
-        assert!(v8_admission_cursor_publish_fast_path_env_enabled(Some("1")));
-        assert!(!v8_admission_cursor_publish_fast_path_env_enabled(None));
-        assert!(!v8_admission_cursor_publish_fast_path_env_enabled(Some(
-            "0"
-        )));
-        assert!(!v8_admission_cursor_publish_fast_path_env_enabled(Some(
-            "true"
-        )));
-        assert!(!v8_admission_cursor_publish_fast_path_env_enabled(Some(
-            "yes"
-        )));
     }
 }

@@ -58,7 +58,6 @@ use crate::{
 use crate::wal::{
     WalExtentPreparationDiagnostics, WalExtentPreparationMode, WalIoDiagnostics,
     WalIoHandleMetadata, WalV8SlidingExtentPreparationDiagnostics,
-    v8_admission_cursor_publish_fast_path_enabled,
 };
 
 #[cfg(feature = "bench")]
@@ -67,7 +66,7 @@ use crate::wal::parallel_worker::DirectGroupWriteCompletion;
 #[cfg(feature = "bench")]
 use super::parallel::WalV8ProgressAdvanceTiming;
 #[cfg(feature = "bench")]
-use super::parallel::{WalV8DurabilityDriverElection, WalV8ReadyPrefix, WalV8TicketProgress};
+use super::parallel::{WalV8ReadyPrefix, WalV8TicketProgress};
 
 use super::{
     WAL_V8_HEADER_LEN,
@@ -276,118 +275,6 @@ pub(crate) struct WalV8LeaderWriter {
 /// Shared v8 writer path for concurrent producers. Admission and DATA writes
 /// can overlap across callers; this mutex protects only the one-at-a-time
 /// FRONTIER write and sync cycle.
-#[cfg(feature = "bench")]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum WalV8DurabilityMode {
-    CallerDriven,
-    Dedicated,
-}
-
-#[cfg(feature = "bench")]
-struct WalV8DedicatedDurabilityRequests {
-    requested_ticket_end: AtomicU64,
-    shutdown_requested: AtomicBool,
-    wake_sender: Sender<()>,
-    terminal_error: Mutex<Option<String>>,
-    diagnostics_enabled: bool,
-    request_count: AtomicU64,
-    wake_signal_count: AtomicU64,
-    coalesced_wake_count: AtomicU64,
-    advance_attempt_count: AtomicU64,
-    #[cfg(test)]
-    before_wait_hook: Mutex<Option<WalV8DedicatedDriverBeforeWaitHook>>,
-    #[cfg(test)]
-    driver_joined_signal: Mutex<Option<Sender<()>>>,
-}
-
-#[cfg(feature = "bench")]
-impl WalV8DedicatedDurabilityRequests {
-    fn record_failure(&self, error: String) {
-        let mut terminal_error = self.terminal_error.lock();
-        if terminal_error.is_none() {
-            *terminal_error = Some(error);
-        }
-    }
-
-    fn terminal_error(&self) -> Option<String> {
-        self.terminal_error.lock().clone()
-    }
-
-    fn request(&self, ticket_end: u64) -> Result<()> {
-        ensure!(
-            !self.shutdown_requested.load(Ordering::Acquire),
-            "v8 dedicated durability driver is stopping"
-        );
-        self.requested_ticket_end
-            .fetch_max(ticket_end, Ordering::Release);
-        if self.diagnostics_enabled {
-            self.request_count.fetch_add(1, Ordering::Relaxed);
-        }
-        match self.wake_sender.try_send(()) {
-            Ok(()) => {
-                if self.diagnostics_enabled {
-                    self.wake_signal_count.fetch_add(1, Ordering::Relaxed);
-                }
-                Ok(())
-            }
-            Err(crossbeam_channel::TrySendError::Full(())) => {
-                if self.diagnostics_enabled {
-                    self.coalesced_wake_count.fetch_add(1, Ordering::Relaxed);
-                }
-                Ok(())
-            }
-            Err(crossbeam_channel::TrySendError::Disconnected(())) => {
-                anyhow::bail!("v8 dedicated durability driver has exited")
-            }
-        }
-    }
-
-    fn shutdown(&self) {
-        self.shutdown_requested.store(true, Ordering::Release);
-        let _ = self.wake_sender.try_send(());
-    }
-}
-
-#[cfg(all(test, feature = "bench"))]
-type WalV8DedicatedDriverBeforeWaitHook = Arc<dyn Fn() + Send + Sync>;
-#[cfg(all(test, feature = "bench"))]
-type WalV8PostPublishRetirementHook = Arc<dyn Fn() -> Result<()> + Send + Sync>;
-
-/// WAL-owned join handle for the benchmark-only dedicated durability thread.
-/// The writer stores only request state, never this handle, so the worker's
-/// `Arc` cannot form a writer/JoinHandle ownership cycle.
-#[cfg(feature = "bench")]
-pub(crate) struct WalV8DedicatedDurabilityDriver {
-    requests: Arc<WalV8DedicatedDurabilityRequests>,
-    coordinator: WalV8ParallelCoordinator,
-    join: Option<thread::JoinHandle<()>>,
-}
-
-#[cfg(feature = "bench")]
-impl Drop for WalV8DedicatedDurabilityDriver {
-    fn drop(&mut self) {
-        self.requests.shutdown();
-        if self.requests.requested_ticket_end.load(Ordering::Acquire)
-            > self.coordinator.durable_ticket_end()
-        {
-            // A WAL owner should normally run its durability barrier before
-            // teardown. If it is dropped with an outstanding request, wake
-            // waiters with a terminal error instead of leaving them parked on
-            // a worker that is being stopped.
-            self.coordinator.poison();
-        }
-        if let Some(join) = self.join.take()
-            && join.join().is_err()
-        {
-            log::error!("v8 dedicated durability driver panicked during shutdown");
-        }
-        #[cfg(test)]
-        if let Some(signal) = self.requests.driver_joined_signal.lock().take() {
-            let _ = signal.send(());
-        }
-    }
-}
-
 pub(crate) struct WalV8ParallelWriter {
     frontier_file: File,
     sync_file: File,
@@ -407,13 +294,6 @@ pub(crate) struct WalV8ParallelWriter {
     initial_ticket: u64,
     #[cfg(feature = "bench")]
     io_diagnostics: WalIoDiagnostics,
-    #[cfg(feature = "bench")]
-    durability_mode: WalV8DurabilityMode,
-    /// Benchmark-only independent ACK waiter, disabled by default.
-    #[cfg(feature = "bench")]
-    independent_ack_waiter_enabled: bool,
-    #[cfg(feature = "bench")]
-    dedicated_durability_requests: Option<Arc<WalV8DedicatedDurabilityRequests>>,
     /// Benchmark-only budget for eligible coalescing calls, independent of
     /// detailed sync-observation capture.
     #[cfg(feature = "bench")]
@@ -422,25 +302,6 @@ pub(crate) struct WalV8ParallelWriter {
     /// durable prefixes. Batch and mixed prefixes retain the existing path.
     #[cfg(feature = "bench")]
     batch_point_frontier_credits: bool,
-    /// Benchmark-only C1 experiment that detaches multi-ticket Point prefixes
-    /// before performing resource retirement.
-    #[cfg(feature = "bench")]
-    point_resource_retirement_mode: WalV8PointResourceRetirementMode,
-    #[cfg(feature = "bench")]
-    point_resource_retirement_detached_prefixes: AtomicU64,
-    #[cfg(feature = "bench")]
-    point_resource_retirement_detached_tickets: AtomicU64,
-    #[cfg(feature = "bench")]
-    point_resource_retirement_batched_prefixes: AtomicU64,
-    #[cfg(feature = "bench")]
-    caller_durability_driver_election_attempts: AtomicU64,
-    #[cfg(feature = "bench")]
-    durability_driver_diagnostics_enabled: bool,
-    #[cfg(all(test, feature = "bench"))]
-    point_resource_retirement_detached_hook:
-        Mutex<Option<WalV8PointResourceRetirementDetachedHook>>,
-    #[cfg(all(test, feature = "bench"))]
-    post_publish_retirement_hook: Mutex<Option<WalV8PostPublishRetirementHook>>,
     #[cfg(feature = "bench")]
     point_buffer_preallocation_enabled: bool,
     #[cfg(all(test, feature = "bench"))]
@@ -461,50 +322,6 @@ struct WalV8FrontierResource {
     reservation: WalV7OwnedBatchReservation,
     #[cfg(feature = "bench")]
     write_class: WalV8WriteClass,
-}
-
-#[cfg(feature = "bench")]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-#[repr(u8)]
-enum WalV8PointResourceRetirementMode {
-    #[default]
-    PerTicket = 0,
-    DetachPointPrefix = 1,
-    DetachAndBatchPointPrefix = 2,
-}
-
-#[cfg(feature = "bench")]
-impl WalV8PointResourceRetirementMode {
-    fn detaches_point_prefix(self) -> bool {
-        matches!(
-            self,
-            Self::DetachPointPrefix | Self::DetachAndBatchPointPrefix
-        )
-    }
-
-    fn batches_point_retirement(self) -> bool {
-        self == Self::DetachAndBatchPointPrefix
-    }
-}
-
-#[cfg(feature = "bench")]
-impl WalV8PointResourceRetirementMode {
-    fn from_environment() -> Result<Self> {
-        let value = std::env::var_os(WAL_V8_POINT_RESOURCE_RETIREMENT_MODE_ENV);
-        Self::from_value(value.as_deref())
-    }
-
-    fn from_value(value: Option<&OsStr>) -> Result<Self> {
-        match value {
-            None => Ok(Self::PerTicket),
-            Some(value) if value == OsStr::new("0") => Ok(Self::PerTicket),
-            Some(value) if value == OsStr::new("1") => Ok(Self::DetachPointPrefix),
-            Some(value) if value == OsStr::new("2") => Ok(Self::DetachAndBatchPointPrefix),
-            Some(value) => anyhow::bail!(
-                "invalid {WAL_V8_POINT_RESOURCE_RETIREMENT_MODE_ENV} {value:?}; expected `0`, `1`, or `2`"
-            ),
-        }
-    }
 }
 
 #[cfg(feature = "bench")]
@@ -588,68 +405,6 @@ struct WalV8RetirementObservation {
     finish_cpu_ns: u64,
     #[cfg(feature = "bench")]
     batch_point_frontier_credits: bool,
-    #[cfg(feature = "bench")]
-    point_prefix_detached: bool,
-}
-
-#[cfg(feature = "bench")]
-fn exact_prefix_is_eligible<T>(
-    resources: &BTreeMap<u64, T>,
-    first_ticket: u64,
-    ticket_end: u64,
-    expected: usize,
-    eligible: impl Fn(&T) -> bool,
-) -> Result<bool> {
-    let expected_from_range = usize::try_from(
-        ticket_end
-            .checked_sub(first_ticket)
-            .context("v8 resource retirement range is reversed")?,
-    )?;
-    ensure!(
-        expected_from_range == expected,
-        "v8 resource retirement ticket count differs from its range"
-    );
-
-    let mut seen = 0usize;
-    let mut all_eligible = true;
-    for (&ticket, resource) in resources.range(first_ticket..ticket_end) {
-        let expected_ticket = first_ticket
-            .checked_add(u64::try_from(seen)?)
-            .context("v8 resource retirement ticket overflow")?;
-        ensure!(
-            ticket == expected_ticket,
-            "v8 Parallel durable prefix has a missing resource reservation"
-        );
-        all_eligible &= eligible(resource);
-        seen = seen
-            .checked_add(1)
-            .context("v8 resource retirement ticket count overflow")?;
-    }
-    ensure!(
-        seen == expected,
-        "v8 Parallel durable prefix is missing resource reservations"
-    );
-    Ok(all_eligible)
-}
-
-#[cfg(feature = "bench")]
-fn detach_validated_prefix_into<T>(
-    resources: &mut BTreeMap<u64, T>,
-    first_ticket: u64,
-    ticket_end: u64,
-    expected: usize,
-    detached: &mut Vec<T>,
-) {
-    debug_assert!(detached.is_empty());
-    debug_assert!(detached.capacity() >= expected);
-    for ticket in first_ticket..ticket_end {
-        detached.push(
-            resources
-                .remove(&ticket)
-                .expect("validated v8 resource prefix entry must remain present"),
-        );
-    }
-    debug_assert_eq!(detached.len(), expected);
 }
 
 #[cfg(feature = "bench")]
@@ -712,9 +467,6 @@ const WAL_V8_EXTENT_PREPARATION_ENV: &str = "TOYKV_BENCH_V8_EXTENT_PREP";
 const WAL_V8_EXTENT_PREPARATION_BYTES_ENV: &str = "TOYKV_BENCH_V8_EXTENT_PREP_BYTES";
 #[cfg(feature = "bench")]
 const WAL_V8_POINT_FRONTIER_CREDIT_BATCH_ENV: &str = "TOYKV_BENCH_V8_POINT_FRONTIER_CREDIT_BATCH";
-#[cfg(feature = "bench")]
-const WAL_V8_POINT_RESOURCE_RETIREMENT_MODE_ENV: &str =
-    "TOYKV_BENCH_V8_POINT_RESOURCE_RETIREMENT_MODE";
 #[cfg(feature = "bench")]
 const WAL_V8_POINT_PROGRESS_RING_ENV: &str = "TOYKV_BENCH_V8_POINT_PROGRESS_RING";
 #[cfg(feature = "bench")]
@@ -3085,9 +2837,6 @@ type WalV8CompletionReapHook = Arc<dyn Fn(WalV8CompletionReapTestEvent) + Send +
 #[cfg(test)]
 type WalV8SharedCompletionReapHook = Arc<Mutex<Option<WalV8CompletionReapHook>>>;
 
-#[cfg(all(test, feature = "bench"))]
-type WalV8PointResourceRetirementDetachedHook = Arc<dyn Fn() -> Result<()> + Send + Sync>;
-
 fn benchmark_submits_any_ready_ticket() -> Result<bool> {
     #[cfg(feature = "bench")]
     {
@@ -4793,7 +4542,7 @@ impl WalV8LeaderWriter {
             point_buffer_preallocation_attempts: 0,
             point_buffer_preallocation_hits: 0,
             point_buffer_preallocation_fallbacks: 0,
-            point_resource_retirement_mode: WalV8PointResourceRetirementMode::PerTicket as u8,
+            point_resource_retirement_mode: 0,
             point_resource_retirement_detached_prefixes: 0,
             point_resource_retirement_detached_tickets: 0,
             point_resource_retirement_batched_prefixes: 0,
@@ -4982,8 +4731,6 @@ impl WalV8LeaderWriter {
         #[cfg(feature = "bench")]
         let batch_point_frontier_credits = point_frontier_credit_batch_from_environment()?;
         #[cfg(feature = "bench")]
-        let point_resource_retirement_mode = WalV8PointResourceRetirementMode::from_environment()?;
-        #[cfg(feature = "bench")]
         let point_buffer_preallocation_enabled = point_buffer_preallocation_from_environment()?;
         #[cfg(feature = "bench")]
         {
@@ -4992,10 +4739,7 @@ impl WalV8LeaderWriter {
             io_diagnostics.progress_cursor_enabled = self.coordinator.progress_cursor_enabled();
             io_diagnostics.cursor_direct_completion_enabled = direct_completion_enabled;
             io_diagnostics.cursor_singleton_submission_enabled = singleton_submission_enabled;
-            io_diagnostics.admission_cursor_publish_fast_path_enabled =
-                v8_admission_cursor_publish_fast_path_enabled();
             io_diagnostics.point_buffer_preallocation_enabled = point_buffer_preallocation_enabled;
-            io_diagnostics.point_resource_retirement_mode = point_resource_retirement_mode as u8;
         }
         #[cfg(feature = "bench")]
         let (extent_preallocator, extent_preparation) =
@@ -5194,31 +4938,9 @@ impl WalV8LeaderWriter {
             #[cfg(feature = "bench")]
             io_diagnostics,
             #[cfg(feature = "bench")]
-            durability_mode: WalV8DurabilityMode::CallerDriven,
-            #[cfg(feature = "bench")]
-            independent_ack_waiter_enabled: false,
-            #[cfg(feature = "bench")]
-            dedicated_durability_requests: None,
-            #[cfg(feature = "bench")]
             coalesce_budget_override_us,
             #[cfg(feature = "bench")]
             batch_point_frontier_credits,
-            #[cfg(feature = "bench")]
-            point_resource_retirement_mode,
-            #[cfg(feature = "bench")]
-            point_resource_retirement_detached_prefixes: AtomicU64::new(0),
-            #[cfg(feature = "bench")]
-            point_resource_retirement_detached_tickets: AtomicU64::new(0),
-            #[cfg(feature = "bench")]
-            point_resource_retirement_batched_prefixes: AtomicU64::new(0),
-            #[cfg(feature = "bench")]
-            caller_durability_driver_election_attempts: AtomicU64::new(0),
-            #[cfg(feature = "bench")]
-            durability_driver_diagnostics_enabled: false,
-            #[cfg(all(test, feature = "bench"))]
-            point_resource_retirement_detached_hook: Mutex::new(None),
-            #[cfg(all(test, feature = "bench"))]
-            post_publish_retirement_hook: Mutex::new(None),
             #[cfg(feature = "bench")]
             point_buffer_preallocation_enabled,
             #[cfg(all(test, feature = "bench"))]
@@ -5795,203 +5517,8 @@ impl WalV8LeaderWriter {
 }
 
 impl WalV8ParallelWriter {
-    #[cfg(feature = "bench")]
-    pub(crate) fn into_dedicated_durability_driver(
-        mut self,
-        diagnostics_enabled: bool,
-    ) -> Result<(Arc<Self>, WalV8DedicatedDurabilityDriver)> {
-        self.durability_driver_diagnostics_enabled = diagnostics_enabled;
-        let (wake_sender, wake_receiver) = crossbeam_channel::bounded(1);
-        let requests = Arc::new(WalV8DedicatedDurabilityRequests {
-            requested_ticket_end: AtomicU64::new(self.coordinator.durable_ticket_end()),
-            shutdown_requested: AtomicBool::new(false),
-            wake_sender,
-            terminal_error: Mutex::new(None),
-            diagnostics_enabled,
-            request_count: AtomicU64::new(0),
-            wake_signal_count: AtomicU64::new(0),
-            coalesced_wake_count: AtomicU64::new(0),
-            advance_attempt_count: AtomicU64::new(0),
-            #[cfg(test)]
-            before_wait_hook: Mutex::new(None),
-            #[cfg(test)]
-            driver_joined_signal: Mutex::new(None),
-        });
-        self.durability_mode = WalV8DurabilityMode::Dedicated;
-        self.dedicated_durability_requests = Some(Arc::clone(&requests));
-
-        let coordinator = self.coordinator.clone();
-        let writer = Arc::new(self);
-        let worker_writer = Arc::clone(&writer);
-        let worker_requests = Arc::clone(&requests);
-        let join = thread::Builder::new()
-            .name("v8-dedicated-durability".to_owned())
-            .spawn(move || {
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    worker_writer.dedicated_durability_loop(&worker_requests, wake_receiver)
-                }));
-                match result {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => {
-                        worker_writer.coordinator.poison();
-                        worker_requests.record_failure(format!("{error:#}"));
-                        log::error!("v8 dedicated durability driver failed: {error:#}");
-                    }
-                    Err(_) => {
-                        worker_writer.coordinator.poison();
-                        worker_requests
-                            .record_failure("dedicated durability driver panicked".to_owned());
-                        log::error!("v8 dedicated durability driver panicked");
-                    }
-                }
-            })
-            .context("spawn v8 dedicated durability driver")?;
-
-        Ok((
-            writer,
-            WalV8DedicatedDurabilityDriver {
-                requests,
-                coordinator,
-                join: Some(join),
-            },
-        ))
-    }
-
-    #[cfg(feature = "bench")]
-    fn dedicated_durability_loop(
-        &self,
-        requests: &WalV8DedicatedDurabilityRequests,
-        wake_receiver: Receiver<()>,
-    ) -> Result<()> {
-        loop {
-            if requests.shutdown_requested.load(Ordering::Acquire) {
-                return Ok(());
-            }
-
-            let requested_ticket_end = requests.requested_ticket_end.load(Ordering::Acquire);
-            if requested_ticket_end > self.coordinator.durable_ticket_end() {
-                let last_ticket = requested_ticket_end
-                    .checked_sub(1)
-                    .context("v8 dedicated durability request has an empty prefix")?;
-                if requests.diagnostics_enabled {
-                    requests
-                        .advance_attempt_count
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-                self.advance_frontier_through_dedicated(last_ticket, requests)
-                    .context("advance requested v8 durable prefix")?;
-                continue;
-            }
-
-            #[cfg(test)]
-            if let Some(hook) = requests.before_wait_hook.lock().take() {
-                hook();
-            }
-
-            match wake_receiver.recv() {
-                Ok(()) => {}
-                Err(_) if requests.shutdown_requested.load(Ordering::Acquire) => return Ok(()),
-                Err(_) => anyhow::bail!("v8 dedicated durability request channel disconnected"),
-            }
-        }
-    }
-
-    #[cfg(feature = "bench")]
-    fn advance_frontier_through_dedicated(
-        &self,
-        ticket: u64,
-        requests: &WalV8DedicatedDurabilityRequests,
-    ) -> Result<()> {
-        let ticket_end = ticket
-            .checked_add(1)
-            .context("v8 Parallel durable ticket end overflows")?;
-        let Some(mut driver) = self.coordinator.acquire_durability_driver(ticket_end)? else {
-            return Ok(());
-        };
-        let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.drive_frontier_through(ticket_end, &mut driver)
-        })) {
-            Ok(result) => result,
-            Err(_) => Err(anyhow::anyhow!(
-                "v8 dedicated durability driver panicked while advancing FRONTIER"
-            )),
-        };
-        match &result {
-            Ok(()) => driver.complete(),
-            Err(error) => {
-                // The frontier-cycle guard has already poisoned the coordinator
-                // and woken waiters. Keep the detailed cause as best-effort
-                // diagnostics; it must not delay the fail-stop transition.
-                requests.record_failure(format!("{error:#}"));
-            }
-        }
-
-        result
-    }
-
-    fn wait_for_requested_durable_prefix(&self, ticket_end: u64) -> Result<()> {
-        ensure!(ticket_end > 0, "v8 durability request prefix is empty");
-
-        #[cfg(feature = "bench")]
-        if self.durability_mode == WalV8DurabilityMode::Dedicated {
-            let requests = self
-                .dedicated_durability_requests
-                .as_ref()
-                .context("v8 dedicated durability request state is missing")?;
-            #[cfg(feature = "bench")]
-            if self.independent_ack_waiter_enabled && self.coordinator.try_ack_prefix(ticket_end)? {
-                return Ok(());
-            }
-            if let Err(error) = requests.request(ticket_end) {
-                self.coordinator.poison();
-                return Err(requests
-                    .terminal_error()
-                    .map(anyhow::Error::msg)
-                    .unwrap_or(error));
-            }
-            #[cfg(feature = "bench")]
-            let wait_result = if self.independent_ack_waiter_enabled {
-                self.coordinator
-                    .wait_for_durable_prefix_independent(ticket_end)
-            } else {
-                self.coordinator.wait_for_durable_prefix(ticket_end)
-            };
-            #[cfg(not(feature = "bench"))]
-            let wait_result = self.coordinator.wait_for_durable_prefix(ticket_end);
-            return wait_result.map_err(|error| {
-                requests
-                    .terminal_error()
-                    .map(anyhow::Error::msg)
-                    .unwrap_or(error)
-            });
-        }
-
-        #[cfg(feature = "bench")]
-        if self.durability_driver_diagnostics_enabled {
-            self.caller_durability_driver_election_attempts
-                .fetch_add(1, Ordering::Relaxed);
-        }
-        self.advance_frontier_through(ticket_end - 1)
-            .inspect_err(|_| {
-                self.coordinator.poison();
-            })
-    }
-
     pub(crate) fn progress_ring_enabled(&self) -> bool {
         self.coordinator.progress_ring_enabled()
-    }
-
-    #[cfg(feature = "bench")]
-    pub(crate) fn set_durability_driver_diagnostics_enabled(&mut self, enabled: bool) {
-        self.durability_driver_diagnostics_enabled = enabled;
-    }
-
-    #[cfg(feature = "bench")]
-    pub(crate) fn set_independent_ack_waiter_enabled(&mut self, enabled: bool) -> Result<()> {
-        self.coordinator
-            .set_independent_ack_waiter_enabled(enabled)?;
-        self.independent_ack_waiter_enabled = enabled;
-        Ok(())
     }
 
     #[cfg(feature = "bench")]
@@ -6000,7 +5527,6 @@ impl WalV8ParallelWriter {
         diagnostics.sliding_extent_preparation = self.io.extent_preparation_diagnostics();
         diagnostics.progress_ring_enabled = self.coordinator.progress_ring_enabled();
         diagnostics.progress_cursor_enabled = self.coordinator.progress_cursor_enabled();
-        diagnostics.independent_ack_waiter_enabled = self.independent_ack_waiter_enabled;
         diagnostics.progress_diagnostics = self.coordinator.progress_diagnostics();
         diagnostics.point_buffer_preallocation_attempts = self
             .point_buffer_preallocation_attempts
@@ -6015,34 +5541,6 @@ impl WalV8ParallelWriter {
                 .load(Ordering::Relaxed),
         )
         .expect("outstanding preallocation permits fit in u64");
-        diagnostics.dedicated_durability_driver_enabled =
-            self.durability_mode == WalV8DurabilityMode::Dedicated;
-        diagnostics.dedicated_durability_diagnostics_enabled =
-            self.durability_driver_diagnostics_enabled;
-        if let Some(requests) = &self.dedicated_durability_requests {
-            diagnostics.dedicated_durability_requests =
-                requests.request_count.load(Ordering::Relaxed);
-            diagnostics.dedicated_durability_wake_signals =
-                requests.wake_signal_count.load(Ordering::Relaxed);
-            diagnostics.dedicated_durability_coalesced_wakes =
-                requests.coalesced_wake_count.load(Ordering::Relaxed);
-            diagnostics.dedicated_durability_advance_attempts =
-                requests.advance_attempt_count.load(Ordering::Relaxed);
-        }
-        if self.durability_driver_diagnostics_enabled {
-            diagnostics.caller_durability_driver_election_attempts = self
-                .caller_durability_driver_election_attempts
-                .load(Ordering::Relaxed);
-        }
-        diagnostics.point_resource_retirement_detached_prefixes = self
-            .point_resource_retirement_detached_prefixes
-            .load(Ordering::Relaxed);
-        diagnostics.point_resource_retirement_detached_tickets = self
-            .point_resource_retirement_detached_tickets
-            .load(Ordering::Relaxed);
-        diagnostics.point_resource_retirement_batched_prefixes = self
-            .point_resource_retirement_batched_prefixes
-            .load(Ordering::Relaxed);
         #[cfg(test)]
         {
             diagnostics.point_buffer_preallocation_enabled |= self
@@ -6453,12 +5951,6 @@ impl WalV8ParallelWriter {
         let ticket_end = ticket
             .checked_add(1)
             .context("v8 Parallel durable ticket end overflows")?;
-
-        #[cfg(feature = "bench")]
-        if self.independent_ack_waiter_enabled {
-            return self.advance_frontier_through_independent_ack(ticket_end);
-        }
-
         let Some(mut driver) = self.coordinator.acquire_durability_driver(ticket_end)? else {
             return Ok(());
         };
@@ -6468,30 +5960,6 @@ impl WalV8ParallelWriter {
         }
 
         result
-    }
-
-    #[cfg(feature = "bench")]
-    fn advance_frontier_through_independent_ack(&self, ticket_end: u64) -> Result<()> {
-        loop {
-            let observed_generation = self.coordinator.ack_waiter_generation();
-            if self.coordinator.try_ack_prefix(ticket_end)? {
-                return Ok(());
-            }
-
-            match self.coordinator.try_acquire_durability_driver(ticket_end)? {
-                WalV8DurabilityDriverElection::Durable => return Ok(()),
-                WalV8DurabilityDriverElection::Busy => self
-                    .coordinator
-                    .wait_for_ack_waiter_change(observed_generation, ticket_end)?,
-                WalV8DurabilityDriverElection::Driver(mut driver) => {
-                    let result = self.drive_frontier_through(ticket_end, &mut driver);
-                    if result.is_ok() {
-                        driver.complete();
-                    }
-                    return result;
-                }
-            }
-        }
     }
 
     fn drive_frontier_through(
@@ -6981,10 +6449,6 @@ impl WalV8ParallelWriter {
             #[cfg(feature = "bench")]
             let sample_guard_retirement = phase_sample_id.is_some();
             self.io.progress.mark_durable(frontier_ticket_end);
-            #[cfg(all(test, feature = "bench"))]
-            if let Some(hook) = self.post_publish_retirement_hook.lock().clone() {
-                hook().context("injected pause before post-publish resource retirement")?;
-            }
             #[cfg(feature = "chaos-testing")]
             crate::chaos::failpoint::wal_crash_point("wal_v8.parallel.after_durable_publish");
             #[cfg(not(feature = "bench"))]
@@ -7146,8 +6610,7 @@ impl WalV8ParallelWriter {
                             resource_retire_before_publish.finish_cpu_ns,
                         resource_retire_before_publish_batched_point_credits:
                             resource_retire_before_publish.batch_point_frontier_credits,
-                        resource_retire_before_publish_point_prefix_detached:
-                            resource_retire_before_publish.point_prefix_detached,
+                        resource_retire_before_publish_point_prefix_detached: false,
                         resource_retire_after_publish_wall_ns: resource_retire_after_publish
                             .wall_ns,
                         resource_retire_after_publish_cpu_ns: resource_retire_after_publish.cpu_ns,
@@ -7194,25 +6657,11 @@ impl WalV8ParallelWriter {
         if self.reservation_owner.is_none() {
             return Ok(WalV8RetirementObservation::default());
         }
-        let ticket_count = ticket_end
-            .checked_sub(first_ticket)
-            .context("v8 resource retirement range is reversed")?;
-        let expected = usize::try_from(ticket_count)?;
-        // Declare the detached payload before the map guard. If an invariant
-        // fails after removal, Rust drops the map guard before dropping these
-        // reservation owners, so their cleanup never re-enters the ledger
-        // while `frontier_resources` is locked.
-        #[cfg(feature = "bench")]
-        let mut detached_point_resources =
-            if expected > 1 && self.point_resource_retirement_mode.detaches_point_prefix() {
-                Vec::with_capacity(expected)
-            } else {
-                Vec::new()
-            };
-        #[cfg(feature = "bench")]
-        let lock_wait_cpu_started = sample.then(digest::thread_cpu_time_ns);
+        let expected = usize::try_from(ticket_end - first_ticket)?;
         #[cfg(feature = "bench")]
         let lock_wait_started = sample.then(Instant::now);
+        #[cfg(feature = "bench")]
+        let lock_wait_cpu_started = sample.then(digest::thread_cpu_time_ns);
         let mut resources = self.frontier_resources.lock();
         #[cfg(feature = "bench")]
         let lock_wait_wall_ns = lock_wait_started
@@ -7226,182 +6675,6 @@ impl WalV8ParallelWriter {
         let lock_hold_started = sample.then(Instant::now);
         #[cfg(feature = "bench")]
         let lock_hold_cpu_started = sample.then(digest::thread_cpu_time_ns);
-
-        #[cfg(feature = "bench")]
-        if expected > 1 && self.point_resource_retirement_mode.detaches_point_prefix() {
-            #[cfg(feature = "bench")]
-            let collect_started = sample.then(digest::thread_cpu_time_ns);
-            let point_prefix = exact_prefix_is_eligible(
-                &resources,
-                first_ticket,
-                ticket_end,
-                expected,
-                |resource| resource.write_class == WalV8WriteClass::Point,
-            )?;
-            #[cfg(feature = "bench")]
-            let collect_cpu_ns = collect_started
-                .map(|started| digest::thread_cpu_time_ns().saturating_sub(started))
-                .unwrap_or_default();
-
-            if point_prefix {
-                #[cfg(feature = "bench")]
-                let remove_started = sample.then(digest::thread_cpu_time_ns);
-                detach_validated_prefix_into(
-                    &mut resources,
-                    first_ticket,
-                    ticket_end,
-                    expected,
-                    &mut detached_point_resources,
-                );
-                #[cfg(feature = "bench")]
-                let remove_cpu_ns = remove_started
-                    .map(|started| digest::thread_cpu_time_ns().saturating_sub(started))
-                    .unwrap_or_default();
-
-                #[cfg(feature = "bench")]
-                let lock_hold_wall_ns = lock_hold_started
-                    .map(|started| started.elapsed().as_nanos().min(u64::MAX as u128) as u64)
-                    .unwrap_or_default();
-                #[cfg(feature = "bench")]
-                let lock_hold_cpu_ns = lock_hold_cpu_started
-                    .map(|started| digest::thread_cpu_time_ns().saturating_sub(started))
-                    .unwrap_or_default();
-                drop(resources);
-
-                let detached_ticket_count = u64::try_from(expected)?;
-                self.point_resource_retirement_detached_prefixes
-                    .fetch_add(1, Ordering::Relaxed);
-                self.point_resource_retirement_detached_tickets
-                    .fetch_add(detached_ticket_count, Ordering::Relaxed);
-
-                #[cfg(test)]
-                if let Some(hook) = self.point_resource_retirement_detached_hook.lock().clone() {
-                    hook().context("injected failure after detaching Point resource prefix")?;
-                }
-
-                let mut detached = std::mem::take(&mut detached_point_resources);
-                let batch_point_frontier_credits = if self
-                    .point_resource_retirement_mode
-                    .batches_point_retirement()
-                {
-                    expected > 1
-                } else {
-                    self.batch_point_frontier_credits && expected > 1
-                };
-                #[cfg(feature = "bench")]
-                let (mut release_cpu_ns, mut finish_cpu_ns) = (0u64, 0u64);
-
-                if self
-                    .point_resource_retirement_mode
-                    .batches_point_retirement()
-                {
-                    #[cfg(feature = "bench")]
-                    let step_started = sample.then(digest::thread_cpu_time_ns);
-                    let mut reservations: Vec<&mut WalV7OwnedBatchReservation> = detached
-                        .iter_mut()
-                        .map(|resource| &mut resource.reservation)
-                        .collect();
-                    WalV7OwnedBatchReservation::retire_after_io_batch(&mut reservations, 1)
-                        .context("batch retire detached durable Point v8 resources")?;
-                    self.point_resource_retirement_batched_prefixes
-                        .fetch_add(1, Ordering::Relaxed);
-                    #[cfg(feature = "bench")]
-                    {
-                        finish_cpu_ns = step_started
-                            .map(|started| digest::thread_cpu_time_ns().saturating_sub(started))
-                            .unwrap_or_default();
-                    }
-                } else if batch_point_frontier_credits {
-                    #[cfg(feature = "bench")]
-                    let step_started = sample.then(digest::thread_cpu_time_ns);
-                    let mut reservations: Vec<&mut WalV7OwnedBatchReservation> = detached
-                        .iter_mut()
-                        .skip(1)
-                        .map(|resource| &mut resource.reservation)
-                        .collect();
-                    WalV7OwnedBatchReservation::release_unused_frontier_credits_batch(
-                        &mut reservations,
-                    )
-                    .context("release detached batched Point v8 FRONTIER credits")?;
-                    #[cfg(feature = "bench")]
-                    {
-                        release_cpu_ns = release_cpu_ns.saturating_add(
-                            step_started
-                                .map(|started| digest::thread_cpu_time_ns().saturating_sub(started))
-                                .unwrap_or_default(),
-                        );
-                    }
-                }
-
-                if !self
-                    .point_resource_retirement_mode
-                    .batches_point_retirement()
-                {
-                    for (index, resource) in detached.drain(..).enumerate() {
-                        let mut reservation = resource.reservation;
-                        if index > 0 && !batch_point_frontier_credits {
-                            #[cfg(feature = "bench")]
-                            let step_started = sample.then(digest::thread_cpu_time_ns);
-                            reservation
-                                .release_unused_frontier_credit()
-                                .context("release detached coalesced v8 FRONTIER reservation")?;
-                            #[cfg(feature = "bench")]
-                            {
-                                release_cpu_ns = release_cpu_ns.saturating_add(
-                                    step_started
-                                        .map(|started| {
-                                            digest::thread_cpu_time_ns().saturating_sub(started)
-                                        })
-                                        .unwrap_or_default(),
-                                );
-                            }
-                        }
-                        #[cfg(feature = "bench")]
-                        let step_started = sample.then(digest::thread_cpu_time_ns);
-                        reservation
-                            .finish_after_io()
-                            .context("retire detached durable v8 batch resources")?;
-                        #[cfg(feature = "bench")]
-                        {
-                            finish_cpu_ns = finish_cpu_ns.saturating_add(
-                                step_started
-                                    .map(|started| {
-                                        digest::thread_cpu_time_ns().saturating_sub(started)
-                                    })
-                                    .unwrap_or_default(),
-                            );
-                        }
-                    }
-                }
-
-                // Include the detached guards' final Drops in retirement
-                // timing. A DATA buffer pin that became the final remaining
-                // owner can finish its resource cleanup here.
-                drop(detached);
-
-                let observation = WalV8RetirementObservation {
-                    wall_ns: started
-                        .map(|started| started.elapsed().as_nanos().min(u64::MAX as u128) as u64)
-                        .unwrap_or_default(),
-                    cpu_ns: cpu_started
-                        .map(|started| digest::thread_cpu_time_ns().saturating_sub(started))
-                        .unwrap_or_default(),
-                    lock_wait_wall_ns,
-                    lock_wait_cpu_ns,
-                    lock_hold_wall_ns,
-                    lock_hold_cpu_ns,
-                    tickets: detached_ticket_count,
-                    collect_cpu_ns,
-                    remove_cpu_ns,
-                    release_cpu_ns,
-                    finish_cpu_ns,
-                    batch_point_frontier_credits,
-                    point_prefix_detached: true,
-                };
-                return Ok(observation);
-            }
-        }
-
         #[cfg(feature = "bench")]
         let collect_started = sample.then(digest::thread_cpu_time_ns);
         #[cfg(feature = "bench")]
@@ -7646,81 +6919,35 @@ impl WalV8ParallelWriter {
         Ok(observation)
     }
 
-    /// Wait for the current durable prefix. This writer-level operation does
-    /// not wait for post-publication retirement in Dedicated mode. Callers
-    /// implementing a whole-WAL close or rotation barrier must also call
-    /// `wait_for_post_publish_cleanup`; the outer `Wal` wrapper does so.
     pub(crate) fn sync(&self) -> Result<()> {
         ensure!(!self.is_poisoned(), "v8 Parallel WAL is poisoned");
         let ticket_end = self.coordinator.next_ticket();
         if ticket_end == 0 {
             return Ok(());
         }
-
-        self.wait_for_requested_durable_prefix(ticket_end)
-    }
-
-    /// Wait for any FRONTIER cycle that has published its durable prefix to
-    /// finish post-publication resource retirement. Whole-WAL barriers call
-    /// this; per-ticket ACKs intentionally return at durable publication.
-    pub(crate) fn wait_for_post_publish_cleanup(&self) -> Result<()> {
-        #[cfg(feature = "bench")]
-        if self.durability_mode == WalV8DurabilityMode::Dedicated {
-            // The driver holds this mutex through publication and retirement.
-            drop(self.frontier.lock());
-            ensure!(
-                !self.is_poisoned(),
-                "v8 Parallel WAL failed during post-publication cleanup"
-            );
+        if let Err(error) = self.advance_frontier_through(ticket_end - 1) {
+            self.coordinator.poison();
+            return Err(error);
         }
 
-        Ok(())
-    }
-
-    #[cfg(all(test, feature = "bench"))]
-    pub(crate) fn set_post_publish_retirement_hook_for_test(
-        &self,
-        hook: impl Fn() -> Result<()> + Send + Sync + 'static,
-    ) {
-        *self.post_publish_retirement_hook.lock() = Some(Arc::new(hook));
-    }
-
-    #[cfg(all(test, feature = "bench"))]
-    pub(crate) fn set_dedicated_driver_joined_signal_for_test(
-        &self,
-        signal: Sender<()>,
-    ) -> Result<()> {
-        let requests = self
-            .dedicated_durability_requests
-            .as_ref()
-            .context("v8 dedicated durability request state is missing")?;
-        *requests.driver_joined_signal.lock() = Some(signal);
         Ok(())
     }
 
     pub(crate) fn wait_durable(&self, ticket: u64) -> Result<()> {
-        let ticket_end = ticket
-            .checked_add(1)
-            .context("v8 Parallel durable ticket end overflows")?;
-
-        #[cfg(feature = "bench")]
-        if self.independent_ack_waiter_enabled {
-            if self.coordinator.try_ack_prefix(ticket_end)? {
-                return Ok(());
-            }
-            return self.wait_for_requested_durable_prefix(ticket_end);
-        }
-
         ensure!(!self.is_poisoned(), "v8 Parallel WAL is poisoned");
         ensure!(
-            ticket_end <= self.coordinator.next_ticket(),
+            ticket < self.coordinator.next_ticket(),
             "v8 Parallel durability wait names an unassigned ticket"
         );
-        if self.coordinator.durable_ticket_end() >= ticket_end {
+        if self.coordinator.durable_ticket_end() > ticket {
             return Ok(());
         }
+        if let Err(error) = self.advance_frontier_through(ticket) {
+            self.coordinator.poison();
+            return Err(error);
+        }
 
-        self.wait_for_requested_durable_prefix(ticket_end)
+        Ok(())
     }
 
     #[cfg(feature = "bench")]
@@ -7946,59 +7173,6 @@ mod tests {
         assert_eq!(coalescing_active_duration_ns(120, None, true), None);
         assert_eq!(coalescing_active_duration_ns(0, None, false), Some(0));
         assert_eq!(coalescing_active_duration_ns(120, Some(35), true), Some(85));
-    }
-
-    #[cfg(feature = "bench")]
-    #[test]
-    fn point_resource_retirement_mode_is_opt_in() {
-        assert_eq!(
-            WalV8PointResourceRetirementMode::from_value(None).unwrap(),
-            WalV8PointResourceRetirementMode::PerTicket
-        );
-        assert_eq!(
-            WalV8PointResourceRetirementMode::from_value(Some(OsStr::new("0"))).unwrap(),
-            WalV8PointResourceRetirementMode::PerTicket
-        );
-        assert_eq!(
-            WalV8PointResourceRetirementMode::from_value(Some(OsStr::new("1"))).unwrap(),
-            WalV8PointResourceRetirementMode::DetachPointPrefix
-        );
-        assert_eq!(
-            WalV8PointResourceRetirementMode::from_value(Some(OsStr::new("2"))).unwrap(),
-            WalV8PointResourceRetirementMode::DetachAndBatchPointPrefix
-        );
-        assert!(WalV8PointResourceRetirementMode::from_value(Some(OsStr::new("3"))).is_err());
-    }
-
-    #[cfg(feature = "bench")]
-    #[test]
-    fn point_resource_prefix_validation_is_exact_and_non_mutating() -> Result<()> {
-        let mut resources = BTreeMap::from([(4, true), (5, true), (6, false)]);
-
-        assert!(exact_prefix_is_eligible(&resources, 4, 6, 2, |point| {
-            *point
-        })?);
-        assert_eq!(resources.keys().copied().collect::<Vec<_>>(), [4, 5, 6]);
-
-        assert!(!exact_prefix_is_eligible(&resources, 4, 7, 3, |point| {
-            *point
-        })?);
-        assert_eq!(resources.keys().copied().collect::<Vec<_>>(), [4, 5, 6]);
-
-        let missing_ticket = exact_prefix_is_eligible(&resources, 4, 8, 4, |point| *point);
-        assert!(missing_ticket.is_err());
-        assert_eq!(resources.keys().copied().collect::<Vec<_>>(), [4, 5, 6]);
-
-        let reversed_range = exact_prefix_is_eligible(&resources, 8, 4, 0, |point| *point);
-        assert!(reversed_range.is_err());
-        assert_eq!(resources.keys().copied().collect::<Vec<_>>(), [4, 5, 6]);
-
-        let mut detached = Vec::with_capacity(2);
-        detach_validated_prefix_into(&mut resources, 4, 6, 2, &mut detached);
-        assert_eq!(detached, [true, true]);
-        assert_eq!(resources.keys().copied().collect::<Vec<_>>(), [6]);
-
-        Ok(())
     }
 
     #[cfg(feature = "bench")]
@@ -9060,432 +8234,6 @@ mod tests {
         )
     }
 
-    #[test]
-    fn wait_durable_checks_poison_and_ticket_assignment_without_poisoning_invalid_waits()
-    -> Result<()> {
-        let directory = tempfile::tempdir()?;
-        let path = directory.path().join("wait-durable-validation.wal");
-        let installed = install_empty(&path, header())?;
-        let writer = match open_writer(&path, &installed) {
-            Ok(writer) => match writer.into_parallel() {
-                Ok(writer) => writer,
-                Err(error) if is_io_uring_unavailable_error(&error) => {
-                    eprintln!("skipping test (io_uring unavailable): {error:#}");
-                    return Ok(());
-                }
-                Err(error) => return Err(error),
-            },
-            Err(error) if is_io_uring_unavailable_error(&error) => {
-                eprintln!("skipping test (io_uring unavailable): {error:#}");
-                return Ok(());
-            }
-            Err(error) => return Err(error),
-        };
-
-        let error = writer
-            .wait_durable(0)
-            .expect_err("waiting for an unassigned ticket must fail");
-        assert!(format!("{error:#}").contains("unassigned ticket"));
-        assert!(!writer.is_poisoned());
-
-        writer.coordinator.poison();
-        let error = writer
-            .wait_durable(0)
-            .expect_err("poison must take precedence over ticket assignment");
-        assert!(format!("{error:#}").contains("v8 Parallel WAL is poisoned"));
-        assert!(writer.is_poisoned());
-
-        Ok(())
-    }
-
-    #[cfg(feature = "bench")]
-    #[test]
-    fn caller_driven_durability_diagnostics_are_reported_without_dedicated_driver() -> Result<()> {
-        let directory = tempfile::tempdir()?;
-        let path = directory
-            .path()
-            .join("caller-driven-durability-diagnostics.wal");
-        let installed = install_empty(&path, header())?;
-        let leader = match open_writer(&path, &installed) {
-            Ok(writer) => writer,
-            Err(error) if is_io_uring_unavailable_error(&error) => {
-                eprintln!("skipping test (io_uring unavailable): {error:#}");
-                return Ok(());
-            }
-            Err(error) => return Err(error),
-        };
-        let mut writer = match leader.into_parallel() {
-            Ok(writer) => writer,
-            Err(error) if is_io_uring_unavailable_error(&error) => {
-                eprintln!("skipping test (io_uring unavailable): {error:#}");
-                return Ok(());
-            }
-            Err(error) => return Err(error),
-        };
-
-        writer.set_durability_driver_diagnostics_enabled(true);
-        let diagnostics = writer.io_diagnostics();
-
-        assert!(!diagnostics.dedicated_durability_driver_enabled);
-        assert!(diagnostics.dedicated_durability_diagnostics_enabled);
-        assert_eq!(diagnostics.caller_durability_driver_election_attempts, 0);
-
-        Ok(())
-    }
-
-    #[cfg(feature = "bench")]
-    #[test]
-    fn dedicated_durability_driver_coalesces_concurrent_waiters_and_recovers() -> Result<()> {
-        let directory = tempfile::tempdir()?;
-        let path = directory.path().join("dedicated-durability-driver.wal");
-        let installed = install_empty(&path, header())?;
-        let leader = match open_writer(&path, &installed) {
-            Ok(writer) => writer,
-            Err(error) if is_io_uring_unavailable_error(&error) => {
-                eprintln!("skipping test (io_uring unavailable): {error:#}");
-                return Ok(());
-            }
-            Err(error) => return Err(error),
-        };
-        let parallel = match leader.into_parallel() {
-            Ok(writer) => writer,
-            Err(error) if is_io_uring_unavailable_error(&error) => {
-                eprintln!("skipping test (io_uring unavailable): {error:#}");
-                return Ok(());
-            }
-            Err(error) => return Err(error),
-        };
-        let (writer, driver) = parallel.into_dedicated_durability_driver(true)?;
-        let requests = Arc::clone(
-            writer
-                .dedicated_durability_requests
-                .as_ref()
-                .expect("dedicated request state is installed"),
-        );
-        let (before_wait_tx, before_wait_rx) = crossbeam_channel::bounded(1);
-        let (release_tx, release_rx) = crossbeam_channel::bounded(1);
-        *requests.before_wait_hook.lock() = Some(Arc::new(move || {
-            before_wait_tx
-                .send(())
-                .expect("test receiver remains connected");
-            release_rx
-                .recv_timeout(Duration::from_secs(5))
-                .expect("test releases driver before its bounded wait expires");
-        }));
-
-        // Wake an idle driver into the hook, then hold it immediately before
-        // recv(). All writer requests below arrive while it cannot consume the
-        // capacity-one token, deterministically exercising wake coalescing.
-        requests
-            .wake_sender
-            .try_send(())
-            .expect("idle driver wake token is available");
-        before_wait_rx
-            .recv_timeout(Duration::from_secs(5))
-            .context("dedicated driver did not reach its pre-wait hook")?;
-
-        let batches = (1..=4).map(|index| batch(index * 10)).collect::<Vec<_>>();
-        let mut jobs = Vec::with_capacity(batches.len());
-        for batch in &batches {
-            jobs.push(writer.admit_prepared_batch(
-                writer.preflight_batch(batch, LIVE_WAL_V5_LIMITS)?,
-                batch.commit_ts,
-                batch.recorded_at,
-            )?);
-        }
-        let tickets = jobs
-            .iter()
-            .map(|job| job.assignment().segment_ticket)
-            .collect::<Vec<_>>();
-
-        // Make later tickets frame-ready first. Their waiters must not elect
-        // themselves; the dedicated owner advances the required prefix.
-        for job in jobs.into_iter().rev() {
-            job.finish()?;
-        }
-
-        let waiters = tickets
-            .iter()
-            .copied()
-            .map(|ticket| {
-                let writer = Arc::clone(&writer);
-                thread::spawn(move || writer.wait_for_requested_durable_prefix(ticket + 1))
-            })
-            .collect::<Vec<_>>();
-        let request_deadline = Instant::now() + Duration::from_secs(5);
-        let expected_requests = tickets.len() as u64;
-        loop {
-            let request_count = requests.request_count.load(Ordering::Acquire);
-            let wake_notifications = requests
-                .wake_signal_count
-                .load(Ordering::Acquire)
-                .saturating_add(requests.coalesced_wake_count.load(Ordering::Acquire));
-            if request_count == expected_requests && wake_notifications == request_count {
-                break;
-            }
-            ensure!(
-                Instant::now() < request_deadline,
-                "all dedicated waiters did not finish publishing their wake notifications"
-            );
-            thread::yield_now();
-        }
-        assert!(
-            requests.coalesced_wake_count.load(Ordering::Relaxed) >= 3,
-            "the held capacity-one wake token should coalesce concurrent requests"
-        );
-        release_tx
-            .send(())
-            .context("release dedicated driver pre-wait hook")?;
-
-        for waiter in waiters {
-            waiter
-                .join()
-                .expect("dedicated durability waiter panicked")?;
-        }
-        writer.sync()?;
-
-        let diagnostics = writer.io_diagnostics();
-        assert!(diagnostics.dedicated_durability_driver_enabled);
-        assert!(diagnostics.dedicated_durability_diagnostics_enabled);
-        assert_eq!(diagnostics.caller_durability_driver_election_attempts, 0);
-        assert_eq!(
-            diagnostics.dedicated_durability_requests,
-            batches.len() as u64 + 1
-        );
-        assert!(diagnostics.dedicated_durability_wake_signals > 0);
-        assert!(diagnostics.dedicated_durability_coalesced_wakes >= 3);
-        assert!(diagnostics.dedicated_durability_advance_attempts > 0);
-        assert_eq!(
-            writer.coordinator.durable_ticket_end(),
-            batches.len() as u64
-        );
-
-        // The driver owner wakes and joins an idle worker before the writer and
-        // its segment handles are released.
-        drop(driver);
-        drop(writer);
-
-        let recovered = super::super::install::recover_and_install_active(
-            &path,
-            &[installed.active_boundary],
-            header().predecessor,
-            LIVE_WAL_V5_LIMITS,
-            MAX_WAL_FILE_SIZE,
-        )?;
-        assert_eq!(recovered.active_boundary.ticket_end, batches.len() as u64);
-        assert_eq!(replayed_batches(&path, &recovered)?, batches);
-
-        Ok(())
-    }
-
-    #[cfg(feature = "bench")]
-    #[test]
-    fn dedicated_driver_counters_are_inert_without_diagnostics() -> Result<()> {
-        let (wake_sender, _wake_receiver) = crossbeam_channel::bounded(1);
-        let requests = WalV8DedicatedDurabilityRequests {
-            requested_ticket_end: AtomicU64::new(0),
-            shutdown_requested: AtomicBool::new(false),
-            wake_sender,
-            terminal_error: Mutex::new(None),
-            diagnostics_enabled: false,
-            request_count: AtomicU64::new(0),
-            wake_signal_count: AtomicU64::new(0),
-            coalesced_wake_count: AtomicU64::new(0),
-            advance_attempt_count: AtomicU64::new(0),
-            #[cfg(test)]
-            before_wait_hook: Mutex::new(None),
-            #[cfg(test)]
-            driver_joined_signal: Mutex::new(None),
-        };
-
-        requests.request(1)?;
-        requests.request(2)?;
-
-        assert_eq!(requests.request_count.load(Ordering::Relaxed), 0);
-        assert_eq!(requests.wake_signal_count.load(Ordering::Relaxed), 0);
-        assert_eq!(requests.coalesced_wake_count.load(Ordering::Relaxed), 0);
-        assert_eq!(requests.advance_attempt_count.load(Ordering::Relaxed), 0);
-
-        Ok(())
-    }
-
-    #[cfg(feature = "bench")]
-    #[test]
-    fn dedicated_whole_wal_barrier_waits_for_post_publish_retirement() -> Result<()> {
-        const SEGMENT_LIMIT: u64 = 256 * 1024;
-
-        let directory = tempfile::tempdir()?;
-        let path = directory.path().join("dedicated-retirement-barrier.wal");
-        let installed = install_empty(&path, header())?;
-        let (parallel, _owner) = match open_accounted_parallel_writer(
-            &path,
-            &installed,
-            SEGMENT_LIMIT,
-            2 * SEGMENT_LIMIT,
-            4096,
-        ) {
-            Ok(writer) => writer,
-            Err(error) if is_io_uring_unavailable_error(&error) => {
-                eprintln!("skipping test (io_uring unavailable): {error:#}");
-                return Ok(());
-            }
-            Err(error) => return Err(error),
-        };
-        let (detached_tx, detached_rx) = crossbeam_channel::bounded(1);
-        let (release_tx, release_rx) = crossbeam_channel::bounded(1);
-        *parallel.post_publish_retirement_hook.lock() = Some(Arc::new(move || {
-            detached_tx.send(()).map_err(anyhow::Error::from)?;
-            release_rx
-                .recv_timeout(Duration::from_secs(3))
-                .context("test did not release post-publish retirement")?;
-            Ok(())
-        }));
-        let (writer, driver) = parallel.into_dedicated_durability_driver(false)?;
-
-        let point = batch(10);
-        let prepared = writer.preflight_batch_with_write_class(
-            &point,
-            LIVE_WAL_V5_LIMITS,
-            WalV8WriteClass::Point,
-        )?;
-        let job = writer.admit_prepared_point_batch(
-            WalV8PointAdmissionScratch::new(prepared),
-            point.commit_ts,
-            point.recorded_at,
-        )?;
-        let ticket_end = job.assignment().segment_ticket + 1;
-        job.finish()?;
-
-        let ack_writer = Arc::clone(&writer);
-        let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
-        thread::spawn(move || {
-            let _ = ack_tx.send(ack_writer.wait_for_requested_durable_prefix(ticket_end));
-        });
-
-        detached_rx
-            .recv_timeout(Duration::from_secs(5))
-            .context("driver did not reach post-publish retirement")?;
-        let published_ticket_end = writer.coordinator.durable_ticket_end();
-        ensure!(
-            published_ticket_end >= ticket_end,
-            "retirement hook ran before any ticket became durable"
-        );
-        ack_rx
-            .recv_timeout(Duration::from_secs(2))
-            .context("per-ticket ACK waited for post-publish retirement")??;
-
-        let barrier_writer = Arc::clone(&writer);
-        let (barrier_tx, barrier_rx) = crossbeam_channel::bounded(1);
-        thread::spawn(move || {
-            let _ = barrier_tx.send(barrier_writer.wait_for_post_publish_cleanup());
-        });
-        assert!(
-            matches!(
-                barrier_rx.recv_timeout(Duration::from_millis(100)),
-                Err(crossbeam_channel::RecvTimeoutError::Timeout)
-            ),
-            "whole-WAL barrier returned while post-publish retirement was paused"
-        );
-        release_tx
-            .send(())
-            .context("release post-publish retirement hook")?;
-        barrier_rx
-            .recv_timeout(Duration::from_secs(3))
-            .context("whole-WAL barrier did not finish after retirement")??;
-
-        drop(driver);
-        drop(writer);
-
-        Ok(())
-    }
-
-    #[cfg(feature = "bench")]
-    #[test]
-    fn dedicated_driver_panic_poisons_and_wakes_waiter() -> Result<()> {
-        let directory = tempfile::tempdir()?;
-        let path = directory.path().join("dedicated-driver-panic.wal");
-        let installed = install_empty(&path, header())?;
-        let leader = match open_writer(&path, &installed) {
-            Ok(writer) => writer,
-            Err(error) if is_io_uring_unavailable_error(&error) => {
-                eprintln!("skipping test (io_uring unavailable): {error:#}");
-                return Ok(());
-            }
-            Err(error) => return Err(error),
-        };
-        let parallel = match leader.into_parallel() {
-            Ok(writer) => writer,
-            Err(error) if is_io_uring_unavailable_error(&error) => {
-                eprintln!("skipping test (io_uring unavailable): {error:#}");
-                return Ok(());
-            }
-            Err(error) => return Err(error),
-        };
-        let (writer, driver) = parallel.into_dedicated_durability_driver(true)?;
-        let requests = Arc::clone(
-            writer
-                .dedicated_durability_requests
-                .as_ref()
-                .expect("dedicated request state is installed"),
-        );
-        let (before_wait_tx, before_wait_rx) = crossbeam_channel::bounded(1);
-        let (release_tx, release_rx) = crossbeam_channel::bounded(1);
-        *requests.before_wait_hook.lock() = Some(Arc::new(move || {
-            before_wait_tx
-                .send(())
-                .expect("test receiver remains connected");
-            release_rx
-                .recv_timeout(Duration::from_secs(3))
-                .expect("test releases panic hook before its bounded wait expires");
-            panic!("injected dedicated durability worker panic");
-        }));
-        requests
-            .wake_sender
-            .try_send(())
-            .expect("idle driver wake token is available");
-        before_wait_rx
-            .recv_timeout(Duration::from_secs(3))
-            .context("dedicated driver did not reach its panic hook")?;
-
-        let first = batch(10);
-        let admitted = writer.admit_prepared_batch(
-            writer.preflight_batch(&first, LIVE_WAL_V5_LIMITS)?,
-            first.commit_ts,
-            first.recorded_at,
-        )?;
-        let ticket_end = admitted.assignment().segment_ticket + 1;
-        admitted.finish()?;
-
-        let (waiter_tx, waiter_rx) = crossbeam_channel::bounded(1);
-        let waiter_writer = Arc::clone(&writer);
-        thread::spawn(move || {
-            let _ = waiter_tx.send(waiter_writer.wait_for_requested_durable_prefix(ticket_end));
-        });
-        let request_deadline = Instant::now() + Duration::from_secs(3);
-        while requests.request_count.load(Ordering::Relaxed) == 0 {
-            ensure!(
-                Instant::now() < request_deadline,
-                "waiter did not publish request before panic injection"
-            );
-            thread::yield_now();
-        }
-        release_tx
-            .send(())
-            .context("release dedicated driver panic hook")?;
-
-        let wait_result = waiter_rx
-            .recv_timeout(Duration::from_secs(3))
-            .context("waiter was not woken after dedicated driver panic")?;
-        assert!(wait_result.is_err(), "panic must not produce a durable ACK");
-        assert!(writer.is_poisoned());
-        assert_eq!(writer.coordinator.durable_ticket_end(), 0);
-
-        drop(driver);
-        drop(writer);
-
-        Ok(())
-    }
-
     #[cfg(feature = "bench")]
     fn assert_one_two_ticket_profile(profile: &crate::mem_table::WriteProfile) {
         let snapshot = profile.snapshot();
@@ -10123,27 +8871,6 @@ mod tests {
         max_source_spool_bytes: u64,
         allocation_unit: u64,
     ) -> Result<(WalV8ParallelWriter, Arc<WalV8ReservationOwner>)> {
-        open_accounted_parallel_writer_with_progress_and_completion(
-            path,
-            installed,
-            max_file_size,
-            max_source_spool_bytes,
-            allocation_unit,
-            WalV8ProgressMode::Eager,
-            false,
-        )
-    }
-
-    #[cfg(feature = "bench")]
-    fn open_accounted_parallel_writer_with_progress_and_completion(
-        path: &Path,
-        installed: &WalV8InstalledRecovery,
-        max_file_size: u64,
-        max_source_spool_bytes: u64,
-        allocation_unit: u64,
-        progress_mode: WalV8ProgressMode,
-        direct_completion_enabled: bool,
-    ) -> Result<(WalV8ParallelWriter, Arc<WalV8ReservationOwner>)> {
         let sync_file = OpenOptions::new().read(true).write(true).open(path)?;
         let (leader, owner) = open_accounted_writer(
             path,
@@ -10158,565 +8885,13 @@ mod tests {
             .write(true)
             .custom_flags(libc::O_DIRECT)
             .open(path)?;
-        let mut writer = leader.into_parallel_with_worker_file_progress_and_completion(
+        let mut writer = leader.into_parallel_with_worker_file_and_progress_mode(
             worker_file,
-            progress_mode,
-            direct_completion_enabled,
-            false,
-            None,
+            WalV8ProgressMode::Eager,
         )?;
         writer.point_buffer_preallocation_enabled = true;
 
         Ok((writer, owner))
-    }
-
-    #[cfg(feature = "bench")]
-    #[test]
-    fn point_resource_retirement_unlocks_map_before_retiring_detached_prefix() -> Result<()> {
-        const SEGMENT_LIMIT: u64 = 256 * 1024;
-
-        let directory = tempfile::tempdir()?;
-        let path = directory
-            .path()
-            .join("point-resource-retirement-detach.wal");
-        let installed = install_empty(&path, header())?;
-        let (mut writer, _owner) = match open_accounted_parallel_writer(
-            &path,
-            &installed,
-            SEGMENT_LIMIT,
-            2 * SEGMENT_LIMIT,
-            4096,
-        ) {
-            Ok(writer) => writer,
-            Err(error) if is_io_uring_unavailable_error(&error) => {
-                eprintln!("skipping test (io_uring unavailable): {error:#}");
-                return Ok(());
-            }
-            Err(error) => return Err(error),
-        };
-        writer.point_resource_retirement_mode = WalV8PointResourceRetirementMode::DetachPointPrefix;
-        let writer = Arc::new(writer);
-
-        let (detached_tx, detached_rx) = crossbeam_channel::bounded(1);
-        let (release_tx, release_rx) = crossbeam_channel::bounded(1);
-        *writer.point_resource_retirement_detached_hook.lock() = Some(Arc::new(move || {
-            detached_tx.send(()).map_err(anyhow::Error::from)?;
-            release_rx
-                .recv()
-                .context("test did not release detached Point retirement")?;
-            Ok(())
-        }));
-
-        let first = batch(10);
-        let first_job = writer.admit_prepared_point_batch(
-            WalV8PointAdmissionScratch::new(writer.preflight_batch_with_write_class(
-                &first,
-                LIVE_WAL_V5_LIMITS,
-                WalV8WriteClass::Point,
-            )?),
-            first.commit_ts,
-            first.recorded_at,
-        )?;
-        let first_ticket = first_job.assignment().segment_ticket;
-        first_job.finish()?;
-
-        let second = batch(20);
-        let second_job = writer.admit_prepared_point_batch(
-            WalV8PointAdmissionScratch::new(writer.preflight_batch_with_write_class(
-                &second,
-                LIVE_WAL_V5_LIMITS,
-                WalV8WriteClass::Point,
-            )?),
-            second.commit_ts,
-            second.recorded_at,
-        )?;
-        let second_ticket = second_job.assignment().segment_ticket;
-        second_job.finish()?;
-        assert_eq!((first_ticket, second_ticket), (0, 1));
-
-        // Wait until both tickets are simultaneously eligible before electing
-        // the driver. Otherwise the first completion may form a singleton
-        // durability advance, which intentionally does not use the detach path.
-        let ready_deadline = Instant::now() + Duration::from_secs(10);
-        while writer.coordinator.frontier_ready_prefix().len() < 2 {
-            ensure!(
-                Instant::now() < ready_deadline,
-                "both Point tickets did not become frontier-ready"
-            );
-            thread::sleep(Duration::from_millis(1));
-        }
-
-        let (driver_result_tx, driver_result_rx) = mpsc::channel();
-        thread::scope(|scope| -> Result<()> {
-            struct ReleaseDetachedPrefixHook(Option<crossbeam_channel::Sender<()>>);
-            impl ReleaseDetachedPrefixHook {
-                fn release(&mut self) {
-                    if let Some(sender) = self.0.take() {
-                        let _ = sender.send(());
-                    }
-                }
-            }
-            impl Drop for ReleaseDetachedPrefixHook {
-                fn drop(&mut self) {
-                    self.release();
-                }
-            }
-
-            let mut hook_release = ReleaseDetachedPrefixHook(Some(release_tx));
-            let driver_writer = Arc::clone(&writer);
-            let driver = scope.spawn(move || {
-                let _ =
-                    driver_result_tx.send(driver_writer.advance_frontier_through(second_ticket));
-            });
-
-            detached_rx
-                .recv_timeout(Duration::from_secs(5))
-                .context("Point resource prefix was not detached")?;
-
-            // The first two resources are detached while their retirement is
-            // paused. The map is available, and the successor admission can
-            // register its own resource without waiting for owner/ledger work.
-            let resources = writer
-                .frontier_resources
-                .try_lock()
-                .context("frontier resource map remained locked after detachment")?;
-            assert!(resources.is_empty());
-            drop(resources);
-
-            let third = batch(30);
-            let successor_writer = Arc::clone(&writer);
-            let (successor_result_tx, successor_result_rx) = mpsc::channel();
-            let successor = scope.spawn(move || {
-                let result = (|| -> Result<u64> {
-                    let third_job = successor_writer.admit_prepared_point_batch(
-                        WalV8PointAdmissionScratch::new(
-                            successor_writer.preflight_batch_with_write_class(
-                                &third,
-                                LIVE_WAL_V5_LIMITS,
-                                WalV8WriteClass::Point,
-                            )?,
-                        ),
-                        third.commit_ts,
-                        third.recorded_at,
-                    )?;
-                    let third_ticket = third_job.assignment().segment_ticket;
-                    third_job.finish()?;
-                    Ok(third_ticket)
-                })();
-                let _ = successor_result_tx.send(result);
-            });
-            let third_ticket = successor_result_rx
-                .recv_timeout(Duration::from_secs(5))
-                .context("successor admission blocked while retirement was detached")??;
-            successor
-                .join()
-                .map_err(|_| anyhow::anyhow!("successor admission thread panicked"))?;
-            assert_eq!(third_ticket, 2);
-
-            let resources = writer
-                .frontier_resources
-                .try_lock()
-                .context("successor resource map unexpectedly remained locked")?;
-            assert_eq!(
-                resources.keys().copied().collect::<Vec<_>>(),
-                [third_ticket]
-            );
-            drop(resources);
-
-            ensure!(
-                matches!(driver_result_rx.try_recv(), Err(mpsc::TryRecvError::Empty)),
-                "durability driver completed before detached retirement was released"
-            );
-            hook_release.release();
-            let driver_result = driver_result_rx.recv_timeout(Duration::from_secs(5));
-            driver
-                .join()
-                .map_err(|_| anyhow::anyhow!("resource retirement driver panicked"))?;
-            driver_result.context("resource retirement driver did not return")??;
-
-            assert_eq!(writer.active_boundaries()?.1.ticket_end, 2);
-            assert_eq!(
-                writer
-                    .point_resource_retirement_detached_prefixes
-                    .load(Ordering::Relaxed),
-                1
-            );
-            assert_eq!(
-                writer
-                    .point_resource_retirement_detached_tickets
-                    .load(Ordering::Relaxed),
-                2
-            );
-            Ok(())
-        })?;
-
-        writer.advance_frontier_through(2)?;
-        assert_eq!(writer.active_boundaries()?.1.ticket_end, 3);
-        assert_eq!(
-            writer
-                .io_diagnostics()
-                .point_resource_retirement_detached_prefixes,
-            1
-        );
-        assert_eq!(
-            writer
-                .io_diagnostics()
-                .point_resource_retirement_detached_tickets,
-            2
-        );
-
-        drop(writer);
-        let recovered = super::super::install::recover_and_install_active(
-            &path,
-            &[installed.active_boundary],
-            header().predecessor,
-            LIVE_WAL_V5_LIMITS,
-            MAX_WAL_FILE_SIZE,
-        )?;
-        assert_eq!(
-            replayed_batches(&path, &recovered)?,
-            [first, second, batch(30)]
-        );
-
-        Ok(())
-    }
-
-    #[cfg(feature = "bench")]
-    #[test]
-    fn point_resource_retirement_detaches_only_multi_ticket_point_prefixes() -> Result<()> {
-        const SEGMENT_LIMIT: u64 = 256 * 1024;
-        let cases: [(
-            &str,
-            &[WalV8WriteClass],
-            WalV8PointResourceRetirementMode,
-            u64,
-            u64,
-        ); 8] = [
-            (
-                "point-point",
-                &[WalV8WriteClass::Point, WalV8WriteClass::Point],
-                WalV8PointResourceRetirementMode::DetachPointPrefix,
-                1,
-                0,
-            ),
-            (
-                "point-batch",
-                &[WalV8WriteClass::Point, WalV8WriteClass::Batch],
-                WalV8PointResourceRetirementMode::DetachPointPrefix,
-                0,
-                0,
-            ),
-            (
-                "batch-batch",
-                &[WalV8WriteClass::Batch, WalV8WriteClass::Batch],
-                WalV8PointResourceRetirementMode::DetachPointPrefix,
-                0,
-                0,
-            ),
-            (
-                "point-singleton",
-                &[WalV8WriteClass::Point],
-                WalV8PointResourceRetirementMode::DetachPointPrefix,
-                0,
-                0,
-            ),
-            (
-                "point-point-c2",
-                &[WalV8WriteClass::Point, WalV8WriteClass::Point],
-                WalV8PointResourceRetirementMode::DetachAndBatchPointPrefix,
-                1,
-                1,
-            ),
-            (
-                "point-batch-c2",
-                &[WalV8WriteClass::Point, WalV8WriteClass::Batch],
-                WalV8PointResourceRetirementMode::DetachAndBatchPointPrefix,
-                0,
-                0,
-            ),
-            (
-                "batch-batch-c2",
-                &[WalV8WriteClass::Batch, WalV8WriteClass::Batch],
-                WalV8PointResourceRetirementMode::DetachAndBatchPointPrefix,
-                0,
-                0,
-            ),
-            (
-                "point-singleton-c2",
-                &[WalV8WriteClass::Point],
-                WalV8PointResourceRetirementMode::DetachAndBatchPointPrefix,
-                0,
-                0,
-            ),
-        ];
-
-        for (
-            name,
-            classes,
-            retirement_mode,
-            expected_detached_prefixes,
-            expected_batched_prefixes,
-        ) in cases
-        {
-            let directory = tempfile::tempdir()?;
-            let path = directory
-                .path()
-                .join(format!("point-retirement-{name}.wal"));
-            let installed = install_empty(&path, header())?;
-            let (mut writer, _owner) = match open_accounted_parallel_writer(
-                &path,
-                &installed,
-                SEGMENT_LIMIT,
-                2 * SEGMENT_LIMIT,
-                4096,
-            ) {
-                Ok(writer) => writer,
-                Err(error) if is_io_uring_unavailable_error(&error) => {
-                    eprintln!("skipping test (io_uring unavailable): {error:#}");
-                    return Ok(());
-                }
-                Err(error) => return Err(error),
-            };
-            writer.point_resource_retirement_mode = retirement_mode;
-            writer.io_diagnostics.point_resource_retirement_mode = retirement_mode as u8;
-
-            let mut last_ticket = 0;
-            for (index, write_class) in classes.iter().copied().enumerate() {
-                let batch = batch((index as u64 + 1) * 10);
-                let prepared = writer.preflight_batch_with_write_class(
-                    &batch,
-                    LIVE_WAL_V5_LIMITS,
-                    write_class,
-                )?;
-                let job =
-                    writer.admit_prepared_batch(prepared, batch.commit_ts, batch.recorded_at)?;
-                last_ticket = job.assignment().segment_ticket;
-                job.finish()?;
-            }
-
-            assert_eq!(last_ticket + 1, classes.len() as u64);
-            let ready_deadline = Instant::now() + Duration::from_secs(10);
-            while writer.coordinator.frontier_ready_prefix().len() < classes.len() {
-                ensure!(
-                    Instant::now() < ready_deadline,
-                    "{name}: all tickets did not become frontier-ready"
-                );
-                thread::sleep(Duration::from_millis(1));
-            }
-
-            writer.advance_frontier_through(last_ticket)?;
-            let diagnostics = writer.io_diagnostics();
-            assert_eq!(
-                diagnostics.point_resource_retirement_detached_prefixes, expected_detached_prefixes,
-                "unexpected detach count for {name}"
-            );
-            assert_eq!(
-                diagnostics.point_resource_retirement_detached_tickets,
-                if expected_detached_prefixes == 0 {
-                    0
-                } else {
-                    classes.len() as u64
-                },
-                "unexpected detached ticket count for {name}"
-            );
-            assert_eq!(
-                diagnostics.point_resource_retirement_batched_prefixes, expected_batched_prefixes,
-                "unexpected batched retirement count for {name}"
-            );
-        }
-
-        Ok(())
-    }
-
-    #[cfg(feature = "bench")]
-    #[test]
-    fn cursor_direct_completion_c2_retirement_recovers_point_prefix() -> Result<()> {
-        const SEGMENT_LIMIT: u64 = 256 * 1024;
-
-        let directory = tempfile::tempdir()?;
-        let path = directory.path().join("cursor-direct-c2-retirement-v8.wal");
-        let wal_header = header();
-        let installed = install_empty(&path, wal_header)?;
-        let (mut writer, owner) = match open_accounted_parallel_writer_with_progress_and_completion(
-            &path,
-            &installed,
-            SEGMENT_LIMIT,
-            2 * SEGMENT_LIMIT,
-            4096,
-            WalV8ProgressMode::Cursor,
-            true,
-        ) {
-            Ok(writer) => writer,
-            Err(error) if is_io_uring_unavailable_error(&error) => {
-                eprintln!("skipping test (io_uring unavailable): {error:#}");
-                return Ok(());
-            }
-            Err(error) => return Err(error),
-        };
-        writer.point_resource_retirement_mode =
-            WalV8PointResourceRetirementMode::DetachAndBatchPointPrefix;
-        writer.io_diagnostics.point_resource_retirement_mode =
-            WalV8PointResourceRetirementMode::DetachAndBatchPointPrefix as u8;
-
-        let mut expected = Vec::new();
-        let mut last_ticket = 0;
-        for commit_ts in [10, 20] {
-            let point = batch(commit_ts);
-            let prepared = writer.preflight_batch_with_write_class(
-                &point,
-                LIVE_WAL_V5_LIMITS,
-                WalV8WriteClass::Point,
-            )?;
-            let job = writer.admit_prepared_point_batch(
-                WalV8PointAdmissionScratch::new(prepared),
-                point.commit_ts,
-                point.recorded_at,
-            )?;
-            last_ticket = job.assignment().segment_ticket;
-            job.finish()?;
-            expected.push(point);
-        }
-
-        // Cursor mode advances readiness only when the active driver drains
-        // completion events. Prime that cursor before the durability advance
-        // so both tickets are available to the C2 batch path together.
-        let ticket_end = last_ticket
-            .checked_add(1)
-            .context("C2 recovery test ticket end overflows")?;
-        let mut readiness_driver = writer
-            .coordinator
-            .acquire_durability_driver(ticket_end)?
-            .context("C2 recovery test could not acquire the readiness driver")?;
-        let ready_deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            let snapshot = writer
-                .io
-                .advance_and_snapshot(&mut readiness_driver, false)?;
-            if snapshot.ready_prefix.len() >= expected.len() {
-                break;
-            }
-            ensure!(
-                Instant::now() < ready_deadline,
-                "both Point tickets did not become frontier-ready"
-            );
-            thread::sleep(Duration::from_millis(1));
-        }
-        readiness_driver.complete();
-        drop(readiness_driver);
-
-        writer.advance_frontier_through(last_ticket)?;
-        assert!(writer.io.completion_thread.lock().is_none());
-        let diagnostics = writer.io_diagnostics();
-        assert!(diagnostics.progress_cursor_enabled);
-        assert!(diagnostics.cursor_direct_completion_enabled);
-        assert_eq!(
-            diagnostics.point_resource_retirement_mode,
-            WalV8PointResourceRetirementMode::DetachAndBatchPointPrefix as u8
-        );
-        assert_eq!(diagnostics.point_resource_retirement_detached_prefixes, 1);
-        assert!(diagnostics.point_resource_retirement_batched_prefixes > 0);
-        let (_, boundary) = writer.active_boundaries()?;
-        assert_eq!(boundary.ticket_end, last_ticket + 1);
-        drop(writer);
-        drop(owner);
-
-        let recovered = super::super::install::recover_and_install_active(
-            &path,
-            &[boundary],
-            wal_header.predecessor,
-            LIVE_WAL_V5_LIMITS,
-            MAX_WAL_FILE_SIZE,
-        )?;
-        assert_eq!(replayed_batches(&path, &recovered)?, expected);
-
-        Ok(())
-    }
-
-    #[cfg(feature = "bench")]
-    #[test]
-    fn point_resource_retirement_detach_failure_releases_buffers_and_poisons_writer() -> Result<()>
-    {
-        const SEGMENT_LIMIT: u64 = 256 * 1024;
-
-        let directory = tempfile::tempdir()?;
-        let path = directory.path().join("point-retirement-detach-failure.wal");
-        let installed = install_empty(&path, header())?;
-        let (mut writer, owner) = match open_accounted_parallel_writer(
-            &path,
-            &installed,
-            SEGMENT_LIMIT,
-            2 * SEGMENT_LIMIT,
-            4096,
-        ) {
-            Ok(writer) => writer,
-            Err(error) if is_io_uring_unavailable_error(&error) => {
-                eprintln!("skipping test (io_uring unavailable): {error:#}");
-                return Ok(());
-            }
-            Err(error) => return Err(error),
-        };
-        let image_owner = owner.image_owner();
-        writer.point_resource_retirement_mode = WalV8PointResourceRetirementMode::DetachPointPrefix;
-        let baseline_buffer_memory = image_owner.snapshot().buffer_memory_bytes;
-        *writer.point_resource_retirement_detached_hook.lock() = Some(Arc::new(|| {
-            anyhow::bail!("injected post-detach retirement failure")
-        }));
-
-        let first = batch(10);
-        let first_job = writer.admit_prepared_point_batch(
-            WalV8PointAdmissionScratch::new(writer.preflight_batch_with_write_class(
-                &first,
-                LIVE_WAL_V5_LIMITS,
-                WalV8WriteClass::Point,
-            )?),
-            first.commit_ts,
-            first.recorded_at,
-        )?;
-        let first_ticket = first_job.assignment().segment_ticket;
-        first_job.finish()?;
-
-        let second = batch(20);
-        let second_job = writer.admit_prepared_point_batch(
-            WalV8PointAdmissionScratch::new(writer.preflight_batch_with_write_class(
-                &second,
-                LIVE_WAL_V5_LIMITS,
-                WalV8WriteClass::Point,
-            )?),
-            second.commit_ts,
-            second.recorded_at,
-        )?;
-        let second_ticket = second_job.assignment().segment_ticket;
-        second_job.finish()?;
-        assert_eq!((first_ticket, second_ticket), (0, 1));
-
-        let ready_deadline = Instant::now() + Duration::from_secs(10);
-        while writer.coordinator.frontier_ready_prefix().len() < 2 {
-            ensure!(
-                Instant::now() < ready_deadline,
-                "both Point tickets did not become frontier-ready"
-            );
-            thread::sleep(Duration::from_millis(1));
-        }
-
-        let error = writer
-            .advance_frontier_through(second_ticket)
-            .expect_err("injected failure after detachment must fail the durable advance");
-        assert!(
-            format!("{error:#}").contains("injected post-detach retirement failure"),
-            "unexpected retirement error: {error:#}"
-        );
-        assert!(writer.is_poisoned());
-        assert_eq!(writer.active_boundaries()?.1.ticket_end, 0);
-        assert!(!image_owner.has_in_flight_source_spool_work());
-        assert_eq!(
-            image_owner.snapshot().buffer_memory_bytes,
-            baseline_buffer_memory
-        );
-
-        drop(writer);
-        image_owner.retire_after_durable_cleanup()?;
-        assert_eq!(image_owner.snapshot().buffer_memory_bytes, 0);
-        Ok(())
     }
 
     #[cfg(feature = "bench")]
@@ -11818,10 +9993,7 @@ mod tests {
         let error = writer
             .append_batch(&batch(10), LIVE_WAL_V5_LIMITS)
             .expect_err("fdatasync failure must reject the commit");
-        assert!(
-            format!("{error:#}").contains("fdatasync"),
-            "unexpected sync failure: {error:#}"
-        );
+        assert!(format!("{error:#}").contains("fdatasync"));
         assert!(writer.is_poisoned());
         assert!(writer.append_batch(&batch(20), LIVE_WAL_V5_LIMITS).is_err());
         drop(writer);
@@ -11843,16 +10015,6 @@ mod tests {
 
     #[test]
     fn explicit_sync_failure_poisons_parallel_writer() -> Result<()> {
-        explicit_sync_failure_poisons_parallel_writer_with_mode(false)
-    }
-
-    #[cfg(feature = "bench")]
-    #[test]
-    fn dedicated_durability_sync_failure_poisons_and_wakes_waiter() -> Result<()> {
-        explicit_sync_failure_poisons_parallel_writer_with_mode(true)
-    }
-
-    fn explicit_sync_failure_poisons_parallel_writer_with_mode(dedicated: bool) -> Result<()> {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("active-v8.wal");
         let header = header();
@@ -11868,27 +10030,8 @@ mod tests {
         );
         // SAFETY: sync_fd was returned by open and ownership transfers to File.
         let sync_file = unsafe { File::from_raw_fd(sync_fd) };
-        let leader = WalV8LeaderWriter::new(write_file, sync_file, &installed, MAX_WAL_FILE_SIZE)?;
-        let parallel_writer = match leader.into_parallel() {
-            Ok(writer) => writer,
-            Err(error) if is_io_uring_unavailable_error(&error) => {
-                eprintln!("skipping test (io_uring unavailable): {error:#}");
-                return Ok(());
-            }
-            Err(error) => return Err(error),
-        };
-        #[cfg(feature = "bench")]
-        let (writer, dedicated_driver) = if dedicated {
-            let (writer, driver) = parallel_writer.into_dedicated_durability_driver(true)?;
-            (writer, Some(driver))
-        } else {
-            (Arc::new(parallel_writer), None)
-        };
-        #[cfg(not(feature = "bench"))]
-        let writer = {
-            ensure!(!dedicated, "dedicated driver requires the bench feature");
-            Arc::new(parallel_writer)
-        };
+        let writer = WalV8LeaderWriter::new(write_file, sync_file, &installed, MAX_WAL_FILE_SIZE)?
+            .into_parallel()?;
         let first_batch = batch(10);
         let prepared = writer.preflight_batch(&first_batch, LIVE_WAL_V5_LIMITS)?;
         let mut data_buffer = DirectBuf::new(prepared.frame_buffer_bytes());
@@ -11925,39 +10068,14 @@ mod tests {
         let error = writer
             .sync()
             .expect_err("explicit fdatasync failure must reject the durability advance");
-        let error_message = format!("{error:#}");
-        if !dedicated {
-            assert!(
-                error_message.contains("fdatasync"),
-                "unexpected sync failure: {error_message}"
-            );
-        }
+        assert!(format!("{error:#}").contains("fdatasync"));
         assert!(writer.is_poisoned());
-        #[cfg(feature = "bench")]
-        if dedicated {
-            let diagnostics = writer.io_diagnostics();
-            assert!(diagnostics.dedicated_durability_driver_enabled);
-            assert_eq!(diagnostics.caller_durability_driver_election_attempts, 0);
-            assert_eq!(diagnostics.dedicated_durability_advance_attempts, 1);
-        }
         assert!(
             writer
                 .preflight_batch(&batch(20), LIVE_WAL_V5_LIMITS)
                 .is_err()
         );
         drop(encoded);
-        #[cfg(feature = "bench")]
-        if let Some(driver) = dedicated_driver {
-            let requests = Arc::clone(&driver.requests);
-            drop(driver);
-            let error = requests
-                .terminal_error()
-                .expect("driver records detailed failure after poisoning waiters");
-            assert!(
-                error.contains("fdatasync"),
-                "unexpected driver diagnostic: {error}"
-            );
-        }
 
         Ok(())
     }

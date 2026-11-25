@@ -40264,218 +40264,6 @@ mod tests {
     }
 
     #[cfg(all(target_os = "linux", feature = "bench"))]
-    fn v8_ack_mode_rotates_and_recovers(
-        test_name: &str,
-        child_env: &str,
-        dedicated_driver_enabled: bool,
-        independent_ack_waiter_enabled: bool,
-    ) -> anyhow::Result<()> {
-        use anyhow::Context;
-
-        if std::env::var_os(child_env).is_none() {
-            let status = std::process::Command::new(std::env::current_exe()?)
-                .arg("--nocapture")
-                .arg(test_name)
-                .env(child_env, "1")
-                .env(
-                    "TOYKV_BENCH_V8_DEDICATED_DURABILITY_DRIVER",
-                    if dedicated_driver_enabled { "1" } else { "0" },
-                )
-                .env("TOYKV_BENCH_V8_DURABILITY_DRIVER_DIAGNOSTICS", "0")
-                .env(
-                    "TOYKV_BENCH_V8_INDEPENDENT_ACK_WAITER",
-                    if independent_ack_waiter_enabled {
-                        "1"
-                    } else {
-                        "0"
-                    },
-                )
-                .status()?;
-            anyhow::ensure!(status.success(), "V8 ACK-mode rotation child failed");
-            return Ok(());
-        }
-
-        use crate::pitr::api::{PersistedPitrConfig, PitrOptions, PitrRuntimeOptions};
-        use crate::tests::harness::is_io_uring_unavailable_error;
-        use crate::wal::WalIoMode;
-
-        const MAX_SEGMENT_BYTES: u64 = 4 * 1024 * 1024;
-        const VALUE: &[u8] = &[0x5a; 1024];
-
-        let directory = tempdir()?;
-        let database = directory.path().join("db");
-        let repository = directory.path().join("repository");
-        let options = LsmStorageOptions {
-            enable_wal: true,
-            target_sst_size: 1 << 30,
-            ..LsmStorageOptions::default_for_test()
-        };
-        let engine = match KvEngine::open_with_wal_io_mode(
-            &database,
-            options.clone(),
-            WalIoMode::Parallel,
-        ) {
-            Ok(engine) => engine,
-            Err(error) if is_io_uring_unavailable_error(&error) => {
-                eprintln!("skipping test (io_uring unavailable): {error:#}");
-                return Ok(());
-            }
-            Err(error) => return Err(error),
-        };
-        if let Err(error) = engine.enable_pitr(PitrOptions {
-            repository,
-            config: PersistedPitrConfig {
-                archive_interval: std::time::Duration::from_secs(3600),
-                max_segment_bytes: MAX_SEGMENT_BYTES,
-                max_unarchived_bytes: 8 * 1024 * 1024,
-                max_source_spool_bytes: 32 * 1024 * 1024,
-            },
-            runtime: PitrRuntimeOptions::default(),
-        }) {
-            if is_io_uring_unavailable_error(&error) {
-                eprintln!("skipping test (io_uring unavailable): {error:#}");
-                engine.close()?;
-                return Ok(());
-            }
-            return Err(error);
-        }
-
-        let first_active = engine.inner.state.load().memtable.clone();
-        anyhow::ensure!(first_active.uses_v8_wal());
-        anyhow::ensure!(
-            first_active
-                .benchmark_wal_io_diagnostics()
-                .is_some_and(|diagnostics| {
-                    diagnostics.dedicated_durability_driver_enabled == dedicated_driver_enabled
-                        && diagnostics.independent_ack_waiter_enabled
-                            == independent_ack_waiter_enabled
-                }),
-            "initial V8 WAL did not install the requested durability and ACK modes"
-        );
-        let driver_joined_rx = if dedicated_driver_enabled {
-            let (driver_joined_tx, driver_joined_rx) = crossbeam_channel::bounded(1);
-            first_active.set_v8_dedicated_driver_joined_signal_for_test(driver_joined_tx)?;
-            Some(driver_joined_rx)
-        } else {
-            None
-        };
-        let first_active_id = first_active.id();
-        engine.put(b"before-rotation", VALUE)?;
-        anyhow::ensure!(matches!(
-            engine.create_recovery_point()?,
-            crate::pitr::api::RecoveryPointOutcome::Durable(_)
-        ));
-
-        let successor = engine.inner.state.load().memtable.clone();
-        anyhow::ensure!(successor.uses_v8_wal());
-        anyhow::ensure!(successor.id() != first_active_id);
-        anyhow::ensure!(
-            successor
-                .benchmark_wal_io_diagnostics()
-                .is_some_and(|diagnostics| {
-                    diagnostics.dedicated_durability_driver_enabled == dedicated_driver_enabled
-                        && diagnostics.independent_ack_waiter_enabled
-                            == independent_ack_waiter_enabled
-                }),
-            "rotated V8 WAL did not preserve the requested durability and ACK modes"
-        );
-        drop(successor);
-
-        engine.put(b"after-rotation", VALUE)?;
-        engine.close()?;
-        drop(engine);
-        if let Some(driver_joined_rx) = driver_joined_rx.as_ref() {
-            anyhow::ensure!(
-                matches!(
-                    driver_joined_rx.try_recv(),
-                    Err(crossbeam_channel::TryRecvError::Empty)
-                ),
-                "old dedicated driver exited while the old memtable owner was still retained"
-            );
-        }
-        drop(first_active);
-        if let Some(driver_joined_rx) = driver_joined_rx {
-            driver_joined_rx
-                .recv_timeout(std::time::Duration::from_secs(5))
-                .context("old V8 WAL owner dropped before its dedicated driver joined")?;
-        }
-
-        let reopened = KvEngine::open_with_wal_io_mode(&database, options, WalIoMode::Parallel)?;
-        let recovered_active = reopened.inner.state.load().memtable.clone();
-        anyhow::ensure!(recovered_active.uses_v8_wal());
-        anyhow::ensure!(
-            recovered_active
-                .benchmark_wal_io_diagnostics()
-                .is_some_and(|diagnostics| {
-                    diagnostics.dedicated_durability_driver_enabled == dedicated_driver_enabled
-                        && diagnostics.independent_ack_waiter_enabled
-                            == independent_ack_waiter_enabled
-                }),
-            "recovered V8 WAL did not preserve the requested durability and ACK modes"
-        );
-        assert_eq!(reopened.get(b"before-rotation")?.as_deref(), Some(VALUE));
-        assert_eq!(reopened.get(b"after-rotation")?.as_deref(), Some(VALUE));
-        reopened.close()?;
-
-        Ok(())
-    }
-
-    #[cfg(all(target_os = "linux", feature = "bench"))]
-    #[test]
-    fn v8_dedicated_durability_driver_rotates_and_recovers() -> anyhow::Result<()> {
-        v8_ack_mode_rotates_and_recovers(
-            "v8_dedicated_durability_driver_rotates_and_recovers",
-            "TOYKV_TEST_V8_DEDICATED_ROTATION_CHILD",
-            true,
-            false,
-        )
-    }
-
-    #[cfg(all(target_os = "linux", feature = "bench"))]
-    #[test]
-    fn v8_caller_driven_independent_ack_rotates_and_recovers() -> anyhow::Result<()> {
-        v8_ack_mode_rotates_and_recovers(
-            "v8_caller_driven_independent_ack_rotates_and_recovers",
-            "TOYKV_TEST_V8_CALLER_ACK_ROTATION_CHILD",
-            false,
-            true,
-        )
-    }
-
-    #[cfg(all(target_os = "linux", feature = "bench"))]
-    #[test]
-    fn v8_dedicated_independent_ack_rotates_and_recovers() -> anyhow::Result<()> {
-        v8_ack_mode_rotates_and_recovers(
-            "v8_dedicated_independent_ack_rotates_and_recovers",
-            "TOYKV_TEST_V8_DEDICATED_ACK_ROTATION_CHILD",
-            true,
-            true,
-        )
-    }
-
-    #[cfg(all(target_os = "linux", feature = "bench"))]
-    fn put_through_transient_pitr_barrier(
-        engine: &KvEngine,
-        key: &[u8],
-        value: &[u8],
-    ) -> anyhow::Result<()> {
-        const PITR_BARRIER_ERROR: &str = "commit admission is stopped at a PITR barrier";
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            match engine.put(key, value) {
-                Ok(()) => return Ok(()),
-                Err(error)
-                    if format!("{error:#}").contains(PITR_BARRIER_ERROR)
-                        && std::time::Instant::now() < deadline =>
-                {
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                }
-                Err(error) => return Err(error),
-            }
-        }
-    }
-
-    #[cfg(all(target_os = "linux", feature = "bench"))]
     #[test]
     fn v8_point_buffer_preallocation_is_inherited_across_rotation_and_recovery()
     -> anyhow::Result<()> {
@@ -40535,7 +40323,7 @@ mod tests {
             .set_v8_point_buffer_preallocation_for_test(true)?;
         for index in 0..WRITES_PER_SEGMENT {
             let key = format!("point-{index:03}");
-            put_through_transient_pitr_barrier(&engine, key.as_bytes(), VALUE)?;
+            engine.put(key.as_bytes(), VALUE)?;
         }
         assert!(matches!(
             engine.create_recovery_point()?,
@@ -40553,7 +40341,7 @@ mod tests {
         drop(successor);
         for index in WRITES_PER_SEGMENT..(2 * WRITES_PER_SEGMENT) {
             let key = format!("point-{index:03}");
-            put_through_transient_pitr_barrier(&engine, key.as_bytes(), VALUE)?;
+            engine.put(key.as_bytes(), VALUE)?;
         }
         engine.sync()?;
 
@@ -40710,8 +40498,7 @@ mod tests {
                         start_phase.wait();
                         for write in 0..WRITES_BEFORE_ROTATION {
                             let key = format!("writer-{writer}-phase-{phase}-put-{write}");
-                            let result =
-                                put_through_transient_pitr_barrier(&engine, key.as_bytes(), VALUE);
+                            let result = engine.put(key.as_bytes(), VALUE);
                             if let Err(error) = result {
                                 let mut first_error = first_error.lock();
                                 if first_error.is_none() {
@@ -40723,8 +40510,7 @@ mod tests {
                         after_rotation.wait();
                         for write in WRITES_BEFORE_ROTATION..WRITES_PER_PHASE {
                             let key = format!("writer-{writer}-phase-{phase}-put-{write}");
-                            let result =
-                                put_through_transient_pitr_barrier(&engine, key.as_bytes(), VALUE);
+                            let result = engine.put(key.as_bytes(), VALUE);
                             if let Err(error) = result {
                                 let mut first_error = first_error.lock();
                                 if first_error.is_none() {
