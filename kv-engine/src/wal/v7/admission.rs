@@ -501,17 +501,14 @@ impl WalV7ReservationOwner {
         {
             return Err(WalV7ReservationError::InvalidBatchLength);
         }
-        self.reserve_owned_batch(frontier_source_credit, || {
-            self.ledger.reserve(charge).map(Some)
-        })?
-        .ok_or(WalV7ReservationError::UnknownReservation)
+        self.reserve_owned_batch(charge, frontier_source_credit)
     }
 
     fn reserve_owned_batch(
         self: &Arc<Self>,
+        charge: WalV7ResourceCharge,
         frontier_source_credit: u64,
-        reserve: impl FnOnce() -> Result<Option<WalV7Reservation>, WalV7ReservationError>,
-    ) -> Result<Option<WalV7OwnedBatchReservation>, WalV7ReservationError> {
+    ) -> Result<WalV7OwnedBatchReservation, WalV7ReservationError> {
         let (_owner_lock_timer, mut state) =
             mutex_diagnostics::lock(&self.state, MutexLockKind::ReservationOwner);
         if state.retired {
@@ -521,15 +518,13 @@ impl WalV7ReservationOwner {
             .active_batch_operations
             .checked_add(1)
             .ok_or(WalV7ReservationError::ArithmeticOverflow)?;
-        let Some(reservation) = reserve()? else {
-            return Ok(None);
-        };
+        let reservation = self.ledger.reserve(charge)?;
         let id = reservation.id;
         state.reservations.insert(id, reservation);
         state.active_batch_operations = active_batch_operations;
         drop(state);
 
-        Ok(Some(WalV7OwnedBatchReservation {
+        Ok(WalV7OwnedBatchReservation {
             operation: Arc::new(WalV7BatchOperation {
                 owner: Arc::clone(self),
                 id,
@@ -538,7 +533,7 @@ impl WalV7ReservationOwner {
             }),
             frontier_credit_held: true,
             frontier_source_credit,
-        }))
+        })
     }
 
     /// Reserve source-spool bytes for an extent allocated ahead of admitted
