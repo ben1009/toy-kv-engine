@@ -2756,11 +2756,13 @@ fn coalesce_ready_target_from_value(
         .to_str()
         .with_context(|| format!("{WAL_V8_COALESCE_READY_TARGET_ENV} is not valid UTF-8"))?;
     let target = value.parse::<usize>().with_context(|| {
-        format!("invalid {WAL_V8_COALESCE_READY_TARGET_ENV} {value:?}; expected `8` or `12`")
+        format!(
+            "invalid {WAL_V8_COALESCE_READY_TARGET_ENV} {value:?}; expected `4`, `6`, `8`, or `12`"
+        )
     })?;
     ensure!(
-        matches!(target, 8 | 12),
-        "invalid {WAL_V8_COALESCE_READY_TARGET_ENV} {value:?}; expected `8` or `12`"
+        matches!(target, 4 | 6 | 8 | 12),
+        "invalid {WAL_V8_COALESCE_READY_TARGET_ENV} {value:?}; expected `4`, `6`, `8`, or `12`"
     );
     ensure!(
         progress_mode == WalV8ProgressMode::Cursor && direct_completion_enabled,
@@ -8255,7 +8257,7 @@ mod tests {
             coalesce_ready_target_from_value(None, WalV8ProgressMode::Cursor, true).unwrap(),
             None
         );
-        for value in ["8", "12"] {
+        for value in ["4", "6", "8", "12"] {
             assert!(
                 coalesce_ready_target_from_value(
                     Some(OsStr::new(value)),

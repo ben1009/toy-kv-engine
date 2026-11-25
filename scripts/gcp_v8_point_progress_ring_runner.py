@@ -28,6 +28,11 @@ from gcp_wal_matrix import (
     CURSOR_PUBLICATION_WRITERS,
     CURSOR_COALESCING_READY_TARGET_NUM,
     CURSOR_COALESCING_READY_TARGET_WRITERS,
+    CURSOR_COALESCING_READY_TARGET_SCAN_NUM,
+    CURSOR_COALESCING_READY_TARGET_SCAN_ARMS,
+    CURSOR_COALESCING_READY_TARGET_SCAN_CASES,
+    CURSOR_COALESCING_READY_TARGET_SCAN_REPETITIONS,
+    CURSOR_COALESCING_READY_TARGET_SCAN_WRITERS,
     POINT_LOOKAHEAD_WINDOW_BYTES,
     POINT_PROGRESS_PLAN_SCHEMA_V1,
     POINT_PROGRESS_PLAN_SCHEMA_V2,
@@ -46,6 +51,8 @@ from gcp_wal_matrix import (
     build_cursor_coalescing_budget_schedule,
     build_cursor_coalescing_ready_target_plan,
     build_cursor_coalescing_ready_target_schedule,
+    build_cursor_coalescing_ready_target_scan_plan,
+    build_cursor_coalescing_ready_target_scan_schedule,
     build_cursor_singleton_submission_plan,
     build_cursor_singleton_submission_schedule,
     build_cursor_publication_plan,
@@ -68,6 +75,7 @@ from gcp_wal_matrix import (
     validate_cursor_direct_completion_wake_rows,
     validate_cursor_coalescing_budget_rows,
     validate_cursor_coalescing_ready_target_rows,
+    validate_cursor_coalescing_ready_target_scan_rows,
     validate_cursor_singleton_submission_rows,
     validate_cursor_publication_rows,
 )
@@ -222,8 +230,8 @@ def _environment(
             raise ValueError("coalescing budget override must be 100 or 400 μs")
         environment["TOYKV_WAL_V8_COALESCE_BUDGET_US"] = str(coalescing_budget_us)
     if coalescing_ready_target is not None:
-        if coalescing_ready_target not in (8, 12):
-            raise ValueError("coalescing ready target must be 8 or 12")
+        if coalescing_ready_target not in (4, 6, 8, 12):
+            raise ValueError("coalescing ready target must be 4, 6, 8, or 12")
         environment["TOYKV_BENCH_V8_COALESCE_READY_TARGET"] = str(coalescing_ready_target)
     if point_buffer_preallocation_enabled is not None:
         environment["TOYKV_BENCH_V8_POINT_BUFFER_PREALLOC"] = (
@@ -574,6 +582,8 @@ def _validate_record(record: dict[str, Any], row: dict[str, Any]) -> dict[str, A
         if type(hits_start) is not int or type(hits_end) is not int or hits_end < hits_start:
             raise ValueError("coalescing ready-target hit counter is missing or moved backwards")
         hits = hits_end - hits_start
+        if hits > sync_count:
+            raise ValueError("coalescing ready-target hits exceed sync count")
         if (expected_target is None or (row["workload"] == "point" and row["writer"] == 1)) and hits != 0:
             raise ValueError("Dynamic or Point1 unexpectedly recorded ready-target hits")
         metrics.update({
@@ -902,7 +912,7 @@ def _run_one(
     point_preallocation = (
         bool(row["point_buffer_preallocation_enabled"])
         if cursor_publication_suite or dedicated_durability_suite or candidate_mode in (
-            "completion-wake", "coalescing-ready-target",
+            "completion-wake", "coalescing-ready-target", "coalescing-ready-target-scan",
         ) else None
     )
     environment = (
@@ -939,7 +949,8 @@ def _run_one(
                 if candidate_mode == "completion-wake" else None
             ),
             coalescing_ready_target=(
-                row["coalescing_ready_target"] if candidate_mode == "coalescing-ready-target" else None
+                row["coalescing_ready_target"]
+                if candidate_mode in ("coalescing-ready-target", "coalescing-ready-target-scan") else None
             ),
         )
     )
@@ -976,7 +987,8 @@ def _run_one(
                 if candidate_mode == "completion-wake" else None
             ),
             coalescing_ready_target=(
-                row["coalescing_ready_target"] if candidate_mode == "coalescing-ready-target" else None
+                row["coalescing_ready_target"]
+                if candidate_mode in ("coalescing-ready-target", "coalescing-ready-target-scan") else None
             ),
         ), encoding="utf-8",
     )
@@ -2455,6 +2467,104 @@ def _coalescing_ready_target_summary(
     }
 
 
+def _coalescing_ready_target_scan_summary(
+    rows: list[dict[str, Any]], writers: tuple[int, ...], planned: int,
+) -> dict[str, Any]:
+    validation = validate_cursor_coalescing_ready_target_scan_rows(rows)
+    arms = CURSOR_COALESCING_READY_TARGET_SCAN_ARMS
+    cases = tuple((writer, workload) for writer, workload in CURSOR_COALESCING_READY_TARGET_SCAN_CASES
+                  if writer in writers)
+    comparisons: list[dict[str, Any]] = []
+    for writer, workload in cases:
+        by_repetition = {
+            repetition: {
+                row["arm"]: row for row in rows
+                if row.get("writer") == writer and row.get("workload") == workload
+                and row.get("repetition") == repetition
+            }
+            for repetition in range(1, CURSOR_COALESCING_READY_TARGET_SCAN_REPETITIONS + 1)
+        }
+        for arm in arms[1:]:
+            paired = [
+                (pair["dynamic"], pair[arm]) for pair in by_repetition.values()
+                if "dynamic" in pair and arm in pair
+                and pair["dynamic"].get("exit_code") == 0 and pair[arm].get("exit_code") == 0
+            ]
+            throughput_changes = [
+                (candidate["puts_per_second"] / baseline["puts_per_second"] - 1.0) * 100.0
+                for baseline, candidate in paired
+            ]
+            p99_changes = [
+                (candidate["p99_ms"] / baseline["p99_ms"] - 1.0) * 100.0
+                for baseline, candidate in paired
+            ]
+            comparisons.append({
+                "writer": writer,
+                "workload": workload,
+                "baseline": "dynamic",
+                "candidate": arm,
+                "paired_runs": len(paired),
+                "paired_throughput_change_pct_median": median(throughput_changes) if paired else None,
+                "paired_throughput_wins": sum(change > 0 for change in throughput_changes),
+                "paired_cpu_us_per_put_change_median": median([
+                    candidate["cpu_us_per_put"] - baseline["cpu_us_per_put"]
+                    for baseline, candidate in paired
+                ]) if paired else None,
+                "paired_p99_change_pct_median": median(p99_changes) if paired else None,
+                "paired_sync_count_change_median": median([
+                    candidate["sync_count"] - baseline["sync_count"]
+                    for baseline, candidate in paired
+                ]) if paired else None,
+                "paired_puts_per_sync_change_median": median([
+                    candidate["puts_per_sync"] - baseline["puts_per_sync"]
+                    for baseline, candidate in paired
+                ]) if paired else None,
+                "candidate_ready_target_hits": sum(
+                    int(candidate["coalescing_ready_target_hits"]) for _, candidate in paired
+                ),
+                "candidate_sync_count": sum(int(candidate["sync_count"]) for _, candidate in paired),
+            })
+
+    target_usage: list[dict[str, Any]] = []
+    for writer, workload in cases:
+        for arm in arms:
+            matching = [
+                row for row in rows
+                if row.get("writer") == writer and row.get("workload") == workload and row.get("arm") == arm
+            ]
+            sync_count = sum(int(row["sync_count"]) for row in matching)
+            hits = sum(int(row["coalescing_ready_target_hits"]) for row in matching)
+            target_usage.append({
+                "writer": writer,
+                "workload": workload,
+                "arm": arm,
+                "configured_target": matching[0]["coalescing_ready_target"] if matching else None,
+                "runs": len(matching),
+                "target_hits": hits,
+                "sync_count": sync_count,
+                "target_hits_per_sync": hits / sync_count if sync_count else None,
+            })
+    return {
+        "suite": "v8-cursor-coalescing-ready-target-scan",
+        "complete": len(rows) == planned and validation["complete"],
+        "runs_started": len(rows),
+        "runs_completed": sum(row.get("exit_code") == 0 for row in rows),
+        "runs_planned": planned,
+        "writers": list(writers),
+        "workloads": ["point8", "point16"],
+        "arms": list(arms),
+        "results": rows,
+        "matrix_validation": validation,
+        "target_usage": target_usage,
+        "comparison": comparisons,
+        "qualification_note": (
+            "Same-host, same-source, same-release-binary E3b Point8/Point16 scan. Dynamic, Target4, Target6, and "
+            "Target8 are counterbalanced. Target hits are reported relative to sync count; scoring runs have no "
+            "detailed profiling. Results are exploratory and do not qualify a target as the production default."
+        ),
+    }
+
+
 def run_suite(args: argparse.Namespace) -> int:
     if len(args.commit) != 40 or any(char not in "0123456789abcdef" for char in args.commit):
         raise ValueError("commit must be a full lowercase 40-character SHA")
@@ -2478,6 +2588,8 @@ def run_suite(args: argparse.Namespace) -> int:
         POINT_RESOURCE_RETIREMENT_WRITERS if candidate_mode in (
             "point-resource-retirement", "point-resource-retirement-stage-a",
         ) else
+        CURSOR_COALESCING_READY_TARGET_SCAN_WRITERS
+        if candidate_mode == "coalescing-ready-target-scan" else
         CURSOR_COALESCING_READY_TARGET_WRITERS if candidate_mode == "coalescing-ready-target" else
         (8, 16) if candidate_mode == "coalescing-budget" else POINT_PROGRESS_RING_WRITERS
     )
@@ -2560,6 +2672,15 @@ def run_suite(args: argparse.Namespace) -> int:
         )
         schedule_filename = "cursor-coalescing-ready-target-schedule.tsv"
         summarize = _coalescing_ready_target_summary
+    elif candidate_mode == "coalescing-ready-target-scan":
+        schedule = build_cursor_coalescing_ready_target_scan_schedule()
+        plan = build_cursor_coalescing_ready_target_scan_plan(
+            machine_type=args.machine_type,
+            machine_spec={"vcpus": 16, "ssd_count": args.ssd_count, "ssd_gib": args.ssd_gib},
+            commit=args.commit,
+        )
+        schedule_filename = "cursor-coalescing-ready-target-scan-schedule.tsv"
+        summarize = _coalescing_ready_target_scan_summary
     elif candidate_mode == "v7-v8-point-preallocation":
         schedule = build_v7_v8_point_preallocation_schedule()
         plan = build_v7_v8_point_preallocation_plan(
@@ -3465,6 +3586,17 @@ def verify_coalescing_budget_results_directory(results: Path) -> dict[str, Any]:
 
 def verify_coalescing_ready_target_results_directory(results: Path) -> dict[str, Any]:
     """Strictly verify E3's 60-run Dynamic/Target8/Target12 archive."""
+    return _verify_coalescing_ready_target_results_directory(results, scan=False)
+
+
+def verify_coalescing_ready_target_scan_results_directory(results: Path) -> dict[str, Any]:
+    """Strictly verify E3b's 40-run Point8/16 Dynamic/Target4/6/8 archive."""
+    return _verify_coalescing_ready_target_results_directory(results, scan=True)
+
+
+def _verify_coalescing_ready_target_results_directory(
+    results: Path, *, scan: bool,
+) -> dict[str, Any]:
     errors: list[str] = []
     try:
         summary = json.loads((results / "summary.json").read_text(encoding="utf-8"))
@@ -3474,20 +3606,38 @@ def verify_coalescing_ready_target_results_directory(results: Path) -> dict[str,
         binary_sha = (results / "write-perf.sha256").read_text(encoding="utf-8").strip()
         if not all(isinstance(value, dict) for value in (summary, remote_exit, plan)):
             raise ValueError("summary, remote-exit, and plan must be JSON objects")
-        schedule = build_cursor_coalescing_ready_target_schedule()
-        expected_plan = build_cursor_coalescing_ready_target_plan(
+        schedule = (
+            build_cursor_coalescing_ready_target_scan_schedule()
+            if scan else build_cursor_coalescing_ready_target_schedule()
+        )
+        plan_builder = (
+            build_cursor_coalescing_ready_target_scan_plan
+            if scan else build_cursor_coalescing_ready_target_plan
+        )
+        expected_plan = plan_builder(
             machine_type="c4-standard-16-lssd",
             machine_spec={"vcpus": 16, "ssd_count": 2, "ssd_gib": 750},
             commit=commit,
         )
+        suite = "v8-cursor-coalescing-ready-target-scan" if scan else "v8-cursor-coalescing-ready-target"
+        schedule_filename = (
+            "cursor-coalescing-ready-target-scan-schedule.tsv"
+            if scan else "cursor-coalescing-ready-target-schedule.tsv"
+        )
+        writers = CURSOR_COALESCING_READY_TARGET_SCAN_WRITERS if scan else CURSOR_COALESCING_READY_TARGET_WRITERS
+        validate_rows = (
+            validate_cursor_coalescing_ready_target_scan_rows
+            if scan else validate_cursor_coalescing_ready_target_rows
+        )
+        summarize = _coalescing_ready_target_scan_summary if scan else _coalescing_ready_target_summary
         if plan != expected_plan:
-            errors.append("benchmark plan differs from the fixed E3 ready-target suite")
+            errors.append("benchmark plan differs from the fixed coalescing ready-target suite")
         if len(commit) != 40 or any(char not in "0123456789abcdef" for char in commit):
             errors.append("source commit identity is invalid")
         if len(binary_sha) != 64 or any(char not in "0123456789abcdef" for char in binary_sha):
             errors.append("binary checksum is invalid")
         if (
-            summary.get("suite") != "v8-cursor-coalescing-ready-target"
+            summary.get("suite") != suite
             or summary.get("source_commit") != commit
             or summary.get("binary_sha256") != binary_sha
             or summary.get("complete") is not True
@@ -3503,9 +3653,7 @@ def verify_coalescing_ready_target_results_directory(results: Path) -> dict[str,
             or remote_exit.get("runs_attempted") != len(schedule)
         ):
             errors.append("remote-exit does not confirm all planned runs")
-        with (results / "cursor-coalescing-ready-target-schedule.tsv").open(
-            encoding="utf-8", newline="",
-        ) as stream:
+        with (results / schedule_filename).open(encoding="utf-8", newline="") as stream:
             actual_schedule = list(csv.DictReader(stream, delimiter="\t"))
         expected_schedule = [
             {
@@ -3517,14 +3665,14 @@ def verify_coalescing_ready_target_results_directory(results: Path) -> dict[str,
             for row in schedule
         ]
         if actual_schedule != expected_schedule:
-            errors.append("schedule file differs from the fixed E3 run order or configuration")
+            errors.append("schedule file differs from the fixed ready-target run order or configuration")
         rows = summary.get("results")
         if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
             raise ValueError("summary results are missing or malformed")
-        validation = validate_cursor_coalescing_ready_target_rows(rows)
+        validation = validate_rows(rows)
         if validation["complete"] is not True:
-            errors.append("run rows do not match the E3 ready-target matrix")
-        recomputed = _coalescing_ready_target_summary(rows, CURSOR_COALESCING_READY_TARGET_WRITERS, len(schedule))
+            errors.append("run rows do not match the ready-target matrix")
+        recomputed = summarize(rows, writers, len(schedule))
         for key in (
             "suite", "complete", "runs_started", "runs_completed", "runs_planned", "writers", "workloads",
             "arms", "matrix_validation", "target_usage", "comparison",
@@ -3537,7 +3685,7 @@ def verify_coalescing_ready_target_results_directory(results: Path) -> dict[str,
             if path.is_dir() and path.name.startswith(("r", "w"))
         }
         if actual_ids != expected_ids:
-            errors.append("run directories do not exactly match the E3 schedule")
+            errors.append("run directories do not exactly match the ready-target schedule")
         rows_by_id = {_run_id(row): row for row in rows}
         for row in schedule:
             run_id = _run_id(row)
@@ -3564,7 +3712,7 @@ def verify_coalescing_ready_target_results_directory(results: Path) -> dict[str,
             )
             environment_path = run_dir / "environment.txt"
             if not environment_path.is_file() or environment_path.read_text(encoding="utf-8") != expected_environment:
-                errors.append(f"{run_id} environment differs from the planned E3 arm")
+                errors.append(f"{run_id} environment differs from the planned ready-target arm")
             try:
                 raw = json.loads(result_path.read_text(encoding="utf-8"))
                 expected_metrics = _validate_record(raw, row)
@@ -3612,6 +3760,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=(
             "cursor", "direct-completion", "completion-wake", "singleton-submission", "cursor-publication",
             "coalescing-budget", "coalescing-ready-target",
+            "coalescing-ready-target-scan",
             "v7-v8-point-preallocation",
         ),
         default="cursor",

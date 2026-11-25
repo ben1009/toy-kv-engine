@@ -178,6 +178,17 @@ CURSOR_COALESCING_READY_TARGET_CASES = (
     (16, "point"),
     (16, "batch64"),
 )
+CURSOR_COALESCING_READY_TARGET_SCAN_WRITERS = (8, 16)
+CURSOR_COALESCING_READY_TARGET_SCAN_REPETITIONS = 5
+CURSOR_COALESCING_READY_TARGET_SCAN_NUM = 100_000
+CURSOR_COALESCING_READY_TARGET_SCAN_ARMS = ("dynamic", "target_4", "target_6", "target_8")
+CURSOR_COALESCING_READY_TARGET_SCAN_ORDERS = (
+    ("dynamic", "target_4", "target_6", "target_8"),
+    ("target_4", "target_6", "target_8", "dynamic"),
+    ("target_6", "target_8", "dynamic", "target_4"),
+    ("target_8", "dynamic", "target_4", "target_6"),
+)
+CURSOR_COALESCING_READY_TARGET_SCAN_CASES = ((8, "point"), (16, "point"))
 POINT_PROGRESS_RING_ORDERS = (
     ("eager", "progress_ring"),
     ("progress_ring", "eager"),
@@ -1626,6 +1637,117 @@ def validate_cursor_coalescing_ready_target_rows(
             or row.get("cursor_singleton_submission_enabled") is not False
             or row.get("coalescing_ready_target") != expected["coalescing_ready_target"]
             or row.get("point_buffer_preallocation_enabled") is not expected["point_buffer_preallocation_enabled"]
+        ):
+            invalid_rows.append(row)
+    if invalid_rows:
+        validation["complete"] = False
+        validation["invalid_rows"].extend(dict(row) for row in invalid_rows)
+    return validation
+
+
+def build_cursor_coalescing_ready_target_scan_schedule() -> list[dict[str, object]]:
+    """Build the 40-run Point8/16 Dynamic/Target4/6/8 E3b scan."""
+    schedule: list[dict[str, object]] = []
+    for repetition in range(1, CURSOR_COALESCING_READY_TARGET_SCAN_REPETITIONS + 1):
+        cases = (
+            CURSOR_COALESCING_READY_TARGET_SCAN_CASES
+            if repetition % 2
+            else tuple(reversed(CURSOR_COALESCING_READY_TARGET_SCAN_CASES))
+        )
+        for case_index, (writer, workload) in enumerate(cases):
+            order = CURSOR_COALESCING_READY_TARGET_SCAN_ORDERS[
+                (repetition + case_index - 1) % len(CURSOR_COALESCING_READY_TARGET_SCAN_ORDERS)
+            ]
+            for arm in order:
+                schedule.append({
+                    "run_index": len(schedule) + 1,
+                    "writer": writer,
+                    "workload": workload,
+                    "repetition": repetition,
+                    "arm": arm,
+                    "bench": "wal_concurrent",
+                    "batch_entries": 1,
+                    "batch_size": None,
+                    "num": CURSOR_COALESCING_READY_TARGET_SCAN_NUM,
+                    "sample_every": 10,
+                    "coalescing_ready_target": {
+                        "dynamic": None,
+                        "target_4": 4,
+                        "target_6": 6,
+                        "target_8": 8,
+                    }[arm],
+                    "extent_mode": "sliding-point-lookahead",
+                    "extent_window_bytes": POINT_LOOKAHEAD_WINDOW_BYTES,
+                    "frontier_mode": "direct",
+                    "progress_ring_enabled": True,
+                    "progress_cursor_enabled": True,
+                    "progress_counters_enabled": False,
+                    "cursor_direct_completion_enabled": True,
+                    "cursor_singleton_submission_enabled": False,
+                    "point_buffer_preallocation_enabled": True,
+                    "scan_diagnostics_enabled": False,
+                })
+    return schedule
+
+
+def build_cursor_coalescing_ready_target_scan_plan(
+    *, machine_type: str, machine_spec: Mapping[str, int], commit: str,
+) -> dict[str, object]:
+    schedule = build_cursor_coalescing_ready_target_scan_schedule()
+    return {
+        "plan_schema_version": 1,
+        "suite": "v8-cursor-coalescing-ready-target-scan",
+        "commit": commit,
+        "machine_type": machine_type,
+        "machine_spec": dict(machine_spec),
+        "writers": list(CURSOR_COALESCING_READY_TARGET_SCAN_WRITERS),
+        "workloads": ["point8", "point16"],
+        "arms": list(CURSOR_COALESCING_READY_TARGET_SCAN_ARMS),
+        "repetitions": CURSOR_COALESCING_READY_TARGET_SCAN_REPETITIONS,
+        "runs_planned": len(schedule),
+        "num": CURSOR_COALESCING_READY_TARGET_SCAN_NUM,
+        "value_size_bytes": 1024,
+        "latency_sample_every": 10,
+        "runtime_protocol": {
+            "progress_mode": "cursor (2)",
+            "completion": "direct",
+            "singleton_submission": False,
+            "frontier_mode": "direct",
+            "extent_preparation": "1 MiB sliding-point-lookahead",
+            "extent_policy_scan_diagnostics": False,
+            "point_buffer_preallocation": "on",
+            "coalescing_ready_target": {
+                "dynamic": "unset; preserve runtime adaptive policy",
+                "target_4": 4,
+                "target_6": 6,
+                "target_8": 8,
+            },
+        },
+        "qualification_note": (
+            "Same-host, same-source, same-release-binary E3b Point8/Point16 parameter scan. Five counterbalanced "
+            "repetitions compare Dynamic, ready-prefix targets 4, 6, and 8. Scoring runs have no detailed profiling; "
+            "runtime target-hit counters prove configured behavior. This is an exploratory scan, not final qualification."
+        ),
+    }
+
+
+def validate_cursor_coalescing_ready_target_scan_rows(
+    rows: list[Mapping[str, object]],
+) -> dict[str, object]:
+    schedule = build_cursor_coalescing_ready_target_scan_schedule()
+    validation = _validate_point_progress_rows(rows, schedule)
+    expected_by_index = {row["run_index"]: row for row in schedule}
+    invalid_rows: list[Mapping[str, object]] = []
+    for row in rows:
+        expected = expected_by_index.get(row.get("run_index"))
+        if (
+            expected is None
+            or row.get("progress_cursor_enabled") is not True
+            or row.get("progress_counters_enabled") is not False
+            or row.get("cursor_direct_completion_enabled") is not True
+            or row.get("cursor_singleton_submission_enabled") is not False
+            or row.get("coalescing_ready_target") != expected["coalescing_ready_target"]
+            or row.get("point_buffer_preallocation_enabled") is not True
         ):
             invalid_rows.append(row)
     if invalid_rows:
