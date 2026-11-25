@@ -5169,7 +5169,8 @@ mod tests {
 
     #[cfg(feature = "bench")]
     #[test]
-    fn cursor_direct_worker_failure_publishes_poison_before_queue_disconnect() -> anyhow::Result<()> {
+    fn cursor_direct_worker_failure_publishes_poison_before_queue_disconnect() -> anyhow::Result<()>
+    {
         let (coordinator, progress_tokens) = cursor_completion_coordinator()?;
         let (completion_tx, completion_rx) = bounded(1);
         let completion_sender = WorkerCompletionSender::CursorDirect {

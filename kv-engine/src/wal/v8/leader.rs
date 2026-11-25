@@ -8333,12 +8333,8 @@ mod tests {
 
         let invalid = OsStr::from_bytes(b"select\xff");
         assert!(
-            direct_completion_wake_mode_from_value(
-                Some(invalid),
-                WalV8ProgressMode::Cursor,
-                true,
-            )
-            .is_err()
+            direct_completion_wake_mode_from_value(Some(invalid), WalV8ProgressMode::Cursor, true,)
+                .is_err()
         );
     }
 
@@ -11184,6 +11180,30 @@ mod tests {
     }
 
     #[cfg(feature = "bench")]
+    fn cursor_completion_coordinator() -> Result<(WalV8ParallelCoordinator, Receiver<()>)> {
+        let wal_header = header();
+        let durable_prefix_digest = wal_header.initial_prefix_digest()?;
+        let coordinator = WalV8ParallelCoordinator::new(
+            wal_header,
+            WalV8ParallelConfig {
+                next_ticket: 0,
+                next_data_offset: HEADER_LEN_U64 + FRAME_LEN_U64,
+                last_commit_ts: 0,
+                last_recorded_at: None,
+                durable_prefix_digest,
+                max_inflight_tickets: 1,
+                max_inflight_bytes: FRAME_LEN_U64,
+                max_file_size: MAX_WAL_FILE_SIZE,
+                progress_mode: WalV8ProgressMode::Cursor,
+            },
+        )?;
+        let control_tokens = coordinator
+            .take_progress_token_receiver()?
+            .context("Cursor coordinator has no control-token receiver")?;
+        Ok((coordinator, control_tokens))
+    }
+
+    #[cfg(feature = "bench")]
     #[test]
     fn cursor_direct_completion_writes_reopens_and_recovers_without_reaper() -> Result<()> {
         check_cursor_direct_completion_writes_reopens_and_recovers(
@@ -11205,7 +11225,9 @@ mod tests {
                 &completion_rx,
                 Duration::from_secs(2),
                 || {
-                    registered_tx.send(()).expect("test receiver remains connected");
+                    registered_tx
+                        .send(())
+                        .expect("test receiver remains connected");
                     let _ = release_rx.recv();
                 },
             );
@@ -11242,7 +11264,9 @@ mod tests {
                 &completion_rx,
                 Duration::from_secs(2),
                 || {
-                    registered_tx.send(()).expect("test receiver remains connected");
+                    registered_tx
+                        .send(())
+                        .expect("test receiver remains connected");
                     let _ = release_rx.recv();
                 },
             );
@@ -11283,12 +11307,7 @@ mod tests {
         let mut batch = vec![direct_completion_event(first)?];
         let capacity = 3;
         let remaining_capacity = capacity - batch.len();
-        drain_direct_completion_queue(
-            &completion_rx,
-            &mut batch,
-            remaining_capacity,
-            false,
-        )?;
+        drain_direct_completion_queue(&completion_rx, &mut batch, remaining_capacity, false)?;
         assert_eq!(batch.len(), capacity);
         assert!(completion_rx.is_empty());
         assert_eq!(
@@ -11296,11 +11315,16 @@ mod tests {
             [1, 2, 3]
         );
         assert_eq!(
-            batch.iter().map(|event| event.tickets.clone()).collect::<Vec<_>>(),
+            batch
+                .iter()
+                .map(|event| event.tickets.clone())
+                .collect::<Vec<_>>(),
             [1..2, 2..3, 3..4]
         );
         assert!(
-            batch.iter().all(|event| event.completion_observed_at == Some(observed_at))
+            batch
+                .iter()
+                .all(|event| event.completion_observed_at == Some(observed_at))
         );
 
         Ok(())
@@ -11320,7 +11344,9 @@ mod tests {
                 &completions,
                 Duration::from_secs(2),
                 || {
-                    registered_tx.send(()).expect("test receiver remains connected");
+                    registered_tx
+                        .send(())
+                        .expect("test receiver remains connected");
                     let _ = release_rx.recv();
                 },
             );
@@ -11354,7 +11380,9 @@ mod tests {
                 &completions,
                 Duration::from_secs(2),
                 || {
-                    registered_tx.send(()).expect("test receiver remains connected");
+                    registered_tx
+                        .send(())
+                        .expect("test receiver remains connected");
                     let _ = release_rx.recv();
                 },
             );
