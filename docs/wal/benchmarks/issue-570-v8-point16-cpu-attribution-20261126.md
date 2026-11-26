@@ -39,7 +39,7 @@ Inclusive vs. exclusive relationships are marked explicitly so sub-phases are no
 | **Follower `coordinator_lock_wait_cpu_ns`** | Exclusive (pre-wait) | 0.590 | **0.728** | Initial `state.lock()` before `total_wait_cpu_ns` begins |
 | **Resource Retire Before Publish** | Inclusive | 2.487 | **2.526** | `lock_hold` (`2.326` cand.) includes `collect` (`0.084`), `remove` (`0.343`), `release` (`0.742`), `finish` (`0.516`) |
 | **Resource Retire After Publish** | Inclusive | 2.007 | **1.909** | `lock_hold` (`1.546` cand.) includes `collect` (`0.122`), `remove` (`0.485`), `finish` (`0.185`) |
-| **Coalescing (`coalescing_cpu_ns`)** | Inclusive | 2.492 | **2.502** | `progress_wait` (`1.362`) + `active` (`1.140`); `lock_hold` (`0.711`) includes drain (`0.091`), apply (`0.099`), digest fold (`0.201`), cursor advance (`0.062`) |
+| **Coalescing (`coalescing_cpu_ns`)** | Inclusive | 2.492 | **2.502** | `progress_wait` (`1.362`) + `active` (`1.140`); `active` includes `drain` (`0.091`, outside lock) + `lock_hold` (`0.711`, which includes `apply` `0.099`, `digest fold` `0.201`, `cursor advance` `0.062`) |
 | **FRONTIER Write (`frontier_write_cpu_ns`)** | Exclusive | 1.059 | **1.095** | FRONTIER I/O submission/completion |
 | **FRONTIER Prep (`preparation_cpu_ns`)** | Exclusive | 0.910 | **0.961** | Extent check, reservation, frame encode + digest |
 | **Coordinator Publish (`coordinator_publish_cpu_ns`)** | Exclusive | 0.608 | **0.611** | `publish_durable_frontier_sampled()` |
