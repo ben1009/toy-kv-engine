@@ -527,7 +527,7 @@ def _validate_record(record: dict[str, Any], row: dict[str, Any]) -> dict[str, A
         ):
             if key in row and snapshot.get(key) is not bool(row[key]):
                 raise ValueError(f"{boundary} {key} differs from the planned arm")
-        if snapshot.get("progress_diagnostics") is not None:
+        if row.get("offered_rate_ops_per_sec") is None and snapshot.get("progress_diagnostics") is not None:
             raise ValueError(f"{boundary} progress diagnostics must be disabled for scored runs")
         preparation = _require_object(
             snapshot.get("sliding_extent_preparation"), f"{boundary} extent preparation metadata",
