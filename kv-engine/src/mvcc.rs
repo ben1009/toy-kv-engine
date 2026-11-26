@@ -1395,7 +1395,6 @@ impl LsmMvccInner {
             .write_profile()
             .record_commit_order_timestamp_reserved(commit_ts);
         let _unwind_guard = self.guard_versioned_commit_unwind(memtable, commit_ts);
-        let encoded_key = encode_internal_key(user_key, commit_ts);
         let recorded_at = self.pitr_recorded_at_for_commit(commit_ts)?;
         #[cfg(feature = "bench")]
         if let Some(sample) = cpu_attribution.as_mut() {
@@ -1440,6 +1439,7 @@ impl LsmMvccInner {
             sample.observation.sequencer_hold_cpu_ns = cpu_ns;
         }
         drop(write_guard);
+        let encoded_key = encode_internal_key(user_key, commit_ts);
         if let Some(frame_job) = frame_job {
             #[cfg(feature = "bench")]
             let phase_timer = WalCpuPhaseTimer::start(cpu_attribution.is_some());
@@ -1960,6 +1960,25 @@ impl LsmMvccInner {
         shared_publish_bytes: bool,
     ) -> Result<(u64, DeferredBatchPublish, Option<u64>), anyhow::Error> {
         self.write_batch_wal_only_inner(entries, memtable, shared_publish_bytes, false, None, None)
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn write_batch_wal_only_with_guard_for_test(
+        &self,
+        entries: &[(bytes::Bytes, bytes::Bytes, BatchEntryKind)],
+        memtable: &MemTable,
+        shared_publish_bytes: bool,
+        write_guard: parking_lot::MutexGuard<'_, ()>,
+    ) -> Result<(u64, DeferredBatchPublish, Option<u64>), anyhow::Error> {
+        self.write_batch_wal_only_inner(
+            entries,
+            memtable,
+            shared_publish_bytes,
+            false,
+            None,
+            Some(write_guard),
+        )
     }
 
     /// Native async point writes prepare v7 batches while holding the bounded

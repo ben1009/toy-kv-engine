@@ -276,7 +276,7 @@ pub(crate) struct WalV8ParallelWriter {
     io: Arc<WalV8ParallelIo>,
     reservation_owner: Option<Arc<WalV8ReservationOwner>>,
     frontier: Mutex<WalV8ParallelFrontier>,
-    frontier_resources: Mutex<BTreeMap<u64, WalV8FrontierResource>>,
+    frontier_resources: Arc<Mutex<BTreeMap<u64, WalV8FrontierResource>>>,
     producer_guards: Arc<Mutex<BTreeMap<u64, EncodedWalV8Batch<WalV8ParallelAdmissionGuard>>>>,
     max_file_size: u64,
     installed_dev: u64,
@@ -4996,9 +4996,11 @@ pub(crate) struct WalV8FrameJob<'a> {
         Option<AdmittedWalV8Batch<'a, WalV8ParallelAdmissionGuard, WalV8PreflightReservation>>,
     assignment: WalV8BatchAssignment,
     coordinator: WalV8ParallelCoordinator,
+    frontier_resources: Arc<Mutex<BTreeMap<u64, WalV8FrontierResource>>>,
     producer_guards: Arc<Mutex<BTreeMap<u64, EncodedWalV8Batch<WalV8ParallelAdmissionGuard>>>>,
     io: Arc<WalV8ParallelIo>,
     data_buffer: Option<DirectBufAllocation>,
+    reservation: Option<WalV7OwnedBatchReservation>,
     #[cfg(feature = "bench")]
     profile: Option<Arc<crate::mem_table::WriteProfile>>,
 }
@@ -5059,6 +5061,16 @@ impl WalV8FrameJob<'_> {
             .admitted
             .take()
             .context("v8 producer job lost its admitted batch")?;
+        if let Some(reservation) = self.reservation.take() {
+            let previous = self.frontier_resources.lock().insert(
+                self.assignment.segment_ticket,
+                WalV8FrontierResource { reservation },
+            );
+            if previous.is_some() {
+                self.coordinator.poison();
+                anyhow::bail!("v8 Parallel ticket already owns a resource reservation");
+            }
+        }
         // The selector is injectable in unit tests. Production only enables it
         // through the bench-only OnceLock above.
         let direct_point = direct_point_enabled && admitted.can_encode_point_single_frame();
@@ -5848,7 +5860,7 @@ impl WalV8LeaderWriter {
                 digest: self.frontier_digest,
                 last_sync_latency: None,
             }),
-            frontier_resources: Mutex::new(BTreeMap::new()),
+            frontier_resources: Arc::new(Mutex::new(BTreeMap::new())),
             producer_guards: Arc::new(Mutex::new(BTreeMap::new())),
             max_file_size: self.max_file_size,
             installed_dev: self.installed_dev,
@@ -6761,11 +6773,11 @@ impl WalV8ParallelWriter {
         commit_ts: u64,
         recorded_at: crate::pitr::RecordedAt,
     ) -> Result<WalV8FrameJob<'a>> {
+        ensure!(!self.is_poisoned(), "v8 Parallel WAL is poisoned");
         let WalV8PointAdmissionScratch {
             prepared,
             preallocated_buffer,
         } = scratch;
-        ensure!(!self.is_poisoned(), "v8 Parallel WAL is poisoned");
         let logical_bytes = u64::try_from(prepared.logical_batch_bytes())?;
         let frame_bytes = u64::try_from(prepared.frame_buffer_bytes())?;
         let resources = self.reserve_and_allocate_batch_resources(
@@ -6775,7 +6787,14 @@ impl WalV8ParallelWriter {
             preallocated_buffer,
         )?;
 
-        self.admit_prepared_batch_with_resources(prepared, commit_ts, recorded_at, resources, || {})
+        self.admit_prepared_batch_with_resources(
+            prepared,
+            commit_ts,
+            recorded_at,
+            resources,
+            true,
+            || {},
+        )
     }
 
     fn reserve_batch_resources(
@@ -6827,6 +6846,7 @@ impl WalV8ParallelWriter {
             commit_ts,
             recorded_at,
             resources,
+            false,
             after_admission,
         )
     }
@@ -6857,6 +6877,7 @@ impl WalV8ParallelWriter {
         commit_ts: u64,
         recorded_at: crate::pitr::RecordedAt,
         mut resources: WalV8AdmissionResources,
+        defer_frontier_resource_registration: bool,
         after_admission: F,
     ) -> Result<WalV8FrameJob<'a>>
     where
@@ -6869,25 +6890,32 @@ impl WalV8ParallelWriter {
         };
         let admitted = prepared.admit_with_metadata(commit_ts, recorded_at, &publisher)?;
         let assignment = admitted.assignment();
-        if let Some(reservation) = resources.reservation.take() {
-            let previous = self.frontier_resources.lock().insert(
-                assignment.segment_ticket,
-                WalV8FrontierResource { reservation },
-            );
-            if previous.is_some() {
-                self.coordinator.poison();
-                anyhow::bail!("v8 Parallel ticket already owns a resource reservation");
+        let reservation = if defer_frontier_resource_registration {
+            resources.reservation.take()
+        } else {
+            if let Some(reservation) = resources.reservation.take() {
+                let previous = self.frontier_resources.lock().insert(
+                    assignment.segment_ticket,
+                    WalV8FrontierResource { reservation },
+                );
+                if previous.is_some() {
+                    self.coordinator.poison();
+                    anyhow::bail!("v8 Parallel ticket already owns a resource reservation");
+                }
             }
-        }
+            None
+        };
         after_admission();
 
         Ok(WalV8FrameJob {
             admitted: Some(admitted),
             assignment,
             coordinator: self.coordinator.clone(),
+            frontier_resources: Arc::clone(&self.frontier_resources),
             producer_guards: Arc::clone(&self.producer_guards),
             io: Arc::clone(&self.io),
             data_buffer: Some(resources.data_buffer),
+            reservation,
             #[cfg(feature = "bench")]
             profile: self.profile.load_full(),
         })
@@ -14701,6 +14729,208 @@ mod tests {
             .wait_durable(ticket + 10)
             .expect_err("poisoned coordinator must reject unassigned wait_durable");
         assert!(poisoned_unassigned.to_string().contains("poisoned"));
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn point_admit_defers_frontier_resource_registration_until_finish() -> Result<()> {
+        const SEGMENT_LIMIT: u64 = 64 * 1024;
+        const INITIAL_SOURCE_CHARGE: u64 = HEADER_LEN_U64 + FRAME_LEN_U64;
+        const TWO_BATCH_SOURCE_CHARGE: u64 = 4 * WAL_V8_FRAME_LEN as u64;
+        const SOURCE_SPOOL_LIMIT: u64 =
+            SEGMENT_LIMIT + INITIAL_SOURCE_CHARGE + TWO_BATCH_SOURCE_CHARGE;
+
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("defer-frontier-point.wal");
+        let installed = install_empty(&path, header())?;
+        let sync_file = OpenOptions::new().read(true).write(true).open(&path)?;
+        let (leader, _owner) = open_accounted_writer(
+            &path,
+            &installed,
+            SEGMENT_LIMIT,
+            SOURCE_SPOOL_LIMIT,
+            FRAME_LEN_U64,
+            sync_file,
+        )?;
+        let writer = match leader.into_parallel_with_worker_file_and_config(
+            OpenOptions::new().read(true).write(true).open(&path)?,
+            WalV8RequestedConfig::candidate(),
+        ) {
+            Ok(writer) => writer,
+            Err(error) if is_io_uring_unavailable_error(&error) => return Ok(()),
+            Err(error) => return Err(error),
+        };
+
+        // Hold an earlier unfinished job j1 so the durability driver cannot retire j2 before we
+        // observe j2's frontier_resources entry after j2.finish().
+        let b1 = batch(10);
+        let p1 = writer.preflight_batch_with_write_class(
+            &b1,
+            LIVE_WAL_V5_LIMITS,
+            WalV8WriteClass::Point,
+        )?;
+        let mut s1 = WalV8PointAdmissionScratch::new(p1);
+        assert!(writer.try_preallocate_point_buffer(&mut s1));
+        let j1 = writer.admit_prepared_point_batch(s1, b1.commit_ts, b1.recorded_at)?;
+        let t1 = j1.assignment().segment_ticket;
+        assert!(!writer.frontier_resources.lock().contains_key(&t1));
+
+        let b2 = batch(20);
+        let p2 = writer.preflight_batch_with_write_class(
+            &b2,
+            LIVE_WAL_V5_LIMITS,
+            WalV8WriteClass::Point,
+        )?;
+        let mut s2 = WalV8PointAdmissionScratch::new(p2);
+        assert!(writer.try_preallocate_point_buffer(&mut s2));
+        let j2 = writer.admit_prepared_point_batch(s2, b2.commit_ts, b2.recorded_at)?;
+        let t2 = j2.assignment().segment_ticket;
+        assert!(!writer.frontier_resources.lock().contains_key(&t2));
+
+        let _ = j2.finish()?;
+        assert!(writer.frontier_resources.lock().contains_key(&t2));
+
+        let _ = j1.finish()?;
+        writer.sync()?;
+        assert!(!writer.frontier_resources.lock().contains_key(&t1));
+        assert!(!writer.frontier_resources.lock().contains_key(&t2));
+        assert!(writer.frontier_resources.lock().is_empty());
+        assert_eq!(writer.point_buffer_preallocations_in_flight_for_test(), 0);
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn point_unfinished_job_drop_poisons_and_releases_buffer_quota() -> Result<()> {
+        const SEGMENT_LIMIT: u64 = 64 * 1024;
+        const INITIAL_SOURCE_CHARGE: u64 = HEADER_LEN_U64 + FRAME_LEN_U64;
+        const ONE_BATCH_SOURCE_CHARGE: u64 = 2 * WAL_V8_FRAME_LEN as u64;
+        const SOURCE_SPOOL_LIMIT: u64 =
+            SEGMENT_LIMIT + INITIAL_SOURCE_CHARGE + ONE_BATCH_SOURCE_CHARGE;
+
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("point-unfinished-drop.wal");
+        let installed = install_empty(&path, header())?;
+        let sync_file = OpenOptions::new().read(true).write(true).open(&path)?;
+        let (leader, owner) = open_accounted_writer(
+            &path,
+            &installed,
+            SEGMENT_LIMIT,
+            SOURCE_SPOOL_LIMIT,
+            FRAME_LEN_U64,
+            sync_file,
+        )?;
+        let writer = match leader.into_parallel_with_worker_file_and_config(
+            OpenOptions::new().read(true).write(true).open(&path)?,
+            WalV8RequestedConfig::candidate(),
+        ) {
+            Ok(writer) => writer,
+            Err(error) if is_io_uring_unavailable_error(&error) => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        let initial_quota = owner.image_owner().snapshot();
+
+        // Admit then drop FrameJob without finish(): coordinator is poisoned and buffer quota
+        // released.
+        let pt_batch = batch(10);
+        let prepared = writer.preflight_batch_with_write_class(
+            &pt_batch,
+            LIVE_WAL_V5_LIMITS,
+            WalV8WriteClass::Point,
+        )?;
+        let mut scratch = WalV8PointAdmissionScratch::new(prepared);
+        assert!(writer.try_preallocate_point_buffer(&mut scratch));
+        let job =
+            writer.admit_prepared_point_batch(scratch, pt_batch.commit_ts, pt_batch.recorded_at)?;
+        assert!(
+            owner.image_owner().snapshot().source_spool_bytes > initial_quota.source_spool_bytes
+        );
+        assert!(
+            owner.image_owner().snapshot().buffer_memory_bytes > initial_quota.buffer_memory_bytes
+        );
+        drop(job);
+        assert!(writer.is_poisoned());
+        assert!(writer.frontier_resources.lock().is_empty());
+        assert_eq!(
+            owner.image_owner().snapshot().buffer_memory_bytes,
+            initial_quota.buffer_memory_bytes
+        );
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn point_out_of_order_finish_and_mixed_batch_retire_all_resources() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("point-ooo-mixed.wal");
+        let installed = install_empty(&path, header())?;
+        let sync_file = OpenOptions::new().read(true).write(true).open(&path)?;
+        let (leader, owner) = open_accounted_writer(
+            &path,
+            &installed,
+            256 * 1024,
+            1024 * 1024,
+            FRAME_LEN_U64,
+            sync_file,
+        )?;
+        let writer = match leader.into_parallel_with_worker_file_and_config(
+            OpenOptions::new().read(true).write(true).open(&path)?,
+            WalV8RequestedConfig::candidate(),
+        ) {
+            Ok(writer) => writer,
+            Err(error) if is_io_uring_unavailable_error(&error) => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        let initial_quota = owner.image_owner().snapshot();
+
+        // Admit two Point jobs and one Batch job, then finish them out of order.
+        let b1 = batch(10);
+        let p1 = writer.preflight_batch_with_write_class(
+            &b1,
+            LIVE_WAL_V5_LIMITS,
+            WalV8WriteClass::Point,
+        )?;
+        let mut s1 = WalV8PointAdmissionScratch::new(p1);
+        assert!(writer.try_preallocate_point_buffer(&mut s1));
+        let j1 = writer.admit_prepared_point_batch(s1, b1.commit_ts, b1.recorded_at)?;
+
+        let b2 = batch(20);
+        let p2 = writer.preflight_batch_with_write_class(
+            &b2,
+            LIVE_WAL_V5_LIMITS,
+            WalV8WriteClass::Point,
+        )?;
+        let mut s2 = WalV8PointAdmissionScratch::new(p2);
+        assert!(writer.try_preallocate_point_buffer(&mut s2));
+        let j2 = writer.admit_prepared_point_batch(s2, b2.commit_ts, b2.recorded_at)?;
+
+        let b3 = batch(30);
+        let p3 = writer.preflight_batch_with_write_class(
+            &b3,
+            LIVE_WAL_V5_LIMITS,
+            WalV8WriteClass::Batch,
+        )?;
+        let j3 = writer.admit_prepared_batch(p3, b3.commit_ts, b3.recorded_at)?;
+
+        // Out-of-order finish: Batch j3, then Point j2, then Point j1.
+        let _ = j3.finish()?;
+        let _ = j2.finish()?;
+        let _ = j1.finish()?;
+        writer.sync()?;
+        assert!(writer.frontier_resources.lock().is_empty());
+        let after_sync = owner.image_owner().snapshot();
+        assert_eq!(
+            after_sync.buffer_memory_bytes,
+            initial_quota.buffer_memory_bytes
+        );
+        assert_eq!(
+            after_sync.seal_index_bytes,
+            initial_quota.seal_index_bytes + 24
+        );
 
         Ok(())
     }

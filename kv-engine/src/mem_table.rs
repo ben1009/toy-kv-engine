@@ -7322,4 +7322,135 @@ mod tests {
         assert_eq!(mt.get_raw_exact(&key2), Some(value2));
         assert_eq!(mt.approximate_size(), expected_size);
     }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn v8_sequencer_held_batch_retains_shared_wal_quota_against_queued_put() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("sequencer-quota-order-v8.wal");
+        let (header, empty_anchor) = install_empty_v8(&path)?;
+        let installed = recover_v8(&path, header, &[empty_anchor])?;
+
+        // Allow room for the empty active segment plus one 1-frame batch (DATA + FRONTIER),
+        // but not both the batch and a competing put.
+        let segment_limit = 64 * 1024;
+        let one_batch_source_charge = 2 * crate::wal::v8::codec::WAL_V8_FRAME_LEN as u64;
+        let initial_source_charge = crate::wal::v8::WAL_V8_HEADER_LEN as u64
+            + crate::wal::v8::codec::WAL_V8_FRAME_LEN as u64;
+        let workspace_bytes = segment_limit + initial_source_charge;
+        let max_source_spool_bytes = 1024 * 1024;
+        let ledger = WalV7ResourceLedger::new(WalV7ResourceLimits {
+            max_logical_wal_bytes: segment_limit,
+            max_source_spool_bytes,
+            max_recovery_workspace_bytes: workspace_bytes,
+            max_buffer_memory_bytes: 1024 * 1024,
+            max_seal_index_bytes: 1024 * 1024,
+        })?;
+        let ledger_for_fill = ledger.clone();
+
+        let retained_resources = crate::wal::v7::admission::WalV7RetainedResources::new(ledger);
+        let (memtable, max_ts) = match MemTable::recover_from_v8_active_with_owner(
+            8,
+            false,
+            &path,
+            installed,
+            segment_limit,
+            WalIoMode::Parallel,
+            crate::wal::v8::leader::WalV8RequestedConfig::candidate(),
+            |installed| {
+                Ok(Arc::new(
+                    crate::wal::v8::resource::WalV8ReservationOwner::new_with_retained_resources(
+                        retained_resources,
+                        installed,
+                        initial_source_charge,
+                        workspace_bytes,
+                        crate::wal::v8::codec::WAL_V8_FRAME_LEN as u64,
+                    )?,
+                ))
+            },
+        ) {
+            Ok(recovered) => recovered,
+            Err(error)
+                if error.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|io_err| io_err.raw_os_error() == Some(libc::ENOSYS))
+                }) =>
+            {
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        let snapshot = ledger_for_fill.snapshot();
+        let remaining_before_fill = max_source_spool_bytes
+            .saturating_sub(snapshot.source_spool_bytes)
+            .saturating_sub(snapshot.recovery_workspace_bytes)
+            .saturating_sub(one_batch_source_charge);
+        let _fill_spool = ledger_for_fill
+            .reserve(crate::wal::v7::admission::WalV7ResourceCharge {
+                source_spool_bytes: remaining_before_fill,
+                ..Default::default()
+            })
+            .expect("fill_spool");
+        let mvcc = LsmMvccInner::new(max_ts);
+        let batch_entries = [(
+            Bytes::from_static(b"batch-key"),
+            Bytes::from_static(b"batch-val"),
+            BatchEntryKind::PutRaw,
+        )];
+
+        std::thread::scope(|scope| -> Result<()> {
+            // Hold the MVCC sequencer lock as an in-progress batch before its WAL quota check.
+            let write_guard = mvcc.write_lock.lock();
+            let competing_put =
+                scope.spawn(|| mvcc.write_wal_only(b"queued-put", b"queued-val", &memtable));
+
+            // Wait deterministically until the queued put has completed preflight and Stage A
+            // DATA buffer preallocation and is blocked on write_lock.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while memtable
+                .wal
+                .as_ref()
+                .expect("v8 WAL attached")
+                .v8_point_buffer_preallocations_in_flight_for_test()
+                == 0
+            {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "queued put did not reach Stage A preallocation before write_lock"
+                );
+                std::thread::yield_now();
+            }
+
+            // The batch holding the sequencer must still obtain the remaining shared WAL quota.
+            let (_commit_ts, _publish, batch_ticket) = mvcc
+                .write_batch_wal_only_with_guard_for_test(
+                    &batch_entries,
+                    &memtable,
+                    false,
+                    write_guard,
+                )
+                .expect("batch holding sequencer must not lose shared WAL quota to queued put");
+            memtable
+                .commit_wal_ticket(batch_ticket)
+                .expect("commit_wal_ticket");
+
+            let put_err = competing_put
+                .join()
+                .expect("competing put panicked")
+                .expect_err("queued put must fail SourceSpoolLimit after batch consumes quota");
+            assert!(
+                matches!(
+                    put_err.downcast_ref::<crate::wal::v7::admission::WalV7ReservationError>(),
+                    Some(crate::wal::v7::admission::WalV7ReservationError::SourceSpoolLimit { .. })
+                ),
+                "expected SourceSpoolLimit for queued put, got {put_err:#}"
+            );
+
+            Ok(())
+        })?;
+
+        memtable.wal.as_ref().unwrap().close()?;
+        Ok(())
+    }
 }
