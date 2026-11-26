@@ -667,6 +667,8 @@ pub struct WalCpuAttributionObservation {
     pub preflight_cpu_ns: u64,
     pub point_buffer_preallocation_wall_ns: u64,
     pub point_buffer_preallocation_cpu_ns: u64,
+    pub pre_reserve_wall_ns: u64,
+    pub pre_reserve_cpu_ns: u64,
     pub sequencer_wait_wall_ns: u64,
     pub sequencer_wait_cpu_ns: u64,
     pub sequencer_hold_wall_ns: u64,
@@ -4237,6 +4239,12 @@ impl MemTable {
         }
 
         false
+    }
+
+    pub(crate) fn v8_point_pre_reserve_enabled(&self) -> bool {
+        self.wal
+            .as_ref()
+            .is_some_and(Wal::v8_point_pre_reserve_enabled)
     }
 
     pub(crate) fn pre_reserve_v8_point_resources(

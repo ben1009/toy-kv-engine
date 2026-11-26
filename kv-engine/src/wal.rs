@@ -2756,6 +2756,12 @@ impl Wal {
         false
     }
 
+    pub(crate) fn v8_point_pre_reserve_enabled(&self) -> bool {
+        self.v8_parallel
+            .as_ref()
+            .is_some_and(v8::leader::WalV8ParallelWriter::point_pre_reserve_enabled)
+    }
+
     pub(crate) fn pre_reserve_v8_point_resources(
         &self,
         scratch: &mut v8::leader::WalV8PointAdmissionScratch<'_>,
