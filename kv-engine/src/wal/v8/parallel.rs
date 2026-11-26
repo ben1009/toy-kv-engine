@@ -3001,6 +3001,7 @@ impl WalV8ParallelCoordinator {
         let coordinator_lock_wait_cpu_ns = lock_wait_cpu_started
             .map(|started| super::digest::thread_cpu_time_ns().saturating_sub(started))
             .unwrap_or_default();
+        ensure!(!state.poisoned, "v8 Parallel coordinator is poisoned");
         ensure!(
             ticket_end <= state.next_ticket,
             "v8 durability driver names an unassigned ticket"
@@ -3025,18 +3026,22 @@ impl WalV8ParallelCoordinator {
             ensure!(!state.poisoned, "v8 Parallel coordinator is poisoned");
             if state.durable_ticket_end >= ticket_end {
                 #[cfg(feature = "bench")]
-                let observation = make_follower_wait_observation(WalV8FollowerWaitSample {
-                    sample_id: follower_sample_id,
-                    requested_ticket_end: ticket_end,
-                    durable_ticket_end_on_resume: state.durable_ticket_end,
-                    coordinator_lock_wait_ns,
-                    coordinator_lock_wait_cpu_ns,
-                    wait_started: follower_wait_started,
-                    wait_cpu_started: follower_wait_cpu_started,
-                    condvar_wait_count: follower_condvar_wait_count,
-                    notify_to_resume_ns,
-                    followers_woken_by_last_notify,
-                });
+                let observation = if diagnostics_enabled {
+                    make_follower_wait_observation(WalV8FollowerWaitSample {
+                        sample_id: follower_sample_id,
+                        requested_ticket_end: ticket_end,
+                        durable_ticket_end_on_resume: state.durable_ticket_end,
+                        coordinator_lock_wait_ns,
+                        coordinator_lock_wait_cpu_ns,
+                        wait_started: follower_wait_started,
+                        wait_cpu_started: follower_wait_cpu_started,
+                        condvar_wait_count: follower_condvar_wait_count,
+                        notify_to_resume_ns,
+                        followers_woken_by_last_notify,
+                    })
+                } else {
+                    None
+                };
                 drop(state);
                 #[cfg(feature = "bench")]
                 if let (Some(profile), Some(observation)) = (profile.as_ref(), observation) {
@@ -3047,7 +3052,7 @@ impl WalV8ParallelCoordinator {
             }
             if !state.durability_driver_active {
                 let completion_batch = state.completion_batch.take();
-                if self.progress_cursor_enabled() && completion_batch.is_none() {
+                if completion_batch.is_none() && self.progress_cursor_enabled() {
                     poison_locked(&self.inner, &mut state);
                     anyhow::bail!("v8 durability driver completion buffer is missing");
                 }
@@ -3058,18 +3063,22 @@ impl WalV8ParallelCoordinator {
                     completion_batch,
                 };
                 #[cfg(feature = "bench")]
-                let observation = make_follower_wait_observation(WalV8FollowerWaitSample {
-                    sample_id: follower_sample_id,
-                    requested_ticket_end: ticket_end,
-                    durable_ticket_end_on_resume: state.durable_ticket_end,
-                    coordinator_lock_wait_ns,
-                    coordinator_lock_wait_cpu_ns,
-                    wait_started: follower_wait_started,
-                    wait_cpu_started: follower_wait_cpu_started,
-                    condvar_wait_count: follower_condvar_wait_count,
-                    notify_to_resume_ns,
-                    followers_woken_by_last_notify,
-                });
+                let observation = if diagnostics_enabled {
+                    make_follower_wait_observation(WalV8FollowerWaitSample {
+                        sample_id: follower_sample_id,
+                        requested_ticket_end: ticket_end,
+                        durable_ticket_end_on_resume: state.durable_ticket_end,
+                        coordinator_lock_wait_ns,
+                        coordinator_lock_wait_cpu_ns,
+                        wait_started: follower_wait_started,
+                        wait_cpu_started: follower_wait_cpu_started,
+                        condvar_wait_count: follower_condvar_wait_count,
+                        notify_to_resume_ns,
+                        followers_woken_by_last_notify,
+                    })
+                } else {
+                    None
+                };
                 drop(state);
                 #[cfg(feature = "bench")]
                 if let (Some(profile), Some(observation)) = (profile.as_ref(), observation) {

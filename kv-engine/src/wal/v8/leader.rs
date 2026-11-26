@@ -6903,6 +6903,8 @@ impl WalV8ParallelWriter {
         let result = self.drive_frontier_through(ticket_end, &mut driver);
         if result.is_ok() {
             driver.complete();
+        } else {
+            self.coordinator.poison();
         }
 
         result
@@ -7826,29 +7828,11 @@ impl WalV8ParallelWriter {
         if ticket_end == 0 {
             return Ok(());
         }
-        if let Err(error) = self.advance_frontier_through(ticket_end - 1) {
-            self.coordinator.poison();
-            return Err(error);
-        }
-
-        Ok(())
+        self.advance_frontier_through(ticket_end - 1)
     }
 
     pub(crate) fn wait_durable(&self, ticket: u64) -> Result<()> {
-        ensure!(!self.is_poisoned(), "v8 Parallel WAL is poisoned");
-        ensure!(
-            ticket < self.coordinator.next_ticket(),
-            "v8 Parallel durability wait names an unassigned ticket"
-        );
-        if self.coordinator.durable_ticket_end() > ticket {
-            return Ok(());
-        }
-        if let Err(error) = self.advance_frontier_through(ticket) {
-            self.coordinator.poison();
-            return Err(error);
-        }
-
-        Ok(())
+        self.advance_frontier_through(ticket)
     }
 
     #[cfg(feature = "bench")]
@@ -14641,6 +14625,72 @@ mod tests {
         let _ = job.finish()?;
         writer.sync()?;
         assert_eq!(writer.point_buffer_preallocations_in_flight_for_test(), 0);
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn wait_durable_unassigned_ticket_does_not_poison_and_poisoned_fails() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("wait-durable-edge.wal");
+        let installed = install_empty(&path, header())?;
+        let sync_file = OpenOptions::new().read(true).write(true).open(&path)?;
+        let (leader, _owner) = open_accounted_writer(
+            &path,
+            &installed,
+            64 * 1024,
+            1024 * 1024,
+            FRAME_LEN_U64,
+            sync_file,
+        )?;
+        let writer = match leader.into_parallel_with_worker_file_and_config(
+            OpenOptions::new().read(true).write(true).open(&path)?,
+            WalV8RequestedConfig::candidate(),
+        ) {
+            Ok(writer) => writer,
+            Err(error) if is_io_uring_unavailable_error(&error) => return Ok(()),
+            Err(error) => return Err(error),
+        };
+
+        // Unassigned ticket fails without poisoning the coordinator.
+        let unassigned_err = writer
+            .wait_durable(0)
+            .expect_err("unassigned ticket wait must fail");
+        assert!(unassigned_err.to_string().contains("unassigned ticket"));
+        assert!(!writer.is_poisoned());
+
+        // Overflowing ticket also fails without poisoning.
+        assert!(writer.wait_durable(u64::MAX).is_err());
+        assert!(!writer.is_poisoned());
+
+        // Admit and finish one ticket; wait_durable succeeds twice (driver + already-durable).
+        let b = batch(1);
+        let prepared = writer.preflight_batch_with_write_class(
+            &b,
+            LIVE_WAL_V5_LIMITS,
+            WalV8WriteClass::Point,
+        )?;
+        let ticket = writer
+            .append_prepared_batch(prepared, b.commit_ts, b.recorded_at)?
+            .0
+            .ticket;
+        writer.wait_durable(ticket)?;
+        writer.wait_durable(ticket)?;
+        assert!(!writer.is_poisoned());
+
+        // Poisoned coordinator rejects wait_durable even for an already-durable or unassigned
+        // ticket.
+        writer.coordinator.poison();
+        assert!(writer.is_poisoned());
+        let poisoned_durable = writer
+            .wait_durable(ticket)
+            .expect_err("poisoned coordinator must reject wait_durable");
+        assert!(poisoned_durable.to_string().contains("poisoned"));
+        let poisoned_unassigned = writer
+            .wait_durable(ticket + 10)
+            .expect_err("poisoned coordinator must reject unassigned wait_durable");
+        assert!(poisoned_unassigned.to_string().contains("poisoned"));
 
         Ok(())
     }
