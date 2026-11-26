@@ -11687,7 +11687,7 @@ mod tests {
         let injected = Arc::new(AtomicBool::new(false));
         writer.io.set_progress_wait_hook(Arc::new({
             let coordinator = writer.coordinator.clone();
-            let io = Arc::clone(&writer.io);
+            let progress_tokens = writer.io.progress_tokens.clone();
             let wait_outcomes = Arc::clone(&wait_outcomes);
             let injected = Arc::clone(&injected);
             move |event| match event {
@@ -11697,7 +11697,7 @@ mod tests {
                             .mark_data_group_complete(1..2)
                             .expect("mark ticket 1 complete for coalescing refresh test");
                         if drop_token_before_wait {
-                            if let Some(tokens) = io.progress_tokens.as_ref() {
+                            if let Some(tokens) = progress_tokens.as_ref() {
                                 while tokens.try_recv().is_ok() {}
                             }
                         } else {
