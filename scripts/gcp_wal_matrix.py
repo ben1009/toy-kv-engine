@@ -115,6 +115,28 @@ V7_V8_READY_TARGET_FINAL_CASES = (
     (16, "point"),
     (16, "batch64"),
 )
+V8_D2_QUALIFICATION_WRITERS = (1, 8, 16)
+V8_D2_QUALIFICATION_REPETITIONS = 5
+V8_D2_QUALIFICATION_NUM = 100_000
+V8_D2_QUALIFICATION_ARMS = (
+    "v8_legacy",
+    "v8_candidate_dynamic",
+    "v8_candidate_target8",
+    "v7_parallel",
+)
+V8_D2_QUALIFICATION_ORDERS = (
+    ("v8_legacy", "v8_candidate_dynamic", "v8_candidate_target8", "v7_parallel"),
+    ("v8_candidate_dynamic", "v8_candidate_target8", "v7_parallel", "v8_legacy"),
+    ("v8_candidate_target8", "v7_parallel", "v8_legacy", "v8_candidate_dynamic"),
+    ("v7_parallel", "v8_legacy", "v8_candidate_dynamic", "v8_candidate_target8"),
+    ("v8_candidate_target8", "v8_candidate_dynamic", "v8_legacy", "v7_parallel"),
+)
+V8_D2_QUALIFICATION_CASES = (
+    (1, "point"),
+    (8, "point"),
+    (16, "point"),
+    (16, "batch64"),
+)
 POINT_PROGRESS_PLAN_SCHEMA_V1 = 1
 POINT_PROGRESS_PLAN_SCHEMA_V2 = 2
 POINT_PROGRESS_PLAN_SCHEMA_V3 = 3
@@ -895,6 +917,100 @@ def build_v7_v8_ready_target_final_plan(
             "Point1, Point8, Point16, and Batch64/w16 each run five counterbalanced repetitions across V7 Parallel, "
             "V8 Dynamic, V8 Target4, and V8 Target8. Stage A is enabled for all V8 Point arms and disabled for "
             "Batch64. All arms use the same source commit and release binary; Point latency is sampled every 10 puts."
+        ),
+    }
+
+
+def build_v8_d2_qualification_schedule() -> list[dict[str, object]]:
+    """Build the 80-run D2 qualification matrix (Legacy, Candidate Dynamic, Candidate Target8, V7)."""
+    schedule: list[dict[str, object]] = []
+    for repetition in range(1, V8_D2_QUALIFICATION_REPETITIONS + 1):
+        case_order = V8_D2_QUALIFICATION_CASES[repetition % len(V8_D2_QUALIFICATION_CASES):] + (
+            V8_D2_QUALIFICATION_CASES[:repetition % len(V8_D2_QUALIFICATION_CASES)]
+        )
+        for writer, workload in case_order:
+            case_index = V8_D2_QUALIFICATION_CASES.index((writer, workload))
+            arm_order = V8_D2_QUALIFICATION_ORDERS[(repetition - 1 + case_index) % len(
+                V8_D2_QUALIFICATION_ORDERS
+            )]
+            is_batch = workload == "batch64"
+            bench = "wal_batch_concurrent" if is_batch else "wal_concurrent"
+            batch_entries = 64 if is_batch else 1
+            batch_size = 64 if is_batch else None
+            sample_every = None if is_batch else 10
+            for arm in arm_order:
+                is_v7 = arm == "v7_parallel"
+                is_legacy = arm == "v8_legacy"
+                is_target8 = arm == "v8_candidate_target8"
+                schedule.append({
+                    "run_index": len(schedule) + 1,
+                    "writer": writer,
+                    "workload": workload,
+                    "repetition": repetition,
+                    "arm": arm,
+                    "bench": bench,
+                    "batch_entries": batch_entries,
+                    "batch_size": batch_size,
+                    "num": V8_D2_QUALIFICATION_NUM,
+                    "sample_every": sample_every,
+                    "format_version": 7 if is_v7 else 8,
+                    "v8_profile": None if is_v7 else ("legacy" if is_legacy else "candidate"),
+                    "coalesce_target_policy": (
+                        None if is_v7 else ("point_only" if is_target8 else "disabled")
+                    ),
+                    "coalescing_ready_target": 8 if is_target8 else None,
+                    "point_buffer_preallocation_enabled": None if is_v7 else (not is_legacy),
+                    "progress_ring_enabled": False if is_v7 else (not is_legacy),
+                    "progress_cursor_enabled": False if is_v7 else (not is_legacy),
+                    "progress_counters_enabled": False if not is_v7 else None,
+                    "cursor_direct_completion_enabled": (False if is_legacy else True) if not is_v7 else None,
+                    "cursor_singleton_submission_enabled": False if not is_v7 else None,
+                    "extent_mode": (
+                        None if is_v7 else ("sliding-fallocate" if is_legacy else "sliding-point-lookahead")
+                    ),
+                    "extent_window_bytes": POINT_LOOKAHEAD_WINDOW_BYTES if not is_v7 else 0,
+                    "frontier_mode": None if is_v7 else ("buffered" if is_legacy else "direct"),
+                })
+    return schedule
+
+
+def build_v8_d2_qualification_plan(
+    *, machine_type: str, machine_spec: Mapping[str, int], commit: str,
+    binary_sha256: str | None = None,
+) -> dict[str, object]:
+    schedule = build_v8_d2_qualification_schedule()
+    return {
+        "plan_schema_version": 1,
+        "suite": "v8-d2-qualification",
+        "writers": list(V8_D2_QUALIFICATION_WRITERS),
+        "workloads": [
+            {"writer": writer, "name": workload, "bench": "wal_concurrent" if workload == "point"
+             else "wal_batch_concurrent", "batch_size": 64 if workload == "batch64" else None,
+             "num": V8_D2_QUALIFICATION_NUM, "latency_sample_every": 10 if workload == "point" else None}
+            for writer, workload in V8_D2_QUALIFICATION_CASES
+        ],
+        "arms": list(V8_D2_QUALIFICATION_ARMS),
+        "repetitions_per_cell": V8_D2_QUALIFICATION_REPETITIONS,
+        "arm_orders": [list(order) for order in V8_D2_QUALIFICATION_ORDERS],
+        "runs_planned": len(schedule),
+        "score_runs_planned": len(schedule),
+        "counterbalanced": True,
+        "machine_type": machine_type,
+        "vcpus": int(machine_spec["vcpus"]),
+        "local_ssd_count": int(machine_spec["ssd_count"]),
+        "local_ssd_total_gib": int(machine_spec["ssd_gib"]),
+        "runtime_protocol": "single C4 Local SSD host; same source commit and release binary for all four arms",
+        "value_bytes": 1024,
+        "compaction": "none",
+        "commit": commit,
+        "binary_sha256": binary_sha256,
+        "v8_legacy_configuration": "production-equivalent V8 Legacy (Eager, Relay, Buffered FRONTIER, 1 MiB FallocateOnly, Stage A off, Dynamic)",
+        "v8_candidate_configuration": "TOYKV_WAL_V8_PROFILE=candidate with TOYKV_WAL_V8_COALESCING=dynamic or point-target8",
+        "v7_configuration": "V7 Parallel; no V8-only environment variables",
+        "qualification_note": (
+            "Point1, Point8, Point16, and Batch64/w16 each run five counterbalanced repetitions across V8 Legacy, "
+            "V8 Candidate Dynamic, V8 Candidate Point-only Target8, and V7 Parallel on the same host, source commit, "
+            "and release bench binary. Point latency is sampled every 10 puts; Batch64 latency sampling is disabled."
         ),
     }
 

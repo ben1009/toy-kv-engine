@@ -92,6 +92,11 @@ from gcp_wal_matrix import (
     V7_V8_READY_TARGET_FINAL_NUM,
     V7_V8_READY_TARGET_FINAL_ORDERS,
     V7_V8_READY_TARGET_FINAL_WRITERS,
+    V8_D2_QUALIFICATION_ARMS,
+    V8_D2_QUALIFICATION_CASES,
+    V8_D2_QUALIFICATION_NUM,
+    V8_D2_QUALIFICATION_ORDERS,
+    V8_D2_QUALIFICATION_WRITERS,
     POINT_RESOURCE_RETIREMENT_NUM,
     POINT_RESOURCE_RETIREMENT_WRITERS,
     POINT_ACK_D1_ARMS,
@@ -126,6 +131,8 @@ from gcp_wal_matrix import (
     build_v7_v8_point_preallocation_schedule,
     build_v7_v8_ready_target_final_plan,
     build_v7_v8_ready_target_final_schedule,
+    build_v8_d2_qualification_plan,
+    build_v8_d2_qualification_schedule,
     build_point_resource_retirement_plan,
     build_point_resource_retirement_schedule,
     build_point_ack_d1_plan,
@@ -581,11 +588,29 @@ class PointProgressRingQualificationTests(unittest.TestCase):
         }
         if "coalescing_ready_target" in row:
             target = row["coalescing_ready_target"]
-            hits = int(target is not None and row["writer"] > 1 and row["workload"] in ("point", "batch64"))
+            policy = row.get("coalesce_target_policy")
+            is_point_only = policy == "point_only"
+            hits = int(
+                target is not None
+                and row["writer"] > 1
+                and (row["workload"] == "point" if is_point_only else row["workload"] in ("point", "batch64"))
+            )
             for snapshot in (start, end):
                 snapshot["coalesce_ready_target"] = target
                 snapshot["coalesce_ready_target_hits"] = 0
+                if policy is not None:
+                    snapshot["coalesce_target_policy"] = policy
+                    snapshot["coalesce_target_eligible_cycles"] = 0
+                    snapshot["coalesce_target_mixed_fallback_cycles"] = 0
+                    snapshot["coalesce_target_initial_hits"] = 0
+                    snapshot["coalesce_target_after_wake_hits"] = 0
             end["coalesce_ready_target_hits"] = hits
+            if is_point_only and row["writer"] > 1:
+                if row["workload"] == "point":
+                    end["coalesce_target_eligible_cycles"] = hits
+                    end["coalesce_target_initial_hits"] = hits
+                elif row["workload"] == "batch64":
+                    end["coalesce_target_mixed_fallback_cycles"] = 1
         if "point_resource_retirement_mode" in row:
             mode = int(row["point_resource_retirement_mode"])
             detached = int(row["workload"] == "point" and mode > 0)
@@ -724,6 +749,7 @@ class PointProgressRingQualificationTests(unittest.TestCase):
         retirement_preallocation: bool = False,
         cursor_publication: bool = False,
         ready_target_final: bool = False,
+        v8_d2_qualification: bool = False,
         cursor_schema_version: int | None = None,
         include_schema_version: bool = True,
     ) -> Path:
@@ -746,6 +772,9 @@ class PointProgressRingQualificationTests(unittest.TestCase):
         elif ready_target_final:
             schedule_builder = lambda _selected_writers: build_v7_v8_ready_target_final_schedule()
             plan_builder = build_v7_v8_ready_target_final_plan
+        elif v8_d2_qualification:
+            schedule_builder = lambda _selected_writers: build_v8_d2_qualification_schedule()
+            plan_builder = build_v8_d2_qualification_plan
         elif retirement:
             schedule_builder = lambda selected_writers: build_point_resource_retirement_schedule(
                 selected_writers,
@@ -779,12 +808,13 @@ class PointProgressRingQualificationTests(unittest.TestCase):
             CURSOR_COALESCING_READY_TARGET_WRITERS if coalescing_ready_target else
             CURSOR_PUBLICATION_WRITERS if cursor_publication else
             V7_V8_READY_TARGET_FINAL_WRITERS if ready_target_final else
+            V8_D2_QUALIFICATION_WRITERS if v8_d2_qualification else
             POINT_RESOURCE_RETIREMENT_WRITERS if retirement else
             CURSOR_COALESCING_BUDGET_WRITERS if coalescing_budget else
             POINT_PROGRESS_RING_WRITERS
         )
         schedule = schedule_builder(writers)
-        if ready_target_final:
+        if ready_target_final or v8_d2_qualification:
             plan = plan_builder(
                 machine_type="c4-standard-16-lssd",
                 machine_spec=BENCH.MACHINE_SPECS["c4-standard-16-lssd"],
@@ -843,6 +873,7 @@ class PointProgressRingQualificationTests(unittest.TestCase):
         schedule_name = (
             "cursor-coalescing-ready-target-small-scan-schedule.tsv" if coalescing_ready_target_small_scan else
             "v7-v8-ready-target-final-schedule.tsv" if ready_target_final else
+            "v8-d2-qualification-schedule.tsv" if v8_d2_qualification else
             "cursor-coalescing-ready-target-scan-schedule.tsv" if coalescing_ready_target_scan else
             "cursor-coalescing-ready-target-schedule.tsv" if coalescing_ready_target else
             "point-resource-retirement-schedule.tsv" if retirement else
@@ -864,9 +895,14 @@ class PointProgressRingQualificationTests(unittest.TestCase):
             run_id = progress_ring_runner._run_id(row)
             run_dir = results / run_id
             run_dir.mkdir()
-            raw = cls._raw_v7_record(row) if ready_target_final and row["format_version"] == 7 else cls._raw_record(row)
+            raw = (
+                cls._raw_v7_record(row)
+                if (ready_target_final or v8_d2_qualification) and row["format_version"] == 7
+                else cls._raw_record(row)
+            )
             record_validator = (
-                progress_ring_runner._validate_point_preallocation_record if ready_target_final else
+                progress_ring_runner._validate_point_preallocation_record
+                if ready_target_final or v8_d2_qualification else
                 progress_ring_runner._validate_record
                 if coalescing_ready_target_small_scan or coalescing_ready_target_scan or coalescing_ready_target else
                 progress_ring_runner._validate_cursor_publication_record if cursor_publication else
@@ -885,6 +921,7 @@ class PointProgressRingQualificationTests(unittest.TestCase):
             (run_dir / "result.json").write_text(json.dumps(raw), encoding="utf-8")
             (run_dir / "run-metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
             (run_dir / "environment.txt").write_text(
+                progress_ring_runner._v8_d2_qualification_environment_text(row) if v8_d2_qualification else
                 progress_ring_runner._v7_v8_ready_target_final_environment_text(row) if ready_target_final else
                 progress_ring_runner._expected_environment_text(
                     bool(row["progress_ring_enabled"]), bool(row.get("progress_cursor_enabled", False)),
@@ -911,7 +948,9 @@ class PointProgressRingQualificationTests(unittest.TestCase):
                 encoding="utf-8",
             )
             rows.append(metadata)
-        if ready_target_final:
+        if v8_d2_qualification:
+            summary = progress_ring_runner._v8_d2_qualification_summary(rows, len(schedule))
+        elif ready_target_final:
             summary = progress_ring_runner._v7_v8_ready_target_final_summary(rows, len(schedule))
         elif coalescing_ready_target_small_scan:
             summary = progress_ring_runner._coalescing_ready_target_small_scan_summary(
@@ -1423,6 +1462,112 @@ class PointProgressRingQualificationTests(unittest.TestCase):
         self.assertEqual(metadata["exit_code"], 0)
         self.assertEqual(metadata["format_version"], 7)
         self.assertEqual(metadata["sync_count"], 1000)
+
+    def test_v8_d2_qualification_schedule_plan_env_and_verifier(self) -> None:
+        schedule = build_v8_d2_qualification_schedule()
+        self.assertEqual(len(schedule), 80)
+        self.assertEqual({row["arm"] for row in schedule}, set(V8_D2_QUALIFICATION_ARMS))
+        self.assertEqual({(row["writer"], row["workload"]) for row in schedule}, set(V8_D2_QUALIFICATION_CASES))
+        for writer, workload in V8_D2_QUALIFICATION_CASES:
+            for repetition in range(1, 6):
+                cell = [
+                    row for row in schedule
+                    if row["writer"] == writer and row["workload"] == workload and row["repetition"] == repetition
+                ]
+                self.assertEqual(len(cell), len(V8_D2_QUALIFICATION_ARMS))
+                self.assertEqual({row["arm"] for row in cell}, set(V8_D2_QUALIFICATION_ARMS))
+            observed_orders = {
+                tuple(
+                    row["arm"] for row in schedule
+                    if row["writer"] == writer and row["workload"] == workload and row["repetition"] == repetition
+                )
+                for repetition in range(1, 6)
+            }
+            self.assertEqual(observed_orders, set(V8_D2_QUALIFICATION_ORDERS))
+
+        for row in schedule:
+            if row["arm"] == "v7_parallel":
+                self.assertEqual(row["format_version"], 7)
+                self.assertIsNone(row["v8_profile"])
+                self.assertIsNone(row["coalesce_target_policy"])
+            elif row["arm"] == "v8_legacy":
+                self.assertEqual(row["format_version"], 8)
+                self.assertEqual(row["v8_profile"], "legacy")
+                self.assertEqual(row["coalesce_target_policy"], "disabled")
+            elif row["arm"] == "v8_candidate_dynamic":
+                self.assertEqual(row["format_version"], 8)
+                self.assertEqual(row["v8_profile"], "candidate")
+                self.assertEqual(row["coalesce_target_policy"], "disabled")
+            else:
+                self.assertEqual(row["arm"], "v8_candidate_target8")
+                self.assertEqual(row["format_version"], 8)
+                self.assertEqual(row["v8_profile"], "candidate")
+                self.assertEqual(row["coalesce_target_policy"], "point_only")
+                self.assertEqual(row["coalescing_ready_target"], 8)
+
+        plan = build_v8_d2_qualification_plan(
+            machine_type="c4-standard-16-lssd",
+            machine_spec=BENCH.MACHINE_SPECS["c4-standard-16-lssd"],
+            commit="a" * 40,
+            binary_sha256="b" * 64,
+        )
+        self.assertEqual(plan["suite"], "v8-d2-qualification")
+        self.assertEqual(plan["runs_planned"], 80)
+        self.assertEqual(plan["score_runs_planned"], 80)
+        self.assertEqual(plan["arms"], list(V8_D2_QUALIFICATION_ARMS))
+
+        legacy_point = next(
+            row for row in schedule if row["arm"] == "v8_legacy" and row["workload"] == "point"
+        )
+        cand_dyn_point = next(
+            row for row in schedule if row["arm"] == "v8_candidate_dynamic" and row["workload"] == "point"
+        )
+        cand_t8_batch = next(
+            row for row in schedule if row["arm"] == "v8_candidate_target8" and row["workload"] == "batch64"
+        )
+        self.assertIn(
+            "TOYKV_WAL_V8_PROFILE=legacy\n",
+            progress_ring_runner._v8_d2_qualification_environment_text(legacy_point),
+        )
+        self.assertIn(
+            "TOYKV_WAL_V8_COALESCING=dynamic\n",
+            progress_ring_runner._v8_d2_qualification_environment_text(legacy_point),
+        )
+        self.assertIn(
+            "TOYKV_WAL_V8_PROFILE=candidate\n",
+            progress_ring_runner._v8_d2_qualification_environment_text(cand_dyn_point),
+        )
+        self.assertIn(
+            "TOYKV_WAL_V8_COALESCING=dynamic\n",
+            progress_ring_runner._v8_d2_qualification_environment_text(cand_dyn_point),
+        )
+        self.assertIn(
+            "TOYKV_WAL_V8_COALESCING=point-target8\n",
+            progress_ring_runner._v8_d2_qualification_environment_text(cand_t8_batch),
+        )
+
+        # Reject Batch64 target hits under point_only policy
+        bad_batch_raw = self._raw_record(cand_t8_batch)
+        bad_batch_raw["result"]["wal_pipeline"]["wal_io_end"]["coalesce_target_initial_hits"] = 1
+        with self.assertRaises(ValueError):
+            progress_ring_runner._validate_point_preallocation_record(bad_batch_raw, cand_t8_batch)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            results = self._make_fixture(Path(temporary), v8_d2_qualification=True)
+            verification = progress_ring_runner.verify_v8_d2_qualification_results_directory(results)
+            self.assertTrue(verification["verified"], verification["errors"])
+            self.assertEqual(verification["planned"], 80)
+            self.assertEqual(verification["observed"], 80)
+            self.assertTrue(BENCH._verify_result_set(results)["verified"])
+            summary = json.loads((results / "summary.json").read_text(encoding="utf-8"))
+            self.assertTrue(summary["complete"])
+            self.assertEqual(summary["runs_completed"], 80)
+            self.assertEqual(summary["runs_attempted"], 80)
+            summary["comparison"][0]["arms"]["v8_candidate_target8"]["puts_per_second"] += 1
+            (results / "summary.json").write_text(json.dumps(summary), encoding="utf-8")
+            verification = progress_ring_runner.verify_v8_d2_qualification_results_directory(results)
+            self.assertFalse(verification["verified"])
+            self.assertTrue(any("comparison differs" in error for error in verification["errors"]))
 
     def test_run_suite_rejects_retired_candidate_modes(self) -> None:
         for mode in sorted(progress_ring_runner.RETIRED_CANDIDATE_MODES):
@@ -2875,6 +3020,38 @@ class PointProgressRingQualificationTests(unittest.TestCase):
 
 
 class GcpFreeTrialWalBenchTests(unittest.TestCase):
+    def test_v8_d2_qualification_preflight_and_remote_runner_validation(self) -> None:
+        common = [
+            "--project", "test-project", "--zone", "us-central1-b", "--commit", "a" * 40,
+            "--machine-type", "c4-standard-16-lssd", "--writers", "1", "8", "16",
+            "--v8-d2-qualification", "--ssh-source-range", "192.0.2.1/32",
+            "--max-runtime-minutes", "60", "--estimated-hourly-cost-usd", "1.50",
+            "--max-estimated-spend-usd", "2", "--preflight-only",
+        ]
+        args = BENCH.parse_args([*common, "--network", "d2-isolated", "--subnet", "d2-subnet"])
+        self.assertEqual(args.writers, V8_D2_QUALIFICATION_WRITERS)
+        self.assertEqual(args.num, V8_D2_QUALIFICATION_NUM)
+        self.assertTrue(args.v8_d2_qualification)
+        for suffix in (
+            ["--network", "default", "--subnet", "default"],
+            ["--network", "d2-isolated"],
+            ["--writers", "8", "16"],
+            ["--num", "99999"],
+        ):
+            with self.subTest(suffix=suffix), redirect_stderr(StringIO()), self.assertRaises(SystemExit):
+                BENCH.parse_args([*common, *suffix])
+
+        remote_script = Path(__file__).with_name("gcp-free-trial-wal-bench-remote.sh")
+        environment = {**os.environ, "TOYKV_GCP_BENCH_VALIDATE_ONLY": "1"}
+        valid = [
+            "bash", str(remote_script), "a" * 40, str(V8_D2_QUALIFICATION_NUM), "test-project",
+            "us-central1-b", "wal-test", "4102444800", "c4-standard-16-lssd", "1,8,16",
+            "v8-d2-qualification", "-", "-",
+        ]
+        accepted = subprocess.run(valid, cwd=Path(__file__).resolve().parents[1], env=environment,
+                                  capture_output=True, text=True, timeout=5)
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+
     def test_v7_v8_ready_target_final_preflight_requires_fixed_isolated_matrix(self) -> None:
         common = [
             "--project", "test-project", "--zone", "us-central1-b", "--commit", "a" * 40,
