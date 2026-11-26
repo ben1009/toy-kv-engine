@@ -1434,7 +1434,6 @@ enum WalV8ExtentPolicy {
 enum WalV8ExtentPreparationStrategy {
     FallocateOnly,
     Lookahead,
-    #[cfg(feature = "bench")]
     PointOnlyLookahead,
 }
 
@@ -1444,14 +1443,7 @@ impl WalV8ExtentPreparationStrategy {
     }
 
     const fn is_point_only(self) -> bool {
-        #[cfg(feature = "bench")]
-        {
-            matches!(self, Self::PointOnlyLookahead)
-        }
-        #[cfg(not(feature = "bench"))]
-        {
-            false
-        }
+        matches!(self, Self::PointOnlyLookahead)
     }
 }
 
@@ -1517,7 +1509,6 @@ impl WalV8ExtentPreallocator {
         )
     }
 
-    #[cfg(feature = "bench")]
     fn new_with_point_only_lookahead(
         data_file: File,
         sync_file: &File,
@@ -1533,7 +1524,6 @@ impl WalV8ExtentPreallocator {
             max_file_size,
             window_bytes,
             Some(reservation_owner),
-            #[cfg(feature = "bench")]
             WalV8ExtentPreparationStrategy::PointOnlyLookahead,
         )
     }
@@ -5003,17 +4993,30 @@ impl WalV8LeaderWriter {
             if let Some(owner) = &self.reservation_owner
                 && eligible
             {
-                Some(Arc::new(WalV8ExtentPreallocator::new_with_lookahead(
-                    worker_file
-                        .try_clone()
-                        .context("clone v8 WAL handle for production extent preparation")?,
-                    &self.sync_file,
-                    self.coordinator.last_frontier_end(),
-                    self.max_file_size,
-                    WAL_V8_PRODUCTION_EXTENT_WINDOW_BYTES,
-                    Some(Arc::clone(owner)),
-                    lookahead,
-                )?))
+                let cloned_worker = worker_file
+                    .try_clone()
+                    .context("clone v8 WAL handle for production extent preparation")?;
+                let preallocator = if lookahead {
+                    WalV8ExtentPreallocator::new_with_point_only_lookahead(
+                        cloned_worker,
+                        &self.sync_file,
+                        self.coordinator.last_frontier_end(),
+                        self.max_file_size,
+                        WAL_V8_PRODUCTION_EXTENT_WINDOW_BYTES,
+                        Arc::clone(owner),
+                    )?
+                } else {
+                    WalV8ExtentPreallocator::new_with_lookahead(
+                        cloned_worker,
+                        &self.sync_file,
+                        self.coordinator.last_frontier_end(),
+                        self.max_file_size,
+                        WAL_V8_PRODUCTION_EXTENT_WINDOW_BYTES,
+                        Some(Arc::clone(owner)),
+                        false,
+                    )?
+                };
+                Some(Arc::new(preallocator))
             } else {
                 None
             }
@@ -7665,7 +7668,6 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(feature = "bench")]
     #[test]
     fn point_only_lookahead_keeps_batches_on_fallocate_path() -> Result<()> {
         const SEGMENT_LIMIT: u64 = 1024 * 1024;
@@ -7693,6 +7695,7 @@ mod tests {
 
         let point_state = point_fixture.preallocator.state.lock();
         assert_eq!(point_state.prepared_end, point_fixture.window_end);
+        #[cfg(feature = "bench")]
         assert_eq!(point_state.initialized_bytes, WINDOW_BYTES);
         assert_eq!(
             point_state.extent_policies.get(point_fixture.start_offset),
@@ -7726,6 +7729,7 @@ mod tests {
 
         let batch_state = batch_fixture.preallocator.state.lock();
         assert_eq!(batch_state.prepared_end, batch_fixture.window_end);
+        #[cfg(feature = "bench")]
         assert_eq!(batch_state.initialized_bytes, 0);
         assert_eq!(
             batch_state.extent_policies.get(batch_fixture.start_offset),
@@ -7754,6 +7758,50 @@ mod tests {
             Some(WalV8ExtentPolicy::FallocateOnly)
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn point_only_lookahead_respects_extent_window_boundaries_for_mixed_writes() -> Result<()> {
+        const SEGMENT_LIMIT: u64 = 1024 * 1024;
+        const WINDOW_BYTES: u64 = WAL_V8_EXTENT_PREPARATION_CHUNK_BYTES as u64;
+
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("point-only-mixed-boundary-v8.wal");
+        let fixture = point_only_extent_preallocator_fixture(&path, SEGMENT_LIMIT, WINDOW_BYTES)?;
+        let window0_start = fixture.start_offset;
+        let window1_start = window0_start + WINDOW_BYTES;
+
+        // Window 0 receives a single-frame Point write -> Lookahead (initialized).
+        fixture.preallocator.register_data_range(
+            window0_start,
+            window0_start + FRAME_LEN_U64,
+            WalV8WriteClass::Point,
+            FRAME_LEN_U64,
+        )?;
+        // Window 1 receives a Batch write -> FallocateOnly (not initialized).
+        fixture.preallocator.register_data_range(
+            window1_start,
+            window1_start + FRAME_LEN_U64,
+            WalV8WriteClass::Batch,
+            FRAME_LEN_U64,
+        )?;
+        fixture
+            .preallocator
+            .ensure_prepared_through(window1_start + FRAME_LEN_U64)?;
+
+        let state = fixture.preallocator.state.lock();
+        assert_eq!(state.prepared_end, window1_start + WINDOW_BYTES);
+        #[cfg(feature = "bench")]
+        assert_eq!(state.initialized_bytes, WINDOW_BYTES);
+        assert_eq!(
+            state.extent_policies.get(window0_start),
+            Some(WalV8ExtentPolicy::Lookahead)
+        );
+        assert_eq!(
+            state.extent_policies.get(window1_start),
+            Some(WalV8ExtentPolicy::FallocateOnly)
+        );
         Ok(())
     }
 
@@ -9598,7 +9646,6 @@ mod tests {
         })
     }
 
-    #[cfg(feature = "bench")]
     fn point_only_extent_preallocator_fixture(
         path: &Path,
         max_file_size: u64,
