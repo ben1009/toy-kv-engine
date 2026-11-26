@@ -5635,6 +5635,14 @@ impl WalV8ParallelWriter {
         self.coordinator.progress_ring_enabled()
     }
 
+    #[cfg(test)]
+    pub(crate) fn uses_cursor_direct_completion(&self) -> bool {
+        self.coordinator.progress_cursor_enabled()
+            && self.io.direct_completions.is_some()
+            && self.io.completion_events.is_none()
+            && self.io.completion_thread.lock().is_none()
+    }
+
     #[cfg(feature = "bench")]
     pub(crate) fn io_diagnostics(&self) -> WalIoDiagnostics {
         let mut diagnostics = self.io_diagnostics;
@@ -11613,11 +11621,14 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn coalescing_progress_ring_refreshes_snapshot_after_wake_and_timeout_final_scan() -> Result<()>
-    {
+    fn run_coalescing_snapshot_refresh_case(
+        filename: &str,
+        budget: Duration,
+        drop_token_before_wait: bool,
+        expected_wait: WalV8ProgressTokenWait,
+    ) -> Result<()> {
         let directory = tempfile::tempdir()?;
-        let path = directory.path().join("coalesce-snapshot-refresh-v8.wal");
+        let path = directory.path().join(filename);
         let wal_header = header();
         let installed = install_empty(&path, wal_header)?;
         let writer = match open_parallel_with_direct_completion(
@@ -11672,24 +11683,73 @@ mod tests {
         assert_eq!(snapshot.ready_prefix.len(), 1);
         assert_eq!(snapshot.admitted_ticket_count, 2);
 
-        // Complete ticket 1 without signaling a progress token so the coalesce
-        // wait times out and must refresh the snapshot on the final scan.
-        writer.coordinator.mark_data_group_complete(1..2)?;
+        let wait_outcomes = Arc::new(Mutex::new(Vec::new()));
+        let injected = Arc::new(AtomicBool::new(false));
+        writer.io.set_progress_wait_hook(Arc::new({
+            let coordinator = writer.coordinator.clone();
+            let io = Arc::clone(&writer.io);
+            let wait_outcomes = Arc::clone(&wait_outcomes);
+            let injected = Arc::clone(&injected);
+            move |event| match event {
+                WalV8ProgressWaitTestEvent::BeforeWait => {
+                    if !injected.swap(true, Ordering::AcqRel) {
+                        coordinator
+                            .mark_data_group_complete(1..2)
+                            .expect("mark ticket 1 complete for coalescing refresh test");
+                        if drop_token_before_wait {
+                            if let Some(tokens) = io.progress_tokens.as_ref() {
+                                while tokens.try_recv().is_ok() {}
+                            }
+                        } else {
+                            coordinator
+                                .worker_completion_handle()
+                                .notify_completion_queued()
+                                .expect("signal progress token for coalescing refresh test");
+                        }
+                    }
+                }
+                WalV8ProgressWaitTestEvent::AfterWait(status) => {
+                    wait_outcomes.lock().push(status);
+                }
+            }
+        }));
+
         let waited = writer.io.coalesce_progress_ring(
             &mut driver,
             &mut snapshot,
-            Duration::from_millis(5),
+            budget,
             false,
             #[cfg(feature = "bench")]
             None,
         )?;
         assert!(waited);
+        assert_eq!(wait_outcomes.lock().as_slice(), &[expected_wait]);
         assert_eq!(snapshot.ready_prefix.len(), 2);
 
         drop(driver);
         drop(first_job);
         drop(second_job);
         Ok(())
+    }
+
+    #[test]
+    fn coalescing_progress_ring_refreshes_snapshot_after_token_wake() -> Result<()> {
+        run_coalescing_snapshot_refresh_case(
+            "coalesce-token-wake-v8.wal",
+            Duration::from_secs(5),
+            false,
+            WalV8ProgressTokenWait::Signaled,
+        )
+    }
+
+    #[test]
+    fn coalescing_progress_ring_refreshes_snapshot_on_timeout_final_scan() -> Result<()> {
+        run_coalescing_snapshot_refresh_case(
+            "coalesce-timeout-final-scan-v8.wal",
+            Duration::from_millis(5),
+            true,
+            WalV8ProgressTokenWait::TimedOut,
+        )
     }
 
     #[cfg(feature = "bench")]

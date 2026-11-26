@@ -4418,6 +4418,13 @@ impl MemTable {
         self.wal_v8_source || self.wal.as_ref().is_some_and(Wal::is_v8)
     }
 
+    #[cfg(test)]
+    pub(crate) fn uses_v8_cursor_direct_completion(&self) -> bool {
+        self.wal
+            .as_ref()
+            .is_some_and(Wal::uses_v8_cursor_direct_completion)
+    }
+
     /// Capture both the canonical empty floor and the writer's latest v7
     /// frontier. The caller must have stopped commit admission and synced the
     /// WAL before using the returned active boundary as manifest authority.

@@ -40493,6 +40493,7 @@ mod tests {
 
             let first_memtable = engine.inner.state.load().memtable.clone();
             assert!(first_memtable.uses_v8_wal());
+            assert!(first_memtable.uses_v8_cursor_direct_completion());
             #[cfg(feature = "bench")]
             assert!(
                 first_memtable
@@ -40509,6 +40510,7 @@ mod tests {
 
             let second_memtable = engine.inner.state.load().memtable.clone();
             assert!(second_memtable.uses_v8_wal());
+            assert!(second_memtable.uses_v8_cursor_direct_completion());
             assert!(!Arc::ptr_eq(&first_memtable, &second_memtable));
             #[cfg(feature = "bench")]
             assert!(
@@ -40531,6 +40533,14 @@ mod tests {
             options.pitr_repository = Some(repository);
             let reopened =
                 KvEngine::open_with_wal_io_mode(&database, options, WalIoMode::Parallel)?;
+            assert!(
+                reopened
+                    .inner
+                    .state
+                    .load()
+                    .memtable
+                    .uses_v8_cursor_direct_completion()
+            );
             #[cfg(feature = "bench")]
             assert!(
                 reopened

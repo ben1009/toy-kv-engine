@@ -2188,6 +2188,13 @@ impl Wal {
             .is_some_and(v8::leader::WalV8ParallelWriter::progress_ring_enabled)
     }
 
+    #[cfg(test)]
+    pub(crate) fn uses_v8_cursor_direct_completion(&self) -> bool {
+        self.v8_parallel
+            .as_ref()
+            .is_some_and(v8::leader::WalV8ParallelWriter::uses_cursor_direct_completion)
+    }
+
     pub(crate) fn pitr_rotation_needed(&self) -> bool {
         self.pitr_rotation_needed.load(Ordering::Acquire)
     }
