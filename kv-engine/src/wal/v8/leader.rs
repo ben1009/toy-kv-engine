@@ -438,12 +438,18 @@ impl WalV8FrontierWriteMode {
     }
 
     fn from_value(value: Option<&OsStr>) -> Result<Self> {
-        match value.and_then(OsStr::to_str) {
-            None | Some("buffered") => Ok(Self::Buffered),
-            Some("direct") => Ok(Self::Direct),
-            Some(value) => anyhow::bail!(
-                "invalid TOYKV_WAL_V8_FRONTIER_MODE {value:?}; expected `buffered` or `direct`"
-            ),
+        match value {
+            None => Ok(Self::Buffered),
+            Some(value) => match value.to_str() {
+                Some("buffered") => Ok(Self::Buffered),
+                Some("direct") => Ok(Self::Direct),
+                Some(value) => anyhow::bail!(
+                    "invalid TOYKV_WAL_V8_FRONTIER_MODE {value:?}; expected `buffered` or `direct`"
+                ),
+                None => anyhow::bail!(
+                    "TOYKV_WAL_V8_FRONTIER_MODE is not valid UTF-8; expected `buffered` or `direct`"
+                ),
+            },
         }
     }
 }
@@ -7918,6 +7924,8 @@ mod tests {
             WalV8FrontierWriteMode::Direct
         );
         assert!(WalV8FrontierWriteMode::from_value(Some(OsStr::new("invalid"))).is_err());
+        let non_utf8 = std::os::unix::ffi::OsStrExt::from_bytes(b"\xff");
+        assert!(WalV8FrontierWriteMode::from_value(Some(non_utf8)).is_err());
     }
 
     #[cfg(feature = "bench")]
@@ -8596,8 +8604,10 @@ mod tests {
                 LIVE_WAL_V5_LIMITS,
                 MAX_WAL_FILE_SIZE,
             )?;
+            let requested_direct_frontier =
+                std::env::var(CHILD_FRONTIER_MODE_ENV).as_deref() == Ok("direct");
             #[cfg(feature = "bench")]
-            let writer = if std::env::var(CHILD_FRONTIER_MODE_ENV).as_deref() == Ok("direct")
+            let writer = if requested_direct_frontier
                 || std::env::var_os(EXTENT_PREPARATION_ENV).is_some()
             {
                 let worker_file = OpenOptions::new()
@@ -8656,7 +8666,21 @@ mod tests {
                 );
             }
             #[cfg(not(feature = "bench"))]
-            let writer = open_writer(wal_path, &installed)?.into_parallel()?;
+            let writer = if requested_direct_frontier {
+                let worker_file = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .custom_flags(libc::O_DIRECT)
+                    .open(wal_path)?;
+                open_writer(wal_path, &installed)?.into_parallel_with_worker_file(worker_file)?
+            } else {
+                open_writer(wal_path, &installed)?.into_parallel()?
+            };
+            assert_eq!(
+                writer.uses_direct_frontier()?,
+                requested_direct_frontier,
+                "child writer must use the requested FRONTIER mode"
+            );
             #[cfg(feature = "bench")]
             {
                 let requested = std::env::var(WAL_V8_POINT_PROGRESS_RING_ENV)?;
@@ -8731,6 +8755,21 @@ mod tests {
                     let ack_path = directory.path().join("acknowledged");
                     let marker_path = directory.path().join("crash.marker");
                     let anchor = create_empty_active(&wal_path, header())?;
+                    if frontier_mode == "direct"
+                        && let Err(error) = OpenOptions::new()
+                            .read(true)
+                            .write(true)
+                            .custom_flags(libc::O_DIRECT)
+                            .open(&wal_path)
+                    {
+                        if error.raw_os_error() == Some(libc::EINVAL) {
+                            eprintln!(
+                                "skipping {crash_point} in direct mode (O_DIRECT unsupported on test fs): {error}"
+                            );
+                            continue;
+                        }
+                        return Err(error.into());
+                    }
 
                     let mut child = Command::new(std::env::current_exe()?);
                     child
