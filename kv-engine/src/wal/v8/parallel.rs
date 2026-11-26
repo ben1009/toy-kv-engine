@@ -22,7 +22,7 @@ use anyhow::{Context, Result, ensure};
 use crossbeam_channel::{Receiver, Sender};
 use parking_lot::{Condvar, Mutex};
 
-use crate::{pitr::RecordedAt, wal::MAX_WAL_FILE_SIZE};
+use crate::{pitr::RecordedAt, wal::MAX_WAL_FILE_SIZE, wal::v8::prepare::WalV8WriteClass};
 
 #[cfg(feature = "bench")]
 use crate::wal::WalV8ProgressDiagnostics;
@@ -472,6 +472,7 @@ struct CoordinatorState {
     reserved_bytes: u64,
     reserved_preparation_bytes: u64,
     tickets: VecDeque<TicketState>,
+    outstanding_batch_tickets: usize,
     pending_frontier: Option<WalV8FrontierReservation>,
     last_frontier_end: u64,
     /// Tickets whose DATA was allocated before the previous FRONTIER marker.
@@ -844,6 +845,7 @@ impl WalV8ReadyPrefix {
 pub(crate) struct WalV8FrontierReadySnapshot {
     pub(crate) ready_prefix: WalV8ReadyPrefix,
     pub(crate) admitted_ticket_count: usize,
+    pub(crate) has_outstanding_batch_tickets: bool,
     pub(crate) closed: bool,
     #[cfg(feature = "bench")]
     pub(crate) frames_ready_prefix_count: usize,
@@ -1181,6 +1183,7 @@ impl WalV8ParallelCoordinator {
                     reserved_bytes: 0,
                     reserved_preparation_bytes: 0,
                     tickets,
+                    outstanding_batch_tickets: 0,
                     pending_frontier: None,
                     last_frontier_end: config.next_data_offset,
                     last_frontier_ticket_end: config.next_ticket,
@@ -2621,7 +2624,11 @@ impl WalV8ParallelCoordinator {
             return Err(error).context("retire v8 progress ring durable prefix");
         }
         for _ in 0..ticket_count {
-            state.tickets.pop_front();
+            if let Some(retired) = state.tickets.pop_front()
+                && retired.plan.write_class == WalV8WriteClass::Batch
+            {
+                state.outstanding_batch_tickets = state.outstanding_batch_tickets.saturating_sub(1);
+            }
         }
         #[cfg(feature = "bench")]
         if let (Some(cursor), Some(data_bytes)) =
@@ -3352,6 +3359,7 @@ impl WalV8AdmissionPublisher for WalV8ParallelCoordinator {
             return Err(error).context("initialize v8 progress ring admission slot");
         }
 
+        let is_batch_ticket = plan.write_class == WalV8WriteClass::Batch;
         state.tickets.push_back(TicketState {
             assignment,
             plan,
@@ -3369,6 +3377,9 @@ impl WalV8AdmissionPublisher for WalV8ParallelCoordinator {
             #[cfg(feature = "bench")]
             data_completion_hol_started_at: None,
         });
+        if is_batch_ticket {
+            state.outstanding_batch_tickets += 1;
+        }
         state.next_ticket = next_ticket;
         state.next_data_offset = data_end;
         state.last_commit_ts = plan.commit_ts;
@@ -3544,6 +3555,7 @@ fn empty_frontier_ready_snapshot() -> WalV8FrontierReadySnapshot {
     WalV8FrontierReadySnapshot {
         ready_prefix: WalV8ReadyPrefix::Tickets(Vec::new()),
         admitted_ticket_count: 0,
+        has_outstanding_batch_tickets: false,
         closed: false,
         #[cfg(feature = "bench")]
         frames_ready_prefix_count: 0,
@@ -3601,6 +3613,7 @@ fn frontier_ready_snapshot_locked(
         return Ok(snapshot);
     }
     snapshot.admitted_ticket_count = state.tickets.len();
+    snapshot.has_outstanding_batch_tickets = state.outstanding_batch_tickets > 0;
     if inner.progress_ring.is_none() {
         snapshot.ready_prefix = WalV8ReadyPrefix::Tickets(
             state
@@ -3709,6 +3722,7 @@ fn cursor_frontier_snapshot_locked(
         data_bytes: cursor.data_bytes,
     };
     snapshot.admitted_ticket_count = state.tickets.len();
+    snapshot.has_outstanding_batch_tickets = state.outstanding_batch_tickets > 0;
     snapshot.closed = state.closed;
     enforce_frontier_ticket_floor(state, &mut snapshot);
     Ok(snapshot)

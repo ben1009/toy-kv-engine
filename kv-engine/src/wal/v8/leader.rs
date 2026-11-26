@@ -711,6 +711,85 @@ fn wal_v8_extent_lookahead_from_environment() -> Result<bool> {
     wal_v8_extent_lookahead_from_value(std::env::var_os(WAL_V8_EXTENT_LOOKAHEAD_ENV).as_deref())
 }
 
+/// Opt-in V8 WAL configuration profile.
+/// Production defaults to [`WalV8Profile::Legacy`] until Phase D qualification.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum WalV8Profile {
+    #[default]
+    Legacy,
+    Candidate,
+}
+
+impl WalV8Profile {
+    fn from_value(value: Option<&OsStr>) -> Result<Self> {
+        match value {
+            None => Ok(Self::Legacy),
+            Some(value) => match value.to_str() {
+                Some("legacy") => Ok(Self::Legacy),
+                Some("candidate") => Ok(Self::Candidate),
+                Some(value) => anyhow::bail!(
+                    "invalid TOYKV_WAL_V8_PROFILE {value:?}; expected `legacy` or `candidate`"
+                ),
+                None => anyhow::bail!(
+                    "TOYKV_WAL_V8_PROFILE is not valid UTF-8; expected `legacy` or `candidate`"
+                ),
+            },
+        }
+    }
+
+    fn from_environment() -> Result<Self> {
+        Self::from_value(std::env::var_os("TOYKV_WAL_V8_PROFILE").as_deref())
+    }
+}
+
+/// Coalescing early-exit target policy for Cursor durability cycles.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum WalV8CoalesceTargetPolicy {
+    #[default]
+    Disabled,
+    #[cfg(feature = "bench")]
+    Always(usize),
+    PointOnly(usize),
+}
+
+impl WalV8CoalesceTargetPolicy {
+    fn target_for_snapshot(self, snapshot: &WalV8FrontierReadySnapshot) -> Option<usize> {
+        match self {
+            Self::Disabled => None,
+            #[cfg(feature = "bench")]
+            Self::Always(target) => Some(target),
+            Self::PointOnly(target) => (!snapshot.has_outstanding_batch_tickets).then_some(target),
+        }
+    }
+
+    fn target_count(self) -> Option<usize> {
+        match self {
+            Self::Disabled => None,
+            #[cfg(feature = "bench")]
+            Self::Always(target) => Some(target),
+            Self::PointOnly(target) => Some(target),
+        }
+    }
+}
+
+#[cfg(feature = "bench")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WalV8BenchExtentOverride {
+    Disabled,
+    Mode(WalExtentPreparationMode, u64),
+}
+
+#[cfg(feature = "bench")]
+fn bench_extent_override_from_environment() -> Result<Option<WalV8BenchExtentOverride>> {
+    if let Some(value) = std::env::var_os(WAL_V8_EXTENT_PREPARATION_ENV)
+        && matches!(value.to_str(), Some("none" | "disabled"))
+    {
+        return Ok(Some(WalV8BenchExtentOverride::Disabled));
+    }
+    Ok(WalExtentPreparationMode::from_environment()?
+        .map(|(m, b)| WalV8BenchExtentOverride::Mode(m, b)))
+}
+
 /// Effective extent preparation policy resolved for one V8 WAL instance.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum WalV8ExtentPreparationPolicy {
@@ -730,17 +809,17 @@ pub(crate) enum WalV8ExtentPreparationPolicy {
 /// across automatic and PITR WAL rotations without on-disk serialization.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct WalV8RequestedConfig {
+    pub(crate) profile: WalV8Profile,
     pub(crate) progress_mode: WalV8ProgressMode,
     pub(crate) direct_completion_enabled: bool,
     pub(crate) frontier_mode: WalV8FrontierWriteMode,
     pub(crate) extent_lookahead: bool,
     pub(crate) point_buffer_preallocation_enabled: bool,
+    pub(crate) coalesce_policy: WalV8CoalesceTargetPolicy,
     #[cfg(feature = "bench")]
     progress_counters_enabled: bool,
     #[cfg(feature = "bench")]
-    coalesce_ready_target: Option<usize>,
-    #[cfg(feature = "bench")]
-    extent_preparation: Option<(WalExtentPreparationMode, u64)>,
+    extent_preparation: Option<WalV8BenchExtentOverride>,
     #[cfg(feature = "bench")]
     extent_policy_storage: WalV8ExtentPolicyStorageKind,
     #[cfg(feature = "bench")]
@@ -755,15 +834,15 @@ pub(crate) struct WalV8RequestedConfig {
 impl Default for WalV8RequestedConfig {
     fn default() -> Self {
         Self {
+            profile: WalV8Profile::Legacy,
             progress_mode: WalV8ProgressMode::default(),
             direct_completion_enabled: false,
             frontier_mode: WalV8FrontierWriteMode::default(),
             extent_lookahead: false,
             point_buffer_preallocation_enabled: false,
+            coalesce_policy: WalV8CoalesceTargetPolicy::Disabled,
             #[cfg(feature = "bench")]
             progress_counters_enabled: false,
-            #[cfg(feature = "bench")]
-            coalesce_ready_target: None,
             #[cfg(feature = "bench")]
             extent_preparation: None,
             #[cfg(feature = "bench")]
@@ -779,35 +858,114 @@ impl Default for WalV8RequestedConfig {
 }
 
 impl WalV8RequestedConfig {
+    /// Construct the opt-in Phase C candidate profile (`Cursor`, Direct
+    /// completion, Direct FRONTIER with Buffered fallback, Point-only 1 MiB
+    /// lookahead when eligible, Stage A on, Dynamic + Point-only Target8).
+    #[allow(clippy::needless_update)]
+    pub(crate) fn candidate() -> Self {
+        Self {
+            profile: WalV8Profile::Candidate,
+            progress_mode: WalV8ProgressMode::Cursor,
+            direct_completion_enabled: true,
+            frontier_mode: WalV8FrontierWriteMode::Direct,
+            extent_lookahead: false,
+            point_buffer_preallocation_enabled: true,
+            coalesce_policy: WalV8CoalesceTargetPolicy::PointOnly(8),
+            ..Self::default()
+        }
+    }
+
     /// Parse V8 WAL configuration from environment variables and test overrides.
     pub(crate) fn from_environment() -> Result<Self> {
-        #[cfg(feature = "bench")]
-        let progress_mode = progress_mode_from_environment()?;
-        #[cfg(not(feature = "bench"))]
-        let progress_mode = production_progress_mode_from_environment()?;
+        let profile = WalV8Profile::from_environment()?;
+        let base = match profile {
+            WalV8Profile::Legacy => Self::default(),
+            WalV8Profile::Candidate => Self::candidate(),
+        };
+
+        let test_override_active = {
+            #[cfg(test)]
+            {
+                WAL_V8_TEST_MODE_OVERRIDE
+                    .with(std::cell::Cell::get)
+                    .is_some()
+            }
+            #[cfg(not(test))]
+            {
+                false
+            }
+        };
 
         #[cfg(feature = "bench")]
-        let direct_completion_enabled =
-            cursor_direct_completion_enabled_from_environment(progress_mode)?;
+        let progress_mode =
+            if std::env::var_os(WAL_V8_POINT_PROGRESS_RING_ENV).is_some() || test_override_active {
+                progress_mode_from_environment()?
+            } else {
+                base.progress_mode
+            };
         #[cfg(not(feature = "bench"))]
-        let direct_completion_enabled =
-            production_direct_completion_enabled_from_environment(progress_mode)?;
+        let progress_mode =
+            if std::env::var_os(WAL_V8_PROGRESS_MODE_ENV).is_some() || test_override_active {
+                production_progress_mode_from_environment()?
+            } else {
+                base.progress_mode
+            };
 
-        let frontier_mode = WalV8FrontierWriteMode::from_environment()?;
+        #[cfg(feature = "bench")]
+        let direct_completion_enabled = if std::env::var_os(WAL_V8_CURSOR_DIRECT_COMPLETION_ENV)
+            .is_some()
+            || test_override_active
+        {
+            cursor_direct_completion_enabled_from_environment(progress_mode)?
+        } else {
+            base.direct_completion_enabled && progress_mode == WalV8ProgressMode::Cursor
+        };
+        #[cfg(not(feature = "bench"))]
+        let direct_completion_enabled = if test_override_active {
+            production_direct_completion_enabled_from_environment(progress_mode)?
+        } else {
+            base.direct_completion_enabled && progress_mode == WalV8ProgressMode::Cursor
+        };
+
+        let frontier_mode = if std::env::var_os("TOYKV_WAL_V8_FRONTIER_MODE").is_some() {
+            WalV8FrontierWriteMode::from_environment()?
+        } else {
+            base.frontier_mode
+        };
         let extent_lookahead = wal_v8_extent_lookahead_from_environment()?;
 
         #[cfg(feature = "bench")]
-        let point_buffer_preallocation_enabled = point_buffer_preallocation_from_environment()?;
+        let point_buffer_preallocation_enabled =
+            if std::env::var_os("TOYKV_BENCH_V8_POINT_BUFFER_PREALLOC").is_some() {
+                point_buffer_preallocation_from_environment()?
+            } else {
+                base.point_buffer_preallocation_enabled
+            };
         #[cfg(not(feature = "bench"))]
-        let point_buffer_preallocation_enabled = false;
+        let point_buffer_preallocation_enabled = base.point_buffer_preallocation_enabled;
+
+        #[cfg(feature = "bench")]
+        let coalesce_policy = if let Some(target) =
+            coalesce_ready_target_from_environment(progress_mode, direct_completion_enabled)?
+        {
+            WalV8CoalesceTargetPolicy::Always(target)
+        } else if progress_mode == WalV8ProgressMode::Cursor && direct_completion_enabled {
+            base.coalesce_policy
+        } else {
+            WalV8CoalesceTargetPolicy::Disabled
+        };
+        #[cfg(not(feature = "bench"))]
+        let coalesce_policy =
+            if progress_mode == WalV8ProgressMode::Cursor && direct_completion_enabled {
+                base.coalesce_policy
+            } else {
+                WalV8CoalesceTargetPolicy::Disabled
+            };
 
         #[cfg(feature = "bench")]
         let progress_counters_enabled = progress_counters_enabled_from_environment(progress_mode)?;
         #[cfg(feature = "bench")]
-        let coalesce_ready_target =
-            coalesce_ready_target_from_environment(progress_mode, direct_completion_enabled)?;
-        #[cfg(feature = "bench")]
-        let extent_preparation = WalExtentPreparationMode::from_environment()?;
+        let extent_preparation = bench_extent_override_from_environment()?;
         #[cfg(feature = "bench")]
         let extent_policy_storage = extent_policy_storage_kind_from_env()?;
         #[cfg(feature = "bench")]
@@ -816,19 +974,18 @@ impl WalV8RequestedConfig {
         #[cfg(feature = "bench")]
         let data_submit_ready_order = benchmark_submits_any_ready_ticket()?;
         #[cfg(feature = "bench")]
-        let point_direct_frame_enabled =
-            std::env::var_os("TOYKV_BENCH_V8_POINT_DIRECT_FRAME").is_some_and(|v| v == "1");
+        let point_direct_frame_enabled = point_direct_frame_from_environment()?;
 
         Ok(Self {
+            profile,
             progress_mode,
             direct_completion_enabled,
             frontier_mode,
             extent_lookahead,
             point_buffer_preallocation_enabled,
+            coalesce_policy,
             #[cfg(feature = "bench")]
             progress_counters_enabled,
-            #[cfg(feature = "bench")]
-            coalesce_ready_target,
             #[cfg(feature = "bench")]
             extent_preparation,
             #[cfg(feature = "bench")]
@@ -849,6 +1006,9 @@ impl WalV8RequestedConfig {
     ) -> Self {
         self.progress_mode = progress_mode;
         self.direct_completion_enabled = direct_completion_enabled;
+        if !(progress_mode == WalV8ProgressMode::Cursor && direct_completion_enabled) {
+            self.coalesce_policy = WalV8CoalesceTargetPolicy::Disabled;
+        }
         self
     }
 }
@@ -857,19 +1017,19 @@ impl WalV8RequestedConfig {
 /// and the actual worker file, filesystem, and quota owner of one WAL segment.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct WalV8EffectiveConfig {
+    pub(crate) profile: WalV8Profile,
     pub(crate) progress_mode: WalV8ProgressMode,
     pub(crate) direct_completion_enabled: bool,
     pub(crate) frontier_mode: WalV8FrontierWriteMode,
     pub(crate) extent_policy: WalV8ExtentPreparationPolicy,
     pub(crate) extent_window_bytes: u64,
     pub(crate) point_buffer_preallocation_enabled: bool,
+    pub(crate) coalesce_policy: WalV8CoalesceTargetPolicy,
     pub(crate) o_direct_worker: bool,
     pub(crate) ext_family_filesystem: bool,
     pub(crate) has_reservation_owner: bool,
     #[cfg(feature = "bench")]
     pub(crate) progress_counters_enabled: bool,
-    #[cfg(feature = "bench")]
-    pub(crate) coalesce_ready_target: Option<usize>,
     #[cfg(feature = "bench")]
     extent_policy_storage: WalV8ExtentPolicyStorageKind,
     #[cfg(feature = "bench")]
@@ -926,6 +1086,26 @@ impl WalV8EffectiveConfig {
             #[cfg(not(test))]
             let override_strategy: Option<(WalV8ExtentPreparationStrategy, u64)> = None;
 
+            let resolve_production_extent = || -> Result<(WalV8ExtentPreparationPolicy, u64)> {
+                let eligible = has_reservation_owner && ext_family_filesystem && o_direct_worker;
+                ensure!(
+                    !requested.extent_lookahead || eligible,
+                    "{WAL_V8_EXTENT_LOOKAHEAD_ENV} requires an ext4 WAL, an O_DIRECT DATA worker, and a quota owner"
+                );
+                if eligible {
+                    let policy = if requested.extent_lookahead {
+                        WalV8ExtentPreparationPolicy::Lookahead
+                    } else if requested.profile == WalV8Profile::Candidate {
+                        WalV8ExtentPreparationPolicy::PointOnlyLookahead
+                    } else {
+                        WalV8ExtentPreparationPolicy::FallocateOnly
+                    };
+                    Ok((policy, WAL_V8_PRODUCTION_EXTENT_WINDOW_BYTES))
+                } else {
+                    Ok((WalV8ExtentPreparationPolicy::Disabled, 0))
+                }
+            };
+
             if let Some((strategy, window_bytes)) = override_strategy {
                 ensure!(
                     has_reservation_owner,
@@ -945,90 +1125,72 @@ impl WalV8EffectiveConfig {
                 (policy, window_bytes)
             } else {
                 #[cfg(feature = "bench")]
-                if let Some((mode, bytes)) = requested.extent_preparation {
-                    let policy = match mode {
-                        WalExtentPreparationMode::SlidingLookahead => {
-                            ensure!(
-                                has_reservation_owner,
-                                "sliding lookahead benchmark requires PITR quota accounting"
-                            );
-                            WalV8ExtentPreparationPolicy::Lookahead
-                        }
-                        WalExtentPreparationMode::SlidingPointLookahead => {
-                            ensure!(
-                                has_reservation_owner,
-                                "point-only sliding lookahead benchmark requires PITR quota accounting"
-                            );
-                            WalV8ExtentPreparationPolicy::PointOnlyLookahead
-                        }
-                        WalExtentPreparationMode::SlidingFallocate => {
-                            WalV8ExtentPreparationPolicy::FallocateOnly
-                        }
-                        WalExtentPreparationMode::SlidingInitialize => {
-                            WalV8ExtentPreparationPolicy::SlidingInitialize
-                        }
-                        WalExtentPreparationMode::Fallocate => {
-                            WalV8ExtentPreparationPolicy::OneShotFallocate
-                        }
-                        WalExtentPreparationMode::Initialize => {
-                            WalV8ExtentPreparationPolicy::OneShotInitialize
-                        }
-                    };
-                    (policy, bytes)
-                } else {
-                    let eligible =
-                        has_reservation_owner && ext_family_filesystem && o_direct_worker;
-                    ensure!(
-                        !requested.extent_lookahead || eligible,
-                        "{WAL_V8_EXTENT_LOOKAHEAD_ENV} requires an ext4 WAL, an O_DIRECT DATA worker, and a quota owner"
-                    );
-                    if eligible {
-                        let policy = if requested.extent_lookahead {
-                            WalV8ExtentPreparationPolicy::Lookahead
-                        } else {
-                            WalV8ExtentPreparationPolicy::FallocateOnly
-                        };
-                        (policy, WAL_V8_PRODUCTION_EXTENT_WINDOW_BYTES)
-                    } else {
+                match requested.extent_preparation {
+                    Some(WalV8BenchExtentOverride::Disabled) => {
                         (WalV8ExtentPreparationPolicy::Disabled, 0)
+                    }
+                    Some(WalV8BenchExtentOverride::Mode(mode, bytes)) => {
+                        let policy = match mode {
+                            WalExtentPreparationMode::SlidingLookahead => {
+                                ensure!(
+                                    has_reservation_owner,
+                                    "sliding lookahead benchmark requires PITR quota accounting"
+                                );
+                                WalV8ExtentPreparationPolicy::Lookahead
+                            }
+                            WalExtentPreparationMode::SlidingPointLookahead => {
+                                ensure!(
+                                    has_reservation_owner,
+                                    "point-only sliding lookahead benchmark requires PITR quota accounting"
+                                );
+                                WalV8ExtentPreparationPolicy::PointOnlyLookahead
+                            }
+                            WalExtentPreparationMode::SlidingFallocate => {
+                                WalV8ExtentPreparationPolicy::FallocateOnly
+                            }
+                            WalExtentPreparationMode::SlidingInitialize => {
+                                WalV8ExtentPreparationPolicy::SlidingInitialize
+                            }
+                            WalExtentPreparationMode::Fallocate => {
+                                WalV8ExtentPreparationPolicy::OneShotFallocate
+                            }
+                            WalExtentPreparationMode::Initialize => {
+                                WalV8ExtentPreparationPolicy::OneShotInitialize
+                            }
+                        };
+                        (policy, bytes)
+                    }
+                    None => {
+                        if requested.profile == WalV8Profile::Candidate
+                            || requested.extent_lookahead
+                        {
+                            resolve_production_extent()?
+                        } else {
+                            // Preserve historical bench default when no extent
+                            // override or candidate profile is selected.
+                            (WalV8ExtentPreparationPolicy::Disabled, 0)
+                        }
                     }
                 }
                 #[cfg(not(feature = "bench"))]
-                {
-                    let eligible =
-                        has_reservation_owner && ext_family_filesystem && o_direct_worker;
-                    ensure!(
-                        !requested.extent_lookahead || eligible,
-                        "{WAL_V8_EXTENT_LOOKAHEAD_ENV} requires an ext4 WAL, an O_DIRECT DATA worker, and a quota owner"
-                    );
-                    if eligible {
-                        let policy = if requested.extent_lookahead {
-                            WalV8ExtentPreparationPolicy::Lookahead
-                        } else {
-                            WalV8ExtentPreparationPolicy::FallocateOnly
-                        };
-                        (policy, WAL_V8_PRODUCTION_EXTENT_WINDOW_BYTES)
-                    } else {
-                        (WalV8ExtentPreparationPolicy::Disabled, 0)
-                    }
-                }
+                resolve_production_extent()?
             }
         };
 
         Ok(Self {
+            profile: requested.profile,
             progress_mode: requested.progress_mode,
             direct_completion_enabled: requested.direct_completion_enabled,
             frontier_mode,
             extent_policy,
             extent_window_bytes,
             point_buffer_preallocation_enabled: requested.point_buffer_preallocation_enabled,
+            coalesce_policy: requested.coalesce_policy,
             o_direct_worker,
             ext_family_filesystem,
             has_reservation_owner,
             #[cfg(feature = "bench")]
             progress_counters_enabled: requested.progress_counters_enabled,
-            #[cfg(feature = "bench")]
-            coalesce_ready_target: requested.coalesce_ready_target,
             #[cfg(feature = "bench")]
             extent_policy_storage: requested.extent_policy_storage,
             #[cfg(feature = "bench")]
@@ -3087,6 +3249,28 @@ fn point_buffer_preallocation_from_environment() -> Result<bool> {
     }
 }
 
+#[cfg(feature = "bench")]
+fn point_direct_frame_from_value(value: Option<&OsStr>) -> Result<bool> {
+    let Some(value) = value else {
+        return Ok(false);
+    };
+    let value = value
+        .to_str()
+        .context("TOYKV_BENCH_V8_POINT_DIRECT_FRAME is not valid UTF-8")?;
+    match value {
+        "0" => Ok(false),
+        "1" => Ok(true),
+        _ => anyhow::bail!(
+            "invalid TOYKV_BENCH_V8_POINT_DIRECT_FRAME {value:?}; expected `0` or `1`"
+        ),
+    }
+}
+
+#[cfg(feature = "bench")]
+fn point_direct_frame_from_environment() -> Result<bool> {
+    point_direct_frame_from_value(std::env::var_os("TOYKV_BENCH_V8_POINT_DIRECT_FRAME").as_deref())
+}
+
 struct WalV8ParallelFrontier {
     frontier: WalV8Frontier,
     offset: u64,
@@ -3290,8 +3474,7 @@ struct WalV8ParallelIo {
     extent_preparation: Option<Arc<WalV8SlidingExtentPreparation>>,
     completion_events: Option<Receiver<WalV8CompletedGroupEvent>>,
     direct_completions: Option<Receiver<DirectGroupWriteCompletion>>,
-    #[cfg(feature = "bench")]
-    coalesce_ready_target: Option<usize>,
+    coalesce_ready_target: WalV8CoalesceTargetPolicy,
     #[cfg(feature = "bench")]
     coalesce_ready_target_hits: AtomicU64,
     #[cfg(test)]
@@ -3314,8 +3497,7 @@ struct WalV8ParallelIoConfig {
     #[cfg(feature = "bench")]
     extent_preparation: Option<Arc<WalV8SlidingExtentPreparation>>,
     direct_completion_enabled: bool,
-    #[cfg(feature = "bench")]
-    coalesce_ready_target: Option<usize>,
+    coalesce_ready_target: WalV8CoalesceTargetPolicy,
     #[cfg(feature = "bench")]
     data_submit_ready_order: bool,
     #[cfg(feature = "bench")]
@@ -3335,7 +3517,6 @@ impl WalV8ParallelIo {
         #[cfg(feature = "bench")]
         let extent_preparation = config.extent_preparation;
         let direct_completion_enabled = config.direct_completion_enabled;
-        #[cfg(feature = "bench")]
         let coalesce_ready_target = config.coalesce_ready_target;
         #[cfg(test)]
         let worker_group_limit = config.worker_group_limit;
@@ -3550,7 +3731,6 @@ impl WalV8ParallelIo {
             extent_preparation,
             completion_events,
             direct_completions,
-            #[cfg(feature = "bench")]
             coalesce_ready_target,
             #[cfg(feature = "bench")]
             coalesce_ready_target_hits: AtomicU64::new(0),
@@ -3768,7 +3948,7 @@ impl WalV8ParallelIo {
     fn coalesce_ready_prefix_with(
         snapshot: &mut WalV8FrontierReadySnapshot,
         budget: Duration,
-        ready_target: Option<usize>,
+        coalesce_policy: WalV8CoalesceTargetPolicy,
         mut wait_and_advance: impl FnMut(Duration, &mut WalV8FrontierReadySnapshot) -> Result<bool>,
     ) -> Result<WalV8CoalesceOutcome> {
         let deadline = Instant::now() + budget;
@@ -3777,27 +3957,34 @@ impl WalV8ParallelIo {
             #[cfg(feature = "bench")]
             target_hit: !snapshot.closed
                 && snapshot.ready_prefix.len() < snapshot.admitted_ticket_count
-                && Self::coalesce_ready_target_reached(snapshot.ready_prefix.len(), ready_target),
+                && Self::coalesce_ready_target_reached(
+                    snapshot.ready_prefix.len(),
+                    coalesce_policy.target_for_snapshot(snapshot),
+                ),
         };
 
         while !snapshot.closed
-            && !Self::coalesce_ready_target_reached(snapshot.ready_prefix.len(), ready_target)
+            && !Self::coalesce_ready_target_reached(
+                snapshot.ready_prefix.len(),
+                coalesce_policy.target_for_snapshot(snapshot),
+            )
             && let Some(remaining) = deadline.checked_duration_since(Instant::now())
         {
             outcome.waited = true;
             let signaled = wait_and_advance(remaining, snapshot)?;
+            let current_target = coalesce_policy.target_for_snapshot(snapshot);
             #[cfg(feature = "bench")]
             if signaled
                 && !snapshot.closed
                 && snapshot.ready_prefix.len() < snapshot.admitted_ticket_count
-                && Self::coalesce_ready_target_reached(snapshot.ready_prefix.len(), ready_target)
+                && Self::coalesce_ready_target_reached(snapshot.ready_prefix.len(), current_target)
             {
                 outcome.target_hit = true;
             }
             if !signaled
                 || snapshot.ready_prefix.is_empty()
                 || snapshot.ready_prefix.len() >= snapshot.admitted_ticket_count
-                || Self::coalesce_ready_target_reached(snapshot.ready_prefix.len(), ready_target)
+                || Self::coalesce_ready_target_reached(snapshot.ready_prefix.len(), current_target)
             {
                 break;
             }
@@ -3814,15 +4001,10 @@ impl WalV8ParallelIo {
         capture_monotonic_ns: bool,
         #[cfg(feature = "bench")] mut timing: Option<&mut WalV8CursorCoalescingTiming>,
     ) -> Result<bool> {
-        #[cfg(feature = "bench")]
-        let ready_target = self.coalesce_ready_target;
-        #[cfg(not(feature = "bench"))]
-        let ready_target: Option<usize> = None;
-
         let outcome = Self::coalesce_ready_prefix_with(
             snapshot,
             budget,
-            ready_target,
+            self.coalesce_ready_target,
             |remaining, snapshot| {
                 #[cfg(feature = "bench")]
                 if let Some(timing) = timing.as_deref_mut() {
@@ -5213,8 +5395,7 @@ impl WalV8LeaderWriter {
         }
         #[cfg(feature = "bench")]
         let mut io_diagnostics = self.io_diagnostics;
-        #[cfg(feature = "bench")]
-        let coalesce_ready_target = effective_config.coalesce_ready_target;
+        let coalesce_ready_target = effective_config.coalesce_policy;
         let point_buffer_preallocation_enabled =
             effective_config.point_buffer_preallocation_enabled;
         #[cfg(feature = "bench")]
@@ -5382,7 +5563,6 @@ impl WalV8LeaderWriter {
                 #[cfg(feature = "bench")]
                 extent_preparation: _extent_preparation,
                 direct_completion_enabled: effective_config.direct_completion_enabled,
-                #[cfg(feature = "bench")]
                 coalesce_ready_target,
                 #[cfg(feature = "bench")]
                 data_submit_ready_order: effective_config.data_submit_ready_order,
@@ -6024,7 +6204,7 @@ impl WalV8ParallelWriter {
         diagnostics.sliding_extent_preparation = self.io.extent_preparation_diagnostics();
         diagnostics.progress_ring_enabled = self.coordinator.progress_ring_enabled();
         diagnostics.progress_cursor_enabled = self.coordinator.progress_cursor_enabled();
-        diagnostics.coalesce_ready_target = self.io.coalesce_ready_target;
+        diagnostics.coalesce_ready_target = self.io.coalesce_ready_target.target_count();
         diagnostics.coalesce_ready_target_hits =
             self.io.coalesce_ready_target_hits.load(Ordering::Relaxed);
         diagnostics.progress_diagnostics = self.coordinator.progress_diagnostics();
@@ -8771,6 +8951,7 @@ mod tests {
                 data_bytes: 0,
             },
             admitted_ticket_count: admitted,
+            has_outstanding_batch_tickets: false,
             closed: false,
             frames_ready_prefix_count: ready,
             data_complete_prefix_count: ready,
@@ -8799,7 +8980,7 @@ mod tests {
         let outcome = WalV8ParallelIo::coalesce_ready_prefix_with(
             &mut at_target,
             Duration::from_millis(100),
-            Some(8),
+            WalV8CoalesceTargetPolicy::Always(8),
             |_, _| anyhow::bail!("coalescing should not wait after reaching the target"),
         )?;
 
@@ -8811,7 +8992,7 @@ mod tests {
         let outcome = WalV8ParallelIo::coalesce_ready_prefix_with(
             &mut beyond_target,
             Duration::from_millis(100),
-            Some(8),
+            WalV8CoalesceTargetPolicy::Always(8),
             |_, _| anyhow::bail!("coalescing should preserve an already-ready prefix"),
         )?;
 
@@ -8823,7 +9004,7 @@ mod tests {
         let outcome = WalV8ParallelIo::coalesce_ready_prefix_with(
             &mut complete_prefix,
             Duration::from_millis(100),
-            Some(8),
+            WalV8CoalesceTargetPolicy::Always(8),
             |_, _| anyhow::bail!("coalescing should not wait when the full prefix is ready"),
         )?;
 
@@ -8841,7 +9022,7 @@ mod tests {
         let outcome = WalV8ParallelIo::coalesce_ready_prefix_with(
             &mut snapshot,
             Duration::from_millis(100),
-            Some(8),
+            WalV8CoalesceTargetPolicy::Always(8),
             |_, snapshot| {
                 calls += 1;
                 set_coalescing_test_ready(snapshot, 10);
@@ -8866,7 +9047,7 @@ mod tests {
         let outcome = WalV8ParallelIo::coalesce_ready_prefix_with(
             &mut snapshot,
             budget,
-            Some(8),
+            WalV8CoalesceTargetPolicy::Always(8),
             |remaining, snapshot| {
                 calls += 1;
                 if calls == 1 {
@@ -8900,7 +9081,7 @@ mod tests {
         let outcome = WalV8ParallelIo::coalesce_ready_prefix_with(
             &mut snapshot,
             Duration::from_millis(100),
-            None,
+            WalV8CoalesceTargetPolicy::Disabled,
             |_, snapshot| {
                 calls += 1;
                 set_coalescing_test_ready(snapshot, 5);
@@ -13215,11 +13396,12 @@ mod tests {
                 WalV8FrontierWriteMode::Direct
             );
             assert!(direct_effective.has_reservation_owner);
-            let expected_policy = if direct_effective.ext_family_filesystem {
-                WalV8ExtentPreparationPolicy::FallocateOnly
-            } else {
-                WalV8ExtentPreparationPolicy::Disabled
-            };
+            let expected_policy =
+                if cfg!(not(feature = "bench")) && direct_effective.ext_family_filesystem {
+                    WalV8ExtentPreparationPolicy::FallocateOnly
+                } else {
+                    WalV8ExtentPreparationPolicy::Disabled
+                };
             assert_eq!(direct_effective.extent_policy, expected_policy);
         }
 
@@ -13232,5 +13414,251 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn point_only_target8_stops_only_when_no_batch_tickets_are_outstanding() -> Result<()> {
+        use crate::wal::v8::parallel::WalV8ReadyPrefix;
+
+        let make_prefix = |ticket_count: usize| WalV8ReadyPrefix::Cursor {
+            ticket_count,
+            tail: None,
+            #[cfg(feature = "bench")]
+            data_bytes: 0,
+        };
+        let make_snapshot = |ready: usize, has_batch: bool| WalV8FrontierReadySnapshot {
+            ready_prefix: make_prefix(ready),
+            admitted_ticket_count: 16,
+            has_outstanding_batch_tickets: has_batch,
+            closed: false,
+            #[cfg(feature = "bench")]
+            frames_ready_prefix_count: ready,
+            #[cfg(feature = "bench")]
+            data_complete_prefix_count: ready,
+            #[cfg(feature = "bench")]
+            reserved_preparation_bytes: 0,
+            #[cfg(feature = "bench")]
+            next_not_ready: None,
+            #[cfg(feature = "bench")]
+            data_hol_blocker: None,
+            #[cfg(feature = "bench")]
+            snapshot_monotonic_ns: None,
+        };
+
+        let mut point_only_at_8 = make_snapshot(8, false);
+        let outcome = WalV8ParallelIo::coalesce_ready_prefix_with(
+            &mut point_only_at_8,
+            Duration::from_millis(100),
+            WalV8CoalesceTargetPolicy::PointOnly(8),
+            |_, _| anyhow::bail!("PointOnly(8) should stop without waiting at 8 ready Points"),
+        )?;
+        assert!(!outcome.waited);
+
+        // Scenario B: 8 Point tickets are ready, but an unready Batch ticket is
+        // outstanding in the admitted window -> must keep Dynamic coalescing.
+        let mut mixed_at_8 = make_snapshot(8, true);
+        let mut wait_calls = 0;
+        let outcome = WalV8ParallelIo::coalesce_ready_prefix_with(
+            &mut mixed_at_8,
+            Duration::from_millis(100),
+            WalV8CoalesceTargetPolicy::PointOnly(8),
+            |_, snapshot| {
+                wait_calls += 1;
+                snapshot.ready_prefix = make_prefix(9);
+                Ok(false)
+            },
+        )?;
+        assert!(outcome.waited);
+        assert_eq!(wait_calls, 1);
+        assert_eq!(mixed_at_8.ready_prefix.len(), 9);
+
+        // Transition mid-wait: starts Point-only below target (4 ready), then a
+        // Batch ticket is admitted before reaching 8 -> continues Dynamic wait.
+        let mut transition = make_snapshot(4, false);
+        let mut transition_calls = 0;
+        let outcome = WalV8ParallelIo::coalesce_ready_prefix_with(
+            &mut transition,
+            Duration::from_millis(100),
+            WalV8CoalesceTargetPolicy::PointOnly(8),
+            |_, snapshot| {
+                transition_calls += 1;
+                if transition_calls == 1 {
+                    snapshot.has_outstanding_batch_tickets = true;
+                    snapshot.ready_prefix = make_prefix(8);
+                    Ok(true)
+                } else {
+                    snapshot.ready_prefix = make_prefix(10);
+                    Ok(false)
+                }
+            },
+        )?;
+        assert!(outcome.waited);
+        assert_eq!(transition_calls, 2);
+        assert_eq!(transition.ready_prefix.len(), 10);
+
+        Ok(())
+    }
+
+    #[test]
+    fn coordinator_tracks_outstanding_batch_tickets_across_admission_and_retirement() -> Result<()>
+    {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("outstanding-batch.wal");
+        let header = header();
+        let installed = install_empty(&path, header)?;
+        let writer = open_writer(&path, &installed)?.into_parallel_with_worker_file_and_config(
+            OpenOptions::new().read(true).write(true).open(&path)?,
+            WalV8RequestedConfig::candidate(),
+        )?;
+
+        // 1. Admit a Point ticket -> no outstanding Batch tickets.
+        let point_batch = batch(10);
+        let point_prepared = writer.preflight_batch_with_write_class(
+            &point_batch,
+            LIVE_WAL_V5_LIMITS,
+            WalV8WriteClass::Point,
+        )?;
+        let mut point_scratch = WalV8PointAdmissionScratch::new(point_prepared);
+        assert!(writer.try_preallocate_point_buffer(&mut point_scratch));
+        let point_job = writer.admit_prepared_point_batch(
+            point_scratch,
+            point_batch.commit_ts,
+            point_batch.recorded_at,
+        )?;
+        assert!(
+            !writer
+                .coordinator
+                .frontier_ready_snapshot()
+                .has_outstanding_batch_tickets
+        );
+
+        // 2. Admit an unready Batch ticket -> outstanding Batch flag becomes true.
+        let batch_write = batch(20);
+        let batch_prepared = writer.preflight_batch_with_write_class(
+            &batch_write,
+            LIVE_WAL_V5_LIMITS,
+            WalV8WriteClass::Batch,
+        )?;
+        let batch_job = writer.admit_prepared_batch(
+            batch_prepared,
+            batch_write.commit_ts,
+            batch_write.recorded_at,
+        )?;
+        assert!(
+            writer
+                .coordinator
+                .frontier_ready_snapshot()
+                .has_outstanding_batch_tickets
+        );
+
+        // 3. Complete and sync both tickets -> outstanding Batch flag clears.
+        let _ = point_job.finish()?;
+        let _ = batch_job.finish()?;
+        writer.sync()?;
+        assert!(
+            !writer
+                .coordinator
+                .frontier_ready_snapshot()
+                .has_outstanding_batch_tickets
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn candidate_profile_resolves_all_components_and_preserves_legacy_defaults() -> Result<()> {
+        use std::os::unix::ffi::OsStrExt;
+
+        assert_eq!(WalV8Profile::from_value(None)?, WalV8Profile::Legacy);
+        assert_eq!(
+            WalV8Profile::from_value(Some(OsStr::new("legacy")))?,
+            WalV8Profile::Legacy
+        );
+        assert_eq!(
+            WalV8Profile::from_value(Some(OsStr::new("candidate")))?,
+            WalV8Profile::Candidate
+        );
+        assert!(WalV8Profile::from_value(Some(OsStr::new("unknown"))).is_err());
+        assert!(WalV8Profile::from_value(Some(OsStr::from_bytes(b"\xff"))).is_err());
+
+        let legacy = WalV8RequestedConfig::default();
+        assert_eq!(legacy.profile, WalV8Profile::Legacy);
+        assert_eq!(legacy.progress_mode, WalV8ProgressMode::Eager);
+        assert!(!legacy.direct_completion_enabled);
+        assert_eq!(legacy.frontier_mode, WalV8FrontierWriteMode::Buffered);
+        assert!(!legacy.point_buffer_preallocation_enabled);
+        assert_eq!(legacy.coalesce_policy, WalV8CoalesceTargetPolicy::Disabled);
+
+        let candidate = WalV8RequestedConfig::candidate();
+        assert_eq!(candidate.profile, WalV8Profile::Candidate);
+        assert_eq!(candidate.progress_mode, WalV8ProgressMode::Cursor);
+        assert!(candidate.direct_completion_enabled);
+        assert_eq!(candidate.frontier_mode, WalV8FrontierWriteMode::Direct);
+        assert!(candidate.point_buffer_preallocation_enabled);
+        assert_eq!(
+            candidate.coalesce_policy,
+            WalV8CoalesceTargetPolicy::PointOnly(8)
+        );
+
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("candidate-profile.wal");
+        let buffered_file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&path)?;
+        let buffered_effective = WalV8EffectiveConfig::resolve(&candidate, &buffered_file, true)?;
+        assert_eq!(
+            buffered_effective.frontier_mode,
+            WalV8FrontierWriteMode::Buffered
+        );
+        assert_eq!(
+            buffered_effective.extent_policy,
+            WalV8ExtentPreparationPolicy::Disabled
+        );
+        assert_eq!(
+            buffered_effective.coalesce_policy,
+            WalV8CoalesceTargetPolicy::PointOnly(8)
+        );
+        assert!(buffered_effective.point_buffer_preallocation_enabled);
+
+        if let Ok(direct_file) = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_DIRECT)
+            .open(&path)
+        {
+            let direct_effective = WalV8EffectiveConfig::resolve(&candidate, &direct_file, true)?;
+            assert_eq!(
+                direct_effective.frontier_mode,
+                WalV8FrontierWriteMode::Direct
+            );
+            if direct_effective.ext_family_filesystem {
+                assert_eq!(
+                    direct_effective.extent_policy,
+                    WalV8ExtentPreparationPolicy::PointOnlyLookahead
+                );
+                assert_eq!(
+                    direct_effective.extent_window_bytes,
+                    WAL_V8_PRODUCTION_EXTENT_WINDOW_BYTES
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn point_direct_frame_from_value_rejects_invalid_values() {
+        use std::os::unix::ffi::OsStrExt;
+
+        assert!(!point_direct_frame_from_value(None).unwrap());
+        assert!(!point_direct_frame_from_value(Some(OsStr::new("0"))).unwrap());
+        assert!(point_direct_frame_from_value(Some(OsStr::new("1"))).unwrap());
+        assert!(point_direct_frame_from_value(Some(OsStr::new("true"))).is_err());
+        assert!(point_direct_frame_from_value(Some(OsStr::new("2"))).is_err());
+        assert!(point_direct_frame_from_value(Some(OsStr::from_bytes(b"\xff"))).is_err());
     }
 }
