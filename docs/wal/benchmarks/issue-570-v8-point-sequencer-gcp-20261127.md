@@ -5,7 +5,7 @@
 - **Baseline commit**: `2562767ba4269532a5f399048071bf6f68558c49` (`main`, V8 Candidate Target8 default)
 - **Candidate commit**: `70ec99bdf8e189bfcc122d36e220c4ac94d5c177` (`perf/issue-570-producer-sequencer`)
 - **Patch SHA-256**: `af73b5b5323ab082b3574b406d023f4b610e010f9977df66ee9e6e8189d77360`
-- **Environment**: `c4-standard-16-lssd` (`us-central1-b`), 16 vCPUs, 2× NVMe Local SSD RAID0 (`/mnt/gcp-wal-bench`, ext4), `write-perf --wal --pitr --pitr-format v8 --wal-io-mode parallel --value-size 1024 --compaction none --latency-sample-every 100` (`TOYKV_BENCH_V8_EXTENT_PREP=sliding-point-lookahead`, `TOYKV_BENCH_V8_EXTENT_PREP_BYTES=1048576`, `TOYKV_WAL_V8_FRONTIER_MODE=direct`, `TOYKV_BENCH_V8_POINT_DIRECT_FRAME=0`)
+- **Environment**: `c4-standard-16-lssd` (`us-central1-b`), 16 vCPUs, 2× NVMe Local SSD RAID0 (`/mnt/gcp-wal-bench`, ext4), `write-perf --wal --pitr --pitr-format v8 --wal-io-mode parallel --value-size 1024 --compaction none --latency-sample-every 100` (`TOYKV_BENCH_V8_EXTENT_PREP=sliding-point-lookahead`, `TOYKV_BENCH_V8_EXTENT_PREP_BYTES=1048576`, `TOYKV_WAL_V8_FRONTIER_MODE=direct`, `TOYKV_BENCH_V8_POINT_DIRECT_FRAME=0`; effective config is `PointOnlyLookahead` 1 MiB + `Direct` FRONTIER + `Direct Frame` disabled, so these numbers should not be mixed directly with historical default-config runs)
 - **Local archive**: `bench-results/gcp-pr574-ab-20261127-b3/collection-attempt-01` (`sha256: 639f83c4a52f6ad0fbe38b956b5e209dcacb6d5e6edae78ffebe042518b6e524`, 50/50 runs verified)
 
 ## 1. 50-Run Counterbalanced A/B Results (5 Pairs per Workload, Unprofiled)
