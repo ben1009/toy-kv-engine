@@ -1370,18 +1370,6 @@ impl LsmMvccInner {
             sample.observation.point_buffer_preallocation_wall_ns = wall_ns;
             sample.observation.point_buffer_preallocation_cpu_ns = cpu_ns;
         }
-        if point_buffer_preallocated && memtable.v8_point_pre_reserve_enabled() {
-            #[cfg(feature = "bench")]
-            let phase_timer = WalCpuPhaseTimer::start(cpu_attribution.is_some());
-            let pre_reserve_result = memtable.pre_reserve_v8_point_resources(&mut point_scratch);
-            #[cfg(feature = "bench")]
-            if let Some(sample) = cpu_attribution.as_mut() {
-                let (wall_ns, cpu_ns) = phase_timer.finish();
-                sample.observation.pre_reserve_wall_ns = wall_ns;
-                sample.observation.pre_reserve_cpu_ns = cpu_ns;
-            }
-            pre_reserve_result?;
-        }
 
         #[cfg(feature = "bench")]
         let phase_timer = WalCpuPhaseTimer::start(cpu_attribution.is_some());
@@ -1972,6 +1960,25 @@ impl LsmMvccInner {
         shared_publish_bytes: bool,
     ) -> Result<(u64, DeferredBatchPublish, Option<u64>), anyhow::Error> {
         self.write_batch_wal_only_inner(entries, memtable, shared_publish_bytes, false, None, None)
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn write_batch_wal_only_with_guard_for_test(
+        &self,
+        entries: &[(bytes::Bytes, bytes::Bytes, BatchEntryKind)],
+        memtable: &MemTable,
+        shared_publish_bytes: bool,
+        write_guard: parking_lot::MutexGuard<'_, ()>,
+    ) -> Result<(u64, DeferredBatchPublish, Option<u64>), anyhow::Error> {
+        self.write_batch_wal_only_inner(
+            entries,
+            memtable,
+            shared_publish_bytes,
+            false,
+            None,
+            Some(write_guard),
+        )
     }
 
     /// Native async point writes prepare v7 batches while holding the bounded
