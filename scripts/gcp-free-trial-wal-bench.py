@@ -53,6 +53,8 @@ from gcp_wal_matrix import (
     V7_V8_READY_TARGET_FINAL_WRITERS,
     V8_D2_QUALIFICATION_NUM,
     V8_D2_QUALIFICATION_WRITERS,
+    V8_EQUAL_THROUGHPUT_NUM,
+    V8_EQUAL_THROUGHPUT_WRITERS,
     POINT_RESOURCE_RETIREMENT_NUM,
     POINT_RESOURCE_RETIREMENT_WRITERS,
     POINT_ACK_D1_NUM,
@@ -99,6 +101,7 @@ from gcp_wal_matrix import (
     build_v7_v8_point_preallocation_plan,
     build_v7_v8_ready_target_final_plan,
     build_v8_d2_qualification_plan,
+    build_v8_equal_throughput_plan,
     build_point_resource_retirement_plan,
     build_point_ack_d1_plan,
     build_dedicated_durability_driver_plan,
@@ -155,6 +158,9 @@ from gcp_v8_point_progress_ring_runner import (
 )
 from gcp_v8_point_progress_ring_runner import (
     verify_v8_d2_qualification_results_directory as verify_v8_d2_qualification_results,
+)
+from gcp_v8_point_progress_ring_runner import (
+    verify_v8_equal_throughput_results_directory as verify_v8_equal_throughput_results,
 )
 from gcp_v8_point_progress_ring_runner import (
     verify_point_resource_retirement_results_directory as verify_point_resource_retirement_results,
@@ -246,6 +252,7 @@ root_names = {
     "v7-v8-point-preallocation-schedule.tsv",
     "v7-v8-ready-target-final-schedule.tsv",
     "v8-d2-qualification-schedule.tsv",
+    "v8-equal-throughput-schedule.tsv",
     "point-resource-retirement-schedule.tsv",
     "point-ack-d1-schedule.tsv", "dedicated-durability-schedule.tsv", "runner-bundle.sha256",
     "runner-bundle-verification.json",
@@ -1298,6 +1305,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                              help="Compare V7 and V8 Dynamic/Target4/Target8 for Point1/8/16 and Batch64 (80 runs)")
     suite_group.add_argument("--v8-d2-qualification", action="store_true",
                              help="Run V8 D2 qualification matrix (Legacy, Candidate Dynamic/Target8, V7 Parallel; 80 runs)")
+    suite_group.add_argument("--v8-equal-throughput", action="store_true",
+                             help="Run V8 equal-throughput offered-load latency comparison (18 runs)")
     suite_group.add_argument("--v8-point-resource-retirement-ab", action="store_true",
                              help="Retired historical suite; kept only to provide an explanatory error")
     suite_group.add_argument("--v8-point-resource-retirement-stage-a-ab", action="store_true",
@@ -1354,6 +1363,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     point_preallocation_suite = args.v7_v8_point_preallocation_ab
     point_ready_target_final_suite = args.v7_v8_ready_target_final_ab
     v8_d2_qualification_suite = args.v8_d2_qualification
+    v8_equal_throughput_suite = args.v8_equal_throughput
     point_resource_retirement_stage_a_suite = args.v8_point_resource_retirement_stage_a_ab
     point_resource_retirement_suite = (
         args.v8_point_resource_retirement_ab or point_resource_retirement_stage_a_suite
@@ -1372,6 +1382,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         or point_preallocation_suite or point_resource_retirement_suite or point_ack_d1_suite
         or point_ready_target_final_suite
         or v8_d2_qualification_suite
+        or v8_equal_throughput_suite
         or dedicated_durability_suite
     )
     explicit_network = args.network is not None
@@ -1405,6 +1416,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             POINT_PREALLOCATION_NUM if point_preallocation_suite else
             V7_V8_READY_TARGET_FINAL_NUM if point_ready_target_final_suite else
             V8_D2_QUALIFICATION_NUM if v8_d2_qualification_suite else
+            V8_EQUAL_THROUGHPUT_NUM if v8_equal_throughput_suite else
             POINT_RESOURCE_RETIREMENT_NUM if point_resource_retirement_suite else
             POINT_ACK_D1_NUM if point_ack_d1_suite else
             DURABILITY_DRIVER_NUM if dedicated_durability_suite else
@@ -1425,6 +1437,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             or point_preallocation_suite
             or point_ready_target_final_suite
             or v8_d2_qualification_suite
+        or v8_equal_throughput_suite
             or point_resource_retirement_suite
             or point_ack_d1_suite
             or dedicated_durability_suite
@@ -1453,6 +1466,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             args.writers = V7_V8_READY_TARGET_FINAL_WRITERS
         elif v8_d2_qualification_suite:
             args.writers = V8_D2_QUALIFICATION_WRITERS
+        elif v8_equal_throughput_suite:
+            args.writers = V8_EQUAL_THROUGHPUT_WRITERS
         elif point_resource_retirement_suite:
             args.writers = POINT_RESOURCE_RETIREMENT_WRITERS
         elif point_ack_d1_suite:
@@ -1544,6 +1559,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         )
     if v8_d2_qualification_suite and args.machine_type != "c4-standard-16-lssd":
         parser.error("--v8-d2-qualification requires c4-standard-16-lssd")
+    if v8_equal_throughput_suite and args.writers != V8_EQUAL_THROUGHPUT_WRITERS:
+        parser.error(f"--v8-equal-throughput requires writers {V8_EQUAL_THROUGHPUT_WRITERS}")
+    if v8_equal_throughput_suite and args.machine_type != "c4-standard-16-lssd":
+        parser.error("--v8-equal-throughput requires c4-standard-16-lssd")
     if point_resource_retirement_suite and args.writers != POINT_RESOURCE_RETIREMENT_WRITERS:
         parser.error(f"--v8-point-resource-retirement-ab requires writers {POINT_RESOURCE_RETIREMENT_WRITERS}")
     if point_resource_retirement_suite and args.machine_type != "c4-standard-16-lssd":
@@ -1570,6 +1589,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     if point_resource_retirement_suite:
         expected_progress_writers = POINT_RESOURCE_RETIREMENT_WRITERS
+    if v8_equal_throughput_suite:
+        expected_progress_writers = V8_EQUAL_THROUGHPUT_WRITERS
     if point_ack_d1_suite:
         expected_progress_writers = POINT_ACK_D1_WRITERS
     if dedicated_durability_suite:
@@ -1596,6 +1617,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error(f"--v7-v8-ready-target-final-ab uses a fixed {V7_V8_READY_TARGET_FINAL_NUM}-put workload")
     if v8_d2_qualification_suite and args.num != V8_D2_QUALIFICATION_NUM:
         parser.error(f"--v8-d2-qualification uses a fixed {V8_D2_QUALIFICATION_NUM}-put workload")
+    if v8_equal_throughput_suite and args.num != V8_EQUAL_THROUGHPUT_NUM:
+        parser.error(f"--v8-equal-throughput uses a fixed {V8_EQUAL_THROUGHPUT_NUM}-put workload")
     if point_preallocation_suite and args.num != POINT_PREALLOCATION_NUM:
         parser.error(f"--v7-v8-point-preallocation-ab uses a fixed {POINT_PREALLOCATION_NUM}-put workload")
     if point_resource_retirement_suite and args.num != POINT_RESOURCE_RETIREMENT_NUM:
@@ -1752,6 +1775,7 @@ def _run_identifier(row: dict[str, Any], suite: str) -> str:
         "v7-v8-point-preallocation",
         "v7-v8-ready-target-final",
         "v8-d2-qualification",
+        "v8-equal-throughput",
         "v8-point-resource-retirement", "v8-cursor-publication",
     ):
         return f"r{row['repetition']}-w{row['writer']}-{row['workload']}-{row['arm']}"
@@ -1786,6 +1810,7 @@ def _summary_row_identifier(row: dict[str, Any], suite: str) -> str:
         "v7-v8-point-preallocation",
         "v7-v8-ready-target-final",
         "v8-d2-qualification",
+        "v8-equal-throughput",
         "v8-point-resource-retirement", "v8-cursor-publication",
     ):
         return f"r{int(row['repetition'])}-w{int(row['writer'])}-{row['workload']}-{row['arm']}"
@@ -1979,6 +2004,8 @@ def _verify_result_set(results: Path) -> dict[str, Any]:
             return verify_v7_v8_ready_target_final_results(results)
         if suite == "v8-d2-qualification":
             return verify_v8_d2_qualification_results(results)
+        if suite == "v8-equal-throughput":
+            return verify_v8_equal_throughput_results(results)
         if suite == "v8-point-resource-retirement":
             return verify_point_resource_retirement_results(results)
         if suite == "v8-point-ack-d1":
@@ -3206,6 +3233,7 @@ def provision_and_run(
     point_preallocation_suite = getattr(args, "v7_v8_point_preallocation_ab", False)
     point_ready_target_final_suite = getattr(args, "v7_v8_ready_target_final_ab", False)
     v8_d2_qualification_suite = getattr(args, "v8_d2_qualification", False)
+    v8_equal_throughput_suite = getattr(args, "v8_equal_throughput", False)
     point_resource_retirement_stage_a_suite = getattr(args, "v8_point_resource_retirement_stage_a_ab", False)
     point_resource_retirement_suite = (
         getattr(args, "v8_point_resource_retirement_ab", False) or point_resource_retirement_stage_a_suite
@@ -3224,6 +3252,7 @@ def provision_and_run(
         or point_preallocation_suite or point_resource_retirement_suite or point_ack_d1_suite
         or point_ready_target_final_suite
         or v8_d2_qualification_suite
+        or v8_equal_throughput_suite
         or dedicated_durability_suite
     )
     extent_policy_storage_suite = getattr(args, "v8_extent_policy_storage_ab", False)
@@ -3591,6 +3620,8 @@ def provision_and_run(
                 remote_suite = "v7-v8-ready-target-final"
             elif v8_d2_qualification_suite:
                 remote_suite = "v8-d2-qualification"
+            elif v8_equal_throughput_suite:
+                remote_suite = "v8-equal-throughput"
             elif point_resource_retirement_suite:
                 remote_suite = (
                     "v8-point-resource-retirement-stage-a"
@@ -3794,6 +3825,7 @@ def main(argv: list[str] | None = None) -> int:
     point_preallocation_suite = args.v7_v8_point_preallocation_ab
     point_ready_target_final_suite = args.v7_v8_ready_target_final_ab
     v8_d2_qualification_suite = args.v8_d2_qualification
+    v8_equal_throughput_suite = args.v8_equal_throughput
     point_resource_retirement_stage_a_suite = args.v8_point_resource_retirement_stage_a_ab
     point_resource_retirement_suite = (
         args.v8_point_resource_retirement_ab or point_resource_retirement_stage_a_suite
@@ -3811,6 +3843,7 @@ def main(argv: list[str] | None = None) -> int:
         or point_preallocation_suite or point_resource_retirement_suite or point_ack_d1_suite
         or point_ready_target_final_suite
         or v8_d2_qualification_suite
+        or v8_equal_throughput_suite
         or dedicated_durability_suite
     )
     if point_progress_suite:
@@ -3996,6 +4029,13 @@ def main(argv: list[str] | None = None) -> int:
         elif v8_d2_qualification_suite:
             report["benchmark_suite"] = "v8-d2-qualification"
             report["benchmark_plan"] = build_v8_d2_qualification_plan(
+                machine_type=args.machine_type,
+                machine_spec=MACHINE_SPECS[args.machine_type],
+                commit=args.commit.lower(),
+            )
+        elif v8_equal_throughput_suite:
+            report["benchmark_suite"] = "v8-equal-throughput"
+            report["benchmark_plan"] = build_v8_equal_throughput_plan(
                 machine_type=args.machine_type,
                 machine_spec=MACHINE_SPECS[args.machine_type],
                 commit=args.commit.lower(),

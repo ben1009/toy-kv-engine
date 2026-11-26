@@ -137,6 +137,23 @@ V8_D2_QUALIFICATION_CASES = (
     (16, "point"),
     (16, "batch64"),
 )
+V8_EQUAL_THROUGHPUT_WRITERS = (8, 16)
+V8_EQUAL_THROUGHPUT_REPETITIONS = 3
+V8_EQUAL_THROUGHPUT_NUM = 100_000
+V8_EQUAL_THROUGHPUT_ARMS = (
+    "v8_legacy",
+    "v8_candidate_dynamic",
+    "v8_candidate_target8",
+)
+V8_EQUAL_THROUGHPUT_ORDERS = (
+    ("v8_legacy", "v8_candidate_dynamic", "v8_candidate_target8"),
+    ("v8_candidate_dynamic", "v8_candidate_target8", "v8_legacy"),
+    ("v8_candidate_target8", "v8_legacy", "v8_candidate_dynamic"),
+)
+V8_EQUAL_THROUGHPUT_CASES = (
+    (8, "point", 20_000),
+    (16, "point", 28_000),
+)
 POINT_PROGRESS_PLAN_SCHEMA_V1 = 1
 POINT_PROGRESS_PLAN_SCHEMA_V2 = 2
 POINT_PROGRESS_PLAN_SCHEMA_V3 = 3
@@ -1011,6 +1028,94 @@ def build_v8_d2_qualification_plan(
             "Point1, Point8, Point16, and Batch64/w16 each run five counterbalanced repetitions across V8 Legacy, "
             "V8 Candidate Dynamic, V8 Candidate Point-only Target8, and V7 Parallel on the same host, source commit, "
             "and release bench binary. Point latency is sampled every 10 puts; Batch64 latency sampling is disabled."
+        ),
+    }
+
+
+def build_v8_equal_throughput_schedule() -> list[dict[str, object]]:
+    """Build the 18-run fixed-offered-load latency comparison (Legacy, Dynamic, Target8)."""
+    schedule: list[dict[str, object]] = []
+    for repetition in range(1, V8_EQUAL_THROUGHPUT_REPETITIONS + 1):
+        case_order = V8_EQUAL_THROUGHPUT_CASES[repetition % len(V8_EQUAL_THROUGHPUT_CASES):] + (
+            V8_EQUAL_THROUGHPUT_CASES[:repetition % len(V8_EQUAL_THROUGHPUT_CASES)]
+        )
+        for writer, workload, offered_rate in case_order:
+            case_index = V8_EQUAL_THROUGHPUT_CASES.index((writer, workload, offered_rate))
+            arm_order = V8_EQUAL_THROUGHPUT_ORDERS[(repetition - 1 + case_index) % len(
+                V8_EQUAL_THROUGHPUT_ORDERS
+            )]
+            for arm in arm_order:
+                is_legacy = arm == "v8_legacy"
+                is_target8 = arm == "v8_candidate_target8"
+                schedule.append({
+                    "run_index": len(schedule) + 1,
+                    "writer": writer,
+                    "workload": workload,
+                    "repetition": repetition,
+                    "arm": arm,
+                    "bench": "wal_concurrent",
+                    "batch_entries": 1,
+                    "batch_size": None,
+                    "num": V8_EQUAL_THROUGHPUT_NUM,
+                    "sample_every": 10,
+                    "offered_rate_ops_per_sec": offered_rate,
+                    "format_version": 8,
+                    "v8_profile": "legacy" if is_legacy else "candidate",
+                    "coalesce_target_policy": "point_only" if is_target8 else "disabled",
+                    "coalescing_ready_target": 8 if is_target8 else None,
+                    "point_buffer_preallocation_enabled": not is_legacy,
+                    "progress_ring_enabled": not is_legacy,
+                    "progress_cursor_enabled": not is_legacy,
+                    "progress_counters_enabled": False,
+                    "cursor_direct_completion_enabled": not is_legacy,
+                    "cursor_singleton_submission_enabled": False,
+                    "extent_mode": "sliding-fallocate" if is_legacy else "sliding-point-lookahead",
+                    "extent_window_bytes": POINT_LOOKAHEAD_WINDOW_BYTES,
+                    "frontier_mode": "buffered" if is_legacy else "direct",
+                })
+    return schedule
+
+
+def build_v8_equal_throughput_plan(
+    *, machine_type: str, machine_spec: Mapping[str, int], commit: str,
+    binary_sha256: str | None = None,
+) -> dict[str, object]:
+    schedule = build_v8_equal_throughput_schedule()
+    return {
+        "plan_schema_version": 1,
+        "suite": "v8-equal-throughput",
+        "writers": list(V8_EQUAL_THROUGHPUT_WRITERS),
+        "workloads": [
+            {
+                "writer": writer,
+                "name": workload,
+                "bench": "wal_concurrent",
+                "batch_size": None,
+                "num": V8_EQUAL_THROUGHPUT_NUM,
+                "latency_sample_every": 10,
+                "offered_rate_ops_per_sec": offered_rate,
+            }
+            for writer, workload, offered_rate in V8_EQUAL_THROUGHPUT_CASES
+        ],
+        "arms": list(V8_EQUAL_THROUGHPUT_ARMS),
+        "repetitions_per_cell": V8_EQUAL_THROUGHPUT_REPETITIONS,
+        "arm_orders": [list(order) for order in V8_EQUAL_THROUGHPUT_ORDERS],
+        "runs_planned": len(schedule),
+        "score_runs_planned": len(schedule),
+        "counterbalanced": True,
+        "machine_type": machine_type,
+        "vcpus": int(machine_spec["vcpus"]),
+        "local_ssd_count": int(machine_spec["ssd_count"]),
+        "local_ssd_total_gib": int(machine_spec["ssd_gib"]),
+        "runtime_protocol": "single C4 Local SSD host; coordinated-omission-free paced arrival schedule",
+        "value_bytes": 1024,
+        "compaction": "none",
+        "commit": commit,
+        "binary_sha256": binary_sha256,
+        "qualification_note": (
+            "Point8 (20,000 puts/s) and Point16 (28,000 puts/s) each run three counterbalanced repetitions across "
+            "V8 Legacy, V8 Candidate Dynamic, and V8 Candidate Point-only Target8 using coordinated-omission-free "
+            "scheduled arrival timestamps, 1-in-10 latency sampling, and WAL sync diagnostics."
         ),
     }
 

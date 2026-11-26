@@ -97,6 +97,10 @@ from gcp_wal_matrix import (
     V8_D2_QUALIFICATION_NUM,
     V8_D2_QUALIFICATION_ORDERS,
     V8_D2_QUALIFICATION_WRITERS,
+    V8_EQUAL_THROUGHPUT_ARMS,
+    V8_EQUAL_THROUGHPUT_CASES,
+    V8_EQUAL_THROUGHPUT_NUM,
+    V8_EQUAL_THROUGHPUT_WRITERS,
     POINT_RESOURCE_RETIREMENT_NUM,
     POINT_RESOURCE_RETIREMENT_WRITERS,
     POINT_ACK_D1_ARMS,
@@ -133,6 +137,8 @@ from gcp_wal_matrix import (
     build_v7_v8_ready_target_final_schedule,
     build_v8_d2_qualification_plan,
     build_v8_d2_qualification_schedule,
+    build_v8_equal_throughput_plan,
+    build_v8_equal_throughput_schedule,
     build_point_resource_retirement_plan,
     build_point_resource_retirement_schedule,
     build_point_ack_d1_plan,
@@ -1677,6 +1683,91 @@ class PointProgressRingQualificationTests(unittest.TestCase):
                 run_dir = root / "results" / progress_ring_runner._run_id(row_with_commit)
                 self.assertEqual(metadata["exit_code"], 0, row["arm"])
                 self.assertFalse((run_dir / "validation-error.txt").exists(), row["arm"])
+
+    def test_v8_equal_throughput_schedule_plan_validator_and_cli(self) -> None:
+        schedule = build_v8_equal_throughput_schedule()
+        self.assertEqual(len(schedule), 18)
+        self.assertEqual({row["arm"] for row in schedule}, set(V8_EQUAL_THROUGHPUT_ARMS))
+        self.assertEqual(
+            {(row["writer"], row["workload"], row["offered_rate_ops_per_sec"]) for row in schedule},
+            set(V8_EQUAL_THROUGHPUT_CASES),
+        )
+        plan = build_v8_equal_throughput_plan(
+            machine_type="c4-standard-16-lssd",
+            machine_spec=BENCH.MACHINE_SPECS["c4-standard-16-lssd"],
+            commit="a" * 40,
+            binary_sha256="b" * 64,
+        )
+        self.assertEqual(plan["suite"], "v8-equal-throughput")
+        self.assertEqual(plan["runs_planned"], 18)
+
+        row = {**schedule[0], "source_commit": "a" * 40}
+        raw = self._raw_record(row)
+        raw["params"]["offered_rate_ops_per_sec"] = row["offered_rate_ops_per_sec"]
+        raw["result"]["service_latency"] = {"p50_ms": 0.25, "p95_ms": 0.45, "p99_ms": 0.65}
+        raw["result"]["schedule_lag"] = {"p50_ms": 0.01, "p95_ms": 0.03, "p99_ms": 0.05}
+        raw["result"]["wal_pipeline"].update({
+            "inflight_groups_max": 4,
+            "outstanding_write_sqes_max": 8,
+            "v8_data_submit_hol_wait_ns": 100,
+            "v8_data_completion_hol_wait_ns": 200,
+            "sync_coalesce_wait_ns": 300,
+            "wal_sync_wait_ns": 400,
+            "sync_observations": [{
+                "admitted_ticket_count": 5,
+                "data_completion_to_frontier_start_ns": 1200,
+                "coalescing_wait_ns": 2500,
+            }],
+        })
+        process = Mock()
+        process.args = ["write-perf"]
+        process.returncode = 0
+        process.communicate.return_value = (json.dumps(raw), "")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with patch.object(progress_ring_runner.subprocess, "Popen", return_value=process) as popen:
+                metadata = progress_ring_runner._run_one(
+                    binary=Path("write-perf"),
+                    binary_sha256="b" * 64,
+                    row=row,
+                    results_dir=root / "results",
+                    db_root=root / "db",
+                    safe_deadline_epoch=int(time.time()) + 3600,
+                    candidate_mode="v8-equal-throughput",
+                )
+            cmd = popen.call_args[0][0]
+            self.assertIn("--offered-rate-ops-per-sec", cmd)
+            self.assertIn(str(row["offered_rate_ops_per_sec"]), cmd)
+            self.assertIn("--wal-sync-diagnostics", cmd)
+            self.assertEqual(metadata["exit_code"], 0)
+            self.assertEqual(metadata["median_outstanding_tickets_at_sync"], 5.0)
+            self.assertEqual(metadata["outstanding_write_sqes_max"], 8)
+
+        common = [
+            "--project", "test-project", "--zone", "us-central1-c", "--commit", "a" * 40,
+            "--machine-type", "c4-standard-16-lssd", "--writers", "8", "16",
+            "--v8-equal-throughput", "--ssh-source-range", "192.0.2.1/32",
+            "--max-runtime-minutes", "60", "--estimated-hourly-cost-usd", "1.50",
+            "--max-estimated-spend-usd", "2", "--preflight-only",
+            "--network", "eq-isolated", "--subnet", "eq-subnet",
+        ]
+        args = BENCH.parse_args(common)
+        self.assertEqual(args.writers, V8_EQUAL_THROUGHPUT_WRITERS)
+        self.assertEqual(args.num, V8_EQUAL_THROUGHPUT_NUM)
+        self.assertTrue(args.v8_equal_throughput)
+
+        remote_script = Path(__file__).with_name("gcp-free-trial-wal-bench-remote.sh")
+        environment = {**os.environ, "TOYKV_GCP_BENCH_VALIDATE_ONLY": "1"}
+        accepted = subprocess.run(
+            [
+                "bash", str(remote_script), "a" * 40, str(V8_EQUAL_THROUGHPUT_NUM), "test-project",
+                "us-central1-c", "wal-test", "4102444800", "c4-standard-16-lssd", "8,16",
+                "v8-equal-throughput", "-", "-",
+            ],
+            cwd=Path(__file__).resolve().parents[1], env=environment,
+            capture_output=True, text=True, timeout=5,
+        )
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
 
     def test_run_suite_rejects_retired_candidate_modes(self) -> None:
         for mode in sorted(progress_ring_runner.RETIRED_CANDIDATE_MODES):

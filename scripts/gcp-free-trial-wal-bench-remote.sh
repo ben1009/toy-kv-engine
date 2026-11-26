@@ -73,6 +73,7 @@ if [[ "$SUITE" != "batch64" && "$SUITE" != "rfc026-full" \
      && "$SUITE" != "v7-v8-point-preallocation" \
      && "$SUITE" != "v7-v8-ready-target-final" \
      && "$SUITE" != "v8-d2-qualification" \
+     && "$SUITE" != "v8-equal-throughput" \
      && "$SUITE" != "v8-point-ack-d1" \
      && "$SUITE" != "v8-dedicated-durability-driver" ]]; then
     echo "unsupported benchmark suite: $SUITE" >&2
@@ -181,6 +182,12 @@ if [[ "$SUITE" == "v7-v8-ready-target-final" || "$SUITE" == "v8-d2-qualification
     && { [[ "$NUM" != "100000" ]] || [[ "$MACHINE_TYPE" != "c4-standard-16-lssd" ]] \
         || [[ "$WRITERS_CSV" != "1,8,16" ]]; }; then
     echo "$SUITE requires c4-standard-16-lssd, writers 1,8,16, and 100000 operations" >&2
+    exit 64
+fi
+if [[ "$SUITE" == "v8-equal-throughput" ]] \
+    && { [[ "$NUM" != "100000" ]] || [[ "$MACHINE_TYPE" != "c4-standard-16-lssd" ]] \
+        || [[ "$WRITERS_CSV" != "8,16" ]]; }; then
+    echo "v8-equal-throughput requires c4-standard-16-lssd, writers 8,16, and 100000 operations" >&2
     exit 64
 fi
 if [[ "$SUITE" == "v8-point-resource-retirement" || "$SUITE" == "v8-point-resource-retirement-stage-a" ]] \
@@ -659,7 +666,7 @@ if [[ "$BENCH_SUITE" == "v7-v8-point-preallocation" ]]; then
     exit $?
 fi
 
-if [[ "$BENCH_SUITE" == "v7-v8-ready-target-final" || "$BENCH_SUITE" == "v8-d2-qualification" ]]; then
+if [[ "$BENCH_SUITE" == "v7-v8-ready-target-final" || "$BENCH_SUITE" == "v8-d2-qualification" || "$BENCH_SUITE" == "v8-equal-throughput" ]]; then
     if [[ ! -r /tmp/gcp-v8-point-progress-ring-runner.py ]]; then
         echo "V7/V8 qualification runner was not uploaded" >&2
         exit 1

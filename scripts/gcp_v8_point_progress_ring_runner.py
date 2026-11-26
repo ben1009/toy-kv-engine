@@ -84,6 +84,12 @@ from gcp_wal_matrix import (
     V8_D2_QUALIFICATION_WRITERS,
     build_v8_d2_qualification_plan,
     build_v8_d2_qualification_schedule,
+    V8_EQUAL_THROUGHPUT_ARMS,
+    V8_EQUAL_THROUGHPUT_CASES,
+    V8_EQUAL_THROUGHPUT_REPETITIONS,
+    V8_EQUAL_THROUGHPUT_WRITERS,
+    build_v8_equal_throughput_plan,
+    build_v8_equal_throughput_schedule,
     build_point_resource_retirement_plan,
     build_point_resource_retirement_schedule,
     validate_point_progress_cursor_rows,
@@ -178,6 +184,17 @@ def _summary_fields(schedule: list[dict[str, Any]]) -> tuple[str, ...]:
             "coalesce_target_mixed_fallback_cycles",
             "coalesce_target_initial_hits",
             "coalesce_target_after_wake_hits",
+        )
+    if any("offered_rate_ops_per_sec" in row for row in schedule):
+        fields += (
+            "service_p50_ms", "service_p95_ms", "service_p99_ms",
+            "lag_p50_ms", "lag_p95_ms", "lag_p99_ms",
+            "inflight_groups_max", "outstanding_write_sqes_max",
+            "v8_data_submit_hol_wait_ns", "v8_data_completion_hol_wait_ns",
+            "sync_coalesce_wait_ns", "wal_sync_wait_ns",
+            "median_outstanding_tickets_at_sync",
+            "median_data_completion_to_frontier_start_ns",
+            "median_coalescing_wait_ns",
         )
     if any("point_buffer_preallocation_enabled" in row for row in schedule):
         fields += (
@@ -1057,11 +1074,17 @@ def _run_one(
     ]
     if row["workload"] == "point":
         command.extend(("--latency-sample-every", str(row["sample_every"])))
+        if row.get("offered_rate_ops_per_sec") is not None:
+            command.extend((
+                "--offered-rate-ops-per-sec", str(row["offered_rate_ops_per_sec"]),
+                "--wal-sync-diagnostics",
+            ))
     else:
         command.extend(("--wal-batch-size", str(row["batch_entries"])))
     preallocation_suite = candidate_mode == "v7-v8-point-preallocation"
     ready_target_final_suite = candidate_mode == "v7-v8-ready-target-final"
-    d2_qualification_suite = candidate_mode == "v8-d2-qualification"
+    equal_throughput_suite = candidate_mode == "v8-equal-throughput"
+    d2_qualification_suite = candidate_mode in ("v8-d2-qualification", "v8-equal-throughput")
     retirement_suite = candidate_mode in (
         "point-resource-retirement", "point-resource-retirement-stage-a",
     )
@@ -1199,6 +1222,7 @@ def _run_one(
         if completed.returncode != 0:
             raise ValueError(f"write-perf exited with status {completed.returncode}")
         validator = (
+            _validate_equal_throughput_record if equal_throughput_suite else
             _validate_point_preallocation_record
             if preallocation_suite or ready_target_final_suite or d2_qualification_suite else
             _validate_cursor_publication_record if cursor_publication_suite else
@@ -2028,6 +2052,207 @@ def verify_v8_d2_qualification_results_directory(results: Path) -> dict[str, Any
             except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
                 errors.append(f"{run_id} result is invalid: {error}")
 
+        return {"verified": not errors, "planned": len(schedule), "observed": len(rows), "errors": errors}
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+        return {"verified": False, "errors": [str(error)]}
+
+
+def _validate_equal_throughput_record(record: dict[str, Any], row: dict[str, Any]) -> dict[str, Any]:
+    metrics = _validate_point_preallocation_record(record, row)
+    params = _require_object(record.get("params"), "benchmark parameters")
+    result = _require_object(record.get("result"), "benchmark result")
+    expected_rate = int(row["offered_rate_ops_per_sec"])
+    if params.get("offered_rate_ops_per_sec") != expected_rate:
+        raise ValueError(
+            f"offered_rate_ops_per_sec {params.get('offered_rate_ops_per_sec')!r} != {expected_rate}"
+        )
+    service_latency = _require_object(result.get("service_latency"), "service_latency")
+    schedule_lag = _require_object(result.get("schedule_lag"), "schedule_lag")
+    pipeline = _require_object(result.get("wal_pipeline"), "WAL pipeline metadata")
+    sync_observations = pipeline.get("sync_observations")
+    if not isinstance(sync_observations, list) or not sync_observations:
+        raise ValueError("wal_sync_diagnostics sync_observations are missing")
+    admitted_counts = [float(obs["admitted_ticket_count"]) for obs in sync_observations]
+    d2f_ns = [
+        float(obs["data_completion_to_frontier_start_ns"])
+        for obs in sync_observations
+        if obs.get("data_completion_to_frontier_start_ns") is not None
+    ]
+    coalesce_ns = [
+        float(obs["coalescing_wait_ns"])
+        for obs in sync_observations
+        if obs.get("coalescing_wait_ns") is not None
+    ]
+    metrics.update({
+        "offered_rate_ops_per_sec": expected_rate,
+        "service_p50_ms": float(service_latency["p50_ms"]),
+        "service_p95_ms": float(service_latency["p95_ms"]),
+        "service_p99_ms": float(service_latency["p99_ms"]),
+        "lag_p50_ms": float(schedule_lag["p50_ms"]),
+        "lag_p95_ms": float(schedule_lag["p95_ms"]),
+        "lag_p99_ms": float(schedule_lag["p99_ms"]),
+        "inflight_groups_max": int(pipeline["inflight_groups_max"]),
+        "outstanding_write_sqes_max": int(pipeline["outstanding_write_sqes_max"]),
+        "v8_data_submit_hol_wait_ns": int(pipeline["v8_data_submit_hol_wait_ns"]),
+        "v8_data_completion_hol_wait_ns": int(pipeline["v8_data_completion_hol_wait_ns"]),
+        "sync_coalesce_wait_ns": int(pipeline["sync_coalesce_wait_ns"]),
+        "wal_sync_wait_ns": int(pipeline["wal_sync_wait_ns"]),
+        "median_outstanding_tickets_at_sync": median(admitted_counts),
+        "median_data_completion_to_frontier_start_ns": median(d2f_ns) if d2f_ns else None,
+        "median_coalescing_wait_ns": median(coalesce_ns) if coalesce_ns else None,
+    })
+    return metrics
+
+
+def _v8_equal_throughput_summary(rows: list[dict[str, Any]], planned: int) -> dict[str, Any]:
+    schedule = build_v8_equal_throughput_schedule()
+    expected = {
+        (row["writer"], row["workload"], row["repetition"], row["arm"])
+        for row in schedule
+    }
+    observed = [
+        (row.get("writer"), row.get("workload"), row.get("repetition"), row.get("arm"))
+        for row in rows
+    ]
+    validation = {
+        "complete": len(observed) == len(expected) and set(observed) == expected
+        and len(set(observed)) == len(observed) and all(row.get("exit_code") == 0 for row in rows),
+        "planned": len(expected),
+        "observed": len(observed),
+        "missing_cells": [list(cell) for cell in sorted(expected - set(observed), key=str)],
+        "unexpected_cells": [list(cell) for cell in sorted(set(observed) - expected, key=str)],
+        "duplicate_cells": [
+            list(cell) for cell in sorted(
+                {cell for cell in observed if observed.count(cell) > 1}, key=str,
+            )
+        ],
+    }
+    metric_names = (
+        "puts_per_second", "cpu_us_per_put", "p50_ms", "p95_ms", "p99_ms",
+        "service_p50_ms", "service_p95_ms", "service_p99_ms",
+        "lag_p50_ms", "lag_p95_ms", "lag_p99_ms",
+        "sync_count", "puts_per_sync", "inflight_groups_max", "outstanding_write_sqes_max",
+        "v8_data_submit_hol_wait_ns", "v8_data_completion_hol_wait_ns",
+        "sync_coalesce_wait_ns", "wal_sync_wait_ns",
+        "median_outstanding_tickets_at_sync", "median_data_completion_to_frontier_start_ns",
+        "median_coalescing_wait_ns", "coalescing_ready_target_hits",
+    )
+    comparisons: list[dict[str, Any]] = []
+    for writer, workload, offered_rate in V8_EQUAL_THROUGHPUT_CASES:
+        selected = {
+            arm: [
+                row for row in rows
+                if row.get("writer") == writer and row.get("workload") == workload
+                and row.get("arm") == arm and row.get("exit_code") == 0
+            ]
+            for arm in V8_EQUAL_THROUGHPUT_ARMS
+        }
+        stats = {
+            arm: {
+                "runs": len(arm_rows),
+                **{
+                    metric: median(float(row[metric]) for row in arm_rows)
+                    if arm_rows and all(row.get(metric) is not None for row in arm_rows) else None
+                    for metric in metric_names
+                },
+            }
+            for arm, arm_rows in selected.items()
+        }
+        comparisons.append({
+            "writer": writer,
+            "workload": workload,
+            "offered_rate_ops_per_sec": offered_rate,
+            "arms": stats,
+        })
+    return {
+        "suite": "v8-equal-throughput",
+        "complete": validation["complete"] and len(rows) == planned == len(schedule),
+        "runs_started": len(rows),
+        "runs_completed": sum(row.get("exit_code") == 0 for row in rows),
+        "runs_planned": planned,
+        "writers": list(V8_EQUAL_THROUGHPUT_WRITERS),
+        "workloads": ["point8-20k", "point16-28k"],
+        "arms": list(V8_EQUAL_THROUGHPUT_ARMS),
+        "results": rows,
+        "matrix_validation": validation,
+        "comparison": comparisons,
+    }
+
+
+def verify_v8_equal_throughput_results_directory(results: Path) -> dict[str, Any]:
+    """Strictly verify the 18-run equal-throughput archive before cleanup."""
+    errors: list[str] = []
+    try:
+        summary = json.loads((results / "summary.json").read_text(encoding="utf-8"))
+        remote_exit = json.loads((results / "remote-exit.json").read_text(encoding="utf-8"))
+        plan = json.loads((results / "benchmark-plan.json").read_text(encoding="utf-8"))
+        commit = (results / "commit.txt").read_text(encoding="utf-8").strip()
+        binary_sha = (results / "write-perf.sha256").read_text(encoding="utf-8").strip()
+        if not all(isinstance(value, dict) for value in (summary, remote_exit, plan)):
+            raise ValueError("summary, remote-exit, and plan must be JSON objects")
+        schedule = build_v8_equal_throughput_schedule()
+        expected_plan = build_v8_equal_throughput_plan(
+            machine_type="c4-standard-16-lssd",
+            machine_spec={"vcpus": 16, "ssd_count": 2, "ssd_gib": 750},
+            commit=commit,
+            binary_sha256=binary_sha,
+        )
+        if plan != expected_plan:
+            errors.append("benchmark plan differs from the fixed V8 equal-throughput suite")
+        if (
+            summary.get("suite") != "v8-equal-throughput"
+            or summary.get("source_commit") != commit
+            or summary.get("binary_sha256") != binary_sha
+            or summary.get("complete") is not True
+            or summary.get("runs_started") != len(schedule)
+            or summary.get("runs_attempted") != len(schedule)
+            or summary.get("runs_completed") != len(schedule)
+            or summary.get("runs_planned") != len(schedule)
+        ):
+            errors.append("summary identity or 18-run completion counts are invalid")
+        if (
+            remote_exit.get("failed") is not False
+            or remote_exit.get("runs_started") != len(schedule)
+            or remote_exit.get("runs_attempted") != len(schedule)
+        ):
+            errors.append("remote-exit does not confirm all 18 planned runs")
+        rows = summary.get("results")
+        if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+            raise ValueError("summary results are missing or malformed")
+        recomputed = _v8_equal_throughput_summary(rows, len(schedule))
+        for key in (
+            "suite", "complete", "runs_started", "runs_completed", "runs_planned",
+            "writers", "workloads", "arms", "matrix_validation", "comparison",
+        ):
+            if summary.get(key) != recomputed.get(key):
+                errors.append(f"summary field {key} differs from archived run rows")
+        expected_ids = {_run_id(row) for row in schedule}
+        actual_ids = {
+            path.name for path in results.iterdir()
+            if path.is_dir() and path.name.startswith(("r", "w"))
+        }
+        if actual_ids != expected_ids:
+            errors.append("run directories do not exactly match the 18-run schedule")
+        rows_by_id = {_run_id(row): row for row in rows}
+        for row in schedule:
+            run_id = _run_id(row)
+            run_dir = results / run_id
+            result_path = run_dir / "result.json"
+            metadata_path = run_dir / "run-metadata.json"
+            if not result_path.is_file() or not metadata_path.is_file():
+                errors.append(f"{run_id} is missing result.json or run-metadata.json")
+                continue
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            if not isinstance(metadata, dict) or metadata != rows_by_id.get(run_id):
+                errors.append(f"{run_id} metadata differs from its summary row")
+                continue
+            try:
+                raw = json.loads(result_path.read_text(encoding="utf-8"))
+                metrics = _validate_equal_throughput_record(raw, row)
+                if any(metadata.get(key) != value for key, value in metrics.items()):
+                    errors.append(f"{run_id} metrics differ from result.json")
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+                errors.append(f"{run_id} result is invalid: {error}")
         return {"verified": not errors, "planned": len(schedule), "observed": len(rows), "errors": errors}
     except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
         return {"verified": False, "errors": [str(error)]}
@@ -3558,6 +3783,16 @@ def run_suite(args: argparse.Namespace) -> int:
         )
         schedule_filename = "v8-d2-qualification-schedule.tsv"
         summarize = lambda rows, _writers, planned: _v8_d2_qualification_summary(rows, planned)
+    elif candidate_mode == "v8-equal-throughput":
+        schedule = build_v8_equal_throughput_schedule()
+        plan = build_v8_equal_throughput_plan(
+            machine_type=args.machine_type,
+            machine_spec={"vcpus": 16, "ssd_count": args.ssd_count, "ssd_gib": args.ssd_gib},
+            commit=args.commit,
+            binary_sha256=args.binary_sha256,
+        )
+        schedule_filename = "v8-equal-throughput-schedule.tsv"
+        summarize = lambda rows, _writers, planned: _v8_equal_throughput_summary(rows, planned)
     elif candidate_mode in ("point-resource-retirement", "point-resource-retirement-stage-a"):
         point_buffer_preallocation_enabled = candidate_mode == "point-resource-retirement-stage-a"
         schedule = build_point_resource_retirement_schedule(
@@ -4655,6 +4890,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "v7-v8-point-preallocation",
             "v7-v8-ready-target-final",
             "v8-d2-qualification",
+            "v8-equal-throughput",
         ),
         default="cursor",
     )
