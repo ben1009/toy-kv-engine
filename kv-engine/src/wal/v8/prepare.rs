@@ -115,6 +115,10 @@ pub(crate) struct PreparedWalV8Batch<'a, R> {
 }
 
 impl<'a, R> PreparedWalV8Batch<'a, R> {
+    pub(crate) fn write_class(&self) -> WalV8WriteClass {
+        self.write_class
+    }
+
     /// Calculate the canonical point-index charge before allocating it during
     /// preflight.
     pub(crate) fn preparation_buffer_bytes(batch: &WalBatch, limits: WalV5Limits) -> Result<u64> {

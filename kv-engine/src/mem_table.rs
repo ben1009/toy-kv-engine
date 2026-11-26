@@ -4418,6 +4418,13 @@ impl MemTable {
             .map_or(0, Wal::v8_point_buffer_preallocations_in_flight_for_test)
     }
 
+    #[cfg(test)]
+    pub(crate) fn v8_point_buffer_preallocation_hits_for_test(&self) -> u64 {
+        self.wal
+            .as_ref()
+            .map_or(0, Wal::v8_point_buffer_preallocation_hits_for_test)
+    }
+
     pub(crate) fn uses_pitr_batch_wal(&self) -> bool {
         self.wal_v7_source || self.wal_v8_source || self.wal.as_ref().is_some_and(Wal::is_pitr)
     }

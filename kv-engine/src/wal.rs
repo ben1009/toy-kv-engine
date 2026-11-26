@@ -2743,6 +2743,14 @@ impl Wal {
         )
     }
 
+    #[cfg(test)]
+    pub(crate) fn v8_point_buffer_preallocation_hits_for_test(&self) -> u64 {
+        self.v8_parallel.as_ref().map_or(
+            0,
+            v8::leader::WalV8ParallelWriter::point_buffer_preallocation_hits_for_test,
+        )
+    }
+
     pub(crate) fn admit_v8_prepared_parallel_point_batch<'a>(
         &self,
         scratch: v8::leader::WalV8PointAdmissionScratch<'a>,

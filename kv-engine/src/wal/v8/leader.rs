@@ -27,7 +27,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[cfg(feature = "bench")]
+#[cfg(any(test, feature = "bench"))]
 use std::sync::atomic::AtomicU64;
 
 #[cfg(test)]
@@ -290,7 +290,7 @@ pub(crate) struct WalV8ParallelWriter {
     point_buffer_preallocation_test_override: AtomicBool,
     #[cfg(feature = "bench")]
     point_buffer_preallocation_attempts: AtomicU64,
-    #[cfg(feature = "bench")]
+    #[cfg(any(test, feature = "bench"))]
     point_buffer_preallocation_hits: AtomicU64,
     #[cfg(feature = "bench")]
     point_buffer_preallocation_fallbacks: AtomicU64,
@@ -5105,7 +5105,7 @@ impl WalV8LeaderWriter {
             point_buffer_preallocation_test_override: AtomicBool::new(false),
             #[cfg(feature = "bench")]
             point_buffer_preallocation_attempts: AtomicU64::new(0),
-            #[cfg(feature = "bench")]
+            #[cfg(any(test, feature = "bench"))]
             point_buffer_preallocation_hits: AtomicU64::new(0),
             #[cfg(feature = "bench")]
             point_buffer_preallocation_fallbacks: AtomicU64::new(0),
@@ -5741,6 +5741,11 @@ impl WalV8ParallelWriter {
             .load(Ordering::Relaxed)
     }
 
+    #[cfg(test)]
+    pub(crate) fn point_buffer_preallocation_hits_for_test(&self) -> u64 {
+        self.point_buffer_preallocation_hits.load(Ordering::Relaxed)
+    }
+
     fn should_preallocate_point_buffer(&self) -> bool {
         #[cfg(test)]
         {
@@ -5940,7 +5945,9 @@ impl WalV8ParallelWriter {
         self.point_buffer_preallocation_attempts
             .fetch_add(1, Ordering::Relaxed);
 
-        if scratch.prepared.frame_buffer_bytes() != WAL_V8_FRAME_LEN {
+        if scratch.prepared.write_class() != WalV8WriteClass::Point
+            || scratch.prepared.frame_buffer_bytes() != WAL_V8_FRAME_LEN
+        {
             #[cfg(feature = "bench")]
             self.point_buffer_preallocation_fallbacks
                 .fetch_add(1, Ordering::Relaxed);
@@ -5962,7 +5969,7 @@ impl WalV8ParallelWriter {
             data_buffer,
             _permit: permit,
         });
-        #[cfg(feature = "bench")]
+        #[cfg(any(test, feature = "bench"))]
         self.point_buffer_preallocation_hits
             .fetch_add(1, Ordering::Relaxed);
         true
@@ -9731,6 +9738,59 @@ mod tests {
             assert_eq!(diagnostics.point_buffer_preallocation_fallbacks, 1);
         }
 
+        Ok(())
+    }
+
+    #[test]
+    fn point_buffer_preallocation_rejects_non_point_and_multiframe_writes() -> Result<()> {
+        const SEGMENT_LIMIT: u64 = 128 * 1024;
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("point-prealloc-eligibility-v8.wal");
+        let installed = install_empty(&path, header())?;
+        let (writer, _owner) = match open_accounted_parallel_writer(
+            &path,
+            &installed,
+            SEGMENT_LIMIT,
+            2 * SEGMENT_LIMIT,
+            4096,
+        ) {
+            Ok(writer) => writer,
+            Err(error) if is_io_uring_unavailable_error(&error) => {
+                eprintln!("skipping test (io_uring unavailable): {error:#}");
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+
+        let single_point = batch(10);
+        let single_batch = batch(20);
+        let multi_point = multi_frame_batch(30);
+        let multi_batch = multi_frame_batch(40);
+
+        let mut single_point_scratch =
+            WalV8PointAdmissionScratch::new(writer.preflight_batch_with_write_class(
+                &single_point,
+                LIVE_WAL_V5_LIMITS,
+                WalV8WriteClass::Point,
+            )?);
+        assert!(writer.try_preallocate_point_buffer(&mut single_point_scratch));
+        assert_eq!(writer.point_buffer_preallocations_in_flight_for_test(), 1);
+        drop(single_point_scratch);
+        assert_eq!(writer.point_buffer_preallocations_in_flight_for_test(), 0);
+
+        for (input, class) in [
+            (&single_batch, WalV8WriteClass::Batch),
+            (&multi_point, WalV8WriteClass::Point),
+            (&multi_batch, WalV8WriteClass::Batch),
+        ] {
+            let mut scratch = WalV8PointAdmissionScratch::new(
+                writer.preflight_batch_with_write_class(input, LIVE_WAL_V5_LIMITS, class)?,
+            );
+            assert!(!writer.try_preallocate_point_buffer(&mut scratch));
+            assert_eq!(writer.point_buffer_preallocations_in_flight_for_test(), 0);
+        }
+
+        assert_eq!(writer.point_buffer_preallocation_hits_for_test(), 1);
         Ok(())
     }
 

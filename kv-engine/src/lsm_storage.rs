@@ -40396,6 +40396,21 @@ mod tests {
                     == 0),
             "the test preallocation setting should be inherited by every V8 successor with no leaked permits"
         );
+        assert!(
+            v8_memtables
+                .iter()
+                .map(|memtable| memtable.v8_point_buffer_preallocation_hits_for_test())
+                .sum::<u64>()
+                > 0,
+            "Point admissions should consume preallocated buffers"
+        );
+        assert!(
+            v8_memtables.iter().any(|memtable| {
+                memtable.id() == successor_id
+                    && memtable.v8_point_buffer_preallocation_hits_for_test() > 0
+            }),
+            "a rotated V8 memtable should record a preallocation hit"
+        );
         #[cfg(feature = "bench")]
         {
             let diagnostics = v8_memtables
@@ -40743,6 +40758,12 @@ mod tests {
                 .all(|memtable| memtable.v8_point_buffer_preallocations_in_flight_for_test() == 0),
             "rotation must not strand speculative buffer permits"
         );
+        assert!(
+            test_memtables
+                .iter()
+                .all(|memtable| memtable.v8_point_buffer_preallocation_hits_for_test() > 0),
+            "every WAL created across rotations should record a preallocation hit"
+        );
         #[cfg(feature = "bench")]
         {
             let diagnostics = test_memtables
@@ -40921,11 +40942,13 @@ mod tests {
             source.v8_point_buffer_preallocations_in_flight_for_test(),
             0
         );
+        assert_eq!(source.v8_point_buffer_preallocation_hits_for_test(), 1);
         assert!(successor.v8_point_buffer_preallocation_enabled_for_test());
         assert_eq!(
             successor.v8_point_buffer_preallocations_in_flight_for_test(),
             0
         );
+        assert_eq!(successor.v8_point_buffer_preallocation_hits_for_test(), 0);
         #[cfg(feature = "bench")]
         {
             let source_diagnostics = source
@@ -40949,6 +40972,7 @@ mod tests {
             successor.v8_point_buffer_preallocations_in_flight_for_test(),
             0
         );
+        assert_eq!(successor.v8_point_buffer_preallocation_hits_for_test(), 1);
         #[cfg(feature = "bench")]
         {
             let successor_diagnostics = successor
