@@ -41249,7 +41249,7 @@ mod tests {
                 engine.enable_pitr(PitrOptions {
                     repository: repository.clone(),
                     config: PersistedPitrConfig {
-                        archive_interval: std::time::Duration::from_millis(100),
+                        archive_interval: std::time::Duration::from_secs(3600),
                         max_segment_bytes: MAX_SEGMENT_BYTES,
                         max_unarchived_bytes: 16 * 1024 * 1024,
                         max_source_spool_bytes: 64 * 1024 * 1024,
@@ -41376,12 +41376,118 @@ mod tests {
             0
         );
 
-        // 5. Automatic PITR maintenance rotation outside the thread-local override.
+        engine.close()?;
+        drop(successor);
+        drop(source);
+        drop(engine);
+
+        // Reopen and verify all 248 Point1, Point16, and Mixed Point+Batch keys.
+        let mut reopen_options = options;
+        reopen_options.pitr_repository = Some(repository);
+        let reopened =
+            KvEngine::open_with_wal_io_mode(&database, reopen_options, WalIoMode::Parallel)?;
+        for i in 0..8u32 {
+            assert_eq!(
+                reopened.get(format!("p1-{i:02}").as_bytes())?.as_deref(),
+                Some(format!("v1-{i:02}").as_bytes())
+            );
+        }
+        for tid in 0..16u32 {
+            for iter in 0..8u32 {
+                assert_eq!(
+                    reopened
+                        .get(format!("p16-{tid:02}-{iter:02}").as_bytes())?
+                        .as_deref(),
+                    Some(format!("val-{tid:02}-{iter:02}").as_bytes())
+                );
+            }
+        }
+        for tid in 0..8u32 {
+            for iter in 0..8u32 {
+                assert_eq!(
+                    reopened
+                        .get(format!("mix-p-{tid:02}-{iter:02}").as_bytes())?
+                        .as_deref(),
+                    Some(format!("mix-pv-{tid:02}-{iter:02}").as_bytes())
+                );
+            }
+        }
+        for tid in 0..4u32 {
+            for iter in 0..6u32 {
+                assert_eq!(
+                    reopened
+                        .get(format!("mix-b-{tid:02}-{iter:02}-a").as_bytes())?
+                        .as_deref(),
+                    Some(format!("mix-bv-{tid:02}-{iter:02}-a").as_bytes())
+                );
+                assert_eq!(
+                    reopened
+                        .get(format!("mix-b-{tid:02}-{iter:02}-b").as_bytes())?
+                        .as_deref(),
+                    Some(format!("mix-bv-{tid:02}-{iter:02}-b").as_bytes())
+                );
+            }
+        }
+        reopened.close()?;
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn v8_candidate_profile_auto_pitr_rotation_inherits_config() -> anyhow::Result<()> {
+        use crate::pitr::api::{PersistedPitrConfig, PitrOptions, PitrRuntimeOptions};
+        use crate::tests::harness::is_io_uring_unavailable_error;
+        use crate::wal::WalIoMode;
+        use crate::wal::v8::leader::{
+            WalV8CoalesceTargetPolicy, WalV8Profile, with_candidate_profile_for_test,
+        };
+        use crate::wal::v8::parallel::WalV8ProgressMode;
+
+        const MAX_SEGMENT_BYTES: u64 = 4 * 1024 * 1024;
+
+        let directory = tempdir()?;
+        let database = directory.path().join("db");
+        let repository = directory.path().join("repository");
+        let options = LsmStorageOptions {
+            enable_wal: true,
+            target_sst_size: 1 << 30,
+            ..LsmStorageOptions::default_for_test()
+        };
+
+        let engine =
+            match with_candidate_profile_for_test(|| -> anyhow::Result<Option<Arc<KvEngine>>> {
+                let engine = match KvEngine::open_with_wal_io_mode(
+                    &database,
+                    options.clone(),
+                    WalIoMode::Parallel,
+                ) {
+                    Ok(engine) => engine,
+                    Err(error) if is_io_uring_unavailable_error(&error) => return Ok(None),
+                    Err(error) => return Err(error),
+                };
+                engine.enable_pitr(PitrOptions {
+                    repository: repository.clone(),
+                    config: PersistedPitrConfig {
+                        archive_interval: std::time::Duration::from_millis(100),
+                        max_segment_bytes: MAX_SEGMENT_BYTES,
+                        max_unarchived_bytes: 16 * 1024 * 1024,
+                        max_source_spool_bytes: 64 * 1024 * 1024,
+                    },
+                    runtime: PitrRuntimeOptions::default(),
+                })?;
+                Ok(Some(engine))
+            })? {
+                Some(engine) => engine,
+                None => return Ok(()),
+            };
+
+        let source = engine.inner.state.load().memtable.clone();
         engine.put(b"auto-rot-key", b"auto-rot-val")?;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let auto_rotated = loop {
             let current = engine.inner.state.load().memtable.clone();
-            if !Arc::ptr_eq(&current, &successor) {
+            if !Arc::ptr_eq(&current, &source) {
                 break current;
             }
             anyhow::ensure!(
@@ -41390,36 +41496,32 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(20));
         };
-        assert_candidate_active(&auto_rotated);
+        assert!(auto_rotated.uses_v8_cursor_direct_completion());
+        assert!(auto_rotated.v8_point_buffer_preallocation_enabled_for_test());
+        let effective = auto_rotated
+            .v8_effective_config_for_test()
+            .expect("auto-rotated V8 WAL exposes effective config");
+        assert_eq!(effective.profile, WalV8Profile::Candidate);
+        assert_eq!(effective.progress_mode, WalV8ProgressMode::Cursor);
+        assert!(effective.direct_completion_enabled);
         assert_eq!(
-            successor.v8_point_buffer_preallocations_in_flight_for_test(),
+            effective.coalesce_policy,
+            WalV8CoalesceTargetPolicy::PointOnly(8)
+        );
+        assert_eq!(
+            source.v8_point_buffer_preallocations_in_flight_for_test(),
             0
         );
 
         engine.close()?;
         drop(auto_rotated);
-        drop(successor);
         drop(source);
         drop(engine);
 
-        // Reopen and verify all Point1, Point16, Mixed Point+Batch, and auto-rot keys.
         let mut reopen_options = options;
         reopen_options.pitr_repository = Some(repository);
         let reopened =
             KvEngine::open_with_wal_io_mode(&database, reopen_options, WalIoMode::Parallel)?;
-        assert_eq!(reopened.get(b"p1-00")?.as_deref(), Some(&b"v1-00"[..]));
-        assert_eq!(
-            reopened.get(b"p16-15-07")?.as_deref(),
-            Some(&b"val-15-07"[..])
-        );
-        assert_eq!(
-            reopened.get(b"mix-p-07-07")?.as_deref(),
-            Some(&b"mix-pv-07-07"[..])
-        );
-        assert_eq!(
-            reopened.get(b"mix-b-03-05-b")?.as_deref(),
-            Some(&b"mix-bv-03-05-b"[..])
-        );
         assert_eq!(
             reopened.get(b"auto-rot-key")?.as_deref(),
             Some(&b"auto-rot-val"[..])
@@ -41462,8 +41564,8 @@ mod tests {
                     config: PersistedPitrConfig {
                         archive_interval: std::time::Duration::from_secs(3600),
                         max_segment_bytes: 512 * 1024,
-                        max_unarchived_bytes: 3 * 1024 * 1024,
-                        max_source_spool_bytes: 3 * 1024 * 1024,
+                        max_unarchived_bytes: 512 * 1024,
+                        max_source_spool_bytes: 8 * 1024 * 1024,
                     },
                     runtime: PitrRuntimeOptions::default(),
                 })?;
@@ -41473,27 +41575,72 @@ mod tests {
                 None => return Ok(()),
             };
 
-        let payload = vec![0x7c; 32 * 1024];
+        let active = engine.inner.state.load().memtable.clone();
+        // 1. Single-frame Point writes must hit Stage A before quota exhaustion.
+        let point_payload = vec![0x42; 512];
         let mut committed = Vec::new();
-        let mut saw_capacity_error = false;
-        for i in 0..64u32 {
-            let key = format!("quota-{i:02}").into_bytes();
-            match engine.put(&key, &payload) {
-                Ok(()) => committed.push(key),
-                Err(_) => {
-                    saw_capacity_error = true;
+        for i in 0..8u32 {
+            let key = format!("quota-pt-{i:02}").into_bytes();
+            engine.put(&key, &point_payload)?;
+            committed.push((key, point_payload.clone()));
+        }
+        assert!(
+            active.v8_point_buffer_preallocation_hits_for_test() >= 8,
+            "single-frame Point writes under Candidate must hit Stage A"
+        );
+
+        let is_capacity_error = |error: &anyhow::Error| {
+            crate::wal::Wal::v7_capacity_failure(error).is_some()
+                || error
+                    .downcast_ref::<crate::wal::v8::leader::WalV8LeaderCapacityError>()
+                    .is_some()
+        };
+
+        // 2. Fill most of the tight segment budget with larger entries.
+        let filler_payload = vec![0x7c; 32 * 1024];
+        for i in 0..32u32 {
+            let key = format!("quota-fill-{i:03}").into_bytes();
+            match engine.put(&key, &filler_payload) {
+                Ok(()) => committed.push((key, filler_payload.clone())),
+                Err(error) => {
+                    assert!(
+                        is_capacity_error(&error),
+                        "expected capacity error while filling quota, got {error:#}"
+                    );
+                    break;
+                }
+            }
+        }
+
+        // 3. Drive single-frame Point writes to deterministic capacity rejection
+        // and verify Stage A permits are released and the writer is not poisoned.
+        let mut saw_point_capacity_error = false;
+        for i in 0..256u32 {
+            let key = format!("quota-end-{i:03}").into_bytes();
+            match engine.put(&key, &point_payload) {
+                Ok(()) => committed.push((key, point_payload.clone())),
+                Err(error) => {
+                    assert!(
+                        is_capacity_error(&error),
+                        "expected capacity error on Point write, got {error:#}"
+                    );
+                    saw_point_capacity_error = true;
                     break;
                 }
             }
         }
         assert!(
-            saw_capacity_error && !committed.is_empty(),
-            "tight PITR segment/quota limits should reject further writes cleanly"
+            saw_point_capacity_error && !committed.is_empty(),
+            "single-frame Point writes should hit deterministic capacity exhaustion"
         );
-        let active = engine.inner.state.load().memtable.clone();
         assert_eq!(
             active.v8_point_buffer_preallocations_in_flight_for_test(),
             0
+        );
+        // Existing committed data remains readable (writer/engine is not poisoned).
+        assert_eq!(
+            engine.get(&committed[0].0)?.as_deref(),
+            Some(committed[0].1.as_slice())
         );
         drop(active);
         engine.close()?;
@@ -41503,8 +41650,8 @@ mod tests {
         reopen_options.pitr_repository = Some(repository);
         let reopened =
             KvEngine::open_with_wal_io_mode(&database, reopen_options, WalIoMode::Parallel)?;
-        for key in &committed {
-            assert_eq!(reopened.get(key)?.as_deref(), Some(payload.as_slice()));
+        for (key, value) in &committed {
+            assert_eq!(reopened.get(key)?.as_deref(), Some(value.as_slice()));
         }
         reopened.close()?;
 

@@ -9587,8 +9587,11 @@ mod tests {
             )?;
             let requested_direct_frontier =
                 std::env::var(CHILD_FRONTIER_MODE_ENV).as_deref() == Ok("direct");
+            let requested_candidate = std::env::var_os("TOYKV_WAL_V8_PROFILE").as_deref()
+                == Some(OsStr::new("candidate"));
             #[cfg(feature = "bench")]
             let writer = if requested_direct_frontier
+                || requested_candidate
                 || std::env::var_os(EXTENT_PREPARATION_ENV).is_some()
             {
                 let worker_file = OpenOptions::new()
@@ -9596,12 +9599,13 @@ mod tests {
                     .write(true)
                     .custom_flags(libc::O_DIRECT)
                     .open(wal_path)?;
-                if std::env::var_os(EXTENT_PREPARATION_ENV)
-                    .as_deref()
-                    .is_some_and(|mode| {
-                        mode == OsStr::new("sliding-lookahead")
-                            || mode == OsStr::new("sliding-point-lookahead")
-                    })
+                if requested_candidate
+                    || std::env::var_os(EXTENT_PREPARATION_ENV)
+                        .as_deref()
+                        .is_some_and(|mode| {
+                            mode == OsStr::new("sliding-lookahead")
+                                || mode == OsStr::new("sliding-point-lookahead")
+                        })
                 {
                     let sync_file = OpenOptions::new().read(true).write(true).open(wal_path)?;
                     let (leader, _owner) = open_accounted_writer(
@@ -9647,7 +9651,23 @@ mod tests {
                 );
             }
             #[cfg(not(feature = "bench"))]
-            let writer = if requested_direct_frontier {
+            let writer = if requested_candidate {
+                let worker_file = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .custom_flags(libc::O_DIRECT)
+                    .open(wal_path)?;
+                let sync_file = OpenOptions::new().read(true).write(true).open(wal_path)?;
+                let (leader, _owner) = open_accounted_writer(
+                    wal_path,
+                    &installed,
+                    MAX_WAL_FILE_SIZE,
+                    2 * MAX_WAL_FILE_SIZE,
+                    FRAME_LEN_U64,
+                    sync_file,
+                )?;
+                leader.into_parallel_with_worker_file(worker_file)?
+            } else if requested_direct_frontier {
                 let worker_file = OpenOptions::new()
                     .read(true)
                     .write(true)
@@ -9663,7 +9683,7 @@ mod tests {
                 "child writer must use the requested FRONTIER mode"
             );
             #[cfg(feature = "bench")]
-            {
+            if !requested_candidate {
                 let requested = std::env::var(WAL_V8_POINT_PROGRESS_RING_ENV)?;
                 assert_eq!(
                     writer.progress_ring_enabled(),
@@ -9674,6 +9694,16 @@ mod tests {
                     writer.coordinator.progress_cursor_enabled(),
                     requested == "2",
                     "child writer must use the requested progress cursor mode"
+                );
+            }
+            if requested_candidate {
+                let effective = writer.effective_config();
+                assert_eq!(effective.profile, WalV8Profile::Candidate);
+                assert!(writer.uses_cursor_direct_completion());
+                assert!(writer.point_buffer_preallocation_enabled_for_test());
+                assert_eq!(
+                    effective.coalesce_policy,
+                    WalV8CoalesceTargetPolicy::PointOnly(8)
                 );
             }
             #[cfg(feature = "bench")]
@@ -9714,7 +9744,7 @@ mod tests {
         for frontier_mode in frontier_modes {
             for extent_preparation_mode in extent_preparation_modes {
                 let mut cases = CRASH_POINTS
-                    .map(|(point, min, max)| ("0", point, min, max))
+                    .map(|(point, min, max)| ("0", "legacy", point, min, max))
                     .to_vec();
                 if cfg!(feature = "bench")
                     && matches!(
@@ -9722,10 +9752,18 @@ mod tests {
                         ("buffered", "none") | ("direct", "sliding-point-lookahead")
                     )
                 {
-                    cases.extend(CRASH_POINTS.map(|(point, min, max)| ("2", point, min, max)));
+                    cases.extend(
+                        CRASH_POINTS.map(|(point, min, max)| ("2", "legacy", point, min, max)),
+                    );
+                }
+                if frontier_mode == "direct" && extent_preparation_mode == "none" {
+                    cases.extend(
+                        CRASH_POINTS.map(|(point, min, max)| ("2", "candidate", point, min, max)),
+                    );
                 }
                 for (
                     progress_mode,
+                    profile,
                     crash_point,
                     expected_min_ticket_end,
                     expected_max_ticket_end,
@@ -9761,6 +9799,7 @@ mod tests {
                         .env(CHILD_ACK_ENV, &ack_path)
                         .env(CHILD_FRONTIER_MODE_ENV, frontier_mode)
                         .env(FRONTIER_MODE_ENV, frontier_mode)
+                        .env("TOYKV_WAL_V8_PROFILE", profile)
                         .env_remove(EXTENT_PREPARATION_ENV)
                         .env_remove(EXTENT_PREPARATION_BYTES_ENV)
                         .env(
@@ -13897,6 +13936,96 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn v8_candidate_mixed_target8_falls_back_to_dynamic_on_real_admission() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("candidate-mixed-target8.wal");
+        let header = header();
+        let installed = install_empty(&path, header)?;
+        let writer = Arc::new(
+            match open_writer(&path, &installed)?.into_parallel_with_worker_file_and_config(
+                OpenOptions::new().read(true).write(true).open(&path)?,
+                WalV8RequestedConfig::candidate(),
+            ) {
+                Ok(writer) => writer,
+                Err(error) if is_io_uring_unavailable_error(&error) => {
+                    eprintln!("skipping test (io_uring unavailable): {error:#}");
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            },
+        );
+
+        // Admit 8 Point tickets + 1 Batch ticket so all 9 are in the outstanding
+        // window simultaneously, with the Batch ticket still unready.
+        let point_batches: Vec<_> = (0..8u64).map(|i| batch((i + 1) * 10)).collect();
+        let mut point_jobs = Vec::new();
+        for b in &point_batches {
+            let prepared = writer.preflight_batch_with_write_class(
+                b,
+                LIVE_WAL_V5_LIMITS,
+                WalV8WriteClass::Point,
+            )?;
+            let mut scratch = WalV8PointAdmissionScratch::new(prepared);
+            assert!(writer.try_preallocate_point_buffer(&mut scratch));
+            point_jobs.push(writer.admit_prepared_point_batch(
+                scratch,
+                b.commit_ts,
+                b.recorded_at,
+            )?);
+        }
+        let batch_write = batch(100);
+        let batch_job = writer.admit_prepared_batch(
+            writer.preflight_batch_with_write_class(
+                &batch_write,
+                LIVE_WAL_V5_LIMITS,
+                WalV8WriteClass::Batch,
+            )?,
+            batch_write.commit_ts,
+            batch_write.recorded_at,
+        )?;
+        let last_ticket = batch_job.assignment().segment_ticket;
+
+        // Finish all 8 Point jobs while keeping the 9th Batch job unready.
+        for job in point_jobs {
+            let _ = job.finish()?;
+        }
+        let snapshot = writer.coordinator.frontier_ready_snapshot();
+        assert!(snapshot.has_outstanding_batch_tickets);
+
+        // Drive durability for the 8th Point ticket: because an unready Batch
+        // ticket is outstanding, Target8 must be suppressed and the driver must
+        // enter Dynamic coalescing (`BeforeWait`) instead of stopping early at 8.
+        let (wait_tx, wait_rx) = crossbeam_channel::bounded(4);
+        writer.io.set_progress_wait_hook(Arc::new(move |event| {
+            if matches!(event, WalV8ProgressWaitTestEvent::BeforeWait) {
+                let _ = wait_tx.try_send(());
+            }
+        }));
+        thread::scope(|scope| -> Result<()> {
+            let driver = scope.spawn({
+                let writer = Arc::clone(&writer);
+                move || writer.wait_durable(last_ticket)
+            });
+            wait_rx
+                .recv_timeout(Duration::from_secs(5))
+                .context("mixed outstanding window should park in Dynamic coalescing")?;
+            let _ = batch_job.finish()?;
+            driver.join().expect("durability driver thread panicked")?;
+            Ok(())
+        })?;
+
+        assert!(
+            !writer
+                .coordinator
+                .frontier_ready_snapshot()
+                .has_outstanding_batch_tickets
+        );
+        assert_eq!(writer.active_boundaries()?.1.ticket_end, last_ticket + 1);
+
+        Ok(())
+    }
+
     #[cfg(feature = "bench")]
     #[test]
     fn target8_diagnostics_distinguish_eligible_mixed_and_hit_phases() -> Result<()> {
@@ -13981,6 +14110,90 @@ mod tests {
         assert!(outcome.mixed_fallback_cycle);
         assert!(!outcome.target_hit);
         assert!(outcome.waited);
+
+        Ok(())
+    }
+
+    #[test]
+    fn v8_candidate_stage_a_logical_quota_exhaustion_and_recovery() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("candidate-quota.wal");
+        let installed = install_empty(&path, header())?;
+        let sync_file = OpenOptions::new().read(true).write(true).open(&path)?;
+        let logical_limit = 2 * MAX_WAL_FILE_SIZE;
+        let (leader, owner) = open_accounted_writer(
+            &path,
+            &installed,
+            MAX_WAL_FILE_SIZE,
+            logical_limit,
+            FRAME_LEN_U64,
+            sync_file,
+        )?;
+        let writer = leader.into_parallel_with_worker_file_and_config(
+            OpenOptions::new().read(true).write(true).open(&path)?,
+            WalV8RequestedConfig::candidate(),
+        )?;
+
+        // 1. Exhaust logical quota deterministically to < 16 bytes remaining.
+        let mut held_reservations = Vec::new();
+        for chunk in [64 * 1024, 16 * 1024, 4096, 1024, 256, 64, 16] {
+            while let Ok(reservation) = owner.reserve_batch(chunk, FRAME_LEN_U64) {
+                held_reservations.push(reservation);
+            }
+        }
+        assert!(!held_reservations.is_empty());
+
+        // 2. Single-frame Point write hits Stage A, fails at admission with
+        // LogicalWalLimit, releases its Stage A permit, and does not poison writer.
+        let pt_batch = batch(10);
+        let prepared = writer.preflight_batch_with_write_class(
+            &pt_batch,
+            LIVE_WAL_V5_LIMITS,
+            WalV8WriteClass::Point,
+        )?;
+        let mut scratch = WalV8PointAdmissionScratch::new(prepared);
+        assert!(writer.try_preallocate_point_buffer(&mut scratch));
+        assert!(writer.point_buffer_preallocation_hits_for_test() >= 1);
+        assert_eq!(writer.point_buffer_preallocations_in_flight_for_test(), 1);
+
+        let err = match writer.admit_prepared_point_batch(
+            scratch,
+            pt_batch.commit_ts,
+            pt_batch.recorded_at,
+        ) {
+            Ok(_) => anyhow::bail!("expected LogicalWalLimit when quota is exhausted"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(
+                err.downcast_ref::<crate::wal::v7::admission::WalV7ReservationError>(),
+                Some(
+                    crate::wal::v7::admission::WalV7ReservationError::LogicalWalLimit
+                        | crate::wal::v7::admission::WalV7ReservationError::SourceSpoolLimit { .. }
+                )
+            ),
+            "expected V7 quota exhaustion error, got {err:#}"
+        );
+        assert_eq!(writer.point_buffer_preallocations_in_flight_for_test(), 0);
+        assert!(!writer.is_poisoned());
+
+        // 3. Release quota and verify a subsequent single-frame Point write succeeds.
+        drop(held_reservations);
+        let prepared_ok = writer.preflight_batch_with_write_class(
+            &pt_batch,
+            LIVE_WAL_V5_LIMITS,
+            WalV8WriteClass::Point,
+        )?;
+        let mut scratch_ok = WalV8PointAdmissionScratch::new(prepared_ok);
+        assert!(writer.try_preallocate_point_buffer(&mut scratch_ok));
+        let job = writer.admit_prepared_point_batch(
+            scratch_ok,
+            pt_batch.commit_ts,
+            pt_batch.recorded_at,
+        )?;
+        let _ = job.finish()?;
+        writer.sync()?;
+        assert_eq!(writer.point_buffer_preallocations_in_flight_for_test(), 0);
 
         Ok(())
     }
