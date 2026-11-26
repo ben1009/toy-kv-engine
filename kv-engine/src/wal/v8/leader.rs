@@ -2094,6 +2094,8 @@ struct WalV8ExtentPreallocator {
     worker_handle: WalV8ExtentWorkerHandle<()>,
     #[cfg(test)]
     worker_hook_for_test: WalV8LookaheadWorkerHook,
+    #[cfg(test)]
+    quiesce_hook_for_test: WalV8LookaheadWorkerHook,
 }
 
 impl WalV8ExtentPreallocator {
@@ -2354,6 +2356,8 @@ impl WalV8ExtentPreallocator {
             worker_handle: WalV8ExtentWorkerHandle::new(request_sender, worker),
             #[cfg(test)]
             worker_hook_for_test,
+            #[cfg(test)]
+            quiesce_hook_for_test: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -2362,7 +2366,16 @@ impl WalV8ExtentPreallocator {
         *self.worker_hook_for_test.lock() = hook;
     }
 
+    #[cfg(test)]
+    fn set_quiesce_hook_for_test(&self, hook: Option<Arc<dyn Fn() + Send + Sync>>) {
+        *self.quiesce_hook_for_test.lock() = hook;
+    }
+
     fn quiesce(&self) {
+        #[cfg(test)]
+        if let Some(hook) = self.quiesce_hook_for_test.lock().take() {
+            hook();
+        }
         self.worker_handle
             .quiesce("V8 extent lookahead worker panicked");
     }
@@ -7893,6 +7906,16 @@ impl WalV8ParallelWriter {
     ) {
         if let Some(preallocator) = &self.io.extent_preallocator {
             preallocator.set_worker_hook_for_test(hook);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_lookahead_quiesce_hook_for_test(
+        &self,
+        hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) {
+        if let Some(preallocator) = &self.io.extent_preallocator {
+            preallocator.set_quiesce_hook_for_test(hook);
         }
     }
 

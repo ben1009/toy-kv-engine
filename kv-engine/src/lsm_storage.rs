@@ -41182,6 +41182,7 @@ mod tests {
         use crate::pitr::api::{PersistedPitrConfig, PitrOptions, PitrRuntimeOptions};
         use crate::tests::harness::is_io_uring_unavailable_error;
         use crate::wal::WalIoMode;
+        use anyhow::Context as _;
 
         let directory = tempdir()?;
         let database = directory.path().join("db");
@@ -41232,19 +41233,38 @@ mod tests {
             .to_path_buf();
         let source_segment_id = retained_source.v8_active_boundaries()?.1.segment_id;
 
-        let entered = Arc::new(std::sync::Barrier::new(2));
-        let release = Arc::new(std::sync::Barrier::new(2));
-        let entered_worker = Arc::clone(&entered);
-        let release_worker = Arc::clone(&release);
+        struct ReleaseOnDrop(Option<std::sync::mpsc::Sender<()>>);
+        impl Drop for ReleaseOnDrop {
+            fn drop(&mut self) {
+                if let Some(tx) = self.0.take() {
+                    let _ = tx.send(());
+                }
+            }
+        }
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        let _release_guard = ReleaseOnDrop(Some(release_tx));
         retained_source.set_v8_lookahead_worker_hook_for_test(Some(Arc::new(move || {
-            entered_worker.wait();
-            release_worker.wait();
+            let _ = entered_tx.send(());
+            let _ = release_rx
+                .lock()
+                .expect("release mutex poisoned")
+                .recv_timeout(std::time::Duration::from_secs(5));
+        })));
+
+        let (quiesce_tx, quiesce_rx) = std::sync::mpsc::channel();
+        retained_source.set_v8_lookahead_quiesce_hook_for_test(Some(Arc::new(move || {
+            let _ = quiesce_tx.send(());
         })));
 
         // Trigger Point-only Lookahead: `put` returns once the requested prefix
         // is ready, while the background worker blocks inside the slack zero-fill loop.
         engine.put(b"seal-k-00", b"point-payload")?;
-        entered.wait();
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .context("timed out waiting for lookahead worker to enter slack zero-fill")?;
 
         let seal_completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let seal_completed_thread = Arc::clone(&seal_completed);
@@ -41259,15 +41279,17 @@ mod tests {
             Ok(())
         });
 
-        // Give the seal thread time to reach `quiesce_extent_preparation`: it
-        // must remain blocked while the background lookahead worker is active.
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        // Deterministically wait until the seal reaches `quiesce_extent_preparation`,
+        // then confirm it cannot complete while the lookahead worker is active.
+        quiesce_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .context("timed out waiting for PITR seal to reach quiesce_extent_preparation")?;
         assert!(
             !seal_completed.load(std::sync::atomic::Ordering::Acquire),
             "PITR seal must wait for the background extent lookahead worker before truncating"
         );
 
-        release.wait();
+        drop(_release_guard);
         seal_handle.join().expect("seal thread panicked")?;
         assert!(seal_completed.load(std::sync::atomic::Ordering::Acquire));
 
