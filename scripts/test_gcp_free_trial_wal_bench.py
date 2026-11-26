@@ -558,20 +558,25 @@ class PointProgressRingQualificationTests(unittest.TestCase):
     def _raw_record(row: dict[str, object]) -> dict[str, object]:
         ring_enabled = bool(row["progress_ring_enabled"])
         cursor_enabled = bool(row.get("progress_cursor_enabled", False))
+        extent_mode = row.get("extent_mode") or "sliding-point-lookahead"
+        frontier_direct = (row.get("frontier_mode") or "direct") != "buffered"
         start_preparation = {
-            "mode": "sliding-point-lookahead",
-            "window_bytes": POINT_LOOKAHEAD_WINDOW_BYTES,
+            "mode": extent_mode,
+            "window_bytes": row.get("extent_window_bytes", POINT_LOOKAHEAD_WINDOW_BYTES),
             "extent_policy_storage": "vec",
             "extent_policy_scan_diagnostics_enabled": False,
             "initialized_bytes": 0,
         }
         end_preparation = {
             **start_preparation,
-            "initialized_bytes": POINT_LOOKAHEAD_WINDOW_BYTES if row["workload"] == "point" else 0,
+            "initialized_bytes": (
+                POINT_LOOKAHEAD_WINDOW_BYTES
+                if row["workload"] == "point" and extent_mode == "sliding-point-lookahead" else 0
+            ),
         }
         handles = {
             "data": {"o_direct": True, "device": 8, "inode": 101},
-            "frontier": {"o_direct": True, "device": 8, "inode": 101},
+            "frontier": {"o_direct": frontier_direct, "device": 8, "inode": 101},
             "sync": {"o_direct": False, "device": 8, "inode": 101},
         }
         start = {
@@ -1525,6 +1530,22 @@ class PointProgressRingQualificationTests(unittest.TestCase):
         cand_t8_batch = next(
             row for row in schedule if row["arm"] == "v8_candidate_target8" and row["workload"] == "batch64"
         )
+        cand_t8_point1 = next(
+            row for row in schedule
+            if row["arm"] == "v8_candidate_target8" and row["workload"] == "point" and row["writer"] == 1
+        )
+        cand_t8_point8 = next(
+            row for row in schedule
+            if row["arm"] == "v8_candidate_target8" and row["workload"] == "point" and row["writer"] == 8
+        )
+        v7_point = next(row for row in schedule if row["arm"] == "v7_parallel" and row["workload"] == "point")
+        for sample_row in (v7_point, legacy_point, cand_dyn_point, cand_t8_batch):
+            runtime_env = progress_ring_runner._v8_d2_qualification_environment(sample_row)
+            for base_key in ("PATH", "HOME", "TMPDIR", "LC_ALL"):
+                self.assertIn(base_key, runtime_env)
+            archive_env = progress_ring_runner._v8_d2_qualification_environment_text(sample_row)
+            for base_key in ("PATH=", "HOME=", "TMPDIR=", "LC_ALL="):
+                self.assertNotIn(base_key, archive_env)
         self.assertIn(
             "TOYKV_WAL_V8_PROFILE=legacy\n",
             progress_ring_runner._v8_d2_qualification_environment_text(legacy_point),
@@ -1546,11 +1567,35 @@ class PointProgressRingQualificationTests(unittest.TestCase):
             progress_ring_runner._v8_d2_qualification_environment_text(cand_t8_batch),
         )
 
-        # Reject Batch64 target hits under point_only policy
+        # Reject Dynamic arm with non-zero Target8 counters
+        bad_dyn_raw = self._raw_record(cand_dyn_point)
+        bad_dyn_raw["result"]["wal_pipeline"]["wal_io_end"]["coalesce_target_eligible_cycles"] = 1
+        with self.assertRaises(ValueError):
+            progress_ring_runner._validate_point_preallocation_record(bad_dyn_raw, cand_dyn_point)
+
+        # Reject Point1 Target8 hits
+        bad_p1_raw = self._raw_record(cand_t8_point1)
+        bad_p1_raw["result"]["wal_pipeline"]["wal_io_end"]["coalesce_target_initial_hits"] = 1
+        with self.assertRaises(ValueError):
+            progress_ring_runner._validate_point_preallocation_record(bad_p1_raw, cand_t8_point1)
+
+        # Reject Point8/16 mixed-batch fallback cycles under point_only
+        bad_p8_raw = self._raw_record(cand_t8_point8)
+        bad_p8_raw["result"]["wal_pipeline"]["wal_io_end"]["coalesce_target_mixed_fallback_cycles"] = 1
+        with self.assertRaises(ValueError):
+            progress_ring_runner._validate_point_preallocation_record(bad_p8_raw, cand_t8_point8)
+
+        # Reject Batch64 eligible cycles or target hits under point_only policy
         bad_batch_raw = self._raw_record(cand_t8_batch)
-        bad_batch_raw["result"]["wal_pipeline"]["wal_io_end"]["coalesce_target_initial_hits"] = 1
+        bad_batch_raw["result"]["wal_pipeline"]["wal_io_end"]["coalesce_target_eligible_cycles"] = 1
         with self.assertRaises(ValueError):
             progress_ring_runner._validate_point_preallocation_record(bad_batch_raw, cand_t8_batch)
+
+        # Reject initial + after_wake != total target hits
+        bad_sum_raw = self._raw_record(cand_t8_point8)
+        bad_sum_raw["result"]["wal_pipeline"]["wal_io_end"]["coalesce_target_initial_hits"] += 1
+        with self.assertRaises(ValueError):
+            progress_ring_runner._validate_point_preallocation_record(bad_sum_raw, cand_t8_point8)
 
         with tempfile.TemporaryDirectory() as temporary:
             results = self._make_fixture(Path(temporary), v8_d2_qualification=True)
@@ -1563,11 +1608,53 @@ class PointProgressRingQualificationTests(unittest.TestCase):
             self.assertTrue(summary["complete"])
             self.assertEqual(summary["runs_completed"], 80)
             self.assertEqual(summary["runs_attempted"], 80)
+            self.assertTrue(summary["qualification_gates"]["all_automated_gates_passed"])
+            self.assertGreater(summary["qualification_gates"]["point16_target8_hits"], 0)
+            self.assertIsNotNone(
+                summary["comparison"][0]["paired"]["v8_candidate_target8_vs_v8_candidate_dynamic"][
+                    "paired_cpu_us_per_put_delta_median_us"
+                ]
+            )
             summary["comparison"][0]["arms"]["v8_candidate_target8"]["puts_per_second"] += 1
             (results / "summary.json").write_text(json.dumps(summary), encoding="utf-8")
             verification = progress_ring_runner.verify_v8_d2_qualification_results_directory(results)
             self.assertFalse(verification["verified"])
             self.assertTrue(any("comparison differs" in error for error in verification["errors"]))
+
+    def test_v8_d2_qualification_live_runner_smoke_all_four_arms(self) -> None:
+        schedule = build_v8_d2_qualification_schedule()
+        sample_rows = [
+            next(row for row in schedule if row["arm"] == arm and row["workload"] == "point" and row["writer"] == 8)
+            for arm in V8_D2_QUALIFICATION_ARMS
+        ] + [
+            next(row for row in schedule if row["arm"] == "v8_legacy" and row["workload"] == "batch64"),
+            next(row for row in schedule if row["arm"] == "v8_candidate_target8" and row["workload"] == "batch64"),
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for row in sample_rows:
+                row_with_commit = {**row, "source_commit": "a" * 40}
+                raw = (
+                    self._raw_v7_record(row_with_commit)
+                    if row["format_version"] == 7 else self._raw_record(row_with_commit)
+                )
+                process = Mock()
+                process.args = ["write-perf"]
+                process.returncode = 0
+                process.communicate.return_value = (json.dumps(raw), "")
+                with patch.object(progress_ring_runner.subprocess, "Popen", return_value=process):
+                    metadata = progress_ring_runner._run_one(
+                        binary=Path("write-perf"),
+                        binary_sha256="b" * 64,
+                        row=row_with_commit,
+                        results_dir=root / "results",
+                        db_root=root / "db",
+                        safe_deadline_epoch=int(time.time()) + 3600,
+                        candidate_mode="v8-d2-qualification",
+                    )
+                run_dir = root / "results" / progress_ring_runner._run_id(row_with_commit)
+                self.assertEqual(metadata["exit_code"], 0, row["arm"])
+                self.assertFalse((run_dir / "validation-error.txt").exists(), row["arm"])
 
     def test_run_suite_rejects_retired_candidate_modes(self) -> None:
         for mode in sorted(progress_ring_runner.RETIRED_CANDIDATE_MODES):

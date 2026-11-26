@@ -350,8 +350,14 @@ def _v7_v8_ready_target_final_environment_text(row: dict[str, Any]) -> str:
 
 
 def _v8_d2_qualification_environment(row: dict[str, Any]) -> dict[str, str]:
+    base_env = {
+        "PATH": os.environ.get("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"),
+        "HOME": os.environ.get("HOME", "/home/bench"),
+        "TMPDIR": os.environ.get("TMPDIR", "/tmp"),
+        "LC_ALL": "C",
+    }
     if row["format_version"] == 7:
-        return _point_preallocation_environment(row)
+        return base_env
     fixed_non_experiment = {
         "TOYKV_BENCH_V8_POINT_DIRECT_FRAME": "0",
         "TOYKV_BENCH_V8_POINT_FRONTIER_CREDIT_BATCH": "0",
@@ -362,6 +368,7 @@ def _v8_d2_qualification_environment(row: dict[str, Any]) -> dict[str, str]:
     }
     if row["arm"] == "v8_legacy":
         return {
+            **base_env,
             **fixed_non_experiment,
             "TOYKV_WAL_V8_PROFILE": "legacy",
             "TOYKV_WAL_V8_COALESCING": "dynamic",
@@ -376,6 +383,7 @@ def _v8_d2_qualification_environment(row: dict[str, Any]) -> dict[str, str]:
         }
     coalescing = "point-target8" if row["arm"] == "v8_candidate_target8" else "dynamic"
     return {
+        **base_env,
         **fixed_non_experiment,
         "TOYKV_WAL_V8_PROFILE": "candidate",
         "TOYKV_WAL_V8_COALESCING": coalescing,
@@ -385,8 +393,14 @@ def _v8_d2_qualification_environment(row: dict[str, Any]) -> dict[str, str]:
 
 
 def _v8_d2_qualification_environment_text(row: dict[str, Any]) -> str:
+    if row["format_version"] == 7:
+        return _point_preallocation_environment_text(row)
     env = _v8_d2_qualification_environment(row)
-    return "".join(f"{key}={value}\n" for key, value in env.items())
+    controlled = {
+        key: value for key, value in env.items()
+        if key not in ("PATH", "HOME", "TMPDIR", "LC_ALL")
+    }
+    return "".join(f"{key}={value}\n" for key, value in sorted(controlled.items()))
 
 
 def _expected_environment_text(
@@ -505,9 +519,11 @@ def _validate_record(record: dict[str, Any], row: dict[str, Any]) -> dict[str, A
         preparation = _require_object(
             snapshot.get("sliding_extent_preparation"), f"{boundary} extent preparation metadata",
         )
+        expected_extent_mode = row.get("extent_mode") or "sliding-point-lookahead"
+        expected_window_bytes = row.get("extent_window_bytes", POINT_LOOKAHEAD_WINDOW_BYTES)
         if any((
-            preparation.get("mode") != "sliding-point-lookahead",
-            preparation.get("window_bytes") != POINT_LOOKAHEAD_WINDOW_BYTES,
+            preparation.get("mode") != expected_extent_mode,
+            preparation.get("window_bytes") != expected_window_bytes,
             preparation.get("extent_policy_storage") != "vec",
             preparation.get("extent_policy_scan_diagnostics_enabled") is not False,
         )):
@@ -522,8 +538,9 @@ def _validate_record(record: dict[str, Any], row: dict[str, Any]) -> dict[str, A
             ):
                 raise ValueError(f"{boundary} {name} I/O metadata is invalid")
             handles[name] = handle
-        if not handles["data"]["o_direct"] or not handles["frontier"]["o_direct"]:
-            raise ValueError(f"{boundary} did not use O_DIRECT for DATA and Direct FRONTIER")
+        expected_frontier_direct = (row.get("frontier_mode") or "direct") != "buffered"
+        if not handles["data"]["o_direct"] or handles["frontier"]["o_direct"] is not expected_frontier_direct:
+            raise ValueError(f"{boundary} DATA/FRONTIER O_DIRECT settings do not match the planned mode")
         io_by_boundary[boundary] = handles
     if io_by_boundary["wal_io_start"] != io_by_boundary["wal_io_end"]:
         raise ValueError("DATA, FRONTIER, or sync descriptor metadata changed during the run")
@@ -574,8 +591,11 @@ def _validate_record(record: dict[str, Any], row: dict[str, Any]) -> dict[str, A
 
     start_prep = pipeline["wal_io_start"]["sliding_extent_preparation"]
     end_prep = pipeline["wal_io_end"]["sliding_extent_preparation"]
+    expected_initialized = (
+        is_point and (row.get("extent_mode") or "sliding-point-lookahead") == "sliding-point-lookahead"
+    )
     initialized = end_prep.get("initialized_bytes", 0) - start_prep.get("initialized_bytes", 0)
-    if type(initialized) is not int or initialized < 0 or (initialized > 0) is not is_point:
+    if type(initialized) is not int or initialized < 0 or (initialized > 0) is not expected_initialized:
         raise ValueError("Lookahead initialization differs from the Point/Batch plan")
 
     metrics = {
@@ -712,12 +732,28 @@ def _validate_record(record: dict[str, Any], row: dict[str, Any]) -> dict[str, A
             if type(before) is not int or type(after) is not int or after < before:
                 raise ValueError(f"{name} counter is missing or moved backwards")
             policy_deltas[name] = after - before
-        if expected_policy == "point_only" and row["workload"] == "batch64":
-            if (
+        if expected_policy == "disabled":
+            if any(policy_deltas.values()):
+                raise ValueError("Dynamic arm unexpectedly recorded Target8 policy counters")
+        elif expected_policy == "point_only":
+            if row["writer"] == 1 and (
                 policy_deltas["coalesce_target_initial_hits"] != 0
                 or policy_deltas["coalesce_target_after_wake_hits"] != 0
             ):
-                raise ValueError("Batch64 unexpectedly recorded Point-only Target8 hits")
+                raise ValueError("Point1 unexpectedly recorded Point-only Target8 hits")
+            if row["workload"] == "point" and row["writer"] > 1 and policy_deltas["coalesce_target_mixed_fallback_cycles"] != 0:
+                raise ValueError("Point8/16 unexpectedly recorded mixed-batch fallback cycles")
+            if row["workload"] == "batch64" and (
+                policy_deltas["coalesce_target_eligible_cycles"] != 0
+                or policy_deltas["coalesce_target_initial_hits"] != 0
+                or policy_deltas["coalesce_target_after_wake_hits"] != 0
+            ):
+                raise ValueError("Batch64 unexpectedly recorded Point-only Target8 cycles or hits")
+            if "coalescing_ready_target" in row and (
+                policy_deltas["coalesce_target_initial_hits"] + policy_deltas["coalesce_target_after_wake_hits"]
+                != metrics["coalescing_ready_target_hits"]
+            ):
+                raise ValueError("Point-only Target8 initial+after-wake hits do not equal total target hits")
         metrics.update({"coalesce_target_policy": expected_policy, **policy_deltas})
     if "point_buffer_preallocation_enabled" in row:
         start = pipeline["wal_io_start"]
@@ -1167,7 +1203,8 @@ def _run_one(
         if completed.returncode != 0:
             raise ValueError(f"write-perf exited with status {completed.returncode}")
         validator = (
-            _validate_point_preallocation_record if preallocation_suite or ready_target_final_suite else
+            _validate_point_preallocation_record
+            if preallocation_suite or ready_target_final_suite or d2_qualification_suite else
             _validate_cursor_publication_record if cursor_publication_suite else
             _validate_dedicated_durability_record if dedicated_durability_suite else
             _validate_point_resource_retirement_stage_a_record
@@ -1740,6 +1777,8 @@ def _v8_d2_qualification_summary(rows: list[dict[str, Any]], planned: int) -> di
         for baseline_arm, candidate_arm in pairs:
             changes: list[float] = []
             p99_changes: list[float] = []
+            cpu_changes: list[float] = []
+            cpu_deltas: list[float] = []
             for repetition in range(1, V8_D2_QUALIFICATION_REPETITIONS + 1):
                 baseline = next((row for row in rows if row.get("writer") == writer
                                  and row.get("workload") == workload and row.get("repetition") == repetition
@@ -1752,6 +1791,9 @@ def _v8_d2_qualification_summary(rows: list[dict[str, Any]], planned: int) -> di
                 changes.append((candidate["puts_per_second"] / baseline["puts_per_second"] - 1) * 100)
                 if workload == "point" and baseline.get("p99_ms"):
                     p99_changes.append((candidate["p99_ms"] / baseline["p99_ms"] - 1) * 100)
+                if baseline.get("cpu_us_per_put") and candidate.get("cpu_us_per_put") is not None:
+                    cpu_deltas.append(float(candidate["cpu_us_per_put"]) - float(baseline["cpu_us_per_put"]))
+                    cpu_changes.append((float(candidate["cpu_us_per_put"]) / float(baseline["cpu_us_per_put"]) - 1) * 100)
             paired[f"{candidate_arm}_vs_{baseline_arm}"] = {
                 "baseline_arm": baseline_arm,
                 "candidate_arm": candidate_arm,
@@ -1760,8 +1802,67 @@ def _v8_d2_qualification_summary(rows: list[dict[str, Any]], planned: int) -> di
                 "candidate_pair_wins": sum(change > 0 for change in changes),
                 "paired_p99_changes_pct": p99_changes,
                 "paired_p99_change_median_pct": median(p99_changes) if p99_changes else None,
+                "paired_cpu_us_per_put_deltas_us": cpu_deltas,
+                "paired_cpu_us_per_put_delta_median_us": median(cpu_deltas) if cpu_deltas else None,
+                "paired_cpu_us_per_put_changes_pct": cpu_changes,
+                "paired_cpu_us_per_put_change_median_pct": median(cpu_changes) if cpu_changes else None,
             }
         comparisons.append({"writer": writer, "workload": workload, "arms": stats, "paired": paired})
+
+    def _cell_pair(writer: int, workload: str, pair_key: str) -> dict[str, Any] | None:
+        cell = next((c for c in comparisons if c["writer"] == writer and c["workload"] == workload), None)
+        return cell["paired"].get(pair_key) if cell else None
+
+    def _median_ge(pair: dict[str, Any] | None, field: str, threshold: float) -> bool:
+        val = pair.get(field) if pair else None
+        return val is not None and val >= threshold
+
+    def _median_le(pair: dict[str, Any] | None, field: str, threshold: float) -> bool:
+        val = pair.get(field) if pair else None
+        return val is not None and val <= threshold
+
+    candidate_pairs = ("v8_candidate_dynamic_vs_v8_legacy", "v8_candidate_target8_vs_v8_legacy")
+    point1_ge_98 = all(
+        _median_ge(_cell_pair(1, "point", key), "paired_throughput_change_median_pct", -2.0)
+        for key in candidate_pairs
+    )
+    batch64_ge_98 = all(
+        _median_ge(_cell_pair(16, "batch64", key), "paired_throughput_change_median_pct", -2.0)
+        for key in candidate_pairs
+    )
+    point_p99_le_105 = all(
+        _median_le(_cell_pair(w, "point", key), "paired_p99_change_median_pct", 5.0)
+        for w in (1, 8, 16)
+        for key in candidate_pairs
+    )
+    point16_target8_hits = sum(
+        int(row.get("coalescing_ready_target_hits") or 0)
+        for row in rows
+        if row.get("writer") == 16 and row.get("workload") == "point"
+        and row.get("arm") == "v8_candidate_target8" and row.get("exit_code") == 0
+    )
+    target8_cpu_vs_dynamic = {
+        f"{workload}{writer}": {
+            "median_delta_us": (_cell_pair(writer, workload, "v8_candidate_target8_vs_v8_candidate_dynamic") or {}).get(
+                "paired_cpu_us_per_put_delta_median_us"
+            ),
+            "median_change_pct": (_cell_pair(writer, workload, "v8_candidate_target8_vs_v8_candidate_dynamic") or {}).get(
+                "paired_cpu_us_per_put_change_median_pct"
+            ),
+        }
+        for writer, workload in V8_D2_QUALIFICATION_CASES
+    }
+    qualification_gates = {
+        "point1_throughput_vs_legacy_ge_98pct": point1_ge_98,
+        "batch64_throughput_vs_legacy_ge_98pct": batch64_ge_98,
+        "point_p99_vs_legacy_le_105pct": point_p99_le_105,
+        "point16_target8_hits": point16_target8_hits,
+        "point16_target8_hits_observed": point16_target8_hits > 0,
+        "target8_cpu_per_put_vs_dynamic": target8_cpu_vs_dynamic,
+        "all_automated_gates_passed": (
+            point1_ge_98 and batch64_ge_98 and point_p99_le_105 and point16_target8_hits > 0
+        ),
+    }
     return {
         "suite": "v8-d2-qualification",
         "complete": validation["complete"] and len(rows) == planned == len(schedule),
@@ -1774,6 +1875,7 @@ def _v8_d2_qualification_summary(rows: list[dict[str, Any]], planned: int) -> di
         "results": rows,
         "matrix_validation": validation,
         "comparison": comparisons,
+        "qualification_gates": qualification_gates,
         "qualification_note": (
             "Same-host, same-source, same-release-binary comparison of V8 Legacy, V8 Candidate Dynamic, "
             "V8 Candidate Point-only Target8, and V7 Parallel. Point latency is sampled every 10 puts; "
@@ -1843,7 +1945,7 @@ def verify_v8_d2_qualification_results_directory(results: Path) -> dict[str, Any
         recomputed = _v8_d2_qualification_summary(rows, len(schedule))
         for key in (
             "suite", "complete", "runs_started", "runs_completed", "runs_planned", "writers", "workloads",
-            "arms", "matrix_validation", "comparison", "qualification_note",
+            "arms", "matrix_validation", "comparison", "qualification_gates", "qualification_note",
         ):
             if summary.get(key) != recomputed.get(key):
                 errors.append(f"summary field {key} differs from archived run rows")
@@ -1950,7 +2052,7 @@ def verify_v7_v8_ready_target_final_results_directory(results: Path) -> dict[str
         recomputed = _v7_v8_ready_target_final_summary(rows, len(schedule))
         for key in (
             "suite", "complete", "runs_started", "runs_completed", "runs_planned", "writers", "workloads",
-            "arms", "matrix_validation", "comparison", "qualification_note",
+            "arms", "matrix_validation", "comparison", "qualification_gates", "qualification_note",
         ):
             if summary.get(key) != recomputed.get(key):
                 errors.append(f"summary field {key} differs from archived run rows")
