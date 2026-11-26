@@ -7572,6 +7572,10 @@ impl WalV8ParallelWriter {
                     });
             }
             if frontier_ticket_end >= ticket_end {
+                ensure!(
+                    !self.coordinator.is_poisoned(),
+                    "v8 Parallel WAL is poisoned"
+                );
                 return Ok(());
             }
         }
