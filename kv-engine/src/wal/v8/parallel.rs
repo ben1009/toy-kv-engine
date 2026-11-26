@@ -482,6 +482,8 @@ struct CoordinatorState {
     change_generation: u64,
     durability_generation: u64,
     durability_driver_active: bool,
+    durability_driver_waiters: u64,
+    min_waiting_ticket_end: u64,
     closed: bool,
     poisoned: bool,
     #[cfg(test)]
@@ -498,8 +500,6 @@ struct CoordinatorState {
     completion_timeline_frontier_ready_end: u64,
     #[cfg(feature = "bench")]
     completion_timeline_samples: BTreeMap<u64, PendingCompletionTimeline>,
-    #[cfg(feature = "bench")]
-    durability_driver_waiters: u64,
     #[cfg(feature = "bench")]
     last_durability_notify_at: Option<Instant>,
     #[cfg(feature = "bench")]
@@ -1192,6 +1192,8 @@ impl WalV8ParallelCoordinator {
                     change_generation: 0,
                     durability_generation: 0,
                     durability_driver_active: false,
+                    durability_driver_waiters: 0,
+                    min_waiting_ticket_end: u64::MAX,
                     closed: false,
                     poisoned: false,
                     #[cfg(test)]
@@ -1208,8 +1210,6 @@ impl WalV8ParallelCoordinator {
                     completion_timeline_frontier_ready_end: config.next_ticket,
                     #[cfg(feature = "bench")]
                     completion_timeline_samples: BTreeMap::new(),
-                    #[cfg(feature = "bench")]
-                    durability_driver_waiters: 0,
                     #[cfg(feature = "bench")]
                     last_durability_notify_at: None,
                     #[cfg(feature = "bench")]
@@ -2725,15 +2725,17 @@ impl WalV8ParallelCoordinator {
         signal_change(&self.inner, &mut state);
         signal_durability_progress(&self.inner, &mut state);
         #[cfg(feature = "bench")]
-        if state.durability_driver_waiters > 0 {
-            state.last_durability_notify_at = Some(Instant::now());
-            state.last_durability_notify_waiters = state.durability_driver_waiters;
-        }
-        #[cfg(feature = "bench")]
         let followers_waiting = state.durability_driver_waiters;
         #[cfg(feature = "bench")]
         let notify_started = sample.then(Instant::now);
-        self.inner.durable_published.notify_all();
+        if state.durability_driver_waiters > 0
+            && state.min_waiting_ticket_end <= state.durable_ticket_end
+        {
+            #[cfg(feature = "bench")]
+            record_durable_notification_for_waiters(&mut state);
+            state.min_waiting_ticket_end = u64::MAX;
+            self.inner.durable_published.notify_all();
+        }
         #[cfg(feature = "bench")]
         let notify_all_wall_ns = notify_started
             .map(|started| started.elapsed().as_nanos().min(u64::MAX as u128) as u64)
@@ -3093,18 +3095,17 @@ impl WalV8ParallelCoordinator {
 
                 return Ok(Some(driver));
             }
+            state.durability_driver_waiters += 1;
+            state.min_waiting_ticket_end = state.min_waiting_ticket_end.min(ticket_end);
             #[cfg(feature = "bench")]
-            if diagnostics_enabled {
-                state.durability_driver_waiters += 1;
-                if !follower_sampling_decided {
-                    follower_sampling_decided = true;
-                    follower_sample_id = profile
-                        .as_ref()
-                        .and_then(|profile| profile.next_wal_v8_follower_sample());
-                    if follower_sample_id.is_some() {
-                        follower_wait_started = Some(Instant::now());
-                        follower_wait_cpu_started = Some(super::digest::thread_cpu_time_ns());
-                    }
+            if diagnostics_enabled && !follower_sampling_decided {
+                follower_sampling_decided = true;
+                follower_sample_id = profile
+                    .as_ref()
+                    .and_then(|profile| profile.next_wal_v8_follower_sample());
+                if follower_sample_id.is_some() {
+                    follower_wait_started = Some(Instant::now());
+                    follower_wait_cpu_started = Some(super::digest::thread_cpu_time_ns());
                 }
             }
             #[cfg(test)]
@@ -3117,19 +3118,20 @@ impl WalV8ParallelCoordinator {
             #[cfg(feature = "bench")]
             let observed_durability_generation = state.durability_generation;
             self.inner.durable_published.wait(&mut state);
+            state.durability_driver_waiters -= 1;
+            if state.durability_driver_waiters == 0 {
+                state.min_waiting_ticket_end = u64::MAX;
+            }
             #[cfg(feature = "bench")]
-            if diagnostics_enabled {
-                state.durability_driver_waiters -= 1;
-                if follower_sample_id.is_some() {
-                    follower_condvar_wait_count = follower_condvar_wait_count.saturating_add(1);
-                    if state.durability_generation != observed_durability_generation
-                        || !state.durability_driver_active
-                    {
-                        notify_to_resume_ns = state
-                            .last_durability_notify_at
-                            .map(|at| at.elapsed().as_nanos().min(u64::MAX as u128) as u64);
-                        followers_woken_by_last_notify = state.last_durability_notify_waiters;
-                    }
+            if diagnostics_enabled && follower_sample_id.is_some() {
+                follower_condvar_wait_count = follower_condvar_wait_count.saturating_add(1);
+                if state.durability_generation != observed_durability_generation
+                    || !state.durability_driver_active
+                {
+                    notify_to_resume_ns = state
+                        .last_durability_notify_at
+                        .map(|at| at.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+                    followers_woken_by_last_notify = state.last_durability_notify_waiters;
                 }
             }
             #[cfg(test)]
@@ -3255,9 +3257,19 @@ impl Drop for WalV8DurabilityDriver {
             state.completion_batch = Some(batch);
         }
         state.durability_driver_active = false;
-        #[cfg(feature = "bench")]
-        record_durable_notification_for_waiters(&mut state);
-        self.coordinator.inner.durable_published.notify_all();
+        if state.poisoned
+            || (state.durability_driver_waiters > 0
+                && state.min_waiting_ticket_end <= state.durable_ticket_end)
+        {
+            #[cfg(feature = "bench")]
+            record_durable_notification_for_waiters(&mut state);
+            state.min_waiting_ticket_end = u64::MAX;
+            self.coordinator.inner.durable_published.notify_all();
+        } else if state.durability_driver_waiters > 0 {
+            #[cfg(feature = "bench")]
+            record_durable_notification_for_waiters(&mut state);
+            self.coordinator.inner.durable_published.notify_one();
+        }
     }
 }
 
@@ -4079,6 +4091,7 @@ fn poison_locked(inner: &CoordinatorInner, state: &mut CoordinatorState) {
         signal_durability_progress(inner, state);
         #[cfg(feature = "bench")]
         record_durable_notification_for_waiters(state);
+        state.min_waiting_ticket_end = u64::MAX;
         inner.durable_published.notify_all();
     }
 }
@@ -6691,6 +6704,83 @@ mod tests {
         assert_eq!(
             coordinator.published_cursor(),
             (2, frontier.frame_offset + FRAME_LEN_U64, 2)
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn driver_handoff_via_notify_one_wakes_uncovered_follower_and_completes_all() -> Result<()> {
+        let coordinator = coordinator(8)?;
+        let mut first_encoded = admit(&batch(10), &coordinator)?.encode()?;
+        let mut second_encoded = admit(&batch(20), &coordinator)?.encode()?;
+        let mut third_encoded = admit(&batch(30), &coordinator)?.encode()?;
+        mark_producer_ready(&mut first_encoded, &coordinator, true)?;
+        mark_producer_ready(&mut second_encoded, &coordinator, true)?;
+        mark_producer_ready(&mut third_encoded, &coordinator, true)?;
+
+        let mut driver1 = coordinator
+            .acquire_durability_driver(1)?
+            .context("missing first driver")?;
+
+        let (tx2, rx2) = std::sync::mpsc::channel();
+        let coord2 = coordinator.clone();
+        let f2 = std::thread::spawn(move || {
+            let res = (|| -> Result<()> {
+                if let Some(mut d) = coord2.acquire_durability_driver(2)? {
+                    if coord2.durable_ticket_end() < 3 {
+                        let f = coord2.reserve_frontier(3)?;
+                        coord2.publish_durable_frontier(f)?;
+                    }
+                    d.complete();
+                }
+                Ok(())
+            })();
+            let _ = tx2.send(res);
+        });
+
+        let (tx3, rx3) = std::sync::mpsc::channel();
+        let coord3 = coordinator.clone();
+        let f3 = std::thread::spawn(move || {
+            let res = (|| -> Result<()> {
+                if let Some(mut d) = coord3.acquire_durability_driver(3)? {
+                    if coord3.durable_ticket_end() < 3 {
+                        let f = coord3.reserve_frontier(3)?;
+                        coord3.publish_durable_frontier(f)?;
+                    }
+                    d.complete();
+                }
+                Ok(())
+            })();
+            let _ = tx3.send(res);
+        });
+
+        // Wait until both followers are parked on durable_published.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while coordinator.inner.state.lock().durability_driver_waiters < 2 {
+            assert!(Instant::now() < deadline, "followers did not park in time");
+            std::thread::yield_now();
+        }
+
+        // Publish only ticket 1 (min_waiting_ticket_end == 2 > 1), then drop driver1 (notify_one).
+        let frontier1 = coordinator.reserve_frontier(1)?;
+        coordinator.publish_durable_frontier(frontier1)?;
+        first_encoded.disarm_after_durable();
+        driver1.complete();
+        drop(driver1);
+
+        rx2.recv_timeout(Duration::from_secs(2))??;
+        rx3.recv_timeout(Duration::from_secs(2))??;
+        f2.join().expect("follower 2 panicked");
+        f3.join().expect("follower 3 panicked");
+
+        second_encoded.disarm_after_durable();
+        third_encoded.disarm_after_durable();
+        assert_eq!(coordinator.durable_ticket_end(), 3);
+        assert_eq!(coordinator.inner.state.lock().durability_driver_waiters, 0);
+        assert_eq!(
+            coordinator.inner.state.lock().min_waiting_ticket_end,
+            u64::MAX
         );
 
         Ok(())
