@@ -1608,6 +1608,8 @@ class PointProgressRingQualificationTests(unittest.TestCase):
             self.assertTrue(summary["complete"])
             self.assertEqual(summary["runs_completed"], 80)
             self.assertEqual(summary["runs_attempted"], 80)
+            self.assertTrue(summary["qualification_gates"]["candidate_dynamic_qualified"])
+            self.assertTrue(summary["qualification_gates"]["candidate_target8_qualified"])
             self.assertTrue(summary["qualification_gates"]["all_automated_gates_passed"])
             self.assertGreater(summary["qualification_gates"]["point16_target8_hits"], 0)
             self.assertIsNotNone(
@@ -1615,6 +1617,26 @@ class PointProgressRingQualificationTests(unittest.TestCase):
                     "paired_cpu_us_per_put_delta_median_us"
                 ]
             )
+            # Incomplete paired repetitions must fail both candidate gates
+            partial_rows = [
+                row for row in summary["results"]
+                if not (row["writer"] == 1 and row["workload"] == "point" and row["repetition"] == 5)
+            ]
+            partial_summary = progress_ring_runner._v8_d2_qualification_summary(partial_rows, 80)
+            self.assertFalse(partial_summary["qualification_gates"]["candidate_dynamic_qualified"])
+            self.assertFalse(partial_summary["qualification_gates"]["candidate_target8_qualified"])
+
+            # Frozen historical archive environment.txt must remain exact
+            historical_env = progress_ring_runner._expected_environment_text(
+                True, True, False, True, False,
+            )
+            for d2_only_var in (
+                "TOYKV_WAL_V8_PROFILE",
+                "TOYKV_WAL_V8_COALESCING",
+                "TOYKV_WAL_V8_PROGRESS_MODE",
+                "TOYKV_WAL_V8_EXTENT_LOOKAHEAD",
+            ):
+                self.assertNotIn(d2_only_var, historical_env)
             summary["comparison"][0]["arms"]["v8_candidate_target8"]["puts_per_second"] += 1
             (results / "summary.json").write_text(json.dumps(summary), encoding="utf-8")
             verification = progress_ring_runner.verify_v8_d2_qualification_results_directory(results)

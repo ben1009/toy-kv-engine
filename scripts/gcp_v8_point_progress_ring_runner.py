@@ -102,10 +102,6 @@ from gcp_wal_matrix import (
 
 RUN_TIMEOUT_SECONDS = 300
 UNSET_EXPERIMENT_VARIABLES = (
-    "TOYKV_WAL_V8_PROFILE",
-    "TOYKV_WAL_V8_COALESCING",
-    "TOYKV_WAL_V8_PROGRESS_MODE",
-    "TOYKV_WAL_V8_EXTENT_LOOKAHEAD",
     "TOYKV_WAL_V8_COALESCE_BUDGET_US",
     "TOYKV_BENCH_V8_COALESCE_READY_TARGET",
     "TOYKV_BENCH_WAL_CPU_ATTRIBUTION_SAMPLE_EVERY",
@@ -1813,33 +1809,79 @@ def _v8_d2_qualification_summary(rows: list[dict[str, Any]], planned: int) -> di
         cell = next((c for c in comparisons if c["writer"] == writer and c["workload"] == workload), None)
         return cell["paired"].get(pair_key) if cell else None
 
-    def _median_ge(pair: dict[str, Any] | None, field: str, threshold: float) -> bool:
-        val = pair.get(field) if pair else None
+    def _median_ge(pair: dict[str, Any] | None, field: str, list_field: str, threshold: float) -> bool:
+        if not pair or len(pair.get(list_field) or []) != V8_D2_QUALIFICATION_REPETITIONS:
+            return False
+        val = pair.get(field)
         return val is not None and val >= threshold
 
-    def _median_le(pair: dict[str, Any] | None, field: str, threshold: float) -> bool:
-        val = pair.get(field) if pair else None
+    def _median_le(pair: dict[str, Any] | None, field: str, list_field: str, threshold: float) -> bool:
+        if not pair or len(pair.get(list_field) or []) != V8_D2_QUALIFICATION_REPETITIONS:
+            return False
+        val = pair.get(field)
         return val is not None and val <= threshold
 
-    candidate_pairs = ("v8_candidate_dynamic_vs_v8_legacy", "v8_candidate_target8_vs_v8_legacy")
-    point1_ge_98 = all(
-        _median_ge(_cell_pair(1, "point", key), "paired_throughput_change_median_pct", -2.0)
-        for key in candidate_pairs
+    dynamic_pair = "v8_candidate_dynamic_vs_v8_legacy"
+    target8_pair = "v8_candidate_target8_vs_v8_legacy"
+    dynamic_point1_ge_98 = _median_ge(
+        _cell_pair(1, "point", dynamic_pair),
+        "paired_throughput_change_median_pct",
+        "paired_throughput_changes_pct",
+        -2.0,
     )
-    batch64_ge_98 = all(
-        _median_ge(_cell_pair(16, "batch64", key), "paired_throughput_change_median_pct", -2.0)
-        for key in candidate_pairs
+    dynamic_batch64_ge_98 = _median_ge(
+        _cell_pair(16, "batch64", dynamic_pair),
+        "paired_throughput_change_median_pct",
+        "paired_throughput_changes_pct",
+        -2.0,
     )
-    point_p99_le_105 = all(
-        _median_le(_cell_pair(w, "point", key), "paired_p99_change_median_pct", 5.0)
+    dynamic_point_p99_le_105 = all(
+        _median_le(
+            _cell_pair(w, "point", dynamic_pair),
+            "paired_p99_change_median_pct",
+            "paired_p99_changes_pct",
+            5.0,
+        )
         for w in (1, 8, 16)
-        for key in candidate_pairs
     )
+    target8_point1_ge_98 = _median_ge(
+        _cell_pair(1, "point", target8_pair),
+        "paired_throughput_change_median_pct",
+        "paired_throughput_changes_pct",
+        -2.0,
+    )
+    target8_batch64_ge_98 = _median_ge(
+        _cell_pair(16, "batch64", target8_pair),
+        "paired_throughput_change_median_pct",
+        "paired_throughput_changes_pct",
+        -2.0,
+    )
+    target8_point_p99_le_105 = all(
+        _median_le(
+            _cell_pair(w, "point", target8_pair),
+            "paired_p99_change_median_pct",
+            "paired_p99_changes_pct",
+            5.0,
+        )
+        for w in (1, 8, 16)
+    )
+    point1_ge_98 = dynamic_point1_ge_98 and target8_point1_ge_98
+    batch64_ge_98 = dynamic_batch64_ge_98 and target8_batch64_ge_98
+    point_p99_le_105 = dynamic_point_p99_le_105 and target8_point_p99_le_105
     point16_target8_hits = sum(
         int(row.get("coalescing_ready_target_hits") or 0)
         for row in rows
         if row.get("writer") == 16 and row.get("workload") == "point"
         and row.get("arm") == "v8_candidate_target8" and row.get("exit_code") == 0
+    )
+    candidate_dynamic_qualified = (
+        dynamic_point1_ge_98 and dynamic_batch64_ge_98 and dynamic_point_p99_le_105
+    )
+    candidate_target8_qualified = (
+        target8_point1_ge_98
+        and target8_batch64_ge_98
+        and target8_point_p99_le_105
+        and point16_target8_hits > 0
     )
     target8_cpu_vs_dynamic = {
         f"{workload}{writer}": {
@@ -1858,10 +1900,10 @@ def _v8_d2_qualification_summary(rows: list[dict[str, Any]], planned: int) -> di
         "point_p99_vs_legacy_le_105pct": point_p99_le_105,
         "point16_target8_hits": point16_target8_hits,
         "point16_target8_hits_observed": point16_target8_hits > 0,
+        "candidate_dynamic_qualified": candidate_dynamic_qualified,
+        "candidate_target8_qualified": candidate_target8_qualified,
         "target8_cpu_per_put_vs_dynamic": target8_cpu_vs_dynamic,
-        "all_automated_gates_passed": (
-            point1_ge_98 and batch64_ge_98 and point_p99_le_105 and point16_target8_hits > 0
-        ),
+        "all_automated_gates_passed": candidate_dynamic_qualified and candidate_target8_qualified,
     }
     return {
         "suite": "v8-d2-qualification",

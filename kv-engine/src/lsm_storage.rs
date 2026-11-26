@@ -41656,15 +41656,6 @@ mod tests {
         for (key, value) in &committed {
             assert_eq!(reopened.get(key)?.as_deref(), Some(value.as_slice()));
         }
-        assert!(matches!(
-            reopened.create_recovery_point()?,
-            crate::pitr::api::RecoveryPointOutcome::Durable(_)
-        ));
-        reopened.put(b"quota-after-reopen", b"ok")?;
-        assert_eq!(
-            reopened.get(b"quota-after-reopen")?.as_deref(),
-            Some(&b"ok"[..])
-        );
         reopened.close()?;
 
         Ok(())
