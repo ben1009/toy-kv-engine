@@ -426,14 +426,12 @@ struct WalV8SlidingExtentPreparationState {
     failure: Option<String>,
 }
 
-#[cfg(feature = "bench")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WalV8FrontierWriteMode {
     Buffered,
     Direct,
 }
 
-#[cfg(feature = "bench")]
 impl WalV8FrontierWriteMode {
     fn from_environment() -> Result<Self> {
         Self::from_value(std::env::var_os("TOYKV_WAL_V8_FRONTIER_MODE").as_deref())
@@ -4795,10 +4793,13 @@ impl WalV8LeaderWriter {
         let direct_completion_enabled =
             production_direct_completion_enabled_from_environment(progress_mode)?;
 
+        let frontier_mode = WalV8FrontierWriteMode::from_environment()?;
+
         self.into_parallel_with_worker_file_progress_and_completion(
             worker_file,
             progress_mode,
             direct_completion_enabled,
+            frontier_mode,
             #[cfg(test)]
             None,
         )
@@ -4809,6 +4810,7 @@ impl WalV8LeaderWriter {
         worker_file: File,
         progress_mode: WalV8ProgressMode,
         direct_completion_enabled: bool,
+        frontier_mode: WalV8FrontierWriteMode,
         #[cfg(test)] worker_group_limit: Option<usize>,
     ) -> Result<WalV8ParallelWriter> {
         validate_positional_write_handle(&worker_file)
@@ -4958,30 +4960,30 @@ impl WalV8LeaderWriter {
                 }
                 None => (None, None),
             };
-        #[cfg(feature = "bench")]
-        let frontier_file = match WalV8FrontierWriteMode::from_environment()? {
+        let frontier_file = match frontier_mode {
             WalV8FrontierWriteMode::Buffered => self.write_file,
             WalV8FrontierWriteMode::Direct => {
-                ensure!(
-                    io_diagnostics.data.o_direct == Some(true),
-                    "direct FRONTIER experiment requires an O_DIRECT DATA worker"
-                );
-                worker_file
-                    .try_clone()
-                    .context("clone direct V8 WAL DATA handle for FRONTIER writes")?
+                if is_o_direct_file(&worker_file)? {
+                    worker_file
+                        .try_clone()
+                        .context("clone direct V8 WAL DATA handle for FRONTIER writes")?
+                } else {
+                    self.write_file
+                }
             }
         };
+        let frontier_metadata = frontier_file
+            .metadata()
+            .context("inspect v8 WAL FRONTIER handle")?;
+        ensure!(
+            frontier_metadata.dev() == self.installed_dev
+                && frontier_metadata.ino() == self.installed_ino,
+            "V8 WAL FRONTIER handle does not refer to the installed Active inode"
+        );
         #[cfg(feature = "bench")]
         {
             io_diagnostics.frontier = WalIoHandleMetadata::from_file(&frontier_file)?;
-            ensure!(
-                io_diagnostics.frontier.device == io_diagnostics.data.device
-                    && io_diagnostics.frontier.inode == io_diagnostics.data.inode,
-                "V8 WAL FRONTIER handle does not refer to the DATA inode"
-            );
         }
-        #[cfg(not(feature = "bench"))]
-        let frontier_file = self.write_file;
         #[cfg(not(feature = "bench"))]
         let extent_preallocator = {
             let lookahead = wal_v8_extent_lookahead_from_environment()?;
@@ -5641,6 +5643,11 @@ impl WalV8ParallelWriter {
             && self.io.direct_completions.is_some()
             && self.io.completion_events.is_none()
             && self.io.completion_thread.lock().is_none()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn uses_direct_frontier(&self) -> Result<bool> {
+        is_o_direct_file(&self.frontier_file)
     }
 
     #[cfg(feature = "bench")]
@@ -7896,7 +7903,6 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(feature = "bench")]
     #[test]
     fn frontier_write_mode_parses_only_supported_values() {
         assert_eq!(
@@ -8686,10 +8692,7 @@ mod tests {
 
         let parent = Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/wal-v8-tests");
         std::fs::create_dir_all(&parent)?;
-        #[cfg(feature = "bench")]
         let frontier_modes = ["buffered", "direct"];
-        #[cfg(not(feature = "bench"))]
-        let frontier_modes = ["buffered"];
         #[cfg(feature = "bench")]
         let extent_preparation_modes = [
             "none",
@@ -10976,6 +10979,7 @@ mod tests {
             worker_file,
             mode,
             true,
+            WalV8FrontierWriteMode::Buffered,
             worker_group_limit,
         )
     }
@@ -11750,6 +11754,111 @@ mod tests {
             true,
             WalV8ProgressTokenWait::TimedOut,
         )
+    }
+
+    #[test]
+    fn direct_frontier_uses_o_direct_data_descriptor_and_recovers() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("direct-frontier-v8.wal");
+        let wal_header = header();
+        let installed = install_empty(&path, wal_header)?;
+        let worker_file = match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_DIRECT)
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(error) if error.raw_os_error() == Some(libc::EINVAL) => {
+                eprintln!("skipping test (O_DIRECT unsupported on test fs): {error}");
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let writer = match open_writer(&path, &installed)?
+            .into_parallel_with_worker_file_progress_and_completion(
+                worker_file,
+                WalV8ProgressMode::Cursor,
+                true,
+                WalV8FrontierWriteMode::Direct,
+                None,
+            ) {
+            Ok(writer) => writer,
+            Err(error) if is_io_uring_unavailable_error(&error) => {
+                eprintln!("skipping test (io_uring unavailable): {error:#}");
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        assert!(writer.uses_direct_frontier()?);
+
+        let inputs = [batch(10), batch(20)];
+        for input in &inputs {
+            writer.append_prepared_batch(
+                writer.preflight_batch(input, LIVE_WAL_V5_LIMITS)?,
+                input.commit_ts,
+                input.recorded_at,
+            )?;
+        }
+        let (_, boundary) = writer.active_boundaries()?;
+        drop(writer);
+
+        let recovered = super::super::install::recover_and_install_active(
+            &path,
+            &[boundary],
+            wal_header.predecessor,
+            LIVE_WAL_V5_LIMITS,
+            MAX_WAL_FILE_SIZE,
+        )?;
+        assert_eq!(replayed_batches(&path, &recovered)?, inputs);
+        Ok(())
+    }
+
+    #[test]
+    fn direct_frontier_falls_back_to_buffered_when_data_worker_is_buffered() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("direct-frontier-fallback-v8.wal");
+        let wal_header = header();
+        let installed = install_empty(&path, wal_header)?;
+        let worker_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)?;
+        let writer = match open_writer(&path, &installed)?
+            .into_parallel_with_worker_file_progress_and_completion(
+                worker_file,
+                WalV8ProgressMode::Eager,
+                false,
+                WalV8FrontierWriteMode::Direct,
+                None,
+            ) {
+            Ok(writer) => writer,
+            Err(error) if is_io_uring_unavailable_error(&error) => {
+                eprintln!("skipping test (io_uring unavailable): {error:#}");
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        assert!(!writer.uses_direct_frontier()?);
+
+        let input = batch(30);
+        writer.append_prepared_batch(
+            writer.preflight_batch(&input, LIVE_WAL_V5_LIMITS)?,
+            input.commit_ts,
+            input.recorded_at,
+        )?;
+        let (_, boundary) = writer.active_boundaries()?;
+        drop(writer);
+
+        let recovered = super::super::install::recover_and_install_active(
+            &path,
+            &[boundary],
+            wal_header.predecessor,
+            LIVE_WAL_V5_LIMITS,
+            MAX_WAL_FILE_SIZE,
+        )?;
+        assert_eq!(replayed_batches(&path, &recovered)?, [input]);
+        Ok(())
     }
 
     #[cfg(feature = "bench")]
