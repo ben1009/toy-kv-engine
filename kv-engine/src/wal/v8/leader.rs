@@ -711,9 +711,24 @@ fn wal_v8_extent_lookahead_from_environment() -> Result<bool> {
     wal_v8_extent_lookahead_from_value(std::env::var_os(WAL_V8_EXTENT_LOOKAHEAD_ENV).as_deref())
 }
 
+/// Effective extent preparation policy resolved for one V8 WAL instance.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WalV8ExtentPreparationPolicy {
+    Disabled,
+    FallocateOnly,
+    Lookahead,
+    PointOnlyLookahead,
+    #[cfg(feature = "bench")]
+    SlidingInitialize,
+    #[cfg(feature = "bench")]
+    OneShotFallocate,
+    #[cfg(feature = "bench")]
+    OneShotInitialize,
+}
+
 /// Process-wide V8 WAL configuration requested at Engine open and inherited
 /// across automatic and PITR WAL rotations without on-disk serialization.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct WalV8RequestedConfig {
     pub(crate) progress_mode: WalV8ProgressMode,
     pub(crate) direct_completion_enabled: bool,
@@ -726,6 +741,41 @@ pub(crate) struct WalV8RequestedConfig {
     coalesce_ready_target: Option<usize>,
     #[cfg(feature = "bench")]
     extent_preparation: Option<(WalExtentPreparationMode, u64)>,
+    #[cfg(feature = "bench")]
+    extent_policy_storage: WalV8ExtentPolicyStorageKind,
+    #[cfg(feature = "bench")]
+    extent_policy_scan_diagnostics_enabled: bool,
+    #[cfg(feature = "bench")]
+    data_submit_ready_order: bool,
+    #[cfg(feature = "bench")]
+    point_direct_frame_enabled: bool,
+}
+
+#[allow(clippy::derivable_impls)]
+impl Default for WalV8RequestedConfig {
+    fn default() -> Self {
+        Self {
+            progress_mode: WalV8ProgressMode::default(),
+            direct_completion_enabled: false,
+            frontier_mode: WalV8FrontierWriteMode::default(),
+            extent_lookahead: false,
+            point_buffer_preallocation_enabled: false,
+            #[cfg(feature = "bench")]
+            progress_counters_enabled: false,
+            #[cfg(feature = "bench")]
+            coalesce_ready_target: None,
+            #[cfg(feature = "bench")]
+            extent_preparation: None,
+            #[cfg(feature = "bench")]
+            extent_policy_storage: WalV8ExtentPolicyStorageKind::Vec,
+            #[cfg(feature = "bench")]
+            extent_policy_scan_diagnostics_enabled: true,
+            #[cfg(feature = "bench")]
+            data_submit_ready_order: false,
+            #[cfg(feature = "bench")]
+            point_direct_frame_enabled: false,
+        }
+    }
 }
 
 impl WalV8RequestedConfig {
@@ -758,6 +808,16 @@ impl WalV8RequestedConfig {
             coalesce_ready_target_from_environment(progress_mode, direct_completion_enabled)?;
         #[cfg(feature = "bench")]
         let extent_preparation = WalExtentPreparationMode::from_environment()?;
+        #[cfg(feature = "bench")]
+        let extent_policy_storage = extent_policy_storage_kind_from_env()?;
+        #[cfg(feature = "bench")]
+        let extent_policy_scan_diagnostics_enabled =
+            extent_policy_scan_diagnostics_enabled_from_env()?;
+        #[cfg(feature = "bench")]
+        let data_submit_ready_order = benchmark_submits_any_ready_ticket()?;
+        #[cfg(feature = "bench")]
+        let point_direct_frame_enabled =
+            std::env::var_os("TOYKV_BENCH_V8_POINT_DIRECT_FRAME").is_some_and(|v| v == "1");
 
         Ok(Self {
             progress_mode,
@@ -771,6 +831,14 @@ impl WalV8RequestedConfig {
             coalesce_ready_target,
             #[cfg(feature = "bench")]
             extent_preparation,
+            #[cfg(feature = "bench")]
+            extent_policy_storage,
+            #[cfg(feature = "bench")]
+            extent_policy_scan_diagnostics_enabled,
+            #[cfg(feature = "bench")]
+            data_submit_ready_order,
+            #[cfg(feature = "bench")]
+            point_direct_frame_enabled,
         })
     }
 
@@ -792,7 +860,8 @@ pub(crate) struct WalV8EffectiveConfig {
     pub(crate) progress_mode: WalV8ProgressMode,
     pub(crate) direct_completion_enabled: bool,
     pub(crate) frontier_mode: WalV8FrontierWriteMode,
-    pub(crate) extent_lookahead: bool,
+    pub(crate) extent_policy: WalV8ExtentPreparationPolicy,
+    pub(crate) extent_window_bytes: u64,
     pub(crate) point_buffer_preallocation_enabled: bool,
     pub(crate) o_direct_worker: bool,
     pub(crate) ext_family_filesystem: bool,
@@ -801,6 +870,14 @@ pub(crate) struct WalV8EffectiveConfig {
     pub(crate) progress_counters_enabled: bool,
     #[cfg(feature = "bench")]
     pub(crate) coalesce_ready_target: Option<usize>,
+    #[cfg(feature = "bench")]
+    extent_policy_storage: WalV8ExtentPolicyStorageKind,
+    #[cfg(feature = "bench")]
+    extent_policy_scan_diagnostics_enabled: bool,
+    #[cfg(feature = "bench")]
+    data_submit_ready_order: bool,
+    #[cfg(feature = "bench")]
+    point_direct_frame_enabled: bool,
 }
 
 impl WalV8EffectiveConfig {
@@ -809,6 +886,21 @@ impl WalV8EffectiveConfig {
         requested: &WalV8RequestedConfig,
         worker_file: &File,
         has_reservation_owner: bool,
+    ) -> Result<Self> {
+        Self::resolve_with_test_override(
+            requested,
+            worker_file,
+            has_reservation_owner,
+            #[cfg(test)]
+            None,
+        )
+    }
+
+    fn resolve_with_test_override(
+        requested: &WalV8RequestedConfig,
+        worker_file: &File,
+        has_reservation_owner: bool,
+        #[cfg(test)] extent_strategy_override: Option<(WalV8ExtentPreparationStrategy, u64)>,
     ) -> Result<Self> {
         ensure!(
             !requested.direct_completion_enabled
@@ -828,33 +920,107 @@ impl WalV8EffectiveConfig {
             }
         };
 
-        #[cfg(not(feature = "bench"))]
-        {
-            let extent_eligible = has_reservation_owner && ext_family_filesystem && o_direct_worker;
-            ensure!(
-                !requested.extent_lookahead || extent_eligible,
-                "{WAL_V8_EXTENT_LOOKAHEAD_ENV} requires an ext4 WAL, an O_DIRECT DATA worker, and a quota owner"
-            );
-        }
+        let (extent_policy, extent_window_bytes) = {
+            #[cfg(test)]
+            let override_strategy = extent_strategy_override;
+            #[cfg(not(test))]
+            let override_strategy: Option<(WalV8ExtentPreparationStrategy, u64)> = None;
 
-        #[cfg(feature = "bench")]
-        let extent_lookahead = match requested.extent_preparation {
-            Some((
-                WalExtentPreparationMode::SlidingLookahead
-                | WalExtentPreparationMode::SlidingPointLookahead,
-                _,
-            )) => true,
-            Some(_) => false,
-            None => requested.extent_lookahead,
+            if let Some((strategy, window_bytes)) = override_strategy {
+                ensure!(
+                    has_reservation_owner,
+                    "point-only extent strategy test requires PITR quota accounting"
+                );
+                let policy = match strategy {
+                    WalV8ExtentPreparationStrategy::FallocateOnly => {
+                        WalV8ExtentPreparationPolicy::FallocateOnly
+                    }
+                    WalV8ExtentPreparationStrategy::Lookahead => {
+                        WalV8ExtentPreparationPolicy::Lookahead
+                    }
+                    WalV8ExtentPreparationStrategy::PointOnlyLookahead => {
+                        WalV8ExtentPreparationPolicy::PointOnlyLookahead
+                    }
+                };
+                (policy, window_bytes)
+            } else {
+                #[cfg(feature = "bench")]
+                if let Some((mode, bytes)) = requested.extent_preparation {
+                    let policy = match mode {
+                        WalExtentPreparationMode::SlidingLookahead => {
+                            ensure!(
+                                has_reservation_owner,
+                                "sliding lookahead benchmark requires PITR quota accounting"
+                            );
+                            WalV8ExtentPreparationPolicy::Lookahead
+                        }
+                        WalExtentPreparationMode::SlidingPointLookahead => {
+                            ensure!(
+                                has_reservation_owner,
+                                "point-only sliding lookahead benchmark requires PITR quota accounting"
+                            );
+                            WalV8ExtentPreparationPolicy::PointOnlyLookahead
+                        }
+                        WalExtentPreparationMode::SlidingFallocate => {
+                            WalV8ExtentPreparationPolicy::FallocateOnly
+                        }
+                        WalExtentPreparationMode::SlidingInitialize => {
+                            WalV8ExtentPreparationPolicy::SlidingInitialize
+                        }
+                        WalExtentPreparationMode::Fallocate => {
+                            WalV8ExtentPreparationPolicy::OneShotFallocate
+                        }
+                        WalExtentPreparationMode::Initialize => {
+                            WalV8ExtentPreparationPolicy::OneShotInitialize
+                        }
+                    };
+                    (policy, bytes)
+                } else {
+                    let eligible =
+                        has_reservation_owner && ext_family_filesystem && o_direct_worker;
+                    ensure!(
+                        !requested.extent_lookahead || eligible,
+                        "{WAL_V8_EXTENT_LOOKAHEAD_ENV} requires an ext4 WAL, an O_DIRECT DATA worker, and a quota owner"
+                    );
+                    if eligible {
+                        let policy = if requested.extent_lookahead {
+                            WalV8ExtentPreparationPolicy::Lookahead
+                        } else {
+                            WalV8ExtentPreparationPolicy::FallocateOnly
+                        };
+                        (policy, WAL_V8_PRODUCTION_EXTENT_WINDOW_BYTES)
+                    } else {
+                        (WalV8ExtentPreparationPolicy::Disabled, 0)
+                    }
+                }
+                #[cfg(not(feature = "bench"))]
+                {
+                    let eligible =
+                        has_reservation_owner && ext_family_filesystem && o_direct_worker;
+                    ensure!(
+                        !requested.extent_lookahead || eligible,
+                        "{WAL_V8_EXTENT_LOOKAHEAD_ENV} requires an ext4 WAL, an O_DIRECT DATA worker, and a quota owner"
+                    );
+                    if eligible {
+                        let policy = if requested.extent_lookahead {
+                            WalV8ExtentPreparationPolicy::Lookahead
+                        } else {
+                            WalV8ExtentPreparationPolicy::FallocateOnly
+                        };
+                        (policy, WAL_V8_PRODUCTION_EXTENT_WINDOW_BYTES)
+                    } else {
+                        (WalV8ExtentPreparationPolicy::Disabled, 0)
+                    }
+                }
+            }
         };
-        #[cfg(not(feature = "bench"))]
-        let extent_lookahead = requested.extent_lookahead;
 
         Ok(Self {
             progress_mode: requested.progress_mode,
             direct_completion_enabled: requested.direct_completion_enabled,
             frontier_mode,
-            extent_lookahead,
+            extent_policy,
+            extent_window_bytes,
             point_buffer_preallocation_enabled: requested.point_buffer_preallocation_enabled,
             o_direct_worker,
             ext_family_filesystem,
@@ -863,6 +1029,15 @@ impl WalV8EffectiveConfig {
             progress_counters_enabled: requested.progress_counters_enabled,
             #[cfg(feature = "bench")]
             coalesce_ready_target: requested.coalesce_ready_target,
+            #[cfg(feature = "bench")]
+            extent_policy_storage: requested.extent_policy_storage,
+            #[cfg(feature = "bench")]
+            extent_policy_scan_diagnostics_enabled: requested
+                .extent_policy_scan_diagnostics_enabled,
+            #[cfg(feature = "bench")]
+            data_submit_ready_order: requested.data_submit_ready_order,
+            #[cfg(feature = "bench")]
+            point_direct_frame_enabled: requested.point_direct_frame_enabled,
         })
     }
 }
@@ -1534,11 +1709,6 @@ fn extent_policy_storage_kind_from_env() -> Result<WalV8ExtentPolicyStorageKind>
     }
 }
 
-#[cfg(not(feature = "bench"))]
-fn extent_policy_storage_kind_from_env() -> Result<WalV8ExtentPolicyStorageKind> {
-    Ok(WalV8ExtentPolicyStorageKind::Vec)
-}
-
 #[cfg(feature = "bench")]
 fn extent_policy_scan_diagnostics_enabled_from_env() -> Result<bool> {
     match std::env::var("TOYKV_BENCH_V8_EXTENT_POLICY_SCAN_DIAGNOSTICS") {
@@ -1550,11 +1720,6 @@ fn extent_policy_scan_diagnostics_enabled_from_env() -> Result<bool> {
         Err(std::env::VarError::NotPresent) => Ok(true),
         Err(error) => Err(error).context("read V8 extent policy scan diagnostics setting"),
     }
-}
-
-#[cfg(not(feature = "bench"))]
-fn extent_policy_scan_diagnostics_enabled_from_env() -> Result<bool> {
-    Ok(false)
 }
 
 #[cfg(feature = "bench")]
@@ -1691,15 +1856,35 @@ impl WalV8ExtentPreallocator {
         reservation_owner: Option<Arc<WalV8ReservationOwner>>,
         strategy: WalV8ExtentPreparationStrategy,
     ) -> Result<Self> {
+        Self::new_with_strategy_and_policy_config(
+            data_file,
+            sync_file,
+            start_offset,
+            max_file_size,
+            window_bytes,
+            reservation_owner,
+            strategy,
+            WalV8ExtentPolicyStorageKind::Vec,
+            cfg!(feature = "bench"),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_strategy_and_policy_config(
+        data_file: File,
+        sync_file: &File,
+        start_offset: u64,
+        max_file_size: u64,
+        window_bytes: u64,
+        reservation_owner: Option<Arc<WalV8ReservationOwner>>,
+        strategy: WalV8ExtentPreparationStrategy,
+        extent_policy_storage_kind: WalV8ExtentPolicyStorageKind,
+        extent_policy_scan_diagnostics_enabled: bool,
+    ) -> Result<Self> {
         let lookahead = strategy.uses_lookahead();
         let point_only_lookahead = strategy.is_point_only();
-        let extent_policy_storage_kind = extent_policy_storage_kind_from_env()?;
-        #[cfg(feature = "bench")]
-        let extent_policy_scan_diagnostics_enabled =
-            extent_policy_scan_diagnostics_enabled_from_env()?;
         #[cfg(not(feature = "bench"))]
-        let _extent_policy_scan_diagnostics_enabled =
-            extent_policy_scan_diagnostics_enabled_from_env()?;
+        let _extent_policy_scan_diagnostics_enabled = extent_policy_scan_diagnostics_enabled;
         ensure!(
             is_o_direct_file(&data_file)?,
             "V8 sliding extent preparation requires an O_DIRECT DATA worker"
@@ -3066,26 +3251,19 @@ type WalV8CompletionReapHook = Arc<dyn Fn(WalV8CompletionReapTestEvent) + Send +
 #[cfg(test)]
 type WalV8SharedCompletionReapHook = Arc<Mutex<Option<WalV8CompletionReapHook>>>;
 
+#[cfg(feature = "bench")]
 fn benchmark_submits_any_ready_ticket() -> Result<bool> {
-    #[cfg(feature = "bench")]
-    {
-        const SUBMIT_ORDER_ENV: &str = "TOYKV_BENCH_V8_DATA_SUBMIT_ORDER";
-        let Some(value) = std::env::var_os(SUBMIT_ORDER_ENV) else {
-            return Ok(false);
-        };
-        let value = value
-            .into_string()
-            .map_err(|_| anyhow::anyhow!("{SUBMIT_ORDER_ENV} is not valid UTF-8"))?;
-        match value.as_str() {
-            "ordered" => Ok(false),
-            "ready" => Ok(true),
-            _ => anyhow::bail!("{SUBMIT_ORDER_ENV} must be 'ordered' or 'ready'"),
-        }
-    }
-
-    #[cfg(not(feature = "bench"))]
-    {
-        Ok(false)
+    const SUBMIT_ORDER_ENV: &str = "TOYKV_BENCH_V8_DATA_SUBMIT_ORDER";
+    let Some(value) = std::env::var_os(SUBMIT_ORDER_ENV) else {
+        return Ok(false);
+    };
+    let value = value
+        .into_string()
+        .map_err(|_| anyhow::anyhow!("{SUBMIT_ORDER_ENV} is not valid UTF-8"))?;
+    match value.as_str() {
+        "ordered" => Ok(false),
+        "ready" => Ok(true),
+        _ => anyhow::bail!("{SUBMIT_ORDER_ENV} must be 'ordered' or 'ready'"),
     }
 }
 
@@ -3101,6 +3279,8 @@ struct WalV8ParallelIo {
     group_join_micros: std::sync::atomic::AtomicU64,
     coordinator: WalV8ParallelCoordinator,
     progress: Arc<crate::wal::parallel_worker::WalSyncProgress>,
+    #[cfg(feature = "bench")]
+    point_direct_frame_enabled: bool,
     #[cfg(feature = "bench")]
     profile: arc_swap::ArcSwapOption<crate::mem_table::WriteProfile>,
     #[cfg(feature = "bench")]
@@ -3136,6 +3316,10 @@ struct WalV8ParallelIoConfig {
     direct_completion_enabled: bool,
     #[cfg(feature = "bench")]
     coalesce_ready_target: Option<usize>,
+    #[cfg(feature = "bench")]
+    data_submit_ready_order: bool,
+    #[cfg(feature = "bench")]
+    point_direct_frame_enabled: bool,
     #[cfg(test)]
     worker_group_limit: Option<usize>,
 }
@@ -3172,7 +3356,10 @@ impl WalV8ParallelIo {
             };
         let progress_tokens = coordinator.take_progress_token_receiver()?;
         let shutdown_started = Arc::new(AtomicBool::new(false));
-        let submit_any_ready_ticket = benchmark_submits_any_ready_ticket()?;
+        #[cfg(feature = "bench")]
+        let submit_any_ready_ticket = config.data_submit_ready_order;
+        #[cfg(not(feature = "bench"))]
+        let submit_any_ready_ticket = false;
         let worker_file = Arc::new(worker_file);
         let buffer_pool = Arc::new(ArrayQueue::<WalV8DataBuffer>::new(1));
         let direct_completion_handle = coordinator.worker_completion_handle();
@@ -3352,6 +3539,8 @@ impl WalV8ParallelIo {
             ),
             coordinator,
             progress,
+            #[cfg(feature = "bench")]
+            point_direct_frame_enabled: config.point_direct_frame_enabled,
             #[cfg(feature = "bench")]
             profile: arc_swap::ArcSwapOption::empty(),
             #[cfg(feature = "bench")]
@@ -4403,7 +4592,11 @@ impl WalV8FrameJob<'_> {
     }
 
     pub(crate) fn finish(self) -> Result<digest::WalV8DigestMetrics> {
-        self.finish_with_point_direct_frame(Self::point_direct_frame_enabled())
+        #[cfg(feature = "bench")]
+        let enabled = self.io.point_direct_frame_enabled;
+        #[cfg(not(feature = "bench"))]
+        let enabled = false;
+        self.finish_with_point_direct_frame(enabled)
     }
 
     #[cfg(feature = "bench")]
@@ -4411,10 +4604,8 @@ impl WalV8FrameJob<'_> {
         self,
     ) -> Result<(digest::WalV8DigestMetrics, WalV8ProducerCpuPhases)> {
         let mut phases = WalV8ProducerCpuPhases::default();
-        let metrics = self.finish_with_point_direct_frame_and_phases(
-            Self::point_direct_frame_enabled(),
-            Some(&mut phases),
-        )?;
+        let enabled = self.io.point_direct_frame_enabled;
+        let metrics = self.finish_with_point_direct_frame_and_phases(enabled, Some(&mut phases))?;
         Ok((metrics, phases))
     }
 
@@ -4423,20 +4614,6 @@ impl WalV8FrameJob<'_> {
         direct_point_enabled: bool,
     ) -> Result<digest::WalV8DigestMetrics> {
         self.finish_with_point_direct_frame_and_phases(direct_point_enabled, None)
-    }
-
-    fn point_direct_frame_enabled() -> bool {
-        #[cfg(feature = "bench")]
-        {
-            static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            *ENABLED.get_or_init(|| {
-                std::env::var("TOYKV_BENCH_V8_POINT_DIRECT_FRAME").as_deref() == Ok("1")
-            })
-        }
-        #[cfg(not(feature = "bench"))]
-        {
-            false
-        }
     }
 
     fn finish_with_point_direct_frame_and_phases(
@@ -5009,10 +5186,12 @@ impl WalV8LeaderWriter {
                 && worker_metadata.len() >= self.coordinator.last_frontier_end(),
             "v8 WAL I/O worker handle does not refer to the installed Active inode"
         );
-        let effective_config = WalV8EffectiveConfig::resolve(
+        let effective_config = WalV8EffectiveConfig::resolve_with_test_override(
             &requested,
             &worker_file,
             self.reservation_owner.is_some(),
+            #[cfg(test)]
+            extent_strategy_override,
         )?;
         self.coordinator = self
             .coordinator
@@ -5050,98 +5229,72 @@ impl WalV8LeaderWriter {
             io_diagnostics.point_buffer_preallocation_enabled = point_buffer_preallocation_enabled;
         }
         #[cfg(feature = "bench")]
-        let (extent_preallocator, extent_preparation) = {
-            #[cfg(test)]
-            let test_strategy_override = extent_strategy_override;
-            #[cfg(not(test))]
-            let test_strategy_override: Option<(WalV8ExtentPreparationStrategy, u64)> = None;
-            if let Some((strategy, window_bytes)) = test_strategy_override {
-                let owner = self
-                    .reservation_owner
-                    .as_ref()
-                    .context("point-only extent strategy test requires PITR quota accounting")?;
-                let preallocator = Arc::new(WalV8ExtentPreallocator::new_with_strategy(
-                    worker_file
-                        .try_clone()
-                        .context("clone v8 WAL handle for test extent strategy")?,
-                    &self.sync_file,
-                    self.coordinator.last_frontier_end(),
-                    self.max_file_size,
-                    window_bytes,
-                    Some(Arc::clone(owner)),
-                    strategy,
-                )?);
-                (Some(preallocator), None)
-            } else {
-                match requested.extent_preparation {
-                    Some((mode, window_bytes)) if mode.is_sliding() => {
-                        let start_offset = self.coordinator.last_frontier_end();
-                        let owned_preallocator = match mode {
-                            WalExtentPreparationMode::SlidingLookahead => {
-                                let owner = self.reservation_owner.as_ref().context(
-                                    "sliding lookahead benchmark requires PITR quota accounting",
-                                )?;
-                                Some(Arc::new(WalV8ExtentPreallocator::new_with_lookahead(
-                                    worker_file.try_clone().context(
-                                        "clone v8 WAL handle for sliding extent lookahead",
-                                    )?,
-                                    &self.sync_file,
-                                    start_offset,
-                                    self.max_file_size,
-                                    window_bytes,
-                                    Some(Arc::clone(owner)),
-                                    true,
-                                )?))
-                            }
-                            WalExtentPreparationMode::SlidingPointLookahead => {
-                                let owner = self.reservation_owner.as_ref().context(
-                                "point-only sliding lookahead benchmark requires PITR quota accounting",
-                            )?;
-                                Some(Arc::new(
-                                    WalV8ExtentPreallocator::new_with_point_only_lookahead(
-                                        worker_file.try_clone().context(
-                                            "clone v8 WAL handle for point-only extent lookahead",
-                                        )?,
-                                        &self.sync_file,
-                                        start_offset,
-                                        self.max_file_size,
-                                        window_bytes,
-                                        Arc::clone(owner),
-                                    )?,
-                                ))
-                            }
-                            WalExtentPreparationMode::SlidingFallocate => {
-                                if let Some(owner) = &self.reservation_owner {
-                                    Some(Arc::new(WalV8ExtentPreallocator::new(
-                                        worker_file.try_clone().context(
-                                            "clone v8 WAL handle for sliding extent preparation",
-                                        )?,
-                                        &self.sync_file,
-                                        start_offset,
-                                        self.max_file_size,
-                                        window_bytes,
-                                        Some(Arc::clone(owner)),
-                                    )?))
-                                } else {
-                                    None
-                                }
-                            }
-                            WalExtentPreparationMode::SlidingInitialize => None,
-                            WalExtentPreparationMode::Fallocate
-                            | WalExtentPreparationMode::Initialize => {
-                                anyhow::bail!("invalid sliding V8 extent preparation mode")
-                            }
-                        };
-                        if let Some(preallocator) = owned_preallocator {
+        type ExtentPrep = Option<Arc<WalV8SlidingExtentPreparation>>;
+        #[cfg(not(feature = "bench"))]
+        type ExtentPrep = Option<()>;
+        let (extent_preallocator, _extent_preparation): (
+            Option<Arc<WalV8ExtentPreallocator>>,
+            ExtentPrep,
+        ) = {
+            let start_offset = self.coordinator.last_frontier_end();
+            #[cfg(feature = "bench")]
+            let extent_policy_storage = effective_config.extent_policy_storage;
+            #[cfg(not(feature = "bench"))]
+            let extent_policy_storage = WalV8ExtentPolicyStorageKind::Vec;
+            #[cfg(feature = "bench")]
+            let extent_policy_scan_diagnostics_enabled =
+                effective_config.extent_policy_scan_diagnostics_enabled;
+            #[cfg(not(feature = "bench"))]
+            let extent_policy_scan_diagnostics_enabled = false;
+
+            let preallocate_with_strategy = |strategy: WalV8ExtentPreparationStrategy,
+                                             owner: &Arc<WalV8ReservationOwner>|
+             -> Result<Arc<WalV8ExtentPreallocator>> {
+                Ok(Arc::new(
+                    WalV8ExtentPreallocator::new_with_strategy_and_policy_config(
+                        worker_file
+                            .try_clone()
+                            .context("clone v8 WAL handle for extent preparation")?,
+                        &self.sync_file,
+                        start_offset,
+                        self.max_file_size,
+                        effective_config.extent_window_bytes,
+                        Some(Arc::clone(owner)),
+                        strategy,
+                        extent_policy_storage,
+                        extent_policy_scan_diagnostics_enabled,
+                    )?,
+                ))
+            };
+
+            match effective_config.extent_policy {
+                WalV8ExtentPreparationPolicy::Disabled => (None, None),
+                WalV8ExtentPreparationPolicy::FallocateOnly
+                | WalV8ExtentPreparationPolicy::Lookahead
+                | WalV8ExtentPreparationPolicy::PointOnlyLookahead => {
+                    let strategy = match effective_config.extent_policy {
+                        WalV8ExtentPreparationPolicy::FallocateOnly => {
+                            WalV8ExtentPreparationStrategy::FallocateOnly
+                        }
+                        WalV8ExtentPreparationPolicy::Lookahead => {
+                            WalV8ExtentPreparationStrategy::Lookahead
+                        }
+                        WalV8ExtentPreparationPolicy::PointOnlyLookahead => {
+                            WalV8ExtentPreparationStrategy::PointOnlyLookahead
+                        }
+                        _ => unreachable!(),
+                    };
+                    if let Some(owner) = &self.reservation_owner {
+                        let preallocator = preallocate_with_strategy(strategy, owner)?;
+                        #[cfg(feature = "bench")]
+                        {
                             io_diagnostics.sliding_extent_preparation =
                                 Some(preallocator.diagnostics());
-
-                            (Some(preallocator), None)
-                        } else {
-                            // Unit tests and non-PITR benchmark constructors have
-                            // no image quota owner. Preserve their explicit
-                            // benchmark preparation behavior without enabling it
-                            // in the production path.
+                        }
+                        (Some(preallocator), None)
+                    } else {
+                        #[cfg(feature = "bench")]
+                        {
                             let preparation = Arc::new(WalV8SlidingExtentPreparation::new(
                                 worker_file.try_clone().context(
                                     "clone v8 WAL handle for sliding extent preparation",
@@ -5149,28 +5302,55 @@ impl WalV8LeaderWriter {
                                 &self.sync_file,
                                 start_offset,
                                 self.max_file_size,
-                                window_bytes,
-                                mode,
+                                effective_config.extent_window_bytes,
+                                WalExtentPreparationMode::SlidingFallocate,
                             )?);
                             io_diagnostics.sliding_extent_preparation =
                                 Some(preparation.diagnostics());
-
                             (None, Some(preparation))
                         }
-                    }
-                    Some((mode, bytes)) => {
-                        io_diagnostics.extent_preparation = Some(prepare_v8_extent_suffix(
-                            &worker_file,
-                            &self.sync_file,
-                            self.coordinator.last_frontier_end(),
-                            self.max_file_size,
-                            mode,
-                            bytes,
-                        )?);
-
+                        #[cfg(not(feature = "bench"))]
                         (None, None)
                     }
-                    None => (None, None),
+                }
+                #[cfg(feature = "bench")]
+                WalV8ExtentPreparationPolicy::SlidingInitialize => {
+                    let preparation = Arc::new(WalV8SlidingExtentPreparation::new(
+                        worker_file
+                            .try_clone()
+                            .context("clone v8 WAL handle for sliding extent preparation")?,
+                        &self.sync_file,
+                        start_offset,
+                        self.max_file_size,
+                        effective_config.extent_window_bytes,
+                        WalExtentPreparationMode::SlidingInitialize,
+                    )?);
+                    io_diagnostics.sliding_extent_preparation = Some(preparation.diagnostics());
+                    (None, Some(preparation))
+                }
+                #[cfg(feature = "bench")]
+                WalV8ExtentPreparationPolicy::OneShotFallocate => {
+                    io_diagnostics.extent_preparation = Some(prepare_v8_extent_suffix(
+                        &worker_file,
+                        &self.sync_file,
+                        start_offset,
+                        self.max_file_size,
+                        WalExtentPreparationMode::Fallocate,
+                        effective_config.extent_window_bytes,
+                    )?);
+                    (None, None)
+                }
+                #[cfg(feature = "bench")]
+                WalV8ExtentPreparationPolicy::OneShotInitialize => {
+                    io_diagnostics.extent_preparation = Some(prepare_v8_extent_suffix(
+                        &worker_file,
+                        &self.sync_file,
+                        start_offset,
+                        self.max_file_size,
+                        WalExtentPreparationMode::Initialize,
+                        effective_config.extent_window_bytes,
+                    )?);
+                    (None, None)
                 }
             }
         };
@@ -5192,57 +5372,6 @@ impl WalV8LeaderWriter {
         {
             io_diagnostics.frontier = WalIoHandleMetadata::from_file(&frontier_file)?;
         }
-        #[cfg(not(feature = "bench"))]
-        let extent_preallocator = {
-            #[cfg(test)]
-            let test_strategy_override = extent_strategy_override;
-            #[cfg(not(test))]
-            let test_strategy_override: Option<(WalV8ExtentPreparationStrategy, u64)> = None;
-            let lookahead = effective_config.extent_lookahead;
-            let eligible = effective_config.has_reservation_owner
-                && effective_config.ext_family_filesystem
-                && effective_config.o_direct_worker;
-            if let Some(owner) = &self.reservation_owner
-                && (eligible || test_strategy_override.is_some())
-            {
-                let cloned_worker = worker_file
-                    .try_clone()
-                    .context("clone v8 WAL handle for production extent preparation")?;
-                let preallocator = match test_strategy_override {
-                    Some((WalV8ExtentPreparationStrategy::PointOnlyLookahead, window_bytes)) => {
-                        WalV8ExtentPreallocator::new_with_point_only_lookahead(
-                            cloned_worker,
-                            &self.sync_file,
-                            self.coordinator.last_frontier_end(),
-                            self.max_file_size,
-                            window_bytes,
-                            Arc::clone(owner),
-                        )?
-                    }
-                    Some((strategy, window_bytes)) => WalV8ExtentPreallocator::new_with_strategy(
-                        cloned_worker,
-                        &self.sync_file,
-                        self.coordinator.last_frontier_end(),
-                        self.max_file_size,
-                        window_bytes,
-                        Some(Arc::clone(owner)),
-                        strategy,
-                    )?,
-                    None => WalV8ExtentPreallocator::new_with_lookahead(
-                        cloned_worker,
-                        &self.sync_file,
-                        self.coordinator.last_frontier_end(),
-                        self.max_file_size,
-                        WAL_V8_PRODUCTION_EXTENT_WINDOW_BYTES,
-                        Some(Arc::clone(owner)),
-                        lookahead,
-                    )?,
-                };
-                Some(Arc::new(preallocator))
-            } else {
-                None
-            }
-        };
         let initial_ticket = self.coordinator.next_ticket();
         let io = WalV8ParallelIo::spawn(
             worker_file,
@@ -5251,10 +5380,14 @@ impl WalV8LeaderWriter {
             extent_preallocator,
             WalV8ParallelIoConfig {
                 #[cfg(feature = "bench")]
-                extent_preparation,
+                extent_preparation: _extent_preparation,
                 direct_completion_enabled: effective_config.direct_completion_enabled,
                 #[cfg(feature = "bench")]
                 coalesce_ready_target,
+                #[cfg(feature = "bench")]
+                data_submit_ready_order: effective_config.data_submit_ready_order,
+                #[cfg(feature = "bench")]
+                point_direct_frame_enabled: effective_config.point_direct_frame_enabled,
                 #[cfg(test)]
                 worker_group_limit,
             },
@@ -13062,6 +13195,11 @@ mod tests {
             buffered_effective.frontier_mode,
             WalV8FrontierWriteMode::Buffered
         );
+        assert_eq!(
+            buffered_effective.extent_policy,
+            WalV8ExtentPreparationPolicy::Disabled
+        );
+        assert_eq!(buffered_effective.extent_window_bytes, 0);
         assert!(!buffered_effective.has_reservation_owner);
 
         if let Ok(direct_file) = OpenOptions::new()
@@ -13077,18 +13215,21 @@ mod tests {
                 WalV8FrontierWriteMode::Direct
             );
             assert!(direct_effective.has_reservation_owner);
+            let expected_policy = if direct_effective.ext_family_filesystem {
+                WalV8ExtentPreparationPolicy::FallocateOnly
+            } else {
+                WalV8ExtentPreparationPolicy::Disabled
+            };
+            assert_eq!(direct_effective.extent_policy, expected_policy);
         }
 
-        #[cfg(not(feature = "bench"))]
-        {
-            let lookahead_requested = WalV8RequestedConfig {
-                extent_lookahead: true,
-                ..WalV8RequestedConfig::default()
-            };
-            assert!(
-                WalV8EffectiveConfig::resolve(&lookahead_requested, &buffered_file, false).is_err()
-            );
-        }
+        let lookahead_requested = WalV8RequestedConfig {
+            extent_lookahead: true,
+            ..WalV8RequestedConfig::default()
+        };
+        assert!(
+            WalV8EffectiveConfig::resolve(&lookahead_requested, &buffered_file, false).is_err()
+        );
 
         Ok(())
     }

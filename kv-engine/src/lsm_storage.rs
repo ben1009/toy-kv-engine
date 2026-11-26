@@ -683,7 +683,7 @@ struct RecoveryPlan {
     max_recorded_at: Option<crate::pitr::RecordedAt>,
     options: LsmStorageOptions,
     wal_io_mode: crate::wal::WalIoMode,
-    wal_v8_requested_config: crate::wal::v8::leader::WalV8RequestedConfig,
+    wal_v8_requested_config: Option<crate::wal::v8::leader::WalV8RequestedConfig>,
     compaction_controller: CompactionController,
     pitr_state: crate::pitr::manifest::PitrState,
     /// The newest segment the database has on disk, measured at recovery.
@@ -1894,7 +1894,7 @@ pub(crate) struct LsmStorageInner {
     next_sst_id: AtomicUsize,
     pub(crate) options: Arc<LsmStorageOptions>,
     wal_io_mode: crate::wal::WalIoMode,
-    wal_v8_requested_config: crate::wal::v8::leader::WalV8RequestedConfig,
+    wal_v8_requested_config: Mutex<Option<crate::wal::v8::leader::WalV8RequestedConfig>>,
     pub(crate) compaction_controller: CompactionController,
     pub(crate) pitr_state: Mutex<crate::pitr::manifest::PitrState>,
     pub(crate) pitr_next_segment_id: AtomicU64,
@@ -13397,8 +13397,7 @@ impl LsmStorageInner {
         use std::os::unix::fs::MetadataExt;
 
         options.prefix_bloom.validate()?;
-        let wal_v8_requested_config =
-            crate::wal::v8::leader::WalV8RequestedConfig::from_environment()?;
+        let mut wal_v8_requested_config = None;
         let vlog_enabled = options
             .value_separation
             .as_ref()
@@ -14844,6 +14843,17 @@ impl LsmStorageInner {
                                 )?;
                             let allocation_unit =
                                 crate::pitr::segment::filesystem_allocation_reservation(path, 1)?;
+                            let v8_config = match wal_io_mode {
+                                crate::wal::WalIoMode::Parallel => {
+                                    let config =
+                                        crate::wal::v8::leader::WalV8RequestedConfig::from_environment()?;
+                                    wal_v8_requested_config = Some(config);
+                                    config
+                                }
+                                crate::wal::WalIoMode::Leader => {
+                                    crate::wal::v8::leader::WalV8RequestedConfig::default()
+                                }
+                            };
                             MemTable::recover_from_v8_active_with_owner(
                                 memtable_id,
                                 vlog_enabled,
@@ -14851,7 +14861,7 @@ impl LsmStorageInner {
                                 recovery,
                                 max_segment_bytes,
                                 wal_io_mode,
-                                wal_v8_requested_config,
+                                v8_config,
                                 |installed| {
                                     let metadata = std::fs::metadata(&wal_path)?;
                                     ensure!(
@@ -15365,7 +15375,7 @@ impl LsmStorageInner {
             manifest: Some(plan.manifest),
             options: plan.options.into(),
             wal_io_mode: plan.wal_io_mode,
-            wal_v8_requested_config: plan.wal_v8_requested_config,
+            wal_v8_requested_config: Mutex::new(plan.wal_v8_requested_config),
             mvcc: Some(Arc::new(LsmMvccInner::new(plan.max_commit_ts))),
             reserved_ssts: Mutex::new(HashSet::new()),
             compaction_filters: Mutex::new(CompactionFilterRegistry {
@@ -19055,6 +19065,16 @@ impl LsmStorageInner {
         self.rotate_after_wal_full(error, expected_memtable, retries, false)
     }
 
+    fn wal_v8_requested_config(&self) -> Result<crate::wal::v8::leader::WalV8RequestedConfig> {
+        let mut guard = self.wal_v8_requested_config.lock();
+        if let Some(config) = *guard {
+            return Ok(config);
+        }
+        let config = crate::wal::v8::leader::WalV8RequestedConfig::from_environment()?;
+        *guard = Some(config);
+        Ok(config)
+    }
+
     #[cfg(test)]
     fn set_v8_point_buffer_preallocation_for_test(&self, enabled: bool) -> Result<()> {
         self.point_buffer_preallocation_test_override
@@ -21214,6 +21234,12 @@ impl LsmStorageInner {
         )?;
         let allocation_unit =
             crate::pitr::segment::filesystem_allocation_reservation(&database_path, 1)?;
+        let wal_v8_config = match self.wal_io_mode {
+            crate::wal::WalIoMode::Parallel => self.wal_v8_requested_config()?,
+            crate::wal::WalIoMode::Leader => {
+                crate::wal::v8::leader::WalV8RequestedConfig::default()
+            }
+        };
         let (memtable, owner) = mem_table::MemTable::create_with_wal_v8_active(
             self.next_sst_id(),
             self.vlog.is_some(),
@@ -21222,7 +21248,7 @@ impl LsmStorageInner {
             max_segment_bytes,
             Arc::clone(&retained_resources),
             self.wal_io_mode,
-            self.wal_v8_requested_config,
+            wal_v8_config,
             |installed| {
                 use std::os::unix::fs::MetadataExt;
 
@@ -41045,7 +41071,7 @@ mod tests {
             engine.enable_pitr(PitrOptions {
                 repository: repository.clone(),
                 config: PersistedPitrConfig {
-                    archive_interval: std::time::Duration::from_secs(3600),
+                    archive_interval: std::time::Duration::from_millis(100),
                     max_segment_bytes: MAX_SEGMENT_BYTES,
                     max_unarchived_bytes: 16 * 1024 * 1024,
                     max_source_spool_bytes: 64 * 1024 * 1024,
@@ -41056,6 +41082,7 @@ mod tests {
             let source_effective = source
                 .v8_effective_config_for_test()
                 .expect("active V8 WAL exposes effective config");
+            assert!(source.uses_v8_cursor_direct_completion());
             Ok((Some(engine), Some(source_effective)))
         })?;
         let Some(engine) = engine else {
@@ -41067,7 +41094,7 @@ mod tests {
         assert!(source_effective.has_reservation_owner);
 
         // Rotate outside the thread-local override: the successor must still
-        // inherit Engine-open `wal_v8_requested_config`.
+        // inherit Engine-open `wal_v8_requested_config` and wire the runtime.
         let source = engine.inner.state.load().memtable.clone();
         engine.put(b"k1", b"v1")?;
         assert!(matches!(
@@ -41076,6 +41103,7 @@ mod tests {
         ));
         let successor = engine.inner.state.load().memtable.clone();
         assert!(!Arc::ptr_eq(&source, &successor));
+        assert!(successor.uses_v8_cursor_direct_completion());
         let successor_effective = successor
             .v8_effective_config_for_test()
             .expect("rotated V8 WAL exposes effective config");
@@ -41083,7 +41111,31 @@ mod tests {
         assert!(successor_effective.direct_completion_enabled);
         assert!(successor_effective.has_reservation_owner);
 
+        // Trigger an automatic PITR maintenance rotation outside the
+        // thread-local override and confirm the auto-rotated successor also inherits it.
+        engine.put(b"auto-rot", b"v2")?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let auto_rotated = loop {
+            let current = engine.inner.state.load().memtable.clone();
+            if !Arc::ptr_eq(&current, &successor) {
+                break current;
+            }
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "writes should trigger automatic PITR V8 WAL rotation"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        assert!(auto_rotated.uses_v8_cursor_direct_completion());
+        let auto_effective = auto_rotated
+            .v8_effective_config_for_test()
+            .expect("auto-rotated V8 WAL exposes effective config");
+        assert_eq!(auto_effective.progress_mode, WalV8ProgressMode::Cursor);
+        assert!(auto_effective.direct_completion_enabled);
+        assert!(auto_effective.has_reservation_owner);
+
         engine.close()?;
+        drop(auto_rotated);
         drop(successor);
         drop(source);
         drop(engine);
@@ -41094,11 +41146,9 @@ mod tests {
         reopen_options.pitr_repository = Some(repository);
         let reopened =
             KvEngine::open_with_wal_io_mode(&database, reopen_options, WalIoMode::Parallel)?;
-        let reopened_effective = reopened
-            .inner
-            .state
-            .load()
-            .memtable
+        let reopened_active = reopened.inner.state.load().memtable.clone();
+        assert!(!reopened_active.uses_v8_cursor_direct_completion());
+        let reopened_effective = reopened_active
             .v8_effective_config_for_test()
             .expect("reopened V8 WAL exposes effective config");
         assert_eq!(reopened_effective.progress_mode, WalV8ProgressMode::Eager);
@@ -41106,6 +41156,58 @@ mod tests {
         assert!(reopened_effective.has_reservation_owner);
         assert_eq!(reopened.get(b"k1")?.as_deref(), Some(&b"v1"[..]));
         reopened.close()?;
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn non_v8_parallel_engines_ignore_invalid_v8_parallel_env() -> anyhow::Result<()> {
+        const CHILD_ENV: &str = "TOYKV_TEST_NON_V8_ENV_ISOLATION_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("lsm_storage::tests::non_v8_parallel_engines_ignore_invalid_v8_parallel_env")
+                .arg("--nocapture")
+                .env(CHILD_ENV, "1")
+                .env("TOYKV_WAL_V8_PROGRESS_MODE", "invalid-mode")
+                .env("TOYKV_BENCH_V8_POINT_PROGRESS_RING", "invalid-ring")
+                .env("TOYKV_BENCH_V8_CURSOR_DIRECT_COMPLETION", "1")
+                .env("TOYKV_WAL_V8_FRONTIER_MODE", "invalid-frontier")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "child test failed: stdout={}, stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            return Ok(());
+        }
+
+        // 1. V4 WAL engine opens and writes cleanly despite invalid V8 env vars.
+        let v4_dir = tempdir()?;
+        let v4_engine = KvEngine::open(
+            v4_dir.path().join("v4-db"),
+            LsmStorageOptions {
+                enable_wal: true,
+                ..LsmStorageOptions::default_for_test()
+            },
+        )?;
+        v4_engine.put(b"k", b"v")?;
+        v4_engine.close()?;
+
+        // 2. WAL-disabled engine opens cleanly despite invalid V8 env vars.
+        let no_wal_dir = tempdir()?;
+        let no_wal_engine = KvEngine::open(
+            no_wal_dir.path().join("no-wal-db"),
+            LsmStorageOptions {
+                enable_wal: false,
+                ..LsmStorageOptions::default_for_test()
+            },
+        )?;
+        no_wal_engine.put(b"k", b"v")?;
+        no_wal_engine.close()?;
 
         Ok(())
     }
