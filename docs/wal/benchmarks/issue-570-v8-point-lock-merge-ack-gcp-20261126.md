@@ -17,7 +17,7 @@
 | **Batch64/w16** (100k puts, 16t) | 627,235.3 puts/s · 4.88 μs/put · 2.337 ms p99 | 629,128.6 puts/s · 4.77 μs/put · 2.440 ms p99 | +0.30% · -2.12% · +8.86% | 4/5 · 3/5 · 2/5 |
 
 - At **Point16**, Candidate won **5/5** pairs on both throughput (**+1.86%**) and CPU/Put (**-5.78%**, `74.75 μs` → `70.92 μs`), while sampled p99 median improved from `1.048 ms` to `0.948 ms` (`+0.47%` paired median due to two high tail outliers in pairs 4–5: `1.261` and `1.661 ms` vs `0.919–0.948 ms` in pairs 1–3).
-- At **Point1** and **Batch64/w16**, sampled p99 paired medians were `+16.61%` (`2/5` wins; baseline ranged `0.458–0.928 ms` vs candidate `0.551–0.639 ms`) and `+8.86%` (`2/5` wins; `1.657–3.083 ms` vs `1.781–4.836 ms`), reflecting run-to-run sampled tail variance rather than a consistent directional shift (`2/5` wins across all four workloads).
+- At **Point1** and **Batch64/w16**, sampled p99 paired medians were `+16.61%` (`2/5` wins; baseline `0.458–0.928 ms` vs candidate `0.551–0.639 ms`) and `+8.86%` (`2/5` wins; `1.657–3.083 ms` vs `1.781–4.836 ms`). Because `--latency-sample-every 100` yields only ~200 latency samples per 20k-put Point1 run (and 2/5 p99 wins across all four workloads), these p99 increases remain **unconfirmed tail-latency risks** to verify with denser sampling rather than dismissed as noise.
 - **Batch64/w16** throughput and CPU/Put had no regression (+0.30% ops/s, -2.12% CPU/put).
 
 ## 2. Point16 Diagnostic Comparison (`--wal-v8-durability-sample-every 64`, 100k puts)
