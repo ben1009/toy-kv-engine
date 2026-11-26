@@ -253,6 +253,12 @@ pub struct WriteProfile {
     pub wal_commit_max_buffers: AtomicU64,
     /// Maximum aligned bytes submitted by one WAL commit group.
     pub wal_commit_max_bytes: AtomicU64,
+    /// DATA worker-group ticket-count buckets for benchmark reporting.
+    pub wal_worker_group_size_one_ticket: AtomicU64,
+    pub wal_worker_group_size_two_tickets: AtomicU64,
+    pub wal_worker_group_size_three_to_four_tickets: AtomicU64,
+    pub wal_worker_group_size_five_to_eight_tickets: AtomicU64,
+    pub wal_worker_group_size_nine_or_more_tickets: AtomicU64,
     /// Number of successfully written embedded v7 FRONTIER frames.
     pub wal_frontier_writes: AtomicU64,
     /// Aligned bytes written for embedded v7 FRONTIER frames.
@@ -552,8 +558,32 @@ pub struct WalV8DurabilityPhaseObservation {
     pub frontier_lock_wait_ns: u64,
     pub coalescing_wall_ns: u64,
     pub coalescing_cpu_ns: u64,
-    pub coalescing_active_wall_ns: u64,
-    pub coalescing_active_cpu_ns: u64,
+    /// Active wall time from the detailed wait breakdown; `Some(0)` when no
+    /// coalescing call was made, and `None` when a call lacks that breakdown.
+    pub coalescing_active_wall_ns: Option<u64>,
+    /// Active CPU time from the detailed wait breakdown, with the same
+    /// availability semantics as `coalescing_active_wall_ns`.
+    pub coalescing_active_cpu_ns: Option<u64>,
+    /// Whether the legacy state-lock/condvar wait fields below are populated.
+    /// Cursor mode uses progress-token timing fields instead.
+    pub coalescing_wait_breakdown_available: bool,
+    pub coalescing_budget_us: Option<u64>,
+    pub coalescing_progress_wait_wall_ns: Option<u64>,
+    pub coalescing_progress_wait_cpu_ns: Option<u64>,
+    pub coalescing_completion_drain_wall_ns: Option<u64>,
+    pub coalescing_completion_drain_cpu_ns: Option<u64>,
+    pub coalescing_coordinator_lock_wait_wall_ns: Option<u64>,
+    pub coalescing_coordinator_lock_wait_cpu_ns: Option<u64>,
+    pub coalescing_coordinator_lock_hold_wall_ns: Option<u64>,
+    pub coalescing_coordinator_lock_hold_cpu_ns: Option<u64>,
+    pub coalescing_completion_apply_wall_ns: Option<u64>,
+    pub coalescing_completion_apply_cpu_ns: Option<u64>,
+    pub coalescing_digest_fold_wall_ns: Option<u64>,
+    pub coalescing_digest_fold_cpu_ns: Option<u64>,
+    pub coalescing_cursor_advance_wall_ns: Option<u64>,
+    pub coalescing_cursor_advance_cpu_ns: Option<u64>,
+    pub coalescing_iterations: Option<u64>,
+    pub coalescing_ready_tickets_gained: Option<u64>,
     pub coalescing_state_lock_wait_wall_ns: u64,
     pub coalescing_state_lock_wait_cpu_ns: u64,
     pub coalescing_condvar_wait_wall_ns: u64,
@@ -583,6 +613,7 @@ pub struct WalV8DurabilityPhaseObservation {
     pub resource_retire_before_publish_release_cpu_ns: u64,
     pub resource_retire_before_publish_finish_cpu_ns: u64,
     pub resource_retire_before_publish_batched_point_credits: bool,
+    pub resource_retire_before_publish_point_prefix_detached: bool,
     pub resource_retire_after_publish_wall_ns: u64,
     pub resource_retire_after_publish_cpu_ns: u64,
     pub resource_retire_after_publish_lock_wait_wall_ns: u64,
@@ -626,8 +657,12 @@ pub struct WalCpuAttributionObservation {
     pub input_build_cpu_ns: u64,
     pub preflight_wall_ns: u64,
     pub preflight_cpu_ns: u64,
+    pub point_buffer_preallocation_wall_ns: u64,
+    pub point_buffer_preallocation_cpu_ns: u64,
     pub sequencer_wait_wall_ns: u64,
     pub sequencer_wait_cpu_ns: u64,
+    pub sequencer_hold_wall_ns: u64,
+    pub sequencer_hold_cpu_ns: u64,
     pub commit_setup_wall_ns: u64,
     pub commit_setup_cpu_ns: u64,
     pub admission_wall_ns: u64,
@@ -882,10 +917,6 @@ impl WriteProfile {
         anyhow::ensure!(
             self.wal_v8_completion_timeline_sample_every() == 0,
             "V8 completion timeline diagnostics are not supported with the progress ring"
-        );
-        anyhow::ensure!(
-            self.wal_v8_durability_sample_every() == 0,
-            "V8 durability phase diagnostics are not supported with the progress ring"
         );
         Ok(())
     }
@@ -1151,6 +1182,25 @@ impl WriteProfile {
     #[cfg(feature = "bench")]
     pub(crate) fn reset(&self) {
         let o = std::sync::atomic::Ordering::Relaxed;
+        self.wal_sync_diagnostics_enabled.store(false, o);
+        self.wal_hol_diagnostics_enabled.store(false, o);
+        self.wal_v8_completion_timeline_sample_every.store(0, o);
+        self.wal_v8_durability_sample_every.store(0, o);
+        self.wal_cpu_attribution_sample_every.store(0, o);
+        self.clear_measurements(0);
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn reset_measurements(&self) {
+        let commit_order_trace_limit = self
+            .commit_order_trace_limit
+            .load(std::sync::atomic::Ordering::Relaxed);
+        self.clear_measurements(commit_order_trace_limit);
+    }
+
+    #[cfg(feature = "bench")]
+    fn clear_measurements(&self, commit_order_trace_limit: u64) {
+        let o = std::sync::atomic::Ordering::Relaxed;
         self.batch_build_ns.store(0, o);
         self.mvcc_wal_only_ns.store(0, o);
         self.wal_write_ns.store(0, o);
@@ -1175,10 +1225,6 @@ impl WriteProfile {
         #[cfg(feature = "bench")]
         self.wal_sync_observations.lock().clear();
         #[cfg(feature = "bench")]
-        self.wal_sync_diagnostics_enabled.store(false, o);
-        #[cfg(feature = "bench")]
-        self.wal_hol_diagnostics_enabled.store(false, o);
-        #[cfg(feature = "bench")]
         self.wal_v8_completion_timeline.lock().clear();
         #[cfg(feature = "bench")]
         self.wal_v8_completion_timeline_dropped_samples.store(0, o);
@@ -1187,9 +1233,6 @@ impl WriteProfile {
             self.wal_completion_handoff_timeline.lock().clear();
             self.wal_completion_handoff_timeline_dropped_samples
                 .store(0, o);
-            self.wal_v8_completion_timeline_sample_every.store(0, o);
-            self.wal_v8_durability_sample_every.store(0, o);
-            self.wal_cpu_attribution_sample_every.store(0, o);
             self.wal_cpu_attribution_sequence.store(0, o);
             self.wal_cpu_attribution_selected_samples.store(0, o);
             self.wal_cpu_attribution_dropped_samples.store(0, o);
@@ -1212,7 +1255,7 @@ impl WriteProfile {
             self.wal_v8_ack_dropped_samples.store(0, o);
             self.wal_v8_follower_waits.lock().clear();
             self.wal_v8_follower_wait_dropped_samples.store(0, o);
-            self.configure_commit_order_trace(0);
+            self.configure_commit_order_trace(commit_order_trace_limit);
         }
         self.wal_worker_eventfd_notifications.store(0, o);
         self.wal_worker_eventfd_writes.store(0, o);
@@ -1257,6 +1300,11 @@ impl WriteProfile {
         self.wal_commit_bytes.store(0, o);
         self.wal_commit_max_buffers.store(0, o);
         self.wal_commit_max_bytes.store(0, o);
+        self.wal_worker_group_size_one_ticket.store(0, o);
+        self.wal_worker_group_size_two_tickets.store(0, o);
+        self.wal_worker_group_size_three_to_four_tickets.store(0, o);
+        self.wal_worker_group_size_five_to_eight_tickets.store(0, o);
+        self.wal_worker_group_size_nine_or_more_tickets.store(0, o);
         self.wal_frontier_writes.store(0, o);
         self.wal_frontier_bytes.store(0, o);
         self.wal_frontier_write_ns.store(0, o);
@@ -1336,6 +1384,18 @@ impl WriteProfile {
             wal_commit_bytes: self.wal_commit_bytes.load(o),
             wal_commit_max_buffers: self.wal_commit_max_buffers.load(o),
             wal_commit_max_bytes: self.wal_commit_max_bytes.load(o),
+            wal_worker_group_size_one_ticket: self.wal_worker_group_size_one_ticket.load(o),
+            wal_worker_group_size_two_tickets: self.wal_worker_group_size_two_tickets.load(o),
+            wal_worker_group_size_three_to_four_tickets: self
+                .wal_worker_group_size_three_to_four_tickets
+                .load(o),
+            wal_worker_group_size_five_to_eight_tickets: self
+                .wal_worker_group_size_five_to_eight_tickets
+                .load(o),
+            wal_worker_group_size_nine_or_more_tickets: self
+                .wal_worker_group_size_nine_or_more_tickets
+                .load(o),
+            wal_worker_group_size_histogram_enabled: self.wal_worker_group_size_histogram_enabled(),
             wal_frontier_writes: self.wal_frontier_writes.load(o),
             wal_frontier_bytes: self.wal_frontier_bytes.load(o),
             wal_frontier_write_ns: self.wal_frontier_write_ns.load(o),
@@ -1391,6 +1451,33 @@ impl WriteProfile {
         self.wal_commit_bytes.fetch_add(bytes, o);
         self.wal_commit_max_buffers.fetch_max(buffers, o);
         self.wal_commit_max_bytes.fetch_max(bytes, o);
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn record_wal_worker_group(&self, ticket_count: u64) {
+        let counter = match ticket_count {
+            0 => return,
+            1 => &self.wal_worker_group_size_one_ticket,
+            2 => &self.wal_worker_group_size_two_tickets,
+            3..=4 => &self.wal_worker_group_size_three_to_four_tickets,
+            5..=8 => &self.wal_worker_group_size_five_to_eight_tickets,
+            _ => &self.wal_worker_group_size_nine_or_more_tickets,
+        };
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn wal_worker_group_size_histogram_enabled(&self) -> bool {
+        #[cfg(feature = "bench")]
+        {
+            static ENABLED: OnceLock<bool> = OnceLock::new();
+            *ENABLED.get_or_init(|| {
+                std::env::var_os("TOYKV_BENCH_WAL_WORKER_GROUP_HISTOGRAM")
+                    .and_then(|value| value.into_string().ok())
+                    .is_some_and(|value| value == "1")
+            })
+        }
+        #[cfg(not(feature = "bench"))]
+        false
     }
 
     #[cfg(feature = "bench")]
@@ -2179,6 +2266,12 @@ pub struct WriteProfileSnapshot {
     pub wal_commit_bytes: u64,
     pub wal_commit_max_buffers: u64,
     pub wal_commit_max_bytes: u64,
+    pub wal_worker_group_size_one_ticket: u64,
+    pub wal_worker_group_size_two_tickets: u64,
+    pub wal_worker_group_size_three_to_four_tickets: u64,
+    pub wal_worker_group_size_five_to_eight_tickets: u64,
+    pub wal_worker_group_size_nine_or_more_tickets: u64,
+    pub wal_worker_group_size_histogram_enabled: bool,
     pub wal_frontier_writes: u64,
     pub wal_frontier_bytes: u64,
     pub wal_frontier_write_ns: u64,
@@ -2346,6 +2439,22 @@ impl WriteProfileSnapshot {
                 .saturating_sub(before.wal_commit_bytes),
             wal_commit_max_buffers: self.wal_commit_max_buffers,
             wal_commit_max_bytes: self.wal_commit_max_bytes,
+            wal_worker_group_size_one_ticket: self
+                .wal_worker_group_size_one_ticket
+                .saturating_sub(before.wal_worker_group_size_one_ticket),
+            wal_worker_group_size_two_tickets: self
+                .wal_worker_group_size_two_tickets
+                .saturating_sub(before.wal_worker_group_size_two_tickets),
+            wal_worker_group_size_three_to_four_tickets: self
+                .wal_worker_group_size_three_to_four_tickets
+                .saturating_sub(before.wal_worker_group_size_three_to_four_tickets),
+            wal_worker_group_size_five_to_eight_tickets: self
+                .wal_worker_group_size_five_to_eight_tickets
+                .saturating_sub(before.wal_worker_group_size_five_to_eight_tickets),
+            wal_worker_group_size_nine_or_more_tickets: self
+                .wal_worker_group_size_nine_or_more_tickets
+                .saturating_sub(before.wal_worker_group_size_nine_or_more_tickets),
+            wal_worker_group_size_histogram_enabled: self.wal_worker_group_size_histogram_enabled,
             wal_frontier_writes: self
                 .wal_frontier_writes
                 .saturating_sub(before.wal_frontier_writes),
@@ -2911,6 +3020,7 @@ impl MemTable {
         max_file_size: u64,
         retained_resources: Arc<WalV7RetainedResources>,
         io_mode: WalIoMode,
+        wal_v8_config: crate::wal::v8::leader::WalV8RequestedConfig,
         create_owner: F,
     ) -> Result<(Self, Arc<crate::wal::v8::resource::WalV8ReservationOwner>)>
     where
@@ -2972,6 +3082,7 @@ impl MemTable {
             installed,
             max_file_size,
             io_mode,
+            wal_v8_config,
             create_owner,
         )?;
         ensure!(
@@ -3185,12 +3296,14 @@ impl MemTable {
         installed: crate::wal::v8::install::WalV8InstalledRecovery,
         max_file_size: u64,
     ) -> Result<(Self, u64)> {
+        let wal_v8_config = crate::wal::v8::leader::WalV8RequestedConfig::from_environment()?;
         Self::recover_from_v8_active_inner(
             id,
             vlog_enabled,
             path,
             installed,
             WalIoMode::Parallel,
+            wal_v8_config,
             |write, sync, installed| {
                 let writer = crate::wal::v8::leader::WalV8LeaderWriter::new(
                     write,
@@ -3207,6 +3320,7 @@ impl MemTable {
     /// Replay under the caller's recovery reservation, then attach an
     /// image-bound owner before the recovered WAL can accept writes.
     #[cfg(target_os = "linux")]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn recover_from_v8_active_with_owner<F>(
         id: usize,
         vlog_enabled: bool,
@@ -3214,6 +3328,7 @@ impl MemTable {
         installed: crate::wal::v8::install::WalV8InstalledRecovery,
         max_file_size: u64,
         io_mode: WalIoMode,
+        wal_v8_config: crate::wal::v8::leader::WalV8RequestedConfig,
         create_owner: F,
     ) -> Result<(Self, u64)>
     where
@@ -3227,6 +3342,7 @@ impl MemTable {
             path,
             installed,
             io_mode,
+            wal_v8_config,
             |write, sync, installed| {
                 let owner = create_owner(installed)?;
                 let writer = crate::wal::v8::leader::WalV8LeaderWriter::new_with_reservation_owner(
@@ -3249,6 +3365,7 @@ impl MemTable {
         path: impl AsRef<Path>,
         installed: crate::wal::v8::install::WalV8InstalledRecovery,
         io_mode: WalIoMode,
+        wal_v8_config: crate::wal::v8::leader::WalV8RequestedConfig,
         create_writer: F,
     ) -> Result<(Self, u64)>
     where
@@ -3301,8 +3418,9 @@ impl MemTable {
         ret.wal = Some(match io_mode {
             WalIoMode::Leader => Wal::from_v8_leader(writer, &installed)?,
             WalIoMode::Parallel => Wal::from_v8_parallel(
-                writer.into_parallel_with_worker_file(
+                writer.into_parallel_with_worker_file_and_config(
                     worker_file.context("v8 Parallel WAL has no worker file handle")?,
+                    wal_v8_config,
                 )?,
                 &installed,
             )?,
@@ -3461,6 +3579,32 @@ impl MemTable {
         &self,
     ) -> Option<Arc<crate::wal::v8::resource::WalV8ReservationOwner>> {
         self.wal_v8_reservation_owner.clone()
+    }
+
+    pub(crate) fn quiesce_v8_wal_extent_preparation(&self) {
+        if let Some(wal) = &self.wal {
+            wal.quiesce_v8_extent_preparation();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_v8_lookahead_worker_hook_for_test(
+        &self,
+        hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) {
+        if let Some(wal) = &self.wal {
+            wal.set_v8_lookahead_worker_hook_for_test(hook);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_v8_lookahead_quiesce_hook_for_test(
+        &self,
+        hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) {
+        if let Some(wal) = &self.wal {
+            wal.set_v8_lookahead_quiesce_hook_for_test(hook);
+        }
     }
 
     #[allow(dead_code)]
@@ -4028,6 +4172,42 @@ impl MemTable {
         Ok((Some(ticket), Some(frame_job)))
     }
 
+    pub(crate) fn try_preallocate_prepared_v8_point_buffer_only(
+        &self,
+        scratch: &mut crate::wal::v8::leader::WalV8PointAdmissionScratch<'_>,
+    ) -> bool {
+        if let Some(wal) = &self.wal {
+            return wal.try_preallocate_v8_point_buffer(scratch);
+        }
+
+        false
+    }
+
+    pub(crate) fn admit_prepared_v8_point_pitr_wal_batch_only<'a>(
+        &self,
+        scratch: crate::wal::v8::leader::WalV8PointAdmissionScratch<'a>,
+        commit_ts: u64,
+        recorded_at: crate::pitr::RecordedAt,
+    ) -> Result<(
+        Option<u64>,
+        Option<crate::wal::v8::leader::WalV8FrameJob<'a>>,
+    )> {
+        let wal = self
+            .wal
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("PITR WAL is not configured"))?;
+        anyhow::ensure!(
+            wal.is_v8() && wal.is_parallel(),
+            "prepared v8 batch requires a Parallel v8 WAL"
+        );
+        let (ticket, frame_job) =
+            wal.admit_v8_prepared_parallel_point_batch(scratch, commit_ts, recorded_at)?;
+        self.last_ticket
+            .fetch_max(ticket + 1, std::sync::atomic::Ordering::Release);
+
+        Ok((Some(ticket), Some(frame_job)))
+    }
+
     pub(crate) fn finish_v8_frame_job(
         &self,
         frame_job: crate::wal::v8::leader::WalV8FrameJob<'_>,
@@ -4251,6 +4431,44 @@ impl MemTable {
         self.wal.as_ref().and_then(Wal::benchmark_io_diagnostics)
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_v8_point_buffer_preallocation_for_test(&self, enabled: bool) -> Result<()> {
+        self.wal
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("memtable has no WAL"))?
+            .set_v8_point_buffer_preallocation_for_test(enabled)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn v8_point_buffer_preallocation_enabled_for_test(&self) -> bool {
+        self.wal
+            .as_ref()
+            .is_some_and(Wal::v8_point_buffer_preallocation_enabled_for_test)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn v8_point_buffer_preallocations_in_flight_for_test(&self) -> usize {
+        self.wal
+            .as_ref()
+            .map_or(0, Wal::v8_point_buffer_preallocations_in_flight_for_test)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn v8_point_buffer_preallocation_hits_for_test(&self) -> u64 {
+        self.wal
+            .as_ref()
+            .map_or(0, Wal::v8_point_buffer_preallocation_hits_for_test)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn v8_effective_config_for_test(
+        &self,
+    ) -> Option<crate::wal::v8::leader::WalV8EffectiveConfig> {
+        self.wal
+            .as_ref()
+            .and_then(Wal::v8_effective_config_for_test)
+    }
+
     pub(crate) fn uses_pitr_batch_wal(&self) -> bool {
         self.wal_v7_source || self.wal_v8_source || self.wal.as_ref().is_some_and(Wal::is_pitr)
     }
@@ -4261,6 +4479,13 @@ impl MemTable {
 
     pub(crate) fn uses_v8_wal(&self) -> bool {
         self.wal_v8_source || self.wal.as_ref().is_some_and(Wal::is_v8)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn uses_v8_cursor_direct_completion(&self) -> bool {
+        self.wal
+            .as_ref()
+            .is_some_and(Wal::uses_v8_cursor_direct_completion)
     }
 
     /// Capture both the canonical empty floor and the writer's latest v7
@@ -5285,15 +5510,6 @@ impl MemTable {
 
     #[cfg(feature = "bench")]
     pub(crate) fn set_wal_v8_durability_sample_every(&self, every: u64) -> Result<()> {
-        if every > 0
-            && let Some(wal) = &self.wal
-        {
-            anyhow::ensure!(
-                !wal.v8_progress_ring_enabled(),
-                "V8 durability phase diagnostics are not supported with the progress ring"
-            );
-        }
-
         self.write_profile
             .load_full()
             .set_wal_v8_durability_sample_every(every);

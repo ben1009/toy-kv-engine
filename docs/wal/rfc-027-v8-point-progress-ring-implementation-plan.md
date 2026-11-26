@@ -23,7 +23,7 @@ the eager Coordinator backend.
 | F0.2 Completion queue | `leader.rs::WalV8ParallelIo::spawn`, `reap_v8_group_result`, `parallel.rs::mark_data_group_complete_inner` | Whole group validation, queue capacity and reopen isolation pass in tests. |
 | F0.3 Producer publication and advance | `leader.rs::WalV8FrameJob`, `parallel.rs::fold_ready_digests`, readiness and FRONTIER accessors | An elected owner builds the same ordered digest and durable prefix as the baseline. |
 | F0.4 Driver waits and enablement | `leader.rs::drive_frontier_through`, `parallel.rs` driver acquisition and readiness waits, `mem_table.rs` Active writer open | Both waits use the token protocol. The entire mode passes the correctness matrix before scoring. |
-| F0.5 Qualification | `write-perf`, `scripts/gcp_wal_matrix.py`, the GCP launcher and archive verifier | Local screen passes, then five valid GCP pairs per workload produce a keep or stop decision. |
+| F0.5 Qualification | `write-perf`, `scripts/gcp_wal_matrix.py`, the GCP launcher and archive verifier | The user-waived local performance screen is recorded as skipped; five valid GCP pairs per workload produce a keep or stop decision. |
 
 Both the producer and Coordinator code live in the
 [V8 writer](../../kv-engine/src/wal/v8/leader.rs) and
@@ -159,9 +159,11 @@ Both the producer and Coordinator code live in the
    fresh Active WALs, reopens and rotation successors. Activate the ring with
    empty cells at an empty admission window. Keep the recovered absolute
    ticket cursors and verified digest boundary in the Coordinator. The bench
-   switch (proposed name `TOYKV_BENCH_V8_POINT_PROGRESS_RING`) selects eager
-   mode with `0` or when absent, and F0 with `1`. Use explicit mode injection
-   in parallel tests. Export the actual mode from the opened writer in both
+   switch `TOYKV_BENCH_V8_POINT_PROGRESS_RING` selects Eager with `0` and
+   Cursor with `2`; retired mode `1` is rejected. Non-bench builds keep Eager
+   by default and allow explicit Cursor opt-in through
+   `TOYKV_WAL_V8_PROGRESS_MODE=cursor` (`eager` selects the fallback). Use
+   explicit mode injection in parallel tests. Export the actual mode from the opened writer in both
    `wal_io_start` and `wal_io_end`, including on a reopened writer. Keep
    F0.2 and F0.3 behind test construction until both runtime waits are wired.
 5. Adapt sync diagnostics, completion timeline and HOL sampling to F0 or
@@ -225,13 +227,11 @@ cargo test --package kv-engine --lib --features bench,chaos-testing \
 
 ## F0.5 Local screen and GCP A/B
 
-1. Build a single release `write-perf` binary with `bench`. Screen Point8 and
-   Point16 locally with both modes. Advance only if both show higher throughput
-   and lower p99, and successful digest and frame publication and Reaper
-   enqueue avoid acquiring the Coordinator lock. Preparation and admission
-   retain their existing locking. Use separate diagnostic runs for role CPU,
-   owner lock hold time, digest and group counts per wake, and peak ring and
-   queue occupancy.
+1. Skip local Point8 and Point16 performance screening under the user's waiver;
+   do not use local throughput or p99 as an advance gate. Use the GCP matrix
+   below as the performance evidence. Keep F0-enabled correctness checks as a
+   separate requirement. Use separate diagnostic runs for role CPU, owner lock
+   hold time, digest and group counts per wake, and peak ring and queue occupancy.
 2. Schedule five counterbalanced pairs per workload on one
    `c4-standard-16-lssd` with two Local SSDs in ext4 RAID0. Run Point at 1, 8
    and 16 writers and Batch64 at 16 writers, for 40 scored runs. Use 100,000
@@ -283,9 +283,11 @@ cargo test --package kv-engine --lib --features bench,chaos-testing \
    confirm removal.
    [GCP scoring runbook](https://github.com/ben1009/toy-kv-engine/blob/13fa67640889d35e56c9476191d8276ee0e185cc/docs/wal/benchmarks/gcp-free-trial-wal-bench.md#scoring-v8-point-candidates)
 
-Report throughput, process CPU/Put, Puts/Sync, DATA Groups/Put and Point
-p50/p95/p99. Compute DATA Groups/Put as the sum of the
-`result.wal_pipeline.worker_group_sizes` buckets divided by `result.ops`.
+Report throughput, process CPU/Put, Puts/Sync and Point p50/p95/p99. Keep the
+worker-group histogram disabled during scored runs so it cannot add arm-dependent
+measurement overhead. If group-size distribution is needed for interpretation,
+collect it in a separate, explicitly diagnostic run and do not mix it into the
+qualification score.
 V8 `commit_groups` counts FRONTIER/sync cycles. Compute promotion scores
 from archived `result.json` values and require the run metadata and summary
 to agree. Match each pair by workload, writer count and repetition. Retain
@@ -299,6 +301,50 @@ Use throughput for Batch64's promotion check.
 | Point1 and Batch64 throughput | At least −2% paired median for each workload |
 | Correctness | All RFC 027 Section 7 checks pass with F0 enabled |
 
-Record the result and stop F0 if the local screen or any promotion gate fails.
-Passing the gates qualifies the opt-in implementation for review. Changing the
+The user explicitly waived local performance screening because the local SSD is
+unstable; record that screen as skipped and use the cloud matrix as the performance
+evidence. Stop F0 if any promotion gate fails. Passing the gates qualifies the
+opt-in implementation for review. Changing the
 production default requires a separate decision.
+
+## F0.5 qualification outcome (2026-11-21)
+
+The local SSD screen was skipped at the user's direction. The GCP matrix
+completed and verified 40/40 planned runs. It failed the Point throughput
+promotion gate: Point8 was −5.05% (0/5 wins) and Point16 was +1.92% (4/5
+wins), versus the required +5% paired median and at least 4/5 wins for both.
+Point8/16 p99 and the Point1/Batch64 throughput guardrails passed, but every
+gate is required. Per the stop rule, F0 is stopped and is not qualified for
+promotion or production enablement. The mode remains off by default.
+
+See the [GCP qualification report](benchmarks/rfc-027-v8-point-progress-ring-gcp-20261121.md)
+for the complete score, archive verification and run provenance.
+
+## Cursor production opt-in stage
+
+The first production-selection slice retires the intermediate Ring mode while
+keeping Eager as the default. Cursor can be selected in a non-bench build with
+`TOYKV_WAL_V8_PROGRESS_MODE=cursor`; unset or `eager` keeps the previous Eager
+behavior. The benchmark runner now compares only Eager and Cursor. The old
+two-arm F0.5 Ring plan and result verifier remain for reading archived results,
+but the runner no longer launches mode 1.
+
+This does not promote Cursor to the production default. Before considering that
+change, qualify the non-bench Cursor path with production I/O configuration,
+including buffered FRONTIER and production extent preparation, across PITR,
+crash recovery, rotation and seal tests. Keep Eager available as the rollback
+mode until that qualification and a separate default-change review are complete.
+
+## Cursor completion and submission follow-ups (2026-11-22)
+
+The Direct Completion comparison did not pass its Point16 throughput gate.
+The separate allocation-free Singleton DATA Submission comparison also failed
+the throughput gate: Point8 gained 1.11%, while Point16 regressed 0.43% and
+won one of five pairs. Both remain experimental; neither changes the
+production default. Because the standalone Singleton candidate did not qualify,
+do not infer that combining it with Direct Completion will help or proceed to
+a combined performance run on these results.
+
+See the [Direct Completion GCP report](benchmarks/rfc-027-v8-cursor-direct-completion-gcp-20261122.md)
+and [Singleton Submission GCP report](benchmarks/rfc-027-v8-cursor-singleton-submission-gcp-20261122.md)
+for the complete scores, validation and provenance.

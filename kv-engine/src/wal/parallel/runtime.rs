@@ -7199,9 +7199,12 @@ mod tests {
             );
             if expected_capacity == super::WAL_V7_FRAME_LEN {
                 let next_batch = v7_test_batch(2, 10);
+                // Keep the buffer queued while checking that admission took it from the pool.
+                let packer = runtime.inner.packer_state.lock();
                 let (next_ticket, _) =
                     wal.put_v7_batch_with_index(&next_batch, LIVE_WAL_V5_LIMITS)?;
                 assert!(runtime.inner.v7_frame_buffer_pool.is_empty());
+                drop(packer);
                 wal.submit_and_commit(next_ticket)?;
                 assert_eq!(runtime.inner.v7_frame_buffer_pool.len(), 1);
             }

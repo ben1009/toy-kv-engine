@@ -27,7 +27,18 @@ and do not define the current writer selection.
 - [RFC 024: Parallel WAL Implementation Plan](wal/rfc-024-parallel-wal-implementation-plan.md)
 - [RFC 025 Implementation Plan: Parallel WAL with Embedded Frontiers and One Sync](wal/rfc-025-parallel-wal-embedded-frontiers-implementation-plan.md)
 - [RFC 026 Implementation Plan: Composable WAL Prefix Digests](wal/rfc-026-implementation-plan.md)
-- [V8 Point Progress Ring proposal](../rfcs/027-v8-point-progress-ring.md)
+- [V8 Point Progress Ring (F0 stopped after GCP qualification)](../rfcs/027-v8-point-progress-ring.md)
+- [RFC 028: V8 Dedicated Durability Driver (D3a experiment)](../rfcs/028-v8-dedicated-durability-driver.md)
+- [RFC 027 V8 Point Progress Ring GCP qualification, 2026-11-21](wal/benchmarks/rfc-027-v8-point-progress-ring-gcp-20261121.md)
+- [RFC 027 V8 Cursor direct-completion GCP qualification, 2026-11-22](wal/benchmarks/rfc-027-v8-cursor-direct-completion-gcp-20261122.md)
+- [RFC 028 V8 Cursor coalescing GCP diagnostic, 2026-11-23](wal/benchmarks/rfc-028-v8-cursor-coalescing-gcp-20261123.md)
+- [RFC 028 V8 Cursor coalescing ready-target parameter scan, 2026-11-25](wal/benchmarks/rfc-028-v8-cursor-coalescing-ready-target-scan-gcp-20261125.md)
+- [RFC 028 V8 Cursor coalescing small ready-target scan, 2026-11-25](wal/benchmarks/rfc-028-v8-cursor-coalescing-ready-target-small-scan-gcp-20261125.md)
+- [RFC 028 V7/V8 final same-host Ready Target4/8 comparison, 2026-11-25](wal/benchmarks/rfc-028-v7-v8-ready-target-final-gcp-20261125.md)
+- [RFC 028 V7/V8 Point buffer preallocation same-host GCP qualification, 2026-11-23](wal/benchmarks/rfc-028-v7-v8-point-preallocation-same-host-gcp-20261123.md)
+- [RFC 028 V8 Point resource preclaim Stage B GCP A/B — throughput gate failed, 2026-11-23](wal/benchmarks/rfc-028-v8-point-resource-preclaim-stage-b-gcp-20261123.md)
+- [RFC 028 V8 Point Resource Preclaim final GCP A/B — Stage B3 missed the Point throughput gate, 2026-11-24](wal/benchmarks/rfc-028-v8-point-resource-preclaim-final-gcp-20261124.md)
+- [RFC 028 V8 Point Resource Retirement with Stage A GCP A/B, 2026-11-24](wal/benchmarks/rfc-028-v8-point-resource-retirement-stage-a-c2-gcp-20261124.md)
 
 ## Benchmark reports
 
@@ -38,6 +49,8 @@ and do not define the current writer selection.
 - [Io_uring Benchmark Results](benchmarks/io-uring-bench.md)
 - [Performance Profiling Report](benchmarks/perf-profile.md)
 - [GCP Free Trial WAL benchmark runner](wal/benchmarks/gcp-free-trial-wal-bench.md)
+- [RFC 028 V8 Cursor coalescing GCP diagnostic, 2026-11-23](wal/benchmarks/rfc-028-v8-cursor-coalescing-gcp-20261123.md)
+- [RFC 028 V7/V8 final same-host Ready Target4/8 comparison, 2026-11-25](wal/benchmarks/rfc-028-v7-v8-ready-target-final-gcp-20261125.md)
 - [GCP V8 point sync diagnostic, 2026-11-10](wal/benchmarks/rfc-026-v8-point-sync-gcp-20261110.md)
 - [GCP V8 FRONTIER I/O A/B, 2026-11-11](wal/benchmarks/rfc-026-v8-frontier-io-ab-gcp-20261111.md)
 - [GCP V7/V8 CPU affinity, 2026-11-11](wal/benchmarks/rfc-026-v7-v8-cpu-affinity-gcp-20261111.md)

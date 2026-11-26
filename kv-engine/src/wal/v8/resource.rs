@@ -190,6 +190,18 @@ impl WalV8ReservationOwner {
         logical_batch_bytes: u64,
         frame_buffer_bytes: u64,
     ) -> Result<WalV7OwnedBatchReservation> {
+        let (charge, marker_source_bytes) =
+            self.batch_charge(logical_batch_bytes, frame_buffer_bytes)?;
+        self.image_owner
+            .reserve_batch_charge(charge, marker_source_bytes)
+            .map_err(Into::into)
+    }
+
+    fn batch_charge(
+        &self,
+        logical_batch_bytes: u64,
+        frame_buffer_bytes: u64,
+    ) -> Result<(WalV7ResourceCharge, u64)> {
         let mut charge = WalV7ResourceCharge::for_batch(logical_batch_bytes)?;
         let expected_wal_bytes = frame_buffer_bytes
             .checked_add(WAL_V8_FRAME_LEN as u64)
@@ -203,9 +215,7 @@ impl WalV8ReservationOwner {
             .checked_add(marker_source_bytes)
             .context("v8 source spool reservation overflows")?;
 
-        self.image_owner
-            .reserve_batch_charge(charge, marker_source_bytes)
-            .map_err(Into::into)
+        Ok((charge, marker_source_bytes))
     }
 }
 

@@ -501,6 +501,14 @@ impl WalV7ReservationOwner {
         {
             return Err(WalV7ReservationError::InvalidBatchLength);
         }
+        self.reserve_owned_batch(charge, frontier_source_credit)
+    }
+
+    fn reserve_owned_batch(
+        self: &Arc<Self>,
+        charge: WalV7ResourceCharge,
+        frontier_source_credit: u64,
+    ) -> Result<WalV7OwnedBatchReservation, WalV7ReservationError> {
         let (_owner_lock_timer, mut state) =
             mutex_diagnostics::lock(&self.state, MutexLockKind::ReservationOwner);
         if state.retired {
@@ -710,8 +718,6 @@ impl WalV7ReservationOwner {
             .ok_or(WalV7ReservationError::AccountingUnderflow);
         release_retired_reservations(&mut state);
         drop(state);
-        // A solo admitted batch retains source bytes when only its buffers
-        // retire. Wake pressure waiters so they can now reclaim Active.
         self.ledger.notify_source_spool_work_finished();
 
         result.and(operation_result)
@@ -817,131 +823,6 @@ impl WalV7OwnedBatchReservation {
             .owner
             .release_frontier_credit(self.operation.id, self.frontier_source_credit)?;
         self.frontier_credit_held = false;
-
-        Ok(())
-    }
-
-    /// Release several coalesced FRONTIER credits with one owner/ledger lock
-    /// pair and one waiter notification. The operation validates the full set
-    /// before changing any charge so a failed batch leaves every token intact.
-    pub(crate) fn release_unused_frontier_credits_batch(
-        reservations: &mut [&mut Self],
-    ) -> Result<(), WalV7ReservationError> {
-        let Some(first) = reservations.first() else {
-            return Ok(());
-        };
-        let owner = Arc::clone(&first.operation.owner);
-        for reservation in reservations.iter() {
-            let reservation = &**reservation;
-            if !Arc::ptr_eq(&owner, &reservation.operation.owner) {
-                return Err(WalV7ReservationError::ForeignReservation);
-            }
-            if !reservation.operation.admitted.load(Ordering::Acquire) {
-                return Err(WalV7ReservationError::ReservationMismatch);
-            }
-        }
-
-        // Preserve the existing owner -> ledger lock order used by the
-        // single-credit release path.
-        let (_owner_lock_timer, mut owner_state) =
-            mutex_diagnostics::lock(&owner.state, MutexLockKind::ReservationOwner);
-        let (_ledger_lock_timer, mut ledger_state) =
-            mutex_diagnostics::lock(&owner.ledger.inner.state, MutexLockKind::ResourceLedger);
-        let credit = WAL_V7_FRAME_LEN as u64;
-        let mut total_retired = WalV7ResourceCharge::default();
-        let mut release_count = 0u64;
-
-        // Validate and calculate the complete mutation before touching either
-        // map. The caller supplies distinct owned reservations from one WAL
-        // prefix, so each ledger ID occurs at most once.
-        for reservation in reservations.iter() {
-            let reservation = &**reservation;
-            if !reservation.frontier_credit_held {
-                continue;
-            }
-
-            let token = owner_state
-                .reservations
-                .get(&reservation.operation.id)
-                .ok_or(WalV7ReservationError::UnknownReservation)?;
-            if !Arc::ptr_eq(&token.ledger, &owner.ledger.inner) {
-                return Err(WalV7ReservationError::ForeignReservation);
-            }
-            let issued_charge = ledger_state
-                .reservations
-                .get(&token.id)
-                .copied()
-                .ok_or(WalV7ReservationError::UnknownReservation)?;
-            if issued_charge != token.charge {
-                return Err(WalV7ReservationError::ReservationMismatch);
-            }
-
-            let retired = WalV7ResourceCharge {
-                logical_wal_bytes: credit,
-                source_spool_bytes: reservation.frontier_source_credit,
-                ..WalV7ResourceCharge::default()
-            };
-            issued_charge
-                .checked_sub(retired)
-                .ok_or(WalV7ReservationError::AccountingUnderflow)?;
-            total_retired = total_retired
-                .checked_add(retired)
-                .ok_or(WalV7ReservationError::ArithmeticOverflow)?;
-            release_count = release_count
-                .checked_add(1)
-                .ok_or(WalV7ReservationError::ArithmeticOverflow)?;
-        }
-
-        if release_count == 0 {
-            return Ok(());
-        }
-        let next_charged = ledger_state
-            .charged
-            .checked_sub(total_retired)
-            .ok_or(WalV7ReservationError::AccountingUnderflow)?;
-
-        for reservation in reservations.iter_mut() {
-            let reservation = &mut **reservation;
-            if !reservation.frontier_credit_held {
-                continue;
-            }
-
-            let id = reservation.operation.id;
-            let retired = WalV7ResourceCharge {
-                logical_wal_bytes: credit,
-                source_spool_bytes: reservation.frontier_source_credit,
-                ..WalV7ResourceCharge::default()
-            };
-            let token = owner_state
-                .reservations
-                .get_mut(&id)
-                .expect("validated batch frontier reservation must remain present");
-            let issued_charge = ledger_state
-                .reservations
-                .get(&id)
-                .copied()
-                .expect("validated batch ledger reservation must remain present");
-            let retained = issued_charge
-                .checked_sub(retired)
-                .expect("validated batch frontier credit must remain covered");
-            ledger_state.reservations.insert(id, retained);
-            token.charge = retained;
-            reservation.frontier_credit_held = false;
-        }
-
-        ledger_state.charged = next_charged;
-        ledger_state.source_spool_generation = ledger_state
-            .source_spool_generation
-            .wrapping_add(release_count);
-        drop(ledger_state);
-        drop(owner_state);
-
-        owner.ledger.inner.source_spool_changed.notify_all();
-        owner
-            .ledger
-            .inner
-            .async_source_spool_changed
-            .notify_waiters();
 
         Ok(())
     }
@@ -1098,10 +979,55 @@ impl WalV7ResourceLedger {
 
         let (_lock_timer, mut state) =
             mutex_diagnostics::lock(&self.inner.state, MutexLockKind::ResourceLedger);
+        self.reserve_with_priority_locked(&mut state, charge, maintenance)
+    }
+
+    fn reserve_with_priority_locked(
+        &self,
+        state: &mut LedgerState,
+        charge: WalV7ResourceCharge,
+        maintenance: bool,
+    ) -> Result<WalV7Reservation, WalV7ReservationError> {
         let next = state
             .charged
             .checked_add(charge)
             .ok_or(WalV7ReservationError::ArithmeticOverflow)?;
+        self.check_charge_limits(next, maintenance, state.source_spool_generation)?;
+        let next_id = state
+            .next_id
+            .checked_add(1)
+            .ok_or(WalV7ReservationError::ReservationIdExhausted)?;
+        let id = state.next_id;
+
+        state.next_id = next_id;
+        Ok(self.register_reservation(state, id, charge, next))
+    }
+
+    fn register_reservation(
+        &self,
+        state: &mut LedgerState,
+        id: u64,
+        charge: WalV7ResourceCharge,
+        next: WalV7ResourceCharge,
+    ) -> WalV7Reservation {
+        state.charged = next;
+        let previous = state.reservations.insert(id, charge);
+        debug_assert!(previous.is_none());
+
+        WalV7Reservation {
+            id,
+            charge,
+            ledger: Arc::clone(&self.inner),
+            active: true,
+        }
+    }
+
+    fn check_charge_limits(
+        &self,
+        next: WalV7ResourceCharge,
+        maintenance: bool,
+        source_spool_generation: u64,
+    ) -> Result<(), WalV7ReservationError> {
         if next.logical_wal_bytes > self.inner.limits.max_logical_wal_bytes {
             return Err(WalV7ReservationError::LogicalWalLimit);
         }
@@ -1112,7 +1038,7 @@ impl WalV7ResourceLedger {
             > self.inner.limits.max_source_spool_bytes
         {
             return Err(WalV7ReservationError::SourceSpoolLimit {
-                generation: state.source_spool_generation,
+                generation: source_spool_generation,
             });
         }
         if next.recovery_workspace_bytes > self.inner.limits.max_recovery_workspace_bytes {
@@ -1133,23 +1059,7 @@ impl WalV7ResourceLedger {
         if next.seal_index_bytes > max_seal_index_bytes {
             return Err(WalV7ReservationError::SealIndexLimit);
         }
-        let next_id = state
-            .next_id
-            .checked_add(1)
-            .ok_or(WalV7ReservationError::ReservationIdExhausted)?;
-        let id = state.next_id;
-
-        state.charged = next;
-        state.next_id = next_id;
-        let previous = state.reservations.insert(id, charge);
-        debug_assert!(previous.is_none());
-
-        Ok(WalV7Reservation {
-            id,
-            charge,
-            ledger: Arc::clone(&self.inner),
-            active: true,
-        })
+        Ok(())
     }
 
     /// Reserve the worst-case resources for one framed DATA batch before its
@@ -1183,11 +1093,19 @@ impl WalV7ResourceLedger {
         &self,
         reservation: &mut WalV7Reservation,
     ) -> Result<(), WalV7ReservationError> {
+        let (_lock_timer, mut state) =
+            mutex_diagnostics::lock(&self.inner.state, MutexLockKind::ResourceLedger);
+        self.release_buffer_memory_locked(&mut state, reservation)
+    }
+
+    fn release_buffer_memory_locked(
+        &self,
+        state: &mut LedgerState,
+        reservation: &mut WalV7Reservation,
+    ) -> Result<(), WalV7ReservationError> {
         if !Arc::ptr_eq(&reservation.ledger, &self.inner) {
             return Err(WalV7ReservationError::ForeignReservation);
         }
-        let (_lock_timer, mut state) =
-            mutex_diagnostics::lock(&self.inner.state, MutexLockKind::ResourceLedger);
         let issued_charge = state
             .reservations
             .get(&reservation.id)
@@ -1396,6 +1314,10 @@ impl WalV7ResourceLedger {
             mutex_diagnostics::lock(&self.inner.state, MutexLockKind::ResourceLedger);
         state.source_spool_work_generation = state.source_spool_work_generation.wrapping_add(1);
         drop(state);
+        self.notify_source_spool_waiters();
+    }
+
+    fn notify_source_spool_waiters(&self) {
         self.inner.source_spool_changed.notify_all();
         self.inner.async_source_spool_changed.notify_waiters();
     }
@@ -2034,92 +1956,6 @@ mod tests {
         assert!(owner.has_batch_operations_beyond(0));
         drop(pin);
         assert!(!owner.has_batch_operations_beyond(0));
-    }
-
-    #[test]
-    fn batched_frontier_credit_release_preserves_all_resource_charges() {
-        let ledger = WalV7ResourceLedger::new(batch_limits()).unwrap();
-        let owner = Arc::new(WalV7ReservationOwner {
-            ledger: ledger.clone(),
-            retained_resources: None,
-            installed_dev: 0,
-            installed_ino: 0,
-            state: Mutex::new(WalV7ReservationOwnerState {
-                retired: false,
-                active_batch_operations: 0,
-                active_source_spool_preparations: 0,
-                reservations: AHashMap::new(),
-            }),
-        });
-        let mut first = owner.reserve_batch(128).unwrap();
-        let mut second = owner.reserve_batch(128).unwrap();
-        first.mark_admitted();
-        second.mark_admitted();
-        let before = ledger.snapshot();
-        let source_credit = first.frontier_source_credit + second.frontier_source_credit;
-        let mut reservations = [first, second];
-        let mut reservation_refs: Vec<_> = reservations.iter_mut().collect();
-
-        WalV7OwnedBatchReservation::release_unused_frontier_credits_batch(&mut reservation_refs)
-            .unwrap();
-
-        assert_eq!(
-            ledger.snapshot(),
-            WalV7ResourceCharge {
-                logical_wal_bytes: before.logical_wal_bytes - 2 * WAL_V7_FRAME_LEN as u64,
-                source_spool_bytes: before.source_spool_bytes - source_credit,
-                ..before
-            }
-        );
-        assert!(
-            reservation_refs
-                .iter()
-                .all(|reservation| !reservation.frontier_credit_held)
-        );
-        drop(reservation_refs);
-        for reservation in reservations {
-            reservation.finish_after_io().unwrap();
-        }
-    }
-
-    #[test]
-    fn batched_frontier_credit_release_validates_before_mutating() {
-        let ledger = WalV7ResourceLedger::new(batch_limits()).unwrap();
-        let owner = Arc::new(WalV7ReservationOwner {
-            ledger: ledger.clone(),
-            retained_resources: None,
-            installed_dev: 0,
-            installed_ino: 0,
-            state: Mutex::new(WalV7ReservationOwnerState {
-                retired: false,
-                active_batch_operations: 0,
-                active_source_spool_preparations: 0,
-                reservations: AHashMap::new(),
-            }),
-        });
-        let mut admitted = owner.reserve_batch(128).unwrap();
-        let unadmitted = owner.reserve_batch(128).unwrap();
-        admitted.mark_admitted();
-        let before = ledger.snapshot();
-        let mut reservations = [admitted, unadmitted];
-        let mut reservation_refs: Vec<_> = reservations.iter_mut().collect();
-
-        assert_eq!(
-            WalV7OwnedBatchReservation::release_unused_frontier_credits_batch(
-                &mut reservation_refs,
-            ),
-            Err(WalV7ReservationError::ReservationMismatch)
-        );
-        assert_eq!(ledger.snapshot(), before);
-        assert!(
-            reservation_refs
-                .iter()
-                .all(|reservation| reservation.frontier_credit_held)
-        );
-        drop(reservation_refs);
-        let [admitted, unadmitted] = reservations;
-        admitted.finish_after_io().unwrap();
-        drop(unadmitted);
     }
 
     fn charge(

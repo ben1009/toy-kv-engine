@@ -15,6 +15,7 @@ import csv
 from collections.abc import Callable
 from datetime import datetime, timezone
 import http.client
+import hashlib
 import ipaddress
 import json
 import math
@@ -44,6 +45,40 @@ from gcp_wal_matrix import (
     POINT_BORROWED_INPUT_WRITERS,
     POINT_DIRECT_FRAME_NUM,
     POINT_DIRECT_FRAME_WRITERS,
+    POINT_PROGRESS_RING_NUM,
+    POINT_PROGRESS_RING_WRITERS,
+    POINT_PREALLOCATION_NUM,
+    POINT_PREALLOCATION_WRITERS,
+    V7_V8_READY_TARGET_FINAL_NUM,
+    V7_V8_READY_TARGET_FINAL_WRITERS,
+    V8_D2_QUALIFICATION_NUM,
+    V8_D2_QUALIFICATION_WRITERS,
+    V8_EQUAL_THROUGHPUT_NUM,
+    V8_EQUAL_THROUGHPUT_WRITERS,
+    POINT_RESOURCE_RETIREMENT_NUM,
+    POINT_RESOURCE_RETIREMENT_WRITERS,
+    POINT_ACK_D1_NUM,
+    POINT_ACK_D1_WRITERS,
+    DURABILITY_DRIVER_NUM,
+    DURABILITY_DRIVER_WRITERS,
+    CURSOR_COALESCING_BUDGET_NUM,
+    CURSOR_COALESCING_BUDGET_WRITERS,
+    CURSOR_COALESCING_READY_TARGET_NUM,
+    CURSOR_COALESCING_READY_TARGET_WRITERS,
+    CURSOR_COALESCING_READY_TARGET_SCAN_NUM,
+    CURSOR_COALESCING_READY_TARGET_SCAN_WRITERS,
+    CURSOR_COALESCING_READY_TARGET_SMALL_SCAN_NUM,
+    CURSOR_COALESCING_READY_TARGET_SMALL_SCAN_WRITERS,
+    CURSOR_PUBLICATION_NUM,
+    CURSOR_PUBLICATION_WRITERS,
+    build_cursor_direct_completion_plan,
+    build_cursor_direct_completion_wake_plan,
+    build_cursor_singleton_submission_plan,
+    build_cursor_coalescing_budget_plan,
+    build_cursor_coalescing_ready_target_plan,
+    build_cursor_coalescing_ready_target_scan_plan,
+    build_cursor_coalescing_ready_target_small_scan_plan,
+    build_cursor_publication_plan,
     V8_EXTENT_POLICY_STORAGE_NUM,
     V8_EXTENT_POLICY_STORAGE_WRITERS,
     V8_MUTEX_DIAGNOSTIC_NUM,
@@ -62,6 +97,14 @@ from gcp_wal_matrix import (
     build_point_borrowed_input_schedule,
     build_point_direct_frame_plan,
     build_point_direct_frame_schedule,
+    build_point_progress_cursor_plan,
+    build_v7_v8_point_preallocation_plan,
+    build_v7_v8_ready_target_final_plan,
+    build_v8_d2_qualification_plan,
+    build_v8_equal_throughput_plan,
+    build_point_resource_retirement_plan,
+    build_point_ack_d1_plan,
+    build_dedicated_durability_driver_plan,
     build_v8_extent_policy_storage_plan,
     build_v8_extent_policy_storage_schedule,
     build_v8_mutex_diagnostic_plan,
@@ -73,12 +116,57 @@ from gcp_wal_matrix import (
     validate_point_lookahead_rows,
     validate_point_borrowed_input_rows,
     validate_point_direct_frame_rows,
+    validate_point_progress_cursor_rows,
     validate_v8_extent_policy_storage_rows,
     validate_v8_mutex_diagnostic_rows,
     validate_v8_point_cpu_attribution_rows,
     validate_writer_counts,
 )
 from gcp_commit_order_trace_runner import analyze_trace
+from gcp_v8_point_progress_ring_runner import verify_results_directory as verify_progress_ring_results
+from gcp_v8_point_progress_ring_runner import verify_cursor_results_directory as verify_progress_cursor_results
+from gcp_v8_point_progress_ring_runner import (
+    verify_direct_completion_results_directory as verify_cursor_direct_completion_results,
+)
+from gcp_v8_point_progress_ring_runner import (
+    verify_cursor_direct_completion_wake_results_directory as verify_cursor_direct_completion_wake_results,
+)
+from gcp_v8_point_progress_ring_runner import (
+    verify_singleton_submission_results_directory as verify_cursor_singleton_submission_results,
+)
+from gcp_v8_point_progress_ring_runner import (
+    verify_coalescing_budget_results_directory as verify_cursor_coalescing_budget_results,
+)
+from gcp_v8_point_progress_ring_runner import (
+    verify_coalescing_ready_target_results_directory as verify_cursor_coalescing_ready_target_results,
+)
+from gcp_v8_point_progress_ring_runner import (
+    verify_coalescing_ready_target_scan_results_directory as verify_cursor_coalescing_ready_target_scan_results,
+)
+from gcp_v8_point_progress_ring_runner import (
+    verify_coalescing_ready_target_small_scan_results_directory
+    as verify_cursor_coalescing_ready_target_small_scan_results,
+)
+from gcp_v8_point_progress_ring_runner import (
+    verify_cursor_publication_results_directory as verify_cursor_publication_results,
+)
+from gcp_v8_point_progress_ring_runner import (
+    verify_point_preallocation_results_directory as verify_point_preallocation_results,
+)
+from gcp_v8_point_progress_ring_runner import (
+    verify_v7_v8_ready_target_final_results_directory as verify_v7_v8_ready_target_final_results,
+)
+from gcp_v8_point_progress_ring_runner import (
+    verify_v8_d2_qualification_results_directory as verify_v8_d2_qualification_results,
+)
+from gcp_v8_point_progress_ring_runner import (
+    verify_v8_equal_throughput_results_directory as verify_v8_equal_throughput_results,
+)
+from gcp_v8_point_progress_ring_runner import (
+    verify_point_resource_retirement_results_directory as verify_point_resource_retirement_results,
+)
+from gcp_v8_point_ack_d1_runner import verify_results_directory as verify_point_ack_d1_results
+from gcp_v8_dedicated_durability_runner import verify_results_directory as verify_dedicated_durability_results
 MACHINE_TYPE = "c4-standard-8-lssd"
 MACHINE_SPECS = {
     "c4-standard-8-lssd": {"vcpus": 8, "ssd_count": 1, "ssd_gb": 375, "ssd_gib": 375},
@@ -94,8 +182,37 @@ V8_MUTEX_DIAGNOSTIC_RUNNER = Path(__file__).with_name("gcp_v8_mutex_diagnostic_r
 V8_POINT_CPU_ATTRIBUTION_RUNNER = Path(__file__).with_name("gcp_v8_point_cpu_attribution_runner.py")
 POINT_BORROWED_INPUT_RUNNER = Path(__file__).with_name("gcp_v8_point_borrowed_input_runner.py")
 POINT_DIRECT_FRAME_RUNNER = Path(__file__).with_name("gcp_v8_point_direct_frame_runner.py")
+POINT_PROGRESS_RING_RUNNER = Path(__file__).with_name("gcp_v8_point_progress_ring_runner.py")
+POINT_ACK_D1_RUNNER = Path(__file__).with_name("gcp_v8_point_ack_d1_runner.py")
+DEDICATED_DURABILITY_RUNNER = Path(__file__).with_name("gcp_v8_dedicated_durability_runner.py")
+POINT_PROGRESS_RING_VM_TAG = "walbench-point-progress-ring"
 V8_EXTENT_POLICY_STORAGE_RUNNER = Path(__file__).with_name("gcp_v8_extent_policy_storage_runner.py")
 REPO_URL = "https://github.com/ben1009/toy-kv-engine.git"
+D3B_RUNNER_BUNDLE_COMPONENTS = (
+    ("gcp-free-trial-wal-bench-remote.sh", RUNNERS),
+    ("gcp_wal_matrix.py", MATRIX_MODULE),
+    ("gcp_v8_point_progress_ring_runner.py", POINT_PROGRESS_RING_RUNNER),
+    ("gcp_v8_dedicated_durability_runner.py", DEDICATED_DURABILITY_RUNNER),
+)
+
+
+def _d3b_runner_bundle_manifest() -> dict[str, Any]:
+    digest = hashlib.sha256()
+    components: dict[str, str] = {}
+    for name, path in D3B_RUNNER_BUNDLE_COMPONENTS:
+        contents = path.read_bytes()
+        components[name] = hashlib.sha256(contents).hexdigest()
+        digest.update(name.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(contents)
+        digest.update(b"\0")
+    return {"schema_version": 1, "bundle_sha256": digest.hexdigest(), "components": components}
+
+
+def _d3b_runner_bundle_sha256() -> str:
+    return str(_d3b_runner_bundle_manifest()["bundle_sha256"])
+
+
 MAX_RUNTIME_MINUTES = 180
 MIN_RUNTIME_MINUTES = 60
 MAX_ARTIFACT_BUNDLE_BYTES = 512 * 1024 * 1024
@@ -121,7 +238,25 @@ root_names = {
     "v8-point-cpu-attribution-schedule.tsv",
     "point-borrowed-input-schedule.tsv",
     "point-direct-frame-schedule.tsv",
+    "point-progress-ring-schedule.tsv",
+    "point-progress-cursor-schedule.tsv",
+    "cursor-direct-completion-schedule.tsv",
+    "cursor-direct-completion-wake-schedule.tsv",
+    "cursor-singleton-submission-schedule.tsv",
+    "cursor-coalescing-budget-schedule.tsv",
+    "cursor-coalescing-ready-target-schedule.tsv",
+    "cursor-coalescing-ready-target-scan-schedule.tsv",
+    "cursor-coalescing-ready-target-small-scan-schedule.tsv",
+    "cursor-publication-schedule.tsv",
     "extent-policy-storage-schedule.tsv",
+    "v7-v8-point-preallocation-schedule.tsv",
+    "v7-v8-ready-target-final-schedule.tsv",
+    "v8-d2-qualification-schedule.tsv",
+    "v8-equal-throughput-schedule.tsv",
+    "point-resource-retirement-schedule.tsv",
+    "point-ack-d1-schedule.tsv", "dedicated-durability-schedule.tsv", "runner-bundle.sha256",
+    "runner-bundle-verification.json",
+    "candidate-commit.txt", "source.patch",
     "commit-order-trace-analysis.json", "commit.txt", "remote-exit.json",
     "finished_utc.txt", "remote-finished-utc.txt", "remote-status.txt", "host.txt",
     "os-release.txt", "uname.txt", "lscpu.txt", "lsblk.txt", "findmnt.txt", "df.txt",
@@ -1144,13 +1279,50 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                              help="Compare V8 Point owned vs borrowed preparation with Batch16/64 guardrails")
     suite_group.add_argument("--v8-point-direct-frame-ab", action="store_true",
                              help="Compare V8 Point direct-frame encoding with the existing path and Batch guardrails")
+    suite_group.add_argument("--v8-point-progress-cursor-ab", action="store_true",
+                             help="Compare V8 Eager and Cursor progress modes with Point/Batch guardrails")
+    suite_group.add_argument("--v8-cursor-direct-completion-ab", action="store_true",
+                             help="Compare Cursor relay and direct completion with Point/Batch guardrails")
+    suite_group.add_argument("--v8-cursor-direct-completion-wake-ab", action="store_true",
+                             help="Retired historical suite; archived results are verifiable but cannot be rerun")
+    suite_group.add_argument("--v8-cursor-singleton-submission-ab", action="store_true",
+                             help="Retired historical suite; archived results are verifiable but cannot be rerun")
+    suite_group.add_argument("--v8-cursor-coalescing-budget-ab", action="store_true",
+                             help="Retired historical suite; archived results are verifiable but cannot be rerun")
+    suite_group.add_argument("--v8-cursor-coalescing-ready-target-ab", action="store_true",
+                             help="Retired historical suite; use the V7/V8 final Target4/8 comparison instead")
+    suite_group.add_argument("--v8-cursor-coalescing-ready-target-scan-ab", action="store_true",
+                             help="Retired historical suite; archived results are verifiable but cannot be rerun")
+    suite_group.add_argument("--v8-cursor-coalescing-ready-target-small-scan-ab", action="store_true",
+                             help="Retired historical suite; archived results are verifiable but cannot be rerun")
+    suite_group.add_argument("--v8-cursor-publication-ab", action="store_true",
+                             help="Retired historical suite; archived results are verifiable but cannot be rerun")
     suite_group.add_argument("--v8-extent-policy-storage-ab", action="store_true",
                              help="Compare V8 BTreeMap and Vec extent-policy storage with Point/Batch guardrails")
-    parser.add_argument("--baseline-commit", help="Full source commit used as the borrowed-input A/B baseline")
+    suite_group.add_argument("--v7-v8-point-preallocation-ab", action="store_true",
+                             help="Compare V7, V8 Point preallocation off/on, and Batch64 regression guardrail")
+    suite_group.add_argument("--v7-v8-ready-target-final-ab", action="store_true",
+                             help="Compare V7 and V8 Dynamic/Target4/Target8 for Point1/8/16 and Batch64 (80 runs)")
+    suite_group.add_argument("--v8-d2-qualification", action="store_true",
+                             help="Run V8 D2 qualification matrix (Legacy, Candidate Dynamic/Target8, V7 Parallel; 80 runs)")
+    suite_group.add_argument("--v8-equal-throughput", action="store_true",
+                             help="Run V8 equal-throughput offered-load latency comparison (18 runs)")
+    suite_group.add_argument("--v8-point-resource-retirement-ab", action="store_true",
+                             help="Retired historical suite; kept only to provide an explanatory error")
+    suite_group.add_argument("--v8-point-resource-retirement-stage-a-ab", action="store_true",
+                             help="Retired historical suite; kept only to provide an explanatory error")
+    suite_group.add_argument("--v8-point-ack-d1-ab", action="store_true",
+                             help="Retired historical suite; archived results are verifiable but cannot be rerun")
+    suite_group.add_argument(
+        "--v8-independent-ack-ab", "--v8-dedicated-durability-driver-ab",
+        dest="v8_dedicated_durability_driver_ab", action="store_true",
+        help="Retired historical suite; archived results are verifiable but cannot be rerun",
+    )
+    parser.add_argument("--baseline-commit", help="Full source commit used as the source A/B baseline")
     parser.add_argument("--source-patch-sha256",
                         help="SHA-256 of the exact source patch used for a commit-order trace run")
-    parser.add_argument("--network", help="Existing VPC to use (default: default)")
-    parser.add_argument("--subnet", help="Subnetwork name for custom-mode VPCs (must be in the requested region)")
+    parser.add_argument("--network", help="VPC network (legacy suites default to default; Cursor qualification requires isolated VPC)")
+    parser.add_argument("--subnet", help="Subnetwork name in the requested region")
     parser.add_argument(
         "--ssh-source-range",
         help=(
@@ -1178,6 +1350,42 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Use a manually verified SSH source CIDR when the HTTPS lookup cannot verify that route",
     )
     args = parser.parse_args(argv)
+    point_cursor_direct_completion_suite = args.v8_cursor_direct_completion_ab
+    point_cursor_direct_completion_wake_suite = args.v8_cursor_direct_completion_wake_ab
+    point_cursor_singleton_submission_suite = args.v8_cursor_singleton_submission_ab
+    point_cursor_coalescing_budget_suite = args.v8_cursor_coalescing_budget_ab
+    point_cursor_coalescing_ready_target_suite = args.v8_cursor_coalescing_ready_target_ab
+    point_cursor_coalescing_ready_target_scan_suite = args.v8_cursor_coalescing_ready_target_scan_ab
+    point_cursor_coalescing_ready_target_small_scan_suite = (
+        args.v8_cursor_coalescing_ready_target_small_scan_ab
+    )
+    point_cursor_publication_suite = args.v8_cursor_publication_ab
+    point_preallocation_suite = args.v7_v8_point_preallocation_ab
+    point_ready_target_final_suite = args.v7_v8_ready_target_final_ab
+    v8_d2_qualification_suite = args.v8_d2_qualification
+    v8_equal_throughput_suite = args.v8_equal_throughput
+    point_resource_retirement_stage_a_suite = args.v8_point_resource_retirement_stage_a_ab
+    point_resource_retirement_suite = (
+        args.v8_point_resource_retirement_ab or point_resource_retirement_stage_a_suite
+    )
+    point_ack_d1_suite = args.v8_point_ack_d1_ab
+    dedicated_durability_suite = args.v8_dedicated_durability_driver_ab
+    args.runner_bundle_sha256 = _d3b_runner_bundle_sha256() if dedicated_durability_suite else None
+    point_progress_suite = (
+        args.v8_point_progress_cursor_ab or point_cursor_direct_completion_suite
+        or point_cursor_direct_completion_wake_suite
+        or point_cursor_singleton_submission_suite or point_cursor_coalescing_budget_suite
+        or point_cursor_coalescing_ready_target_suite
+        or point_cursor_coalescing_ready_target_scan_suite
+        or point_cursor_coalescing_ready_target_small_scan_suite
+        or point_cursor_publication_suite
+        or point_preallocation_suite or point_resource_retirement_suite or point_ack_d1_suite
+        or point_ready_target_final_suite
+        or v8_d2_qualification_suite
+        or v8_equal_throughput_suite
+        or dedicated_durability_suite
+    )
+    explicit_network = args.network is not None
     if args.repetitions <= 0:
         parser.error("--repetitions must be a positive integer")
     if args.repetitions != 1 and not args.v8_point_cpu_attribution:
@@ -1187,8 +1395,32 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         args.ssh_source_range = resolve_ssh_source_range(args.ssh_source_range)
     except BenchError as error:
         parser.error(str(error))
+    if point_progress_suite:
+        network_name = (args.network or "").rstrip("/").rsplit("/", 1)[-1].lower()
+        if not explicit_network or not network_name:
+            parser.error("Cursor/preallocation qualification requires an explicit isolated --network")
+        if network_name == "default":
+            parser.error("Cursor/preallocation qualification cannot use the default VPC")
+        if not args.subnet:
+            parser.error("Cursor/preallocation qualification requires an explicit isolated --subnet")
+        if not args.ssh_source_range:
+            parser.error("Cursor/preallocation qualification requires --ssh-source-range, including for preflight")
     if args.num is None:
         args.num = (
+            CURSOR_COALESCING_READY_TARGET_SMALL_SCAN_NUM
+            if point_cursor_coalescing_ready_target_small_scan_suite else
+            CURSOR_COALESCING_READY_TARGET_SCAN_NUM if point_cursor_coalescing_ready_target_scan_suite else
+            CURSOR_COALESCING_READY_TARGET_NUM if point_cursor_coalescing_ready_target_suite else
+            CURSOR_COALESCING_BUDGET_NUM if point_cursor_coalescing_budget_suite else
+            CURSOR_PUBLICATION_NUM if point_cursor_publication_suite else
+            POINT_PREALLOCATION_NUM if point_preallocation_suite else
+            V7_V8_READY_TARGET_FINAL_NUM if point_ready_target_final_suite else
+            V8_D2_QUALIFICATION_NUM if v8_d2_qualification_suite else
+            V8_EQUAL_THROUGHPUT_NUM if v8_equal_throughput_suite else
+            POINT_RESOURCE_RETIREMENT_NUM if point_resource_retirement_suite else
+            POINT_ACK_D1_NUM if point_ack_d1_suite else
+            DURABILITY_DRIVER_NUM if dedicated_durability_suite else
+            POINT_PROGRESS_RING_NUM if point_progress_suite else
             POINT_DIRECT_FRAME_NUM if args.v8_point_direct_frame_ab else
             V8_EXTENT_POLICY_STORAGE_NUM if args.v8_extent_policy_storage_ab else
             POINT_BORROWED_INPUT_NUM if args.v8_point_borrowed_input_ab else
@@ -1202,6 +1434,15 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             or args.v8_point_cpu_attribution
             or args.v8_point_borrowed_input_ab or args.v8_point_direct_frame_ab
             or args.v8_extent_policy_storage_ab
+            or point_preallocation_suite
+            or point_ready_target_final_suite
+            or v8_d2_qualification_suite
+        or v8_equal_throughput_suite
+            or point_resource_retirement_suite
+            or point_ack_d1_suite
+            or dedicated_durability_suite
+            or point_cursor_publication_suite
+            or point_progress_suite
         ) else MACHINE_TYPE
     args.network = args.network or "default"
     if args.writers is None:
@@ -1219,6 +1460,32 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             args.writers = POINT_DIRECT_FRAME_WRITERS
         elif args.v8_extent_policy_storage_ab:
             args.writers = V8_EXTENT_POLICY_STORAGE_WRITERS
+        elif point_preallocation_suite:
+            args.writers = POINT_PREALLOCATION_WRITERS
+        elif point_ready_target_final_suite:
+            args.writers = V7_V8_READY_TARGET_FINAL_WRITERS
+        elif v8_d2_qualification_suite:
+            args.writers = V8_D2_QUALIFICATION_WRITERS
+        elif v8_equal_throughput_suite:
+            args.writers = V8_EQUAL_THROUGHPUT_WRITERS
+        elif point_resource_retirement_suite:
+            args.writers = POINT_RESOURCE_RETIREMENT_WRITERS
+        elif point_ack_d1_suite:
+            args.writers = POINT_ACK_D1_WRITERS
+        elif dedicated_durability_suite:
+            args.writers = DURABILITY_DRIVER_WRITERS
+        elif point_cursor_coalescing_budget_suite:
+            args.writers = CURSOR_COALESCING_BUDGET_WRITERS
+        elif point_cursor_coalescing_ready_target_suite:
+            args.writers = CURSOR_COALESCING_READY_TARGET_WRITERS
+        elif point_cursor_coalescing_ready_target_scan_suite:
+            args.writers = CURSOR_COALESCING_READY_TARGET_SCAN_WRITERS
+        elif point_cursor_coalescing_ready_target_small_scan_suite:
+            args.writers = CURSOR_COALESCING_READY_TARGET_SMALL_SCAN_WRITERS
+        elif point_cursor_publication_suite:
+            args.writers = CURSOR_PUBLICATION_WRITERS
+        elif point_progress_suite:
+            args.writers = POINT_PROGRESS_RING_WRITERS
         elif args.v8_small_ticket_profile:
             args.writers = (1, 8, 16)
         else:
@@ -1229,6 +1496,29 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error(str(error))
     if args.commit_order_trace and args.writers != (COMMIT_ORDER_TRACE_WRITERS,):
         parser.error("--commit-order-trace requires exactly 16 writers")
+    if point_cursor_coalescing_budget_suite and args.writers != CURSOR_COALESCING_BUDGET_WRITERS:
+        parser.error(f"--v8-cursor-coalescing-budget-ab requires writers {CURSOR_COALESCING_BUDGET_WRITERS}")
+    if point_cursor_coalescing_ready_target_suite and args.writers != CURSOR_COALESCING_READY_TARGET_WRITERS:
+        parser.error(
+            f"--v8-cursor-coalescing-ready-target-ab requires writers {CURSOR_COALESCING_READY_TARGET_WRITERS}"
+        )
+    if point_cursor_coalescing_ready_target_scan_suite and args.writers != CURSOR_COALESCING_READY_TARGET_SCAN_WRITERS:
+        parser.error(
+            "--v8-cursor-coalescing-ready-target-scan-ab requires writers "
+            f"{CURSOR_COALESCING_READY_TARGET_SCAN_WRITERS}"
+        )
+    if (
+        point_cursor_coalescing_ready_target_small_scan_suite
+        and args.writers != CURSOR_COALESCING_READY_TARGET_SMALL_SCAN_WRITERS
+    ):
+        parser.error(
+            "--v8-cursor-coalescing-ready-target-small-scan-ab requires writers "
+            f"{CURSOR_COALESCING_READY_TARGET_SMALL_SCAN_WRITERS}"
+        )
+    if point_cursor_publication_suite and args.writers != CURSOR_PUBLICATION_WRITERS:
+        parser.error(f"--v8-cursor-publication-ab requires writers {CURSOR_PUBLICATION_WRITERS}")
+    if point_cursor_publication_suite and args.machine_type != "c4-standard-16-lssd":
+        parser.error("--v8-cursor-publication-ab requires c4-standard-16-lssd")
     if args.v8_mutex_diagnostic and args.writers != V8_MUTEX_DIAGNOSTIC_WRITERS:
         parser.error("--v8-mutex-diagnostic requires exactly 16 writers")
     if args.v8_mutex_diagnostic and args.machine_type != "c4-standard-16-lssd":
@@ -1253,6 +1543,62 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error(f"--v8-extent-policy-storage-ab requires writers {V8_EXTENT_POLICY_STORAGE_WRITERS}")
     if args.v8_extent_policy_storage_ab and args.machine_type != "c4-standard-16-lssd":
         parser.error("--v8-extent-policy-storage-ab requires c4-standard-16-lssd")
+    if point_preallocation_suite and args.writers != POINT_PREALLOCATION_WRITERS:
+        parser.error(f"--v7-v8-point-preallocation-ab requires writers {POINT_PREALLOCATION_WRITERS}")
+    if point_preallocation_suite and args.machine_type != "c4-standard-16-lssd":
+        parser.error("--v7-v8-point-preallocation-ab requires c4-standard-16-lssd")
+    if point_ready_target_final_suite and args.writers != V7_V8_READY_TARGET_FINAL_WRITERS:
+        parser.error(
+            f"--v7-v8-ready-target-final-ab requires writers {V7_V8_READY_TARGET_FINAL_WRITERS}"
+        )
+    if point_ready_target_final_suite and args.machine_type != "c4-standard-16-lssd":
+        parser.error("--v7-v8-ready-target-final-ab requires c4-standard-16-lssd")
+    if v8_d2_qualification_suite and args.writers != V8_D2_QUALIFICATION_WRITERS:
+        parser.error(
+            f"--v8-d2-qualification requires writers {V8_D2_QUALIFICATION_WRITERS}"
+        )
+    if v8_d2_qualification_suite and args.machine_type != "c4-standard-16-lssd":
+        parser.error("--v8-d2-qualification requires c4-standard-16-lssd")
+    if v8_equal_throughput_suite and args.writers != V8_EQUAL_THROUGHPUT_WRITERS:
+        parser.error(f"--v8-equal-throughput requires writers {V8_EQUAL_THROUGHPUT_WRITERS}")
+    if v8_equal_throughput_suite and args.machine_type != "c4-standard-16-lssd":
+        parser.error("--v8-equal-throughput requires c4-standard-16-lssd")
+    if point_resource_retirement_suite and args.writers != POINT_RESOURCE_RETIREMENT_WRITERS:
+        parser.error(f"--v8-point-resource-retirement-ab requires writers {POINT_RESOURCE_RETIREMENT_WRITERS}")
+    if point_resource_retirement_suite and args.machine_type != "c4-standard-16-lssd":
+        parser.error("--v8-point-resource-retirement-ab requires c4-standard-16-lssd")
+    if point_ack_d1_suite and args.writers != POINT_ACK_D1_WRITERS:
+        parser.error(f"--v8-point-ack-d1-ab requires writers {POINT_ACK_D1_WRITERS}")
+    if point_ack_d1_suite and args.machine_type != "c4-standard-16-lssd":
+        parser.error("--v8-point-ack-d1-ab requires c4-standard-16-lssd")
+    if dedicated_durability_suite and args.writers != DURABILITY_DRIVER_WRITERS:
+        parser.error(f"--v8-dedicated-durability-driver-ab requires writers {DURABILITY_DRIVER_WRITERS}")
+    if dedicated_durability_suite and args.machine_type != "c4-standard-16-lssd":
+        parser.error("--v8-dedicated-durability-driver-ab requires c4-standard-16-lssd")
+    expected_progress_writers = (
+        CURSOR_PUBLICATION_WRITERS
+        if point_cursor_publication_suite else
+        CURSOR_COALESCING_READY_TARGET_SCAN_WRITERS
+        if point_cursor_coalescing_ready_target_scan_suite else
+        CURSOR_COALESCING_READY_TARGET_SMALL_SCAN_WRITERS
+        if point_cursor_coalescing_ready_target_small_scan_suite else
+        CURSOR_COALESCING_READY_TARGET_WRITERS
+        if point_cursor_coalescing_ready_target_suite else
+        CURSOR_COALESCING_BUDGET_WRITERS
+        if point_cursor_coalescing_budget_suite else POINT_PROGRESS_RING_WRITERS
+    )
+    if point_resource_retirement_suite:
+        expected_progress_writers = POINT_RESOURCE_RETIREMENT_WRITERS
+    if v8_equal_throughput_suite:
+        expected_progress_writers = V8_EQUAL_THROUGHPUT_WRITERS
+    if point_ack_d1_suite:
+        expected_progress_writers = POINT_ACK_D1_WRITERS
+    if dedicated_durability_suite:
+        expected_progress_writers = DURABILITY_DRIVER_WRITERS
+    if point_progress_suite and args.writers != expected_progress_writers:
+        parser.error(f"Cursor qualification requires writers {expected_progress_writers}")
+    if point_progress_suite and args.machine_type != "c4-standard-16-lssd":
+        parser.error("Cursor qualification requires c4-standard-16-lssd")
     if not re.fullmatch(r"[0-9a-fA-F]{40}", args.commit):
         parser.error("--commit must be a full 40-character SHA")
     if args.num < 64:
@@ -1265,6 +1611,22 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error(f"--v8-point-direct-frame-ab uses a fixed {POINT_DIRECT_FRAME_NUM}-put workload")
     if args.v8_extent_policy_storage_ab and args.num != V8_EXTENT_POLICY_STORAGE_NUM:
         parser.error(f"--v8-extent-policy-storage-ab uses a fixed {V8_EXTENT_POLICY_STORAGE_NUM}-put workload")
+    if point_progress_suite and args.num != POINT_PROGRESS_RING_NUM:
+        parser.error(f"Cursor qualification uses a fixed {POINT_PROGRESS_RING_NUM}-put workload")
+    if point_ready_target_final_suite and args.num != V7_V8_READY_TARGET_FINAL_NUM:
+        parser.error(f"--v7-v8-ready-target-final-ab uses a fixed {V7_V8_READY_TARGET_FINAL_NUM}-put workload")
+    if v8_d2_qualification_suite and args.num != V8_D2_QUALIFICATION_NUM:
+        parser.error(f"--v8-d2-qualification uses a fixed {V8_D2_QUALIFICATION_NUM}-put workload")
+    if v8_equal_throughput_suite and args.num != V8_EQUAL_THROUGHPUT_NUM:
+        parser.error(f"--v8-equal-throughput uses a fixed {V8_EQUAL_THROUGHPUT_NUM}-put workload")
+    if point_preallocation_suite and args.num != POINT_PREALLOCATION_NUM:
+        parser.error(f"--v7-v8-point-preallocation-ab uses a fixed {POINT_PREALLOCATION_NUM}-put workload")
+    if point_resource_retirement_suite and args.num != POINT_RESOURCE_RETIREMENT_NUM:
+        parser.error(f"--v8-point-resource-retirement-ab uses a fixed {POINT_RESOURCE_RETIREMENT_NUM}-put workload")
+    if point_ack_d1_suite and args.num != POINT_ACK_D1_NUM:
+        parser.error(f"--v8-point-ack-d1-ab uses a fixed {POINT_ACK_D1_NUM}-put workload")
+    if dedicated_durability_suite and args.num != DURABILITY_DRIVER_NUM:
+        parser.error(f"--v8-dedicated-durability-driver-ab uses a fixed {DURABILITY_DRIVER_NUM}-put workload")
     if args.v8_mutex_diagnostic and args.num != V8_MUTEX_DIAGNOSTIC_NUM:
         parser.error(f"--v8-mutex-diagnostic uses a fixed {V8_MUTEX_DIAGNOSTIC_NUM}-put workload")
     if args.v8_point_cpu_attribution and args.num != V8_POINT_CPU_ATTRIBUTION_NUM:
@@ -1282,10 +1644,17 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     if args.v8_point_borrowed_input_ab:
         if not args.baseline_commit or not re.fullmatch(r"[0-9a-fA-F]{40}", args.baseline_commit):
             parser.error("--v8-point-borrowed-input-ab requires --baseline-commit with a full 40-character SHA")
+    elif point_ack_d1_suite:
+        if not args.baseline_commit or not re.fullmatch(r"[0-9a-fA-F]{40}", args.baseline_commit):
+            parser.error("--v8-point-ack-d1-ab requires --baseline-commit with a full 40-character SHA")
     elif args.baseline_commit:
-        parser.error("--baseline-commit is only valid with --v8-point-borrowed-input-ab")
-    if not (args.commit_order_trace or args.v8_point_borrowed_input_ab) and args.source_patch_sha256:
-        parser.error("--source-patch-sha256 is only valid with trace or borrowed-input A/B suites")
+        parser.error("--baseline-commit is only valid with source A/B suites")
+    if (args.v8_point_borrowed_input_ab or point_ack_d1_suite) and (
+        not args.source_patch_sha256 or not re.fullmatch(r"[0-9a-f]{64}", args.source_patch_sha256)
+    ):
+        parser.error("source A/B suites require --source-patch-sha256 with 64 lowercase hex characters")
+    if not (args.commit_order_trace or args.v8_point_borrowed_input_ab or point_ack_d1_suite) and args.source_patch_sha256:
+        parser.error("--source-patch-sha256 is only valid with trace or source A/B suites")
     if not MIN_RUNTIME_MINUTES <= args.max_runtime_minutes <= MAX_RUNTIME_MINUTES:
         parser.error(f"--max-runtime-minutes must be between {MIN_RUNTIME_MINUTES} and {MAX_RUNTIME_MINUTES}")
     if (args.estimated_hourly_cost_usd is None) != (args.max_estimated_spend_usd is None):
@@ -1303,6 +1672,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                 f"estimated maximum spend ${estimated_spend:.2f} exceeds "
                 f"--max-estimated-spend-usd ${args.max_estimated_spend_usd:.2f}"
             )
+    if point_progress_suite:
+        if args.max_runtime_minutes != 60:
+            parser.error("Cursor/preallocation qualification requires --max-runtime-minutes 60")
+        if args.max_estimated_spend_usd is None:
+            parser.error("Cursor/preallocation qualification requires cost guard arguments, including for preflight")
+        if args.max_estimated_spend_usd > 2:
+            parser.error("Cursor/preallocation qualification cannot exceed the authorized $2 estimated-spend ceiling")
     if not args.preflight_only:
         if not args.confirm_free_trial:
             parser.error("VM creation requires --confirm-free-trial after manually checking Billing Overview")
@@ -1390,6 +1766,19 @@ def gcloud_base(project: str, zone: str) -> list[str]:
 
 
 def _run_identifier(row: dict[str, Any], suite: str) -> str:
+    if suite in (
+        "v8-point-progress-ring", "v8-point-progress-cursor", "v8-cursor-direct-completion",
+        "v8-cursor-direct-completion-wake",
+        "v8-cursor-singleton-submission", "v8-cursor-coalescing-budget",
+        "v8-cursor-coalescing-ready-target", "v8-cursor-coalescing-ready-target-scan",
+        "v8-cursor-coalescing-ready-target-small-scan",
+        "v7-v8-point-preallocation",
+        "v7-v8-ready-target-final",
+        "v8-d2-qualification",
+        "v8-equal-throughput",
+        "v8-point-resource-retirement", "v8-cursor-publication",
+    ):
+        return f"r{row['repetition']}-w{row['writer']}-{row['workload']}-{row['arm']}"
     if suite == "v8-small-ticket-profile":
         return f"w{row['writer']}-{row['workload']}-{row['arm']}"
     if suite == "rfc026-full":
@@ -1412,6 +1801,19 @@ def _run_identifier(row: dict[str, Any], suite: str) -> str:
 
 
 def _summary_row_identifier(row: dict[str, Any], suite: str) -> str:
+    if suite in (
+        "v8-point-progress-ring", "v8-point-progress-cursor", "v8-cursor-direct-completion",
+        "v8-cursor-direct-completion-wake",
+        "v8-cursor-singleton-submission", "v8-cursor-coalescing-budget",
+        "v8-cursor-coalescing-ready-target", "v8-cursor-coalescing-ready-target-scan",
+        "v8-cursor-coalescing-ready-target-small-scan",
+        "v7-v8-point-preallocation",
+        "v7-v8-ready-target-final",
+        "v8-d2-qualification",
+        "v8-equal-throughput",
+        "v8-point-resource-retirement", "v8-cursor-publication",
+    ):
+        return f"r{int(row['repetition'])}-w{int(row['writer'])}-{row['workload']}-{row['arm']}"
     if suite == "v8-small-ticket-profile":
         return f"w{int(row['writer'])}-{row['workload']}-{row['arm']}"
     if suite == "rfc026-full":
@@ -1438,6 +1840,74 @@ def _summary_row_identifier(row: dict[str, Any], suite: str) -> str:
 
 
 def _expected_run_metadata(row: dict[str, Any], suite: str) -> dict[str, Any]:
+    if suite in (
+        "v8-point-progress-ring", "v8-point-progress-cursor", "v8-cursor-direct-completion",
+        "v8-cursor-direct-completion-wake",
+        "v8-cursor-singleton-submission", "v8-cursor-coalescing-budget",
+        "v8-cursor-coalescing-ready-target", "v8-cursor-coalescing-ready-target-scan",
+        "v8-cursor-coalescing-ready-target-small-scan",
+        "v8-point-resource-retirement",
+    ):
+        keys = (
+            "run_index", "writer", "workload", "repetition", "arm", "bench",
+            "batch_entries", "batch_size", "num", "sample_every", "extent_mode",
+            "extent_window_bytes", "frontier_mode", "scan_diagnostics_enabled",
+            "progress_ring_enabled",
+        )
+        if suite == "v8-point-progress-cursor":
+            keys += ("progress_cursor_enabled", "progress_counters_enabled")
+        elif suite == "v8-cursor-direct-completion":
+            keys += (
+                "progress_cursor_enabled", "progress_counters_enabled", "cursor_direct_completion_enabled",
+            )
+        elif suite == "v8-cursor-direct-completion-wake":
+            keys += (
+                "progress_cursor_enabled", "progress_counters_enabled", "cursor_direct_completion_enabled",
+                "cursor_direct_completion_wake_mode", "point_buffer_preallocation_enabled",
+            )
+        elif suite == "v8-cursor-singleton-submission":
+            keys += (
+                "progress_cursor_enabled", "progress_counters_enabled", "cursor_direct_completion_enabled",
+                "cursor_singleton_submission_enabled",
+            )
+        elif suite == "v8-cursor-coalescing-budget":
+            keys += (
+                "progress_cursor_enabled", "progress_counters_enabled", "cursor_direct_completion_enabled",
+                "cursor_singleton_submission_enabled", "coalescing_budget_us",
+            )
+        elif suite == "v8-cursor-coalescing-ready-target":
+            keys += (
+                "progress_cursor_enabled", "progress_counters_enabled", "cursor_direct_completion_enabled",
+                "cursor_singleton_submission_enabled", "coalescing_ready_target",
+                "point_buffer_preallocation_enabled",
+            )
+        elif suite == "v8-cursor-coalescing-ready-target-scan":
+            keys += (
+                "progress_cursor_enabled", "progress_counters_enabled", "cursor_direct_completion_enabled",
+                "cursor_singleton_submission_enabled", "coalescing_ready_target",
+                "point_buffer_preallocation_enabled",
+            )
+        elif suite == "v8-cursor-coalescing-ready-target-small-scan":
+            keys += (
+                "progress_cursor_enabled", "progress_counters_enabled", "cursor_direct_completion_enabled",
+                "cursor_singleton_submission_enabled", "coalescing_ready_target",
+                "point_buffer_preallocation_enabled",
+            )
+        elif suite == "v8-point-resource-retirement":
+            keys += (
+                "progress_cursor_enabled", "progress_counters_enabled", "cursor_direct_completion_enabled",
+                "cursor_singleton_submission_enabled", "point_buffer_preallocation_enabled",
+                "point_resource_retirement_mode",
+            )
+        elif suite == "v8-cursor-publication":
+            keys += (
+                "progress_cursor_enabled", "progress_counters_enabled", "cursor_direct_completion_enabled",
+                "cursor_singleton_submission_enabled", "point_buffer_preallocation_enabled",
+                "point_resource_retirement_mode", "admission_cursor_publish_fast_path_enabled",
+            )
+        return {key: row[key] for key in keys}
+    if suite == "v7-v8-point-preallocation":
+        return dict(row)
     if suite == "v8-small-ticket-profile":
         return {key: row[key] for key in ("writer", "workload", "arm", "perf_capture")}
     if suite == "rfc026-full":
@@ -1508,6 +1978,40 @@ def _verify_result_set(results: Path) -> dict[str, Any]:
         if not isinstance(summary, dict) or not isinstance(remote_exit, dict):
             raise ValueError("summary and remote exit metadata must be JSON objects")
         suite = summary.get("suite")
+        if suite == "v8-point-progress-ring":
+            return verify_progress_ring_results(results)
+        if suite == "v8-point-progress-cursor":
+            return verify_progress_cursor_results(results)
+        if suite == "v8-cursor-direct-completion":
+            return verify_cursor_direct_completion_results(results)
+        if suite == "v8-cursor-direct-completion-wake":
+            return verify_cursor_direct_completion_wake_results(results)
+        if suite == "v8-cursor-singleton-submission":
+            return verify_cursor_singleton_submission_results(results)
+        if suite == "v8-cursor-coalescing-budget":
+            return verify_cursor_coalescing_budget_results(results)
+        if suite == "v8-cursor-coalescing-ready-target":
+            return verify_cursor_coalescing_ready_target_results(results)
+        if suite == "v8-cursor-coalescing-ready-target-scan":
+            return verify_cursor_coalescing_ready_target_scan_results(results)
+        if suite == "v8-cursor-coalescing-ready-target-small-scan":
+            return verify_cursor_coalescing_ready_target_small_scan_results(results)
+        if suite == "v8-cursor-publication":
+            return verify_cursor_publication_results(results)
+        if suite == "v7-v8-point-preallocation":
+            return verify_point_preallocation_results(results)
+        if suite == "v7-v8-ready-target-final":
+            return verify_v7_v8_ready_target_final_results(results)
+        if suite == "v8-d2-qualification":
+            return verify_v8_d2_qualification_results(results)
+        if suite == "v8-equal-throughput":
+            return verify_v8_equal_throughput_results(results)
+        if suite == "v8-point-resource-retirement":
+            return verify_point_resource_retirement_results(results)
+        if suite == "v8-point-ack-d1":
+            return verify_point_ack_d1_results(results)
+        if suite == "v8-d3b-independent-ack":
+            return verify_dedicated_durability_results(results)
         if suite == "v8-small-ticket-profile":
             with (results / "profile-schedule.tsv").open(encoding="utf-8", newline="") as stream:
                 schedule_rows = list(csv.DictReader(stream, delimiter="\t"))
@@ -2711,6 +3215,46 @@ def provision_and_run(
     cpu_attribution_suite = getattr(args, "v8_point_cpu_attribution", False)
     point_borrowed_input_suite = getattr(args, "v8_point_borrowed_input_ab", False)
     point_direct_frame_suite = getattr(args, "v8_point_direct_frame_ab", False)
+    point_progress_cursor_suite = getattr(args, "v8_point_progress_cursor_ab", False)
+    point_cursor_direct_completion_suite = getattr(args, "v8_cursor_direct_completion_ab", False)
+    point_cursor_direct_completion_wake_suite = getattr(
+        args, "v8_cursor_direct_completion_wake_ab", False,
+    )
+    point_cursor_singleton_submission_suite = getattr(args, "v8_cursor_singleton_submission_ab", False)
+    point_cursor_coalescing_budget_suite = getattr(args, "v8_cursor_coalescing_budget_ab", False)
+    point_cursor_coalescing_ready_target_suite = getattr(args, "v8_cursor_coalescing_ready_target_ab", False)
+    point_cursor_coalescing_ready_target_scan_suite = getattr(
+        args, "v8_cursor_coalescing_ready_target_scan_ab", False,
+    )
+    point_cursor_coalescing_ready_target_small_scan_suite = getattr(
+        args, "v8_cursor_coalescing_ready_target_small_scan_ab", False,
+    )
+    point_cursor_publication_suite = getattr(args, "v8_cursor_publication_ab", False)
+    point_preallocation_suite = getattr(args, "v7_v8_point_preallocation_ab", False)
+    point_ready_target_final_suite = getattr(args, "v7_v8_ready_target_final_ab", False)
+    v8_d2_qualification_suite = getattr(args, "v8_d2_qualification", False)
+    v8_equal_throughput_suite = getattr(args, "v8_equal_throughput", False)
+    point_resource_retirement_stage_a_suite = getattr(args, "v8_point_resource_retirement_stage_a_ab", False)
+    point_resource_retirement_suite = (
+        getattr(args, "v8_point_resource_retirement_ab", False) or point_resource_retirement_stage_a_suite
+    )
+    point_ack_d1_suite = getattr(args, "v8_point_ack_d1_ab", False)
+    dedicated_durability_suite = getattr(args, "v8_dedicated_durability_driver_ab", False)
+    runner_bundle_sha256 = getattr(args, "runner_bundle_sha256", None)
+    point_progress_suite = (
+        point_progress_cursor_suite or point_cursor_direct_completion_suite
+        or point_cursor_direct_completion_wake_suite
+        or point_cursor_singleton_submission_suite or point_cursor_coalescing_budget_suite
+        or point_cursor_coalescing_ready_target_suite
+        or point_cursor_coalescing_ready_target_scan_suite
+        or point_cursor_coalescing_ready_target_small_scan_suite
+        or point_cursor_publication_suite
+        or point_preallocation_suite or point_resource_retirement_suite or point_ack_d1_suite
+        or point_ready_target_final_suite
+        or v8_d2_qualification_suite
+        or v8_equal_throughput_suite
+        or dedicated_durability_suite
+    )
     extent_policy_storage_suite = getattr(args, "v8_extent_policy_storage_ab", False)
     missing_tools = [tool for tool in ("ssh", "ssh-keygen") if not shutil.which(tool)]
     if missing_tools:
@@ -2725,13 +3269,18 @@ def provision_and_run(
     suffix = uuid.uuid4().hex[:8]
     stamp = datetime.now(timezone.utc).strftime("%y%m%d-%H%M%S")
     instance = f"walbench-{stamp}-{suffix}"
-    tag = f"walbench-{suffix}"
+    tag = getattr(args, "progress_ring_vm_tag", None) if point_progress_suite else None
+    if point_progress_suite and not tag:
+        tag = f"{POINT_PROGRESS_RING_VM_TAG}-{suffix}"
+    elif not point_progress_suite:
+        tag = f"walbench-{suffix}"
     firewall = f"walbench-ssh-{suffix}"
     key_log = results_dir / "ssh.log"
     ssh_log = results_dir / "remote-session.log"
     lifecycle = {"project": args.project, "zone": args.zone,
                  "instance": instance, "firewall": firewall, "created": False, "firewall_created": False,
                  "network": args.network, "subnet": args.subnet,
+                 "network_tag": tag,
                  "benchmark_attempted": False, "benchmark_started": False,
                  "remote_execution_uncertain": False, "collected": False,
                  "summary_complete": False, "results_verified": False,
@@ -3001,6 +3550,15 @@ def provision_and_run(
                 append_local_log(key_log, direct_copy.stdout + direct_copy.stderr)
                 if direct_copy.returncode:
                     raise BenchError(f"Could not copy direct-frame helper: {direct_copy.stderr.strip()}")
+            if point_progress_suite:
+                if not POINT_PROGRESS_RING_RUNNER.is_file():
+                    raise BenchError(f"Progress-ring helper is missing: {POINT_PROGRESS_RING_RUNNER}")
+                progress_ring_copy = upload_to_vm(
+                    POINT_PROGRESS_RING_RUNNER, "/tmp/gcp-v8-point-progress-ring-runner.py"
+                )
+                append_local_log(key_log, progress_ring_copy.stdout + progress_ring_copy.stderr)
+                if progress_ring_copy.returncode:
+                    raise BenchError(f"Could not copy progress-ring helper: {progress_ring_copy.stderr.strip()}")
             if extent_policy_storage_suite:
                 if not V8_EXTENT_POLICY_STORAGE_RUNNER.is_file():
                     raise BenchError(f"Extent-policy storage runner is missing: {V8_EXTENT_POLICY_STORAGE_RUNNER}")
@@ -3010,31 +3568,90 @@ def provision_and_run(
                 append_local_log(key_log, storage_copy.stdout + storage_copy.stderr)
                 if storage_copy.returncode:
                     raise BenchError(f"Could not copy extent-policy storage helper: {storage_copy.stderr.strip()}")
+            if point_ack_d1_suite:
+                if not POINT_ACK_D1_RUNNER.is_file():
+                    raise BenchError(f"D1 ACK A/B runner is missing: {POINT_ACK_D1_RUNNER}")
+                ack_copy = upload_to_vm(POINT_ACK_D1_RUNNER, "/tmp/gcp-v8-point-ack-d1-runner.py")
+                append_local_log(key_log, ack_copy.stdout + ack_copy.stderr)
+                if ack_copy.returncode:
+                    raise BenchError(f"Could not copy D1 ACK A/B runner: {ack_copy.stderr.strip()}")
+            if dedicated_durability_suite:
+                if not DEDICATED_DURABILITY_RUNNER.is_file():
+                    raise BenchError(f"Dedicated durability runner is missing: {DEDICATED_DURABILITY_RUNNER}")
+                driver_copy = upload_to_vm(
+                    DEDICATED_DURABILITY_RUNNER, "/tmp/gcp-v8-dedicated-durability-runner.py"
+                )
+                append_local_log(key_log, driver_copy.stdout + driver_copy.stderr)
+                if driver_copy.returncode:
+                    raise BenchError(f"Could not copy dedicated durability runner: {driver_copy.stderr.strip()}")
+                progress_copy = upload_to_vm(
+                    POINT_PROGRESS_RING_RUNNER, "/tmp/gcp-v8-point-progress-ring-runner.py"
+                )
+                append_local_log(key_log, progress_copy.stdout + progress_copy.stderr)
+                if progress_copy.returncode:
+                    raise BenchError(f"Could not copy progress-ring helper: {progress_copy.stderr.strip()}")
 
             safe_deadline_epoch = int(deadline_epoch - 600)
+            if profile_suite:
+                remote_suite = "v8-small-ticket-profile"
+            elif trace_suite:
+                remote_suite = "commit-order-trace"
+            elif extent_policy_storage_suite:
+                remote_suite = "v8-extent-policy-storage"
+            elif point_cursor_direct_completion_suite:
+                remote_suite = "v8-cursor-direct-completion"
+            elif point_cursor_direct_completion_wake_suite:
+                remote_suite = "v8-cursor-direct-completion-wake"
+            elif point_cursor_singleton_submission_suite:
+                remote_suite = "v8-cursor-singleton-submission"
+            elif point_cursor_coalescing_budget_suite:
+                remote_suite = "v8-cursor-coalescing-budget"
+            elif point_cursor_coalescing_ready_target_suite:
+                remote_suite = "v8-cursor-coalescing-ready-target"
+            elif point_cursor_coalescing_ready_target_scan_suite:
+                remote_suite = "v8-cursor-coalescing-ready-target-scan"
+            elif point_cursor_coalescing_ready_target_small_scan_suite:
+                remote_suite = "v8-cursor-coalescing-ready-target-small-scan"
+            elif point_cursor_publication_suite:
+                remote_suite = "v8-cursor-publication"
+            elif point_preallocation_suite:
+                remote_suite = "v7-v8-point-preallocation"
+            elif point_ready_target_final_suite:
+                remote_suite = "v7-v8-ready-target-final"
+            elif v8_d2_qualification_suite:
+                remote_suite = "v8-d2-qualification"
+            elif v8_equal_throughput_suite:
+                remote_suite = "v8-equal-throughput"
+            elif point_resource_retirement_suite:
+                remote_suite = (
+                    "v8-point-resource-retirement-stage-a"
+                    if point_resource_retirement_stage_a_suite else "v8-point-resource-retirement"
+                )
+            elif point_ack_d1_suite:
+                remote_suite = "v8-point-ack-d1"
+            elif dedicated_durability_suite:
+                remote_suite = "v8-dedicated-durability-driver"
+            elif point_progress_cursor_suite:
+                remote_suite = "v8-point-progress-cursor"
+            elif point_direct_frame_suite:
+                remote_suite = "v8-point-direct-frame"
+            elif point_borrowed_input_suite:
+                remote_suite = "v8-point-borrowed-input"
+            elif mutex_diagnostic_suite:
+                remote_suite = "v8-mutex-diagnostic"
+            elif cpu_attribution_suite:
+                remote_suite = "v8-point-cpu-attribution"
+            elif point_lookahead_suite:
+                remote_suite = "v8-point-lookahead"
+            else:
+                remote_suite = "rfc026-full" if args.full_rfc026_matrix else "batch64"
             remote_command = "sudo -n bash /tmp/run-wal-bench.sh " + shlex.join([
                 args.commit.lower(), str(args.num), args.project, args.zone, instance, str(safe_deadline_epoch),
-                args.machine_type, ",".join(str(writer) for writer in args.writers),
-                "v8-small-ticket-profile" if profile_suite else (
-                    "commit-order-trace" if trace_suite else (
-                        "v8-extent-policy-storage" if extent_policy_storage_suite else (
-                        "v8-point-direct-frame" if point_direct_frame_suite else (
-                            "v8-point-borrowed-input" if point_borrowed_input_suite else (
-                            "v8-mutex-diagnostic" if mutex_diagnostic_suite else (
-                                "v8-point-cpu-attribution" if cpu_attribution_suite else (
-                                "v8-point-lookahead" if point_lookahead_suite else (
-                                    "rfc026-full" if args.full_rfc026_matrix else "batch64"
-                                )
-                                )
-                            )
-                            )
-                            )
-                        )
-                    )
-                ),
+                args.machine_type, ",".join(str(writer) for writer in args.writers), remote_suite,
                 args.source_patch_sha256 or "-",
                 getattr(args, "baseline_commit", "").lower() if getattr(args, "baseline_commit", None) else "-",
                 str(getattr(args, "repetitions", 1)),
+                runner_bundle_sha256 or "-",
             ])
             remaining = max(30, int(deadline - time.monotonic()))
             try:
@@ -3164,7 +3781,73 @@ def provision_and_run(
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = parse_args(sys.argv[1:] if argv is None else argv)
+    raw_argv = sys.argv[1:] if argv is None else argv
+    retired_live_suites = (
+        ("v8_cursor_direct_completion_wake_ab", "--v8-cursor-direct-completion-wake-ab"),
+        ("v8_cursor_singleton_submission_ab", "--v8-cursor-singleton-submission-ab"),
+        ("v8_cursor_coalescing_budget_ab", "--v8-cursor-coalescing-budget-ab"),
+        ("v8_cursor_coalescing_ready_target_ab", "--v8-cursor-coalescing-ready-target-ab"),
+        ("v8_cursor_coalescing_ready_target_scan_ab", "--v8-cursor-coalescing-ready-target-scan-ab"),
+        ("v8_cursor_coalescing_ready_target_small_scan_ab", "--v8-cursor-coalescing-ready-target-small-scan-ab"),
+        ("v8_cursor_publication_ab", "--v8-cursor-publication-ab"),
+        ("v8_point_resource_retirement_ab", "--v8-point-resource-retirement-ab"),
+        ("v8_point_resource_retirement_stage_a_ab", "--v8-point-resource-retirement-stage-a-ab"),
+        ("v8_point_ack_d1_ab", "--v8-point-ack-d1-ab"),
+        ("v8_dedicated_durability_driver_ab", "--v8-independent-ack-ab"),
+    )
+    for _, option in retired_live_suites:
+        if option in raw_argv:
+            print(
+                f"{option} is a retired historical experiment; "
+                "archived results remain verifiable but cannot be executed",
+                file=sys.stderr,
+            )
+            return 2
+    args = parse_args(raw_argv)
+    for attribute, option in retired_live_suites:
+        if getattr(args, attribute):
+            print(
+                f"{option} is a retired historical experiment; "
+                "archived results remain verifiable but cannot be executed",
+                file=sys.stderr,
+            )
+            return 2
+    point_cursor_direct_completion_suite = args.v8_cursor_direct_completion_ab
+    point_cursor_direct_completion_wake_suite = args.v8_cursor_direct_completion_wake_ab
+    point_cursor_singleton_submission_suite = args.v8_cursor_singleton_submission_ab
+    point_cursor_coalescing_budget_suite = args.v8_cursor_coalescing_budget_ab
+    point_cursor_coalescing_ready_target_suite = args.v8_cursor_coalescing_ready_target_ab
+    point_cursor_coalescing_ready_target_scan_suite = args.v8_cursor_coalescing_ready_target_scan_ab
+    point_cursor_coalescing_ready_target_small_scan_suite = (
+        args.v8_cursor_coalescing_ready_target_small_scan_ab
+    )
+    point_cursor_publication_suite = args.v8_cursor_publication_ab
+    point_preallocation_suite = args.v7_v8_point_preallocation_ab
+    point_ready_target_final_suite = args.v7_v8_ready_target_final_ab
+    v8_d2_qualification_suite = args.v8_d2_qualification
+    v8_equal_throughput_suite = args.v8_equal_throughput
+    point_resource_retirement_stage_a_suite = args.v8_point_resource_retirement_stage_a_ab
+    point_resource_retirement_suite = (
+        args.v8_point_resource_retirement_ab or point_resource_retirement_stage_a_suite
+    )
+    point_ack_d1_suite = args.v8_point_ack_d1_ab
+    dedicated_durability_suite = args.v8_dedicated_durability_driver_ab
+    point_progress_suite = (
+        args.v8_point_progress_cursor_ab or point_cursor_direct_completion_suite
+        or point_cursor_direct_completion_wake_suite
+        or point_cursor_singleton_submission_suite or point_cursor_coalescing_budget_suite
+        or point_cursor_coalescing_ready_target_suite
+        or point_cursor_coalescing_ready_target_scan_suite
+        or point_cursor_coalescing_ready_target_small_scan_suite
+        or point_cursor_publication_suite
+        or point_preallocation_suite or point_resource_retirement_suite or point_ack_d1_suite
+        or point_ready_target_final_suite
+        or v8_d2_qualification_suite
+        or v8_equal_throughput_suite
+        or dedicated_durability_suite
+    )
+    if point_progress_suite:
+        args.progress_ring_vm_tag = f"{POINT_PROGRESS_RING_VM_TAG}-{uuid.uuid4().hex[:12]}"
     if args.results_dir is None:
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         args.results_dir = Path("bench-results") / f"gcp-wal-{stamp}"
@@ -3187,6 +3870,23 @@ def main(argv: list[str] | None = None) -> int:
         report = preflight(
             gcloud, args.project, args.zone, args.network, args.subnet, args.machine_type,
         )
+        if point_progress_suite:
+            region = zone_region(args.zone)
+            audit_ssh_firewall_rules(
+                gcloud,
+                args.project,
+                args.network,
+                region,
+                args.progress_ring_vm_tag,
+                args.ssh_source_range,
+            )
+            report["isolated_network_audit"] = {
+                "network": args.network,
+                "subnet": args.subnet,
+                "vm_tag": args.progress_ring_vm_tag,
+                "ssh_source_range": args.ssh_source_range,
+                "effective_ingress_audited": True,
+            }
         report["benchmark_commit"] = args.commit.lower()
         report["writer_counts"] = list(args.writers)
         if args.v8_small_ticket_profile:
@@ -3247,6 +3947,128 @@ def main(argv: list[str] | None = None) -> int:
         elif args.v8_point_direct_frame_ab:
             report["benchmark_suite"] = "v8-point-direct-frame"
             report["benchmark_plan"] = build_point_direct_frame_plan(
+                writers=args.writers,
+                machine_type=args.machine_type,
+                machine_spec=MACHINE_SPECS[args.machine_type],
+                commit=args.commit.lower(),
+            )
+        elif point_cursor_direct_completion_suite:
+            report["benchmark_suite"] = "v8-cursor-direct-completion"
+            report["benchmark_plan"] = build_cursor_direct_completion_plan(
+                writers=args.writers,
+                machine_type=args.machine_type,
+                machine_spec=MACHINE_SPECS[args.machine_type],
+                commit=args.commit.lower(),
+            )
+        elif point_cursor_direct_completion_wake_suite:
+            report["benchmark_suite"] = "v8-cursor-direct-completion-wake"
+            report["benchmark_plan"] = build_cursor_direct_completion_wake_plan(
+                writers=args.writers,
+                machine_type=args.machine_type,
+                machine_spec=MACHINE_SPECS[args.machine_type],
+                commit=args.commit.lower(),
+            )
+        elif point_cursor_singleton_submission_suite:
+            report["benchmark_suite"] = "v8-cursor-singleton-submission"
+            report["benchmark_plan"] = build_cursor_singleton_submission_plan(
+                writers=args.writers,
+                machine_type=args.machine_type,
+                machine_spec=MACHINE_SPECS[args.machine_type],
+                commit=args.commit.lower(),
+            )
+        elif point_cursor_coalescing_budget_suite:
+            report["benchmark_suite"] = "v8-cursor-coalescing-budget"
+            report["benchmark_plan"] = build_cursor_coalescing_budget_plan(
+                machine_type=args.machine_type,
+                machine_spec=MACHINE_SPECS[args.machine_type],
+                commit=args.commit.lower(),
+            )
+        elif point_cursor_coalescing_ready_target_suite:
+            report["benchmark_suite"] = "v8-cursor-coalescing-ready-target"
+            report["benchmark_plan"] = build_cursor_coalescing_ready_target_plan(
+                machine_type=args.machine_type,
+                machine_spec=MACHINE_SPECS[args.machine_type],
+                commit=args.commit.lower(),
+            )
+        elif point_cursor_coalescing_ready_target_scan_suite:
+            report["benchmark_suite"] = "v8-cursor-coalescing-ready-target-scan"
+            report["benchmark_plan"] = build_cursor_coalescing_ready_target_scan_plan(
+                machine_type=args.machine_type,
+                machine_spec=MACHINE_SPECS[args.machine_type],
+                commit=args.commit.lower(),
+            )
+        elif point_cursor_coalescing_ready_target_small_scan_suite:
+            report["benchmark_suite"] = "v8-cursor-coalescing-ready-target-small-scan"
+            report["benchmark_plan"] = build_cursor_coalescing_ready_target_small_scan_plan(
+                machine_type=args.machine_type,
+                machine_spec=MACHINE_SPECS[args.machine_type],
+                commit=args.commit.lower(),
+            )
+        elif point_cursor_publication_suite:
+            report["benchmark_suite"] = "v8-cursor-publication"
+            report["benchmark_plan"] = build_cursor_publication_plan(
+                writers=args.writers,
+                machine_type=args.machine_type,
+                machine_spec=MACHINE_SPECS[args.machine_type],
+                commit=args.commit.lower(),
+            )
+        elif point_preallocation_suite:
+            report["benchmark_suite"] = "v7-v8-point-preallocation"
+            report["benchmark_plan"] = build_v7_v8_point_preallocation_plan(
+                machine_type=args.machine_type,
+                machine_spec=MACHINE_SPECS[args.machine_type],
+                commit=args.commit.lower(),
+            )
+        elif point_ready_target_final_suite:
+            report["benchmark_suite"] = "v7-v8-ready-target-final"
+            report["benchmark_plan"] = build_v7_v8_ready_target_final_plan(
+                machine_type=args.machine_type,
+                machine_spec=MACHINE_SPECS[args.machine_type],
+                commit=args.commit.lower(),
+            )
+        elif v8_d2_qualification_suite:
+            report["benchmark_suite"] = "v8-d2-qualification"
+            report["benchmark_plan"] = build_v8_d2_qualification_plan(
+                machine_type=args.machine_type,
+                machine_spec=MACHINE_SPECS[args.machine_type],
+                commit=args.commit.lower(),
+            )
+        elif v8_equal_throughput_suite:
+            report["benchmark_suite"] = "v8-equal-throughput"
+            report["benchmark_plan"] = build_v8_equal_throughput_plan(
+                machine_type=args.machine_type,
+                machine_spec=MACHINE_SPECS[args.machine_type],
+                commit=args.commit.lower(),
+            )
+        elif point_resource_retirement_suite:
+            report["benchmark_suite"] = "v8-point-resource-retirement"
+            report["benchmark_plan"] = build_point_resource_retirement_plan(
+                machine_type=args.machine_type,
+                machine_spec=MACHINE_SPECS[args.machine_type],
+                commit=args.commit.lower(),
+                point_buffer_preallocation_enabled=point_resource_retirement_stage_a_suite,
+            )
+        elif point_ack_d1_suite:
+            report["benchmark_suite"] = "v8-point-ack-d1"
+            report["benchmark_plan"] = build_point_ack_d1_plan(
+                machine_type=args.machine_type,
+                machine_spec=MACHINE_SPECS[args.machine_type],
+                baseline_commit=args.baseline_commit.lower(),
+                candidate_commit=args.commit.lower(),
+                source_patch_sha256=args.source_patch_sha256,
+            )
+        elif dedicated_durability_suite:
+            report["benchmark_suite"] = "v8-d3b-independent-ack"
+            report["benchmark_plan"] = build_dedicated_durability_driver_plan(
+                writers=args.writers,
+                machine_type=args.machine_type,
+                machine_spec=MACHINE_SPECS[args.machine_type],
+                commit=args.commit.lower(),
+                runner_bundle_sha256=args.runner_bundle_sha256,
+            )
+        elif args.v8_point_progress_cursor_ab:
+            report["benchmark_suite"] = "v8-point-progress-cursor"
+            report["benchmark_plan"] = build_point_progress_cursor_plan(
                 writers=args.writers,
                 machine_type=args.machine_type,
                 machine_spec=MACHINE_SPECS[args.machine_type],

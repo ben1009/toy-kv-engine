@@ -160,6 +160,121 @@ pub struct WalIoDiagnostics {
     pub sliding_extent_preparation: Option<WalV8SlidingExtentPreparationDiagnostics>,
     /// Whether this opened V8 Parallel writer uses RFC 027's progress ring.
     pub progress_ring_enabled: bool,
+    /// Whether the ring uses the validated ready prefix cursor.
+    pub progress_cursor_enabled: bool,
+    /// Whether Cursor DATA completions bypass the benchmark-only reaper relay.
+    pub cursor_direct_completion_enabled: bool,
+    /// Whether direct DATA completion waits select on the completion queue
+    /// instead of using the capacity-one progress token.
+    pub cursor_direct_completion_select_wake_enabled: bool,
+    /// Ready-prefix threshold configured for the benchmark-only coalescing experiment.
+    /// The setting applies to the writer's coalescing path; benchmark plans decide which
+    /// workload arms run with the target enabled.
+    pub coalesce_ready_target: Option<usize>,
+    /// Number of coalescing cycles ended at the target before the full admitted prefix was ready.
+    pub coalesce_ready_target_hits: u64,
+    /// Coalescing target policy (`"disabled"`, `"always"`, or `"point_only"`).
+    pub coalesce_target_policy: &'static str,
+    /// Number of coalescing cycles where the target policy was eligible.
+    pub coalesce_target_eligible_cycles: u64,
+    /// Number of coalescing cycles where Point-only Target fell back to Dynamic due to outstanding
+    /// Batch tickets.
+    pub coalesce_target_mixed_fallback_cycles: u64,
+    /// Number of coalescing cycles that hit the target before waiting.
+    pub coalesce_target_initial_hits: u64,
+    /// Number of coalescing cycles that hit the target after waking.
+    pub coalesce_target_after_wake_hits: u64,
+    /// Whether Cursor DATA submissions use the benchmark-only allocation-free group
+    /// representation.
+    pub cursor_singleton_submission_enabled: bool,
+    // Retired D2/D3 and C1/C2 experiment fields remain in benchmark output so
+    // historical result readers can continue to consume the same schema.
+    pub admission_cursor_publish_fast_path_enabled: bool,
+    /// Whether Point batches attempt the bounded benchmark-only DATA-buffer preallocation.
+    pub point_buffer_preallocation_enabled: bool,
+    pub independent_ack_waiter_enabled: bool,
+    pub dedicated_durability_driver_enabled: bool,
+    pub dedicated_durability_diagnostics_enabled: bool,
+    pub dedicated_durability_requests: u64,
+    pub dedicated_durability_wake_signals: u64,
+    pub dedicated_durability_coalesced_wakes: u64,
+    pub dedicated_durability_advance_attempts: u64,
+    pub caller_durability_driver_election_attempts: u64,
+    /// Number of Point DATA-buffer preallocation attempts during the run.
+    pub point_buffer_preallocation_attempts: u64,
+    /// Number of Point DATA buffers allocated before serialized admission.
+    pub point_buffer_preallocation_hits: u64,
+    /// Number of attempts that used the regular in-sequencer allocation path.
+    pub point_buffer_preallocation_fallbacks: u64,
+    pub point_resource_retirement_mode: u8,
+    pub point_resource_retirement_detached_prefixes: u64,
+    pub point_resource_retirement_detached_tickets: u64,
+    pub point_resource_retirement_batched_prefixes: u64,
+    /// Outstanding speculative buffer permits for in-process lifecycle tests.
+    /// This field is not serialized into benchmark results.
+    pub point_buffer_preallocations_in_flight: u64,
+    // Retired Stage B fields remain in benchmark output for result-schema
+    // compatibility. Current writers report false and zero for this group.
+    /// Whether this writer tries speculative Point quota preclaims.
+    pub point_resource_preclaim_enabled: bool,
+    /// Whether speculative Point quota checks use the cached aggregate charge.
+    pub point_resource_preclaim_sum_cache_enabled: bool,
+    /// Whether Point quota preclaims run after the independent DATA buffer attempt.
+    pub point_resource_preclaim_after_buffer_enabled: bool,
+    /// Number of eligible Point requests that tried to preclaim quota.
+    pub point_resource_preclaim_attempts: u64,
+    /// Number of speculative claims issued by the ledger.
+    pub point_resource_preclaim_granted: u64,
+    /// Number of claims converted to a formal reservation during admission.
+    pub point_resource_preclaim_promoted: u64,
+    /// Number of issued claims rejected at promotion and sent through fallback.
+    pub point_resource_preclaim_invalidated: u64,
+    /// Eligible preclaims declined because the reservation-owner try-lock was busy.
+    pub point_resource_preclaim_owner_trylock_busy: u64,
+    /// Eligible preclaims declined because the reservation owner was retired.
+    pub point_resource_preclaim_owner_retired: u64,
+    /// Eligible preclaims declined because the ledger try-lock was busy.
+    pub point_resource_preclaim_ledger_trylock_busy: u64,
+    /// Eligible preclaims declined because the bounded active-claim set was full.
+    pub point_resource_preclaim_max_preclaims: u64,
+    /// High-water mark of simultaneous active speculative preclaims.
+    pub point_resource_preclaim_max_live: u64,
+    /// Preclaims declined by the corresponding quota checks.
+    pub point_resource_preclaim_logical_quota_rejected: u64,
+    pub point_resource_preclaim_source_spool_quota_rejected: u64,
+    pub point_resource_preclaim_buffer_quota_rejected: u64,
+    pub point_resource_preclaim_seal_index_quota_rejected: u64,
+    pub point_resource_preclaim_recovery_workspace_rejected: u64,
+    pub point_resource_preclaim_arithmetic_rejected: u64,
+    pub point_resource_preclaim_invalid_charge_rejected: u64,
+    /// Eligible admissions that used the ordinary reservation fallback.
+    pub point_resource_preclaim_fallbacks: u64,
+    /// Issued claims revoked by formal admission before promotion.
+    pub point_resource_preclaim_revoked: u64,
+    /// Issued claims dropped while still active instead of being promoted or revoked.
+    pub point_resource_preclaim_abandoned: u64,
+    /// Zero disables CPU timing; positive values select every Nth attempt.
+    pub point_resource_preclaim_cpu_sample_every: u64,
+    /// Sum of sampled thread CPU time around the preclaim attempt.
+    pub point_resource_preclaim_cpu_ns: u64,
+    pub point_resource_preclaim_cpu_samples: u64,
+    /// Sum of sampled thread CPU time around admission-time promotion.
+    pub point_resource_preclaim_promotion_cpu_ns: u64,
+    pub point_resource_preclaim_promotion_cpu_samples: u64,
+    pub progress_diagnostics: Option<WalV8ProgressDiagnostics>,
+}
+
+/// Per-writer progress observations collected with lightweight counters or
+/// detailed WAL sync diagnostics.
+#[cfg(feature = "bench")]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize)]
+#[doc(hidden)]
+pub struct WalV8ProgressDiagnostics {
+    pub token_attempts: u64,
+    pub token_accepts: u64,
+    pub owner_scans: u64,
+    pub scans_without_ready_progress: u64,
+    pub completion_events_drained: u64,
 }
 
 /// Benchmark-only V8 WAL extent preparation performed before timed writes.
@@ -1785,6 +1900,32 @@ impl Wal {
             .image_len()
     }
 
+    pub(crate) fn quiesce_v8_extent_preparation(&self) {
+        if let Some(writer) = &self.v8_parallel {
+            writer.quiesce_extent_preparation();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_v8_lookahead_worker_hook_for_test(
+        &self,
+        hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) {
+        if let Some(writer) = &self.v8_parallel {
+            writer.set_lookahead_worker_hook_for_test(hook);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_v8_lookahead_quiesce_hook_for_test(
+        &self,
+        hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) {
+        if let Some(writer) = &self.v8_parallel {
+            writer.set_lookahead_quiesce_hook_for_test(hook);
+        }
+    }
+
     /// Return the writer's latest v7 FRONTIER after its durability barrier
     /// completes. The caller must stop admission before capturing this value.
     pub(crate) fn v7_frontier_cursor(&self) -> Result<WalV7FrontierCursor> {
@@ -2082,6 +2223,13 @@ impl Wal {
         self.v8_parallel
             .as_ref()
             .is_some_and(v8::leader::WalV8ParallelWriter::progress_ring_enabled)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn uses_v8_cursor_direct_completion(&self) -> bool {
+        self.v8_parallel
+            .as_ref()
+            .is_some_and(v8::leader::WalV8ParallelWriter::uses_cursor_direct_completion)
     }
 
     pub(crate) fn pitr_rotation_needed(&self) -> bool {
@@ -2594,6 +2742,93 @@ impl Wal {
                 return Err(error);
             }
         };
+        self.finish_v8_parallel_admission(writer, job)
+    }
+
+    pub(crate) fn try_preallocate_v8_point_buffer(
+        &self,
+        scratch: &mut v8::leader::WalV8PointAdmissionScratch<'_>,
+    ) -> bool {
+        if let Some(writer) = &self.v8_parallel {
+            return writer.try_preallocate_point_buffer(scratch);
+        }
+
+        false
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_v8_point_buffer_preallocation_for_test(&self, enabled: bool) -> Result<()> {
+        self.v8_parallel
+            .as_ref()
+            .context("v8 WAL has no Parallel writer")?
+            .set_point_buffer_preallocation_for_test(enabled);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn v8_point_buffer_preallocation_enabled_for_test(&self) -> bool {
+        self.v8_parallel.as_ref().is_some_and(
+            v8::leader::WalV8ParallelWriter::point_buffer_preallocation_enabled_for_test,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn v8_point_buffer_preallocations_in_flight_for_test(&self) -> usize {
+        self.v8_parallel.as_ref().map_or(
+            0,
+            v8::leader::WalV8ParallelWriter::point_buffer_preallocations_in_flight_for_test,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn v8_point_buffer_preallocation_hits_for_test(&self) -> u64 {
+        self.v8_parallel.as_ref().map_or(
+            0,
+            v8::leader::WalV8ParallelWriter::point_buffer_preallocation_hits_for_test,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn v8_effective_config_for_test(&self) -> Option<v8::leader::WalV8EffectiveConfig> {
+        self.v8_parallel
+            .as_ref()
+            .map(v8::leader::WalV8ParallelWriter::effective_config)
+    }
+
+    pub(crate) fn admit_v8_prepared_parallel_point_batch<'a>(
+        &self,
+        scratch: v8::leader::WalV8PointAdmissionScratch<'a>,
+        commit_ts: u64,
+        recorded_at: crate::pitr::RecordedAt,
+    ) -> Result<(u64, v8::leader::WalV8FrameJob<'a>)> {
+        ensure!(
+            self.format_version == WAL_FORMAT_VERSION_V8,
+            "v8 batch admission selected for format {}",
+            self.format_version
+        );
+        ensure!(
+            !self.poisoned.load(Ordering::Acquire),
+            "WAL is poisoned due to a previous I/O error"
+        );
+        let writer = self
+            .v8_parallel
+            .as_ref()
+            .context("v8 WAL has no Parallel writer")?;
+        let job = match writer.admit_prepared_point_batch(scratch, commit_ts, recorded_at) {
+            Ok(job) => job,
+            Err(error) => {
+                self.record_v8_parallel_error(writer, &error);
+                return Err(error);
+            }
+        };
+        self.finish_v8_parallel_admission(writer, job)
+    }
+
+    fn finish_v8_parallel_admission<'a>(
+        &self,
+        writer: &v8::leader::WalV8ParallelWriter,
+        job: v8::leader::WalV8FrameJob<'a>,
+    ) -> Result<(u64, v8::leader::WalV8FrameJob<'a>)> {
         let assignment = job.assignment();
         let data_end = assignment
             .first_data_offset

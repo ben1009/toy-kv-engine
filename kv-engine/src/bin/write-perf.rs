@@ -365,6 +365,9 @@ struct Args {
     scan_limit: Option<usize>,
     #[arg(long)]
     latency_sample_every: Option<usize>,
+    /// Target aggregate offered load (ops/sec) for `wal_concurrent` to avoid coordinated omission.
+    #[arg(long)]
+    offered_rate_ops_per_sec: Option<u64>,
     #[arg(long)]
     settle_timeout_secs: Option<u64>,
     #[arg(long)]
@@ -438,6 +441,7 @@ struct HarnessConfig {
     operation_mix_period: usize,
     scan_limit: usize,
     latency_sample_every: Option<usize>,
+    offered_rate_ops_per_sec: Option<u64>,
     settle_timeout_secs: Option<u64>,
     transaction_hot_set: usize,
     transaction_reads: usize,
@@ -564,6 +568,7 @@ impl HarnessConfig {
                 Suite::Legacy => None,
                 Suite::SteadyState => Some(1000),
             }),
+            offered_rate_ops_per_sec: args.offered_rate_ops_per_sec,
             settle_timeout_secs: args.settle_timeout_secs,
             transaction_hot_set: args
                 .transaction_hot_set
@@ -1042,6 +1047,8 @@ struct MeasurementParams {
     scan_limit: Option<usize>,
     latency_sample_every: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    offered_rate_ops_per_sec: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     wal_format_version: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     wal_io_mode: Option<&'static str>,
@@ -1110,6 +1117,10 @@ struct MeasurementResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     mutex_lock_diagnostics:
         Option<kv_engine_wrapper::wal::mutex_diagnostics::MutexLockDiagnosticsSnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    service_latency: Option<LatencyRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    schedule_lag: Option<LatencyRecord>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -1180,6 +1191,8 @@ struct WalPipelineRecord {
     commit_buffers: u64,
     commit_bytes: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
+    worker_group_sizes: Option<WalWorkerGroupSizesRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     v8_data_submit_order: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     v8_point_direct_frame_enabled: Option<bool>,
@@ -1235,6 +1248,15 @@ struct WalPipelineRecord {
     wal_io_end: Option<WalIoDiagnosticsRecord>,
     #[serde(skip_serializing_if = "Option::is_none")]
     wal_io_stable: Option<bool>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+struct WalWorkerGroupSizesRecord {
+    one_ticket: u64,
+    two_tickets: u64,
+    three_to_four_tickets: u64,
+    five_to_eight_tickets: u64,
+    nine_or_more_tickets: u64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
@@ -1592,8 +1614,26 @@ struct WalV8DurabilityPhaseRecord {
     frontier_lock_wait_ns: u64,
     coalescing_wall_ns: u64,
     coalescing_cpu_ns: u64,
-    coalescing_active_wall_ns: u64,
-    coalescing_active_cpu_ns: u64,
+    coalescing_active_wall_ns: Option<u64>,
+    coalescing_active_cpu_ns: Option<u64>,
+    coalescing_wait_breakdown_available: bool,
+    coalescing_budget_us: Option<u64>,
+    coalescing_progress_wait_wall_ns: Option<u64>,
+    coalescing_progress_wait_cpu_ns: Option<u64>,
+    coalescing_completion_drain_wall_ns: Option<u64>,
+    coalescing_completion_drain_cpu_ns: Option<u64>,
+    coalescing_coordinator_lock_wait_wall_ns: Option<u64>,
+    coalescing_coordinator_lock_wait_cpu_ns: Option<u64>,
+    coalescing_coordinator_lock_hold_wall_ns: Option<u64>,
+    coalescing_coordinator_lock_hold_cpu_ns: Option<u64>,
+    coalescing_completion_apply_wall_ns: Option<u64>,
+    coalescing_completion_apply_cpu_ns: Option<u64>,
+    coalescing_digest_fold_wall_ns: Option<u64>,
+    coalescing_digest_fold_cpu_ns: Option<u64>,
+    coalescing_cursor_advance_wall_ns: Option<u64>,
+    coalescing_cursor_advance_cpu_ns: Option<u64>,
+    coalescing_iterations: Option<u64>,
+    coalescing_ready_tickets_gained: Option<u64>,
     coalescing_state_lock_wait_wall_ns: u64,
     coalescing_state_lock_wait_cpu_ns: u64,
     coalescing_condvar_wait_wall_ns: u64,
@@ -1623,6 +1663,7 @@ struct WalV8DurabilityPhaseRecord {
     resource_retire_before_publish_release_cpu_ns: u64,
     resource_retire_before_publish_finish_cpu_ns: u64,
     resource_retire_before_publish_batched_point_credits: bool,
+    resource_retire_before_publish_point_prefix_detached: bool,
     resource_retire_after_publish_wall_ns: u64,
     resource_retire_after_publish_cpu_ns: u64,
     resource_retire_after_publish_lock_wait_wall_ns: u64,
@@ -1713,6 +1754,28 @@ impl From<kv_engine_wrapper::mem_table::WalV8DurabilityPhaseObservation>
             coalescing_cpu_ns: observation.coalescing_cpu_ns,
             coalescing_active_wall_ns: observation.coalescing_active_wall_ns,
             coalescing_active_cpu_ns: observation.coalescing_active_cpu_ns,
+            coalescing_wait_breakdown_available: observation.coalescing_wait_breakdown_available,
+            coalescing_budget_us: observation.coalescing_budget_us,
+            coalescing_progress_wait_wall_ns: observation.coalescing_progress_wait_wall_ns,
+            coalescing_progress_wait_cpu_ns: observation.coalescing_progress_wait_cpu_ns,
+            coalescing_completion_drain_wall_ns: observation.coalescing_completion_drain_wall_ns,
+            coalescing_completion_drain_cpu_ns: observation.coalescing_completion_drain_cpu_ns,
+            coalescing_coordinator_lock_wait_wall_ns: observation
+                .coalescing_coordinator_lock_wait_wall_ns,
+            coalescing_coordinator_lock_wait_cpu_ns: observation
+                .coalescing_coordinator_lock_wait_cpu_ns,
+            coalescing_coordinator_lock_hold_wall_ns: observation
+                .coalescing_coordinator_lock_hold_wall_ns,
+            coalescing_coordinator_lock_hold_cpu_ns: observation
+                .coalescing_coordinator_lock_hold_cpu_ns,
+            coalescing_completion_apply_wall_ns: observation.coalescing_completion_apply_wall_ns,
+            coalescing_completion_apply_cpu_ns: observation.coalescing_completion_apply_cpu_ns,
+            coalescing_digest_fold_wall_ns: observation.coalescing_digest_fold_wall_ns,
+            coalescing_digest_fold_cpu_ns: observation.coalescing_digest_fold_cpu_ns,
+            coalescing_cursor_advance_wall_ns: observation.coalescing_cursor_advance_wall_ns,
+            coalescing_cursor_advance_cpu_ns: observation.coalescing_cursor_advance_cpu_ns,
+            coalescing_iterations: observation.coalescing_iterations,
+            coalescing_ready_tickets_gained: observation.coalescing_ready_tickets_gained,
             coalescing_state_lock_wait_wall_ns: observation.coalescing_state_lock_wait_wall_ns,
             coalescing_state_lock_wait_cpu_ns: observation.coalescing_state_lock_wait_cpu_ns,
             coalescing_condvar_wait_wall_ns: observation.coalescing_condvar_wait_wall_ns,
@@ -1757,6 +1820,8 @@ impl From<kv_engine_wrapper::mem_table::WalV8DurabilityPhaseObservation>
                 .resource_retire_before_publish_finish_cpu_ns,
             resource_retire_before_publish_batched_point_credits: observation
                 .resource_retire_before_publish_batched_point_credits,
+            resource_retire_before_publish_point_prefix_detached: observation
+                .resource_retire_before_publish_point_prefix_detached,
             resource_retire_after_publish_wall_ns: observation
                 .resource_retire_after_publish_wall_ns,
             resource_retire_after_publish_cpu_ns: observation.resource_retire_after_publish_cpu_ns,
@@ -1874,6 +1939,65 @@ struct WalIoDiagnosticsRecord {
     extent_preparation: Option<WalExtentPreparationRecord>,
     sliding_extent_preparation: Option<WalV8SlidingExtentPreparationRecord>,
     progress_ring_enabled: bool,
+    progress_cursor_enabled: bool,
+    cursor_direct_completion_enabled: bool,
+    cursor_direct_completion_select_wake_enabled: bool,
+    coalesce_ready_target: Option<usize>,
+    coalesce_ready_target_hits: u64,
+    coalesce_target_policy: String,
+    coalesce_target_eligible_cycles: u64,
+    coalesce_target_mixed_fallback_cycles: u64,
+    coalesce_target_initial_hits: u64,
+    coalesce_target_after_wake_hits: u64,
+    cursor_singleton_submission_enabled: bool,
+    admission_cursor_publish_fast_path_enabled: bool,
+    point_buffer_preallocation_enabled: bool,
+    independent_ack_waiter_enabled: bool,
+    dedicated_durability_driver_enabled: bool,
+    dedicated_durability_diagnostics_enabled: bool,
+    dedicated_durability_requests: u64,
+    dedicated_durability_wake_signals: u64,
+    dedicated_durability_coalesced_wakes: u64,
+    dedicated_durability_advance_attempts: u64,
+    caller_durability_driver_election_attempts: u64,
+    point_buffer_preallocation_attempts: u64,
+    point_buffer_preallocation_hits: u64,
+    point_buffer_preallocation_fallbacks: u64,
+    point_resource_retirement_mode: u8,
+    point_resource_retirement_detached_prefixes: u64,
+    point_resource_retirement_detached_tickets: u64,
+    point_resource_retirement_batched_prefixes: u64,
+    // Retired Stage B keys stay in benchmark JSON for archived-schema compatibility.
+    point_resource_preclaim_enabled: bool,
+    point_resource_preclaim_sum_cache_enabled: bool,
+    point_resource_preclaim_after_buffer_enabled: bool,
+    point_resource_preclaim_attempts: u64,
+    point_resource_preclaim_granted: u64,
+    point_resource_preclaim_promoted: u64,
+    point_resource_preclaim_invalidated: u64,
+    point_resource_preclaim_owner_trylock_busy: u64,
+    point_resource_preclaim_owner_retired: u64,
+    point_resource_preclaim_ledger_trylock_busy: u64,
+    point_resource_preclaim_max_preclaims: u64,
+    point_resource_preclaim_max_live: u64,
+    point_resource_preclaim_logical_quota_rejected: u64,
+    point_resource_preclaim_source_spool_quota_rejected: u64,
+    point_resource_preclaim_buffer_quota_rejected: u64,
+    point_resource_preclaim_seal_index_quota_rejected: u64,
+    point_resource_preclaim_recovery_workspace_rejected: u64,
+    point_resource_preclaim_arithmetic_rejected: u64,
+    point_resource_preclaim_invalid_charge_rejected: u64,
+    point_resource_preclaim_fallbacks: u64,
+    point_resource_preclaim_revoked: u64,
+    point_resource_preclaim_abandoned: u64,
+    point_resource_preclaim_cpu_sample_every: u64,
+    point_resource_preclaim_cpu_ns: u64,
+    point_resource_preclaim_cpu_samples: u64,
+    point_resource_preclaim_promotion_cpu_ns: u64,
+    point_resource_preclaim_promotion_cpu_samples: u64,
+    #[cfg(feature = "bench")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    progress_diagnostics: Option<kv_engine::wal::WalV8ProgressDiagnostics>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -1995,6 +2119,87 @@ impl From<WalIoDiagnostics> for WalIoDiagnosticsRecord {
             extent_preparation: diagnostics.extent_preparation.map(Into::into),
             sliding_extent_preparation: diagnostics.sliding_extent_preparation.map(Into::into),
             progress_ring_enabled: diagnostics.progress_ring_enabled,
+            progress_cursor_enabled: diagnostics.progress_cursor_enabled,
+            cursor_direct_completion_enabled: diagnostics.cursor_direct_completion_enabled,
+            cursor_direct_completion_select_wake_enabled: diagnostics
+                .cursor_direct_completion_select_wake_enabled,
+            coalesce_ready_target: diagnostics.coalesce_ready_target,
+            coalesce_ready_target_hits: diagnostics.coalesce_ready_target_hits,
+            coalesce_target_policy: diagnostics.coalesce_target_policy.to_string(),
+            coalesce_target_eligible_cycles: diagnostics.coalesce_target_eligible_cycles,
+            coalesce_target_mixed_fallback_cycles: diagnostics
+                .coalesce_target_mixed_fallback_cycles,
+            coalesce_target_initial_hits: diagnostics.coalesce_target_initial_hits,
+            coalesce_target_after_wake_hits: diagnostics.coalesce_target_after_wake_hits,
+            cursor_singleton_submission_enabled: diagnostics.cursor_singleton_submission_enabled,
+            admission_cursor_publish_fast_path_enabled: diagnostics
+                .admission_cursor_publish_fast_path_enabled,
+            point_buffer_preallocation_enabled: diagnostics.point_buffer_preallocation_enabled,
+            independent_ack_waiter_enabled: diagnostics.independent_ack_waiter_enabled,
+            dedicated_durability_driver_enabled: diagnostics.dedicated_durability_driver_enabled,
+            dedicated_durability_diagnostics_enabled: diagnostics
+                .dedicated_durability_diagnostics_enabled,
+            dedicated_durability_requests: diagnostics.dedicated_durability_requests,
+            dedicated_durability_wake_signals: diagnostics.dedicated_durability_wake_signals,
+            dedicated_durability_coalesced_wakes: diagnostics.dedicated_durability_coalesced_wakes,
+            dedicated_durability_advance_attempts: diagnostics
+                .dedicated_durability_advance_attempts,
+            caller_durability_driver_election_attempts: diagnostics
+                .caller_durability_driver_election_attempts,
+            point_buffer_preallocation_attempts: diagnostics.point_buffer_preallocation_attempts,
+            point_buffer_preallocation_hits: diagnostics.point_buffer_preallocation_hits,
+            point_buffer_preallocation_fallbacks: diagnostics.point_buffer_preallocation_fallbacks,
+            point_resource_retirement_mode: diagnostics.point_resource_retirement_mode,
+            point_resource_retirement_detached_prefixes: diagnostics
+                .point_resource_retirement_detached_prefixes,
+            point_resource_retirement_detached_tickets: diagnostics
+                .point_resource_retirement_detached_tickets,
+            point_resource_retirement_batched_prefixes: diagnostics
+                .point_resource_retirement_batched_prefixes,
+            point_resource_preclaim_enabled: diagnostics.point_resource_preclaim_enabled,
+            point_resource_preclaim_sum_cache_enabled: diagnostics
+                .point_resource_preclaim_sum_cache_enabled,
+            point_resource_preclaim_after_buffer_enabled: diagnostics
+                .point_resource_preclaim_after_buffer_enabled,
+            point_resource_preclaim_attempts: diagnostics.point_resource_preclaim_attempts,
+            point_resource_preclaim_granted: diagnostics.point_resource_preclaim_granted,
+            point_resource_preclaim_promoted: diagnostics.point_resource_preclaim_promoted,
+            point_resource_preclaim_invalidated: diagnostics.point_resource_preclaim_invalidated,
+            point_resource_preclaim_owner_trylock_busy: diagnostics
+                .point_resource_preclaim_owner_trylock_busy,
+            point_resource_preclaim_owner_retired: diagnostics
+                .point_resource_preclaim_owner_retired,
+            point_resource_preclaim_ledger_trylock_busy: diagnostics
+                .point_resource_preclaim_ledger_trylock_busy,
+            point_resource_preclaim_max_preclaims: diagnostics
+                .point_resource_preclaim_max_preclaims,
+            point_resource_preclaim_max_live: diagnostics.point_resource_preclaim_max_live,
+            point_resource_preclaim_logical_quota_rejected: diagnostics
+                .point_resource_preclaim_logical_quota_rejected,
+            point_resource_preclaim_source_spool_quota_rejected: diagnostics
+                .point_resource_preclaim_source_spool_quota_rejected,
+            point_resource_preclaim_buffer_quota_rejected: diagnostics
+                .point_resource_preclaim_buffer_quota_rejected,
+            point_resource_preclaim_seal_index_quota_rejected: diagnostics
+                .point_resource_preclaim_seal_index_quota_rejected,
+            point_resource_preclaim_recovery_workspace_rejected: diagnostics
+                .point_resource_preclaim_recovery_workspace_rejected,
+            point_resource_preclaim_arithmetic_rejected: diagnostics
+                .point_resource_preclaim_arithmetic_rejected,
+            point_resource_preclaim_invalid_charge_rejected: diagnostics
+                .point_resource_preclaim_invalid_charge_rejected,
+            point_resource_preclaim_fallbacks: diagnostics.point_resource_preclaim_fallbacks,
+            point_resource_preclaim_revoked: diagnostics.point_resource_preclaim_revoked,
+            point_resource_preclaim_abandoned: diagnostics.point_resource_preclaim_abandoned,
+            point_resource_preclaim_cpu_sample_every: diagnostics
+                .point_resource_preclaim_cpu_sample_every,
+            point_resource_preclaim_cpu_ns: diagnostics.point_resource_preclaim_cpu_ns,
+            point_resource_preclaim_cpu_samples: diagnostics.point_resource_preclaim_cpu_samples,
+            point_resource_preclaim_promotion_cpu_ns: diagnostics
+                .point_resource_preclaim_promotion_cpu_ns,
+            point_resource_preclaim_promotion_cpu_samples: diagnostics
+                .point_resource_preclaim_promotion_cpu_samples,
+            progress_diagnostics: diagnostics.progress_diagnostics,
         }
     }
 }
@@ -2016,6 +2221,27 @@ impl WalIoDiagnosticsRecord {
             && self.sync == other.sync
             && self.extent_preparation == other.extent_preparation
             && self.progress_ring_enabled == other.progress_ring_enabled
+            && self.progress_cursor_enabled == other.progress_cursor_enabled
+            && self.cursor_direct_completion_enabled == other.cursor_direct_completion_enabled
+            && self.cursor_direct_completion_select_wake_enabled
+                == other.cursor_direct_completion_select_wake_enabled
+            && self.coalesce_ready_target == other.coalesce_ready_target
+            && self.cursor_singleton_submission_enabled == other.cursor_singleton_submission_enabled
+            && self.admission_cursor_publish_fast_path_enabled
+                == other.admission_cursor_publish_fast_path_enabled
+            && self.point_buffer_preallocation_enabled == other.point_buffer_preallocation_enabled
+            && self.independent_ack_waiter_enabled == other.independent_ack_waiter_enabled
+            && self.dedicated_durability_driver_enabled == other.dedicated_durability_driver_enabled
+            && self.dedicated_durability_diagnostics_enabled
+                == other.dedicated_durability_diagnostics_enabled
+            && self.point_resource_retirement_mode == other.point_resource_retirement_mode
+            && self.point_resource_preclaim_enabled == other.point_resource_preclaim_enabled
+            && self.point_resource_preclaim_sum_cache_enabled
+                == other.point_resource_preclaim_sum_cache_enabled
+            && self.point_resource_preclaim_after_buffer_enabled
+                == other.point_resource_preclaim_after_buffer_enabled
+            && self.point_resource_preclaim_cpu_sample_every
+                == other.point_resource_preclaim_cpu_sample_every
             && sliding_configuration_stable
     }
 }
@@ -2241,6 +2467,16 @@ fn wal_pipeline_record(
         commit_solo_groups: profile.wal_commit_solo_groups,
         commit_buffers: profile.wal_commit_buffers,
         commit_bytes: profile.wal_commit_bytes,
+        worker_group_sizes: (wal_run_info.format_version == 8
+            && wal_run_info.io_mode == "parallel"
+            && profile.wal_worker_group_size_histogram_enabled)
+            .then_some(WalWorkerGroupSizesRecord {
+                one_ticket: profile.wal_worker_group_size_one_ticket,
+                two_tickets: profile.wal_worker_group_size_two_tickets,
+                three_to_four_tickets: profile.wal_worker_group_size_three_to_four_tickets,
+                five_to_eight_tickets: profile.wal_worker_group_size_five_to_eight_tickets,
+                nine_or_more_tickets: profile.wal_worker_group_size_nine_or_more_tickets,
+            }),
         v8_data_submit_order: (wal_run_info.format_version == 8
             && wal_run_info.io_mode == "parallel")
             .then(
@@ -2498,7 +2734,7 @@ mod bench_cpu_affinity {
                 io_wq_worker_count_after_warmup > 0,
                 "io-wq warmup created no workers after {warmup_puts} puts"
             );
-            engine.reset_write_profile();
+            engine.reset_write_profile_measurements();
 
             let before = thread_snapshot()?;
             let wal_helpers = if mode == "none" {
@@ -5263,6 +5499,10 @@ fn run_wal_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
     let cpu_start = process_cpu_times();
     let per_thread = num_keys / writer_threads;
     let remainder = num_keys % writer_threads;
+    let offered_rate = cfg.offered_rate_ops_per_sec;
+    let pacing_origin = Arc::new(std::sync::OnceLock::<Instant>::new());
+    let pacing_ready = offered_rate.map(|_| Arc::new(std::sync::Barrier::new(writer_threads + 1)));
+    let pacing_start = offered_rate.map(|_| Arc::new(std::sync::Barrier::new(writer_threads + 1)));
     #[cfg(all(feature = "bench", target_os = "linux"))]
     let mut start = Instant::now();
     #[cfg(not(all(feature = "bench", target_os = "linux")))]
@@ -5272,6 +5512,9 @@ fn run_wal_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
         let eng = engine.clone();
         let val = value.clone();
         let sample_every = cfg.latency_sample_every;
+        let pacing_origin = Arc::clone(&pacing_origin);
+        let pacing_ready = pacing_ready.as_ref().map(Arc::clone);
+        let pacing_start = pacing_start.as_ref().map(Arc::clone);
         #[cfg(all(feature = "bench", target_os = "linux"))]
         let affinity_writer_cpu = affinity_capture
             .as_ref()
@@ -5282,44 +5525,86 @@ fn run_wal_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
         let writer_ready = affinity_ready.as_ref().map(Arc::clone);
         #[cfg(all(feature = "bench", target_os = "linux"))]
         let writer_start = affinity_start.as_ref().map(Arc::clone);
-        handles.push(std::thread::spawn(move || -> Result<Vec<u64>> {
-            #[cfg(all(feature = "bench", target_os = "linux"))]
-            if affinity_enabled {
-                match bench_cpu_affinity::place_writer(t, affinity_writer_cpu) {
-                    Ok(placement) => affinity_writer_placements.lock().push(placement),
-                    Err(error) => {
-                        if let (Some(ready), Some(start_gate)) =
-                            (writer_ready.as_ref(), writer_start.as_ref())
-                        {
-                            ready.wait();
-                            start_gate.wait();
+        handles.push(std::thread::spawn(
+            move || -> Result<(Vec<u64>, Vec<u64>, Vec<u64>)> {
+                #[cfg(all(feature = "bench", target_os = "linux"))]
+                if affinity_enabled {
+                    match bench_cpu_affinity::place_writer(t, affinity_writer_cpu) {
+                        Ok(placement) => affinity_writer_placements.lock().push(placement),
+                        Err(error) => {
+                            if let (Some(ready), Some(start_gate)) =
+                                (writer_ready.as_ref(), writer_start.as_ref())
+                            {
+                                ready.wait();
+                                start_gate.wait();
+                            }
+                            if let (Some(ready), Some(start_gate)) =
+                                (pacing_ready.as_ref(), pacing_start.as_ref())
+                            {
+                                ready.wait();
+                                start_gate.wait();
+                            }
+                            return Err(error);
                         }
-                        return Err(error);
                     }
                 }
-            }
-            #[cfg(all(feature = "bench", target_os = "linux"))]
-            if let (Some(ready), Some(start_gate)) = (writer_ready, writer_start) {
-                ready.wait();
-                start_gate.wait();
-            }
-            let thread_ops = per_thread + usize::from(t < remainder);
-            let start_idx = t * per_thread + remainder.min(t);
-            let mut latency_samples = Vec::new();
-            for i in 0..thread_ops {
-                let sample_start = sample_every
-                    .filter(|every| i.is_multiple_of(*every))
-                    .map(|_| Instant::now());
-                with_pitr_admission_retry(retry_pitr_barrier, || {
-                    eng.put(format!("key{:08}", start_idx + i).as_bytes(), &val)
-                })?;
-                if let Some(start) = sample_start {
-                    latency_samples.push(start.elapsed().as_nanos() as u64);
+                #[cfg(all(feature = "bench", target_os = "linux"))]
+                if let (Some(ready), Some(start_gate)) = (writer_ready, writer_start) {
+                    ready.wait();
+                    start_gate.wait();
                 }
-            }
+                if let (Some(ready), Some(start_gate)) = (pacing_ready, pacing_start) {
+                    ready.wait();
+                    start_gate.wait();
+                }
+                let thread_ops = per_thread + usize::from(t < remainder);
+                let start_idx = t * per_thread + remainder.min(t);
+                let mut latency_samples = Vec::new();
+                let mut service_samples = Vec::new();
+                let mut lag_samples = Vec::new();
+                let origin = offered_rate.map(|_| *pacing_origin.get().expect("pacing origin set"));
+                for i in 0..thread_ops {
+                    let scheduled_at = origin.zip(offered_rate).map(|(t0, rate_ops)| {
+                        let global_idx = i * writer_threads + t;
+                        let target_secs = global_idx as f64 / rate_ops as f64;
+                        let scheduled = t0 + Duration::from_secs_f64(target_secs);
+                        while let Some(rem) = scheduled.checked_duration_since(Instant::now()) {
+                            if rem > Duration::from_micros(250) {
+                                std::thread::sleep(rem - Duration::from_micros(150));
+                            } else {
+                                std::hint::spin_loop();
+                            }
+                        }
+                        scheduled
+                    });
+                    let should_sample = sample_every.is_some_and(|every| i.is_multiple_of(every));
+                    let service_start = should_sample.then(Instant::now);
+                    with_pitr_admission_retry(retry_pitr_barrier, || {
+                        eng.put(format!("key{:08}", start_idx + i).as_bytes(), &val)
+                    })?;
+                    if let Some(op_start) = service_start {
+                        let finished = Instant::now();
+                        if let Some(scheduled) = scheduled_at {
+                            latency_samples.push(
+                                finished.saturating_duration_since(scheduled).as_nanos() as u64,
+                            );
+                            service_samples.push(
+                                finished.saturating_duration_since(op_start).as_nanos() as u64,
+                            );
+                            lag_samples.push(
+                                op_start.saturating_duration_since(scheduled).as_nanos() as u64,
+                            );
+                        } else {
+                            latency_samples.push(
+                                finished.saturating_duration_since(op_start).as_nanos() as u64,
+                            );
+                        }
+                    }
+                }
 
-            Ok(latency_samples)
-        }));
+                Ok((latency_samples, service_samples, lag_samples))
+            },
+        ));
     }
     #[cfg(all(feature = "bench", target_os = "linux"))]
     if let (Some(ready), Some(start_gate)) = (affinity_ready.as_ref(), affinity_start.as_ref()) {
@@ -5328,11 +5613,28 @@ fn run_wal_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
         start = Instant::now();
         start_gate.wait();
     }
+    if let (Some(ready), Some(start_gate)) = (pacing_ready.as_ref(), pacing_start.as_ref()) {
+        ready.wait();
+        let now = Instant::now();
+        let _ = pacing_origin.set(now);
+        #[cfg(all(feature = "bench", target_os = "linux"))]
+        if !affinity_enabled {
+            cpu_start = process_cpu_times();
+            start = now;
+        }
+        start_gate.wait();
+    }
     let mut latency_samples = Vec::new();
+    let mut service_samples = Vec::new();
+    let mut lag_samples = Vec::new();
     let mut writer_error = None;
     for handle in handles {
         match handle.join() {
-            Ok(Ok(samples)) => latency_samples.extend(samples),
+            Ok(Ok((samples, service, lag))) => {
+                latency_samples.extend(samples);
+                service_samples.extend(service);
+                lag_samples.extend(lag);
+            }
             Ok(Err(error)) => {
                 writer_error.get_or_insert(error);
             }
@@ -5404,6 +5706,7 @@ fn run_wal_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
             threads: Some(writer_threads),
             seed: Some(cfg.seed),
             latency_sample_every: cfg.latency_sample_every,
+            offered_rate_ops_per_sec: cfg.offered_rate_ops_per_sec,
             wal_format_version: Some(wal_run_info.format_version),
             wal_io_mode: Some(wal_run_info.io_mode),
             wal_runtime_counters_available: Some(wal_run_info.runtime_counters_available()),
@@ -5418,6 +5721,14 @@ fn run_wal_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
             wal_pipeline,
             wal_v8_digest,
             mutex_lock_diagnostics,
+            service_latency: offered_rate
+                .and(cfg.latency_sample_every)
+                .map(|sample_every| {
+                    latency_record(sample_every, num_keys as u64, &service_samples)
+                }),
+            schedule_lag: offered_rate
+                .and(cfg.latency_sample_every)
+                .map(|sample_every| latency_record(sample_every, num_keys as u64, &lag_samples)),
             ..MeasurementResult::default()
         },
         counters,
@@ -5634,6 +5945,7 @@ fn run_wal_batch_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>
             threads: Some(writer_threads),
             seed: Some(cfg.seed),
             latency_sample_every: cfg.latency_sample_every,
+            offered_rate_ops_per_sec: cfg.offered_rate_ops_per_sec,
             wal_format_version: Some(wal_run_info.format_version),
             wal_io_mode: Some(wal_run_info.io_mode),
             wal_runtime_counters_available: Some(wal_run_info.runtime_counters_available()),
@@ -8213,6 +8525,7 @@ fn run_point_read_missing_in_range(cfg: &HarnessConfig) -> Result<Vec<BenchMeasu
             operation_mix_period: Some(1),
             scan_limit: Some(cfg.scan_limit),
             latency_sample_every: cfg.latency_sample_every,
+            offered_rate_ops_per_sec: cfg.offered_rate_ops_per_sec,
             settle_timeout_secs: cfg.settle_timeout_secs,
             ..MeasurementParams::default()
         },
@@ -8849,6 +9162,7 @@ fn run_idle(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
             operation_mix_period: Some(1),
             scan_limit: Some(cfg.scan_limit),
             latency_sample_every: cfg.latency_sample_every,
+            offered_rate_ops_per_sec: cfg.offered_rate_ops_per_sec,
             settle_timeout_secs: cfg.settle_timeout_secs,
             ..MeasurementParams::default()
         },
@@ -8970,6 +9284,7 @@ fn run_steady_state_point_read_workload(
             operation_mix_period: Some(1),
             scan_limit: Some(cfg.scan_limit),
             latency_sample_every: cfg.latency_sample_every,
+            offered_rate_ops_per_sec: cfg.offered_rate_ops_per_sec,
             settle_timeout_secs: cfg.settle_timeout_secs,
             ..MeasurementParams::default()
         },
@@ -9070,6 +9385,7 @@ fn run_range_scan_uniform(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> 
             operation_mix_period: Some(1),
             scan_limit: Some(cfg.scan_limit),
             latency_sample_every: cfg.latency_sample_every,
+            offered_rate_ops_per_sec: cfg.offered_rate_ops_per_sec,
             settle_timeout_secs: cfg.settle_timeout_secs,
             ..MeasurementParams::default()
         },
@@ -9214,6 +9530,7 @@ fn run_mixed_zipfian_workload(
             operation_mix_period: Some(cfg.operation_mix_period),
             scan_limit: Some(cfg.scan_limit),
             latency_sample_every: cfg.latency_sample_every,
+            offered_rate_ops_per_sec: cfg.offered_rate_ops_per_sec,
             settle_timeout_secs: cfg.settle_timeout_secs,
             ..MeasurementParams::default()
         },
@@ -9327,6 +9644,7 @@ fn run_sustained_ingest(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
             operation_mix_period: Some(operation_mix_period),
             scan_limit: Some(cfg.scan_limit),
             latency_sample_every: cfg.latency_sample_every,
+            offered_rate_ops_per_sec: cfg.offered_rate_ops_per_sec,
             settle_timeout_secs: cfg.settle_timeout_secs,
             ..MeasurementParams::default()
         },
@@ -9473,6 +9791,7 @@ fn run_transaction_contention(cfg: &HarnessConfig) -> Result<Vec<BenchMeasuremen
             operation_mix_period: Some(1),
             scan_limit: Some(cfg.scan_limit),
             latency_sample_every: cfg.latency_sample_every,
+            offered_rate_ops_per_sec: cfg.offered_rate_ops_per_sec,
             settle_timeout_secs: cfg.settle_timeout_secs,
             transaction_hot_set: Some(cfg.transaction_hot_set),
             transaction_reads: Some(cfg.transaction_reads),
@@ -10322,6 +10641,9 @@ fn validate_config(cfg: &HarnessConfig) -> Result<()> {
             "--latency-sample-every must be > 0"
         );
     }
+    if let Some(offered_rate) = cfg.offered_rate_ops_per_sec {
+        anyhow::ensure!(offered_rate > 0, "--offered-rate-ops-per-sec must be > 0");
+    }
     if let Some(settle_timeout_secs) = cfg.settle_timeout_secs {
         anyhow::ensure!(settle_timeout_secs > 0, "--settle-timeout-secs must be > 0");
     }
@@ -10529,6 +10851,12 @@ fn validate_run_mode(cfg: &HarnessConfig, bench_arg: Option<&str>) -> Result<()>
             "--wal-cpu-attribution-sample-every requires --bench wal_concurrent"
         );
     }
+    if cfg.offered_rate_ops_per_sec.is_some() {
+        anyhow::ensure!(
+            bench_arg == Some("wal_concurrent"),
+            "--offered-rate-ops-per-sec requires --bench wal_concurrent"
+        );
+    }
 
     let extent_mode = std::env::var_os(WAL_V8_EXTENT_PREPARATION_ENV);
     let extent_bytes = std::env::var_os(WAL_V8_EXTENT_PREPARATION_BYTES_ENV);
@@ -10688,6 +11016,10 @@ mod tests {
             ..WalIoDiagnosticsRecord::default()
         };
         let mut end = start.clone();
+        end.dedicated_durability_diagnostics_enabled = true;
+        assert!(!start.stable_with(&end));
+        end.dedicated_durability_diagnostics_enabled = false;
+
         let preparation = end
             .sliding_extent_preparation
             .as_mut()
@@ -11023,6 +11355,45 @@ mod tests {
         );
 
         assert!(Args::try_parse_from(["write-perf", "--pitr-format", "v6"]).is_err());
+    }
+
+    #[test]
+    fn offered_rate_ops_per_sec_requires_positive_rate_and_wal_concurrent() {
+        let zero = HarnessConfig::from_args(
+            Args::try_parse_from([
+                "write-perf",
+                "--bench",
+                "wal_concurrent",
+                "--offered-rate-ops-per-sec",
+                "0",
+            ])
+            .expect("parse zero offered rate"),
+        );
+        assert!(validate_config(&zero).is_err());
+
+        let batch = HarnessConfig::from_args(
+            Args::try_parse_from([
+                "write-perf",
+                "--bench",
+                "wal_batch_concurrent",
+                "--offered-rate-ops-per-sec",
+                "20000",
+            ])
+            .expect("parse batch offered rate"),
+        );
+        assert!(validate_run_mode(&batch, Some("wal_batch_concurrent")).is_err());
+
+        let valid = HarnessConfig::from_args(
+            Args::try_parse_from([
+                "write-perf",
+                "--bench",
+                "wal_concurrent",
+                "--offered-rate-ops-per-sec",
+                "20000",
+            ])
+            .expect("parse valid offered rate"),
+        );
+        assert!(validate_run_mode(&valid, Some("wal_concurrent")).is_ok());
     }
 
     #[test]
@@ -12690,6 +13061,7 @@ mod tests {
             operation_mix_period: 1000,
             scan_limit: 1,
             latency_sample_every: None,
+            offered_rate_ops_per_sec: None,
             settle_timeout_secs: None,
             transaction_hot_set: 1,
             transaction_reads: 1,
@@ -12741,6 +13113,63 @@ mod tests {
                         extent_preparation: None,
                         sliding_extent_preparation: None,
                         progress_ring_enabled: false,
+                        progress_cursor_enabled: false,
+                        cursor_direct_completion_enabled: false,
+                        cursor_direct_completion_select_wake_enabled: false,
+                        coalesce_ready_target: Some(8),
+                        coalesce_ready_target_hits: 0,
+                        coalesce_target_policy: "always".to_string(),
+                        coalesce_target_eligible_cycles: 0,
+                        coalesce_target_mixed_fallback_cycles: 0,
+                        coalesce_target_initial_hits: 0,
+                        coalesce_target_after_wake_hits: 0,
+                        cursor_singleton_submission_enabled: false,
+                        admission_cursor_publish_fast_path_enabled: false,
+                        point_buffer_preallocation_enabled: false,
+                        independent_ack_waiter_enabled: false,
+                        dedicated_durability_driver_enabled: false,
+                        dedicated_durability_diagnostics_enabled: false,
+                        dedicated_durability_requests: 0,
+                        dedicated_durability_wake_signals: 0,
+                        dedicated_durability_coalesced_wakes: 0,
+                        dedicated_durability_advance_attempts: 0,
+                        caller_durability_driver_election_attempts: 0,
+                        point_buffer_preallocation_attempts: 0,
+                        point_buffer_preallocation_hits: 0,
+                        point_buffer_preallocation_fallbacks: 0,
+                        point_resource_retirement_mode: 0,
+                        point_resource_retirement_detached_prefixes: 0,
+                        point_resource_retirement_detached_tickets: 0,
+                        point_resource_retirement_batched_prefixes: 0,
+                        point_resource_preclaim_enabled: false,
+                        point_resource_preclaim_sum_cache_enabled: false,
+                        point_resource_preclaim_after_buffer_enabled: false,
+                        point_resource_preclaim_attempts: 0,
+                        point_resource_preclaim_granted: 0,
+                        point_resource_preclaim_promoted: 0,
+                        point_resource_preclaim_invalidated: 0,
+                        point_resource_preclaim_owner_trylock_busy: 0,
+                        point_resource_preclaim_owner_retired: 0,
+                        point_resource_preclaim_ledger_trylock_busy: 0,
+                        point_resource_preclaim_max_preclaims: 0,
+                        point_resource_preclaim_max_live: 0,
+                        point_resource_preclaim_logical_quota_rejected: 0,
+                        point_resource_preclaim_source_spool_quota_rejected: 0,
+                        point_resource_preclaim_buffer_quota_rejected: 0,
+                        point_resource_preclaim_seal_index_quota_rejected: 0,
+                        point_resource_preclaim_recovery_workspace_rejected: 0,
+                        point_resource_preclaim_arithmetic_rejected: 0,
+                        point_resource_preclaim_invalid_charge_rejected: 0,
+                        point_resource_preclaim_fallbacks: 0,
+                        point_resource_preclaim_revoked: 0,
+                        point_resource_preclaim_abandoned: 0,
+                        point_resource_preclaim_cpu_sample_every: 0,
+                        point_resource_preclaim_cpu_ns: 0,
+                        point_resource_preclaim_cpu_samples: 0,
+                        point_resource_preclaim_promotion_cpu_ns: 0,
+                        point_resource_preclaim_promotion_cpu_samples: 0,
+                        #[cfg(feature = "bench")]
+                        progress_diagnostics: None,
                     }),
                     wal_io_end: cfg!(feature = "bench").then_some(WalIoDiagnosticsRecord {
                         data: WalIoHandleRecord {
@@ -12761,6 +13190,63 @@ mod tests {
                         extent_preparation: None,
                         sliding_extent_preparation: None,
                         progress_ring_enabled: false,
+                        progress_cursor_enabled: false,
+                        cursor_direct_completion_enabled: false,
+                        cursor_direct_completion_select_wake_enabled: false,
+                        coalesce_ready_target: Some(8),
+                        coalesce_ready_target_hits: 2,
+                        coalesce_target_policy: "always".to_string(),
+                        coalesce_target_eligible_cycles: 2,
+                        coalesce_target_mixed_fallback_cycles: 0,
+                        coalesce_target_initial_hits: 1,
+                        coalesce_target_after_wake_hits: 1,
+                        cursor_singleton_submission_enabled: false,
+                        admission_cursor_publish_fast_path_enabled: false,
+                        point_buffer_preallocation_enabled: false,
+                        independent_ack_waiter_enabled: false,
+                        dedicated_durability_driver_enabled: false,
+                        dedicated_durability_diagnostics_enabled: false,
+                        dedicated_durability_requests: 0,
+                        dedicated_durability_wake_signals: 0,
+                        dedicated_durability_coalesced_wakes: 0,
+                        dedicated_durability_advance_attempts: 0,
+                        caller_durability_driver_election_attempts: 0,
+                        point_buffer_preallocation_attempts: 0,
+                        point_buffer_preallocation_hits: 0,
+                        point_buffer_preallocation_fallbacks: 0,
+                        point_resource_retirement_mode: 0,
+                        point_resource_retirement_detached_prefixes: 0,
+                        point_resource_retirement_detached_tickets: 0,
+                        point_resource_retirement_batched_prefixes: 0,
+                        point_resource_preclaim_enabled: false,
+                        point_resource_preclaim_sum_cache_enabled: false,
+                        point_resource_preclaim_after_buffer_enabled: false,
+                        point_resource_preclaim_attempts: 0,
+                        point_resource_preclaim_granted: 0,
+                        point_resource_preclaim_promoted: 0,
+                        point_resource_preclaim_invalidated: 0,
+                        point_resource_preclaim_owner_trylock_busy: 0,
+                        point_resource_preclaim_owner_retired: 0,
+                        point_resource_preclaim_ledger_trylock_busy: 0,
+                        point_resource_preclaim_max_preclaims: 0,
+                        point_resource_preclaim_max_live: 0,
+                        point_resource_preclaim_logical_quota_rejected: 0,
+                        point_resource_preclaim_source_spool_quota_rejected: 0,
+                        point_resource_preclaim_buffer_quota_rejected: 0,
+                        point_resource_preclaim_seal_index_quota_rejected: 0,
+                        point_resource_preclaim_recovery_workspace_rejected: 0,
+                        point_resource_preclaim_arithmetic_rejected: 0,
+                        point_resource_preclaim_invalid_charge_rejected: 0,
+                        point_resource_preclaim_fallbacks: 0,
+                        point_resource_preclaim_revoked: 0,
+                        point_resource_preclaim_abandoned: 0,
+                        point_resource_preclaim_cpu_sample_every: 0,
+                        point_resource_preclaim_cpu_ns: 0,
+                        point_resource_preclaim_cpu_samples: 0,
+                        point_resource_preclaim_promotion_cpu_ns: 0,
+                        point_resource_preclaim_promotion_cpu_samples: 0,
+                        #[cfg(feature = "bench")]
+                        progress_diagnostics: None,
                     }),
                     wal_io_stable: cfg!(feature = "bench").then_some(true),
                     ..WalPipelineRecord::default()
@@ -12790,6 +13276,22 @@ mod tests {
             assert_eq!(
                 json["result"]["wal_pipeline"]["sync_coalesce_wait_ns"],
                 9000
+            );
+            assert_eq!(
+                json["result"]["wal_pipeline"]["wal_io_start"]["coalesce_ready_target"],
+                8
+            );
+            assert_eq!(
+                json["result"]["wal_pipeline"]["wal_io_start"]["coalesce_ready_target_hits"],
+                0
+            );
+            assert_eq!(
+                json["result"]["wal_pipeline"]["wal_io_end"]["coalesce_ready_target"],
+                8
+            );
+            assert_eq!(
+                json["result"]["wal_pipeline"]["wal_io_end"]["coalesce_ready_target_hits"],
+                2
             );
             assert_eq!(
                 json["result"]["wal_pipeline"]["wal_io_start"]["data"]["o_direct"],
@@ -15237,6 +15739,7 @@ mod tests {
             operation_mix_period: 1000,
             scan_limit: 1,
             latency_sample_every: None,
+            offered_rate_ops_per_sec: None,
             settle_timeout_secs: None,
             transaction_hot_set: 1,
             transaction_reads: 1,

@@ -346,7 +346,7 @@ fn async_checkpoint_accepts_borrowed_path() {
 
 #[test]
 #[cfg(feature = "chaos-testing")]
-fn cancelled_async_checkpoint_keeps_close_waiting_until_blocking_work_finishes() {
+fn failpoint_cancelled_async_checkpoint_keeps_close_waiting_until_blocking_work_finishes() {
     let _lock = async_checkpoint_test_lock();
     let scenario = FailScenario::setup();
     failpoint::cfg("checkpoint.after_sst_pin_before_copy", "pause").unwrap();

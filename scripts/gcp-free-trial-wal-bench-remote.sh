@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-if [[ $# -lt 11 || $# -gt 12 ]]; then
-    echo "usage: $0 <commit> <num> <project> <zone> <instance> <safe-deadline-epoch> <machine-type> <writers-csv> <suite> <source-patch-sha256> <baseline-commit> [repetitions]" >&2
+if [[ $# -lt 11 || $# -gt 13 ]]; then
+    echo "usage: $0 <commit> <num> <project> <zone> <instance> <safe-deadline-epoch> <machine-type> <writers-csv> <suite> <source-patch-sha256> <baseline-commit> [repetitions] [runner-bundle-sha256]" >&2
     exit 64
 fi
 
@@ -18,6 +18,17 @@ SUITE="$9"
 SOURCE_PATCH_SHA256="${10}"
 BASELINE_COMMIT="${11}"
 REPETITIONS="${12:-1}"
+RUNNER_BUNDLE_SHA256="${13:--}"
+case "$SUITE" in
+    v8-cursor-direct-completion-wake|v8-cursor-singleton-submission|v8-cursor-coalescing-budget|\
+    v8-cursor-coalescing-ready-target|v8-cursor-coalescing-ready-target-scan|\
+    v8-cursor-coalescing-ready-target-small-scan|v8-cursor-publication|\
+    v8-point-resource-retirement|v8-point-resource-retirement-stage-a|\
+    v8-point-ack-d1|v8-dedicated-durability-driver)
+    echo "retired historical benchmark suite; archived results remain verifiable but cannot be executed: $SUITE" >&2
+    exit 64
+    ;;
+esac
 if [[ ! "$REPETITIONS" =~ ^[1-9][0-9]*$ ]]; then
     echo "repetitions must be a positive integer: $REPETITIONS" >&2
     exit 64
@@ -49,7 +60,22 @@ if [[ "$SUITE" != "batch64" && "$SUITE" != "rfc026-full" \
     && "$SUITE" != "v8-small-ticket-profile" && "$SUITE" != "commit-order-trace" \
     && "$SUITE" != "v8-point-lookahead" && "$SUITE" != "v8-mutex-diagnostic" \
     && "$SUITE" != "v8-point-borrowed-input" && "$SUITE" != "v8-point-direct-frame" \
-    && "$SUITE" != "v8-extent-policy-storage" && "$SUITE" != "v8-point-cpu-attribution" ]]; then
+    && "$SUITE" != "v8-extent-policy-storage" && "$SUITE" != "v8-point-cpu-attribution" \
+    && "$SUITE" != "v8-point-progress-cursor" \
+    && "$SUITE" != "v8-cursor-direct-completion" \
+     && "$SUITE" != "v8-cursor-direct-completion-wake" \
+     && "$SUITE" != "v8-cursor-singleton-submission" \
+     && "$SUITE" != "v8-cursor-coalescing-budget" \
+     && "$SUITE" != "v8-cursor-coalescing-ready-target" \
+     && "$SUITE" != "v8-cursor-coalescing-ready-target-scan" \
+     && "$SUITE" != "v8-cursor-coalescing-ready-target-small-scan" \
+     && "$SUITE" != "v8-cursor-publication" \
+     && "$SUITE" != "v7-v8-point-preallocation" \
+     && "$SUITE" != "v7-v8-ready-target-final" \
+     && "$SUITE" != "v8-d2-qualification" \
+     && "$SUITE" != "v8-equal-throughput" \
+     && "$SUITE" != "v8-point-ack-d1" \
+     && "$SUITE" != "v8-dedicated-durability-driver" ]]; then
     echo "unsupported benchmark suite: $SUITE" >&2
     exit 64
 fi
@@ -86,10 +112,100 @@ if [[ "$SUITE" == "v8-point-direct-frame" ]] \
     echo "v8-point-direct-frame requires c4-standard-16-lssd, writers 1,8,16, and 100000 operations" >&2
     exit 64
 fi
+if [[ "$SUITE" == "v8-point-progress-cursor" ]] \
+    && { [[ "$NUM" != "100000" ]] || [[ "$MACHINE_TYPE" != "c4-standard-16-lssd" ]] \
+        || [[ "$WRITERS_CSV" != "1,8,16" ]]; }; then
+    echo "progress-cursor qualification requires c4-standard-16-lssd, writers 1,8,16, and 100000 operations" >&2
+    exit 64
+fi
+if [[ "$SUITE" == "v8-cursor-direct-completion" ]] \
+    && { [[ "$NUM" != "100000" ]] || [[ "$MACHINE_TYPE" != "c4-standard-16-lssd" ]] \
+        || [[ "$WRITERS_CSV" != "1,8,16" ]]; }; then
+    echo "cursor direct-completion qualification requires c4-standard-16-lssd, writers 1,8,16, and 100000 operations" >&2
+    exit 64
+fi
+if [[ "$SUITE" == "v8-cursor-direct-completion-wake" ]] \
+    && { [[ "$NUM" != "100000" ]] || [[ "$MACHINE_TYPE" != "c4-standard-16-lssd" ]] \
+        || [[ "$WRITERS_CSV" != "1,8,16" ]]; }; then
+    echo "cursor direct-completion wake qualification requires c4-standard-16-lssd, writers 1,8,16, and 100000 operations" >&2
+    exit 64
+fi
+if [[ "$SUITE" == "v8-cursor-coalescing-ready-target" ]] \
+    && { [[ "$NUM" != "100000" ]] || [[ "$MACHINE_TYPE" != "c4-standard-16-lssd" ]] \
+        || [[ "$WRITERS_CSV" != "1,8,16" ]]; }; then
+    echo "cursor coalescing ready-target qualification requires c4-standard-16-lssd, writers 1,8,16, and 100000 operations" >&2
+    exit 64
+fi
+if [[ "$SUITE" == "v8-cursor-coalescing-ready-target-scan" ]] \
+    && { [[ "$NUM" != "100000" ]] || [[ "$MACHINE_TYPE" != "c4-standard-16-lssd" ]] \
+        || [[ "$WRITERS_CSV" != "8,16" ]]; }; then
+    echo "cursor coalescing ready-target scan requires c4-standard-16-lssd, writers 8,16, and 100000 operations" >&2
+    exit 64
+fi
+if [[ "$SUITE" == "v8-cursor-coalescing-ready-target-small-scan" ]] \
+    && { [[ "$NUM" != "100000" ]] || [[ "$MACHINE_TYPE" != "c4-standard-16-lssd" ]] \
+        || [[ "$WRITERS_CSV" != "8,16" ]]; }; then
+    echo "cursor coalescing small ready-target scan requires c4-standard-16-lssd, writers 8,16, and 100000 operations" >&2
+    exit 64
+fi
+if [[ "$SUITE" == "v8-cursor-singleton-submission" ]] \
+    && { [[ "$NUM" != "100000" ]] || [[ "$MACHINE_TYPE" != "c4-standard-16-lssd" ]] \
+        || [[ "$WRITERS_CSV" != "1,8,16" ]]; }; then
+    echo "cursor singleton-submission qualification requires c4-standard-16-lssd, writers 1,8,16, and 100000 operations" >&2
+    exit 64
+fi
+if [[ "$SUITE" == "v8-cursor-coalescing-budget" ]] \
+    && { [[ "$NUM" != "100000" ]] || [[ "$MACHINE_TYPE" != "c4-standard-16-lssd" ]] \
+        || [[ "$WRITERS_CSV" != "8,16" ]]; }; then
+    echo "cursor coalescing-budget qualification requires c4-standard-16-lssd, writers 8,16, and 100000 operations" >&2
+    exit 64
+fi
+if [[ "$SUITE" == "v8-cursor-publication" ]] \
+    && { [[ "$NUM" != "100000" ]] || [[ "$MACHINE_TYPE" != "c4-standard-16-lssd" ]] \
+        || [[ "$WRITERS_CSV" != "1,8,16" ]]; }; then
+    echo "cursor-publication qualification requires c4-standard-16-lssd, writers 1,8,16, and 100000 operations" >&2
+    exit 64
+fi
 if [[ "$SUITE" == "v8-extent-policy-storage" ]] \
     && { [[ "$NUM" != "100000" ]] || [[ "$MACHINE_TYPE" != "c4-standard-16-lssd" ]] \
         || [[ "$WRITERS_CSV" != "8,16" ]]; }; then
     echo "v8-extent-policy-storage requires c4-standard-16-lssd, writers 8,16, and 100000 operations" >&2
+    exit 64
+fi
+if [[ "$SUITE" == "v7-v8-point-preallocation" ]] \
+    && { [[ "$NUM" != "100000" ]] || [[ "$MACHINE_TYPE" != "c4-standard-16-lssd" ]] \
+        || [[ "$WRITERS_CSV" != "1,8,16" ]]; }; then
+    echo "v7-v8-point-preallocation requires c4-standard-16-lssd, writers 1,8,16, and 100000 operations" >&2
+    exit 64
+fi
+if [[ "$SUITE" == "v7-v8-ready-target-final" || "$SUITE" == "v8-d2-qualification" ]] \
+    && { [[ "$NUM" != "100000" ]] || [[ "$MACHINE_TYPE" != "c4-standard-16-lssd" ]] \
+        || [[ "$WRITERS_CSV" != "1,8,16" ]]; }; then
+    echo "$SUITE requires c4-standard-16-lssd, writers 1,8,16, and 100000 operations" >&2
+    exit 64
+fi
+if [[ "$SUITE" == "v8-equal-throughput" ]] \
+    && { [[ "$NUM" != "100000" ]] || [[ "$MACHINE_TYPE" != "c4-standard-16-lssd" ]] \
+        || [[ "$WRITERS_CSV" != "8,16" ]]; }; then
+    echo "v8-equal-throughput requires c4-standard-16-lssd, writers 8,16, and 100000 operations" >&2
+    exit 64
+fi
+if [[ "$SUITE" == "v8-point-resource-retirement" || "$SUITE" == "v8-point-resource-retirement-stage-a" ]] \
+    && { [[ "$NUM" != "100000" ]] || [[ "$MACHINE_TYPE" != "c4-standard-16-lssd" ]] \
+        || [[ "$WRITERS_CSV" != "8,16" ]]; }; then
+    echo "point resource-retirement qualification requires c4-standard-16-lssd, writers 8,16, and 100000 operations" >&2
+    exit 64
+fi
+if [[ "$SUITE" == "v8-point-ack-d1" ]] \
+    && { [[ "$NUM" != "100000" ]] || [[ "$MACHINE_TYPE" != "c4-standard-16-lssd" ]] \
+        || [[ "$WRITERS_CSV" != "8,16" ]]; }; then
+    echo "v8-point-ack-d1 requires c4-standard-16-lssd, writers 8,16, and 100000 operations" >&2
+    exit 64
+fi
+if [[ "$SUITE" == "v8-dedicated-durability-driver" ]] \
+    && { [[ "$NUM" != "100000" ]] || [[ "$MACHINE_TYPE" != "c4-standard-16-lssd" ]] \
+        || [[ "$WRITERS_CSV" != "1,8,16" ]]; }; then
+    echo "D3a qualification requires c4-standard-16-lssd, writers 1,8,16, and 100000 operations" >&2
     exit 64
 fi
 if [[ "$SUITE" == "v8-point-cpu-attribution" ]] \
@@ -102,24 +218,80 @@ if [[ ! "$SAFE_DEADLINE_EPOCH" =~ ^[0-9]+$ ]] || (( SAFE_DEADLINE_EPOCH < 1 )); 
     echo "safe VM deadline must be a positive Unix epoch" >&2
     exit 64
 fi
-if [[ "$SUITE" == "commit-order-trace" || "$SUITE" == "v8-point-borrowed-input" ]] \
+if [[ "$SUITE" == "commit-order-trace" || "$SUITE" == "v8-point-borrowed-input" \
+    || "$SUITE" == "v8-point-ack-d1" ]] \
     && [[ ! "$SOURCE_PATCH_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
     echo "$SUITE requires a lowercase source patch SHA-256" >&2
     exit 64
 fi
-if [[ "$SUITE" != "commit-order-trace" && "$SUITE" != "v8-point-borrowed-input" ]] \
+if [[ "$SUITE" == "v8-dedicated-durability-driver" ]]; then
+    if [[ ! "$RUNNER_BUNDLE_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+        echo "D3b requires a lowercase runner bundle SHA-256" >&2
+        exit 64
+    fi
+elif [[ "$RUNNER_BUNDLE_SHA256" != "-" ]]; then
+    echo "runner bundle SHA-256 is only valid for D3b" >&2
+    exit 64
+fi
+if [[ "$SUITE" != "commit-order-trace" && "$SUITE" != "v8-point-borrowed-input" \
+    && "$SUITE" != "v8-point-ack-d1" ]] \
     && [[ "$SOURCE_PATCH_SHA256" != "-" ]]; then
     echo "source patch SHA-256 is only valid for commit-order-trace and v8-point-borrowed-input" >&2
     exit 64
 fi
-if [[ "$SUITE" == "v8-point-borrowed-input" ]]; then
+if [[ "$SUITE" == "v8-point-borrowed-input" || "$SUITE" == "v8-point-ack-d1" ]]; then
     if [[ ! "$BASELINE_COMMIT" =~ ^[0-9a-fA-F]{40}$ ]]; then
-        echo "v8-point-borrowed-input requires a full baseline commit SHA" >&2
+        echo "$SUITE requires a full baseline commit SHA" >&2
         exit 64
     fi
 elif [[ "$BASELINE_COMMIT" != "-" ]]; then
-    echo "baseline commit is only valid for v8-point-borrowed-input" >&2
+    echo "baseline commit is only valid for source A/B suites" >&2
     exit 64
+fi
+
+# Offline tests exercise the argument and suite guards without provisioning a VM.
+if [[ "${TOYKV_GCP_BENCH_VALIDATE_ONLY:-0}" == "1" ]]; then
+    exit 0
+fi
+
+if [[ "$SUITE" == "v8-dedicated-durability-driver" ]]; then
+    python3 - "$RUNNER_BUNDLE_SHA256" "$0" /tmp/gcp-v8-d3b-runner-bundle-verification.json <<'PY'
+import hashlib
+import json
+from pathlib import Path
+import sys
+
+expected_bundle_sha256, remote_script, receipt_path = sys.argv[1:]
+components = (
+    ("gcp-free-trial-wal-bench-remote.sh", remote_script),
+    ("gcp_wal_matrix.py", "/tmp/gcp_wal_matrix.py"),
+    ("gcp_v8_point_progress_ring_runner.py", "/tmp/gcp-v8-point-progress-ring-runner.py"),
+    ("gcp_v8_dedicated_durability_runner.py", "/tmp/gcp-v8-dedicated-durability-runner.py"),
+)
+bundle = hashlib.sha256()
+component_sha256 = {}
+for name, path_text in components:
+    path = Path(path_text)
+    contents = path.read_bytes()
+    component_sha256[name] = hashlib.sha256(contents).hexdigest()
+    bundle.update(name.encode("utf-8"))
+    bundle.update(b"\0")
+    bundle.update(contents)
+    bundle.update(b"\0")
+actual_bundle_sha256 = bundle.hexdigest()
+if actual_bundle_sha256 != expected_bundle_sha256:
+    raise SystemExit(
+        f"uploaded D3b runner bundle SHA-256 mismatch: expected {expected_bundle_sha256}, "
+        f"got {actual_bundle_sha256}"
+    )
+Path(receipt_path).write_text(json.dumps({
+    "schema_version": 1,
+    "verified": True,
+    "expected_bundle_sha256": expected_bundle_sha256,
+    "actual_bundle_sha256": actual_bundle_sha256,
+    "components": component_sha256,
+}, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+PY
 fi
 
 BOOT_LOG=/var/log/gcp-free-trial-wal-bench.log
@@ -198,6 +370,10 @@ mkfs.ext4 -F -m 0 -E lazy_itable_init=0,lazy_journal_init=0 "$WAL_DEVICE"
 mount -o noatime "$WAL_DEVICE" /mnt/gcp-wal-bench
 mkdir -p "$RESULTS" "$WORK"
 chown -R bench:bench /mnt/gcp-wal-bench
+if [[ "$SUITE" == "v8-dedicated-durability-driver" ]]; then
+    install -o bench -g bench -m 0644 /tmp/gcp-v8-d3b-runner-bundle-verification.json \
+        "$RESULTS/runner-bundle-verification.json"
+fi
 exec > >(tee -a "$RESULTS/setup.log") 2>&1
 
 cat >"$RESULTS/host.txt" <<EOF
@@ -241,6 +417,7 @@ runuser -u bench -- env \
     BENCH_WRITERS="$WRITERS_CSV" \
     BENCH_SUITE="$SUITE" \
     BENCH_SOURCE_PATCH_SHA256="$SOURCE_PATCH_SHA256" \
+    BENCH_RUNNER_BUNDLE_SHA256="$RUNNER_BUNDLE_SHA256" \
     BENCH_BASELINE_COMMIT="$BASELINE_COMMIT" \
     BENCH_REPETITIONS="${REPETITIONS:-1}" \
     BENCH_BOOT_LOG="$BOOT_LOG" \
@@ -301,6 +478,92 @@ printf '%s\n' "$ACTUAL_COMMIT" >"$BENCH_RESULTS/commit.txt"
 printf '%s\n' "$TOOLCHAIN" >"$BENCH_RESULTS/rust-toolchain.txt"
 printf '%s\n' "$BINARY_SHA256" >"$BENCH_RESULTS/write-perf.sha256"
 cp "$REPO/rust-toolchain" "$BENCH_RESULTS/rust-toolchain.toml"
+
+if [[ "$BENCH_SUITE" == "v8-point-ack-d1" ]]; then
+    if [[ ! -r /tmp/gcp-v8-point-ack-d1-runner.py ]]; then
+        echo "D1 ACK A/B runner was not uploaded" >&2
+        exit 1
+    fi
+    CANDIDATE_BINARY="$BENCH_WORK/write-perf-d1-after"
+    BASELINE_BINARY="$BENCH_WORK/write-perf-d1-before"
+    cp "$BINARY" "$CANDIDATE_BINARY"
+    printf '%s\n' "$ACTUAL_COMMIT" >"$BENCH_RESULTS/candidate-commit.txt"
+    printf '%s\n' "$BINARY_SHA256" >"$BENCH_RESULTS/candidate-binary.sha256"
+
+    git -C "$REPO" fetch --depth=1 origin "$BENCH_BASELINE_COMMIT"
+    BASELINE_REPO="$BENCH_WORK/toy-kv-engine-d1-baseline"
+    git -C "$REPO" worktree add --quiet --detach "$BASELINE_REPO" FETCH_HEAD
+    BASELINE_ACTUAL="$(git -C "$BASELINE_REPO" rev-parse HEAD)"
+    if [[ "$BASELINE_ACTUAL" != "$BENCH_BASELINE_COMMIT" ]]; then
+        echo "checked out baseline $BASELINE_ACTUAL instead of $BENCH_BASELINE_COMMIT" >&2
+        exit 1
+    fi
+    BASELINE_TOOLCHAIN="$(sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$BASELINE_REPO/rust-toolchain")"
+    if [[ "$BASELINE_TOOLCHAIN" != "$TOOLCHAIN" ]]; then
+        echo "baseline and candidate Rust toolchains differ" >&2
+        exit 1
+    fi
+
+    git -C "$REPO" diff --binary "$BENCH_BASELINE_COMMIT" "$ACTUAL_COMMIT" -- \
+        kv-engine/src/wal/v8/leader.rs kv-engine/src/wal/v8/parallel.rs \
+        >"$BENCH_RESULTS/source.patch"
+    ACTUAL_SOURCE_PATCH_SHA256="$(sha256sum "$BENCH_RESULTS/source.patch" | cut -d' ' -f1)"
+    if [[ "$ACTUAL_SOURCE_PATCH_SHA256" != "$BENCH_SOURCE_PATCH_SHA256" ]]; then
+        echo "D1 source patch SHA-256 differs from the local experiment record" >&2
+        exit 1
+    fi
+    printf '%s\n' "$BENCH_BASELINE_COMMIT" >"$BENCH_RESULTS/baseline-commit.txt"
+    printf '%s\n' "$BENCH_SOURCE_PATCH_SHA256" >"$BENCH_RESULTS/source-patch.sha256"
+
+    (
+        cd "$BASELINE_REPO"
+        CARGO_TARGET_DIR="$REPO/target" cargo "+$TOOLCHAIN" build --locked --release \
+            --package kv-engine --features bench --bin write-perf
+    )
+    cp "$REPO/target/release/write-perf" "$BASELINE_BINARY"
+    BASELINE_BINARY_SHA256="$(sha256sum "$BASELINE_BINARY" | cut -d' ' -f1)"
+    printf '%s\n' "$BASELINE_BINARY_SHA256" >"$BENCH_RESULTS/baseline-binary.sha256"
+
+    cp /tmp/gcp-v8-point-ack-d1-runner.py "$REPO/scripts/gcp_v8_point_ack_d1_runner.py"
+    echo "WAL_BENCHMARK_STARTED $(date --iso-8601=seconds)" | tee -a "$BENCH_BOOT_LOG"
+    PYTHONPATH="$REPO/scripts${PYTHONPATH:+:$PYTHONPATH}" \
+        python3 "$REPO/scripts/gcp_v8_point_ack_d1_runner.py" \
+        --baseline-binary "$BASELINE_BINARY" --candidate-binary "$CANDIDATE_BINARY" \
+        --results-dir "$BENCH_RESULTS" --db-root "$BENCH_WORK/databases" \
+        --writers "$BENCH_WRITERS" --safe-deadline-epoch "$BENCH_SAFE_DEADLINE_EPOCH" \
+        --baseline-commit "$BENCH_BASELINE_COMMIT" --candidate-commit "$ACTUAL_COMMIT" \
+        --source-patch-sha256 "$BENCH_SOURCE_PATCH_SHA256" \
+        --baseline-binary-sha256 "$BASELINE_BINARY_SHA256" \
+        --candidate-binary-sha256 "$BINARY_SHA256" \
+        --machine-type "$BENCH_MACHINE_TYPE" --ssd-count "$BENCH_SSD_COUNT" \
+        --ssd-gib "$BENCH_SSD_TOTAL_GIB"
+    exit $?
+fi
+
+if [[ "$BENCH_SUITE" == "v8-dedicated-durability-driver" ]]; then
+    if [[ ! -r /tmp/gcp-v8-dedicated-durability-runner.py ]]; then
+        echo "D3a dedicated durability runner was not uploaded" >&2
+        exit 1
+    fi
+    cp /tmp/gcp-v8-dedicated-durability-runner.py \
+        "$REPO/scripts/gcp_v8_dedicated_durability_runner.py"
+    if [[ ! -r /tmp/gcp-v8-point-progress-ring-runner.py ]]; then
+        echo "D3b progress-ring helper was not uploaded" >&2
+        exit 1
+    fi
+    cp /tmp/gcp-v8-point-progress-ring-runner.py \
+        "$REPO/scripts/gcp_v8_point_progress_ring_runner.py"
+    echo "WAL_BENCHMARK_STARTED $(date --iso-8601=seconds)" | tee -a "$BENCH_BOOT_LOG"
+    PYTHONPATH="$REPO/scripts${PYTHONPATH:+:$PYTHONPATH}" \
+        python3 "$REPO/scripts/gcp_v8_dedicated_durability_runner.py" \
+        --binary "$BINARY" --binary-sha256 "$BINARY_SHA256" --commit "$ACTUAL_COMMIT" \
+        --results-dir "$BENCH_RESULTS" --db-root "$BENCH_WORK/databases" \
+        --writers "$BENCH_WRITERS" --safe-deadline-epoch "$BENCH_SAFE_DEADLINE_EPOCH" \
+        --machine-type "$BENCH_MACHINE_TYPE" --ssd-count "$BENCH_SSD_COUNT" \
+        --ssd-gib "$BENCH_SSD_TOTAL_GIB" \
+        --runner-bundle-sha256 "$BENCH_RUNNER_BUNDLE_SHA256"
+    exit $?
+fi
 
 if [[ "$BENCH_SUITE" == "v8-point-borrowed-input" ]]; then
     if [[ ! -r /tmp/gcp-v8-point-borrowed-input-runner.py ]]; then
@@ -377,6 +640,287 @@ if [[ "$BENCH_SUITE" == "v8-point-direct-frame" ]]; then
         --ssd-count "$BENCH_SSD_COUNT" \
         --ssd-gib "$BENCH_SSD_TOTAL_GIB" \
         --repetitions "$BENCH_REPETITIONS"
+    exit $?
+fi
+
+if [[ "$BENCH_SUITE" == "v7-v8-point-preallocation" ]]; then
+    if [[ ! -r /tmp/gcp-v8-point-progress-ring-runner.py ]]; then
+        echo "point-preallocation runner was not uploaded" >&2
+        exit 1
+    fi
+    cp /tmp/gcp-v8-point-progress-ring-runner.py "$REPO/scripts/gcp_v8_point_progress_ring_runner.py"
+    echo "WAL_BENCHMARK_STARTED $(date --iso-8601=seconds)" | tee -a "$BENCH_BOOT_LOG"
+    PYTHONPATH="$REPO/scripts${PYTHONPATH:+:$PYTHONPATH}" \
+        python3 "$REPO/scripts/gcp_v8_point_progress_ring_runner.py" \
+        --binary "$BINARY" \
+        --results-dir "$BENCH_RESULTS" \
+        --db-root "$BENCH_WORK/databases" \
+        --writers "$BENCH_WRITERS" \
+        --safe-deadline-epoch "$BENCH_SAFE_DEADLINE_EPOCH" \
+        --commit "$ACTUAL_COMMIT" \
+        --binary-sha256 "$BINARY_SHA256" \
+        --machine-type "$BENCH_MACHINE_TYPE" \
+        --ssd-count "$BENCH_SSD_COUNT" \
+        --ssd-gib "$BENCH_SSD_TOTAL_GIB" \
+        --candidate-mode v7-v8-point-preallocation
+    exit $?
+fi
+
+if [[ "$BENCH_SUITE" == "v7-v8-ready-target-final" || "$BENCH_SUITE" == "v8-d2-qualification" || "$BENCH_SUITE" == "v8-equal-throughput" ]]; then
+    if [[ ! -r /tmp/gcp-v8-point-progress-ring-runner.py ]]; then
+        echo "V7/V8 qualification runner was not uploaded" >&2
+        exit 1
+    fi
+    cp /tmp/gcp-v8-point-progress-ring-runner.py "$REPO/scripts/gcp_v8_point_progress_ring_runner.py"
+    echo "WAL_BENCHMARK_STARTED $(date --iso-8601=seconds)" | tee -a "$BENCH_BOOT_LOG"
+    PYTHONPATH="$REPO/scripts${PYTHONPATH:+:$PYTHONPATH}" \
+        python3 "$REPO/scripts/gcp_v8_point_progress_ring_runner.py" \
+        --binary "$BINARY" \
+        --results-dir "$BENCH_RESULTS" \
+        --db-root "$BENCH_WORK/databases" \
+        --writers "$BENCH_WRITERS" \
+        --safe-deadline-epoch "$BENCH_SAFE_DEADLINE_EPOCH" \
+        --commit "$ACTUAL_COMMIT" \
+        --binary-sha256 "$BINARY_SHA256" \
+        --machine-type "$BENCH_MACHINE_TYPE" \
+        --ssd-count "$BENCH_SSD_COUNT" \
+        --ssd-gib "$BENCH_SSD_TOTAL_GIB" \
+        --candidate-mode "$BENCH_SUITE"
+    exit $?
+fi
+
+if [[ "$BENCH_SUITE" == "v8-point-resource-retirement" || \
+    "$BENCH_SUITE" == "v8-point-resource-retirement-stage-a" ]]; then
+    if [[ ! -r /tmp/gcp-v8-point-progress-ring-runner.py ]]; then
+        echo "point resource-retirement runner was not uploaded" >&2
+        exit 1
+    fi
+    cp /tmp/gcp-v8-point-progress-ring-runner.py "$REPO/scripts/gcp_v8_point_progress_ring_runner.py"
+    echo "WAL_BENCHMARK_STARTED $(date --iso-8601=seconds)" | tee -a "$BENCH_BOOT_LOG"
+    RETIREMENT_CANDIDATE_MODE="point-resource-retirement"
+    if [[ "$BENCH_SUITE" == "v8-point-resource-retirement-stage-a" ]]; then
+        RETIREMENT_CANDIDATE_MODE="point-resource-retirement-stage-a"
+    fi
+    PYTHONPATH="$REPO/scripts${PYTHONPATH:+:$PYTHONPATH}" \
+        python3 "$REPO/scripts/gcp_v8_point_progress_ring_runner.py" \
+        --binary "$BINARY" \
+        --results-dir "$BENCH_RESULTS" \
+        --db-root "$BENCH_WORK/databases" \
+        --writers "$BENCH_WRITERS" \
+        --safe-deadline-epoch "$BENCH_SAFE_DEADLINE_EPOCH" \
+        --commit "$ACTUAL_COMMIT" \
+        --binary-sha256 "$BINARY_SHA256" \
+        --machine-type "$BENCH_MACHINE_TYPE" \
+        --ssd-count "$BENCH_SSD_COUNT" \
+        --ssd-gib "$BENCH_SSD_TOTAL_GIB" \
+        --candidate-mode "$RETIREMENT_CANDIDATE_MODE"
+    exit $?
+fi
+
+if [[ "$BENCH_SUITE" == "v8-point-progress-cursor" ]]; then
+    if [[ ! -r /tmp/gcp-v8-point-progress-ring-runner.py ]]; then
+        echo "progress-cursor runner was not uploaded" >&2
+        exit 1
+    fi
+    cp /tmp/gcp-v8-point-progress-ring-runner.py "$REPO/scripts/gcp_v8_point_progress_ring_runner.py"
+    echo "WAL_BENCHMARK_STARTED $(date --iso-8601=seconds)" | tee -a "$BENCH_BOOT_LOG"
+    PYTHONPATH="$REPO/scripts${PYTHONPATH:+:$PYTHONPATH}" \
+        python3 "$REPO/scripts/gcp_v8_point_progress_ring_runner.py" \
+        --binary "$BINARY" \
+        --results-dir "$BENCH_RESULTS" \
+        --db-root "$BENCH_WORK/databases" \
+        --writers "$BENCH_WRITERS" \
+        --safe-deadline-epoch "$BENCH_SAFE_DEADLINE_EPOCH" \
+        --commit "$ACTUAL_COMMIT" \
+        --binary-sha256 "$BINARY_SHA256" \
+        --machine-type "$BENCH_MACHINE_TYPE" \
+        --ssd-count "$BENCH_SSD_COUNT" \
+        --ssd-gib "$BENCH_SSD_TOTAL_GIB" \
+        --candidate-mode cursor
+    exit $?
+fi
+
+if [[ "$BENCH_SUITE" == "v8-cursor-direct-completion" ]]; then
+    if [[ ! -r /tmp/gcp-v8-point-progress-ring-runner.py ]]; then
+        echo "cursor direct-completion runner was not uploaded" >&2
+        exit 1
+    fi
+    cp /tmp/gcp-v8-point-progress-ring-runner.py "$REPO/scripts/gcp_v8_point_progress_ring_runner.py"
+    echo "WAL_BENCHMARK_STARTED $(date --iso-8601=seconds)" | tee -a "$BENCH_BOOT_LOG"
+    PYTHONPATH="$REPO/scripts${PYTHONPATH:+:$PYTHONPATH}" \
+        python3 "$REPO/scripts/gcp_v8_point_progress_ring_runner.py" \
+        --binary "$BINARY" \
+        --results-dir "$BENCH_RESULTS" \
+        --db-root "$BENCH_WORK/databases" \
+        --writers "$BENCH_WRITERS" \
+        --safe-deadline-epoch "$BENCH_SAFE_DEADLINE_EPOCH" \
+        --commit "$ACTUAL_COMMIT" \
+        --binary-sha256 "$BINARY_SHA256" \
+        --machine-type "$BENCH_MACHINE_TYPE" \
+        --ssd-count "$BENCH_SSD_COUNT" \
+        --ssd-gib "$BENCH_SSD_TOTAL_GIB" \
+        --candidate-mode direct-completion
+    exit $?
+fi
+
+if [[ "$BENCH_SUITE" == "v8-cursor-direct-completion-wake" ]]; then
+    if [[ ! -r /tmp/gcp-v8-point-progress-ring-runner.py ]]; then
+        echo "cursor direct-completion wake runner was not uploaded" >&2
+        exit 1
+    fi
+    cp /tmp/gcp-v8-point-progress-ring-runner.py "$REPO/scripts/gcp_v8_point_progress_ring_runner.py"
+    echo "WAL_BENCHMARK_STARTED $(date --iso-8601=seconds)" | tee -a "$BENCH_BOOT_LOG"
+    PYTHONPATH="$REPO/scripts${PYTHONPATH:+:$PYTHONPATH}" \
+        python3 "$REPO/scripts/gcp_v8_point_progress_ring_runner.py" \
+        --binary "$BINARY" \
+        --results-dir "$BENCH_RESULTS" \
+        --db-root "$BENCH_WORK/databases" \
+        --writers "$BENCH_WRITERS" \
+        --safe-deadline-epoch "$BENCH_SAFE_DEADLINE_EPOCH" \
+        --commit "$ACTUAL_COMMIT" \
+        --binary-sha256 "$BINARY_SHA256" \
+        --machine-type "$BENCH_MACHINE_TYPE" \
+        --ssd-count "$BENCH_SSD_COUNT" \
+        --ssd-gib "$BENCH_SSD_TOTAL_GIB" \
+        --candidate-mode completion-wake
+    exit $?
+fi
+
+if [[ "$BENCH_SUITE" == "v8-cursor-singleton-submission" ]]; then
+    if [[ ! -r /tmp/gcp-v8-point-progress-ring-runner.py ]]; then
+        echo "cursor singleton-submission runner was not uploaded" >&2
+        exit 1
+    fi
+    cp /tmp/gcp-v8-point-progress-ring-runner.py "$REPO/scripts/gcp_v8_point_progress_ring_runner.py"
+    echo "WAL_BENCHMARK_STARTED $(date --iso-8601=seconds)" | tee -a "$BENCH_BOOT_LOG"
+    PYTHONPATH="$REPO/scripts${PYTHONPATH:+:$PYTHONPATH}" \
+        python3 "$REPO/scripts/gcp_v8_point_progress_ring_runner.py" \
+        --binary "$BINARY" \
+        --results-dir "$BENCH_RESULTS" \
+        --db-root "$BENCH_WORK/databases" \
+        --writers "$BENCH_WRITERS" \
+        --safe-deadline-epoch "$BENCH_SAFE_DEADLINE_EPOCH" \
+        --commit "$ACTUAL_COMMIT" \
+        --binary-sha256 "$BINARY_SHA256" \
+        --machine-type "$BENCH_MACHINE_TYPE" \
+        --ssd-count "$BENCH_SSD_COUNT" \
+        --ssd-gib "$BENCH_SSD_TOTAL_GIB" \
+        --candidate-mode singleton-submission
+    exit $?
+fi
+
+if [[ "$BENCH_SUITE" == "v8-cursor-coalescing-budget" ]]; then
+    if [[ ! -r /tmp/gcp-v8-point-progress-ring-runner.py ]]; then
+        echo "cursor coalescing-budget runner was not uploaded" >&2
+        exit 1
+    fi
+    cp /tmp/gcp-v8-point-progress-ring-runner.py "$REPO/scripts/gcp_v8_point_progress_ring_runner.py"
+    echo "WAL_BENCHMARK_STARTED $(date --iso-8601=seconds)" | tee -a "$BENCH_BOOT_LOG"
+    PYTHONPATH="$REPO/scripts${PYTHONPATH:+:$PYTHONPATH}" \
+        python3 "$REPO/scripts/gcp_v8_point_progress_ring_runner.py" \
+        --binary "$BINARY" \
+        --results-dir "$BENCH_RESULTS" \
+        --db-root "$BENCH_WORK/databases" \
+        --writers "$BENCH_WRITERS" \
+        --safe-deadline-epoch "$BENCH_SAFE_DEADLINE_EPOCH" \
+        --commit "$ACTUAL_COMMIT" \
+        --binary-sha256 "$BINARY_SHA256" \
+        --machine-type "$BENCH_MACHINE_TYPE" \
+        --ssd-count "$BENCH_SSD_COUNT" \
+        --ssd-gib "$BENCH_SSD_TOTAL_GIB" \
+        --candidate-mode coalescing-budget
+    exit $?
+fi
+
+if [[ "$BENCH_SUITE" == "v8-cursor-coalescing-ready-target" ]]; then
+    if [[ ! -r /tmp/gcp-v8-point-progress-ring-runner.py ]]; then
+        echo "cursor coalescing ready-target runner was not uploaded" >&2
+        exit 1
+    fi
+    cp /tmp/gcp-v8-point-progress-ring-runner.py "$REPO/scripts/gcp_v8_point_progress_ring_runner.py"
+    echo "WAL_BENCHMARK_STARTED $(date --iso-8601=seconds)" | tee -a "$BENCH_BOOT_LOG"
+    PYTHONPATH="$REPO/scripts${PYTHONPATH:+:$PYTHONPATH}" \
+        python3 "$REPO/scripts/gcp_v8_point_progress_ring_runner.py" \
+        --binary "$BINARY" \
+        --results-dir "$BENCH_RESULTS" \
+        --db-root "$BENCH_WORK/databases" \
+        --writers "$BENCH_WRITERS" \
+        --safe-deadline-epoch "$BENCH_SAFE_DEADLINE_EPOCH" \
+        --commit "$ACTUAL_COMMIT" \
+        --binary-sha256 "$BINARY_SHA256" \
+        --machine-type "$BENCH_MACHINE_TYPE" \
+        --ssd-count "$BENCH_SSD_COUNT" \
+        --ssd-gib "$BENCH_SSD_TOTAL_GIB" \
+        --candidate-mode coalescing-ready-target
+    exit $?
+fi
+
+if [[ "$BENCH_SUITE" == "v8-cursor-coalescing-ready-target-scan" ]]; then
+    if [[ ! -r /tmp/gcp-v8-point-progress-ring-runner.py ]]; then
+        echo "cursor coalescing ready-target scan runner was not uploaded" >&2
+        exit 1
+    fi
+    cp /tmp/gcp-v8-point-progress-ring-runner.py "$REPO/scripts/gcp_v8_point_progress_ring_runner.py"
+    echo "WAL_BENCHMARK_STARTED $(date --iso-8601=seconds)" | tee -a "$BENCH_BOOT_LOG"
+    PYTHONPATH="$REPO/scripts${PYTHONPATH:+:$PYTHONPATH}" \
+        python3 "$REPO/scripts/gcp_v8_point_progress_ring_runner.py" \
+        --binary "$BINARY" \
+        --results-dir "$BENCH_RESULTS" \
+        --db-root "$BENCH_WORK/databases" \
+        --writers "$BENCH_WRITERS" \
+        --safe-deadline-epoch "$BENCH_SAFE_DEADLINE_EPOCH" \
+        --commit "$ACTUAL_COMMIT" \
+        --binary-sha256 "$BINARY_SHA256" \
+        --machine-type "$BENCH_MACHINE_TYPE" \
+        --ssd-count "$BENCH_SSD_COUNT" \
+        --ssd-gib "$BENCH_SSD_TOTAL_GIB" \
+        --candidate-mode coalescing-ready-target-scan
+    exit $?
+fi
+
+if [[ "$BENCH_SUITE" == "v8-cursor-coalescing-ready-target-small-scan" ]]; then
+    if [[ ! -r /tmp/gcp-v8-point-progress-ring-runner.py ]]; then
+        echo "cursor coalescing small ready-target scan runner was not uploaded" >&2
+        exit 1
+    fi
+    cp /tmp/gcp-v8-point-progress-ring-runner.py "$REPO/scripts/gcp_v8_point_progress_ring_runner.py"
+    echo "WAL_BENCHMARK_STARTED $(date --iso-8601=seconds)" | tee -a "$BENCH_BOOT_LOG"
+    PYTHONPATH="$REPO/scripts${PYTHONPATH:+:$PYTHONPATH}" \
+        python3 "$REPO/scripts/gcp_v8_point_progress_ring_runner.py" \
+        --binary "$BINARY" \
+        --results-dir "$BENCH_RESULTS" \
+        --db-root "$BENCH_WORK/databases" \
+        --writers "$BENCH_WRITERS" \
+        --safe-deadline-epoch "$BENCH_SAFE_DEADLINE_EPOCH" \
+        --commit "$ACTUAL_COMMIT" \
+        --binary-sha256 "$BINARY_SHA256" \
+        --machine-type "$BENCH_MACHINE_TYPE" \
+        --ssd-count "$BENCH_SSD_COUNT" \
+        --ssd-gib "$BENCH_SSD_TOTAL_GIB" \
+        --candidate-mode coalescing-ready-target-small-scan
+    exit $?
+fi
+
+if [[ "$BENCH_SUITE" == "v8-cursor-publication" ]]; then
+    if [[ ! -r /tmp/gcp-v8-point-progress-ring-runner.py ]]; then
+        echo "cursor-publication runner was not uploaded" >&2
+        exit 1
+    fi
+    cp /tmp/gcp-v8-point-progress-ring-runner.py "$REPO/scripts/gcp_v8_point_progress_ring_runner.py"
+    echo "WAL_BENCHMARK_STARTED $(date --iso-8601=seconds)" | tee -a "$BENCH_BOOT_LOG"
+    PYTHONPATH="$REPO/scripts${PYTHONPATH:+:$PYTHONPATH}" \
+        python3 "$REPO/scripts/gcp_v8_point_progress_ring_runner.py" \
+        --binary "$BINARY" \
+        --results-dir "$BENCH_RESULTS" \
+        --db-root "$BENCH_WORK/databases" \
+        --writers "$BENCH_WRITERS" \
+        --safe-deadline-epoch "$BENCH_SAFE_DEADLINE_EPOCH" \
+        --commit "$ACTUAL_COMMIT" \
+        --binary-sha256 "$BINARY_SHA256" \
+        --machine-type "$BENCH_MACHINE_TYPE" \
+        --ssd-count "$BENCH_SSD_COUNT" \
+        --ssd-gib "$BENCH_SSD_TOTAL_GIB" \
+        --candidate-mode cursor-publication
     exit $?
 fi
 

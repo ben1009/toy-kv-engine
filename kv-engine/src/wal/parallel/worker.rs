@@ -28,6 +28,7 @@ use crossbeam_queue::ArrayQueue;
 use parking_lot::{Condvar, Mutex};
 
 use super::{BUFFER_POOL_BUF_SIZE, DirectBuf, MAX_WAL_FILE_SIZE, RING_SIZE, WAL_FD_INDEX};
+use crate::wal::v8::parallel::WalV8WorkerCompletionHandle;
 
 /// Benchmark-only observations shared by the WAL worker and sync coordinator.
 /// Production builds keep this as a zero-sized no-op.
@@ -537,6 +538,11 @@ impl WalSyncProgress {
         if result.error.is_none()
             && let Some(profile) = self.profile()
         {
+            if profile.wal_worker_group_size_histogram_enabled() {
+                profile.record_wal_worker_group(
+                    result.tickets.end.saturating_sub(result.tickets.start),
+                );
+            }
             if !self.suppress_commit_group_metrics.load(Ordering::Relaxed) {
                 profile.record_wal_commit_group(result.write_count, result.write_bytes);
             }
@@ -1162,6 +1168,138 @@ pub(crate) struct GroupWriteResult {
     pub(crate) write_count: u64,
     pub(crate) write_bytes: u64,
     pub(crate) error: Option<String>,
+}
+
+/// Completion envelope used only by the Cursor direct-delivery experiment.
+/// The I/O worker publishes it to a bounded queue without waiting for the
+/// durability driver; the driver remains responsible for validating and
+/// applying the result.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DirectGroupWriteCompletion {
+    pub(crate) result: GroupWriteResult,
+    #[cfg(feature = "bench")]
+    pub(crate) completion_observed_at: Option<Instant>,
+}
+
+#[derive(Clone)]
+enum WorkerCompletionSender {
+    Relay(Sender<GroupWriteResult>),
+    CursorDirect {
+        sender: Sender<DirectGroupWriteCompletion>,
+        handle: WalV8WorkerCompletionHandle,
+    },
+}
+
+struct WorkerCompletionConfig {
+    sender: WorkerCompletionSender,
+    receiver: Option<Receiver<GroupWriteResult>>,
+    failure_events: Option<Sender<GroupWriteResult>>,
+    #[cfg(test)]
+    group_limit: Option<usize>,
+}
+
+impl WorkerCompletionSender {
+    fn supports_completion_timeline(&self) -> bool {
+        !matches!(self, Self::CursorDirect { .. })
+    }
+
+    fn fail_stop_after_delivery_error(&self) -> bool {
+        matches!(self, Self::CursorDirect { .. })
+    }
+
+    fn send(&self, result: GroupWriteResult) -> Result<()> {
+        match self {
+            Self::Relay(sender) => sender
+                .send(result)
+                .map_err(|error| anyhow!("WAL worker completion receiver stopped: {error}")),
+            Self::CursorDirect { sender, handle } => {
+                if let Some(error) = &result.error {
+                    bail!("WAL DATA worker reported terminal failure: {error}");
+                }
+                #[cfg(feature = "chaos-testing")]
+                crate::chaos::failpoint::wal_crash_point("wal_v8.parallel.after_data_write");
+
+                let event = DirectGroupWriteCompletion {
+                    result,
+                    #[cfg(feature = "bench")]
+                    completion_observed_at: handle.capture_data_completion_time(),
+                };
+                sender.try_send(event).map_err(|error| {
+                    anyhow!("Cursor direct completion queue overflow or disconnect: {error}")
+                })?;
+                handle.notify_completion_queued()?;
+                Ok(())
+            }
+        }
+    }
+
+    /// Terminal cleanup runs after a failure has already stopped normal
+    /// delivery. Relay users retain the historical error events; Cursor direct
+    /// delivery relies on the worker exit guard to poison after cleanup.
+    fn send_terminal(&self, result: GroupWriteResult) {
+        match self {
+            Self::Relay(sender) => {
+                let _ = sender.send(result);
+            }
+            Self::CursorDirect { .. } => {}
+        }
+    }
+
+    fn failure_handle(&self) -> Option<WalV8WorkerCompletionHandle> {
+        match self {
+            Self::Relay(_) => None,
+            Self::CursorDirect { handle, .. } => Some(handle.clone()),
+        }
+    }
+}
+
+struct WorkerCompletionExitGuard {
+    slots: Arc<GroupSlots>,
+    failure_handle: Option<WalV8WorkerCompletionHandle>,
+    // Keep the direct completion channel connected until failure cleanup and
+    // terminal poison publication have completed.
+    _completion_sender_keepalive: Option<WorkerCompletionSender>,
+    completed: bool,
+    failure_reported: bool,
+}
+
+impl WorkerCompletionExitGuard {
+    fn new(
+        slots: Arc<GroupSlots>,
+        failure_handle: Option<WalV8WorkerCompletionHandle>,
+        completion_sender_keepalive: Option<WorkerCompletionSender>,
+    ) -> Self {
+        Self {
+            slots,
+            failure_handle,
+            _completion_sender_keepalive: completion_sender_keepalive,
+            completed: false,
+            failure_reported: false,
+        }
+    }
+
+    fn complete(&mut self) {
+        self.completed = true;
+    }
+
+    fn failure_reported(&mut self) {
+        self.failure_reported = true;
+    }
+}
+
+impl Drop for WorkerCompletionExitGuard {
+    fn drop(&mut self) {
+        if self.completed || self.failure_handle.is_none() {
+            return;
+        }
+
+        close_group_admission(&self.slots);
+        if !self.failure_reported
+            && let Some(handle) = &self.failure_handle
+        {
+            handle.worker_failed_after_cleanup();
+        }
+    }
 }
 
 /// Single-owner submission and completion state used by the dedicated writer.
@@ -1903,6 +2041,52 @@ struct SlotState {
 struct GroupSlots {
     state: Mutex<SlotState>,
     available: Condvar,
+    #[cfg(test)]
+    limit: usize,
+}
+
+impl GroupSlots {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(SlotState {
+                active_groups: 0,
+                next_group_id: 0,
+                closed: false,
+            }),
+            available: Condvar::new(),
+            #[cfg(test)]
+            limit: MAX_INFLIGHT_GROUPS,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_limit(limit: usize) -> Self {
+        assert!(limit > 0, "WAL worker group-slot limit must be nonzero");
+        assert!(
+            limit <= MAX_INFLIGHT_GROUPS,
+            "WAL worker group-slot limit exceeds its core bound"
+        );
+        Self {
+            state: Mutex::new(SlotState {
+                active_groups: 0,
+                next_group_id: 0,
+                closed: false,
+            }),
+            available: Condvar::new(),
+            limit,
+        }
+    }
+
+    fn limit(&self) -> usize {
+        #[cfg(test)]
+        {
+            self.limit
+        }
+        #[cfg(not(test))]
+        {
+            MAX_INFLIGHT_GROUPS
+        }
+    }
 }
 
 struct GroupPermit {
@@ -2043,7 +2227,7 @@ pub(crate) struct IoWorker<B: WorkerBuffer = DirectBuf> {
     wake: Arc<WorkerWake>,
     sync_progress: Arc<WalSyncProgress>,
     completions: Option<Receiver<GroupWriteResult>>,
-    failure_events: Sender<GroupWriteResult>,
+    failure_events: Option<Sender<GroupWriteResult>>,
     join: Option<JoinHandle<Result<()>>>,
     shutdown_sent: bool,
 }
@@ -2203,27 +2387,114 @@ impl<B: WorkerBuffer> IoWorker<B> {
         async_write_min_bytes: Option<usize>,
         allow_out_of_order_groups: bool,
     ) -> Result<Self> {
-        let (command_tx, command_rx) = unbounded();
         let (completion_tx, completion_rx) = unbounded::<GroupWriteResult>();
         let failure_events = completion_tx.clone();
+        Self::spawn_with_completion_sender(
+            wal_file,
+            buffer_pool,
+            async_write_min_bytes,
+            allow_out_of_order_groups,
+            WorkerCompletionConfig {
+                sender: WorkerCompletionSender::Relay(completion_tx),
+                receiver: Some(completion_rx),
+                failure_events: Some(failure_events),
+                #[cfg(test)]
+                group_limit: None,
+            },
+        )
+    }
+
+    pub(crate) fn spawn_cursor_direct_completions(
+        wal_file: Arc<File>,
+        buffer_pool: Arc<ArrayQueue<B>>,
+        async_write_min_bytes: Option<usize>,
+        allow_out_of_order_groups: bool,
+        completion_tx: Sender<DirectGroupWriteCompletion>,
+        completion_handle: WalV8WorkerCompletionHandle,
+    ) -> Result<Self> {
+        Self::spawn_with_completion_sender(
+            wal_file,
+            buffer_pool,
+            async_write_min_bytes,
+            allow_out_of_order_groups,
+            WorkerCompletionConfig {
+                sender: WorkerCompletionSender::CursorDirect {
+                    sender: completion_tx,
+                    handle: completion_handle,
+                },
+                receiver: None,
+                failure_events: None,
+                #[cfg(test)]
+                group_limit: None,
+            },
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn spawn_cursor_direct_completions_with_group_limit(
+        wal_file: Arc<File>,
+        buffer_pool: Arc<ArrayQueue<B>>,
+        async_write_min_bytes: Option<usize>,
+        allow_out_of_order_groups: bool,
+        completion_tx: Sender<DirectGroupWriteCompletion>,
+        completion_handle: WalV8WorkerCompletionHandle,
+        group_limit: usize,
+    ) -> Result<Self> {
+        Self::spawn_with_completion_sender(
+            wal_file,
+            buffer_pool,
+            async_write_min_bytes,
+            allow_out_of_order_groups,
+            WorkerCompletionConfig {
+                sender: WorkerCompletionSender::CursorDirect {
+                    sender: completion_tx,
+                    handle: completion_handle,
+                },
+                receiver: None,
+                failure_events: None,
+                group_limit: Some(group_limit),
+            },
+        )
+    }
+
+    fn spawn_with_completion_sender(
+        wal_file: Arc<File>,
+        buffer_pool: Arc<ArrayQueue<B>>,
+        async_write_min_bytes: Option<usize>,
+        allow_out_of_order_groups: bool,
+        completion: WorkerCompletionConfig,
+    ) -> Result<Self> {
+        let completion_sender = completion.sender;
+        let completion_receiver = completion.receiver;
+        let failure_events = completion.failure_events;
+        #[cfg(test)]
+        let group_limit = completion.group_limit;
+
+        let (command_tx, command_rx) = unbounded();
         let (startup_tx, startup_rx) = bounded::<Result<()>>(1);
-        let slots = Arc::new(GroupSlots {
-            state: Mutex::new(SlotState {
-                active_groups: 0,
-                next_group_id: 0,
-                closed: false,
-            }),
-            available: Condvar::new(),
-        });
+        #[cfg(test)]
+        let slots = Arc::new(group_limit.map_or_else(GroupSlots::new, GroupSlots::with_limit));
+        #[cfg(not(test))]
+        let slots = Arc::new(GroupSlots::new());
         let worker_slots = Arc::clone(&slots);
         let sync_progress = Arc::new(WalSyncProgress::default());
         let worker_sync_progress = Arc::clone(&sync_progress);
         let worker_file = Arc::clone(&wal_file);
         let wake = Arc::new(WorkerWake::new().context("failed to create WAL worker wakeup")?);
         let worker_wake = Arc::clone(&wake);
+        let failure_slots = Arc::clone(&slots);
+        let worker_failure_handle = completion_sender.failure_handle();
         let join = thread::Builder::new()
             .name("wal-io-worker".to_owned())
             .spawn(move || {
+                let completion_sender_keepalive = worker_failure_handle
+                    .as_ref()
+                    .map(|_| completion_sender.clone());
+                let mut exit_guard = WorkerCompletionExitGuard::new(
+                    failure_slots,
+                    worker_failure_handle.clone(),
+                    completion_sender_keepalive,
+                );
                 #[cfg(all(feature = "bench", target_os = "linux"))]
                 let bench_io_affinity = match configure_bench_io_worker_affinity() {
                     Ok(affinity) => affinity,
@@ -2278,38 +2549,55 @@ impl<B: WorkerBuffer> IoWorker<B> {
                     .send(Ok(()))
                     .map_err(|_| anyhow!("WAL worker startup receiver was dropped"))?;
 
-                run_worker(
+                let result = run_worker(
                     &mut ring,
                     buffer_pool,
                     command_rx,
-                    completion_tx,
+                    completion_sender,
                     worker_slots,
                     &worker_wake,
                     worker_sync_progress,
                     async_write_min_bytes,
                     allow_out_of_order_groups,
-                )
+                );
+                match &result {
+                    Ok(()) => exit_guard.complete(),
+                    Err(_) => {
+                        if let Some(handle) = &worker_failure_handle {
+                            handle.worker_failed_after_cleanup();
+                            exit_guard.failure_reported();
+                        }
+                    }
+                }
+                result
             })
             .context("failed to spawn WAL I/O worker")?;
 
-        match startup_rx
-            .recv()
-            .context("WAL worker exited during startup")?
-        {
-            Ok(()) => Ok(Self {
+        match startup_rx.recv() {
+            Ok(Ok(())) => Ok(Self {
                 commands: command_tx,
                 slots,
                 wake,
                 sync_progress,
-                completions: Some(completion_rx),
+                completions: completion_receiver,
                 failure_events,
                 join: Some(join),
                 shutdown_sent: false,
             }),
-            Err(error) => {
+            Ok(Err(error)) => {
                 let _ = join.join();
                 Err(error).context("failed to start WAL I/O worker")
             }
+            Err(receive_error) => match join.join() {
+                Ok(Err(worker_error)) => Err(worker_error)
+                    .context("WAL worker exited before reporting its startup result"),
+                Err(_) => Err(anyhow!(
+                    "WAL worker panicked before reporting its startup result: {receive_error}"
+                )),
+                Ok(Ok(())) => Err(anyhow!(
+                    "WAL worker exited before reporting its startup result: {receive_error}"
+                )),
+            },
         }
     }
 
@@ -2340,13 +2628,30 @@ impl<B: WorkerBuffer> IoWorker<B> {
     }
 
     pub(crate) fn failure_sender(&self) -> Sender<GroupWriteResult> {
-        self.failure_events.clone()
+        self.failure_events
+            .clone()
+            .expect("failure events are unavailable for direct Cursor completion delivery")
     }
 
     pub(crate) fn completions(&self) -> &Receiver<GroupWriteResult> {
         self.completions
             .as_ref()
             .expect("WAL worker completions were transferred")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_group_count_for_test(&self) -> usize {
+        self.slots.state.lock().active_groups
+    }
+
+    #[cfg(test)]
+    pub(crate) fn group_slot_limit_for_test(&self) -> usize {
+        self.slots.limit()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn close_group_admission_for_test(&self) {
+        close_group_admission(&self.slots);
     }
 
     pub(crate) fn close(mut self) -> Result<()> {
@@ -2419,7 +2724,7 @@ impl<B: WorkerBuffer> IoWorkerClient<B> {
             );
         }
         let mut state = self.slots.state.lock();
-        while state.active_groups >= MAX_INFLIGHT_GROUPS && !state.closed {
+        while state.active_groups >= self.slots.limit() && !state.closed {
             self.slots.available.wait(&mut state);
         }
         ensure!(!state.closed, "WAL I/O worker is closed");
@@ -2484,7 +2789,7 @@ fn run_worker<B: WorkerBuffer>(
     ring: &mut io_uring::IoUring,
     buffer_pool: Arc<ArrayQueue<B>>,
     commands: Receiver<WorkerCommand<B>>,
-    completions: Sender<GroupWriteResult>,
+    completions: WorkerCompletionSender,
     slots: Arc<GroupSlots>,
     wake: &WorkerWake,
     sync_progress: Arc<WalSyncProgress>,
@@ -2518,7 +2823,7 @@ fn run_worker<B: WorkerBuffer>(
             let staged = ring_staged.iter().copied().collect::<Vec<_>>();
             if let Ok(events) = core.mark_ambiguous(&staged) {
                 let io_event = sync_progress.begin_io_event();
-                process_worker_events(
+                let _ = process_worker_events(
                     events,
                     &buffer_pool,
                     &mut group_permits,
@@ -2530,7 +2835,7 @@ fn run_worker<B: WorkerBuffer>(
         let reason = format!("WAL I/O worker stopped: {error:#}");
         fail_shutdown_reply(&mut shutdown_reply, &reason);
         for result in core.failed_group_results(&reason) {
-            let _ = completions.send(result);
+            completions.send_terminal(result);
         }
         for command in commands.try_iter() {
             match command {
@@ -2538,7 +2843,7 @@ fn run_worker<B: WorkerBuffer>(
                     let tickets = group.tickets.clone();
                     drop(group);
                     drop(permit);
-                    let _ = completions.send(GroupWriteResult {
+                    completions.send_terminal(GroupWriteResult {
                         group_id: id.0,
                         tickets,
                         write_count: 0,
@@ -2561,7 +2866,7 @@ fn run_worker_loop<B: WorkerBuffer>(
     ring: &mut io_uring::IoUring,
     buffer_pool: &ArrayQueue<B>,
     commands: &Receiver<WorkerCommand<B>>,
-    completions: &Sender<GroupWriteResult>,
+    completions: &WorkerCompletionSender,
     slots: &GroupSlots,
     wake: &WorkerWake,
     sync_progress: &WalSyncProgress,
@@ -2585,6 +2890,11 @@ fn run_worker_loop<B: WorkerBuffer>(
                             sync_progress.completion_timeline_sample_every();
                         #[cfg(not(feature = "bench"))]
                         let timeline_sample_every = 0;
+                        ensure!(
+                            completions.supports_completion_timeline()
+                                || timeline_sample_every == 0,
+                            "WAL completion timeline diagnostics are unsupported with Cursor direct completion"
+                        );
                         enqueue_group_command(
                             id,
                             group,
@@ -2649,6 +2959,8 @@ fn run_worker_loop<B: WorkerBuffer>(
 
         if !ring_staged.is_empty() {
             flush_staged_writes(ring_staged, core, sync_progress, || ring.submit())?;
+            #[cfg(all(test, feature = "chaos-testing"))]
+            crate::chaos::failpoint::before_parallel_wal_completion_drain();
         }
 
         let completion_count = {
@@ -2721,6 +3033,10 @@ fn run_worker_loop<B: WorkerBuffer>(
                     let timeline_sample_every = sync_progress.completion_timeline_sample_every();
                     #[cfg(not(feature = "bench"))]
                     let timeline_sample_every = 0;
+                    ensure!(
+                        completions.supports_completion_timeline() || timeline_sample_every == 0,
+                        "WAL completion timeline diagnostics are unsupported with Cursor direct completion"
+                    );
                     enqueue_group_command(
                         id,
                         group,
@@ -2758,7 +3074,7 @@ fn enqueue_group_command<B: WorkerBuffer>(
     permit: GroupPermit,
     core: &mut WorkerCore<B>,
     group_permits: &mut HashMap<GroupId, GroupPermit>,
-    completions: &Sender<GroupWriteResult>,
+    completions: &WorkerCompletionSender,
     timeline_sample_every: u64,
 ) -> Result<()> {
     #[cfg(feature = "bench")]
@@ -2784,23 +3100,23 @@ fn enqueue_group_command<B: WorkerBuffer>(
         Err(WorkerError::Poisoned) => {
             let poison_ticket = core.poison_ticket.unwrap_or(tickets.start);
             drop(permit);
-            let _ = completions.send(GroupWriteResult {
+            completions.send(GroupWriteResult {
                 group_id: id.0,
                 tickets,
                 write_count: 0,
                 write_bytes: 0,
                 error: Some(format!("WAL poisoned at ticket {poison_ticket}")),
-            });
+            })?;
         }
         Err(error) => {
             drop(permit);
-            let _ = completions.send(GroupWriteResult {
+            completions.send(GroupWriteResult {
                 group_id: id.0,
                 tickets,
                 write_count: 0,
                 write_bytes: 0,
                 error: Some(format!("WAL worker rejected group: {error:?}")),
-            });
+            })?;
             bail!("WAL worker rejected group: {error:?}");
         }
     }
@@ -2946,7 +3262,7 @@ fn process_completions<B: WorkerBuffer>(
     core: &mut WorkerCore<B>,
     buffer_pool: &ArrayQueue<B>,
     group_permits: &mut HashMap<GroupId, GroupPermit>,
-    completion_tx: &Sender<GroupWriteResult>,
+    completion_tx: &WorkerCompletionSender,
     slots: &GroupSlots,
     io_event: &WalIoEvent<'_>,
 ) -> Result<()> {
@@ -2975,7 +3291,7 @@ fn process_completions<B: WorkerBuffer>(
         if core.poison_ticket.is_some() {
             close_group_admission(slots);
         }
-        process_worker_events(events, buffer_pool, group_permits, completion_tx, io_event);
+        process_worker_events(events, buffer_pool, group_permits, completion_tx, io_event)?;
     }
 
     Ok(())
@@ -2985,11 +3301,12 @@ fn process_worker_events<B: WorkerBuffer>(
     events: Vec<WorkerEvent<B>>,
     buffer_pool: &ArrayQueue<B>,
     group_permits: &mut HashMap<GroupId, GroupPermit>,
-    completion_tx: &Sender<GroupWriteResult>,
+    completion_tx: &WorkerCompletionSender,
     io_event: &WalIoEvent<'_>,
-) {
+) -> Result<()> {
     #[cfg(feature = "bench")]
     let mut pending_timeline = None;
+    let mut first_delivery_error = None;
     for event in events {
         match event {
             WorkerEvent::BufferRetired(buffer) => {
@@ -3011,14 +3328,26 @@ fn process_worker_events<B: WorkerBuffer>(
                     io_event.record_completion_timeline(timeline);
                     io_event.mark_completion_timeline_send_started(result.group_id);
                 }
+                let deliver = first_delivery_error.is_none()
+                    || !completion_tx.fail_stop_after_delivery_error();
+                if !deliver {
+                    continue;
+                }
+                let delivery_result = completion_tx.send(result);
                 #[cfg(all(test, feature = "chaos-testing"))]
-                if completion_tx.send(result).is_ok() && injected_failure {
+                if delivery_result.is_ok() && injected_failure {
                     crate::chaos::failpoint::note_parallel_wal_injected_group_failure();
                 }
-                #[cfg(not(all(test, feature = "chaos-testing")))]
-                let _ = completion_tx.send(result);
+                if let Err(error) = delivery_result {
+                    first_delivery_error.get_or_insert(error);
+                }
             }
         }
+    }
+
+    match first_delivery_error {
+        Some(error) => Err(error),
+        None => Ok(()),
     }
 }
 
@@ -3072,13 +3401,112 @@ mod tests {
     use super::SyncProgressSnapshot;
     use super::{
         DIRECT_IO_ALIGNMENT, DirectBuf, GroupId, GroupPermit, GroupSlots, GroupWriteResult,
-        IoWorker, RequestId, SlotState, WalSyncProgress, WorkerCommand, WorkerCore, WorkerError,
-        WorkerEvent, WorkerWake, WriteBuffer, WriteGroup, WriteGroupBuffers, close_group_admission,
+        IoWorker, MAX_INFLIGHT_GROUPS, RequestId, SlotState, WalSyncProgress, WorkerCommand,
+        WorkerCompletionExitGuard, WorkerCompletionSender, WorkerCore, WorkerError, WorkerEvent,
+        WorkerWake, WriteBuffer, WriteGroup, WriteGroupBuffers, close_group_admission,
         enqueue_group_command, fail_shutdown_reply, flush_staged_writes, process_completions,
-        retry_interrupted, wait_for_worker_progress,
+        process_worker_events, retry_interrupted, wait_for_worker_progress,
     };
+    use crossbeam_channel::bounded;
     use crossbeam_queue::ArrayQueue;
     use parking_lot::{Condvar, Mutex};
+
+    fn cursor_completion_coordinator() -> anyhow::Result<(
+        crate::wal::v8::parallel::WalV8ParallelCoordinator,
+        crossbeam_channel::Receiver<()>,
+    )> {
+        use crate::{
+            pitr::{ArchiveEpochId, ChainAnchor, SegmentId, TimelineId},
+            wal::v8::{
+                WAL_V8_HEADER_LEN,
+                codec::{WAL_V8_FRAME_LEN, WalV8Header},
+                parallel::{WalV8ParallelConfig, WalV8ParallelCoordinator, WalV8ProgressMode},
+            },
+        };
+
+        let archive_epoch_id = ArchiveEpochId([0x22; 16]);
+        let header = WalV8Header {
+            timeline_id: TimelineId([0x11; 16]),
+            archive_epoch_id,
+            segment_id: SegmentId(7),
+            predecessor: ChainAnchor::Genesis { archive_epoch_id },
+            incarnation: [0x44; 16],
+        };
+        let coordinator = WalV8ParallelCoordinator::new(
+            header,
+            WalV8ParallelConfig {
+                next_ticket: 0,
+                next_data_offset: (WAL_V8_HEADER_LEN + WAL_V8_FRAME_LEN) as u64,
+                last_commit_ts: 0,
+                last_recorded_at: None,
+                durable_prefix_digest: header.initial_prefix_digest()?,
+                max_inflight_tickets: 1,
+                max_inflight_bytes: 1024 * 1024,
+                max_file_size: super::MAX_WAL_FILE_SIZE,
+                progress_mode: WalV8ProgressMode::Cursor,
+            },
+        )?;
+        let progress_tokens = coordinator
+            .take_progress_token_receiver()?
+            .ok_or_else(|| anyhow::anyhow!("Cursor coordinator did not create a progress token"))?;
+
+        Ok((coordinator, progress_tokens))
+    }
+
+    fn direct_completion_result(group_id: u64, ticket: u64) -> GroupWriteResult {
+        GroupWriteResult {
+            group_id,
+            tickets: ticket..ticket + 1,
+            write_count: 1,
+            write_bytes: DIRECT_IO_ALIGNMENT as u64,
+            error: None,
+        }
+    }
+
+    fn process_one_direct_completion(
+        completion_sender: &WorkerCompletionSender,
+        slots: &Arc<GroupSlots>,
+        drops: &Arc<AtomicUsize>,
+    ) -> anyhow::Result<()> {
+        let group_id = GroupId(1);
+        let mut group_permits = std::collections::HashMap::new();
+        slots.state.lock().active_groups += 1;
+        group_permits.insert(
+            group_id,
+            GroupPermit {
+                slots: Arc::clone(slots),
+            },
+        );
+
+        let events = vec![
+            WorkerEvent::BufferRetired(DropProbe::new(DIRECT_IO_ALIGNMENT, Arc::clone(drops))),
+            WorkerEvent::GroupFinished(direct_completion_result(group_id.0, 1)),
+        ];
+        let sync_progress = WalSyncProgress::default();
+        let io_event = sync_progress.begin_io_event();
+        process_worker_events(
+            events,
+            &ArrayQueue::new(1),
+            &mut group_permits,
+            completion_sender,
+            &io_event,
+        )
+    }
+
+    fn finish_failed_direct_worker(
+        coordinator: &crate::wal::v8::parallel::WalV8ParallelCoordinator,
+        slots: &Arc<GroupSlots>,
+        mut exit_guard: WorkerCompletionExitGuard,
+    ) {
+        // run_worker fences admission and cleans up queued groups before the
+        // thread-level guard publishes the terminal coordinator failure.
+        close_group_admission(slots);
+        coordinator
+            .worker_completion_handle()
+            .worker_failed_after_cleanup();
+        exit_guard.failure_reported();
+        drop(exit_guard);
+    }
 
     struct DropProbe {
         bytes: Box<[u8]>,
@@ -3294,6 +3722,114 @@ mod tests {
     #[test]
     fn io_worker_forces_large_writes_async_beside_ordinary_small_writes() {
         check_io_worker_writes_groups(Some(64 * 1024));
+    }
+
+    #[cfg(all(feature = "chaos-testing", target_os = "linux"))]
+    #[test]
+    fn failpoint_relay_worker_reports_cqe_errors_and_closes_after_rejection() -> anyhow::Result<()>
+    {
+        use crate::chaos::failpoint::{
+            FailScenario, parallel_wal_injected_negative_cqe_count,
+            parallel_wal_injected_short_cqe_count, reset_parallel_wal_failure_test_counters,
+        };
+
+        for (failpoint, expected_error) in [
+            ("parallel_wal.negative_cqe", "io_uring write failed"),
+            ("parallel_wal.short_cqe", "short io_uring write"),
+        ] {
+            let _scenario = FailScenario::setup();
+            reset_parallel_wal_failure_test_counters();
+            fail::cfg(failpoint, "return").map_err(anyhow::Error::msg)?;
+
+            let parent =
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/wal-opt/worker-cqe-failures");
+            std::fs::create_dir_all(&parent)?;
+            let directory = tempfile::tempdir_in(parent)?;
+            let path = directory.path().join("wal");
+            File::create(&path)?.set_len((3 * DIRECT_IO_ALIGNMENT) as u64)?;
+            let file = File::options()
+                .read(true)
+                .write(true)
+                .custom_flags(libc::O_DIRECT)
+                .open(&path)?;
+            let buffer_pool = Arc::new(super::ArrayQueue::new(4));
+            let mut worker = match IoWorker::spawn(Arc::new(file), buffer_pool, None) {
+                Ok(worker) => worker,
+                Err(error) if io_uring_unavailable(&error) => {
+                    eprintln!("skipping test (io_uring unavailable): {error:#}");
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            };
+            let completions = worker.take_completions();
+
+            for ticket in 0..2_u64 {
+                let mut buffer = DirectBuf::new(DIRECT_IO_ALIGNMENT);
+                buffer.as_mut_slice().fill(0x40 + ticket as u8);
+                buffer.set_len(DIRECT_IO_ALIGNMENT);
+                let group = WriteGroup::new(
+                    ticket..ticket + 1,
+                    vec![WriteBuffer::new(
+                        buffer,
+                        ticket * DIRECT_IO_ALIGNMENT as u64,
+                        DIRECT_IO_ALIGNMENT,
+                    )],
+                )
+                .map_err(|error| anyhow::anyhow!("invalid test WAL group: {error:?}"))?;
+                worker.submit_group(group)?;
+            }
+
+            let mut results = Vec::with_capacity(2);
+            for _ in 0..2 {
+                results.push(
+                    completions
+                        .recv_timeout(Duration::from_secs(5))
+                        .map_err(anyhow::Error::msg)?,
+                );
+            }
+            results.sort_unstable_by_key(|result| result.tickets.start);
+            assert_eq!(results[0].tickets, 0..1);
+            assert_eq!(results[0].error, None);
+            assert_eq!(results[1].tickets, 1..2);
+            assert!(
+                results[1]
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.contains(expected_error)),
+                "unexpected ticket 1 completion: {:?}",
+                results[1]
+            );
+            assert_eq!(worker.active_group_count_for_test(), 0);
+            assert!(
+                worker
+                    .submit_group(
+                        WriteGroup::new(
+                            2..3,
+                            vec![WriteBuffer::new(
+                                DirectBuf::new(DIRECT_IO_ALIGNMENT),
+                                2 * DIRECT_IO_ALIGNMENT as u64,
+                                DIRECT_IO_ALIGNMENT,
+                            )],
+                        )
+                        .map_err(|error| {
+                            anyhow::anyhow!("invalid rejected test WAL group: {error:?}")
+                        })?
+                    )
+                    .is_err(),
+                "a poisoned Relay worker must reject later submissions"
+            );
+            worker.close()?;
+
+            if failpoint == "parallel_wal.negative_cqe" {
+                assert_eq!(parallel_wal_injected_negative_cqe_count(), 1);
+                assert_eq!(parallel_wal_injected_short_cqe_count(), 0);
+            } else {
+                assert_eq!(parallel_wal_injected_negative_cqe_count(), 0);
+                assert_eq!(parallel_wal_injected_short_cqe_count(), 1);
+            }
+        }
+
+        Ok(())
     }
 
     #[test]
@@ -4060,12 +4596,14 @@ mod tests {
                 closed: false,
             }),
             available: Condvar::new(),
+            limit: MAX_INFLIGHT_GROUPS,
         });
         close_group_admission(&slots);
         let permit = GroupPermit {
             slots: Arc::clone(&slots),
         };
         let (completion_tx, completion_rx) = crossbeam_channel::unbounded();
+        let completion_sender = WorkerCompletionSender::Relay(completion_tx);
         let mut group_permits = std::collections::HashMap::new();
         enqueue_group_command(
             GroupId(2),
@@ -4075,7 +4613,7 @@ mod tests {
             },
             &mut core,
             &mut group_permits,
-            &completion_tx,
+            &completion_sender,
             0,
         )
         .expect("reject poisoned group without stopping the worker");
@@ -4085,7 +4623,7 @@ mod tests {
             permit,
             &mut core,
             &mut group_permits,
-            &completion_tx,
+            &completion_sender,
             0,
         )
         .expect("reject later poisoned group without a ticket-hole failure");
@@ -4205,14 +4743,8 @@ mod tests {
         let buffer_pool = ArrayQueue::new(1);
         let mut group_permits = std::collections::HashMap::new();
         let (completion_tx, completion_rx) = crossbeam_channel::unbounded();
-        let slots = GroupSlots {
-            state: Mutex::new(SlotState {
-                active_groups: 0,
-                next_group_id: 0,
-                closed: false,
-            }),
-            available: Condvar::new(),
-        };
+        let completion_sender = WorkerCompletionSender::Relay(completion_tx);
+        let slots = GroupSlots::new();
         let sync_progress = WalSyncProgress::default();
         let io_event = sync_progress.begin_io_event();
 
@@ -4221,7 +4753,7 @@ mod tests {
             &mut core,
             &buffer_pool,
             &mut group_permits,
-            &completion_tx,
+            &completion_sender,
             &slots,
             &io_event,
         )
@@ -4450,14 +4982,7 @@ mod tests {
 
             Ok(())
         });
-        let slots = Arc::new(GroupSlots {
-            state: Mutex::new(SlotState {
-                active_groups: 0,
-                next_group_id: 0,
-                closed: false,
-            }),
-            available: Condvar::new(),
-        });
+        let slots = Arc::new(GroupSlots::new());
         let (failure_events, completions) = crossbeam_channel::unbounded();
         let mut worker: IoWorker<DirectBuf> = IoWorker {
             commands: command_tx,
@@ -4465,12 +4990,253 @@ mod tests {
             wake: Arc::new(WorkerWake::new().expect("eventfd")),
             sync_progress: Arc::new(WalSyncProgress::default()),
             completions: Some(completions),
-            failure_events,
+            failure_events: Some(failure_events),
             join: Some(join),
             shutdown_sent: false,
         };
 
         assert!(worker.shutdown_and_join().is_err());
         assert!(worker.join.is_none());
+    }
+
+    fn direct_completion_slots() -> Arc<GroupSlots> {
+        Arc::new(GroupSlots::new())
+    }
+
+    fn assert_delivery_failure_cleanup(
+        coordinator: &crate::wal::v8::parallel::WalV8ParallelCoordinator,
+        slots: Arc<GroupSlots>,
+        drops: &AtomicUsize,
+        error: anyhow::Error,
+        exit_guard: WorkerCompletionExitGuard,
+    ) {
+        assert!(!error.to_string().is_empty());
+        assert_eq!(
+            drops.load(Ordering::Acquire),
+            1,
+            "retired DATA buffer was not dropped"
+        );
+        assert_eq!(
+            slots.state.lock().active_groups,
+            0,
+            "group permit was not released"
+        );
+
+        finish_failed_direct_worker(coordinator, &slots, exit_guard);
+
+        assert!(
+            slots.state.lock().closed,
+            "worker failure left group admission open"
+        );
+        assert!(
+            coordinator.is_poisoned(),
+            "worker failure did not poison the coordinator"
+        );
+    }
+
+    #[test]
+    fn cursor_direct_completion_queue_overflow_cleans_up_and_poisons() -> anyhow::Result<()> {
+        let (coordinator, progress_tokens) = cursor_completion_coordinator()?;
+        let (completion_tx, completion_rx) = bounded(1);
+        let completion_sender = WorkerCompletionSender::CursorDirect {
+            sender: completion_tx,
+            handle: coordinator.worker_completion_handle(),
+        };
+        completion_sender.send(direct_completion_result(0, 0))?;
+        assert_eq!(progress_tokens.try_recv(), Ok(()));
+
+        let slots = direct_completion_slots();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let exit_guard = WorkerCompletionExitGuard::new(
+            Arc::clone(&slots),
+            Some(coordinator.worker_completion_handle()),
+            None,
+        );
+        let error = process_one_direct_completion(&completion_sender, &slots, &drops)
+            .expect_err("full direct-completion queue must fail the worker");
+
+        assert!(error.to_string().contains("queue overflow or disconnect"));
+        assert_eq!(
+            completion_rx.len(),
+            1,
+            "full queue should retain its first event"
+        );
+        assert_delivery_failure_cleanup(&coordinator, slots, &drops, error, exit_guard);
+
+        Ok(())
+    }
+
+    #[test]
+    fn cursor_direct_completion_enqueues_once_and_signals_progress() -> anyhow::Result<()> {
+        let (coordinator, progress_tokens) = cursor_completion_coordinator()?;
+        let (completion_tx, completion_rx) = bounded(1);
+        let completion_sender = WorkerCompletionSender::CursorDirect {
+            sender: completion_tx,
+            handle: coordinator.worker_completion_handle(),
+        };
+        let slots = direct_completion_slots();
+        let drops = Arc::new(AtomicUsize::new(0));
+
+        process_one_direct_completion(&completion_sender, &slots, &drops)?;
+
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+        assert_eq!(slots.state.lock().active_groups, 0);
+        assert_eq!(progress_tokens.try_recv(), Ok(()));
+        let completion = completion_rx.try_recv()?;
+        assert_eq!(completion.result, direct_completion_result(1, 1));
+        assert!(
+            completion_rx.is_empty(),
+            "worker duplicated the DATA completion"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn cursor_direct_completion_disconnect_cleans_up_and_poisons() -> anyhow::Result<()> {
+        let (coordinator, _progress_tokens) = cursor_completion_coordinator()?;
+        let (completion_tx, completion_rx) = bounded(1);
+        drop(completion_rx);
+        let completion_sender = WorkerCompletionSender::CursorDirect {
+            sender: completion_tx,
+            handle: coordinator.worker_completion_handle(),
+        };
+        let slots = direct_completion_slots();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let exit_guard = WorkerCompletionExitGuard::new(
+            Arc::clone(&slots),
+            Some(coordinator.worker_completion_handle()),
+            None,
+        );
+        let error = process_one_direct_completion(&completion_sender, &slots, &drops)
+            .expect_err("disconnected direct-completion queue must fail the worker");
+
+        assert!(error.to_string().contains("queue overflow or disconnect"));
+        assert_delivery_failure_cleanup(&coordinator, slots, &drops, error, exit_guard);
+
+        Ok(())
+    }
+
+    #[test]
+    fn cursor_direct_worker_failure_publishes_poison_before_queue_disconnect() -> anyhow::Result<()>
+    {
+        let (coordinator, progress_tokens) = cursor_completion_coordinator()?;
+        let (completion_tx, completion_rx) = bounded(1);
+        let completion_sender = WorkerCompletionSender::CursorDirect {
+            sender: completion_tx,
+            handle: coordinator.worker_completion_handle(),
+        };
+        let slots = direct_completion_slots();
+        let exit_guard = WorkerCompletionExitGuard::new(
+            Arc::clone(&slots),
+            Some(coordinator.worker_completion_handle()),
+            Some(completion_sender.clone()),
+        );
+
+        // Model run_worker returning and dropping its sender before the
+        // thread entry point publishes terminal worker failure.
+        drop(completion_sender);
+        assert!(matches!(
+            completion_rx.try_recv(),
+            Err(crossbeam_channel::TryRecvError::Empty)
+        ));
+        assert!(!coordinator.is_poisoned());
+
+        finish_failed_direct_worker(&coordinator, &slots, exit_guard);
+
+        assert!(coordinator.is_poisoned());
+        assert!(progress_tokens.try_recv().is_ok());
+        assert!(matches!(
+            completion_rx.try_recv(),
+            Err(crossbeam_channel::TryRecvError::Disconnected)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn cursor_direct_completion_notification_failure_poison_after_enqueue() -> anyhow::Result<()> {
+        let (coordinator, progress_tokens) = cursor_completion_coordinator()?;
+        drop(progress_tokens);
+        let (completion_tx, completion_rx) = bounded(1);
+        let completion_sender = WorkerCompletionSender::CursorDirect {
+            sender: completion_tx,
+            handle: coordinator.worker_completion_handle(),
+        };
+        let slots = direct_completion_slots();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let exit_guard = WorkerCompletionExitGuard::new(
+            Arc::clone(&slots),
+            Some(coordinator.worker_completion_handle()),
+            None,
+        );
+        let error = process_one_direct_completion(&completion_sender, &slots, &drops)
+            .expect_err("disconnected progress-token receiver must fail the worker");
+
+        assert!(
+            error
+                .to_string()
+                .contains("progress token receiver disconnected")
+        );
+        let queued = completion_rx
+            .try_recv()
+            .expect("completion is enqueued before notification is attempted");
+        assert_eq!(queued.result, direct_completion_result(1, 1));
+        assert_delivery_failure_cleanup(&coordinator, slots, &drops, error, exit_guard);
+
+        Ok(())
+    }
+
+    #[test]
+    fn cursor_direct_worker_exit_wakes_waiters_and_clean_shutdown_stays_open() -> anyhow::Result<()>
+    {
+        let (coordinator, _progress_tokens) = cursor_completion_coordinator()?;
+        let slots = direct_completion_slots();
+        slots.state.lock().active_groups = 1;
+        let active_permit = GroupPermit {
+            slots: Arc::clone(&slots),
+        };
+        let (started_tx, started_rx) = bounded(1);
+        let (closed_tx, closed_rx) = bounded(1);
+        let waiter_slots = Arc::clone(&slots);
+        let waiter = thread::spawn(move || {
+            let mut state = waiter_slots.state.lock();
+            started_tx.send(()).expect("test waiter started receiver");
+            while !state.closed {
+                waiter_slots.available.wait(&mut state);
+            }
+            closed_tx.send(()).expect("test waiter exit receiver");
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("submitter waiter did not start");
+
+        let exit_guard = WorkerCompletionExitGuard::new(
+            Arc::clone(&slots),
+            Some(coordinator.worker_completion_handle()),
+            None,
+        );
+        drop(exit_guard);
+        closed_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("worker exit did not wake a blocked submitter");
+        waiter.join().expect("submitter waiter joins");
+        assert!(slots.state.lock().closed);
+        assert!(coordinator.is_poisoned());
+        drop(active_permit);
+        assert_eq!(slots.state.lock().active_groups, 0);
+
+        let (clean_coordinator, _progress_tokens) = cursor_completion_coordinator()?;
+        let clean_slots = direct_completion_slots();
+        let mut clean_guard = WorkerCompletionExitGuard::new(
+            Arc::clone(&clean_slots),
+            Some(clean_coordinator.worker_completion_handle()),
+            None,
+        );
+        clean_guard.complete();
+        drop(clean_guard);
+        assert!(!clean_slots.state.lock().closed);
+        assert!(!clean_coordinator.is_poisoned());
+
+        Ok(())
     }
 }

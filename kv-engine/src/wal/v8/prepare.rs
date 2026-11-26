@@ -12,7 +12,7 @@ use super::{WAL_V8_HEADER_LEN, codec, digest, parallel::WalV8DurablePrefixCheck}
 
 const WAL_V8_DATA_START: u64 = (WAL_V8_HEADER_LEN + codec::WAL_V8_FRAME_LEN) as u64;
 
-/// API-level class used only to select benchmark DATA scheduling policy.
+/// API-level class used to select V8 DATA scheduling and preallocation policy.
 /// It is not serialized and never changes ticket or durability ordering.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) enum WalV8WriteClass {
@@ -115,6 +115,10 @@ pub(crate) struct PreparedWalV8Batch<'a, R> {
 }
 
 impl<'a, R> PreparedWalV8Batch<'a, R> {
+    pub(crate) fn write_class(&self) -> WalV8WriteClass {
+        self.write_class
+    }
+
     /// Calculate the canonical point-index charge before allocating it during
     /// preflight.
     pub(crate) fn preparation_buffer_bytes(batch: &WalBatch, limits: WalV5Limits) -> Result<u64> {

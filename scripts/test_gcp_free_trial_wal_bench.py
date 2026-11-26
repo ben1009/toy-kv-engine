@@ -6,6 +6,7 @@ import base64
 import csv
 import hashlib
 import importlib.util
+from contextlib import redirect_stderr
 from io import BytesIO, StringIO
 import json
 import os
@@ -24,6 +25,10 @@ from unittest.mock import Mock, patch
 from gcp_wal_matrix import (
     COMMIT_ORDER_TRACE_NUM,
     COMMIT_ORDER_TRACE_WRITERS,
+    DURABILITY_DRIVER_ARMS,
+    DURABILITY_DRIVER_NUM,
+    DURABILITY_DRIVER_SCORE_ORDERS,
+    DURABILITY_DRIVER_WRITERS,
     FULL_DEFAULT_WRITERS,
     LEGACY_DEFAULT_WRITERS,
     POINT_LOOKAHEAD_WRITERS,
@@ -32,8 +37,76 @@ from gcp_wal_matrix import (
     POINT_BORROWED_INPUT_WRITERS,
     POINT_DIRECT_FRAME_NUM,
     POINT_DIRECT_FRAME_WRITERS,
+    POINT_PROGRESS_CURSOR_ORDERS,
+    POINT_PROGRESS_CURSOR_V2_ORDERS,
+    POINT_PROGRESS_PLAN_SCHEMA_V1,
+    POINT_PROGRESS_PLAN_SCHEMA_V2,
+    POINT_PROGRESS_PLAN_SCHEMA_V3,
+    POINT_PROGRESS_RING_NUM,
+    POINT_PROGRESS_RING_WRITERS,
+    CURSOR_DIRECT_COMPLETION_ARMS,
+    CURSOR_DIRECT_COMPLETION_WAKE_ARMS,
+    CURSOR_SINGLETON_SUBMISSION_ARMS,
+    CURSOR_COALESCING_BUDGET_ARMS,
+    CURSOR_COALESCING_BUDGET_NUM,
+    CURSOR_COALESCING_BUDGET_WRITERS,
+    CURSOR_COALESCING_READY_TARGET_ARMS,
+    CURSOR_COALESCING_READY_TARGET_NUM,
+    CURSOR_COALESCING_READY_TARGET_WRITERS,
+    CURSOR_COALESCING_READY_TARGET_SCAN_ARMS,
+    CURSOR_COALESCING_READY_TARGET_SCAN_CASES,
+    CURSOR_COALESCING_READY_TARGET_SCAN_NUM,
+    CURSOR_COALESCING_READY_TARGET_SCAN_ORDERS,
+    CURSOR_COALESCING_READY_TARGET_SCAN_WRITERS,
+    CURSOR_COALESCING_READY_TARGET_SMALL_SCAN_ARMS,
+    CURSOR_COALESCING_READY_TARGET_SMALL_SCAN_CASES,
+    CURSOR_COALESCING_READY_TARGET_SMALL_SCAN_NUM,
+    CURSOR_COALESCING_READY_TARGET_SMALL_SCAN_ORDERS,
+    CURSOR_COALESCING_READY_TARGET_SMALL_SCAN_WRITERS,
+    CURSOR_PUBLICATION_ARMS,
+    CURSOR_PUBLICATION_NUM,
+    CURSOR_PUBLICATION_WRITERS,
+    build_cursor_direct_completion_plan,
+    build_cursor_direct_completion_schedule,
+    build_cursor_direct_completion_wake_plan,
+    build_cursor_direct_completion_wake_schedule,
+    build_cursor_coalescing_budget_plan,
+    build_cursor_coalescing_budget_schedule,
+    build_cursor_coalescing_ready_target_plan,
+    build_cursor_coalescing_ready_target_schedule,
+    build_cursor_coalescing_ready_target_scan_plan,
+    build_cursor_coalescing_ready_target_scan_schedule,
+    build_cursor_coalescing_ready_target_small_scan_plan,
+    build_cursor_coalescing_ready_target_small_scan_schedule,
+    build_cursor_publication_plan,
+    build_cursor_publication_schedule,
+    build_cursor_singleton_submission_plan,
+    build_cursor_singleton_submission_schedule,
     V8_EXTENT_POLICY_STORAGE_NUM,
     V8_EXTENT_POLICY_STORAGE_WRITERS,
+    POINT_PREALLOCATION_NUM,
+    POINT_PREALLOCATION_POINT_ORDERS,
+    POINT_PREALLOCATION_WRITERS,
+    V7_V8_READY_TARGET_FINAL_ARMS,
+    V7_V8_READY_TARGET_FINAL_CASES,
+    V7_V8_READY_TARGET_FINAL_NUM,
+    V7_V8_READY_TARGET_FINAL_ORDERS,
+    V7_V8_READY_TARGET_FINAL_WRITERS,
+    V8_D2_QUALIFICATION_ARMS,
+    V8_D2_QUALIFICATION_CASES,
+    V8_D2_QUALIFICATION_NUM,
+    V8_D2_QUALIFICATION_ORDERS,
+    V8_D2_QUALIFICATION_WRITERS,
+    V8_EQUAL_THROUGHPUT_ARMS,
+    V8_EQUAL_THROUGHPUT_CASES,
+    V8_EQUAL_THROUGHPUT_NUM,
+    V8_EQUAL_THROUGHPUT_WRITERS,
+    POINT_RESOURCE_RETIREMENT_NUM,
+    POINT_RESOURCE_RETIREMENT_WRITERS,
+    POINT_ACK_D1_ARMS,
+    POINT_ACK_D1_NUM,
+    POINT_ACK_D1_ORDERS,
+    POINT_ACK_D1_WRITERS,
     V8_MUTEX_DIAGNOSTIC_NUM,
     V8_MUTEX_DIAGNOSTIC_SAMPLE_EVERY,
     V8_MUTEX_DIAGNOSTIC_WRITERS,
@@ -50,8 +123,28 @@ from gcp_wal_matrix import (
     build_point_borrowed_input_schedule,
     build_point_direct_frame_plan,
     build_point_direct_frame_schedule,
+    build_point_progress_ring_plan,
+    build_point_progress_ring_schedule,
+    build_point_progress_cursor_plan,
+    build_point_progress_cursor_schedule,
+    build_point_progress_cursor_v2_plan,
+    build_point_progress_cursor_v2_schedule,
     build_v8_extent_policy_storage_plan,
     build_v8_extent_policy_storage_schedule,
+    build_v7_v8_point_preallocation_plan,
+    build_v7_v8_point_preallocation_schedule,
+    build_v7_v8_ready_target_final_plan,
+    build_v7_v8_ready_target_final_schedule,
+    build_v8_d2_qualification_plan,
+    build_v8_d2_qualification_schedule,
+    build_v8_equal_throughput_plan,
+    build_v8_equal_throughput_schedule,
+    build_point_resource_retirement_plan,
+    build_point_resource_retirement_schedule,
+    build_point_ack_d1_plan,
+    build_point_ack_d1_schedule,
+    build_dedicated_durability_driver_plan,
+    build_dedicated_durability_driver_schedule,
     build_v8_mutex_diagnostic_plan,
     build_v8_mutex_diagnostic_schedule,
     build_v8_point_cpu_attribution_plan,
@@ -62,6 +155,16 @@ from gcp_wal_matrix import (
     validate_point_lookahead_rows,
     validate_point_borrowed_input_rows,
     validate_point_direct_frame_rows,
+    validate_point_progress_ring_rows,
+    validate_point_resource_retirement_rows,
+    validate_point_ack_d1_rows,
+    validate_dedicated_durability_driver_rows,
+    validate_cursor_direct_completion_rows,
+    validate_cursor_singleton_submission_rows,
+    validate_cursor_coalescing_budget_rows,
+    validate_cursor_coalescing_ready_target_rows,
+    validate_cursor_coalescing_ready_target_scan_rows,
+    validate_cursor_publication_rows,
     validate_v8_extent_policy_storage_rows,
     validate_v8_mutex_diagnostic_rows,
     validate_v8_point_cpu_attribution_rows,
@@ -91,6 +194,9 @@ from gcp_v8_mutex_diagnostic_runner import (
 )
 from gcp_v8_point_borrowed_input_runner import _summary_fields
 import gcp_v8_point_cpu_attribution_runner as cpu_attribution_runner
+import gcp_v8_point_progress_ring_runner as progress_ring_runner
+import gcp_v8_point_ack_d1_runner as ack_d1_runner
+import gcp_v8_dedicated_durability_runner as dedicated_durability_runner
 from gcp_v8_point_cpu_attribution_runner import (
     _build_command as build_cpu_attribution_command,
     _completion_handoff_timeline_summary,
@@ -299,7 +405,2945 @@ def fake_keygen(command, **_kwargs):
     return subprocess.CompletedProcess(command, 0, "", "")
 
 
+class PointProgressRingQualificationTests(unittest.TestCase):
+    def test_dedicated_durability_plan_and_schedule_are_fixed(self) -> None:
+        schedule = build_dedicated_durability_driver_schedule()
+        self.assertEqual(len(schedule), 60)
+        score = [row for row in schedule if row["phase"] == "score"]
+        diagnostics = [row for row in schedule if row["phase"] == "diagnostic"]
+        self.assertEqual((len(score), len(diagnostics)), (60, 0))
+        for workload in ("point", "batch64"):
+            writers = DURABILITY_DRIVER_WRITERS if workload == "point" else (16,)
+            for writer in writers:
+                for repetition in range(1, 6):
+                    pair = [
+                        row for row in score
+                        if row["workload"] == workload
+                        and row["writer"] == writer
+                        and row["repetition"] == repetition
+                    ]
+                    expected_order = list(DURABILITY_DRIVER_SCORE_ORDERS[(repetition - 1) % 5])
+                    self.assertEqual([row["arm"] for row in pair], expected_order)
+        for row in schedule:
+            self.assertTrue(row["progress_cursor_enabled"])
+            self.assertTrue(row["cursor_direct_completion_enabled"])
+            self.assertFalse(row["cursor_singleton_submission_enabled"])
+            self.assertEqual(row["point_resource_retirement_mode"], 0)
+            self.assertEqual(row["point_buffer_preallocation_enabled"], row["workload"] == "point")
+            self.assertEqual(row["durability_driver_enabled"], row["arm"] == "dedicated_independent_ack")
+            self.assertEqual(row["independent_ack_waiter_enabled"], row["arm"] != "caller_legacy_ack")
+            self.assertFalse(row["durability_driver_diagnostics_enabled"])
+
+        plan = build_dedicated_durability_driver_plan(
+            writers=DURABILITY_DRIVER_WRITERS,
+            machine_type="c4-standard-16-lssd",
+            machine_spec={"vcpus": 16, "ssd_count": 2, "ssd_gib": 750},
+            commit="a" * 40,
+            binary_sha256="b" * 64,
+            runner_bundle_sha256="c" * 64,
+        )
+        self.assertEqual(plan["runs_planned"], 60)
+        self.assertEqual(plan["score_runs_planned"], 60)
+        self.assertEqual(plan["diagnostic_runs_planned"], 0)
+        self.assertEqual(plan["arms"], list(DURABILITY_DRIVER_ARMS))
+        self.assertEqual(plan["runner_bundle_sha256"], "c" * 64)
+        self.assertEqual(plan["plan_schema_version"], 3)
+        self.assertEqual(plan["runner_bundle_verification"], "remote-component-bytes-v1")
+
+        rows = []
+        for row in schedule:
+            metrics = progress_ring_runner._validate_dedicated_durability_record(
+                self._raw_record(row), row,
+            )
+            rows.append({**row, **metrics, "ops": DURABILITY_DRIVER_NUM, "exit_code": 0})
+        self.assertTrue(validate_dedicated_durability_driver_rows(rows)["complete"])
+        rows[0]["ops"] -= 1
+        self.assertFalse(validate_dedicated_durability_driver_rows(rows)["complete"])
+
+    def test_dedicated_durability_runner_writes_verifiable_bundle(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            binary = root / "write-perf"
+            binary.write_bytes(b"synthetic release binary")
+            binary_sha = self._sha256(binary)
+
+            def fake_run_one(**kwargs: object) -> dict[str, object]:
+                row = kwargs["row"]
+                kwargs["on_subprocess_started"]()
+                run_dir = kwargs["results_dir"] / dedicated_durability_runner._run_id(row)
+                run_dir.mkdir()
+                raw = self._raw_record(row)
+                metrics = progress_ring_runner._validate_dedicated_durability_record(raw, row)
+                metadata = {
+                    **row,
+                    "binary_sha256": kwargs["binary_sha256"],
+                    "exit_code": 0,
+                    "duration_seconds": 1.0,
+                    **metrics,
+                }
+                (run_dir / "result.json").write_text(json.dumps(raw), encoding="utf-8")
+                (run_dir / "run-metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
+                (run_dir / "environment.txt").write_text(
+                    progress_ring_runner._expected_environment_text(
+                        True,
+                        True,
+                        False,
+                        True,
+                        False,
+                        point_buffer_preallocation_enabled=bool(row["point_buffer_preallocation_enabled"]),
+                        point_resource_retirement_mode=0,
+                        dedicated_durability_driver_enabled=bool(row["durability_driver_enabled"]),
+                        dedicated_durability_diagnostics_enabled=bool(
+                            row["durability_driver_diagnostics_enabled"]
+                        ),
+                        independent_ack_waiter_enabled=bool(row["independent_ack_waiter_enabled"]),
+                    ),
+                    encoding="utf-8",
+                )
+                return metadata
+
+            results = root / "results"
+            args = SimpleNamespace(
+                binary=binary,
+                binary_sha256=binary_sha,
+                commit="a" * 40,
+                results_dir=results,
+                db_root=root / "db",
+                writers=",".join(str(writer) for writer in DURABILITY_DRIVER_WRITERS),
+                safe_deadline_epoch=4_000_000_000,
+                machine_type="c4-standard-16-lssd",
+                ssd_count=2,
+                ssd_gib=750,
+                runner_bundle_sha256="c" * 64,
+            )
+            results.mkdir()
+            (results / "runner-bundle-verification.json").write_text(
+                json.dumps({
+                    "schema_version": 1,
+                    "verified": True,
+                    "expected_bundle_sha256": "c" * 64,
+                    "actual_bundle_sha256": "c" * 64,
+                    "components": {
+                        name: "d" * 64
+                        for name in dedicated_durability_runner.D3B_RUNNER_BUNDLE_COMPONENT_NAMES
+                    },
+                }),
+                encoding="utf-8",
+            )
+            with patch.object(dedicated_durability_runner, "_run_one", side_effect=fake_run_one):
+                self.assertEqual(dedicated_durability_runner.run_suite(args), 0)
+            verification = dedicated_durability_runner.verify_results_directory(results)
+            self.assertTrue(verification["verified"], verification["errors"])
+            summary = json.loads((results / "summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(summary["runs_completed"], 60)
+            self.assertEqual(summary["runner_bundle_sha256"], "c" * 64)
+
+            summary["comparison"][0]["arms"]["caller_legacy_ack"]["puts_per_second"] += 1.0
+            (results / "summary.json").write_text(json.dumps(summary), encoding="utf-8")
+            verification = dedicated_durability_runner.verify_results_directory(results)
+            self.assertFalse(verification["verified"])
+            self.assertTrue(any("comparison differs from recomputed" in error for error in verification["errors"]))
+
+    def test_dedicated_durability_preflight_requires_fixed_isolated_matrix(self) -> None:
+        common = [
+            "--project", "test-project", "--zone", "us-central1-a", "--commit", "a" * 40,
+            "--machine-type", "c4-standard-16-lssd", "--writers", "1", "8", "16",
+            "--v8-dedicated-durability-driver-ab", "--ssh-source-range", "192.0.2.1/32",
+            "--max-runtime-minutes", "60", "--estimated-hourly-cost-usd", "1.50",
+            "--max-estimated-spend-usd", "2", "--preflight-only",
+        ]
+        args = BENCH.parse_args([*common, "--network", "d3a-isolated", "--subnet", "d3a-subnet"])
+        self.assertEqual(args.writers, DURABILITY_DRIVER_WRITERS)
+        self.assertEqual(args.num, DURABILITY_DRIVER_NUM)
+        self.assertTrue(args.v8_dedicated_durability_driver_ab)
+        for suffix in ([], ["--network", "default", "--subnet", "default"], ["--network", "d3a-isolated"]):
+            with self.subTest(suffix=suffix), redirect_stderr(StringIO()), self.assertRaises(SystemExit):
+                BENCH.parse_args([*common, *suffix])
+
+    @staticmethod
+    def _raw_record(row: dict[str, object]) -> dict[str, object]:
+        ring_enabled = bool(row["progress_ring_enabled"])
+        cursor_enabled = bool(row.get("progress_cursor_enabled", False))
+        extent_mode = row.get("extent_mode") or "sliding-point-lookahead"
+        frontier_direct = (row.get("frontier_mode") or "direct") != "buffered"
+        start_preparation = {
+            "mode": extent_mode,
+            "window_bytes": row.get("extent_window_bytes", POINT_LOOKAHEAD_WINDOW_BYTES),
+            "extent_policy_storage": "vec",
+            "extent_policy_scan_diagnostics_enabled": False,
+            "initialized_bytes": 0,
+        }
+        end_preparation = {
+            **start_preparation,
+            "initialized_bytes": (
+                POINT_LOOKAHEAD_WINDOW_BYTES
+                if row["workload"] == "point" and extent_mode == "sliding-point-lookahead" else 0
+            ),
+        }
+        handles = {
+            "data": {"o_direct": True, "device": 8, "inode": 101},
+            "frontier": {"o_direct": frontier_direct, "device": 8, "inode": 101},
+            "sync": {"o_direct": False, "device": 8, "inode": 101},
+        }
+        start = {
+            **handles,
+            "progress_ring_enabled": ring_enabled,
+            "progress_cursor_enabled": cursor_enabled,
+            "sliding_extent_preparation": start_preparation,
+        }
+        end = {
+            **handles,
+            "progress_ring_enabled": ring_enabled,
+            "progress_cursor_enabled": cursor_enabled,
+            "sliding_extent_preparation": end_preparation,
+        }
+        if "coalescing_ready_target" in row:
+            target = row["coalescing_ready_target"]
+            policy = row.get("coalesce_target_policy")
+            is_point_only = policy == "point_only"
+            hits = int(
+                target is not None
+                and row["writer"] > 1
+                and (row["workload"] == "point" if is_point_only else row["workload"] in ("point", "batch64"))
+            )
+            for snapshot in (start, end):
+                snapshot["coalesce_ready_target"] = target
+                snapshot["coalesce_ready_target_hits"] = 0
+                if policy is not None:
+                    snapshot["coalesce_target_policy"] = policy
+                    snapshot["coalesce_target_eligible_cycles"] = 0
+                    snapshot["coalesce_target_mixed_fallback_cycles"] = 0
+                    snapshot["coalesce_target_initial_hits"] = 0
+                    snapshot["coalesce_target_after_wake_hits"] = 0
+            end["coalesce_ready_target_hits"] = hits
+            if is_point_only and row["writer"] > 1:
+                if row["workload"] == "point":
+                    end["coalesce_target_eligible_cycles"] = hits
+                    end["coalesce_target_initial_hits"] = hits
+                elif row["workload"] == "batch64":
+                    end["coalesce_target_mixed_fallback_cycles"] = 1
+        if "point_resource_retirement_mode" in row:
+            mode = int(row["point_resource_retirement_mode"])
+            detached = int(row["workload"] == "point" and mode > 0)
+            end.update({
+                "point_resource_retirement_mode": mode,
+                "point_resource_retirement_detached_prefixes": detached,
+                "point_resource_retirement_detached_tickets": detached * 2,
+                "point_resource_retirement_batched_prefixes": int(detached > 0 and mode == 2),
+            })
+            start.update({
+                "point_resource_retirement_mode": mode,
+                "point_resource_retirement_detached_prefixes": 0,
+                "point_resource_retirement_detached_tickets": 0,
+                "point_resource_retirement_batched_prefixes": 0,
+            })
+        for key in (
+            "admission_cursor_publish_fast_path_enabled",
+        ):
+            if key in row:
+                start[key] = bool(row[key])
+                end[key] = bool(row[key])
+        if "cursor_direct_completion_enabled" in row:
+            start["cursor_direct_completion_enabled"] = bool(row["cursor_direct_completion_enabled"])
+            end["cursor_direct_completion_enabled"] = bool(row["cursor_direct_completion_enabled"])
+        if "cursor_direct_completion_wake_mode" in row:
+            select_enabled = row["cursor_direct_completion_wake_mode"] == "select"
+            start["cursor_direct_completion_select_wake_enabled"] = select_enabled
+            end["cursor_direct_completion_select_wake_enabled"] = select_enabled
+        if "cursor_singleton_submission_enabled" in row:
+            start["cursor_singleton_submission_enabled"] = bool(row["cursor_singleton_submission_enabled"])
+            end["cursor_singleton_submission_enabled"] = bool(row["cursor_singleton_submission_enabled"])
+        if "point_buffer_preallocation_enabled" in row:
+            enabled = bool(row["point_buffer_preallocation_enabled"])
+            attempts = POINT_RESOURCE_RETIREMENT_NUM if enabled and row["workload"] == "point" else 0
+            for snapshot in (start, end):
+                snapshot["point_buffer_preallocation_enabled"] = enabled
+                snapshot["point_buffer_preallocation_attempts"] = 0
+                snapshot["point_buffer_preallocation_hits"] = 0
+                snapshot["point_buffer_preallocation_fallbacks"] = 0
+            end["point_buffer_preallocation_attempts"] = attempts
+            end["point_buffer_preallocation_hits"] = attempts
+        if "durability_driver_enabled" in row:
+            driver_enabled = bool(row["durability_driver_enabled"])
+            ack_waiter_enabled = bool(row["independent_ack_waiter_enabled"])
+            diagnostics_enabled = bool(row["durability_driver_diagnostics_enabled"])
+            for snapshot in (start, end):
+                snapshot["dedicated_durability_driver_enabled"] = driver_enabled
+                snapshot["independent_ack_waiter_enabled"] = ack_waiter_enabled
+                snapshot["dedicated_durability_diagnostics_enabled"] = diagnostics_enabled
+                snapshot["dedicated_durability_requests"] = 0
+                snapshot["dedicated_durability_wake_signals"] = 0
+                snapshot["dedicated_durability_coalesced_wakes"] = 0
+                snapshot["dedicated_durability_advance_attempts"] = 0
+                snapshot["caller_durability_driver_election_attempts"] = 0
+            if diagnostics_enabled and driver_enabled:
+                end["dedicated_durability_requests"] = 100
+                end["dedicated_durability_wake_signals"] = 40
+                end["dedicated_durability_coalesced_wakes"] = 60
+                end["dedicated_durability_advance_attempts"] = 20
+            elif diagnostics_enabled:
+                end["caller_durability_driver_election_attempts"] = 100
+        point = row["workload"] == "point"
+        speed = 100_000.0
+        if ring_enabled and row["writer"] in (8, 16) and point:
+            speed *= 1.06
+        elif ring_enabled and row["writer"] == 1 and point:
+            speed *= 0.99
+        elif ring_enabled and row["workload"] == "batch64":
+            speed *= 0.995
+        if row.get("cursor_singleton_submission_enabled"):
+            speed *= 1.06
+        result = {
+            "ops": POINT_PROGRESS_RING_NUM,
+            "ops_per_sec": speed,
+            "process_cpu_user_ms": 6000.0,
+            "process_cpu_system_ms": 1000.0,
+            "wal_pipeline": {
+                "wal_io_stable": True,
+                "wal_io_start": start,
+                "wal_io_end": end,
+                "sync_count": 1000,
+            },
+            "wal_v8_digest": {
+                "cpu_timing_sample_rate": 64,
+                "ordered_link_hash_cpu_ns": 200_000,
+                "cpu_timing_sampled_tickets": 1563,
+            },
+        }
+        record: dict[str, object] = {
+            "params": {
+                "num": POINT_PROGRESS_RING_NUM,
+                "threads": row["writer"],
+                "value_size": 1024,
+                "batch_size": row["batch_size"],
+                "wal_format_version": 8,
+                "wal_io_mode": "parallel",
+            },
+            "result": result,
+        }
+        if point:
+            record["latency"] = {
+                "sample_every": 10,
+                "samples": POINT_PROGRESS_RING_NUM // 10,
+                "unsampled_completed_operations": POINT_PROGRESS_RING_NUM - POINT_PROGRESS_RING_NUM // 10,
+                "p50_ms": 0.35,
+                "p95_ms": 0.70,
+                "p99_ms": 1.0,
+            }
+        return record
+
+    @classmethod
+    def _raw_v7_record(cls, row: dict[str, object]) -> dict[str, object]:
+        """Build V7-shaped output for the mixed-format final comparison fixture."""
+        record = cls._raw_record(row)
+        record["params"]["wal_format_version"] = 7
+        pipeline = record["result"]["wal_pipeline"]
+        for key in ("wal_io_stable", "wal_io_start", "wal_io_end"):
+            pipeline.pop(key, None)
+        record.pop("wal_v8_digest", None)
+        return record
+
+    @classmethod
+    def _make_fixture(
+        cls,
+        root: Path,
+        *,
+        cursor: bool = False,
+        direct_completion: bool = False,
+        completion_wake: bool = False,
+        singleton_submission: bool = False,
+        coalescing_budget: bool = False,
+        coalescing_ready_target: bool = False,
+        coalescing_ready_target_scan: bool = False,
+        coalescing_ready_target_small_scan: bool = False,
+        retirement: bool = False,
+        retirement_preallocation: bool = False,
+        cursor_publication: bool = False,
+        ready_target_final: bool = False,
+        v8_d2_qualification: bool = False,
+        cursor_schema_version: int | None = None,
+        include_schema_version: bool = True,
+    ) -> Path:
+        results = root / "results"
+        results.mkdir()
+        commit = "a" * 40
+        binary_sha = "b" * 64
+        if coalescing_ready_target_small_scan:
+            schedule_builder = lambda _selected_writers: build_cursor_coalescing_ready_target_small_scan_schedule()
+            plan_builder = build_cursor_coalescing_ready_target_small_scan_plan
+        elif coalescing_ready_target_scan:
+            schedule_builder = lambda _selected_writers: build_cursor_coalescing_ready_target_scan_schedule()
+            plan_builder = build_cursor_coalescing_ready_target_scan_plan
+        elif coalescing_ready_target:
+            schedule_builder = lambda _selected_writers: build_cursor_coalescing_ready_target_schedule()
+            plan_builder = build_cursor_coalescing_ready_target_plan
+        elif cursor_publication:
+            schedule_builder = build_cursor_publication_schedule
+            plan_builder = build_cursor_publication_plan
+        elif ready_target_final:
+            schedule_builder = lambda _selected_writers: build_v7_v8_ready_target_final_schedule()
+            plan_builder = build_v7_v8_ready_target_final_plan
+        elif v8_d2_qualification:
+            schedule_builder = lambda _selected_writers: build_v8_d2_qualification_schedule()
+            plan_builder = build_v8_d2_qualification_plan
+        elif retirement:
+            schedule_builder = lambda selected_writers: build_point_resource_retirement_schedule(
+                selected_writers,
+                point_buffer_preallocation_enabled=retirement_preallocation,
+            )
+            plan_builder = build_point_resource_retirement_plan
+        elif coalescing_budget:
+            schedule_builder = build_cursor_coalescing_budget_schedule
+            plan_builder = build_cursor_coalescing_budget_plan
+        elif completion_wake:
+            schedule_builder = build_cursor_direct_completion_wake_schedule
+            plan_builder = build_cursor_direct_completion_wake_plan
+        elif singleton_submission:
+            schedule_builder = build_cursor_singleton_submission_schedule
+            plan_builder = build_cursor_singleton_submission_plan
+        elif direct_completion:
+            schedule_builder = build_cursor_direct_completion_schedule
+            plan_builder = build_cursor_direct_completion_plan
+        elif cursor_schema_version == POINT_PROGRESS_PLAN_SCHEMA_V2:
+            schedule_builder = build_point_progress_cursor_v2_schedule
+            plan_builder = build_point_progress_cursor_v2_plan
+        elif cursor:
+            schedule_builder = build_point_progress_cursor_schedule
+            plan_builder = build_point_progress_cursor_plan
+        else:
+            schedule_builder = build_point_progress_ring_schedule
+            plan_builder = build_point_progress_ring_plan
+        writers = (
+            CURSOR_COALESCING_READY_TARGET_SMALL_SCAN_WRITERS if coalescing_ready_target_small_scan else
+            CURSOR_COALESCING_READY_TARGET_SCAN_WRITERS if coalescing_ready_target_scan else
+            CURSOR_COALESCING_READY_TARGET_WRITERS if coalescing_ready_target else
+            CURSOR_PUBLICATION_WRITERS if cursor_publication else
+            V7_V8_READY_TARGET_FINAL_WRITERS if ready_target_final else
+            V8_D2_QUALIFICATION_WRITERS if v8_d2_qualification else
+            POINT_RESOURCE_RETIREMENT_WRITERS if retirement else
+            CURSOR_COALESCING_BUDGET_WRITERS if coalescing_budget else
+            POINT_PROGRESS_RING_WRITERS
+        )
+        schedule = schedule_builder(writers)
+        if ready_target_final or v8_d2_qualification:
+            plan = plan_builder(
+                machine_type="c4-standard-16-lssd",
+                machine_spec=BENCH.MACHINE_SPECS["c4-standard-16-lssd"],
+                commit=commit,
+                binary_sha256=binary_sha,
+            )
+        elif coalescing_ready_target_small_scan or coalescing_ready_target_scan or coalescing_ready_target:
+            plan = plan_builder(
+                machine_type="c4-standard-16-lssd",
+                machine_spec={"vcpus": 16, "ssd_count": 2, "ssd_gib": 750},
+                commit=commit,
+            )
+        elif cursor_publication:
+            plan = plan_builder(
+                writers=writers,
+                machine_type="c4-standard-16-lssd",
+                machine_spec=BENCH.MACHINE_SPECS["c4-standard-16-lssd"],
+                commit=commit,
+                binary_sha256=binary_sha,
+            )
+        elif completion_wake:
+            plan = plan_builder(
+                writers=writers,
+                machine_type="c4-standard-16-lssd",
+                machine_spec={"vcpus": 16, "ssd_count": 2, "ssd_gib": 750},
+                commit=commit,
+                binary_sha256=binary_sha,
+            )
+        elif retirement:
+            plan = plan_builder(
+                machine_type="c4-standard-16-lssd",
+                machine_spec=BENCH.MACHINE_SPECS["c4-standard-16-lssd"],
+                commit=commit,
+                binary_sha256=binary_sha,
+                point_buffer_preallocation_enabled=retirement_preallocation,
+            )
+        elif coalescing_budget:
+            plan = plan_builder(
+                machine_type="c4-standard-16-lssd",
+                machine_spec={"vcpus": 16, "ssd_count": 2, "ssd_gib": 750},
+                commit=commit,
+            )
+        else:
+            plan = plan_builder(
+                writers=writers,
+                machine_type="c4-standard-16-lssd",
+                machine_spec=BENCH.MACHINE_SPECS["c4-standard-16-lssd"],
+                commit=commit,
+                binary_sha256=binary_sha,
+            )
+        if not include_schema_version:
+            plan.pop("plan_schema_version", None)
+        (results / "benchmark-plan.json").write_text(json.dumps(plan), encoding="utf-8")
+        (results / "commit.txt").write_text(commit + "\n", encoding="utf-8")
+        (results / "write-perf.sha256").write_text(binary_sha + "\n", encoding="utf-8")
+        schedule_name = (
+            "cursor-coalescing-ready-target-small-scan-schedule.tsv" if coalescing_ready_target_small_scan else
+            "v7-v8-ready-target-final-schedule.tsv" if ready_target_final else
+            "v8-d2-qualification-schedule.tsv" if v8_d2_qualification else
+            "cursor-coalescing-ready-target-scan-schedule.tsv" if coalescing_ready_target_scan else
+            "cursor-coalescing-ready-target-schedule.tsv" if coalescing_ready_target else
+            "point-resource-retirement-schedule.tsv" if retirement else
+            "cursor-publication-schedule.tsv" if cursor_publication else
+            "cursor-coalescing-budget-schedule.tsv" if coalescing_budget else
+            "cursor-singleton-submission-schedule.tsv" if singleton_submission else
+            "cursor-direct-completion-wake-schedule.tsv" if completion_wake else
+            "cursor-direct-completion-schedule.tsv" if direct_completion else
+            "point-progress-cursor-schedule.tsv" if cursor else
+            "point-progress-ring-schedule.tsv"
+        )
+        with (results / schedule_name).open("w", encoding="utf-8", newline="") as stream:
+            writer = csv.DictWriter(stream, fieldnames=schedule[0].keys(), delimiter="\t", lineterminator="\n")
+            writer.writeheader()
+            writer.writerows({**row, "batch_size": row["batch_size"] or "none"} for row in schedule)
+
+        rows = []
+        for row in schedule:
+            run_id = progress_ring_runner._run_id(row)
+            run_dir = results / run_id
+            run_dir.mkdir()
+            raw = (
+                cls._raw_v7_record(row)
+                if (ready_target_final or v8_d2_qualification) and row["format_version"] == 7
+                else cls._raw_record(row)
+            )
+            record_validator = (
+                progress_ring_runner._validate_point_preallocation_record
+                if ready_target_final or v8_d2_qualification else
+                progress_ring_runner._validate_record
+                if coalescing_ready_target_small_scan or coalescing_ready_target_scan or coalescing_ready_target else
+                progress_ring_runner._validate_cursor_publication_record if cursor_publication else
+                progress_ring_runner._validate_point_resource_retirement_stage_a_record if completion_wake else
+                progress_ring_runner._validate_point_resource_retirement_stage_a_record
+                if retirement_preallocation else progress_ring_runner._validate_record
+            )
+            metadata = {
+                **row,
+                "source_commit": commit,
+                "binary_sha256": binary_sha,
+                "exit_code": 0,
+                "duration_seconds": 5.0,
+                **record_validator(raw, row),
+            }
+            (run_dir / "result.json").write_text(json.dumps(raw), encoding="utf-8")
+            (run_dir / "run-metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
+            (run_dir / "environment.txt").write_text(
+                progress_ring_runner._v8_d2_qualification_environment_text(row) if v8_d2_qualification else
+                progress_ring_runner._v7_v8_ready_target_final_environment_text(row) if ready_target_final else
+                progress_ring_runner._expected_environment_text(
+                    bool(row["progress_ring_enabled"]), bool(row.get("progress_cursor_enabled", False)),
+                    row.get("progress_counters_enabled"), row.get("cursor_direct_completion_enabled"),
+                    row.get("cursor_singleton_submission_enabled"),
+                    row.get("coalescing_budget_us"),
+                    point_buffer_preallocation_enabled=(
+                        bool(row["point_buffer_preallocation_enabled"])
+                        if coalescing_ready_target_small_scan or coalescing_ready_target_scan or coalescing_ready_target
+                        or cursor_publication or completion_wake else
+                        True if row.get("point_buffer_preallocation_enabled") is True else None
+                    ),
+                    point_resource_retirement_mode=row.get("point_resource_retirement_mode"),
+                    admission_cursor_publish_fast_path_enabled=row.get(
+                        "admission_cursor_publish_fast_path_enabled"
+                    ),
+                    cursor_direct_completion_wake_mode=row.get("cursor_direct_completion_wake_mode"),
+                    coalescing_ready_target=(
+                        row.get("coalescing_ready_target")
+                        if coalescing_ready_target_small_scan or coalescing_ready_target_scan
+                        or coalescing_ready_target else None
+                    ),
+                ),
+                encoding="utf-8",
+            )
+            rows.append(metadata)
+        if v8_d2_qualification:
+            summary = progress_ring_runner._v8_d2_qualification_summary(rows, len(schedule))
+        elif ready_target_final:
+            summary = progress_ring_runner._v7_v8_ready_target_final_summary(rows, len(schedule))
+        elif coalescing_ready_target_small_scan:
+            summary = progress_ring_runner._coalescing_ready_target_small_scan_summary(
+                rows, writers, len(schedule),
+            )
+        elif coalescing_ready_target_scan:
+            summary = progress_ring_runner._coalescing_ready_target_scan_summary(rows, writers, len(schedule))
+        elif coalescing_ready_target:
+            summary = progress_ring_runner._coalescing_ready_target_summary(rows, writers, len(schedule))
+        elif cursor_publication:
+            summary = progress_ring_runner._cursor_publication_summary(rows, writers, len(schedule))
+        elif completion_wake:
+            summary = progress_ring_runner._completion_wake_summary(rows, writers, len(schedule))
+        elif retirement:
+            summary = progress_ring_runner._point_resource_retirement_summary(
+                rows, len(schedule),
+                point_buffer_preallocation_enabled=retirement_preallocation,
+            )
+        elif coalescing_budget:
+            summary = progress_ring_runner._coalescing_budget_summary(rows, writers, len(schedule))
+        elif singleton_submission:
+            summary = progress_ring_runner._singleton_submission_summary(
+                rows, POINT_PROGRESS_RING_WRITERS, len(schedule),
+            )
+        elif direct_completion:
+            summary = progress_ring_runner._direct_completion_summary(
+                rows, POINT_PROGRESS_RING_WRITERS, len(schedule),
+            )
+        elif cursor_schema_version == POINT_PROGRESS_PLAN_SCHEMA_V2:
+            summary = progress_ring_runner._cursor_v2_summary(
+                rows, POINT_PROGRESS_RING_WRITERS, len(schedule),
+            )
+        elif cursor:
+            summary = progress_ring_runner._cursor_summary(rows, POINT_PROGRESS_RING_WRITERS, len(schedule))
+        else:
+            summary = progress_ring_runner._summary(rows, POINT_PROGRESS_RING_WRITERS, len(schedule))
+        summary.update({
+            "source_commit": commit,
+            "binary_sha256": binary_sha,
+            "runs_attempted": len(schedule),
+        })
+        (results / "summary.json").write_text(json.dumps(summary), encoding="utf-8")
+        (results / "remote-exit.json").write_text(
+            json.dumps({"failed": False, "runs_started": len(schedule), "runs_attempted": len(schedule)}),
+            encoding="utf-8",
+        )
+        with (results / "summary.tsv").open("w", encoding="utf-8", newline="") as stream:
+            fields = progress_ring_runner._summary_fields(schedule)
+            writer = csv.DictWriter(stream, fieldnames=fields, delimiter="\t", lineterminator="\n")
+            writer.writeheader()
+            for row in rows:
+                writer.writerow({
+                    key: json.dumps(value, sort_keys=True) if isinstance(value, dict) else value
+                    for key, value in row.items()
+                })
+        return results
+
+    def test_environment_uses_supported_ordered_data_submit_mode(self) -> None:
+        for ring_enabled, cursor_enabled, counters_enabled, mode in (
+            (False, False, None, "0"), (True, True, False, "2"),
+        ):
+            environment = progress_ring_runner._environment(ring_enabled, cursor_enabled, counters_enabled)
+            self.assertEqual(environment["TOYKV_BENCH_V8_DATA_SUBMIT_ORDER"], "ordered")
+            self.assertEqual(environment["TOYKV_BENCH_V8_POINT_PROGRESS_RING"], mode)
+            self.assertEqual(
+                environment.get("TOYKV_BENCH_V8_PROGRESS_COUNTERS"),
+                "0" if counters_enabled is False else None,
+            )
+        direct_environment = progress_ring_runner._environment(
+            True, True, False, True,
+        )
+        self.assertEqual(direct_environment["TOYKV_BENCH_V8_CURSOR_DIRECT_COMPLETION"], "1")
+        self.assertIn(
+            "TOYKV_BENCH_V8_CURSOR_DIRECT_COMPLETION=1\n",
+            progress_ring_runner._expected_environment_text(True, True, False, True),
+        )
+        singleton_environment = progress_ring_runner._environment(
+            True, True, False, False, True,
+        )
+        self.assertEqual(singleton_environment["TOYKV_BENCH_V8_CURSOR_DIRECT_COMPLETION"], "0")
+        self.assertEqual(singleton_environment["TOYKV_BENCH_V8_CURSOR_SINGLETON_SUBMISSION"], "1")
+        self.assertIn(
+            "TOYKV_BENCH_V8_CURSOR_SINGLETON_SUBMISSION=1\n",
+            progress_ring_runner._expected_environment_text(True, True, False, False, True),
+        )
+        with self.assertRaisesRegex(ValueError, r"only Eager \(0\) and Cursor \(2\)"):
+            progress_ring_runner._environment(False, True)
+        with self.assertRaisesRegex(ValueError, r"only Eager \(0\) and Cursor \(2\)"):
+            progress_ring_runner._environment(True, False)
+
+    def test_cursor_fixture_uses_mode_two_and_keeps_f05_verifier_separate(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            results = self._make_fixture(Path(temporary), cursor=True)
+            schedule = build_point_progress_cursor_schedule(POINT_PROGRESS_RING_WRITERS)
+            self.assertEqual(len(schedule), 40)
+            self.assertEqual(
+                {row["arm"] for row in schedule},
+                {"eager", "cursor"},
+            )
+            self.assertTrue(progress_ring_runner.verify_cursor_results_directory(results)["verified"])
+            self.assertFalse(progress_ring_runner.verify_results_directory(results)["verified"])
+            candidate = next(row for row in schedule if row["arm"] == "cursor")
+            environment = (results / progress_ring_runner._run_id(candidate) / "environment.txt").read_text(
+                encoding="utf-8",
+            )
+            self.assertIn("TOYKV_BENCH_V8_POINT_PROGRESS_RING=2\n", environment)
+            self.assertIn("TOYKV_BENCH_V8_PROGRESS_COUNTERS=0\n", environment)
+            plan = json.loads((results / "benchmark-plan.json").read_text(encoding="utf-8"))
+            self.assertEqual(plan["plan_schema_version"], POINT_PROGRESS_PLAN_SCHEMA_V3)
+            self.assertEqual(plan["suite"], "v8-point-progress-cursor")
+            self.assertEqual(plan["arms"], ["eager", "cursor"])
+            self.assertEqual(plan["arm_orders"], [list(order) for order in POINT_PROGRESS_CURSOR_ORDERS])
+            self.assertEqual(plan["runs_planned"], 40)
+            self.assertEqual(
+                plan["runtime_protocol"],
+                "single 16-vCPU host; RAID0 over 2 Local SSDs; same source and binary for two arms",
+            )
+            self.assertEqual(plan["progress_cursor_ab"]["candidate_value"], "2")
+
+    def test_cursor_direct_completion_fixture_verifies_actual_arm_switch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            results = self._make_fixture(Path(temporary), direct_completion=True)
+            schedule = build_cursor_direct_completion_schedule(POINT_PROGRESS_RING_WRITERS)
+            self.assertEqual(len(schedule), 40)
+            self.assertEqual({row["arm"] for row in schedule}, set(CURSOR_DIRECT_COMPLETION_ARMS))
+            self.assertTrue(progress_ring_runner.verify_direct_completion_results_directory(results)["verified"])
+            summary = json.loads((results / "summary.json").read_text(encoding="utf-8"))
+            self.assertTrue(validate_cursor_direct_completion_rows(
+                summary["results"], POINT_PROGRESS_RING_WRITERS,
+            )["complete"])
+            self.assertTrue(BENCH._verify_result_set(results)["verified"])
+            plan = json.loads((results / "benchmark-plan.json").read_text(encoding="utf-8"))
+            self.assertEqual(plan["suite"], "v8-cursor-direct-completion")
+            self.assertEqual(plan["arms"], list(CURSOR_DIRECT_COMPLETION_ARMS))
+            self.assertEqual(plan["runs_planned"], 40)
+            direct = next(row for row in schedule if row["arm"] == "cursor_direct")
+            relay = next(row for row in schedule if row["arm"] == "cursor_relay")
+            self.assertTrue(direct["cursor_direct_completion_enabled"])
+            self.assertFalse(relay["cursor_direct_completion_enabled"])
+            direct_env = (results / progress_ring_runner._run_id(direct) / "environment.txt").read_text(
+                encoding="utf-8",
+            )
+            relay_env = (results / progress_ring_runner._run_id(relay) / "environment.txt").read_text(
+                encoding="utf-8",
+            )
+            self.assertIn("TOYKV_BENCH_V8_CURSOR_DIRECT_COMPLETION=1\n", direct_env)
+            self.assertIn("TOYKV_BENCH_V8_CURSOR_DIRECT_COMPLETION=0\n", relay_env)
+
+            direct_metadata_path = results / progress_ring_runner._run_id(direct) / "run-metadata.json"
+            metadata = json.loads(direct_metadata_path.read_text(encoding="utf-8"))
+            metadata["cursor_direct_completion_enabled"] = False
+            direct_metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+            verification = progress_ring_runner.verify_direct_completion_results_directory(results)
+            self.assertFalse(verification["verified"])
+            self.assertTrue(any("metadata" in error or "matrix" in error for error in verification["errors"]))
+
+    def test_cursor_direct_completion_wake_fixture_verifies_token_select_and_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            results = self._make_fixture(Path(temporary), completion_wake=True)
+            schedule = build_cursor_direct_completion_wake_schedule(POINT_PROGRESS_RING_WRITERS)
+            self.assertEqual(len(schedule), 40)
+            self.assertEqual({row["arm"] for row in schedule}, set(CURSOR_DIRECT_COMPLETION_WAKE_ARMS))
+            verification = progress_ring_runner.verify_cursor_direct_completion_wake_results_directory(results)
+            self.assertTrue(verification["verified"], verification["errors"])
+            self.assertTrue(BENCH._verify_result_set(results)["verified"])
+            plan = json.loads((results / "benchmark-plan.json").read_text(encoding="utf-8"))
+            self.assertEqual(plan["suite"], "v8-cursor-direct-completion-wake")
+            self.assertEqual(plan["arms"], list(CURSOR_DIRECT_COMPLETION_WAKE_ARMS))
+            self.assertEqual(plan["runs_planned"], 40)
+            token = next(row for row in schedule if row["arm"] == "token")
+            select = next(row for row in schedule if row["arm"] == "select")
+            self.assertTrue(token["cursor_direct_completion_enabled"])
+            self.assertEqual(token["cursor_direct_completion_wake_mode"], "token")
+            self.assertEqual(select["cursor_direct_completion_wake_mode"], "select")
+            self.assertTrue(token["point_buffer_preallocation_enabled"])
+            self.assertIn(
+                "TOYKV_BENCH_V8_DIRECT_COMPLETION_WAKE=select\n",
+                (results / progress_ring_runner._run_id(select) / "environment.txt").read_text(
+                    encoding="utf-8",
+                ),
+            )
+
+            summary_path = results / "summary.json"
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            summary["comparison"][0]["select_pair_wins"] += 1
+            summary_path.write_text(json.dumps(summary), encoding="utf-8")
+            verification = progress_ring_runner.verify_cursor_direct_completion_wake_results_directory(results)
+            self.assertFalse(verification["verified"])
+            self.assertTrue(any("comparison" in error for error in verification["errors"]))
+
+    def test_cursor_singleton_submission_fixture_verifies_actual_arm_switch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            results = self._make_fixture(Path(temporary), singleton_submission=True)
+            schedule = build_cursor_singleton_submission_schedule(POINT_PROGRESS_RING_WRITERS)
+            self.assertEqual(len(schedule), 40)
+            self.assertEqual({row["arm"] for row in schedule}, set(CURSOR_SINGLETON_SUBMISSION_ARMS))
+            self.assertTrue(progress_ring_runner.verify_singleton_submission_results_directory(results)["verified"])
+            self.assertTrue(BENCH._verify_result_set(results)["verified"])
+            summary = json.loads((results / "summary.json").read_text(encoding="utf-8"))
+            self.assertTrue(validate_cursor_singleton_submission_rows(
+                summary["results"], POINT_PROGRESS_RING_WRITERS,
+            )["complete"])
+            plan = json.loads((results / "benchmark-plan.json").read_text(encoding="utf-8"))
+            self.assertEqual(plan["suite"], "v8-cursor-singleton-submission")
+            self.assertEqual(plan["arms"], list(CURSOR_SINGLETON_SUBMISSION_ARMS))
+            self.assertEqual(plan["runs_planned"], 40)
+            self.assertFalse(plan["direct_completion_enabled"])
+            candidate = next(row for row in schedule if row["arm"] == "cursor_singleton")
+            control = next(row for row in schedule if row["arm"] == "cursor_control")
+            self.assertTrue(candidate["cursor_singleton_submission_enabled"])
+            self.assertFalse(control["cursor_singleton_submission_enabled"])
+            candidate_env = (results / progress_ring_runner._run_id(candidate) / "environment.txt").read_text(
+                encoding="utf-8",
+            )
+            control_env = (results / progress_ring_runner._run_id(control) / "environment.txt").read_text(
+                encoding="utf-8",
+            )
+            self.assertIn("TOYKV_BENCH_V8_CURSOR_SINGLETON_SUBMISSION=1\n", candidate_env)
+            self.assertIn("TOYKV_BENCH_V8_CURSOR_SINGLETON_SUBMISSION=0\n", control_env)
+            self.assertIn("TOYKV_BENCH_V8_CURSOR_DIRECT_COMPLETION=0\n", control_env)
+
+            metadata_path = results / progress_ring_runner._run_id(candidate) / "run-metadata.json"
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            metadata["cursor_singleton_submission_enabled"] = False
+            metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+            verification = progress_ring_runner.verify_singleton_submission_results_directory(results)
+            self.assertFalse(verification["verified"])
+            self.assertTrue(any("metadata" in error or "matrix" in error for error in verification["errors"]))
+
+    def test_cursor_coalescing_budget_fixture_verifies_dynamic_and_fixed_arms(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            results = self._make_fixture(Path(temporary), coalescing_budget=True)
+            schedule = build_cursor_coalescing_budget_schedule(CURSOR_COALESCING_BUDGET_WRITERS)
+            self.assertEqual(len(schedule), 30)
+            self.assertEqual({row["arm"] for row in schedule}, set(CURSOR_COALESCING_BUDGET_ARMS))
+            self.assertEqual({row["writer"] for row in schedule}, {8, 16})
+            summary = json.loads((results / "summary.json").read_text(encoding="utf-8"))
+            self.assertTrue(validate_cursor_coalescing_budget_rows(summary["results"])["complete"])
+            self.assertTrue(progress_ring_runner.verify_coalescing_budget_results_directory(results)["verified"])
+            self.assertTrue(BENCH._verify_result_set(results)["verified"])
+            plan = json.loads((results / "benchmark-plan.json").read_text(encoding="utf-8"))
+            self.assertEqual(plan["suite"], "v8-cursor-coalescing-budget")
+            self.assertEqual(plan["runs_planned"], 30)
+            self.assertEqual(plan["arms"], list(CURSOR_COALESCING_BUDGET_ARMS))
+
+            dynamic = next(row for row in schedule if row["arm"] == "dynamic")
+            fixed = next(row for row in schedule if row["arm"] == "fixed_100")
+            dynamic_environment = (results / progress_ring_runner._run_id(dynamic) / "environment.txt").read_text(
+                encoding="utf-8",
+            )
+            fixed_environment = (results / progress_ring_runner._run_id(fixed) / "environment.txt").read_text(
+                encoding="utf-8",
+            )
+            self.assertIn("TOYKV_WAL_V8_COALESCE_BUDGET_US=<unset>\n", dynamic_environment)
+            self.assertNotIn(
+                "TOYKV_WAL_V8_COALESCE_BUDGET_US",
+                progress_ring_runner._environment(True, True, False, True, False),
+            )
+            self.assertIn("TOYKV_WAL_V8_COALESCE_BUDGET_US=100\n", fixed_environment)
+            self.assertTrue(dynamic["progress_cursor_enabled"])
+            self.assertTrue(dynamic["cursor_direct_completion_enabled"])
+            self.assertFalse(dynamic["cursor_singleton_submission_enabled"])
+            self.assertEqual(dynamic["num"], CURSOR_COALESCING_BUDGET_NUM)
+
+            fixed_metadata_path = results / progress_ring_runner._run_id(fixed) / "run-metadata.json"
+            metadata = json.loads(fixed_metadata_path.read_text(encoding="utf-8"))
+            metadata["coalescing_budget_us"] = 400
+            fixed_metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+            verification = progress_ring_runner.verify_coalescing_budget_results_directory(results)
+            self.assertFalse(verification["verified"])
+            self.assertTrue(any("metadata" in error or "matrix" in error for error in verification["errors"]))
+
+    def test_cursor_coalescing_ready_target_fixture_verifies_hits_and_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            results = self._make_fixture(Path(temporary), coalescing_ready_target=True)
+            schedule = build_cursor_coalescing_ready_target_schedule()
+            self.assertEqual(len(schedule), 60)
+            self.assertEqual({row["arm"] for row in schedule}, set(CURSOR_COALESCING_READY_TARGET_ARMS))
+            self.assertEqual({row["writer"] for row in schedule}, {1, 8, 16})
+            summary = json.loads((results / "summary.json").read_text(encoding="utf-8"))
+            self.assertTrue(validate_cursor_coalescing_ready_target_rows(summary["results"])["complete"])
+            self.assertTrue(
+                progress_ring_runner.verify_coalescing_ready_target_results_directory(results)["verified"]
+            )
+            self.assertTrue(BENCH._verify_result_set(results)["verified"])
+            plan = json.loads((results / "benchmark-plan.json").read_text(encoding="utf-8"))
+            self.assertEqual(plan["suite"], "v8-cursor-coalescing-ready-target")
+            self.assertEqual(plan["runs_planned"], 60)
+            self.assertEqual(plan["arms"], list(CURSOR_COALESCING_READY_TARGET_ARMS))
+
+            dynamic = next(row for row in schedule if row["arm"] == "dynamic")
+            target8 = next(
+                row for row in schedule
+                if row["writer"] == 8 and row["workload"] == "point" and row["arm"] == "target_8"
+            )
+            point1_target = next(
+                row for row in schedule
+                if row["writer"] == 1 and row["workload"] == "point" and row["arm"] == "target_8"
+            )
+            dynamic_environment = (results / progress_ring_runner._run_id(dynamic) / "environment.txt").read_text(
+                encoding="utf-8",
+            )
+            target_environment = (results / progress_ring_runner._run_id(target8) / "environment.txt").read_text(
+                encoding="utf-8",
+            )
+            self.assertIn("TOYKV_BENCH_V8_COALESCE_READY_TARGET=<unset>\n", dynamic_environment)
+            self.assertIn("TOYKV_BENCH_V8_COALESCE_READY_TARGET=8\n", target_environment)
+            self.assertEqual(
+                next(item for item in summary["target_usage"] if item["writer"] == 8
+                      and item["workload"] == "point" and item["arm"] == "target_8")["target_hits"],
+                5,
+            )
+            self.assertEqual(
+                next(item for item in summary["target_usage"] if item["writer"] == 1
+                      and item["workload"] == "point" and item["arm"] == "target_8")["target_hits"],
+                0,
+            )
+
+            result_path = results / progress_ring_runner._run_id(target8) / "result.json"
+            raw = json.loads(result_path.read_text(encoding="utf-8"))
+            raw["result"]["wal_pipeline"]["wal_io_end"]["coalesce_ready_target_hits"] = 0
+            result_path.write_text(json.dumps(raw), encoding="utf-8")
+            verification = progress_ring_runner.verify_coalescing_ready_target_results_directory(results)
+            self.assertFalse(verification["verified"])
+            self.assertTrue(any("metrics differ" in error for error in verification["errors"]))
+
+    def test_ready_target_scan_rotates_every_workload_through_all_arm_orders(self) -> None:
+        schedule = build_cursor_coalescing_ready_target_scan_schedule()
+        for writer, workload in CURSOR_COALESCING_READY_TARGET_SCAN_CASES:
+            observed_orders = []
+            for repetition in range(1, len(CURSOR_COALESCING_READY_TARGET_SCAN_ORDERS) + 1):
+                observed_orders.append(tuple(
+                    row["arm"] for row in schedule
+                    if row["writer"] == writer
+                    and row["workload"] == workload
+                    and row["repetition"] == repetition
+                ))
+            self.assertEqual(set(observed_orders), set(CURSOR_COALESCING_READY_TARGET_SCAN_ORDERS))
+
+    def test_cursor_coalescing_ready_target_scan_fixture_verifies_all_40_runs(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            results = self._make_fixture(Path(temporary), coalescing_ready_target_scan=True)
+            schedule = build_cursor_coalescing_ready_target_scan_schedule()
+            self.assertEqual(len(schedule), 40)
+            self.assertEqual({row["arm"] for row in schedule}, set(CURSOR_COALESCING_READY_TARGET_SCAN_ARMS))
+            self.assertEqual({row["writer"] for row in schedule}, {8, 16})
+            self.assertEqual({row["workload"] for row in schedule}, {"point"})
+            summary = json.loads((results / "summary.json").read_text(encoding="utf-8"))
+            self.assertTrue(
+                validate_cursor_coalescing_ready_target_scan_rows(summary["results"])["complete"]
+            )
+            verification = progress_ring_runner.verify_coalescing_ready_target_scan_results_directory(results)
+            self.assertTrue(verification["verified"], verification["errors"])
+            self.assertTrue(BENCH._verify_result_set(results)["verified"])
+            plan = json.loads((results / "benchmark-plan.json").read_text(encoding="utf-8"))
+            self.assertEqual(plan["suite"], "v8-cursor-coalescing-ready-target-scan")
+            self.assertEqual(plan["runs_planned"], 40)
+            self.assertEqual(plan["arms"], list(CURSOR_COALESCING_READY_TARGET_SCAN_ARMS))
+
+            dynamic = next(row for row in schedule if row["arm"] == "dynamic")
+            target4 = next(row for row in schedule if row["arm"] == "target_4")
+            dynamic_environment = (results / progress_ring_runner._run_id(dynamic) / "environment.txt").read_text(
+                encoding="utf-8",
+            )
+            target4_environment = (results / progress_ring_runner._run_id(target4) / "environment.txt").read_text(
+                encoding="utf-8",
+            )
+            self.assertIn("TOYKV_BENCH_V8_COALESCE_READY_TARGET=<unset>\n", dynamic_environment)
+            self.assertIn("TOYKV_BENCH_V8_COALESCE_READY_TARGET=4\n", target4_environment)
+            usage = next(item for item in summary["target_usage"] if item["arm"] == "target_4")
+            self.assertEqual(usage["configured_target"], 4)
+
+    def test_cursor_coalescing_ready_target_small_scan_schedule_is_counterbalanced(self) -> None:
+        schedule = build_cursor_coalescing_ready_target_small_scan_schedule()
+        self.assertEqual(len(schedule), 50)
+        self.assertEqual({row["arm"] for row in schedule}, set(CURSOR_COALESCING_READY_TARGET_SMALL_SCAN_ARMS))
+        self.assertEqual({row["writer"] for row in schedule}, {8, 16})
+        self.assertEqual({row["workload"] for row in schedule}, {"point"})
+        for writer, workload in CURSOR_COALESCING_READY_TARGET_SMALL_SCAN_CASES:
+            observed_orders = [
+                tuple(
+                    row["arm"] for row in schedule
+                    if row["writer"] == writer
+                    and row["workload"] == workload
+                    and row["repetition"] == repetition
+                )
+                for repetition in range(1, len(CURSOR_COALESCING_READY_TARGET_SMALL_SCAN_ORDERS) + 1)
+            ]
+            self.assertEqual(
+                set(observed_orders),
+                set(CURSOR_COALESCING_READY_TARGET_SMALL_SCAN_ORDERS),
+            )
+
+    def test_cursor_coalescing_ready_target_small_scan_fixture_verifies_all_50_runs(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            results = self._make_fixture(Path(temporary), coalescing_ready_target_small_scan=True)
+            schedule = build_cursor_coalescing_ready_target_small_scan_schedule()
+            self.assertEqual(len(schedule), 50)
+            self.assertTrue(BENCH._verify_result_set(results)["verified"])
+            verification = progress_ring_runner.verify_coalescing_ready_target_small_scan_results_directory(
+                results,
+            )
+            self.assertTrue(verification["verified"], verification["errors"])
+            summary = json.loads((results / "summary.json").read_text(encoding="utf-8"))
+            plan = json.loads((results / "benchmark-plan.json").read_text(encoding="utf-8"))
+            self.assertEqual(summary["suite"], "v8-cursor-coalescing-ready-target-small-scan")
+            self.assertEqual(plan["runs_planned"], 50)
+            self.assertEqual(plan["arms"], list(CURSOR_COALESCING_READY_TARGET_SMALL_SCAN_ARMS))
+            target1 = next(row for row in schedule if row["arm"] == "target_1")
+            target1_environment = (
+                results / progress_ring_runner._run_id(target1) / "environment.txt"
+            ).read_text(encoding="utf-8")
+            self.assertIn("TOYKV_BENCH_V8_COALESCE_READY_TARGET=1\n", target1_environment)
+
+    def test_v7_v8_ready_target_final_schedule_is_counterbalanced_and_fixed(self) -> None:
+        schedule = build_v7_v8_ready_target_final_schedule()
+        self.assertEqual(len(schedule), 80)
+        self.assertEqual({row["arm"] for row in schedule}, set(V7_V8_READY_TARGET_FINAL_ARMS))
+        self.assertEqual({(row["writer"], row["workload"]) for row in schedule},
+                         set(V7_V8_READY_TARGET_FINAL_CASES))
+        for writer, workload in V7_V8_READY_TARGET_FINAL_CASES:
+            for repetition in range(1, 6):
+                cell = [row for row in schedule if row["writer"] == writer
+                        and row["workload"] == workload and row["repetition"] == repetition]
+                self.assertEqual(len(cell), len(V7_V8_READY_TARGET_FINAL_ARMS))
+                self.assertEqual({row["arm"] for row in cell}, set(V7_V8_READY_TARGET_FINAL_ARMS))
+            observed_orders = {
+                tuple(row["arm"] for row in schedule if row["writer"] == writer
+                      and row["workload"] == workload and row["repetition"] == repetition)
+                for repetition in range(1, 6)
+            }
+            self.assertEqual(observed_orders, set(V7_V8_READY_TARGET_FINAL_ORDERS))
+
+        for row in schedule:
+            if row["arm"] == "v7_parallel":
+                self.assertEqual(row["format_version"], 7)
+                self.assertIsNone(row["point_buffer_preallocation_enabled"])
+                self.assertIsNone(row["coalescing_ready_target"])
+            else:
+                self.assertEqual(row["format_version"], 8)
+                self.assertEqual(row["progress_cursor_enabled"], True)
+                self.assertEqual(row["cursor_direct_completion_enabled"], True)
+                self.assertEqual(row["point_buffer_preallocation_enabled"], row["workload"] == "point")
+                expected_target = {
+                    "v8_dynamic": None,
+                    "v8_target4": 4,
+                    "v8_target8": 8,
+                }[row["arm"]]
+                self.assertEqual(row["coalescing_ready_target"], expected_target)
+
+        plan = build_v7_v8_ready_target_final_plan(
+            machine_type="c4-standard-16-lssd",
+            machine_spec=BENCH.MACHINE_SPECS["c4-standard-16-lssd"],
+            commit="a" * 40,
+            binary_sha256="b" * 64,
+        )
+        self.assertEqual(plan["runs_planned"], 80)
+        self.assertEqual(plan["score_runs_planned"], 80)
+        self.assertEqual(plan["arms"], list(V7_V8_READY_TARGET_FINAL_ARMS))
+
+    def test_v7_v8_ready_target_final_fixture_verifies_all_80_runs_and_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            results = self._make_fixture(Path(temporary), ready_target_final=True)
+            verification = progress_ring_runner.verify_v7_v8_ready_target_final_results_directory(results)
+            self.assertTrue(verification["verified"], verification["errors"])
+            self.assertEqual(verification["planned"], 80)
+            self.assertEqual(verification["observed"], 80)
+            self.assertTrue(BENCH._verify_result_set(results)["verified"])
+            summary = json.loads((results / "summary.json").read_text(encoding="utf-8"))
+            self.assertTrue(summary["complete"])
+            self.assertEqual(summary["runs_completed"], 80)
+            self.assertEqual(summary["runs_attempted"], 80)
+            plan = json.loads((results / "benchmark-plan.json").read_text(encoding="utf-8"))
+            self.assertEqual(plan["suite"], "v7-v8-ready-target-final")
+            self.assertEqual(plan["runs_planned"], 80)
+
+            summary["comparison"][0]["arms"]["v8_target4"]["puts_per_second"] += 1
+            (results / "summary.json").write_text(json.dumps(summary), encoding="utf-8")
+            verification = progress_ring_runner.verify_v7_v8_ready_target_final_results_directory(results)
+            self.assertFalse(verification["verified"])
+            self.assertTrue(any("comparison differs" in error for error in verification["errors"]))
+
+    def test_ready_target_final_live_v7_run_uses_v7_v8_validator(self) -> None:
+        row = next(
+            row for row in build_v7_v8_ready_target_final_schedule()
+            if row["format_version"] == 7 and row["workload"] == "point"
+        )
+        row = {**row, "source_commit": "a" * 40}
+        process = Mock()
+        process.args = ["write-perf"]
+        process.returncode = 0
+        process.communicate.return_value = (json.dumps(self._raw_v7_record(row)), "")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with patch.object(progress_ring_runner.subprocess, "Popen", return_value=process):
+                metadata = progress_ring_runner._run_one(
+                    binary=Path("write-perf"),
+                    binary_sha256="b" * 64,
+                    row=row,
+                    results_dir=root / "results",
+                    db_root=root / "db",
+                    safe_deadline_epoch=int(time.time()) + 3600,
+                    candidate_mode="v7-v8-ready-target-final",
+                )
+            run_dir = root / "results" / progress_ring_runner._run_id(row)
+            self.assertFalse((run_dir / "validation-error.txt").exists())
+
+        self.assertEqual(metadata["exit_code"], 0)
+        self.assertEqual(metadata["format_version"], 7)
+        self.assertEqual(metadata["sync_count"], 1000)
+
+    def test_v8_d2_qualification_schedule_plan_env_and_verifier(self) -> None:
+        schedule = build_v8_d2_qualification_schedule()
+        self.assertEqual(len(schedule), 80)
+        self.assertEqual({row["arm"] for row in schedule}, set(V8_D2_QUALIFICATION_ARMS))
+        self.assertEqual({(row["writer"], row["workload"]) for row in schedule}, set(V8_D2_QUALIFICATION_CASES))
+        for writer, workload in V8_D2_QUALIFICATION_CASES:
+            for repetition in range(1, 6):
+                cell = [
+                    row for row in schedule
+                    if row["writer"] == writer and row["workload"] == workload and row["repetition"] == repetition
+                ]
+                self.assertEqual(len(cell), len(V8_D2_QUALIFICATION_ARMS))
+                self.assertEqual({row["arm"] for row in cell}, set(V8_D2_QUALIFICATION_ARMS))
+            observed_orders = {
+                tuple(
+                    row["arm"] for row in schedule
+                    if row["writer"] == writer and row["workload"] == workload and row["repetition"] == repetition
+                )
+                for repetition in range(1, 6)
+            }
+            self.assertEqual(observed_orders, set(V8_D2_QUALIFICATION_ORDERS))
+
+        for row in schedule:
+            if row["arm"] == "v7_parallel":
+                self.assertEqual(row["format_version"], 7)
+                self.assertIsNone(row["v8_profile"])
+                self.assertIsNone(row["coalesce_target_policy"])
+            elif row["arm"] == "v8_legacy":
+                self.assertEqual(row["format_version"], 8)
+                self.assertEqual(row["v8_profile"], "legacy")
+                self.assertEqual(row["coalesce_target_policy"], "disabled")
+            elif row["arm"] == "v8_candidate_dynamic":
+                self.assertEqual(row["format_version"], 8)
+                self.assertEqual(row["v8_profile"], "candidate")
+                self.assertEqual(row["coalesce_target_policy"], "disabled")
+            else:
+                self.assertEqual(row["arm"], "v8_candidate_target8")
+                self.assertEqual(row["format_version"], 8)
+                self.assertEqual(row["v8_profile"], "candidate")
+                self.assertEqual(row["coalesce_target_policy"], "point_only")
+                self.assertEqual(row["coalescing_ready_target"], 8)
+
+        plan = build_v8_d2_qualification_plan(
+            machine_type="c4-standard-16-lssd",
+            machine_spec=BENCH.MACHINE_SPECS["c4-standard-16-lssd"],
+            commit="a" * 40,
+            binary_sha256="b" * 64,
+        )
+        self.assertEqual(plan["suite"], "v8-d2-qualification")
+        self.assertEqual(plan["runs_planned"], 80)
+        self.assertEqual(plan["score_runs_planned"], 80)
+        self.assertEqual(plan["arms"], list(V8_D2_QUALIFICATION_ARMS))
+
+        legacy_point = next(
+            row for row in schedule if row["arm"] == "v8_legacy" and row["workload"] == "point"
+        )
+        cand_dyn_point = next(
+            row for row in schedule if row["arm"] == "v8_candidate_dynamic" and row["workload"] == "point"
+        )
+        cand_t8_batch = next(
+            row for row in schedule if row["arm"] == "v8_candidate_target8" and row["workload"] == "batch64"
+        )
+        cand_t8_point1 = next(
+            row for row in schedule
+            if row["arm"] == "v8_candidate_target8" and row["workload"] == "point" and row["writer"] == 1
+        )
+        cand_t8_point8 = next(
+            row for row in schedule
+            if row["arm"] == "v8_candidate_target8" and row["workload"] == "point" and row["writer"] == 8
+        )
+        v7_point = next(row for row in schedule if row["arm"] == "v7_parallel" and row["workload"] == "point")
+        for sample_row in (v7_point, legacy_point, cand_dyn_point, cand_t8_batch):
+            runtime_env = progress_ring_runner._v8_d2_qualification_environment(sample_row)
+            for base_key in ("PATH", "HOME", "TMPDIR", "LC_ALL"):
+                self.assertIn(base_key, runtime_env)
+            archive_env = progress_ring_runner._v8_d2_qualification_environment_text(sample_row)
+            for base_key in ("PATH=", "HOME=", "TMPDIR=", "LC_ALL="):
+                self.assertNotIn(base_key, archive_env)
+        self.assertIn(
+            "TOYKV_WAL_V8_PROFILE=legacy\n",
+            progress_ring_runner._v8_d2_qualification_environment_text(legacy_point),
+        )
+        self.assertIn(
+            "TOYKV_WAL_V8_COALESCING=dynamic\n",
+            progress_ring_runner._v8_d2_qualification_environment_text(legacy_point),
+        )
+        self.assertIn(
+            "TOYKV_WAL_V8_PROFILE=candidate\n",
+            progress_ring_runner._v8_d2_qualification_environment_text(cand_dyn_point),
+        )
+        self.assertIn(
+            "TOYKV_WAL_V8_COALESCING=dynamic\n",
+            progress_ring_runner._v8_d2_qualification_environment_text(cand_dyn_point),
+        )
+        self.assertIn(
+            "TOYKV_WAL_V8_COALESCING=point-target8\n",
+            progress_ring_runner._v8_d2_qualification_environment_text(cand_t8_batch),
+        )
+
+        # Reject Dynamic arm with non-zero Target8 counters
+        bad_dyn_raw = self._raw_record(cand_dyn_point)
+        bad_dyn_raw["result"]["wal_pipeline"]["wal_io_end"]["coalesce_target_eligible_cycles"] = 1
+        with self.assertRaises(ValueError):
+            progress_ring_runner._validate_point_preallocation_record(bad_dyn_raw, cand_dyn_point)
+
+        # Reject Point1 Target8 hits
+        bad_p1_raw = self._raw_record(cand_t8_point1)
+        bad_p1_raw["result"]["wal_pipeline"]["wal_io_end"]["coalesce_target_initial_hits"] = 1
+        with self.assertRaises(ValueError):
+            progress_ring_runner._validate_point_preallocation_record(bad_p1_raw, cand_t8_point1)
+
+        # Reject Point8/16 mixed-batch fallback cycles under point_only
+        bad_p8_raw = self._raw_record(cand_t8_point8)
+        bad_p8_raw["result"]["wal_pipeline"]["wal_io_end"]["coalesce_target_mixed_fallback_cycles"] = 1
+        with self.assertRaises(ValueError):
+            progress_ring_runner._validate_point_preallocation_record(bad_p8_raw, cand_t8_point8)
+
+        # Reject Batch64 eligible cycles or target hits under point_only policy
+        bad_batch_raw = self._raw_record(cand_t8_batch)
+        bad_batch_raw["result"]["wal_pipeline"]["wal_io_end"]["coalesce_target_eligible_cycles"] = 1
+        with self.assertRaises(ValueError):
+            progress_ring_runner._validate_point_preallocation_record(bad_batch_raw, cand_t8_batch)
+
+        # Reject initial + after_wake != total target hits
+        bad_sum_raw = self._raw_record(cand_t8_point8)
+        bad_sum_raw["result"]["wal_pipeline"]["wal_io_end"]["coalesce_target_initial_hits"] += 1
+        with self.assertRaises(ValueError):
+            progress_ring_runner._validate_point_preallocation_record(bad_sum_raw, cand_t8_point8)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            results = self._make_fixture(Path(temporary), v8_d2_qualification=True)
+            verification = progress_ring_runner.verify_v8_d2_qualification_results_directory(results)
+            self.assertTrue(verification["verified"], verification["errors"])
+            self.assertEqual(verification["planned"], 80)
+            self.assertEqual(verification["observed"], 80)
+            self.assertTrue(BENCH._verify_result_set(results)["verified"])
+            summary = json.loads((results / "summary.json").read_text(encoding="utf-8"))
+            self.assertTrue(summary["complete"])
+            self.assertEqual(summary["runs_completed"], 80)
+            self.assertEqual(summary["runs_attempted"], 80)
+            self.assertTrue(summary["qualification_gates"]["candidate_dynamic_qualified"])
+            self.assertTrue(summary["qualification_gates"]["candidate_target8_qualified"])
+            self.assertTrue(summary["qualification_gates"]["all_automated_gates_passed"])
+            self.assertGreater(summary["qualification_gates"]["point16_target8_hits"], 0)
+            self.assertIsNotNone(
+                summary["comparison"][0]["paired"]["v8_candidate_target8_vs_v8_candidate_dynamic"][
+                    "paired_cpu_us_per_put_delta_median_us"
+                ]
+            )
+            # Incomplete paired repetitions must fail both candidate gates
+            partial_rows = [
+                row for row in summary["results"]
+                if not (row["writer"] == 1 and row["workload"] == "point" and row["repetition"] == 5)
+            ]
+            partial_summary = progress_ring_runner._v8_d2_qualification_summary(partial_rows, 80)
+            self.assertFalse(partial_summary["qualification_gates"]["candidate_dynamic_qualified"])
+            self.assertFalse(partial_summary["qualification_gates"]["candidate_target8_qualified"])
+
+            # Frozen historical archive environment.txt must remain exact
+            historical_env = progress_ring_runner._expected_environment_text(
+                True, True, False, True, False,
+            )
+            for d2_only_var in (
+                "TOYKV_WAL_V8_PROFILE",
+                "TOYKV_WAL_V8_COALESCING",
+                "TOYKV_WAL_V8_PROGRESS_MODE",
+                "TOYKV_WAL_V8_EXTENT_LOOKAHEAD",
+            ):
+                self.assertNotIn(d2_only_var, historical_env)
+            summary["comparison"][0]["arms"]["v8_candidate_target8"]["puts_per_second"] += 1
+            (results / "summary.json").write_text(json.dumps(summary), encoding="utf-8")
+            verification = progress_ring_runner.verify_v8_d2_qualification_results_directory(results)
+            self.assertFalse(verification["verified"])
+            self.assertTrue(any("comparison differs" in error for error in verification["errors"]))
+
+    def test_v8_d2_qualification_live_runner_smoke_all_four_arms(self) -> None:
+        schedule = build_v8_d2_qualification_schedule()
+        sample_rows = [
+            next(row for row in schedule if row["arm"] == arm and row["workload"] == "point" and row["writer"] == 8)
+            for arm in V8_D2_QUALIFICATION_ARMS
+        ] + [
+            next(row for row in schedule if row["arm"] == "v8_legacy" and row["workload"] == "batch64"),
+            next(row for row in schedule if row["arm"] == "v8_candidate_target8" and row["workload"] == "batch64"),
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for row in sample_rows:
+                row_with_commit = {**row, "source_commit": "a" * 40}
+                raw = (
+                    self._raw_v7_record(row_with_commit)
+                    if row["format_version"] == 7 else self._raw_record(row_with_commit)
+                )
+                process = Mock()
+                process.args = ["write-perf"]
+                process.returncode = 0
+                process.communicate.return_value = (json.dumps(raw), "")
+                with patch.object(progress_ring_runner.subprocess, "Popen", return_value=process):
+                    metadata = progress_ring_runner._run_one(
+                        binary=Path("write-perf"),
+                        binary_sha256="b" * 64,
+                        row=row_with_commit,
+                        results_dir=root / "results",
+                        db_root=root / "db",
+                        safe_deadline_epoch=int(time.time()) + 3600,
+                        candidate_mode="v8-d2-qualification",
+                    )
+                run_dir = root / "results" / progress_ring_runner._run_id(row_with_commit)
+                self.assertEqual(metadata["exit_code"], 0, row["arm"])
+                self.assertFalse((run_dir / "validation-error.txt").exists(), row["arm"])
+
+    def test_v8_equal_throughput_schedule_plan_validator_and_cli(self) -> None:
+        schedule = build_v8_equal_throughput_schedule()
+        self.assertEqual(len(schedule), 18)
+        self.assertEqual({row["arm"] for row in schedule}, set(V8_EQUAL_THROUGHPUT_ARMS))
+        self.assertEqual(
+            {(row["writer"], row["workload"], row["offered_rate_ops_per_sec"]) for row in schedule},
+            set(V8_EQUAL_THROUGHPUT_CASES),
+        )
+        plan = build_v8_equal_throughput_plan(
+            machine_type="c4-standard-16-lssd",
+            machine_spec=BENCH.MACHINE_SPECS["c4-standard-16-lssd"],
+            commit="a" * 40,
+            binary_sha256="b" * 64,
+        )
+        self.assertEqual(plan["suite"], "v8-equal-throughput")
+        self.assertEqual(plan["runs_planned"], 18)
+
+        row = {**schedule[0], "source_commit": "a" * 40}
+        raw = self._raw_record(row)
+        raw["params"]["offered_rate_ops_per_sec"] = row["offered_rate_ops_per_sec"]
+        raw["result"]["service_latency"] = {"p50_ms": 0.25, "p95_ms": 0.45, "p99_ms": 0.65}
+        raw["result"]["schedule_lag"] = {"p50_ms": 0.01, "p95_ms": 0.03, "p99_ms": 0.05}
+        raw["result"]["wal_pipeline"].update({
+            "inflight_groups_max": 4,
+            "outstanding_write_sqes_max": 8,
+            "v8_data_submit_hol_wait_ns": 100,
+            "v8_data_completion_hol_wait_ns": 200,
+            "sync_coalesce_wait_ns": 300,
+            "wal_sync_wait_ns": 400,
+            "sync_observations": [{
+                "admitted_ticket_count": 5,
+                "data_completion_to_frontier_start_ns": 1200,
+                "coalescing_wait_ns": 2500,
+            }],
+        })
+        process = Mock()
+        process.args = ["write-perf"]
+        process.returncode = 0
+        process.communicate.return_value = (json.dumps(raw), "")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with patch.object(progress_ring_runner.subprocess, "Popen", return_value=process) as popen:
+                metadata = progress_ring_runner._run_one(
+                    binary=Path("write-perf"),
+                    binary_sha256="b" * 64,
+                    row=row,
+                    results_dir=root / "results",
+                    db_root=root / "db",
+                    safe_deadline_epoch=int(time.time()) + 3600,
+                    candidate_mode="v8-equal-throughput",
+                )
+            cmd = popen.call_args[0][0]
+            self.assertIn("--offered-rate-ops-per-sec", cmd)
+            self.assertIn(str(row["offered_rate_ops_per_sec"]), cmd)
+            self.assertIn("--wal-sync-diagnostics", cmd)
+            self.assertEqual(metadata["exit_code"], 0)
+            self.assertEqual(metadata["median_outstanding_tickets_at_sync"], 5.0)
+            self.assertEqual(metadata["outstanding_write_sqes_max"], 8)
+
+            # Verify run_suite() writer validation accepts (8, 16) for v8-equal-throughput
+            fake_bin = root / "write-perf"
+            fake_bin.write_bytes(b"fake")
+            fake_sha = hashlib.sha256(b"fake").hexdigest()
+            def _make_mock_popen(cmd, **_kwargs):
+                run_id = Path(cmd[cmd.index("--path") + 1]).name
+                matching = next(r for r in schedule if progress_ring_runner._run_id(r) == run_id)
+                r_raw = self._raw_record(matching)
+                r_raw["params"]["offered_rate_ops_per_sec"] = matching["offered_rate_ops_per_sec"]
+                r_raw["result"]["service_latency"] = {"p50_ms": 0.25, "p95_ms": 0.45, "p99_ms": 0.65}
+                r_raw["result"]["schedule_lag"] = {"p50_ms": 0.01, "p95_ms": 0.03, "p99_ms": 0.05}
+                r_raw["result"]["wal_pipeline"].update({
+                    "inflight_groups_max": 4,
+                    "outstanding_write_sqes_max": 8,
+                    "v8_data_submit_hol_wait_ns": 100,
+                    "v8_data_completion_hol_wait_ns": 200,
+                    "sync_coalesce_wait_ns": 300,
+                    "wal_sync_wait_ns": 400,
+                    "sync_observations": [{
+                        "admitted_ticket_count": 5,
+                        "data_completion_to_frontier_start_ns": 1200,
+                        "coalescing_wait_ns": 2500,
+                    }],
+                })
+                proc = Mock()
+                proc.args = cmd
+                proc.returncode = 0
+                proc.communicate.return_value = (json.dumps(r_raw), "")
+                return proc
+
+            with patch.object(progress_ring_runner.subprocess, "Popen", side_effect=_make_mock_popen):
+                rc = progress_ring_runner.main([
+                    "--binary", str(fake_bin),
+                    "--results-dir", str(root / "suite-results"),
+                    "--db-root", str(root / "suite-db"),
+                    "--writers", "8,16",
+                    "--safe-deadline-epoch", str(int(time.time()) + 3600),
+                    "--commit", "a" * 40,
+                    "--binary-sha256", fake_sha,
+                    "--machine-type", "c4-standard-16-lssd",
+                    "--ssd-count", "2",
+                    "--ssd-gib", "750",
+                    "--candidate-mode", "v8-equal-throughput",
+                ])
+            self.assertEqual(rc, 0)
+            self.assertTrue(
+                progress_ring_runner.verify_v8_equal_throughput_results_directory(
+                    root / "suite-results"
+                )["verified"]
+            )
+
+        common = [
+            "--project", "test-project", "--zone", "us-central1-c", "--commit", "a" * 40,
+            "--machine-type", "c4-standard-16-lssd", "--writers", "8", "16",
+            "--v8-equal-throughput", "--ssh-source-range", "192.0.2.1/32",
+            "--max-runtime-minutes", "60", "--estimated-hourly-cost-usd", "1.50",
+            "--max-estimated-spend-usd", "2", "--preflight-only",
+            "--network", "eq-isolated", "--subnet", "eq-subnet",
+        ]
+        args = BENCH.parse_args(common)
+        self.assertEqual(args.writers, V8_EQUAL_THROUGHPUT_WRITERS)
+        self.assertEqual(args.num, V8_EQUAL_THROUGHPUT_NUM)
+        self.assertTrue(args.v8_equal_throughput)
+
+        remote_script = Path(__file__).with_name("gcp-free-trial-wal-bench-remote.sh")
+        environment = {**os.environ, "TOYKV_GCP_BENCH_VALIDATE_ONLY": "1"}
+        accepted = subprocess.run(
+            [
+                "bash", str(remote_script), "a" * 40, str(V8_EQUAL_THROUGHPUT_NUM), "test-project",
+                "us-central1-c", "wal-test", "4102444800", "c4-standard-16-lssd", "8,16",
+                "v8-equal-throughput", "-", "-",
+            ],
+            cwd=Path(__file__).resolve().parents[1], env=environment,
+            capture_output=True, text=True, timeout=5,
+        )
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+
+    def test_run_suite_rejects_retired_candidate_modes(self) -> None:
+        for mode in sorted(progress_ring_runner.RETIRED_CANDIDATE_MODES):
+            args = SimpleNamespace(candidate_mode=mode)
+            with self.subTest(candidate_mode=mode), self.assertRaisesRegex(ValueError, "retired historical experiment"):
+                progress_ring_runner.run_suite(args)
+
+    def test_ready_target_scan_plan_schedule_and_summary_remain_verifiable(self) -> None:
+        commit = "a" * 40
+        schedule = progress_ring_runner.build_cursor_coalescing_ready_target_scan_schedule()
+        plan = progress_ring_runner.build_cursor_coalescing_ready_target_scan_plan(
+            machine_type="c4-standard-16-lssd",
+            machine_spec={"vcpus": 16, "ssd_count": 2, "ssd_gib": 750},
+            commit=commit,
+        )
+        rows = [
+            {
+                **row,
+                "source_commit": commit,
+                "binary_sha256": "b" * 64,
+                "exit_code": 0,
+                "duration_seconds": 5.0,
+                **progress_ring_runner._validate_record(self._raw_record(row), row),
+            }
+            for row in schedule
+        ]
+        summary = progress_ring_runner._coalescing_ready_target_scan_summary(
+            rows, (8, 16), plan["runs_planned"]
+        )
+        self.assertEqual(len(schedule), 40)
+        self.assertEqual({row["writer"] for row in schedule}, {8, 16})
+        self.assertEqual({row["arm"] for row in schedule}, set(CURSOR_COALESCING_READY_TARGET_SCAN_ARMS))
+        self.assertEqual(plan["suite"], "v8-cursor-coalescing-ready-target-scan")
+        self.assertEqual(plan["runs_planned"], 40)
+        self.assertEqual(summary["suite"], "v8-cursor-coalescing-ready-target-scan")
+        self.assertTrue(summary["complete"])
+
+    def test_ready_target_small_scan_plan_schedule_and_summary_remain_verifiable(self) -> None:
+        commit = "a" * 40
+        schedule = progress_ring_runner.build_cursor_coalescing_ready_target_small_scan_schedule()
+        plan = progress_ring_runner.build_cursor_coalescing_ready_target_small_scan_plan(
+            machine_type="c4-standard-16-lssd",
+            machine_spec={"vcpus": 16, "ssd_count": 2, "ssd_gib": 750},
+            commit=commit,
+        )
+        rows = [
+            {
+                **row,
+                "source_commit": commit,
+                "binary_sha256": "b" * 64,
+                "exit_code": 0,
+                "duration_seconds": 5.0,
+                **progress_ring_runner._validate_record(self._raw_record(row), row),
+            }
+            for row in schedule
+        ]
+        summary = progress_ring_runner._coalescing_ready_target_small_scan_summary(
+            rows, (8, 16), plan["runs_planned"]
+        )
+        self.assertEqual(plan["suite"], "v8-cursor-coalescing-ready-target-small-scan")
+        self.assertEqual(plan["runs_planned"], 50)
+        self.assertEqual(len(schedule), 50)
+        self.assertEqual(summary["suite"], plan["suite"])
+        self.assertTrue(summary["complete"])
+        self.assertEqual(summary["runs_completed"], 50)
+
+    def test_cursor_publication_fixture_verifies_d2a_only_requalification(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            results = self._make_fixture(Path(temporary), cursor_publication=True)
+            schedule = build_cursor_publication_schedule(CURSOR_PUBLICATION_WRITERS)
+            self.assertEqual(len(schedule), 40)
+            self.assertEqual({row["arm"] for row in schedule}, set(CURSOR_PUBLICATION_ARMS))
+            self.assertEqual({row["writer"] for row in schedule}, {1, 8, 16})
+            self.assertEqual(
+                validate_cursor_publication_rows(
+                    json.loads((results / "summary.json").read_text(encoding="utf-8"))["results"],
+                    CURSOR_PUBLICATION_WRITERS,
+                )["complete"],
+                True,
+            )
+            verification = progress_ring_runner.verify_cursor_publication_results_directory(results)
+            self.assertTrue(verification["verified"], verification["errors"])
+            self.assertTrue(BENCH._verify_result_set(results)["verified"])
+
+            plan = json.loads((results / "benchmark-plan.json").read_text(encoding="utf-8"))
+            self.assertEqual(plan["suite"], "v8-cursor-publication")
+            self.assertEqual(plan["plan_schema_version"], 2)
+            self.assertEqual(plan["runs_planned"], 40)
+            self.assertTrue(plan["point_buffer_preallocation_enabled"])
+            self.assertEqual(plan["point_resource_retirement_mode"], 0)
+            baseline = next(row for row in schedule if row["arm"] == "baseline")
+            admission = next(row for row in schedule if row["arm"] == "admission_fast_path")
+            self.assertFalse(baseline["admission_cursor_publish_fast_path_enabled"])
+            self.assertNotIn("cursor_publication_dedup_enabled", baseline)
+            self.assertTrue(admission["admission_cursor_publish_fast_path_enabled"])
+            environment = (
+                results / progress_ring_runner._run_id(admission) / "environment.txt"
+            ).read_text(encoding="utf-8")
+            self.assertIn("TOYKV_BENCH_V8_ADMISSION_CURSOR_PUBLISH_FAST_PATH=1\n", environment)
+            self.assertNotIn("TOYKV_BENCH_V8_CURSOR_PUBLICATION_DEDUP", environment)
+
+            raw_path = results / progress_ring_runner._run_id(admission) / "result.json"
+            raw = json.loads(raw_path.read_text(encoding="utf-8"))
+            raw["result"]["wal_pipeline"]["wal_io_end"][
+                "admission_cursor_publish_fast_path_enabled"
+            ] = False
+            raw_path.write_text(json.dumps(raw), encoding="utf-8")
+            invalid = progress_ring_runner.verify_cursor_publication_results_directory(results)
+            self.assertFalse(invalid["verified"])
+            self.assertTrue(any("raw result" in error for error in invalid["errors"]))
+
+    def test_cursor_publication_cli_uses_fixed_isolated_matrix(self) -> None:
+        args = BENCH.parse_args([
+            "--project", "test-project", "--zone", "us-east1-b", "--commit", "a" * 40,
+            "--network", "walbench-isolated", "--subnet", "walbench-subnet",
+            "--ssh-source-range", "192.0.2.10/32", "--max-runtime-minutes", "60",
+            "--estimated-hourly-cost-usd", "1.5", "--max-estimated-spend-usd", "2",
+            "--v8-cursor-publication-ab", "--preflight-only",
+        ])
+        self.assertEqual(args.writers, CURSOR_PUBLICATION_WRITERS)
+        self.assertEqual(args.num, CURSOR_PUBLICATION_NUM)
+        self.assertEqual(args.machine_type, "c4-standard-16-lssd")
+        with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
+            BENCH.parse_args([
+                "--project", "test-project", "--zone", "us-east1-b", "--commit", "a" * 40,
+                "--network", "walbench-isolated", "--subnet", "walbench-subnet",
+                "--ssh-source-range", "192.0.2.10/32", "--max-runtime-minutes", "60",
+                "--estimated-hourly-cost-usd", "1.5", "--max-estimated-spend-usd", "2",
+                "--v8-cursor-publication-ab", "--writers", "8", "--preflight-only",
+            ])
+
+    def test_point_resource_retirement_fixture_proves_all_three_modes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            results = self._make_fixture(Path(temporary), retirement=True)
+            schedule = build_point_resource_retirement_schedule(POINT_RESOURCE_RETIREMENT_WRITERS)
+            self.assertEqual(len(schedule), 45)
+            self.assertEqual({row["point_resource_retirement_mode"] for row in schedule}, {0, 1, 2})
+            summary = json.loads((results / "summary.json").read_text(encoding="utf-8"))
+            self.assertTrue(validate_point_resource_retirement_rows(summary["results"])["complete"])
+            verification = progress_ring_runner.verify_point_resource_retirement_results_directory(results)
+            self.assertTrue(verification["verified"], verification["errors"])
+            self.assertTrue(BENCH._verify_result_set(results)["verified"])
+            plan = json.loads((results / "benchmark-plan.json").read_text(encoding="utf-8"))
+            self.assertEqual(plan["runs_planned"], 45)
+            self.assertEqual(plan["mode_values"], {"per_ticket": 0, "detach": 1, "batch": 2})
+
+            mode_two = next(row for row in schedule if row["point_resource_retirement_mode"] == 2)
+            env = (results / progress_ring_runner._run_id(mode_two) / "environment.txt").read_text(
+                encoding="utf-8",
+            )
+            self.assertIn("TOYKV_BENCH_V8_POINT_RESOURCE_RETIREMENT_MODE=2\n", env)
+
+            run_dir = results / progress_ring_runner._run_id(mode_two)
+            raw_path = run_dir / "result.json"
+            raw = json.loads(raw_path.read_text(encoding="utf-8"))
+            raw["result"]["wal_pipeline"]["wal_io_end"]["point_resource_retirement_batched_prefixes"] = 0
+            raw_path.write_text(json.dumps(raw), encoding="utf-8")
+            verification = progress_ring_runner.verify_point_resource_retirement_results_directory(results)
+            self.assertFalse(verification["verified"])
+            self.assertTrue(any("raw result" in error for error in verification["errors"]))
+
+    def test_point_resource_retirement_stage_a_proves_preallocation_hits(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            results = self._make_fixture(
+                Path(temporary), retirement=True, retirement_preallocation=True,
+            )
+            verification = progress_ring_runner.verify_point_resource_retirement_results_directory(results)
+            self.assertTrue(verification["verified"], verification["errors"])
+            plan = json.loads((results / "benchmark-plan.json").read_text(encoding="utf-8"))
+            self.assertTrue(plan["point_buffer_preallocation_enabled"])
+            summary = json.loads((results / "summary.json").read_text(encoding="utf-8"))
+            point_rows = [row for row in summary["results"] if row["workload"] == "point"]
+            batch_rows = [row for row in summary["results"] if row["workload"] == "batch64"]
+            self.assertTrue(all(row["point_buffer_preallocation_hits"] > 0 for row in point_rows))
+            self.assertTrue(all(row["point_buffer_preallocation_attempts"] == 0 for row in batch_rows))
+            point_env = (results / progress_ring_runner._run_id(point_rows[0]) / "environment.txt").read_text(
+                encoding="utf-8",
+            )
+            batch_env = (results / progress_ring_runner._run_id(batch_rows[0]) / "environment.txt").read_text(
+                encoding="utf-8",
+            )
+            self.assertIn("TOYKV_BENCH_V8_POINT_BUFFER_PREALLOC=1\n", point_env)
+            self.assertNotIn("TOYKV_BENCH_V8_POINT_BUFFER_PREALLOC", batch_env)
+
+            run_id = progress_ring_runner._run_id(point_rows[0])
+            raw_path = results / run_id / "result.json"
+            raw = json.loads(raw_path.read_text(encoding="utf-8"))
+            raw["result"]["wal_pipeline"]["wal_io_end"]["point_buffer_preallocation_hits"] = 0
+            raw_path.write_text(json.dumps(raw), encoding="utf-8")
+            verification = progress_ring_runner.verify_point_resource_retirement_results_directory(results)
+            self.assertFalse(verification["verified"])
+            self.assertTrue(any("preallocation" in error for error in verification["errors"]))
+
+    def test_point_resource_retirement_cli_is_retired(self) -> None:
+        base_args = [
+            "--commit", "a" * 40, "--project", "test-project", "--zone", "us-central1-a",
+            "--network", "isolated-bench", "--subnet", "isolated-subnet", "--ssh-source-range", "192.0.2.1/32",
+            "--machine-type", "c4-standard-16-lssd", "--max-runtime-minutes", "60",
+            "--estimated-hourly-cost-usd", "0.01", "--max-estimated-spend-usd", "1", "--preflight-only",
+        ]
+        for flag in ("--v8-point-resource-retirement-ab", "--v8-point-resource-retirement-stage-a-ab"):
+            stderr = StringIO()
+            with self.subTest(flag=flag), redirect_stderr(stderr):
+                status = BENCH.main([*base_args, flag])
+            self.assertEqual(status, 2)
+            self.assertIn("retired historical experiment", stderr.getvalue())
+
+    def test_all_retired_suite_flags_stop_before_gcp_preflight(self) -> None:
+        base_args = [
+            "--commit", "a" * 40, "--project", "test-project", "--zone", "us-central1-a",
+            "--network", "isolated-bench", "--subnet", "isolated-subnet",
+            "--ssh-source-range", "192.0.2.1/32", "--machine-type", "c4-standard-16-lssd",
+            "--max-runtime-minutes", "60", "--estimated-hourly-cost-usd", "0.01",
+            "--max-estimated-spend-usd", "1", "--preflight-only",
+        ]
+        retired_flags = (
+            "--v8-cursor-direct-completion-wake-ab",
+            "--v8-cursor-singleton-submission-ab",
+            "--v8-cursor-coalescing-budget-ab",
+            "--v8-cursor-coalescing-ready-target-ab",
+            "--v8-cursor-coalescing-ready-target-scan-ab",
+            "--v8-cursor-coalescing-ready-target-small-scan-ab",
+            "--v8-cursor-publication-ab",
+            "--v8-point-resource-retirement-ab",
+            "--v8-point-resource-retirement-stage-a-ab",
+            "--v8-point-ack-d1-ab",
+            "--v8-independent-ack-ab",
+        )
+        with patch.object(BENCH, "Gcloud", side_effect=AssertionError("cloud preflight must not run")):
+            for flag in retired_flags:
+                stderr = StringIO()
+                with self.subTest(flag=flag), redirect_stderr(stderr):
+                    status = BENCH.main([*base_args, flag])
+                self.assertEqual(status, 2)
+                self.assertIn("retired historical experiment", stderr.getvalue())
+
+        runner_args = [
+            "--binary", "scripts/missing-write-perf",
+            "--results-dir", "results-not-created",
+            "--db-root", "db-not-created",
+            "--writers", "8,16",
+            "--safe-deadline-epoch", "4102444800",
+            "--commit", "a" * 40,
+            "--binary-sha256", "b" * 64,
+            "--machine-type", "c4-standard-16-lssd",
+            "--ssd-count", "2",
+            "--ssd-gib", "750",
+        ]
+        retired_modes = (
+            "completion-wake", "singleton-submission", "cursor-publication", "coalescing-budget",
+            "coalescing-ready-target", "coalescing-ready-target-scan",
+            "coalescing-ready-target-small-scan", "point-resource-retirement",
+            "point-resource-retirement-stage-a",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            results_dir = Path(temporary) / "results"
+            db_root = Path(temporary) / "db"
+            runner_args[runner_args.index("results-not-created")] = str(results_dir)
+            runner_args[runner_args.index("db-not-created")] = str(db_root)
+            for candidate_mode in retired_modes:
+                stderr = StringIO()
+                with self.subTest(candidate_mode=candidate_mode), redirect_stderr(stderr):
+                    status = progress_ring_runner.main([
+                        *runner_args, "--candidate-mode", candidate_mode,
+                    ])
+                self.assertEqual(status, 2)
+                self.assertIn("retired historical experiment", stderr.getvalue())
+                self.assertFalse(results_dir.exists())
+                self.assertFalse(db_root.exists())
+
+    def test_retired_ack_and_driver_runners_stop_before_writing_results(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            results_dir = root / "results"
+            db_root = root / "db"
+            d1_args = [
+                "--baseline-binary", str(root / "missing-baseline"),
+                "--candidate-binary", str(root / "missing-candidate"),
+                "--results-dir", str(results_dir), "--db-root", str(db_root),
+                "--writers", "8,16", "--safe-deadline-epoch", "4102444800",
+                "--baseline-commit", "a" * 40, "--candidate-commit", "b" * 40,
+                "--source-patch-sha256", "c" * 64, "--baseline-binary-sha256", "d" * 64,
+                "--candidate-binary-sha256", "e" * 64, "--machine-type", "c4-standard-16-lssd",
+                "--ssd-count", "2", "--ssd-gib", "750",
+            ]
+            with redirect_stderr(StringIO()):
+                self.assertEqual(ack_d1_runner.main(d1_args), 2)
+            self.assertFalse(results_dir.exists())
+
+            d3_args = [
+                "--binary", str(root / "missing-binary"), "--binary-sha256", "f" * 64,
+                "--commit", "a" * 40, "--results-dir", str(results_dir), "--db-root", str(db_root),
+                "--writers", "8,16", "--safe-deadline-epoch", "4102444800",
+                "--machine-type", "c4-standard-16-lssd", "--ssd-count", "2", "--ssd-gib", "750",
+                "--runner-bundle-sha256", "1" * 64,
+            ]
+            with redirect_stderr(StringIO()), self.assertRaises(SystemExit) as raised:
+                dedicated_durability_runner.main(d3_args)
+            self.assertEqual(raised.exception.code, 2)
+            self.assertFalse(results_dir.exists())
+
+    def test_remote_runner_rejects_retired_point_resource_retirement_suite(self) -> None:
+        remote_script = Path(__file__).with_name("gcp-free-trial-wal-bench-remote.sh")
+        retired_suites = (
+            "v8-cursor-direct-completion-wake",
+            "v8-cursor-singleton-submission",
+            "v8-cursor-coalescing-budget",
+            "v8-cursor-coalescing-ready-target",
+            "v8-cursor-coalescing-ready-target-scan",
+            "v8-cursor-coalescing-ready-target-small-scan",
+            "v8-cursor-publication",
+            "v8-point-resource-retirement",
+            "v8-point-resource-retirement-stage-a",
+            "v8-point-ack-d1",
+            "v8-dedicated-durability-driver",
+        )
+        for suite in retired_suites:
+            with self.subTest(suite=suite):
+                completed = subprocess.run(
+                    [
+                        "bash", str(remote_script), "a" * 40, "100000", "test-project", "us-central1-a",
+                        "wal-test", "4102444800", "c4-standard-16-lssd", "8,16", suite, "-", "-",
+                    ],
+                    cwd=Path(__file__).resolve().parents[1],
+                    capture_output=True,
+                    check=False,
+                    text=True,
+                    timeout=5,
+                )
+                self.assertEqual(completed.returncode, 64)
+                self.assertIn("retired historical benchmark suite", completed.stderr)
+
+    def test_run_suite_writes_separate_direct_completion_plan_and_schedule(self) -> None:
+        binary = Path("scripts/gcp_v8_point_progress_ring_runner.py")
+        binary_sha256 = self._sha256(binary)
+        commit = "a" * 40
+
+        def fake_run_one(**kwargs: object) -> dict[str, object]:
+            row = kwargs["row"]
+            kwargs["on_subprocess_started"]()
+            raw = self._raw_record(row)
+            return {
+                **row,
+                "source_commit": commit,
+                "binary_sha256": binary_sha256,
+                "exit_code": 0,
+                "duration_seconds": 5.0,
+                **progress_ring_runner._validate_record(raw, row),
+            }
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args = SimpleNamespace(
+                commit=commit, binary=binary, binary_sha256=binary_sha256,
+                machine_type="c4-standard-16-lssd", ssd_count=2, ssd_gib=750,
+                writers=",".join(map(str, POINT_PROGRESS_RING_WRITERS)),
+                results_dir=root / "results", db_root=root / "db", safe_deadline_epoch=4_000_000_000,
+                candidate_mode="direct-completion",
+            )
+            with patch.object(progress_ring_runner, "_run_one", side_effect=fake_run_one):
+                status = progress_ring_runner.run_suite(args)
+            self.assertEqual(status, 0)
+            self.assertTrue((args.results_dir / "cursor-direct-completion-schedule.tsv").is_file())
+            self.assertFalse((args.results_dir / "point-progress-cursor-schedule.tsv").exists())
+            plan = json.loads((args.results_dir / "benchmark-plan.json").read_text(encoding="utf-8"))
+            summary = json.loads((args.results_dir / "summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(plan["suite"], "v8-cursor-direct-completion")
+            self.assertEqual(summary["suite"], "v8-cursor-direct-completion")
+            self.assertEqual(summary["arms"], list(CURSOR_DIRECT_COMPLETION_ARMS))
+            self.assertTrue(summary["complete"])
+
+    def test_singleton_submission_plan_schedule_and_summary_remain_verifiable(self) -> None:
+        binary = Path("scripts/gcp_v8_point_progress_ring_runner.py")
+        binary_sha256 = self._sha256(binary)
+        commit = "a" * 40
+        parsed = progress_ring_runner.parse_args([
+            "--binary", str(binary), "--results-dir", "results", "--db-root", "db",
+            "--writers", "1,8,16", "--safe-deadline-epoch", "4000000000",
+            "--commit", commit, "--binary-sha256", binary_sha256,
+            "--machine-type", "c4-standard-16-lssd", "--ssd-count", "2", "--ssd-gib", "750",
+            "--candidate-mode", "singleton-submission",
+        ])
+        self.assertEqual(parsed.candidate_mode, "singleton-submission")
+
+        schedule = progress_ring_runner.build_cursor_singleton_submission_schedule(POINT_PROGRESS_RING_WRITERS)
+        plan = progress_ring_runner.build_cursor_singleton_submission_plan(
+            writers=POINT_PROGRESS_RING_WRITERS,
+            machine_type="c4-standard-16-lssd",
+            machine_spec={"vcpus": 16, "ssd_count": 2, "ssd_gib": 750},
+            commit=commit,
+            binary_sha256=binary_sha256,
+        )
+        rows = [
+            {
+                **row,
+                "source_commit": commit,
+                "binary_sha256": binary_sha256,
+                "exit_code": 0,
+                "duration_seconds": 5.0,
+                **progress_ring_runner._validate_record(self._raw_record(row), row),
+            }
+            for row in schedule
+        ]
+        summary = progress_ring_runner._singleton_submission_summary(
+            rows, POINT_PROGRESS_RING_WRITERS, plan["runs_planned"]
+        )
+        self.assertEqual(plan["suite"], "v8-cursor-singleton-submission")
+        self.assertEqual(summary["suite"], "v8-cursor-singleton-submission")
+        self.assertEqual(summary["arms"], list(CURSOR_SINGLETON_SUBMISSION_ARMS))
+        self.assertTrue(summary["complete"])
+
+    def test_coalescing_budget_plan_schedule_and_summary_remain_verifiable(self) -> None:
+        commit = "a" * 40
+        schedule = progress_ring_runner.build_cursor_coalescing_budget_schedule((8, 16))
+        plan = progress_ring_runner.build_cursor_coalescing_budget_plan(
+            machine_type="c4-standard-16-lssd",
+            machine_spec={"vcpus": 16, "ssd_count": 2, "ssd_gib": 750},
+            commit=commit,
+        )
+        rows = [
+            {
+                **row,
+                "source_commit": commit,
+                "binary_sha256": "b" * 64,
+                "exit_code": 0,
+                "duration_seconds": 5.0,
+                **progress_ring_runner._validate_record(self._raw_record(row), row),
+            }
+            for row in schedule
+        ]
+        summary = progress_ring_runner._coalescing_budget_summary(rows, (8, 16), plan["runs_planned"])
+        self.assertEqual(len(schedule), 30)
+        self.assertEqual({row["writer"] for row in schedule}, {8, 16})
+        self.assertEqual({row["arm"] for row in schedule}, set(CURSOR_COALESCING_BUDGET_ARMS))
+        self.assertEqual(plan["suite"], "v8-cursor-coalescing-budget")
+        self.assertEqual(plan["runs_planned"], 30)
+        self.assertEqual(summary["suite"], "v8-cursor-coalescing-budget")
+        self.assertTrue(summary["complete"])
+
+    def test_ready_target_plan_schedule_and_summary_remain_verifiable(self) -> None:
+        commit = "a" * 40
+        schedule = progress_ring_runner.build_cursor_coalescing_ready_target_schedule()
+        plan = progress_ring_runner.build_cursor_coalescing_ready_target_plan(
+            machine_type="c4-standard-16-lssd",
+            machine_spec={"vcpus": 16, "ssd_count": 2, "ssd_gib": 750},
+            commit=commit,
+        )
+        rows = [
+            {
+                **row,
+                "source_commit": commit,
+                "binary_sha256": "b" * 64,
+                "exit_code": 0,
+                "duration_seconds": 5.0,
+                **progress_ring_runner._validate_record(self._raw_record(row), row),
+            }
+            for row in schedule
+        ]
+        summary = progress_ring_runner._coalescing_ready_target_summary(
+            rows, (1, 8, 16), plan["runs_planned"]
+        )
+        self.assertEqual(len(schedule), 60)
+        self.assertEqual({row["writer"] for row in schedule}, {1, 8, 16})
+        self.assertEqual({row["arm"] for row in schedule}, set(CURSOR_COALESCING_READY_TARGET_ARMS))
+        self.assertEqual(plan["suite"], "v8-cursor-coalescing-ready-target")
+        self.assertEqual(plan["runs_planned"], 60)
+        self.assertEqual(summary["suite"], "v8-cursor-coalescing-ready-target")
+        self.assertTrue(summary["complete"])
+        self.assertEqual(len(summary["target_usage"]), 12)
+
+    def test_historical_progress_plan_schemas_remain_verifiable(self) -> None:
+        self.assertEqual(
+            len(build_point_progress_cursor_v2_schedule(POINT_PROGRESS_RING_WRITERS)),
+            60,
+        )
+        self.assertEqual(POINT_PROGRESS_CURSOR_V2_ORDERS[0], ("eager", "progress_ring", "cursor"))
+        self.assertEqual(
+            build_point_progress_ring_plan(
+                writers=POINT_PROGRESS_RING_WRITERS,
+                machine_type="c4-standard-16-lssd",
+                machine_spec=BENCH.MACHINE_SPECS["c4-standard-16-lssd"],
+                commit="a" * 40,
+            )["plan_schema_version"],
+            POINT_PROGRESS_PLAN_SCHEMA_V1,
+        )
+        self.assertEqual(
+            build_point_progress_cursor_v2_plan(
+                writers=POINT_PROGRESS_RING_WRITERS,
+                machine_type="c4-standard-16-lssd",
+                machine_spec=BENCH.MACHINE_SPECS["c4-standard-16-lssd"],
+                commit="a" * 40,
+            )["plan_schema_version"],
+            POINT_PROGRESS_PLAN_SCHEMA_V2,
+        )
+
+        # Historical V1/V2/V3 artifacts did not yet include the version field;
+        # their suite, arms and run count uniquely identify the schema.
+        with tempfile.TemporaryDirectory() as temporary:
+            results = self._make_fixture(Path(temporary), include_schema_version=False)
+            self.assertTrue(progress_ring_runner.verify_results_directory(results)["verified"])
+        with tempfile.TemporaryDirectory() as temporary:
+            results = self._make_fixture(
+                Path(temporary), cursor=True,
+                cursor_schema_version=POINT_PROGRESS_PLAN_SCHEMA_V2,
+                include_schema_version=False,
+            )
+            verification = progress_ring_runner.verify_cursor_results_directory(results)
+            self.assertTrue(verification["verified"], verification["errors"])
+            self.assertEqual(verification["planned"], 60)
+        with tempfile.TemporaryDirectory() as temporary:
+            results = self._make_fixture(
+                Path(temporary), cursor=True,
+                cursor_schema_version=POINT_PROGRESS_PLAN_SCHEMA_V2,
+            )
+            verification = progress_ring_runner.verify_cursor_results_directory(results)
+            self.assertTrue(verification["verified"], verification["errors"])
+            self.assertEqual(verification["planned"], 60)
+        with tempfile.TemporaryDirectory() as temporary:
+            results = self._make_fixture(
+                Path(temporary), cursor=True, include_schema_version=False,
+            )
+            verification = progress_ring_runner.verify_cursor_results_directory(results)
+            self.assertTrue(verification["verified"], verification["errors"])
+
+    def test_remote_runner_rejects_retired_ring_suite(self) -> None:
+        remote_script = Path(__file__).with_name("gcp-free-trial-wal-bench-remote.sh")
+        completed = subprocess.run(
+            [
+                "bash", str(remote_script), "a" * 40, "100000", "test-project", "us-central1-a",
+                "wal-test", "4102444800", "c4-standard-16-lssd", "1,8,16",
+                "v8-point-progress-ring", "-", "-",
+            ],
+            cwd=Path(__file__).resolve().parents[1],
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=5,
+        )
+        self.assertEqual(completed.returncode, 64)
+        self.assertIn("unsupported benchmark suite: v8-point-progress-ring", completed.stderr)
+
+    def test_verifier_accepts_legacy_plan_label_only_with_ordered_run_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            results = self._make_fixture(Path(temporary))
+            plan_path = results / "benchmark-plan.json"
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            plan["data_submit_order"] = "ticket_prefix"
+            plan_path.write_text(json.dumps(plan), encoding="utf-8")
+            summary_path = results / "summary.json"
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            summary.pop("runs_attempted")
+            summary_path.write_text(json.dumps(summary), encoding="utf-8")
+            remote_exit_path = results / "remote-exit.json"
+            remote_exit = json.loads(remote_exit_path.read_text(encoding="utf-8"))
+            remote_exit.pop("runs_attempted")
+            remote_exit_path.write_text(json.dumps(remote_exit), encoding="utf-8")
+            self.assertTrue(progress_ring_runner.verify_results_directory(results)["verified"])
+
+            first = build_point_progress_ring_schedule(POINT_PROGRESS_RING_WRITERS)[0]
+            run_id = progress_ring_runner._run_id(first)
+            environment_path = results / run_id / "environment.txt"
+            environment_path.write_text(
+                environment_path.read_text(encoding="utf-8").replace(
+                    "TOYKV_BENCH_V8_DATA_SUBMIT_ORDER=ordered",
+                    "TOYKV_BENCH_V8_DATA_SUBMIT_ORDER=ready",
+                ),
+                encoding="utf-8",
+            )
+            verification = progress_ring_runner.verify_results_directory(results)
+            self.assertFalse(verification["verified"])
+            self.assertTrue(any("environment" in error for error in verification["errors"]))
+
+    def test_schedule_and_cli_are_fixed_counterbalanced_and_note_local_screen_waiver(self) -> None:
+        schedule = build_point_progress_ring_schedule(POINT_PROGRESS_RING_WRITERS)
+        self.assertEqual(len(schedule), 40)
+        self.assertEqual({row["workload"] for row in schedule}, {"point", "batch64"})
+        for writer in POINT_PROGRESS_RING_WRITERS:
+            for repetition in range(1, 6):
+                arms = [row["arm"] for row in schedule
+                        if row["writer"] == writer and row["workload"] == "point"
+                        and row["repetition"] == repetition]
+                self.assertEqual(arms, ["eager", "progress_ring"] if repetition % 2 else ["progress_ring", "eager"])
+        plan = build_point_progress_ring_plan(
+            writers=POINT_PROGRESS_RING_WRITERS,
+            machine_type="c4-standard-16-lssd",
+            machine_spec=BENCH.MACHINE_SPECS["c4-standard-16-lssd"],
+            commit="a" * 40,
+        )
+        self.assertEqual(plan["runs_planned"], 40)
+        self.assertEqual(plan["data_submit_order"], "ordered")
+        self.assertEqual(plan["local_screen"]["status"], "skipped_by_user")
+        valid_args = [
+            "--project", "test-project", "--zone", "us-east1-b", "--commit", "a" * 40,
+            "--network", "walbench-isolated", "--subnet", "walbench-subnet",
+            "--ssh-source-range", "192.0.2.10/32",
+            "--max-runtime-minutes", "60", "--estimated-hourly-cost-usd", "1.5",
+            "--max-estimated-spend-usd", "2",
+            "--v8-point-progress-cursor-ab", "--preflight-only",
+        ]
+        args = BENCH.parse_args(valid_args)
+        self.assertEqual(args.writers, POINT_PROGRESS_RING_WRITERS)
+        self.assertEqual(args.num, POINT_PROGRESS_RING_NUM)
+        self.assertEqual(args.machine_type, "c4-standard-16-lssd")
+        with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
+            BENCH.parse_args([
+                *[argument for argument in valid_args if argument != "--v8-point-progress-cursor-ab"],
+                "--v8-point-progress-ring-ab", "--preflight-only",
+            ])
+        stderr = StringIO()
+        with redirect_stderr(stderr), self.assertRaises(SystemExit):
+            BENCH.parse_args([*valid_args, "--writers", "16"])
+        self.assertIn("requires writers (1, 8, 16)", stderr.getvalue())
+
+    def test_retired_progress_ring_cli_mode_is_rejected(self) -> None:
+        base = [
+            "--project", "test-project", "--zone", "us-east1-b", "--commit", "a" * 40,
+            "--max-runtime-minutes", "60", "--estimated-hourly-cost-usd", "1.5",
+            "--max-estimated-spend-usd", "2",
+            "--v8-point-progress-ring-ab", "--preflight-only",
+        ]
+        with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
+            BENCH.parse_args(base)
+
+    def test_progress_cursor_requires_isolated_network_subnet_and_ssh_cidr(self) -> None:
+        base = [
+            "--project", "test-project", "--zone", "us-east1-b", "--commit", "a" * 40,
+            "--max-runtime-minutes", "60", "--estimated-hourly-cost-usd", "1.5",
+            "--max-estimated-spend-usd", "2",
+            "--v8-point-progress-cursor-ab", "--preflight-only",
+        ]
+        invalid_arguments = (
+            base,
+            [*base, "--network", "default", "--subnet", "default", "--ssh-source-range", "192.0.2.10/32"],
+            [*base, "--network", "walbench-isolated", "--ssh-source-range", "192.0.2.10/32"],
+            [*base, "--network", "walbench-isolated", "--subnet", "walbench-subnet"],
+        )
+        for arguments in invalid_arguments:
+            with self.subTest(arguments=arguments), self.assertRaises(SystemExit):
+                BENCH.parse_args(arguments)
+
+    def test_direct_completion_cli_uses_cursor_isolated_network_and_spend_guards(self) -> None:
+        valid = [
+            "--project", "test-project", "--zone", "us-east1-b", "--commit", "a" * 40,
+            "--network", "walbench-isolated", "--subnet", "walbench-subnet",
+            "--ssh-source-range", "192.0.2.10/32", "--max-runtime-minutes", "60",
+            "--estimated-hourly-cost-usd", "1.5", "--max-estimated-spend-usd", "2",
+            "--v8-cursor-direct-completion-ab", "--preflight-only",
+        ]
+        args = BENCH.parse_args(valid)
+        self.assertEqual(args.writers, POINT_PROGRESS_RING_WRITERS)
+        self.assertEqual(args.num, POINT_PROGRESS_RING_NUM)
+        self.assertEqual(args.machine_type, "c4-standard-16-lssd")
+        self.assertTrue(args.v8_cursor_direct_completion_ab)
+        for suffix in (
+            ["--network", "default", "--subnet", "default", "--ssh-source-range", "192.0.2.10/32"],
+            ["--network", "walbench-isolated", "--subnet", "walbench-subnet"],
+        ):
+            with self.subTest(suffix=suffix), redirect_stderr(StringIO()), self.assertRaises(SystemExit):
+                BENCH.parse_args([
+                    *[item for item in valid if item not in (
+                        "--network", "walbench-isolated", "--subnet", "walbench-subnet",
+                        "--ssh-source-range", "192.0.2.10/32",
+                    )],
+                    *suffix,
+                ])
+
+    def test_singleton_submission_cli_uses_cursor_isolated_network_and_spend_guards(self) -> None:
+        valid = [
+            "--project", "test-project", "--zone", "us-east1-b", "--commit", "a" * 40,
+            "--network", "walbench-isolated", "--subnet", "walbench-subnet",
+            "--ssh-source-range", "192.0.2.10/32", "--max-runtime-minutes", "60",
+            "--estimated-hourly-cost-usd", "1.5", "--max-estimated-spend-usd", "2",
+            "--v8-cursor-singleton-submission-ab", "--preflight-only",
+        ]
+        args = BENCH.parse_args(valid)
+        self.assertEqual(args.writers, POINT_PROGRESS_RING_WRITERS)
+        self.assertEqual(args.num, POINT_PROGRESS_RING_NUM)
+        self.assertEqual(args.machine_type, "c4-standard-16-lssd")
+        self.assertTrue(args.v8_cursor_singleton_submission_ab)
+        for suffix in (
+            ["--network", "default", "--subnet", "default", "--ssh-source-range", "192.0.2.10/32"],
+            ["--network", "walbench-isolated", "--subnet", "walbench-subnet"],
+        ):
+            with self.subTest(suffix=suffix), redirect_stderr(StringIO()), self.assertRaises(SystemExit):
+                BENCH.parse_args([
+                    *[item for item in valid if item not in (
+                        "--network", "walbench-isolated", "--subnet", "walbench-subnet",
+                        "--ssh-source-range", "192.0.2.10/32",
+                    )],
+                    *suffix,
+                ])
+
+    def test_coalescing_budget_cli_selects_point8_point16_and_fixed_workload(self) -> None:
+        valid = [
+            "--project", "test-project", "--zone", "us-east1-b", "--commit", "a" * 40,
+            "--network", "walbench-isolated", "--subnet", "walbench-subnet",
+            "--ssh-source-range", "192.0.2.10/32", "--max-runtime-minutes", "60",
+            "--estimated-hourly-cost-usd", "1.5", "--max-estimated-spend-usd", "2",
+            "--v8-cursor-coalescing-budget-ab", "--preflight-only",
+        ]
+        args = BENCH.parse_args(valid)
+        self.assertEqual(args.writers, CURSOR_COALESCING_BUDGET_WRITERS)
+        self.assertEqual(args.num, CURSOR_COALESCING_BUDGET_NUM)
+        self.assertEqual(args.machine_type, "c4-standard-16-lssd")
+        self.assertTrue(args.v8_cursor_coalescing_budget_ab)
+        with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
+            BENCH.parse_args([*valid, "--writers", "16"])
+        with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
+            BENCH.parse_args([*valid, "--num", "100001"])
+
+    def test_coalescing_ready_target_cli_selects_fixed_60_run_matrix(self) -> None:
+        valid = [
+            "--project", "test-project", "--zone", "us-east1-b", "--commit", "a" * 40,
+            "--network", "walbench-isolated", "--subnet", "walbench-subnet",
+            "--ssh-source-range", "192.0.2.10/32", "--max-runtime-minutes", "60",
+            "--estimated-hourly-cost-usd", "1.5", "--max-estimated-spend-usd", "2",
+            "--v8-cursor-coalescing-ready-target-ab", "--preflight-only",
+        ]
+        args = BENCH.parse_args(valid)
+        self.assertEqual(args.writers, CURSOR_COALESCING_READY_TARGET_WRITERS)
+        self.assertEqual(args.num, CURSOR_COALESCING_READY_TARGET_NUM)
+        self.assertEqual(args.machine_type, "c4-standard-16-lssd")
+        self.assertTrue(args.v8_cursor_coalescing_ready_target_ab)
+        with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
+            BENCH.parse_args([*valid, "--writers", "8", "16"])
+        with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
+            BENCH.parse_args([*valid, "--num", "100001"])
+
+    def test_coalescing_ready_target_scan_cli_selects_fixed_40_run_matrix(self) -> None:
+        valid = [
+            "--project", "test-project", "--zone", "us-east1-b", "--commit", "a" * 40,
+            "--network", "walbench-isolated", "--subnet", "walbench-subnet",
+            "--ssh-source-range", "192.0.2.10/32", "--max-runtime-minutes", "60",
+            "--estimated-hourly-cost-usd", "1.5", "--max-estimated-spend-usd", "2",
+            "--v8-cursor-coalescing-ready-target-scan-ab", "--preflight-only",
+        ]
+        args = BENCH.parse_args(valid)
+        self.assertEqual(args.writers, CURSOR_COALESCING_READY_TARGET_SCAN_WRITERS)
+        self.assertEqual(args.num, CURSOR_COALESCING_READY_TARGET_SCAN_NUM)
+        self.assertEqual(args.machine_type, "c4-standard-16-lssd")
+        self.assertTrue(args.v8_cursor_coalescing_ready_target_scan_ab)
+        with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
+            BENCH.parse_args([*valid, "--writers", "1", "8", "16"])
+        with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
+            BENCH.parse_args([*valid, "--num", "100001"])
+
+    def test_coalescing_ready_target_small_scan_cli_selects_fixed_50_run_matrix(self) -> None:
+        valid = [
+            "--project", "test-project", "--zone", "us-east1-b", "--commit", "a" * 40,
+            "--network", "walbench-isolated", "--subnet", "walbench-subnet",
+            "--ssh-source-range", "192.0.2.10/32", "--max-runtime-minutes", "60",
+            "--estimated-hourly-cost-usd", "1.5", "--max-estimated-spend-usd", "2",
+            "--v8-cursor-coalescing-ready-target-small-scan-ab", "--preflight-only",
+        ]
+        args = BENCH.parse_args(valid)
+        self.assertEqual(args.writers, CURSOR_COALESCING_READY_TARGET_SMALL_SCAN_WRITERS)
+        self.assertEqual(args.num, CURSOR_COALESCING_READY_TARGET_SMALL_SCAN_NUM)
+        self.assertEqual(args.machine_type, "c4-standard-16-lssd")
+        self.assertTrue(args.v8_cursor_coalescing_ready_target_small_scan_ab)
+        with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
+            BENCH.parse_args([*valid, "--writers", "16"])
+        with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
+            BENCH.parse_args([*valid, "--num", "100001"])
+
+    def test_ready_target_small_scan_preflight_is_rejected_before_cloud_checks(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            results = Path(temporary) / "preflight"
+            stderr = StringIO()
+            with patch.object(BENCH, "Gcloud", side_effect=AssertionError("cloud preflight must not run")):
+                with redirect_stderr(stderr):
+                    status = BENCH.main([
+                        "--project", "test-project", "--zone", "us-east1-b", "--commit", "a" * 40,
+                        "--network", "walbench-isolated", "--subnet", "walbench-subnet",
+                        "--ssh-source-range", "192.0.2.10/32", "--skip-ssh-egress-check",
+                        "--max-runtime-minutes", "60", "--estimated-hourly-cost-usd", "1.5",
+                        "--max-estimated-spend-usd", "2", "--v8-cursor-coalescing-ready-target-small-scan-ab",
+                        "--preflight-only", "--results-dir", str(results),
+                    ])
+            self.assertEqual(status, 2)
+            self.assertIn("retired historical experiment", stderr.getvalue())
+            self.assertFalse(results.exists())
+
+    def test_ready_target_scan_preflight_is_rejected_before_cloud_checks(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            results = Path(temporary) / "preflight"
+            stderr = StringIO()
+            with patch.object(BENCH, "Gcloud", side_effect=AssertionError("cloud preflight must not run")):
+                with redirect_stderr(stderr):
+                    status = BENCH.main([
+                        "--project", "test-project", "--zone", "us-east1-b", "--commit", "a" * 40,
+                        "--network", "walbench-isolated", "--subnet", "walbench-subnet",
+                        "--ssh-source-range", "192.0.2.10/32", "--skip-ssh-egress-check",
+                        "--max-runtime-minutes", "60", "--estimated-hourly-cost-usd", "1.5",
+                        "--max-estimated-spend-usd", "2", "--v8-cursor-coalescing-ready-target-scan-ab",
+                        "--preflight-only", "--results-dir", str(results),
+                    ])
+            self.assertEqual(status, 2)
+            self.assertIn("retired historical experiment", stderr.getvalue())
+            self.assertFalse(results.exists())
+
+    def test_remote_runner_accepts_direct_completion_suite_only_for_fixed_matrix(self) -> None:
+        remote_script = Path(__file__).with_name("gcp-free-trial-wal-bench-remote.sh")
+        command = [
+            "bash", str(remote_script), "a" * 40, "100000", "test-project", "us-central1-a",
+            "wal-test", "4102444800", "c4-standard-16-lssd", "1,8,16",
+            "v8-cursor-direct-completion", "-", "-",
+        ]
+        accepted = subprocess.run(
+            command, cwd=Path(__file__).resolve().parents[1], capture_output=True,
+            check=False, text=True, timeout=5,
+            env={**os.environ, "TOYKV_GCP_BENCH_VALIDATE_ONLY": "1"},
+        )
+        self.assertNotEqual(accepted.returncode, 64, accepted.stderr)
+        rejected = subprocess.run(
+            [*command[:9], "16", *command[10:]], cwd=Path(__file__).resolve().parents[1],
+            capture_output=True, check=False, text=True, timeout=5,
+        )
+        self.assertEqual(rejected.returncode, 64)
+        self.assertIn("requires c4-standard-16-lssd, writers 1,8,16", rejected.stderr)
+
+    def test_remote_runner_rejects_retired_singleton_submission_suite(self) -> None:
+        remote_script = Path(__file__).with_name("gcp-free-trial-wal-bench-remote.sh")
+        command = [
+            "bash", str(remote_script), "a" * 40, "100000", "test-project", "us-central1-a",
+            "wal-test", "4102444800", "c4-standard-16-lssd", "1,8,16",
+            "v8-cursor-singleton-submission", "-", "-",
+        ]
+        rejected = subprocess.run(
+            command, cwd=Path(__file__).resolve().parents[1], capture_output=True,
+            check=False, text=True, timeout=5,
+        )
+        self.assertEqual(rejected.returncode, 64)
+        self.assertIn("retired historical benchmark suite", rejected.stderr)
+
+    def test_remote_runner_rejects_retired_ready_target_suite(self) -> None:
+        remote_script = Path(__file__).with_name("gcp-free-trial-wal-bench-remote.sh")
+        command = [
+            "bash", str(remote_script), "a" * 40, "100000", "test-project", "us-central1-a",
+            "wal-test", "4102444800", "c4-standard-16-lssd", "1,8,16",
+            "v8-cursor-coalescing-ready-target", "-", "-",
+        ]
+        rejected = subprocess.run(
+            command, cwd=Path(__file__).resolve().parents[1], capture_output=True,
+            check=False, text=True, timeout=5,
+        )
+        self.assertEqual(rejected.returncode, 64)
+        self.assertIn("retired historical benchmark suite", rejected.stderr)
+
+    def test_remote_runner_rejects_retired_ready_target_scan_suite(self) -> None:
+        remote_script = Path(__file__).with_name("gcp-free-trial-wal-bench-remote.sh")
+        command = [
+            "bash", str(remote_script), "a" * 40, "100000", "test-project", "us-central1-a",
+            "wal-test", "4102444800", "c4-standard-16-lssd", "8,16",
+            "v8-cursor-coalescing-ready-target-scan", "-", "-",
+        ]
+        rejected = subprocess.run(
+            command, cwd=Path(__file__).resolve().parents[1], capture_output=True,
+            check=False, text=True, timeout=5,
+        )
+        self.assertEqual(rejected.returncode, 64)
+        self.assertIn("retired historical benchmark suite", rejected.stderr)
+
+    def test_remote_runner_rejects_retired_small_ready_target_scan_suite(self) -> None:
+        remote_script = Path(__file__).with_name("gcp-free-trial-wal-bench-remote.sh")
+        command = [
+            "bash", str(remote_script), "a" * 40, "100000", "test-project", "us-central1-a",
+            "wal-test", "4102444800", "c4-standard-16-lssd", "8,16",
+            "v8-cursor-coalescing-ready-target-small-scan", "-", "-",
+        ]
+        rejected = subprocess.run(
+            command, cwd=Path(__file__).resolve().parents[1], capture_output=True,
+            check=False, text=True, timeout=5,
+        )
+        self.assertEqual(rejected.returncode, 64)
+        self.assertIn("retired historical benchmark suite", rejected.stderr)
+
+    def test_progress_ring_preflight_audits_isolated_ingress(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            results = root / "preflight-1"
+            audit_tags = []
+
+            def audit_and_capture(*args: object) -> None:
+                audit_tags.append(args[4])
+
+            with (
+                patch.object(BENCH, "Gcloud", return_value=Mock()),
+                patch.object(BENCH, "preflight", return_value={"zone": "us-east1-b"}),
+                patch.object(BENCH, "audit_ssh_firewall_rules", side_effect=audit_and_capture),
+            ):
+                for index in (1, 2):
+                    results = root / f"preflight-{index}"
+                    status = BENCH.main([
+                        "--project", "test-project", "--zone", "us-east1-b", "--commit", "a" * 40,
+                        "--network", "walbench-isolated", "--subnet", "walbench-subnet",
+                        "--ssh-source-range", "192.0.2.10/32", "--skip-ssh-egress-check",
+                        "--max-runtime-minutes", "60", "--estimated-hourly-cost-usd", "1.5",
+                        "--max-estimated-spend-usd", "2", "--v8-point-progress-cursor-ab",
+                        "--preflight-only", "--results-dir", str(results),
+                    ])
+                    self.assertEqual(status, 0)
+                    report = json.loads((results / "preflight.json").read_text(encoding="utf-8"))
+                    self.assertEqual(report["isolated_network_audit"]["vm_tag"], audit_tags[-1])
+                    self.assertTrue(audit_tags[-1].startswith(BENCH.POINT_PROGRESS_RING_VM_TAG + "-"))
+            self.assertEqual(len(audit_tags), 2)
+            self.assertNotEqual(audit_tags[0], audit_tags[1])
+
+    def test_cursor_preflight_audits_isolated_ingress_and_records_cursor_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            results = Path(temporary) / "preflight"
+            audit_tags = []
+
+            def audit_and_capture(*args: object) -> None:
+                audit_tags.append(args[4])
+
+            with (
+                patch.object(BENCH, "Gcloud", return_value=Mock()),
+                patch.object(BENCH, "preflight", return_value={"zone": "us-east1-b"}),
+                patch.object(BENCH, "audit_ssh_firewall_rules", side_effect=audit_and_capture),
+            ):
+                status = BENCH.main([
+                    "--project", "test-project", "--zone", "us-east1-b", "--commit", "a" * 40,
+                    "--network", "walbench-isolated", "--subnet", "walbench-subnet",
+                    "--ssh-source-range", "192.0.2.10/32", "--skip-ssh-egress-check",
+                    "--max-runtime-minutes", "60", "--estimated-hourly-cost-usd", "1.5",
+                    "--max-estimated-spend-usd", "2", "--v8-point-progress-cursor-ab",
+                    "--preflight-only", "--results-dir", str(results),
+                ])
+            self.assertEqual(status, 0)
+            self.assertEqual(len(audit_tags), 1)
+            self.assertTrue(audit_tags[0].startswith(BENCH.POINT_PROGRESS_RING_VM_TAG + "-"))
+            report = json.loads((results / "preflight.json").read_text(encoding="utf-8"))
+            self.assertEqual(report["benchmark_suite"], "v8-point-progress-cursor")
+            self.assertEqual(report["benchmark_plan"]["suite"], "v8-point-progress-cursor")
+            self.assertEqual(report["benchmark_plan"]["progress_cursor_ab"]["candidate_value"], "2")
+
+    def test_archive_round_trip_verifies_all_40_raw_runs_and_summaries(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            results = self._make_fixture(root)
+            temp_root = root / "archive-tmp"
+            temp_root.mkdir()
+            command = BENCH._build_remote_archive_command(root=str(results), max_bytes=64 * 1024 * 1024)
+            completed = subprocess.run(
+                ["bash", "-euc", command], capture_output=True, text=True, check=False,
+                env={**os.environ, "TMPDIR": str(temp_root)},
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            archive_values = self._archive_output(completed.stdout)
+            archive = Path(archive_values["ARCHIVE_PATH"])
+            archive_copy = root / "bundle.tar.gz"
+            shutil.copyfile(archive, archive_copy)
+            self.assertEqual(self._sha256(archive_copy), archive_values["ARCHIVE_SHA256"])
+            extracted = root / "extracted"
+            extracted.mkdir()
+            with tarfile.open(archive_copy, "r:gz") as bundle:
+                bundle.extractall(extracted)
+            unpacked = extracted / "results"
+            self.assertTrue((unpacked / "point-progress-ring-schedule.tsv").is_file())
+            self.assertEqual(progress_ring_runner.verify_results_directory(unpacked)["verified"], True)
+
+    def test_archive_round_trip_includes_cursor_schedule(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            results = self._make_fixture(root, cursor=True)
+            temp_root = root / "archive-tmp"
+            temp_root.mkdir()
+            command = BENCH._build_remote_archive_command(root=str(results), max_bytes=64 * 1024 * 1024)
+            completed = subprocess.run(
+                ["bash", "-euc", command], capture_output=True, text=True, check=False,
+                env={**os.environ, "TMPDIR": str(temp_root)},
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            archive_values = self._archive_output(completed.stdout)
+            archive = Path(archive_values["ARCHIVE_PATH"])
+            archive_copy = root / "bundle.tar.gz"
+            shutil.copyfile(archive, archive_copy)
+            self.assertEqual(self._sha256(archive_copy), archive_values["ARCHIVE_SHA256"])
+            extracted = root / "extracted"
+            extracted.mkdir()
+            with tarfile.open(archive_copy, "r:gz") as bundle:
+                bundle.extractall(extracted)
+            unpacked = extracted / "results"
+            self.assertTrue((unpacked / "point-progress-cursor-schedule.tsv").is_file())
+            self.assertFalse((unpacked / "point-progress-ring-schedule.tsv").exists())
+            self.assertTrue(progress_ring_runner.verify_cursor_results_directory(unpacked)["verified"])
+
+    def test_verifier_rejects_missing_extra_bad_samples_and_scores_not_matching_raw(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            results = self._make_fixture(root)
+            self.assertTrue(progress_ring_runner.verify_results_directory(results)["verified"])
+
+            first = build_point_progress_ring_schedule(POINT_PROGRESS_RING_WRITERS)[0]
+            run_id = progress_ring_runner._run_id(first)
+            (results / run_id / "run-metadata.json").unlink()
+            rejected = progress_ring_runner.verify_results_directory(results)
+            self.assertFalse(rejected["verified"])
+            # Each independent corruption case starts with a fresh fixture.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            results = self._make_fixture(root)
+            extra = results / "r99-w16-extra"
+            extra.mkdir()
+            self.assertFalse(progress_ring_runner.verify_results_directory(results)["verified"])
+
+    def test_summary_uses_unrounded_ratios_for_inclusive_promotion_boundaries(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            results = self._make_fixture(Path(temporary))
+            rows = json.loads((results / "summary.json").read_text(encoding="utf-8"))["results"]
+
+        def score(point_ratio: float, p99_ratio: float, guardrail_ratio: float) -> dict[str, object]:
+            adjusted = json.loads(json.dumps(rows))
+            for row in adjusted:
+                writer, workload, arm = row["writer"], row["workload"], row["arm"]
+                baseline = arm == "eager"
+                ratio = 1.0
+                if workload == "point" and writer in (8, 16):
+                    ratio = 1.0 if baseline else point_ratio
+                    row["p99_ms"] = 1.0 if baseline else p99_ratio
+                elif workload == "point" and writer == 1 or workload == "batch64":
+                    ratio = 1.0 if baseline else guardrail_ratio
+                row["puts_per_second"] = 100_000.0 * ratio
+            return progress_ring_runner._summary(adjusted, POINT_PROGRESS_RING_WRITERS, len(adjusted))
+
+        exact = score(1.05, 1.05, 0.98)
+        self.assertTrue(exact["qualification_gates"]["point8_and_point16_each_gain_at_least_5pct_and_win_4_of_5"])
+        self.assertTrue(exact["qualification_gates"]["point8_and_point16_p99_regression_at_most_5pct"])
+        self.assertTrue(exact["qualification_gates"]["point1_and_batch64_paired_median_regression_at_most_2pct"])
+        self.assertTrue(exact["qualification_gates"]["candidate_qualified"])
+
+        throughput_outside = score(1.04999, 1.05, 0.98)
+        self.assertFalse(
+            throughput_outside["qualification_gates"][
+                "point8_and_point16_each_gain_at_least_5pct_and_win_4_of_5"
+            ]
+        )
+        self.assertFalse(throughput_outside["qualification_gates"]["candidate_qualified"])
+
+        p99_outside = score(1.05, 1.05001, 0.98)
+        self.assertTrue(
+            p99_outside["qualification_gates"][
+                "point8_and_point16_each_gain_at_least_5pct_and_win_4_of_5"
+            ]
+        )
+        self.assertFalse(p99_outside["qualification_gates"]["point8_and_point16_p99_regression_at_most_5pct"])
+        self.assertFalse(p99_outside["qualification_gates"]["candidate_qualified"])
+
+        guardrail_outside = score(1.05, 1.05, 0.97999)
+        self.assertFalse(
+            guardrail_outside["qualification_gates"][
+                "point1_and_batch64_paired_median_regression_at_most_2pct"
+            ]
+        )
+        self.assertFalse(guardrail_outside["qualification_gates"]["candidate_qualified"])
+
+    def test_malformed_nested_benchmark_objects_raise_value_error_and_verifier_survives(self) -> None:
+        row = build_point_progress_ring_schedule(POINT_PROGRESS_RING_WRITERS)[0]
+        malformed_records = []
+        malformed_records.append(None)
+        malformed_records.append({"result": None, "params": {}})
+        malformed_records.append({"result": {}, "params": []})
+        malformed_records.append({"result": {"wal_pipeline": None}, "params": {}})
+        malformed_records.append({
+            "result": {"wal_pipeline": {"wal_io_start": None}}, "params": {},
+        })
+        for record in malformed_records:
+            with self.subTest(record=record), self.assertRaises(ValueError):
+                progress_ring_runner._validate_record(record, row)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            results = self._make_fixture(Path(temporary))
+            raw_path = results / progress_ring_runner._run_id(row) / "result.json"
+            raw = json.loads(raw_path.read_text(encoding="utf-8"))
+            raw["result"]["wal_pipeline"] = None
+            raw_path.write_text(json.dumps(raw), encoding="utf-8")
+            verification = progress_ring_runner.verify_results_directory(results)
+            self.assertFalse(verification["verified"])
+            self.assertTrue(any("WAL pipeline metadata" in error for error in verification["errors"]))
+
+    def test_verifier_skips_score_recomputation_for_invalid_matrix_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            results = self._make_fixture(Path(temporary))
+            summary_path = results / "summary.json"
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            point = next(row for row in summary["results"] if row["workload"] == "point")
+            point["p99_ms"] = 0
+            summary_path.write_text(json.dumps(summary), encoding="utf-8")
+            verification = progress_ring_runner.verify_results_directory(results)
+            self.assertFalse(verification["verified"])
+            self.assertTrue(any("run rows" in error for error in verification["errors"]))
+
+    def test_progress_ring_qualification_rejects_cursor_or_progress_diagnostics(self) -> None:
+        row = build_point_progress_ring_schedule(POINT_PROGRESS_RING_WRITERS)[0]
+        for field, value, error in (
+            ("progress_cursor_enabled", True, "Cursor mode differs from the planned arm"),
+            ("progress_diagnostics", {"owner_scans": 0}, "diagnostics must be disabled"),
+        ):
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, error):
+                raw = self._raw_record(row)
+                raw["result"]["wal_pipeline"]["wal_io_start"][field] = value
+                progress_ring_runner._validate_record(raw, row)
+
+    def test_matrix_validator_rejects_boolean_exit_status(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            results = self._make_fixture(Path(temporary))
+            summary = json.loads((results / "summary.json").read_text(encoding="utf-8"))
+        summary["results"][0]["exit_code"] = False
+        validation = validate_point_progress_ring_rows(summary["results"], POINT_PROGRESS_RING_WRITERS)
+        self.assertFalse(validation["complete"])
+
+    def test_run_suite_uses_resolved_binary_and_reports_launches_separately(self) -> None:
+        binary = Path("scripts/gcp_v8_point_progress_ring_runner.py")
+        binary_sha256 = self._sha256(binary)
+        commit = "a" * 40
+        seen_binary_paths: list[Path] = []
+
+        def fake_run_one(**kwargs: object) -> dict[str, object]:
+            row = kwargs["row"]
+            seen_binary_paths.append(kwargs["binary"])
+            kwargs["on_subprocess_started"]()
+            raw = self._raw_record(row)
+            if row["arm"] == "cursor" and row["writer"] in (8, 16) and row["workload"] == "point":
+                raw["result"]["ops_per_sec"] = 101_000.0
+            return {
+                **row,
+                "source_commit": commit,
+                "binary_sha256": binary_sha256,
+                "exit_code": 0,
+                "duration_seconds": 5.0,
+                **progress_ring_runner._validate_record(raw, row),
+            }
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args = SimpleNamespace(
+                commit=commit,
+                binary=binary,
+                binary_sha256=binary_sha256,
+                machine_type="c4-standard-16-lssd",
+                ssd_count=2,
+                ssd_gib=750,
+                writers=",".join(map(str, POINT_PROGRESS_RING_WRITERS)),
+                results_dir=root / "results",
+                db_root=root / "db",
+                safe_deadline_epoch=4_000_000_000,
+            )
+            with patch.object(progress_ring_runner, "_run_one", side_effect=fake_run_one):
+                status = progress_ring_runner.run_suite(args)
+
+            self.assertEqual(status, 0, "complete matrices return success even when a promotion gate fails")
+            self.assertTrue(all(path == binary.resolve(strict=True) for path in seen_binary_paths))
+            summary = json.loads((args.results_dir / "summary.json").read_text(encoding="utf-8"))
+            remote_exit = json.loads((args.results_dir / "remote-exit.json").read_text(encoding="utf-8"))
+            self.assertTrue(summary["complete"])
+            self.assertFalse(summary["qualification_gates"]["candidate_qualified"])
+            self.assertEqual(summary["runs_started"], 40)
+            self.assertEqual(summary["runs_attempted"], 40)
+            self.assertEqual(remote_exit["runs_started"], 40)
+            self.assertEqual(remote_exit["runs_attempted"], 40)
+            self.assertFalse(remote_exit["failed"])
+
+    def test_run_suite_writes_separate_cursor_plan_and_schedule(self) -> None:
+        binary = Path("scripts/gcp_v8_point_progress_ring_runner.py")
+        binary_sha256 = self._sha256(binary)
+        commit = "a" * 40
+
+        def fake_run_one(**kwargs: object) -> dict[str, object]:
+            row = kwargs["row"]
+            kwargs["on_subprocess_started"]()
+            raw = self._raw_record(row)
+            return {
+                **row,
+                "source_commit": commit,
+                "binary_sha256": binary_sha256,
+                "exit_code": 0,
+                "duration_seconds": 5.0,
+                **progress_ring_runner._validate_record(raw, row),
+            }
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args = SimpleNamespace(
+                commit=commit,
+                binary=binary,
+                binary_sha256=binary_sha256,
+                machine_type="c4-standard-16-lssd",
+                ssd_count=2,
+                ssd_gib=750,
+                writers=",".join(map(str, POINT_PROGRESS_RING_WRITERS)),
+                results_dir=root / "results",
+                db_root=root / "db",
+                safe_deadline_epoch=4_000_000_000,
+                candidate_mode="cursor",
+            )
+            with patch.object(progress_ring_runner, "_run_one", side_effect=fake_run_one):
+                status = progress_ring_runner.run_suite(args)
+            self.assertEqual(status, 0)
+            self.assertTrue((args.results_dir / "point-progress-cursor-schedule.tsv").is_file())
+            self.assertFalse((args.results_dir / "point-progress-ring-schedule.tsv").exists())
+            plan = json.loads((args.results_dir / "benchmark-plan.json").read_text(encoding="utf-8"))
+            summary = json.loads((args.results_dir / "summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(plan["suite"], "v8-point-progress-cursor")
+            self.assertEqual(summary["suite"], "v8-point-progress-cursor")
+            self.assertEqual(summary["arms"], ["eager", "cursor"])
+            self.assertEqual(summary["runs_planned"], 40)
+            self.assertEqual(summary["runs_started"], 40)
+            self.assertTrue(summary["complete"])
+
+    def test_launch_count_does_not_include_deadline_rejected_attempt(self) -> None:
+        binary = Path("scripts/gcp_v8_point_progress_ring_runner.py")
+        binary_sha256 = self._sha256(binary)
+        commit = "a" * 40
+        started = 0
+
+        def fake_run_one(**kwargs: object) -> dict[str, object]:
+            nonlocal started
+            if started == 12:
+                raise TimeoutError("stopping before the VM safety deadline")
+            kwargs["on_subprocess_started"]()
+            started += 1
+            return {
+                **kwargs["row"], "source_commit": commit, "binary_sha256": binary_sha256,
+                "exit_code": 0, "puts_per_second": 1.0, "cpu_us_per_put": 1.0,
+                "p50_ms": 1.0, "p95_ms": 1.0, "p99_ms": 1.0,
+                "sync_count": 1, "puts_per_sync": 1.0, "ordered_link_hash_cpu_ns": 0,
+            }
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args = SimpleNamespace(
+                commit=commit, binary=binary, binary_sha256=binary_sha256,
+                machine_type="c4-standard-16-lssd", ssd_count=2, ssd_gib=750,
+                writers=",".join(map(str, POINT_PROGRESS_RING_WRITERS)),
+                results_dir=root / "results", db_root=root / "db", safe_deadline_epoch=4_000_000_000,
+            )
+            with patch.object(progress_ring_runner, "_run_one", side_effect=fake_run_one):
+                status = progress_ring_runner.run_suite(args)
+            self.assertEqual(status, 1)
+            summary = json.loads((args.results_dir / "summary.json").read_text(encoding="utf-8"))
+            remote_exit = json.loads((args.results_dir / "remote-exit.json").read_text(encoding="utf-8"))
+            self.assertFalse(summary["complete"])
+            self.assertEqual(summary["runs_started"], 12)
+            self.assertEqual(summary["runs_attempted"], 13)
+            self.assertEqual(remote_exit["runs_started"], 12)
+            self.assertEqual(remote_exit["runs_attempted"], 13)
+            self.assertTrue(remote_exit["failed"])
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            results = self._make_fixture(root)
+            point = next(row for row in build_point_progress_ring_schedule(POINT_PROGRESS_RING_WRITERS)
+                         if row["workload"] == "point")
+            raw_path = results / progress_ring_runner._run_id(point) / "result.json"
+            raw = json.loads(raw_path.read_text(encoding="utf-8"))
+            raw["result"]["wal_pipeline"]["worker_group_sizes"] = {"one_ticket": 1}
+            raw_path.write_text(json.dumps(raw), encoding="utf-8")
+            self.assertFalse(progress_ring_runner.verify_results_directory(results)["verified"])
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            results = self._make_fixture(root)
+            point = next(row for row in build_point_progress_ring_schedule(POINT_PROGRESS_RING_WRITERS)
+                         if row["workload"] == "point")
+            raw_path = results / progress_ring_runner._run_id(point) / "result.json"
+            raw = json.loads(raw_path.read_text(encoding="utf-8"))
+            raw["latency"]["samples"] -= 1
+            raw_path.write_text(json.dumps(raw), encoding="utf-8")
+            self.assertFalse(progress_ring_runner.verify_results_directory(results)["verified"])
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            results = self._make_fixture(root)
+            schedule = build_point_progress_ring_schedule(POINT_PROGRESS_RING_WRITERS)
+            rows = json.loads((results / "summary.json").read_text(encoding="utf-8"))["results"]
+            first = rows[0]
+            run_id = progress_ring_runner._run_id(first)
+            first["puts_per_second"] *= 2
+            (results / run_id / "run-metadata.json").write_text(json.dumps(first), encoding="utf-8")
+            summary = json.loads((results / "summary.json").read_text(encoding="utf-8"))
+            summary["results"] = rows
+            recomputed = progress_ring_runner._summary(rows, POINT_PROGRESS_RING_WRITERS, len(schedule))
+            summary.update({key: recomputed[key] for key in (
+                "complete", "runs_started", "runs_completed", "runs_planned", "writers", "workloads",
+                "arms", "matrix_validation", "comparison", "comparison_by_cell", "qualification_gates",
+            )})
+            (results / "summary.json").write_text(json.dumps(summary), encoding="utf-8")
+            summary_tsv = results / "summary.tsv"
+            with summary_tsv.open(encoding="utf-8", newline="") as stream:
+                tsv_rows = list(csv.DictReader(stream, delimiter="\t"))
+                fieldnames = tuple(tsv_rows[0])
+            tsv_row = next(row for row in tsv_rows if row["run_index"] == str(first["run_index"]))
+            tsv_row["puts_per_second"] = str(first["puts_per_second"])
+            with summary_tsv.open("w", encoding="utf-8", newline="") as stream:
+                writer = csv.DictWriter(stream, fieldnames=fieldnames, delimiter="\t", lineterminator="\n")
+                writer.writeheader()
+                writer.writerows(tsv_rows)
+            self.assertFalse(progress_ring_runner.verify_results_directory(results)["verified"])
+
+    def test_d1_schedule_holds_stage_a_and_retirement_mode_constant(self) -> None:
+        schedule = build_point_ack_d1_schedule()
+        self.assertEqual(len(schedule), 30)
+        self.assertEqual({row["arm"] for row in schedule}, set(POINT_ACK_D1_ARMS))
+        plan = build_point_ack_d1_plan(
+            machine_type="c4-standard-16-lssd",
+            machine_spec={"vcpus": 16, "ssd_count": 2, "ssd_gib": 750},
+            baseline_commit="a" * 40,
+            candidate_commit="b" * 40,
+            source_patch_sha256="c" * 64,
+        )
+        self.assertEqual(plan["runs_planned"], 30)
+        self.assertEqual(plan["point_resource_retirement_mode"], 0)
+        self.assertTrue(plan["point_buffer_preallocation_enabled"])
+        self.assertEqual(
+            [tuple(row["arm"] for row in schedule if row["writer"] == 8
+                   and row["workload"] == "point" and row["repetition"] == repetition)
+             for repetition in range(1, 6)],
+            [POINT_ACK_D1_ORDERS[(repetition - 1) % len(POINT_ACK_D1_ORDERS)]
+             for repetition in range(1, 6)],
+        )
+        for row in schedule:
+            self.assertEqual(row["point_resource_retirement_mode"], 0)
+            self.assertEqual(row["point_buffer_preallocation_enabled"], row["workload"] == "point")
+            self.assertTrue(row["progress_cursor_enabled"])
+            self.assertTrue(row["cursor_direct_completion_enabled"])
+            self.assertFalse(row["cursor_singleton_submission_enabled"])
+            self.assertFalse(row["scan_diagnostics_enabled"])
+
+        observed = []
+        for row in schedule:
+            raw = self._raw_record(row)
+            metrics = progress_ring_runner._validate_point_resource_retirement_stage_a_record(raw, row)
+            observed.append({**row, **metrics, "exit_code": 0})
+        self.assertTrue(validate_point_ack_d1_rows(observed)["complete"])
+
+        point_row = next(row for row in observed if row["workload"] == "point")
+        point_row["point_buffer_preallocation_hits"] = 0
+        self.assertFalse(validate_point_ack_d1_rows(observed)["complete"])
+
+    def test_d1_runner_writes_verifiable_same_host_ab_bundle(self) -> None:
+        baseline = "a" * 40
+        candidate = "b" * 40
+        patch_bytes = b"synthetic D1 source diff\n"
+        patch_sha = hashlib.sha256(patch_bytes).hexdigest()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            baseline_binary = root / "write-perf-before"
+            candidate_binary = root / "write-perf-after"
+            baseline_binary.write_bytes(b"baseline executable")
+            candidate_binary.write_bytes(b"candidate executable")
+            baseline_sha = self._sha256(baseline_binary)
+            candidate_sha = self._sha256(candidate_binary)
+
+            def fake_run_one(**kwargs: object) -> dict[str, object]:
+                row = kwargs["row"]
+                kwargs["on_subprocess_started"]()
+                results_dir = kwargs["results_dir"]
+                run_dir = results_dir / ack_d1_runner._run_id(row)
+                run_dir.mkdir()
+                raw = self._raw_record(row)
+                metrics = progress_ring_runner._validate_point_resource_retirement_stage_a_record(raw, row)
+                metadata = {
+                    **row,
+                    "binary_sha256": kwargs["binary_sha256"],
+                    "exit_code": 0,
+                    "duration_seconds": 5.0,
+                    **metrics,
+                }
+                (run_dir / "result.json").write_text(json.dumps(raw), encoding="utf-8")
+                (run_dir / "run-metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
+                (run_dir / "environment.txt").write_text(
+                    progress_ring_runner._expected_environment_text(
+                        True,
+                        True,
+                        False,
+                        True,
+                        False,
+                        # The D1 runner sets Stage A only for Point rows; Batch64
+                        # inherits the default-off behavior and leaves the switch unset.
+                        point_buffer_preallocation_enabled=(
+                            True if row["workload"] == "point" else None
+                        ),
+                        point_resource_retirement_mode=0,
+                    ),
+                    encoding="utf-8",
+                )
+                return metadata
+
+            results_dir = root / "results"
+            args = SimpleNamespace(
+                baseline_binary=baseline_binary,
+                baseline_binary_sha256=baseline_sha,
+                baseline_commit=baseline,
+                candidate_binary=candidate_binary,
+                candidate_binary_sha256=candidate_sha,
+                candidate_commit=candidate,
+                source_patch_sha256=patch_sha,
+                results_dir=results_dir,
+                db_root=root / "db",
+                writers="8,16",
+                machine_type="c4-standard-16-lssd",
+                ssd_count=2,
+                ssd_gib=750,
+                safe_deadline_epoch=4_000_000_000,
+            )
+            with patch.object(ack_d1_runner, "_run_one", side_effect=fake_run_one):
+                self.assertEqual(ack_d1_runner.run_suite(args), 0)
+            (results_dir / "source.patch").write_bytes(patch_bytes)
+            verification = ack_d1_runner.verify_results_directory(results_dir)
+            self.assertTrue(verification["verified"], verification["errors"])
+
+            (results_dir / "source.patch").write_bytes(b"changed patch")
+            self.assertFalse(ack_d1_runner.verify_results_directory(results_dir)["verified"])
+
+    def test_d1_remote_suite_is_rejected_as_retired_even_with_valid_args(self) -> None:
+        remote_script = Path(__file__).with_name("gcp-free-trial-wal-bench-remote.sh")
+        environment = {**os.environ, "TOYKV_GCP_BENCH_VALIDATE_ONLY": "1"}
+        valid = [
+            "bash", str(remote_script), "a" * 40, str(POINT_ACK_D1_NUM), "test-project",
+            "us-central1-a", "wal-test", "4102444800", "c4-standard-16-lssd", "8,16",
+            "v8-point-ack-d1", "c" * 64, "b" * 40,
+        ]
+        rejected = subprocess.run(valid, cwd=Path(__file__).resolve().parents[1], env=environment,
+                                  capture_output=True, text=True, timeout=5)
+        self.assertEqual(rejected.returncode, 64, rejected.stderr)
+        self.assertIn("retired historical benchmark suite", rejected.stderr)
+
+    def test_d1_preflight_requires_isolated_network_and_fixed_budget(self) -> None:
+        common = [
+            "--project", "test-project", "--zone", "us-central1-a", "--commit", "a" * 40,
+            "--baseline-commit", "b" * 40, "--source-patch-sha256", "c" * 64,
+            "--machine-type", "c4-standard-16-lssd", "--writers", "8", "16",
+            "--v8-point-ack-d1-ab", "--ssh-source-range", "192.0.2.1/32",
+            "--max-runtime-minutes", "60", "--estimated-hourly-cost-usd", "1.50",
+            "--max-estimated-spend-usd", "2", "--preflight-only",
+        ]
+        args = BENCH.parse_args([*common, "--network", "d1-isolated", "--subnet", "d1-subnet"])
+        self.assertEqual(args.writers, POINT_ACK_D1_WRITERS)
+        self.assertEqual(args.num, POINT_ACK_D1_NUM)
+        self.assertTrue(args.v8_point_ack_d1_ab)
+        for suffix in ([], ["--network", "default", "--subnet", "default"],
+                       ["--network", "d1-isolated"]):
+            with self.subTest(suffix=suffix), redirect_stderr(StringIO()), self.assertRaises(SystemExit):
+                BENCH.parse_args([*common, *suffix])
+
+    @staticmethod
+    def _archive_output(output: str) -> dict[str, str]:
+        return dict(line.split("=", 1) for line in output.splitlines() if "=" in line)
+
+    @staticmethod
+    def _sha256(path: Path) -> str:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
 class GcpFreeTrialWalBenchTests(unittest.TestCase):
+    def test_v8_d2_qualification_preflight_and_remote_runner_validation(self) -> None:
+        common = [
+            "--project", "test-project", "--zone", "us-central1-b", "--commit", "a" * 40,
+            "--machine-type", "c4-standard-16-lssd", "--writers", "1", "8", "16",
+            "--v8-d2-qualification", "--ssh-source-range", "192.0.2.1/32",
+            "--max-runtime-minutes", "60", "--estimated-hourly-cost-usd", "1.50",
+            "--max-estimated-spend-usd", "2", "--preflight-only",
+        ]
+        args = BENCH.parse_args([*common, "--network", "d2-isolated", "--subnet", "d2-subnet"])
+        self.assertEqual(args.writers, V8_D2_QUALIFICATION_WRITERS)
+        self.assertEqual(args.num, V8_D2_QUALIFICATION_NUM)
+        self.assertTrue(args.v8_d2_qualification)
+        for suffix in (
+            ["--network", "default", "--subnet", "default"],
+            ["--network", "d2-isolated"],
+            ["--writers", "8", "16"],
+            ["--num", "99999"],
+        ):
+            with self.subTest(suffix=suffix), redirect_stderr(StringIO()), self.assertRaises(SystemExit):
+                BENCH.parse_args([*common, *suffix])
+
+        remote_script = Path(__file__).with_name("gcp-free-trial-wal-bench-remote.sh")
+        environment = {**os.environ, "TOYKV_GCP_BENCH_VALIDATE_ONLY": "1"}
+        valid = [
+            "bash", str(remote_script), "a" * 40, str(V8_D2_QUALIFICATION_NUM), "test-project",
+            "us-central1-b", "wal-test", "4102444800", "c4-standard-16-lssd", "1,8,16",
+            "v8-d2-qualification", "-", "-",
+        ]
+        accepted = subprocess.run(valid, cwd=Path(__file__).resolve().parents[1], env=environment,
+                                  capture_output=True, text=True, timeout=5)
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+
+    def test_v7_v8_ready_target_final_preflight_requires_fixed_isolated_matrix(self) -> None:
+        common = [
+            "--project", "test-project", "--zone", "us-central1-b", "--commit", "a" * 40,
+            "--machine-type", "c4-standard-16-lssd", "--writers", "1", "8", "16",
+            "--v7-v8-ready-target-final-ab", "--ssh-source-range", "192.0.2.1/32",
+            "--max-runtime-minutes", "60", "--estimated-hourly-cost-usd", "1.50",
+            "--max-estimated-spend-usd", "2", "--preflight-only",
+        ]
+        args = BENCH.parse_args([*common, "--network", "final-isolated", "--subnet", "final-subnet"])
+        self.assertEqual(args.writers, V7_V8_READY_TARGET_FINAL_WRITERS)
+        self.assertEqual(args.num, V7_V8_READY_TARGET_FINAL_NUM)
+        self.assertTrue(args.v7_v8_ready_target_final_ab)
+        for suffix in (
+            ["--network", "default", "--subnet", "default"],
+            ["--network", "final-isolated"],
+            ["--writers", "8", "16"],
+            ["--num", "99999"],
+        ):
+            with self.subTest(suffix=suffix), redirect_stderr(StringIO()), self.assertRaises(SystemExit):
+                BENCH.parse_args([*common, *suffix])
+
+    def test_remote_runner_accepts_only_the_fixed_final_ready_target_matrix(self) -> None:
+        remote_script = Path(__file__).with_name("gcp-free-trial-wal-bench-remote.sh")
+        environment = {**os.environ, "TOYKV_GCP_BENCH_VALIDATE_ONLY": "1"}
+        valid = [
+            "bash", str(remote_script), "a" * 40, str(V7_V8_READY_TARGET_FINAL_NUM), "test-project",
+            "us-central1-b", "wal-test", "4102444800", "c4-standard-16-lssd", "1,8,16",
+            "v7-v8-ready-target-final", "-", "-",
+        ]
+        accepted = subprocess.run(valid, cwd=Path(__file__).resolve().parents[1], env=environment,
+                                  capture_output=True, text=True, timeout=5)
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+
+        for index, value in ((3, "99999"), (8, "c4-standard-8-lssd"), (9, "16,8,1")):
+            with self.subTest(argument=index, value=value):
+                invalid = list(valid)
+                invalid[index] = value
+                rejected = subprocess.run(invalid, cwd=Path(__file__).resolve().parents[1], env=environment,
+                                          capture_output=True, text=True, timeout=5)
+                self.assertEqual(rejected.returncode, 64)
+
     def test_ssh_readiness_retries_within_a_fixed_deadline(self) -> None:
         now = [0.0]
         timeouts = []
@@ -1642,6 +4686,149 @@ class GcpFreeTrialWalBenchTests(unittest.TestCase):
                 "--project", "test-project", "--zone", "us-east1-b", "--commit", "c" * 40,
                 "--writers", "16", "--v8-extent-policy-storage-ab", "--preflight-only",
             ])
+
+    def test_v7_v8_point_preallocation_schedule_and_plan(self) -> None:
+        schedule = build_v7_v8_point_preallocation_schedule()
+        self.assertEqual(len(schedule), 55)
+        for writer in POINT_PREALLOCATION_WRITERS:
+            for repetition in range(1, 6):
+                rows = [
+                    row
+                    for row in schedule
+                    if row["writer"] == writer and row["repetition"] == repetition and row["workload"] == "point"
+                ]
+                self.assertEqual([row["arm"] for row in rows], list(POINT_PREALLOCATION_POINT_ORDERS[repetition - 1]))
+                self.assertEqual(len(rows), 3)
+                self.assertEqual({row["workload"] for row in rows}, {"point"})
+        batch = [row for row in schedule if row["workload"] == "batch64"]
+        self.assertEqual(len(batch), 10)
+        self.assertTrue(all(row["writer"] == 16 for row in batch))
+        self.assertTrue(all(row["format_version"] == 8 for row in batch))
+        self.assertEqual(
+            {row["point_buffer_preallocation_enabled"] for row in batch},
+            {False, True},
+        )
+        self.assertEqual(
+            {row["arm"] for row in batch},
+            {"v8_prealloc_off", "v8_prealloc_on"},
+        )
+        plan = build_v7_v8_point_preallocation_plan(
+            machine_type="c4-standard-16-lssd",
+            machine_spec=BENCH.MACHINE_SPECS["c4-standard-16-lssd"],
+            commit="c" * 40,
+            binary_sha256="d" * 64,
+        )
+        self.assertEqual(plan["runs_planned"], 55)
+        self.assertEqual(plan["arms"], ["v7_parallel", "v8_prealloc_off", "v8_prealloc_on"])
+        self.assertEqual(plan["binary_sha256"], "d" * 64)
+
+    def test_v7_v8_point_preallocation_cli_requires_isolated_16_vcpu_setup(self) -> None:
+        valid = [
+            "--project", "test-project", "--zone", "us-central1-a", "--commit", "c" * 40,
+            "--network", "walbench-isolated", "--subnet", "walbench-subnet",
+            "--ssh-source-range", "192.0.2.10/32", "--max-runtime-minutes", "60",
+            "--estimated-hourly-cost-usd", "1.25", "--max-estimated-spend-usd", "2",
+            "--v7-v8-point-preallocation-ab", "--preflight-only",
+        ]
+        args = BENCH.parse_args(valid)
+        self.assertEqual(args.writers, POINT_PREALLOCATION_WRITERS)
+        self.assertEqual(args.num, POINT_PREALLOCATION_NUM)
+        self.assertEqual(args.machine_type, "c4-standard-16-lssd")
+        for suffix in (
+            ["--network", "default", "--subnet", "default", "--ssh-source-range", "192.0.2.10/32"],
+            ["--writers", "16"],
+            ["--num", str(POINT_PREALLOCATION_NUM + 1)],
+            ["--max-estimated-spend-usd", "2.1"],
+        ):
+            with self.subTest(suffix=suffix), redirect_stderr(StringIO()), self.assertRaises(SystemExit):
+                BENCH.parse_args([*valid, *suffix])
+
+    def test_point_preallocation_verifier_rejects_activity_in_disabled_point_arm(self) -> None:
+        row = next(
+            item for item in build_v7_v8_point_preallocation_schedule()
+            if item["workload"] == "point" and item["arm"] == "v8_prealloc_off"
+        )
+        counters = {"attempts": 0, "hits": 0, "fallbacks": 0}
+
+        def record_with_end_counters(end_counters: dict[str, int]) -> dict[str, object]:
+            def snapshot(values: dict[str, int]) -> dict[str, object]:
+                return {
+                    "progress_ring_enabled": True,
+                    "progress_cursor_enabled": True,
+                    "cursor_direct_completion_enabled": True,
+                    "cursor_singleton_submission_enabled": False,
+                    "progress_diagnostics": None,
+                    "sliding_extent_preparation": {
+                        "mode": "sliding-point-lookahead",
+                        "window_bytes": POINT_LOOKAHEAD_WINDOW_BYTES,
+                        "extent_policy_storage": "vec",
+                        "extent_policy_scan_diagnostics_enabled": False,
+                        "initialized_bytes": 0,
+                    },
+                    "data": {"o_direct": True, "device": 1, "inode": 11},
+                    "frontier": {"o_direct": True, "device": 1, "inode": 12},
+                    "sync": {"o_direct": False, "device": 1, "inode": 13},
+                    "point_buffer_preallocation_enabled": False,
+                    "point_buffer_preallocation_attempts": values["attempts"],
+                    "point_buffer_preallocation_hits": values["hits"],
+                    "point_buffer_preallocation_fallbacks": values["fallbacks"],
+                }
+
+            start = snapshot(counters)
+            end = snapshot(end_counters)
+            end["sliding_extent_preparation"]["initialized_bytes"] = POINT_LOOKAHEAD_WINDOW_BYTES
+            return {
+                "params": {
+                    "num": POINT_PREALLOCATION_NUM,
+                    "threads": row["writer"],
+                    "value_size": 1024,
+                    "batch_size": row["batch_size"],
+                    "wal_format_version": 8,
+                    "wal_io_mode": "parallel",
+                },
+                "latency": {
+                    "sample_every": 10,
+                    "samples": POINT_PREALLOCATION_NUM // 10,
+                    "unsampled_completed_operations": POINT_PREALLOCATION_NUM * 9 // 10,
+                    "p50_ms": 0.1,
+                    "p95_ms": 0.2,
+                    "p99_ms": 0.3,
+                },
+                "result": {
+                    "ops": POINT_PREALLOCATION_NUM,
+                    "ops_per_sec": 10_000.0,
+                    "process_cpu_user_ms": 1.0,
+                    "process_cpu_system_ms": 1.0,
+                    "wal_v8_digest": {
+                        "cpu_timing_sample_rate": 64,
+                        "ordered_link_hash_cpu_ns": 0,
+                        "cpu_timing_sampled_tickets": 1,
+                    },
+                    "wal_pipeline": {
+                        "sync_count": 10,
+                        "wal_io_stable": True,
+                        "wal_io_start": start,
+                        "wal_io_end": end,
+                    },
+                },
+            }
+
+        self.assertEqual(
+            progress_ring_runner._validate_point_preallocation_record(
+                record_with_end_counters(counters), row,
+            )["point_buffer_preallocation_attempts"],
+            0,
+        )
+        for unexpected in (
+            {"attempts": 1, "hits": 1, "fallbacks": 0},
+            {"attempts": 1, "hits": 0, "fallbacks": 1},
+        ):
+            with self.subTest(counters=unexpected), self.assertRaisesRegex(
+                ValueError, "Point preallocation usage differs from the Point-only Stage A plan",
+            ):
+                progress_ring_runner._validate_point_preallocation_record(
+                    record_with_end_counters(unexpected), row,
+                )
 
     def test_point_direct_frame_result_verifier_requires_actual_point_hits_and_batch_misses(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -3064,8 +6251,8 @@ print('[hotpath] diagnostic report follows')
                 )
 
             self.assertEqual(result, 1)
-            cleanup.assert_not_called()
             lifecycle = json.loads((results / "lifecycle.json").read_text(encoding="utf-8"))
+            self.assertFalse(cleanup.called, f"unexpected cleanup after lifecycle {lifecycle!r}")
             self.assertTrue(lifecycle["benchmark_attempted"])
             self.assertTrue(lifecycle["retained"])
             self.assertTrue((results / "retained-ssh-key").is_file())
@@ -3113,8 +6300,8 @@ print('[hotpath] diagnostic report follows')
                 )
 
             self.assertEqual(result, 1)
-            cleanup.assert_not_called()
             lifecycle = json.loads((results / "lifecycle.json").read_text(encoding="utf-8"))
+            self.assertFalse(cleanup.called, f"unexpected cleanup after lifecycle {lifecycle!r}")
             self.assertTrue(lifecycle["retained"])
             self.assertTrue((results / "retained-ssh-key").is_file())
             self.assertFalse((results / "reconnect.txt").exists())
@@ -3296,7 +6483,8 @@ print('[hotpath] diagnostic report follows')
             run_dir = results / "r1-w16-point-v8_parallel"
             run_dir.mkdir(parents=True)
             for name in (
-                "profile-schedule.tsv", "rust-toolchain.txt", "write-perf.sha256", "perf-version.txt",
+                "profile-schedule.tsv", "cursor-direct-completion-schedule.tsv", "rust-toolchain.txt",
+                "cursor-coalescing-budget-schedule.tsv", "write-perf.sha256", "perf-version.txt",
             ):
                 (results / name).write_text("fixture\n", encoding="utf-8")
             for name in (
@@ -3310,13 +6498,15 @@ print('[hotpath] diagnostic report follows')
             result = self._run_remote_bundle(command, results, root)
             self.assertEqual(result.returncode, 0, result.stderr)
             metadata = self._archive_metadata(result.stdout)
-            self.assertEqual(metadata["ARCHIVE_FILES"], "11")
+            self.assertEqual(metadata["ARCHIVE_FILES"], "13")
             archive = Path(metadata["ARCHIVE_PATH"])
             self.assertEqual(archive.parent, root / "remote-tmp")
             with tarfile.open(archive, "r:gz") as bundle:
                 names = set(bundle.getnames())
             for name in (
                 "results/profile-schedule.tsv", "results/rust-toolchain.txt",
+                "results/cursor-direct-completion-schedule.tsv",
+                "results/cursor-coalescing-budget-schedule.tsv",
                 "results/write-perf.sha256", "results/perf-version.txt",
                 "results/r1-w16-point-v8_parallel/stderr.log", "results/r1-w16-point-v8_parallel/timeline.json",
                 "results/r1-w16-point-v8_parallel/perf.data", "results/r1-w16-point-v8_parallel/perf-report.txt",

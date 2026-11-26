@@ -91,6 +91,10 @@ static PARALLEL_WAL_PRODUCER_FRAME_GATE: std::sync::OnceLock<ParallelWalTestGate
     std::sync::OnceLock::new();
 
 #[cfg(all(test, feature = "chaos-testing"))]
+static PARALLEL_WAL_COMPLETION_DRAIN_GATE: std::sync::OnceLock<ParallelWalTestGate> =
+    std::sync::OnceLock::new();
+
+#[cfg(all(test, feature = "chaos-testing"))]
 static PARALLEL_WAL_SMALL_ADMISSION_GATE: std::sync::OnceLock<ParallelWalTestGate> =
     std::sync::OnceLock::new();
 
@@ -389,6 +393,20 @@ pub(crate) fn before_parallel_wal_fdatasync_call() {
 #[cfg(all(test, feature = "chaos-testing"))]
 pub(crate) fn before_parallel_wal_result_drain() {
     PARALLEL_WAL_RESULT_DRAIN_GATE
+        .get_or_init(ParallelWalTestGate::default)
+        .enter();
+}
+
+#[cfg(all(test, feature = "chaos-testing"))]
+pub(crate) fn arm_parallel_wal_completion_drain_gate() -> ParallelWalTestGateGuard {
+    PARALLEL_WAL_COMPLETION_DRAIN_GATE
+        .get_or_init(ParallelWalTestGate::default)
+        .arm()
+}
+
+#[cfg(all(test, feature = "chaos-testing"))]
+pub(crate) fn before_parallel_wal_completion_drain() {
+    PARALLEL_WAL_COMPLETION_DRAIN_GATE
         .get_or_init(ParallelWalTestGate::default)
         .enter();
 }

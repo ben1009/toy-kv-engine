@@ -20,12 +20,15 @@ use std::{
     },
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc,
     },
     thread,
     time::{Duration, Instant},
 };
+
+#[cfg(any(test, feature = "bench"))]
+use std::sync::atomic::AtomicU64;
 
 #[cfg(test)]
 use std::os::unix::fs::OpenOptionsExt;
@@ -43,6 +46,7 @@ use crate::{
         DirectBuf, DirectBufAllocation, MAX_WAL_FILE_SIZE,
         parallel_worker::{
             GroupWriteResult, IoWorker, IoWorkerClient, WorkerBuffer, WriteBuffer, WriteGroup,
+            WriteGroupBuffers,
         },
         v7::admission::{
             WalV7OwnedBatchReservation, WalV7OwnedPreparationReservation, WalV7ReservationError,
@@ -56,8 +60,12 @@ use crate::wal::{
     WalIoHandleMetadata, WalV8SlidingExtentPreparationDiagnostics,
 };
 
+use crate::wal::parallel_worker::DirectGroupWriteCompletion;
+
 #[cfg(feature = "bench")]
-use super::parallel::WalV8TicketProgress;
+use super::parallel::WalV8ProgressAdvanceTiming;
+#[cfg(feature = "bench")]
+use super::parallel::{WalV8ReadyPrefix, WalV8TicketProgress};
 
 use super::{
     WAL_V8_HEADER_LEN,
@@ -68,10 +76,10 @@ use super::{
     digest,
     install::WalV8InstalledRecovery,
     parallel::{
-        WalV8CompletedGroupEvent, WalV8DurabilityDriver, WalV8FrontierReadySnapshot,
-        WalV8ParallelAdmissionGuard, WalV8ParallelConfig, WalV8ParallelCoordinator,
-        WalV8PreparationReservation, WalV8ProgressTokenWait, consume_progress_token_before_scan,
-        wait_for_progress_token,
+        MAX_PARALLEL_INFLIGHT_TICKETS, WalV8CompletedGroupEvent, WalV8DurabilityDriver,
+        WalV8FrontierReadySnapshot, WalV8ParallelAdmissionGuard, WalV8ParallelConfig,
+        WalV8ParallelCoordinator, WalV8PreparationReservation, WalV8ProgressMode,
+        WalV8ProgressTokenWait, consume_progress_token_before_scan, wait_for_progress_token,
     },
     prepare::{
         AdmittedWalV8Batch, EncodedWalV8Batch, PreparedWalV8Batch, WalV8AdmissionPlan,
@@ -83,9 +91,7 @@ use super::{
 const FRAME_LEN_U64: u64 = WAL_V8_FRAME_LEN as u64;
 const HEADER_LEN_U64: u64 = WAL_V8_HEADER_LEN as u64;
 const MAX_GROUP_TICKETS: usize = 8;
-// Keep enough admitted producers in flight to form larger shared FRONTIERs
-// under contention; explicit Leader groups retain their separate smaller cap.
-const MAX_PARALLEL_INFLIGHT_TICKETS: usize = 32;
+const MAX_POINT_BUFFER_PREALLOCATIONS: usize = 16;
 const DATA_GROUP_JOIN_BUDGET: Duration = Duration::from_micros(10);
 const WAL_V8_PRODUCTION_EXTENT_WINDOW_BYTES: u64 = 1 << 20;
 const WAL_V8_EXTENT_LOOKAHEAD_ENV: &str = "TOYKV_WAL_V8_EXTENT_LOOKAHEAD";
@@ -110,6 +116,80 @@ fn data_completion_to_frontier_start_ns(
 }
 
 pub(crate) type WalV8PreparedBatch<'a> = PreparedWalV8Batch<'a, WalV8PreflightReservation>;
+
+/// Point-owned preparation state created before entering the MVCC sequencer.
+/// The optional DATA buffer is uncharged and bounded; serialized admission
+/// still performs the resource reservation in ticket order.
+pub(crate) struct WalV8PointAdmissionScratch<'a> {
+    prepared: WalV8PreparedBatch<'a>,
+    preallocated_buffer: Option<WalV8PointBufferPreallocation>,
+}
+
+/// A bounded speculative DATA buffer allocation. It has no quota reservation;
+/// the normal serialized admission path charges quota before consuming it.
+pub(crate) struct WalV8PointBufferPreallocation {
+    data_buffer: DirectBufAllocation,
+    _permit: WalV8PointBufferPreallocationPermit,
+}
+
+struct WalV8PointBufferPreallocationPermit {
+    in_flight: Arc<AtomicUsize>,
+}
+
+impl Drop for WalV8PointBufferPreallocationPermit {
+    fn drop(&mut self) {
+        let previous = self.in_flight.fetch_sub(1, Ordering::Release);
+        debug_assert!(previous > 0, "point buffer preallocation permit underflow");
+    }
+}
+
+impl WalV8PointBufferPreallocationPermit {
+    fn try_acquire(in_flight: &Arc<AtomicUsize>) -> Option<Self> {
+        in_flight
+            .try_update(Ordering::AcqRel, Ordering::Relaxed, |count| {
+                (count < MAX_POINT_BUFFER_PREALLOCATIONS).then_some(count + 1)
+            })
+            .ok()?;
+
+        Some(Self {
+            in_flight: Arc::clone(in_flight),
+        })
+    }
+}
+
+impl<'a> WalV8PointAdmissionScratch<'a> {
+    pub(crate) fn new(prepared: WalV8PreparedBatch<'a>) -> Self {
+        Self {
+            prepared,
+            preallocated_buffer: None,
+        }
+    }
+
+    pub(crate) fn into_prepared(self) -> WalV8PreparedBatch<'a> {
+        self.prepared
+    }
+
+    fn set_preallocated_buffer(&mut self, preallocated_buffer: WalV8PointBufferPreallocation) {
+        debug_assert!(self.preallocated_buffer.is_none());
+        self.preallocated_buffer = Some(preallocated_buffer);
+    }
+}
+
+struct WalV8AdmissionResources {
+    data_buffer: DirectBufAllocation,
+    reservation: Option<WalV7OwnedBatchReservation>,
+}
+
+impl WalV8PointBufferPreallocation {
+    fn into_data_buffer(self) -> DirectBufAllocation {
+        let Self {
+            data_buffer,
+            _permit,
+        } = self;
+        drop(_permit);
+        data_buffer
+    }
+}
 
 pub(crate) struct WalV8PreflightReservation {
     _coordinator: WalV8PreparationReservation,
@@ -205,22 +285,35 @@ pub(crate) struct WalV8ParallelWriter {
     initial_ticket: u64,
     #[cfg(feature = "bench")]
     io_diagnostics: WalIoDiagnostics,
-    /// Benchmark-only budget for eligible coalescing calls, independent of
-    /// detailed sync-observation capture.
+    point_buffer_preallocation_enabled: bool,
+    effective_config: WalV8EffectiveConfig,
+    #[cfg(test)]
+    point_buffer_preallocation_test_override: AtomicBool,
     #[cfg(feature = "bench")]
-    coalesce_budget_override_us: Option<u64>,
-    /// Benchmark-only experiment that batches credit release for Point-only
-    /// durable prefixes. Batch and mixed prefixes retain the existing path.
+    point_buffer_preallocation_attempts: AtomicU64,
+    #[cfg(any(test, feature = "bench"))]
+    point_buffer_preallocation_hits: AtomicU64,
     #[cfg(feature = "bench")]
-    batch_point_frontier_credits: bool,
+    point_buffer_preallocation_fallbacks: AtomicU64,
+    point_buffer_preallocations_in_flight: Arc<AtomicUsize>,
     #[cfg(feature = "bench")]
     profile: arc_swap::ArcSwapOption<crate::mem_table::WriteProfile>,
 }
 
 struct WalV8FrontierResource {
     reservation: WalV7OwnedBatchReservation,
-    #[cfg(feature = "bench")]
-    write_class: WalV8WriteClass,
+}
+
+#[cfg(feature = "bench")]
+#[derive(Clone, Copy, Debug, Default)]
+struct WalV8CursorCoalescingTiming {
+    progress_wait_wall_ns: u64,
+    progress_wait_cpu_ns: u64,
+    completion_drain_wall_ns: u64,
+    completion_drain_cpu_ns: u64,
+    iterations: u64,
+    ready_tickets_gained: u64,
+    advance: WalV8ProgressAdvanceTiming,
 }
 
 #[cfg(feature = "bench")]
@@ -253,6 +346,19 @@ impl Drop for WalV8DurabilityPhaseSampleGuard {
     }
 }
 
+#[cfg(feature = "bench")]
+fn coalescing_active_duration_ns(
+    total_ns: u64,
+    detailed_wait_ns: Option<u64>,
+    coalescing_attempted: bool,
+) -> Option<u64> {
+    match detailed_wait_ns {
+        Some(wait_ns) => Some(total_ns.saturating_sub(wait_ns)),
+        None if !coalescing_attempted => Some(0),
+        None => None,
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct WalV8RetirementObservation {
     #[cfg(feature = "bench")]
@@ -281,6 +387,51 @@ struct WalV8RetirementObservation {
     batch_point_frontier_credits: bool,
 }
 
+#[cfg(test)]
+type WalV8LookaheadWorkerHook = Arc<Mutex<Option<Arc<dyn Fn() + Send + Sync>>>>;
+
+struct WalV8ExtentWorkerHandle<T> {
+    request_sender: Mutex<Option<mpsc::Sender<T>>>,
+    worker: Mutex<Option<thread::JoinHandle<()>>>,
+    /// Serializes `quiesce` callers so concurrent callers both observe worker exit.
+    join_lock: Mutex<()>,
+}
+
+impl<T: Send + Sync + 'static> WalV8ExtentWorkerHandle<T> {
+    fn new(
+        request_sender: Option<mpsc::Sender<T>>,
+        worker: Option<thread::JoinHandle<()>>,
+    ) -> Self {
+        Self {
+            request_sender: Mutex::new(request_sender),
+            worker: Mutex::new(worker),
+            join_lock: Mutex::new(()),
+        }
+    }
+
+    fn send(&self, msg: T, unavailable: &str, stopped: &str) -> Result<()> {
+        let guard = self.request_sender.lock();
+        let sender = guard.as_ref().with_context(|| unavailable.to_owned())?;
+        sender.send(msg).with_context(|| stopped.to_owned())?;
+        Ok(())
+    }
+
+    /// Close the request channel and join the background worker.
+    /// Serialized by `join_lock` so concurrent callers never return before
+    /// the worker thread has exited.
+    fn quiesce(&self, panic_msg: &str) {
+        let _join_guard = self.join_lock.lock();
+        let sender = self.request_sender.lock().take();
+        drop(sender);
+        let worker = self.worker.lock().take();
+        if let Some(worker) = worker
+            && worker.join().is_err()
+        {
+            log::error!("{panic_msg}");
+        }
+    }
+}
+
 #[cfg(feature = "bench")]
 struct WalV8SlidingExtentPreparation {
     data_file: File,
@@ -290,8 +441,7 @@ struct WalV8SlidingExtentPreparation {
     mode: WalExtentPreparationMode,
     state: Arc<Mutex<WalV8SlidingExtentPreparationState>>,
     prepared: Arc<Condvar>,
-    request_sender: Option<mpsc::Sender<u64>>,
-    worker: Option<thread::JoinHandle<()>>,
+    worker_handle: WalV8ExtentWorkerHandle<u64>,
 }
 
 #[cfg(feature = "bench")]
@@ -311,26 +461,31 @@ struct WalV8SlidingExtentPreparationState {
     failure: Option<String>,
 }
 
-#[cfg(feature = "bench")]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum WalV8FrontierWriteMode {
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum WalV8FrontierWriteMode {
+    #[default]
     Buffered,
     Direct,
 }
 
-#[cfg(feature = "bench")]
 impl WalV8FrontierWriteMode {
     fn from_environment() -> Result<Self> {
         Self::from_value(std::env::var_os("TOYKV_WAL_V8_FRONTIER_MODE").as_deref())
     }
 
     fn from_value(value: Option<&OsStr>) -> Result<Self> {
-        match value.and_then(OsStr::to_str) {
-            None | Some("buffered") => Ok(Self::Buffered),
-            Some("direct") => Ok(Self::Direct),
-            Some(value) => anyhow::bail!(
-                "invalid TOYKV_WAL_V8_FRONTIER_MODE {value:?}; expected `buffered` or `direct`"
-            ),
+        match value {
+            None => Ok(Self::Buffered),
+            Some(value) => match value.to_str() {
+                Some("buffered") => Ok(Self::Buffered),
+                Some("direct") => Ok(Self::Direct),
+                Some(value) => anyhow::bail!(
+                    "invalid TOYKV_WAL_V8_FRONTIER_MODE {value:?}; expected `buffered` or `direct`"
+                ),
+                None => anyhow::bail!(
+                    "TOYKV_WAL_V8_FRONTIER_MODE is not valid UTF-8; expected `buffered` or `direct`"
+                ),
+            },
         }
     }
 }
@@ -340,31 +495,222 @@ const WAL_V8_EXTENT_PREPARATION_ENV: &str = "TOYKV_BENCH_V8_EXTENT_PREP";
 #[cfg(feature = "bench")]
 const WAL_V8_EXTENT_PREPARATION_BYTES_ENV: &str = "TOYKV_BENCH_V8_EXTENT_PREP_BYTES";
 #[cfg(feature = "bench")]
-const WAL_V8_POINT_FRONTIER_CREDIT_BATCH_ENV: &str = "TOYKV_BENCH_V8_POINT_FRONTIER_CREDIT_BATCH";
 #[cfg(feature = "bench")]
 const WAL_V8_POINT_PROGRESS_RING_ENV: &str = "TOYKV_BENCH_V8_POINT_PROGRESS_RING";
+#[cfg(feature = "bench")]
+const WAL_V8_POINT_PROGRESS_COUNTERS_ENV: &str = "TOYKV_BENCH_V8_PROGRESS_COUNTERS";
+#[cfg(feature = "bench")]
+const WAL_V8_CURSOR_DIRECT_COMPLETION_ENV: &str = "TOYKV_BENCH_V8_CURSOR_DIRECT_COMPLETION";
+#[cfg(feature = "bench")]
+const WAL_V8_COALESCE_READY_TARGET_ENV: &str = "TOYKV_BENCH_V8_COALESCE_READY_TARGET";
+#[cfg(not(feature = "bench"))]
+const WAL_V8_PROGRESS_MODE_ENV: &str = "TOYKV_WAL_V8_PROGRESS_MODE";
 const WAL_V8_EXTENT_PREPARATION_CHUNK_BYTES: usize = 128 * 1024;
 
+#[cfg(test)]
+#[derive(Clone, Copy)]
+struct WalV8TestModeOverride {
+    progress_mode: WalV8ProgressMode,
+    direct_completion_enabled: bool,
+}
+
+#[cfg(test)]
+thread_local! {
+    static WAL_V8_TEST_MODE_OVERRIDE: std::cell::Cell<Option<WalV8TestModeOverride>> = const {
+        std::cell::Cell::new(None)
+    };
+    static WAL_V8_TEST_PROFILE_OVERRIDE: std::cell::Cell<Option<WalV8Profile>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+/// Run an engine-level test with the Candidate V8 profile without mutating
+/// process-wide environment variables observed by parallel tests.
+#[cfg(test)]
+pub(crate) fn with_candidate_profile_for_test<T>(run: impl FnOnce() -> T) -> T {
+    with_v8_profile_for_test(WalV8Profile::Candidate, run)
+}
+
+/// Run an engine-level test with the Legacy V8 profile without mutating
+/// process-wide environment variables observed by parallel tests.
+#[cfg(test)]
+pub(crate) fn with_legacy_profile_for_test<T>(run: impl FnOnce() -> T) -> T {
+    with_v8_profile_for_test(WalV8Profile::Legacy, run)
+}
+
+#[cfg(test)]
+fn with_v8_profile_for_test<T>(profile: WalV8Profile, run: impl FnOnce() -> T) -> T {
+    struct Restore(Option<WalV8Profile>);
+
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            WAL_V8_TEST_PROFILE_OVERRIDE.with(|current| current.set(self.0));
+        }
+    }
+
+    let previous = WAL_V8_TEST_PROFILE_OVERRIDE.with(|current| current.replace(Some(profile)));
+    let _restore = Restore(previous);
+    run()
+}
+
+/// Run an engine-level test with Cursor direct completion without mutating
+/// process-wide environment variables observed by parallel tests.
+#[cfg(test)]
+pub(crate) fn with_cursor_direct_completion_for_test<T>(run: impl FnOnce() -> T) -> T {
+    struct Restore(Option<WalV8TestModeOverride>);
+
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            WAL_V8_TEST_MODE_OVERRIDE.with(|current| current.set(self.0));
+        }
+    }
+
+    let previous = WAL_V8_TEST_MODE_OVERRIDE.with(|current| {
+        current.replace(Some(WalV8TestModeOverride {
+            progress_mode: WalV8ProgressMode::Cursor,
+            direct_completion_enabled: true,
+        }))
+    });
+    let _restore = Restore(previous);
+    run()
+}
+
+#[cfg(not(feature = "bench"))]
+fn production_progress_mode_from_value(value: Option<&OsStr>) -> Result<WalV8ProgressMode> {
+    match value {
+        None => Ok(WalV8ProgressMode::Eager),
+        Some(value) => match value.to_str() {
+            Some("eager") => Ok(WalV8ProgressMode::Eager),
+            Some("cursor") => Ok(WalV8ProgressMode::Cursor),
+            Some(value) => anyhow::bail!(
+                "invalid {WAL_V8_PROGRESS_MODE_ENV} {value:?}; expected `eager` or `cursor`"
+            ),
+            None => anyhow::bail!(
+                "{WAL_V8_PROGRESS_MODE_ENV} is not valid UTF-8; expected `eager` or `cursor`"
+            ),
+        },
+    }
+}
+
+#[cfg(not(feature = "bench"))]
+fn production_progress_mode_from_environment() -> Result<WalV8ProgressMode> {
+    #[cfg(test)]
+    if let Some(override_mode) = WAL_V8_TEST_MODE_OVERRIDE.with(std::cell::Cell::get) {
+        return Ok(override_mode.progress_mode);
+    }
+    production_progress_mode_from_value(std::env::var_os(WAL_V8_PROGRESS_MODE_ENV).as_deref())
+}
+
+#[cfg(not(feature = "bench"))]
+fn production_direct_completion_enabled_from_environment(
+    progress_mode: WalV8ProgressMode,
+) -> Result<bool> {
+    #[cfg(test)]
+    if let Some(override_mode) = WAL_V8_TEST_MODE_OVERRIDE.with(std::cell::Cell::get) {
+        ensure!(progress_mode == override_mode.progress_mode);
+        return Ok(override_mode.direct_completion_enabled);
+    }
+    let _ = progress_mode;
+    Ok(false)
+}
+
 #[cfg(feature = "bench")]
-fn progress_ring_enabled_from_value(value: Option<&OsStr>) -> Result<bool> {
+fn progress_mode_from_value(value: Option<&OsStr>) -> Result<WalV8ProgressMode> {
     let Some(value) = value else {
-        return Ok(false);
+        return Ok(WalV8ProgressMode::Eager);
     };
     match value.to_str() {
-        Some("0") => Ok(false),
-        Some("1") => Ok(true),
+        Some("0") => Ok(WalV8ProgressMode::Eager),
+        Some("2") => Ok(WalV8ProgressMode::Cursor),
         Some(value) => {
-            anyhow::bail!("invalid {WAL_V8_POINT_PROGRESS_RING_ENV} {value:?}; expected `0` or `1`")
+            anyhow::bail!("invalid {WAL_V8_POINT_PROGRESS_RING_ENV} {value:?}; expected `0` or `2`")
         }
         None => anyhow::bail!(
-            "{WAL_V8_POINT_PROGRESS_RING_ENV} is not valid UTF-8; expected `0` or `1`"
+            "{WAL_V8_POINT_PROGRESS_RING_ENV} is not valid UTF-8; expected `0` or `2`"
         ),
     }
 }
 
 #[cfg(feature = "bench")]
+fn progress_mode_from_environment() -> Result<WalV8ProgressMode> {
+    #[cfg(test)]
+    if let Some(override_mode) = WAL_V8_TEST_MODE_OVERRIDE.with(std::cell::Cell::get) {
+        return Ok(override_mode.progress_mode);
+    }
+    progress_mode_from_value(std::env::var_os(WAL_V8_POINT_PROGRESS_RING_ENV).as_deref())
+}
+
+#[cfg(feature = "bench")]
+fn progress_counters_enabled_from_value(
+    value: Option<&OsStr>,
+    progress_mode: WalV8ProgressMode,
+) -> Result<bool> {
+    let enabled = match value {
+        None => false,
+        Some(value) => match value.to_str() {
+            Some("0") => false,
+            Some("1") => true,
+            Some(value) => anyhow::bail!(
+                "invalid {WAL_V8_POINT_PROGRESS_COUNTERS_ENV} {value:?}; expected `0` or `1`"
+            ),
+            None => anyhow::bail!(
+                "{WAL_V8_POINT_PROGRESS_COUNTERS_ENV} is not valid UTF-8; expected `0` or `1`"
+            ),
+        },
+    };
+    ensure!(
+        !enabled || progress_mode == WalV8ProgressMode::Cursor,
+        "{WAL_V8_POINT_PROGRESS_COUNTERS_ENV}=1 requires Cursor progress mode"
+    );
+    Ok(enabled)
+}
+
+#[cfg(feature = "bench")]
+fn progress_counters_enabled_from_environment(progress_mode: WalV8ProgressMode) -> Result<bool> {
+    progress_counters_enabled_from_value(
+        std::env::var_os(WAL_V8_POINT_PROGRESS_COUNTERS_ENV).as_deref(),
+        progress_mode,
+    )
+}
+
+#[cfg(feature = "bench")]
+fn cursor_direct_completion_enabled_from_value(
+    value: Option<&OsStr>,
+    progress_mode: WalV8ProgressMode,
+) -> Result<bool> {
+    let enabled = match value {
+        None => false,
+        Some(value) if value.to_str() == Some("0") => false,
+        Some(value) if value.to_str() == Some("1") => true,
+        Some(value) => anyhow::bail!(
+            "invalid {WAL_V8_CURSOR_DIRECT_COMPLETION_ENV} {value:?}; expected `0` or `1`"
+        ),
+    };
+    ensure!(
+        !enabled || progress_mode == WalV8ProgressMode::Cursor,
+        "{WAL_V8_CURSOR_DIRECT_COMPLETION_ENV}=1 requires Cursor progress mode"
+    );
+    Ok(enabled)
+}
+
+#[cfg(feature = "bench")]
+fn cursor_direct_completion_enabled_from_environment(
+    progress_mode: WalV8ProgressMode,
+) -> Result<bool> {
+    #[cfg(test)]
+    if let Some(override_mode) = WAL_V8_TEST_MODE_OVERRIDE.with(std::cell::Cell::get) {
+        ensure!(progress_mode == override_mode.progress_mode);
+        return Ok(override_mode.direct_completion_enabled);
+    }
+    cursor_direct_completion_enabled_from_value(
+        std::env::var_os(WAL_V8_CURSOR_DIRECT_COMPLETION_ENV).as_deref(),
+        progress_mode,
+    )
+}
+
+#[cfg(feature = "bench")]
 pub(crate) fn progress_ring_enabled_from_environment() -> Result<bool> {
-    progress_ring_enabled_from_value(std::env::var_os(WAL_V8_POINT_PROGRESS_RING_ENV).as_deref())
+    Ok(progress_mode_from_environment()?.uses_ring())
 }
 
 #[cfg(feature = "bench")]
@@ -422,17 +768,587 @@ impl WalExtentPreparationMode {
 }
 
 fn wal_v8_extent_lookahead_from_value(value: Option<&OsStr>) -> Result<bool> {
-    match value.and_then(OsStr::to_str) {
-        None | Some("0" | "false") => Ok(false),
-        Some("1" | "true") => Ok(true),
-        Some(value) => anyhow::bail!(
-            "invalid {WAL_V8_EXTENT_LOOKAHEAD_ENV} {value:?}; expected `0`, `1`, `false`, or `true`"
-        ),
+    match value {
+        None => Ok(false),
+        Some(value) => match value.to_str() {
+            Some("0" | "false") => Ok(false),
+            Some("1" | "true") => Ok(true),
+            Some(value) => anyhow::bail!(
+                "invalid {WAL_V8_EXTENT_LOOKAHEAD_ENV} {value:?}; expected `0`, `1`, `false`, or `true`"
+            ),
+            None => anyhow::bail!(
+                "{WAL_V8_EXTENT_LOOKAHEAD_ENV} is not valid UTF-8; expected `0`, `1`, `false`, or `true`"
+            ),
+        },
     }
 }
 
 fn wal_v8_extent_lookahead_from_environment() -> Result<bool> {
     wal_v8_extent_lookahead_from_value(std::env::var_os(WAL_V8_EXTENT_LOOKAHEAD_ENV).as_deref())
+}
+
+/// V8 WAL configuration profile.
+/// Production defaults to [`WalV8Profile::Candidate`] (`Cursor`, Direct
+/// completion, Direct FRONTIER with Buffered fallback, Point-only 1 MiB
+/// lookahead when eligible, Stage A on, Dynamic + Point-only Target8);
+/// `TOYKV_WAL_V8_PROFILE=legacy` remains available as a full fallback.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum WalV8Profile {
+    Legacy,
+    #[default]
+    Candidate,
+}
+
+impl WalV8Profile {
+    fn from_value(value: Option<&OsStr>) -> Result<Self> {
+        match value {
+            None => Ok(Self::Candidate),
+            Some(value) => match value.to_str() {
+                Some("legacy") => Ok(Self::Legacy),
+                Some("candidate") => Ok(Self::Candidate),
+                Some(value) => anyhow::bail!(
+                    "invalid TOYKV_WAL_V8_PROFILE {value:?}; expected `legacy` or `candidate`"
+                ),
+                None => anyhow::bail!(
+                    "TOYKV_WAL_V8_PROFILE is not valid UTF-8; expected `legacy` or `candidate`"
+                ),
+            },
+        }
+    }
+
+    fn from_environment() -> Result<Self> {
+        Self::from_value(std::env::var_os("TOYKV_WAL_V8_PROFILE").as_deref())
+    }
+}
+
+/// Coalescing early-exit target policy for Cursor durability cycles.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum WalV8CoalesceTargetPolicy {
+    #[default]
+    Disabled,
+    #[cfg(feature = "bench")]
+    Always(usize),
+    PointOnly(usize),
+}
+
+impl WalV8CoalesceTargetPolicy {
+    fn target_for_snapshot(self, snapshot: &WalV8FrontierReadySnapshot) -> Option<usize> {
+        match self {
+            Self::Disabled => None,
+            #[cfg(feature = "bench")]
+            Self::Always(target) => Some(target),
+            Self::PointOnly(target) => (!snapshot.has_outstanding_batch_tickets).then_some(target),
+        }
+    }
+
+    fn target_count(self) -> Option<usize> {
+        match self {
+            Self::Disabled => None,
+            #[cfg(feature = "bench")]
+            Self::Always(target) => Some(target),
+            Self::PointOnly(target) => Some(target),
+        }
+    }
+
+    #[cfg(feature = "bench")]
+    fn policy_name(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Always(_) => "always",
+            Self::PointOnly(_) => "point_only",
+        }
+    }
+
+    fn from_value(
+        value: Option<&OsStr>,
+        progress_mode: WalV8ProgressMode,
+        direct_completion_enabled: bool,
+    ) -> Result<Option<Self>> {
+        let Some(value) = value else {
+            return Ok(None);
+        };
+        let value = value
+            .to_str()
+            .context("TOYKV_WAL_V8_COALESCING is not valid UTF-8")?;
+        match value {
+            "dynamic" => Ok(Some(Self::Disabled)),
+            "point-target8" => {
+                ensure!(
+                    progress_mode == WalV8ProgressMode::Cursor && direct_completion_enabled,
+                    "TOYKV_WAL_V8_COALESCING=point-target8 requires Cursor progress mode and direct completion"
+                );
+                Ok(Some(Self::PointOnly(8)))
+            }
+            _ => anyhow::bail!(
+                "invalid TOYKV_WAL_V8_COALESCING {value:?}; expected `dynamic` or `point-target8`"
+            ),
+        }
+    }
+
+    fn from_environment(
+        progress_mode: WalV8ProgressMode,
+        direct_completion_enabled: bool,
+    ) -> Result<Option<Self>> {
+        Self::from_value(
+            std::env::var_os("TOYKV_WAL_V8_COALESCING").as_deref(),
+            progress_mode,
+            direct_completion_enabled,
+        )
+    }
+}
+
+#[cfg(feature = "bench")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WalV8BenchExtentOverride {
+    Disabled,
+    Mode(WalExtentPreparationMode, u64),
+}
+
+#[cfg(feature = "bench")]
+fn bench_extent_override_from_environment() -> Result<Option<WalV8BenchExtentOverride>> {
+    if let Some(value) = std::env::var_os(WAL_V8_EXTENT_PREPARATION_ENV)
+        && matches!(value.to_str(), Some("none" | "disabled"))
+    {
+        return Ok(Some(WalV8BenchExtentOverride::Disabled));
+    }
+    Ok(WalExtentPreparationMode::from_environment()?
+        .map(|(m, b)| WalV8BenchExtentOverride::Mode(m, b)))
+}
+
+/// Effective extent preparation policy resolved for one V8 WAL instance.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WalV8ExtentPreparationPolicy {
+    Disabled,
+    FallocateOnly,
+    Lookahead,
+    PointOnlyLookahead,
+    #[cfg(feature = "bench")]
+    SlidingInitialize,
+    #[cfg(feature = "bench")]
+    OneShotFallocate,
+    #[cfg(feature = "bench")]
+    OneShotInitialize,
+}
+
+/// Process-wide V8 WAL configuration requested at Engine open and inherited
+/// across automatic and PITR WAL rotations without on-disk serialization.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct WalV8RequestedConfig {
+    pub(crate) profile: WalV8Profile,
+    pub(crate) progress_mode: WalV8ProgressMode,
+    pub(crate) direct_completion_enabled: bool,
+    pub(crate) frontier_mode: WalV8FrontierWriteMode,
+    pub(crate) extent_lookahead: bool,
+    pub(crate) point_buffer_preallocation_enabled: bool,
+    pub(crate) coalesce_policy: WalV8CoalesceTargetPolicy,
+    #[cfg(feature = "bench")]
+    progress_counters_enabled: bool,
+    #[cfg(feature = "bench")]
+    extent_preparation: Option<WalV8BenchExtentOverride>,
+    #[cfg(feature = "bench")]
+    extent_policy_storage: WalV8ExtentPolicyStorageKind,
+    #[cfg(feature = "bench")]
+    extent_policy_scan_diagnostics_enabled: bool,
+    #[cfg(feature = "bench")]
+    data_submit_ready_order: bool,
+    #[cfg(feature = "bench")]
+    point_direct_frame_enabled: bool,
+}
+
+impl Default for WalV8RequestedConfig {
+    fn default() -> Self {
+        Self::candidate()
+    }
+}
+
+impl WalV8RequestedConfig {
+    /// Construct the legacy V8 profile (`Eager`, Relay completion, Buffered
+    /// FRONTIER, 1 MiB fallocate-only extent preparation, Stage A off,
+    /// Dynamic coalescing), retained as the `TOYKV_WAL_V8_PROFILE=legacy` fallback.
+    pub(crate) fn legacy() -> Self {
+        Self {
+            profile: WalV8Profile::Legacy,
+            progress_mode: WalV8ProgressMode::default(),
+            direct_completion_enabled: false,
+            frontier_mode: WalV8FrontierWriteMode::default(),
+            extent_lookahead: false,
+            point_buffer_preallocation_enabled: false,
+            coalesce_policy: WalV8CoalesceTargetPolicy::Disabled,
+            #[cfg(feature = "bench")]
+            progress_counters_enabled: false,
+            #[cfg(feature = "bench")]
+            extent_preparation: None,
+            #[cfg(feature = "bench")]
+            extent_policy_storage: WalV8ExtentPolicyStorageKind::Vec,
+            #[cfg(feature = "bench")]
+            extent_policy_scan_diagnostics_enabled: true,
+            #[cfg(feature = "bench")]
+            data_submit_ready_order: false,
+            #[cfg(feature = "bench")]
+            point_direct_frame_enabled: false,
+        }
+    }
+
+    /// Construct the promoted V8 Candidate Target8 profile (`Cursor`, Direct
+    /// completion, Direct FRONTIER with Buffered fallback, Point-only 1 MiB
+    /// lookahead when eligible, Stage A on, Dynamic + Point-only Target8).
+    #[allow(clippy::needless_update)]
+    pub(crate) fn candidate() -> Self {
+        Self {
+            profile: WalV8Profile::Candidate,
+            progress_mode: WalV8ProgressMode::Cursor,
+            direct_completion_enabled: true,
+            frontier_mode: WalV8FrontierWriteMode::Direct,
+            extent_lookahead: false,
+            point_buffer_preallocation_enabled: true,
+            coalesce_policy: WalV8CoalesceTargetPolicy::PointOnly(8),
+            ..Self::legacy()
+        }
+    }
+
+    /// Parse V8 WAL configuration from environment variables and test overrides.
+    pub(crate) fn from_environment() -> Result<Self> {
+        #[cfg(test)]
+        let test_profile = WAL_V8_TEST_PROFILE_OVERRIDE.with(std::cell::Cell::get);
+        #[cfg(not(test))]
+        let test_profile: Option<WalV8Profile> = None;
+        let profile = match test_profile {
+            Some(profile) => profile,
+            None => WalV8Profile::from_environment()?,
+        };
+        let base = match profile {
+            WalV8Profile::Legacy => Self::legacy(),
+            WalV8Profile::Candidate => Self::candidate(),
+        };
+
+        let test_override_active = {
+            #[cfg(test)]
+            {
+                WAL_V8_TEST_MODE_OVERRIDE
+                    .with(std::cell::Cell::get)
+                    .is_some()
+            }
+            #[cfg(not(test))]
+            {
+                false
+            }
+        };
+
+        #[cfg(feature = "bench")]
+        let progress_mode =
+            if std::env::var_os(WAL_V8_POINT_PROGRESS_RING_ENV).is_some() || test_override_active {
+                progress_mode_from_environment()?
+            } else {
+                base.progress_mode
+            };
+        #[cfg(not(feature = "bench"))]
+        let progress_mode =
+            if std::env::var_os(WAL_V8_PROGRESS_MODE_ENV).is_some() || test_override_active {
+                production_progress_mode_from_environment()?
+            } else {
+                base.progress_mode
+            };
+
+        #[cfg(feature = "bench")]
+        let direct_completion_enabled = if std::env::var_os(WAL_V8_CURSOR_DIRECT_COMPLETION_ENV)
+            .is_some()
+            || test_override_active
+        {
+            cursor_direct_completion_enabled_from_environment(progress_mode)?
+        } else {
+            base.direct_completion_enabled && progress_mode == WalV8ProgressMode::Cursor
+        };
+        #[cfg(not(feature = "bench"))]
+        let direct_completion_enabled = if test_override_active {
+            production_direct_completion_enabled_from_environment(progress_mode)?
+        } else {
+            base.direct_completion_enabled && progress_mode == WalV8ProgressMode::Cursor
+        };
+
+        let frontier_mode = if std::env::var_os("TOYKV_WAL_V8_FRONTIER_MODE").is_some() {
+            WalV8FrontierWriteMode::from_environment()?
+        } else {
+            base.frontier_mode
+        };
+        let extent_lookahead = wal_v8_extent_lookahead_from_environment()?;
+
+        #[cfg(feature = "bench")]
+        let point_buffer_preallocation_enabled =
+            if std::env::var_os("TOYKV_BENCH_V8_POINT_BUFFER_PREALLOC").is_some() {
+                point_buffer_preallocation_from_environment()?
+            } else {
+                base.point_buffer_preallocation_enabled
+            };
+        #[cfg(not(feature = "bench"))]
+        let point_buffer_preallocation_enabled = base.point_buffer_preallocation_enabled;
+
+        let explicit_coalescing =
+            WalV8CoalesceTargetPolicy::from_environment(progress_mode, direct_completion_enabled)?;
+        #[cfg(feature = "bench")]
+        let coalesce_policy = if let Some(target) =
+            coalesce_ready_target_from_environment(progress_mode, direct_completion_enabled)?
+        {
+            ensure!(
+                explicit_coalescing.is_none(),
+                "TOYKV_WAL_V8_COALESCING and {WAL_V8_COALESCE_READY_TARGET_ENV} cannot both be set"
+            );
+            WalV8CoalesceTargetPolicy::Always(target)
+        } else if let Some(policy) = explicit_coalescing {
+            policy
+        } else if progress_mode == WalV8ProgressMode::Cursor && direct_completion_enabled {
+            base.coalesce_policy
+        } else {
+            WalV8CoalesceTargetPolicy::Disabled
+        };
+        #[cfg(not(feature = "bench"))]
+        let coalesce_policy = if let Some(policy) = explicit_coalescing {
+            policy
+        } else if progress_mode == WalV8ProgressMode::Cursor && direct_completion_enabled {
+            base.coalesce_policy
+        } else {
+            WalV8CoalesceTargetPolicy::Disabled
+        };
+
+        #[cfg(feature = "bench")]
+        let progress_counters_enabled = progress_counters_enabled_from_environment(progress_mode)?;
+        #[cfg(feature = "bench")]
+        let extent_preparation = bench_extent_override_from_environment()?;
+        #[cfg(feature = "bench")]
+        let extent_policy_storage = extent_policy_storage_kind_from_env()?;
+        #[cfg(feature = "bench")]
+        let extent_policy_scan_diagnostics_enabled =
+            extent_policy_scan_diagnostics_enabled_from_env()?;
+        #[cfg(feature = "bench")]
+        let data_submit_ready_order = benchmark_submits_any_ready_ticket()?;
+        #[cfg(feature = "bench")]
+        let point_direct_frame_enabled = point_direct_frame_from_environment()?;
+
+        Ok(Self {
+            profile,
+            progress_mode,
+            direct_completion_enabled,
+            frontier_mode,
+            extent_lookahead,
+            point_buffer_preallocation_enabled,
+            coalesce_policy,
+            #[cfg(feature = "bench")]
+            progress_counters_enabled,
+            #[cfg(feature = "bench")]
+            extent_preparation,
+            #[cfg(feature = "bench")]
+            extent_policy_storage,
+            #[cfg(feature = "bench")]
+            extent_policy_scan_diagnostics_enabled,
+            #[cfg(feature = "bench")]
+            data_submit_ready_order,
+            #[cfg(feature = "bench")]
+            point_direct_frame_enabled,
+        })
+    }
+
+    pub(crate) fn with_progress_and_completion(
+        mut self,
+        progress_mode: WalV8ProgressMode,
+        direct_completion_enabled: bool,
+    ) -> Self {
+        self.progress_mode = progress_mode;
+        self.direct_completion_enabled = direct_completion_enabled;
+        if !(progress_mode == WalV8ProgressMode::Cursor && direct_completion_enabled) {
+            self.coalesce_policy = WalV8CoalesceTargetPolicy::Disabled;
+        }
+        self
+    }
+}
+
+/// Per-WAL effective V8 configuration resolved from [`WalV8RequestedConfig`]
+/// and the actual worker file, filesystem, and quota owner of one WAL segment.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct WalV8EffectiveConfig {
+    pub(crate) profile: WalV8Profile,
+    pub(crate) progress_mode: WalV8ProgressMode,
+    pub(crate) direct_completion_enabled: bool,
+    pub(crate) frontier_mode: WalV8FrontierWriteMode,
+    pub(crate) extent_policy: WalV8ExtentPreparationPolicy,
+    pub(crate) extent_window_bytes: u64,
+    pub(crate) point_buffer_preallocation_enabled: bool,
+    pub(crate) coalesce_policy: WalV8CoalesceTargetPolicy,
+    pub(crate) o_direct_worker: bool,
+    pub(crate) ext_family_filesystem: bool,
+    pub(crate) has_reservation_owner: bool,
+    #[cfg(feature = "bench")]
+    pub(crate) progress_counters_enabled: bool,
+    #[cfg(feature = "bench")]
+    extent_policy_storage: WalV8ExtentPolicyStorageKind,
+    #[cfg(feature = "bench")]
+    extent_policy_scan_diagnostics_enabled: bool,
+    #[cfg(feature = "bench")]
+    data_submit_ready_order: bool,
+    #[cfg(feature = "bench")]
+    point_direct_frame_enabled: bool,
+}
+
+impl WalV8EffectiveConfig {
+    /// Resolve effective settings for one V8 WAL instance before spawning its worker.
+    pub(crate) fn resolve(
+        requested: &WalV8RequestedConfig,
+        worker_file: &File,
+        has_reservation_owner: bool,
+    ) -> Result<Self> {
+        Self::resolve_with_test_override(
+            requested,
+            worker_file,
+            has_reservation_owner,
+            #[cfg(test)]
+            None,
+        )
+    }
+
+    fn resolve_with_test_override(
+        requested: &WalV8RequestedConfig,
+        worker_file: &File,
+        has_reservation_owner: bool,
+        #[cfg(test)] extent_strategy_override: Option<(WalV8ExtentPreparationStrategy, u64)>,
+    ) -> Result<Self> {
+        ensure!(
+            !requested.direct_completion_enabled
+                || requested.progress_mode == WalV8ProgressMode::Cursor,
+            "direct completion requires Cursor progress mode"
+        );
+        let o_direct_worker = is_o_direct_file(worker_file)?;
+        let ext_family_filesystem = is_ext_family_filesystem(worker_file);
+        let frontier_mode = match requested.frontier_mode {
+            WalV8FrontierWriteMode::Buffered => WalV8FrontierWriteMode::Buffered,
+            WalV8FrontierWriteMode::Direct => {
+                if o_direct_worker {
+                    WalV8FrontierWriteMode::Direct
+                } else {
+                    WalV8FrontierWriteMode::Buffered
+                }
+            }
+        };
+
+        let (extent_policy, extent_window_bytes) = {
+            #[cfg(test)]
+            let override_strategy = extent_strategy_override;
+            #[cfg(not(test))]
+            let override_strategy: Option<(WalV8ExtentPreparationStrategy, u64)> = None;
+
+            let resolve_production_extent = || -> Result<(WalV8ExtentPreparationPolicy, u64)> {
+                let eligible = has_reservation_owner && ext_family_filesystem && o_direct_worker;
+                ensure!(
+                    !requested.extent_lookahead || eligible,
+                    "{WAL_V8_EXTENT_LOOKAHEAD_ENV} requires an ext4 WAL, an O_DIRECT DATA worker, and a quota owner"
+                );
+                if eligible {
+                    let policy = if requested.extent_lookahead {
+                        WalV8ExtentPreparationPolicy::Lookahead
+                    } else if requested.profile == WalV8Profile::Candidate {
+                        WalV8ExtentPreparationPolicy::PointOnlyLookahead
+                    } else {
+                        WalV8ExtentPreparationPolicy::FallocateOnly
+                    };
+                    Ok((policy, WAL_V8_PRODUCTION_EXTENT_WINDOW_BYTES))
+                } else {
+                    Ok((WalV8ExtentPreparationPolicy::Disabled, 0))
+                }
+            };
+
+            if let Some((strategy, window_bytes)) = override_strategy {
+                ensure!(
+                    has_reservation_owner,
+                    "point-only extent strategy test requires PITR quota accounting"
+                );
+                let policy = match strategy {
+                    WalV8ExtentPreparationStrategy::FallocateOnly => {
+                        WalV8ExtentPreparationPolicy::FallocateOnly
+                    }
+                    WalV8ExtentPreparationStrategy::Lookahead => {
+                        WalV8ExtentPreparationPolicy::Lookahead
+                    }
+                    WalV8ExtentPreparationStrategy::PointOnlyLookahead => {
+                        WalV8ExtentPreparationPolicy::PointOnlyLookahead
+                    }
+                };
+                (policy, window_bytes)
+            } else {
+                #[cfg(feature = "bench")]
+                match requested.extent_preparation {
+                    Some(WalV8BenchExtentOverride::Disabled) => {
+                        (WalV8ExtentPreparationPolicy::Disabled, 0)
+                    }
+                    Some(WalV8BenchExtentOverride::Mode(mode, bytes)) => {
+                        let policy = match mode {
+                            WalExtentPreparationMode::SlidingLookahead => {
+                                ensure!(
+                                    has_reservation_owner,
+                                    "sliding lookahead benchmark requires PITR quota accounting"
+                                );
+                                WalV8ExtentPreparationPolicy::Lookahead
+                            }
+                            WalExtentPreparationMode::SlidingPointLookahead => {
+                                ensure!(
+                                    has_reservation_owner,
+                                    "point-only sliding lookahead benchmark requires PITR quota accounting"
+                                );
+                                WalV8ExtentPreparationPolicy::PointOnlyLookahead
+                            }
+                            WalExtentPreparationMode::SlidingFallocate => {
+                                WalV8ExtentPreparationPolicy::FallocateOnly
+                            }
+                            WalExtentPreparationMode::SlidingInitialize => {
+                                WalV8ExtentPreparationPolicy::SlidingInitialize
+                            }
+                            WalExtentPreparationMode::Fallocate => {
+                                WalV8ExtentPreparationPolicy::OneShotFallocate
+                            }
+                            WalExtentPreparationMode::Initialize => {
+                                WalV8ExtentPreparationPolicy::OneShotInitialize
+                            }
+                        };
+                        (policy, bytes)
+                    }
+                    None => {
+                        if requested.profile == WalV8Profile::Candidate
+                            || requested.extent_lookahead
+                        {
+                            resolve_production_extent()?
+                        } else {
+                            // Preserve historical bench default when no extent
+                            // override or candidate profile is selected.
+                            (WalV8ExtentPreparationPolicy::Disabled, 0)
+                        }
+                    }
+                }
+                #[cfg(not(feature = "bench"))]
+                resolve_production_extent()?
+            }
+        };
+
+        Ok(Self {
+            profile: requested.profile,
+            progress_mode: requested.progress_mode,
+            direct_completion_enabled: requested.direct_completion_enabled,
+            frontier_mode,
+            extent_policy,
+            extent_window_bytes,
+            point_buffer_preallocation_enabled: requested.point_buffer_preallocation_enabled,
+            coalesce_policy: requested.coalesce_policy,
+            o_direct_worker,
+            ext_family_filesystem,
+            has_reservation_owner,
+            #[cfg(feature = "bench")]
+            progress_counters_enabled: requested.progress_counters_enabled,
+            #[cfg(feature = "bench")]
+            extent_policy_storage: requested.extent_policy_storage,
+            #[cfg(feature = "bench")]
+            extent_policy_scan_diagnostics_enabled: requested
+                .extent_policy_scan_diagnostics_enabled,
+            #[cfg(feature = "bench")]
+            data_submit_ready_order: requested.data_submit_ready_order,
+            #[cfg(feature = "bench")]
+            point_direct_frame_enabled: requested.point_direct_frame_enabled,
+        })
+    }
 }
 
 #[cfg(feature = "bench")]
@@ -641,9 +1557,13 @@ impl WalV8SlidingExtentPreparation {
             mode,
             state,
             prepared,
-            request_sender,
-            worker,
+            worker_handle: WalV8ExtentWorkerHandle::new(request_sender, worker),
         })
+    }
+
+    fn quiesce(&self) {
+        self.worker_handle
+            .quiesce("V8 background extent initializer panicked");
     }
 
     fn ensure_prepared_through(&self, required_end: u64) -> Result<()> {
@@ -719,13 +1639,11 @@ impl WalV8SlidingExtentPreparation {
             return Ok(());
         }
         if required_end > state.requested_end {
-            let sender = self
-                .request_sender
-                .as_ref()
-                .context("V8 background extent initializer is unavailable")?;
-            sender
-                .send(required_end)
-                .context("V8 background extent initializer stopped unexpectedly")?;
+            self.worker_handle.send(
+                required_end,
+                "V8 background extent initializer is unavailable",
+                "V8 background extent initializer stopped unexpectedly",
+            )?;
             state.requested_end = required_end;
         }
 
@@ -846,7 +1764,7 @@ struct WalV8ExtentPreallocationState {
     allocated_bytes: u64,
     #[cfg(feature = "bench")]
     initialization_chunks: u64,
-    #[cfg(feature = "bench")]
+    #[cfg(any(test, feature = "bench"))]
     initialized_bytes: u64,
     #[cfg(feature = "bench")]
     initialization_elapsed_ns: u64,
@@ -1102,11 +2020,6 @@ fn extent_policy_storage_kind_from_env() -> Result<WalV8ExtentPolicyStorageKind>
     }
 }
 
-#[cfg(not(feature = "bench"))]
-fn extent_policy_storage_kind_from_env() -> Result<WalV8ExtentPolicyStorageKind> {
-    Ok(WalV8ExtentPolicyStorageKind::Vec)
-}
-
 #[cfg(feature = "bench")]
 fn extent_policy_scan_diagnostics_enabled_from_env() -> Result<bool> {
     match std::env::var("TOYKV_BENCH_V8_EXTENT_POLICY_SCAN_DIAGNOSTICS") {
@@ -1118,11 +2031,6 @@ fn extent_policy_scan_diagnostics_enabled_from_env() -> Result<bool> {
         Err(std::env::VarError::NotPresent) => Ok(true),
         Err(error) => Err(error).context("read V8 extent policy scan diagnostics setting"),
     }
-}
-
-#[cfg(not(feature = "bench"))]
-fn extent_policy_scan_diagnostics_enabled_from_env() -> Result<bool> {
-    Ok(false)
 }
 
 #[cfg(feature = "bench")]
@@ -1156,7 +2064,6 @@ enum WalV8ExtentPolicy {
 enum WalV8ExtentPreparationStrategy {
     FallocateOnly,
     Lookahead,
-    #[cfg(feature = "bench")]
     PointOnlyLookahead,
 }
 
@@ -1166,14 +2073,7 @@ impl WalV8ExtentPreparationStrategy {
     }
 
     const fn is_point_only(self) -> bool {
-        #[cfg(feature = "bench")]
-        {
-            matches!(self, Self::PointOnlyLookahead)
-        }
-        #[cfg(not(feature = "bench"))]
-        {
-            false
-        }
+        matches!(self, Self::PointOnlyLookahead)
     }
 }
 
@@ -1191,8 +2091,11 @@ struct WalV8ExtentPreallocator {
     state: Arc<Mutex<WalV8ExtentPreallocationState>>,
     prepared: Arc<Condvar>,
     preparation_lock: Arc<Mutex<()>>,
-    request_sender: Option<mpsc::Sender<()>>,
-    worker: Option<thread::JoinHandle<()>>,
+    worker_handle: WalV8ExtentWorkerHandle<()>,
+    #[cfg(test)]
+    worker_hook_for_test: WalV8LookaheadWorkerHook,
+    #[cfg(test)]
+    quiesce_hook_for_test: WalV8LookaheadWorkerHook,
 }
 
 impl WalV8ExtentPreallocator {
@@ -1239,7 +2142,6 @@ impl WalV8ExtentPreallocator {
         )
     }
 
-    #[cfg(feature = "bench")]
     fn new_with_point_only_lookahead(
         data_file: File,
         sync_file: &File,
@@ -1255,7 +2157,6 @@ impl WalV8ExtentPreallocator {
             max_file_size,
             window_bytes,
             Some(reservation_owner),
-            #[cfg(feature = "bench")]
             WalV8ExtentPreparationStrategy::PointOnlyLookahead,
         )
     }
@@ -1269,15 +2170,35 @@ impl WalV8ExtentPreallocator {
         reservation_owner: Option<Arc<WalV8ReservationOwner>>,
         strategy: WalV8ExtentPreparationStrategy,
     ) -> Result<Self> {
+        Self::new_with_strategy_and_policy_config(
+            data_file,
+            sync_file,
+            start_offset,
+            max_file_size,
+            window_bytes,
+            reservation_owner,
+            strategy,
+            WalV8ExtentPolicyStorageKind::Vec,
+            cfg!(feature = "bench"),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_strategy_and_policy_config(
+        data_file: File,
+        sync_file: &File,
+        start_offset: u64,
+        max_file_size: u64,
+        window_bytes: u64,
+        reservation_owner: Option<Arc<WalV8ReservationOwner>>,
+        strategy: WalV8ExtentPreparationStrategy,
+        extent_policy_storage_kind: WalV8ExtentPolicyStorageKind,
+        extent_policy_scan_diagnostics_enabled: bool,
+    ) -> Result<Self> {
         let lookahead = strategy.uses_lookahead();
         let point_only_lookahead = strategy.is_point_only();
-        let extent_policy_storage_kind = extent_policy_storage_kind_from_env()?;
-        #[cfg(feature = "bench")]
-        let extent_policy_scan_diagnostics_enabled =
-            extent_policy_scan_diagnostics_enabled_from_env()?;
         #[cfg(not(feature = "bench"))]
-        let _extent_policy_scan_diagnostics_enabled =
-            extent_policy_scan_diagnostics_enabled_from_env()?;
+        let _extent_policy_scan_diagnostics_enabled = extent_policy_scan_diagnostics_enabled;
         ensure!(
             is_o_direct_file(&data_file)?,
             "V8 sliding extent preparation requires an O_DIRECT DATA worker"
@@ -1339,7 +2260,7 @@ impl WalV8ExtentPreallocator {
             allocated_bytes: 0,
             #[cfg(feature = "bench")]
             initialization_chunks: 0,
-            #[cfg(feature = "bench")]
+            #[cfg(any(test, feature = "bench"))]
             initialized_bytes: 0,
             #[cfg(feature = "bench")]
             initialization_elapsed_ns: 0,
@@ -1364,6 +2285,8 @@ impl WalV8ExtentPreallocator {
         }));
         let prepared = Arc::new(Condvar::new());
         let preparation_lock = Arc::new(Mutex::new(()));
+        #[cfg(test)]
+        let worker_hook_for_test: WalV8LookaheadWorkerHook = Arc::new(Mutex::new(None));
         let (request_sender, worker) = if lookahead {
             let worker_file = data_file
                 .try_clone()
@@ -1371,6 +2294,8 @@ impl WalV8ExtentPreallocator {
             let worker_state = Arc::clone(&state);
             let worker_prepared = Arc::clone(&prepared);
             let worker_preparation_lock = Arc::clone(&preparation_lock);
+            #[cfg(test)]
+            let worker_hook = Arc::clone(&worker_hook_for_test);
             let worker_owner = Arc::clone(
                 reservation_owner
                     .as_ref()
@@ -1392,6 +2317,8 @@ impl WalV8ExtentPreallocator {
                             max_file_size,
                             window_bytes,
                             point_only_lookahead,
+                            #[cfg(test)]
+                            worker_hook,
                         }
                         .run()
                     }));
@@ -1426,9 +2353,31 @@ impl WalV8ExtentPreallocator {
             state,
             prepared,
             preparation_lock,
-            request_sender,
-            worker,
+            worker_handle: WalV8ExtentWorkerHandle::new(request_sender, worker),
+            #[cfg(test)]
+            worker_hook_for_test,
+            #[cfg(test)]
+            quiesce_hook_for_test: Arc::new(Mutex::new(None)),
         })
+    }
+
+    #[cfg(test)]
+    fn set_worker_hook_for_test(&self, hook: Option<Arc<dyn Fn() + Send + Sync>>) {
+        *self.worker_hook_for_test.lock() = hook;
+    }
+
+    #[cfg(test)]
+    fn set_quiesce_hook_for_test(&self, hook: Option<Arc<dyn Fn() + Send + Sync>>) {
+        *self.quiesce_hook_for_test.lock() = hook;
+    }
+
+    fn quiesce(&self) {
+        #[cfg(test)]
+        if let Some(hook) = self.quiesce_hook_for_test.lock().take() {
+            hook();
+        }
+        self.worker_handle
+            .quiesce("V8 extent lookahead worker panicked");
     }
 
     fn register_data_range(
@@ -1721,13 +2670,11 @@ impl WalV8ExtentPreallocator {
         }
 
         if !state.background_request_pending {
-            let sender = self
-                .request_sender
-                .as_ref()
-                .context("V8 extent lookahead worker is unavailable")?;
-            sender
-                .send(())
-                .context("V8 extent lookahead worker stopped unexpectedly")?;
+            self.worker_handle.send(
+                (),
+                "V8 extent lookahead worker is unavailable",
+                "V8 extent lookahead worker stopped unexpectedly",
+            )?;
             state.background_request_pending = true;
         }
         state.requested_end = required_end;
@@ -1892,12 +2839,7 @@ impl WalV8ExtentPreallocator {
 
 impl Drop for WalV8ExtentPreallocator {
     fn drop(&mut self) {
-        self.request_sender.take();
-        if let Some(worker) = self.worker.take()
-            && worker.join().is_err()
-        {
-            log::error!("V8 extent lookahead worker panicked");
-        }
+        self.quiesce();
     }
 }
 
@@ -1912,6 +2854,8 @@ struct WalV8ExtentLookaheadWorker {
     max_file_size: u64,
     window_bytes: u64,
     point_only_lookahead: bool,
+    #[cfg(test)]
+    worker_hook: WalV8LookaheadWorkerHook,
 }
 
 impl WalV8ExtentLookaheadWorker {
@@ -1927,6 +2871,8 @@ impl WalV8ExtentLookaheadWorker {
             max_file_size,
             window_bytes,
             point_only_lookahead,
+            #[cfg(test)]
+            worker_hook,
         } = self;
         let chunk_bytes = WAL_V8_EXTENT_PREPARATION_CHUNK_BYTES as u64;
         #[cfg(feature = "bench")]
@@ -2079,6 +3025,13 @@ impl WalV8ExtentLookaheadWorker {
                     drop(state_guard);
                     drop(_extent_state_timer);
 
+                    #[cfg(test)]
+                    if initialized_start >= required_end
+                        && let Some(hook) = worker_hook.lock().take()
+                    {
+                        hook();
+                    }
+
                     let initialization_started = Instant::now();
                     initialize_v8_extent_chunk(&state, initialized_start, initialized_end, || {
                         zeros.zero_range(0, chunk_len);
@@ -2100,6 +3053,12 @@ impl WalV8ExtentLookaheadWorker {
                         state_guard.allocated_end >= initialized_end,
                         "V8 extent lookahead initialized beyond allocated space"
                     );
+                    #[cfg(any(test, feature = "bench"))]
+                    {
+                        state_guard.initialized_bytes = state_guard
+                            .initialized_bytes
+                            .saturating_add(initialized_end - initialized_start);
+                    }
                     #[cfg(feature = "bench")]
                     {
                         let initialization_elapsed_ns =
@@ -2107,9 +3066,6 @@ impl WalV8ExtentLookaheadWorker {
                                 .unwrap_or(u64::MAX);
                         state_guard.initialization_chunks =
                             state_guard.initialization_chunks.saturating_add(1);
-                        state_guard.initialized_bytes = state_guard
-                            .initialized_bytes
-                            .saturating_add(initialized_end - initialized_start);
                         state_guard.initialization_elapsed_ns = state_guard
                             .initialization_elapsed_ns
                             .saturating_add(initialization_elapsed_ns);
@@ -2276,12 +3232,7 @@ fn is_ext_family_filesystem(file: &File) -> bool {
 #[cfg(feature = "bench")]
 impl Drop for WalV8SlidingExtentPreparation {
     fn drop(&mut self) {
-        self.request_sender.take();
-        if let Some(worker) = self.worker.take()
-            && worker.join().is_err()
-        {
-            log::error!("V8 background extent initializer panicked");
-        }
+        self.quiesce();
     }
 }
 
@@ -2423,39 +3374,80 @@ fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> &str {
 }
 
 #[cfg(feature = "bench")]
-fn coalesce_budget_override_from_environment() -> Result<Option<u64>> {
-    let Some(value) = std::env::var_os("TOYKV_WAL_V8_COALESCE_BUDGET_US") else {
+fn coalesce_ready_target_from_value(
+    value: Option<&OsStr>,
+    progress_mode: WalV8ProgressMode,
+    direct_completion_enabled: bool,
+) -> Result<Option<usize>> {
+    let Some(value) = value else {
         return Ok(None);
     };
     let value = value
         .to_str()
-        .context("TOYKV_WAL_V8_COALESCE_BUDGET_US is not valid UTF-8")?;
-    let budget_us = value.parse::<u64>().with_context(|| {
-        format!("invalid TOYKV_WAL_V8_COALESCE_BUDGET_US {value:?}; expected `100` or `400`")
+        .with_context(|| format!("{WAL_V8_COALESCE_READY_TARGET_ENV} is not valid UTF-8"))?;
+    let target = value.parse::<usize>().with_context(|| {
+        format!("invalid {WAL_V8_COALESCE_READY_TARGET_ENV} {value:?}; expected `4` or `8`")
     })?;
     ensure!(
-        matches!(budget_us, 100 | 400),
-        "invalid TOYKV_WAL_V8_COALESCE_BUDGET_US {value:?}; expected `100` or `400`"
+        matches!(target, 4 | 8),
+        "invalid {WAL_V8_COALESCE_READY_TARGET_ENV} {value:?}; expected `4` or `8`"
     );
-
-    Ok(Some(budget_us))
+    ensure!(
+        progress_mode == WalV8ProgressMode::Cursor && direct_completion_enabled,
+        "{WAL_V8_COALESCE_READY_TARGET_ENV} requires Cursor progress mode and direct completion"
+    );
+    Ok(Some(target))
 }
 
 #[cfg(feature = "bench")]
-fn point_frontier_credit_batch_from_environment() -> Result<bool> {
-    let Some(value) = std::env::var_os(WAL_V8_POINT_FRONTIER_CREDIT_BATCH_ENV) else {
+fn coalesce_ready_target_from_environment(
+    progress_mode: WalV8ProgressMode,
+    direct_completion_enabled: bool,
+) -> Result<Option<usize>> {
+    coalesce_ready_target_from_value(
+        std::env::var_os(WAL_V8_COALESCE_READY_TARGET_ENV).as_deref(),
+        progress_mode,
+        direct_completion_enabled,
+    )
+}
+
+#[cfg(feature = "bench")]
+fn point_buffer_preallocation_from_environment() -> Result<bool> {
+    let Some(value) = std::env::var_os("TOYKV_BENCH_V8_POINT_BUFFER_PREALLOC") else {
         return Ok(false);
     };
     let value = value
         .to_str()
-        .with_context(|| format!("{WAL_V8_POINT_FRONTIER_CREDIT_BATCH_ENV} is not valid UTF-8"))?;
+        .context("TOYKV_BENCH_V8_POINT_BUFFER_PREALLOC is not valid UTF-8")?;
     match value {
         "0" => Ok(false),
         "1" => Ok(true),
         _ => anyhow::bail!(
-            "invalid {WAL_V8_POINT_FRONTIER_CREDIT_BATCH_ENV} {value:?}; expected `0` or `1`"
+            "invalid TOYKV_BENCH_V8_POINT_BUFFER_PREALLOC {value:?}; expected `0` or `1`"
         ),
     }
+}
+
+#[cfg(feature = "bench")]
+fn point_direct_frame_from_value(value: Option<&OsStr>) -> Result<bool> {
+    let Some(value) = value else {
+        return Ok(false);
+    };
+    let value = value
+        .to_str()
+        .context("TOYKV_BENCH_V8_POINT_DIRECT_FRAME is not valid UTF-8")?;
+    match value {
+        "0" => Ok(false),
+        "1" => Ok(true),
+        _ => anyhow::bail!(
+            "invalid TOYKV_BENCH_V8_POINT_DIRECT_FRAME {value:?}; expected `0` or `1`"
+        ),
+    }
+}
+
+#[cfg(feature = "bench")]
+fn point_direct_frame_from_environment() -> Result<bool> {
+    point_direct_frame_from_value(std::env::var_os("TOYKV_BENCH_V8_POINT_DIRECT_FRAME").as_deref())
 }
 
 struct WalV8ParallelFrontier {
@@ -2515,8 +3507,79 @@ struct WalV8SubmissionState {
     packing: bool,
     #[cfg(test)]
     group_wait_cutoff: Option<u64>,
+    #[cfg(test)]
+    submitted_group_snapshots: Vec<WalV8SubmittedGroupSnapshot>,
     #[cfg(feature = "bench")]
     data_submit_hol: Option<WalV8DataSubmitHol>,
+}
+
+enum WalV8ProgressWake {
+    Control,
+    TimedOut,
+}
+
+impl WalV8ProgressWake {
+    fn is_signaled(&self) -> bool {
+        match self {
+            Self::Control => true,
+            Self::TimedOut => false,
+        }
+    }
+
+    fn wait_status(&self) -> WalV8ProgressTokenWait {
+        if self.is_signaled() {
+            WalV8ProgressTokenWait::Signaled
+        } else {
+            WalV8ProgressTokenWait::TimedOut
+        }
+    }
+}
+
+/// Prefer a queued control token before looking at the DATA queue. If DATA is
+/// selected first while a control token races in, the token remains available
+/// for the pre-scan drain and subsequent wait.
+fn direct_completion_event(
+    completion: DirectGroupWriteCompletion,
+) -> Result<WalV8CompletedGroupEvent> {
+    if let Some(error) = completion.result.error.as_deref() {
+        anyhow::bail!("Cursor direct completion queue received failed DATA result: {error}");
+    }
+    Ok(WalV8CompletedGroupEvent {
+        group_id: completion.result.group_id,
+        tickets: completion.result.tickets,
+        write_count: completion.result.write_count,
+        write_bytes: completion.result.write_bytes,
+        #[cfg(feature = "bench")]
+        completion_observed_at: completion.completion_observed_at,
+    })
+}
+
+fn drain_direct_completion_queue(
+    receiver: &Receiver<DirectGroupWriteCompletion>,
+    batch: &mut Vec<WalV8CompletedGroupEvent>,
+    limit: usize,
+    shutdown_started: bool,
+) -> Result<()> {
+    for _ in 0..limit {
+        match receiver.try_recv() {
+            Ok(completion) => batch.push(direct_completion_event(completion)?),
+            Err(crossbeam_channel::TryRecvError::Empty) => break,
+            Err(crossbeam_channel::TryRecvError::Disconnected) if shutdown_started => break,
+            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                anyhow::bail!("v8 direct DATA completion queue disconnected before teardown");
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct WalV8SubmittedGroupSnapshot {
+    tickets: std::ops::Range<u64>,
+    allocation_range: std::ops::Range<u64>,
+    data_ranges: Vec<std::ops::Range<u64>>,
+    frontier_offsets: Vec<u64>,
 }
 
 #[cfg(feature = "bench")]
@@ -2551,26 +3614,19 @@ type WalV8CompletionReapHook = Arc<dyn Fn(WalV8CompletionReapTestEvent) + Send +
 #[cfg(test)]
 type WalV8SharedCompletionReapHook = Arc<Mutex<Option<WalV8CompletionReapHook>>>;
 
+#[cfg(feature = "bench")]
 fn benchmark_submits_any_ready_ticket() -> Result<bool> {
-    #[cfg(feature = "bench")]
-    {
-        const SUBMIT_ORDER_ENV: &str = "TOYKV_BENCH_V8_DATA_SUBMIT_ORDER";
-        let Some(value) = std::env::var_os(SUBMIT_ORDER_ENV) else {
-            return Ok(false);
-        };
-        let value = value
-            .into_string()
-            .map_err(|_| anyhow::anyhow!("{SUBMIT_ORDER_ENV} is not valid UTF-8"))?;
-        match value.as_str() {
-            "ordered" => Ok(false),
-            "ready" => Ok(true),
-            _ => anyhow::bail!("{SUBMIT_ORDER_ENV} must be 'ordered' or 'ready'"),
-        }
-    }
-
-    #[cfg(not(feature = "bench"))]
-    {
-        Ok(false)
+    const SUBMIT_ORDER_ENV: &str = "TOYKV_BENCH_V8_DATA_SUBMIT_ORDER";
+    let Some(value) = std::env::var_os(SUBMIT_ORDER_ENV) else {
+        return Ok(false);
+    };
+    let value = value
+        .into_string()
+        .map_err(|_| anyhow::anyhow!("{SUBMIT_ORDER_ENV} is not valid UTF-8"))?;
+    match value.as_str() {
+        "ordered" => Ok(false),
+        "ready" => Ok(true),
+        _ => anyhow::bail!("{SUBMIT_ORDER_ENV} must be 'ordered' or 'ready'"),
     }
 }
 
@@ -2587,6 +3643,8 @@ struct WalV8ParallelIo {
     coordinator: WalV8ParallelCoordinator,
     progress: Arc<crate::wal::parallel_worker::WalSyncProgress>,
     #[cfg(feature = "bench")]
+    point_direct_frame_enabled: bool,
+    #[cfg(feature = "bench")]
     profile: arc_swap::ArcSwapOption<crate::mem_table::WriteProfile>,
     #[cfg(feature = "bench")]
     hol_diagnostics_enabled: std::sync::atomic::AtomicBool,
@@ -2594,7 +3652,18 @@ struct WalV8ParallelIo {
     #[cfg(feature = "bench")]
     extent_preparation: Option<Arc<WalV8SlidingExtentPreparation>>,
     completion_events: Option<Receiver<WalV8CompletedGroupEvent>>,
-    completion_batch: Mutex<Vec<WalV8CompletedGroupEvent>>,
+    direct_completions: Option<Receiver<DirectGroupWriteCompletion>>,
+    coalesce_ready_target: WalV8CoalesceTargetPolicy,
+    #[cfg(feature = "bench")]
+    coalesce_ready_target_hits: AtomicU64,
+    #[cfg(feature = "bench")]
+    coalesce_target_eligible_cycles: AtomicU64,
+    #[cfg(feature = "bench")]
+    coalesce_target_mixed_fallback_cycles: AtomicU64,
+    #[cfg(feature = "bench")]
+    coalesce_target_initial_hits: AtomicU64,
+    #[cfg(feature = "bench")]
+    coalesce_target_after_wake_hits: AtomicU64,
     #[cfg(test)]
     progress_wait_hook: Mutex<Option<WalV8ProgressWaitHook>>,
     #[cfg(test)]
@@ -2604,37 +3673,110 @@ struct WalV8ParallelIo {
     completion_thread: Mutex<Option<thread::JoinHandle<()>>>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct WalV8CoalesceOutcome {
+    waited: bool,
+    #[cfg(feature = "bench")]
+    target_hit: bool,
+    #[cfg(feature = "bench")]
+    eligible_cycle: bool,
+    #[cfg(feature = "bench")]
+    mixed_fallback_cycle: bool,
+}
+
+struct WalV8ParallelIoConfig {
+    #[cfg(feature = "bench")]
+    extent_preparation: Option<Arc<WalV8SlidingExtentPreparation>>,
+    direct_completion_enabled: bool,
+    coalesce_ready_target: WalV8CoalesceTargetPolicy,
+    #[cfg(feature = "bench")]
+    data_submit_ready_order: bool,
+    #[cfg(feature = "bench")]
+    point_direct_frame_enabled: bool,
+    #[cfg(test)]
+    worker_group_limit: Option<usize>,
+}
+
 impl WalV8ParallelIo {
     fn spawn(
         worker_file: File,
         coordinator: WalV8ParallelCoordinator,
         first_ticket: u64,
         extent_preallocator: Option<Arc<WalV8ExtentPreallocator>>,
-        #[cfg(feature = "bench")] extent_preparation: Option<Arc<WalV8SlidingExtentPreparation>>,
+        config: WalV8ParallelIoConfig,
     ) -> Result<Arc<Self>> {
-        let (completion_event_sender, completion_events) = if coordinator.progress_ring_enabled() {
-            let capacity = coordinator.completion_queue_capacity();
-            ensure!(capacity > 0, "v8 completion event queue capacity is empty");
-            let (sender, receiver) = crossbeam_channel::bounded(capacity);
-            (Some(sender), Some(receiver))
-        } else {
-            (None, None)
-        };
+        #[cfg(feature = "bench")]
+        let extent_preparation = config.extent_preparation;
+        let direct_completion_enabled = config.direct_completion_enabled;
+        let coalesce_ready_target = config.coalesce_ready_target;
+        #[cfg(test)]
+        let worker_group_limit = config.worker_group_limit;
+
+        ensure!(
+            !direct_completion_enabled || coordinator.progress_cursor_enabled(),
+            "Cursor direct completion requires Cursor progress mode"
+        );
+
+        let (completion_event_sender, completion_events) =
+            if coordinator.progress_ring_enabled() && !direct_completion_enabled {
+                let capacity = coordinator.completion_queue_capacity();
+                ensure!(capacity > 0, "v8 completion event queue capacity is empty");
+                let (sender, receiver) = crossbeam_channel::bounded(capacity);
+                (Some(sender), Some(receiver))
+            } else {
+                (None, None)
+            };
         let progress_tokens = coordinator.take_progress_token_receiver()?;
-        let mut completion_batch = Vec::new();
-        if completion_events.is_some() {
-            completion_batch
-                .try_reserve_exact(coordinator.completion_queue_capacity())
-                .context("reserve v8 completion event drain buffer")?;
-        }
         let shutdown_started = Arc::new(AtomicBool::new(false));
-        let submit_any_ready_ticket = benchmark_submits_any_ready_ticket()?;
+        #[cfg(feature = "bench")]
+        let submit_any_ready_ticket = config.data_submit_ready_order;
+        #[cfg(not(feature = "bench"))]
+        let submit_any_ready_ticket = false;
         let worker_file = Arc::new(worker_file);
         let buffer_pool = Arc::new(ArrayQueue::<WalV8DataBuffer>::new(1));
-        let mut worker = if submit_any_ready_ticket {
-            IoWorker::spawn_out_of_order(worker_file, buffer_pool, None)?
+        let direct_completion_handle = coordinator.worker_completion_handle();
+        let (mut worker, direct_completions) = if direct_completion_enabled {
+            let capacity = coordinator.completion_queue_capacity();
+            ensure!(capacity > 0, "v8 direct completion queue capacity is empty");
+            let (sender, receiver) = crossbeam_channel::bounded(capacity);
+            #[cfg(test)]
+            let worker = if let Some(group_limit) = worker_group_limit {
+                IoWorker::spawn_cursor_direct_completions_with_group_limit(
+                    worker_file,
+                    buffer_pool,
+                    None,
+                    submit_any_ready_ticket,
+                    sender,
+                    direct_completion_handle,
+                    group_limit,
+                )?
+            } else {
+                IoWorker::spawn_cursor_direct_completions(
+                    worker_file,
+                    buffer_pool,
+                    None,
+                    submit_any_ready_ticket,
+                    sender,
+                    direct_completion_handle,
+                )?
+            };
+            #[cfg(not(test))]
+            let worker = IoWorker::spawn_cursor_direct_completions(
+                worker_file,
+                buffer_pool,
+                None,
+                submit_any_ready_ticket,
+                sender,
+                direct_completion_handle,
+            )?;
+            (worker, Some(receiver))
         } else {
-            IoWorker::spawn(worker_file, buffer_pool, None)?
+            let worker = if submit_any_ready_ticket {
+                IoWorker::spawn_out_of_order(worker_file, buffer_pool, None)?
+            } else {
+                IoWorker::spawn(worker_file, buffer_pool, None)?
+            };
+            (worker, None)
         };
         let client = worker.client();
         let progress = worker.sync_progress();
@@ -2643,7 +3785,11 @@ impl WalV8ParallelIo {
         // worker still contributes SQE/CQE and eventfd metrics, but its DATA
         // submission groups are not V8 durability groups.
         progress.suppress_commit_group_metrics();
-        let completions = worker.take_completions();
+        let completions = if direct_completion_enabled {
+            None
+        } else {
+            Some(worker.take_completions())
+        };
         #[cfg(feature = "bench")]
         let completion_progress = Arc::clone(&progress);
         let completion_coordinator = coordinator.clone();
@@ -2653,84 +3799,93 @@ impl WalV8ParallelIo {
         let completion_reap_hook: WalV8SharedCompletionReapHook = Arc::new(Mutex::new(None));
         #[cfg(test)]
         let completion_reap_hook_for_thread = Arc::clone(&completion_reap_hook);
-        let completion_thread = thread::Builder::new()
-            .name("wal-v8-completion-reaper".to_owned())
-            .spawn(move || {
-                let _exit_guard = WalV8CompletionReaperExitGuard {
-                    coordinator: completion_coordinator.clone(),
-                    shutdown_started: completion_shutdown_started,
-                };
-                #[cfg(feature = "bench")]
-                let mut completion_timeline_enabled = None;
-                while let Ok(result) = completions.recv() {
-                    #[cfg(feature = "bench")]
-                    let completion_observed_at =
-                        completion_coordinator.capture_data_completion_time();
-                    #[cfg(feature = "bench")]
-                    let timeline_enabled = *completion_timeline_enabled.get_or_insert_with(|| {
-                        completion_progress.completion_timeline_sample_every() > 0
-                    });
-                    #[cfg(feature = "bench")]
-                    let reaper_recv_at = timeline_enabled
-                        .then(|| completion_observed_at.unwrap_or_else(Instant::now));
-                    #[cfg(feature = "bench")]
-                    let mut cpu_sample = {
-                        let profile = completion_progress.profile();
-                        let work_items = result.tickets.end.saturating_sub(result.tickets.start);
-                        profile.as_ref().and_then(|profile| {
-                            profile.begin_wal_cpu_thread_sample(
-                                crate::mem_table::WalCpuThreadRole::V8CompletionReaper,
-                                work_items,
-                            )
-                        })
-                    };
-                    #[cfg(feature = "bench")]
-                    let timeline = reaper_recv_at.and_then(|received_at| {
-                        completion_progress.take_completion_timeline(result.group_id, received_at)
-                    });
-                    #[cfg(test)]
-                    if let Some(hook) = completion_reap_hook_for_thread.lock().clone() {
-                        hook(WalV8CompletionReapTestEvent::BeforeReap);
-                    }
-                    let reap_result = {
+        let completion_thread = if let Some(completions) = completions {
+            Some(
+                thread::Builder::new()
+                    .name("wal-v8-completion-reaper".to_owned())
+                    .spawn(move || {
+                        let _exit_guard = WalV8CompletionReaperExitGuard {
+                            coordinator: completion_coordinator.clone(),
+                            shutdown_started: completion_shutdown_started,
+                        };
                         #[cfg(feature = "bench")]
-                        {
-                            reap_v8_group_result(
-                                &completion_coordinator,
-                                result,
-                                completion_event_sender_for_thread.as_ref(),
-                                completion_observed_at,
-                                timeline,
-                            )
+                        let mut completion_timeline_enabled = None;
+                        while let Ok(result) = completions.recv() {
+                            #[cfg(feature = "bench")]
+                            let completion_observed_at =
+                                completion_coordinator.capture_data_completion_time();
+                            #[cfg(feature = "bench")]
+                            let timeline_enabled =
+                                *completion_timeline_enabled.get_or_insert_with(|| {
+                                    completion_progress.completion_timeline_sample_every() > 0
+                                });
+                            #[cfg(feature = "bench")]
+                            let reaper_recv_at = timeline_enabled
+                                .then(|| completion_observed_at.unwrap_or_else(Instant::now));
+                            #[cfg(feature = "bench")]
+                            let mut cpu_sample = {
+                                let profile = completion_progress.profile();
+                                let work_items =
+                                    result.tickets.end.saturating_sub(result.tickets.start);
+                                profile.as_ref().and_then(|profile| {
+                                    profile.begin_wal_cpu_thread_sample(
+                                        crate::mem_table::WalCpuThreadRole::V8CompletionReaper,
+                                        work_items,
+                                    )
+                                })
+                            };
+                            #[cfg(feature = "bench")]
+                            let timeline = reaper_recv_at.and_then(|received_at| {
+                                completion_progress
+                                    .take_completion_timeline(result.group_id, received_at)
+                            });
+                            #[cfg(test)]
+                            if let Some(hook) = completion_reap_hook_for_thread.lock().clone() {
+                                hook(WalV8CompletionReapTestEvent::BeforeReap);
+                            }
+                            let reap_result = {
+                                #[cfg(feature = "bench")]
+                                {
+                                    reap_v8_group_result(
+                                        &completion_coordinator,
+                                        result,
+                                        completion_event_sender_for_thread.as_ref(),
+                                        completion_observed_at,
+                                        timeline,
+                                    )
+                                }
+                                #[cfg(not(feature = "bench"))]
+                                {
+                                    reap_v8_group_result(
+                                        &completion_coordinator,
+                                        result,
+                                        completion_event_sender_for_thread.as_ref(),
+                                    )
+                                }
+                            };
+                            #[cfg(test)]
+                            if reap_result.is_ok()
+                                && let Some(hook) = completion_reap_hook_for_thread.lock().clone()
+                            {
+                                hook(WalV8CompletionReapTestEvent::AfterReap);
+                            }
+                            #[cfg(feature = "bench")]
+                            if let Some(sample) = cpu_sample.as_mut()
+                                && reap_result.is_ok()
+                            {
+                                sample.mark_completed();
+                            }
+                            if let Err(error) = reap_result {
+                                log::error!("v8 WAL completion reaper failed: {error:#}");
+                                completion_coordinator.poison();
+                            }
                         }
-                        #[cfg(not(feature = "bench"))]
-                        {
-                            reap_v8_group_result(
-                                &completion_coordinator,
-                                result,
-                                completion_event_sender_for_thread.as_ref(),
-                            )
-                        }
-                    };
-                    #[cfg(test)]
-                    if reap_result.is_ok()
-                        && let Some(hook) = completion_reap_hook_for_thread.lock().clone()
-                    {
-                        hook(WalV8CompletionReapTestEvent::AfterReap);
-                    }
-                    #[cfg(feature = "bench")]
-                    if let Some(sample) = cpu_sample.as_mut()
-                        && reap_result.is_ok()
-                    {
-                        sample.mark_completed();
-                    }
-                    if let Err(error) = reap_result {
-                        log::error!("v8 WAL completion reaper failed: {error:#}");
-                        completion_coordinator.poison();
-                    }
-                }
-            })
-            .context("failed to spawn v8 WAL completion reaper")?;
+                    })
+                    .context("failed to spawn v8 WAL completion reaper")?,
+            )
+        } else {
+            None
+        };
 
         Ok(Arc::new(Self {
             client,
@@ -2744,6 +3899,8 @@ impl WalV8ParallelIo {
                 packing: false,
                 #[cfg(test)]
                 group_wait_cutoff: None,
+                #[cfg(test)]
+                submitted_group_snapshots: Vec::new(),
                 #[cfg(feature = "bench")]
                 data_submit_hol: None,
             }),
@@ -2755,6 +3912,8 @@ impl WalV8ParallelIo {
             coordinator,
             progress,
             #[cfg(feature = "bench")]
+            point_direct_frame_enabled: config.point_direct_frame_enabled,
+            #[cfg(feature = "bench")]
             profile: arc_swap::ArcSwapOption::empty(),
             #[cfg(feature = "bench")]
             hol_diagnostics_enabled: std::sync::atomic::AtomicBool::new(false),
@@ -2762,27 +3921,81 @@ impl WalV8ParallelIo {
             #[cfg(feature = "bench")]
             extent_preparation,
             completion_events,
-            completion_batch: Mutex::new(completion_batch),
+            direct_completions,
+            coalesce_ready_target,
+            #[cfg(feature = "bench")]
+            coalesce_ready_target_hits: AtomicU64::new(0),
+            #[cfg(feature = "bench")]
+            coalesce_target_eligible_cycles: AtomicU64::new(0),
+            #[cfg(feature = "bench")]
+            coalesce_target_mixed_fallback_cycles: AtomicU64::new(0),
+            #[cfg(feature = "bench")]
+            coalesce_target_initial_hits: AtomicU64::new(0),
+            #[cfg(feature = "bench")]
+            coalesce_target_after_wake_hits: AtomicU64::new(0),
             #[cfg(test)]
             progress_wait_hook: Mutex::new(None),
             #[cfg(test)]
             completion_reap_hook,
             progress_tokens,
             shutdown_started,
-            completion_thread: Mutex::new(Some(completion_thread)),
+            completion_thread: Mutex::new(completion_thread),
         }))
     }
 
     fn advance_and_snapshot(
         &self,
-        driver: &WalV8DurabilityDriver,
+        driver: &mut WalV8DurabilityDriver,
         capture_monotonic_ns: bool,
+    ) -> Result<WalV8FrontierReadySnapshot> {
+        self.advance_and_snapshot_after_wake(driver, capture_monotonic_ns)
+    }
+
+    fn advance_and_snapshot_after_wake(
+        &self,
+        driver: &mut WalV8DurabilityDriver,
+        capture_monotonic_ns: bool,
+    ) -> Result<WalV8FrontierReadySnapshot> {
+        self.advance_and_snapshot_inner(
+            driver,
+            capture_monotonic_ns,
+            #[cfg(feature = "bench")]
+            None,
+        )
+    }
+
+    #[cfg(feature = "bench")]
+    fn advance_and_snapshot_with_timing(
+        &self,
+        driver: &mut WalV8DurabilityDriver,
+        capture_monotonic_ns: bool,
+        timing: &mut WalV8CursorCoalescingTiming,
+    ) -> Result<WalV8FrontierReadySnapshot> {
+        self.advance_and_snapshot_after_wake_with_timing(driver, capture_monotonic_ns, timing)
+    }
+
+    #[cfg(feature = "bench")]
+    fn advance_and_snapshot_after_wake_with_timing(
+        &self,
+        driver: &mut WalV8DurabilityDriver,
+        capture_monotonic_ns: bool,
+        timing: &mut WalV8CursorCoalescingTiming,
+    ) -> Result<WalV8FrontierReadySnapshot> {
+        self.advance_and_snapshot_inner(driver, capture_monotonic_ns, Some(timing))
+    }
+
+    fn advance_and_snapshot_inner(
+        &self,
+        driver: &mut WalV8DurabilityDriver,
+        capture_monotonic_ns: bool,
+        #[cfg(feature = "bench")] mut timing: Option<&mut WalV8CursorCoalescingTiming>,
     ) -> Result<WalV8FrontierReadySnapshot> {
         ensure!(
             self.coordinator.owns_durability_driver(driver),
             "v8 progress scan is not owned by the active durability driver"
         );
-        let Some(receiver) = &self.completion_events else {
+        let has_direct_completion_queue = self.direct_completions.is_some();
+        if self.completion_events.is_none() && !has_direct_completion_queue {
             return Ok(if capture_monotonic_ns {
                 #[cfg(feature = "bench")]
                 {
@@ -2795,7 +4008,7 @@ impl WalV8ParallelIo {
             } else {
                 self.coordinator.frontier_ready_snapshot()
             });
-        };
+        }
 
         // The capacity-one token is persistent: consuming it before scanning
         // means a publisher racing after the scan leaves another token for the
@@ -2804,9 +4017,79 @@ impl WalV8ParallelIo {
             consume_progress_token_before_scan(tokens);
         }
 
-        let mut batch = self.completion_batch.lock();
+        let mut batch = driver
+            .completion_batch
+            .take()
+            .context("cursor durability driver completion buffer is missing")?;
+        #[cfg(feature = "bench")]
+        let completion_drain_wall_started = timing.as_ref().map(|_| Instant::now());
+        #[cfg(feature = "bench")]
+        let completion_drain_cpu_started = timing.as_ref().map(|_| digest::thread_cpu_time_ns());
+        let drain_result = (|| -> Result<()> {
+            let capacity = self.coordinator.completion_queue_capacity();
+            ensure!(
+                batch.len() <= capacity,
+                "cursor completion seed exceeds the reusable batch capacity"
+            );
+            let remaining_capacity = capacity - batch.len();
+            if let Some(receiver) = &self.completion_events {
+                self.drain_completion_events(receiver, &mut batch, remaining_capacity)
+            } else {
+                let Some(receiver) = self.direct_completions.as_ref() else {
+                    anyhow::bail!("Cursor direct completion queue is missing")
+                };
+                self.drain_direct_completion_events(receiver, &mut batch, remaining_capacity)
+            }
+        })();
+        #[cfg(feature = "bench")]
+        if let Some(timing) = timing.as_deref_mut() {
+            timing.completion_drain_wall_ns = timing.completion_drain_wall_ns.saturating_add(
+                completion_drain_wall_started
+                    .map(|started| started.elapsed().as_nanos().min(u64::MAX as u128) as u64)
+                    .unwrap_or_default(),
+            );
+            timing.completion_drain_cpu_ns = timing.completion_drain_cpu_ns.saturating_add(
+                completion_drain_cpu_started
+                    .map(|started| digest::thread_cpu_time_ns().saturating_sub(started))
+                    .unwrap_or_default(),
+            );
+        }
+        let snapshot = match drain_result {
+            Ok(()) => {
+                #[cfg(feature = "bench")]
+                {
+                    if let Some(timing) = timing.as_mut() {
+                        self.coordinator.advance_and_snapshot_with_timing(
+                            driver,
+                            &batch,
+                            capture_monotonic_ns,
+                            &mut timing.advance,
+                        )
+                    } else {
+                        self.coordinator
+                            .advance_and_snapshot(driver, &batch, capture_monotonic_ns)
+                    }
+                }
+                #[cfg(not(feature = "bench"))]
+                {
+                    self.coordinator
+                        .advance_and_snapshot(driver, &batch, capture_monotonic_ns)
+                }
+            }
+            Err(error) => Err(error),
+        };
         batch.clear();
-        for _ in 0..self.coordinator.completion_queue_capacity() {
+        driver.completion_batch = Some(batch);
+        snapshot
+    }
+
+    fn drain_completion_events(
+        &self,
+        receiver: &Receiver<WalV8CompletedGroupEvent>,
+        batch: &mut Vec<WalV8CompletedGroupEvent>,
+        limit: usize,
+    ) -> Result<()> {
+        for _ in 0..limit {
             match receiver.try_recv() {
                 Ok(event) => batch.push(event),
                 Err(crossbeam_channel::TryRecvError::Empty) => break,
@@ -2819,39 +4102,222 @@ impl WalV8ParallelIo {
                 }
             }
         }
-        let snapshot =
-            self.coordinator
-                .advance_and_snapshot(driver, &batch, capture_monotonic_ns)?;
-        batch.clear();
-        Ok(snapshot)
+        Ok(())
     }
 
-    fn coalesce_progress_ring(
+    fn drain_direct_completion_events(
         &self,
-        driver: &WalV8DurabilityDriver,
+        receiver: &Receiver<DirectGroupWriteCompletion>,
+        batch: &mut Vec<WalV8CompletedGroupEvent>,
+        limit: usize,
+    ) -> Result<()> {
+        let result = drain_direct_completion_queue(
+            receiver,
+            batch,
+            limit,
+            self.shutdown_started.load(Ordering::Acquire),
+        );
+        if result.is_err() {
+            self.coordinator.poison();
+        }
+        result
+    }
+
+    fn push_direct_completion_event(
+        &self,
+        completion: DirectGroupWriteCompletion,
+        batch: &mut Vec<WalV8CompletedGroupEvent>,
+    ) -> Result<()> {
+        match direct_completion_event(completion) {
+            Ok(event) => {
+                batch.push(event);
+                Ok(())
+            }
+            Err(error) => {
+                self.coordinator.poison();
+                Err(error)
+            }
+        }
+    }
+
+    fn coalesce_ready_target_reached(ready_prefix_len: usize, target: Option<usize>) -> bool {
+        target.is_some_and(|target| ready_prefix_len >= target)
+    }
+
+    fn coalesce_ready_prefix_with(
         snapshot: &mut WalV8FrontierReadySnapshot,
         budget: Duration,
-        capture_monotonic_ns: bool,
-    ) -> Result<bool> {
+        coalesce_policy: WalV8CoalesceTargetPolicy,
+        mut wait_and_advance: impl FnMut(Duration, &mut WalV8FrontierReadySnapshot) -> Result<bool>,
+    ) -> Result<WalV8CoalesceOutcome> {
         let deadline = Instant::now() + budget;
-        let mut waited = false;
+        #[cfg(feature = "bench")]
+        let mut saw_mixed_fallback =
+            matches!(coalesce_policy, WalV8CoalesceTargetPolicy::PointOnly(_))
+                && snapshot.has_outstanding_batch_tickets;
+        let mut outcome = WalV8CoalesceOutcome {
+            waited: false,
+            #[cfg(feature = "bench")]
+            target_hit: !snapshot.closed
+                && snapshot.ready_prefix.len() < snapshot.admitted_ticket_count
+                && Self::coalesce_ready_target_reached(
+                    snapshot.ready_prefix.len(),
+                    coalesce_policy.target_for_snapshot(snapshot),
+                ),
+            #[cfg(feature = "bench")]
+            eligible_cycle: false,
+            #[cfg(feature = "bench")]
+            mixed_fallback_cycle: false,
+        };
+
         while !snapshot.closed
+            && !Self::coalesce_ready_target_reached(
+                snapshot.ready_prefix.len(),
+                coalesce_policy.target_for_snapshot(snapshot),
+            )
             && let Some(remaining) = deadline.checked_duration_since(Instant::now())
         {
-            waited = true;
-            let signaled = self.wait_for_progress(remaining)?;
-            *snapshot = self.advance_and_snapshot(driver, capture_monotonic_ns)?;
+            outcome.waited = true;
+            let signaled = wait_and_advance(remaining, snapshot)?;
+            let current_target = coalesce_policy.target_for_snapshot(snapshot);
+            #[cfg(feature = "bench")]
+            {
+                if matches!(coalesce_policy, WalV8CoalesceTargetPolicy::PointOnly(_))
+                    && snapshot.has_outstanding_batch_tickets
+                {
+                    saw_mixed_fallback = true;
+                }
+                if signaled
+                    && !snapshot.closed
+                    && snapshot.ready_prefix.len() < snapshot.admitted_ticket_count
+                    && Self::coalesce_ready_target_reached(
+                        snapshot.ready_prefix.len(),
+                        current_target,
+                    )
+                {
+                    outcome.target_hit = true;
+                }
+            }
             if !signaled
                 || snapshot.ready_prefix.is_empty()
                 || snapshot.ready_prefix.len() >= snapshot.admitted_ticket_count
+                || Self::coalesce_ready_target_reached(snapshot.ready_prefix.len(), current_target)
             {
                 break;
             }
         }
-        Ok(waited)
+
+        #[cfg(feature = "bench")]
+        if !snapshot.closed {
+            match coalesce_policy {
+                WalV8CoalesceTargetPolicy::Disabled => {}
+                WalV8CoalesceTargetPolicy::Always(_) => {
+                    outcome.eligible_cycle = true;
+                }
+                WalV8CoalesceTargetPolicy::PointOnly(_) => {
+                    if saw_mixed_fallback {
+                        outcome.mixed_fallback_cycle = true;
+                    } else {
+                        outcome.eligible_cycle = true;
+                    }
+                }
+            }
+        }
+
+        Ok(outcome)
     }
 
-    fn wait_for_progress(&self, timeout: Duration) -> Result<bool> {
+    fn coalesce_progress_ring(
+        &self,
+        driver: &mut WalV8DurabilityDriver,
+        snapshot: &mut WalV8FrontierReadySnapshot,
+        budget: Duration,
+        capture_monotonic_ns: bool,
+        #[cfg(feature = "bench")] mut timing: Option<&mut WalV8CursorCoalescingTiming>,
+    ) -> Result<bool> {
+        let outcome = Self::coalesce_ready_prefix_with(
+            snapshot,
+            budget,
+            self.coalesce_ready_target,
+            |remaining, snapshot| {
+                #[cfg(feature = "bench")]
+                if let Some(timing) = timing.as_deref_mut() {
+                    timing.iterations = timing.iterations.saturating_add(1);
+                }
+                #[cfg(feature = "bench")]
+                let wait_wall_started = timing.as_ref().map(|_| Instant::now());
+                #[cfg(feature = "bench")]
+                let wait_cpu_started = timing.as_ref().map(|_| digest::thread_cpu_time_ns());
+                let wake = self.wait_for_progress(remaining)?;
+                let signaled = wake.is_signaled();
+                #[cfg(feature = "bench")]
+                if let Some(timing) = timing.as_deref_mut() {
+                    timing.progress_wait_wall_ns = timing.progress_wait_wall_ns.saturating_add(
+                        wait_wall_started
+                            .map(|started| {
+                                started.elapsed().as_nanos().min(u64::MAX as u128) as u64
+                            })
+                            .unwrap_or_default(),
+                    );
+                    timing.progress_wait_cpu_ns = timing.progress_wait_cpu_ns.saturating_add(
+                        wait_cpu_started
+                            .map(|started| digest::thread_cpu_time_ns().saturating_sub(started))
+                            .unwrap_or_default(),
+                    );
+                }
+                #[cfg(feature = "bench")]
+                let ready_before = snapshot.ready_prefix.len();
+                #[cfg(feature = "bench")]
+                if let Some(timing) = timing.as_deref_mut() {
+                    *snapshot = self.advance_and_snapshot_after_wake_with_timing(
+                        driver,
+                        capture_monotonic_ns,
+                        timing,
+                    )?;
+                } else {
+                    *snapshot =
+                        self.advance_and_snapshot_after_wake(driver, capture_monotonic_ns)?;
+                }
+                #[cfg(not(feature = "bench"))]
+                {
+                    *snapshot =
+                        self.advance_and_snapshot_after_wake(driver, capture_monotonic_ns)?;
+                }
+                #[cfg(feature = "bench")]
+                if let Some(timing) = timing.as_deref_mut() {
+                    timing.ready_tickets_gained = timing.ready_tickets_gained.saturating_add(
+                        snapshot.ready_prefix.len().saturating_sub(ready_before) as u64,
+                    );
+                }
+                Ok(signaled)
+            },
+        )?;
+        #[cfg(feature = "bench")]
+        {
+            if outcome.eligible_cycle {
+                self.coalesce_target_eligible_cycles
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            if outcome.mixed_fallback_cycle {
+                self.coalesce_target_mixed_fallback_cycles
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            if outcome.target_hit {
+                self.coalesce_ready_target_hits
+                    .fetch_add(1, Ordering::Relaxed);
+                if outcome.waited {
+                    self.coalesce_target_after_wake_hits
+                        .fetch_add(1, Ordering::Relaxed);
+                } else {
+                    self.coalesce_target_initial_hits
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        Ok(outcome.waited)
+    }
+
+    fn wait_for_progress(&self, timeout: Duration) -> Result<WalV8ProgressWake> {
         let Some(tokens) = &self.progress_tokens else {
             anyhow::bail!("v8 progress wait requested while the ring is disabled");
         };
@@ -2862,25 +4328,37 @@ impl WalV8ParallelIo {
                 hook(WalV8ProgressWaitTestEvent::BeforeWait);
             }
         }
-        let result = wait_for_progress_token(tokens, timeout);
+        let result = match wait_for_progress_token(tokens, timeout) {
+            WalV8ProgressTokenWait::Signaled => Ok(WalV8ProgressWake::Control),
+            WalV8ProgressTokenWait::TimedOut => Ok(WalV8ProgressWake::TimedOut),
+            WalV8ProgressTokenWait::Disconnected
+                if self.shutdown_started.load(Ordering::Acquire) =>
+            {
+                Ok(WalV8ProgressWake::TimedOut)
+            }
+            WalV8ProgressTokenWait::Disconnected => {
+                self.coordinator.poison();
+                anyhow::bail!("v8 progress token channel disconnected before teardown");
+            }
+        };
         #[cfg(test)]
         {
             let hook = self.progress_wait_hook.lock().clone();
             if let Some(hook) = hook {
-                hook(WalV8ProgressWaitTestEvent::AfterWait(result));
+                #[cfg(feature = "bench")]
+                let status = match &result {
+                    Ok(wake) => wake.wait_status(),
+                    Err(_) => WalV8ProgressTokenWait::Disconnected,
+                };
+                #[cfg(not(feature = "bench"))]
+                let status = match &result {
+                    Ok(wake) => wake.wait_status(),
+                    Err(_) => WalV8ProgressTokenWait::Disconnected,
+                };
+                hook(WalV8ProgressWaitTestEvent::AfterWait(status));
             }
         }
-        match result {
-            WalV8ProgressTokenWait::Signaled => Ok(true),
-            WalV8ProgressTokenWait::TimedOut => Ok(false),
-            WalV8ProgressTokenWait::Disconnected => {
-                if !self.shutdown_started.load(Ordering::Acquire) {
-                    self.coordinator.poison();
-                    anyhow::bail!("v8 progress token channel disconnected before teardown");
-                }
-                Ok(false)
-            }
-        }
+        result
     }
 
     #[cfg(test)]
@@ -3261,7 +4739,10 @@ impl WalV8ParallelIo {
             let mut cursor = allocation_start;
             let mut next_ticket = state.next_ticket;
             let mut selected = Vec::with_capacity(MAX_GROUP_TICKETS);
+            let mut selected_count = 0usize;
             let mut frontier_offsets = Vec::new();
+            #[cfg(test)]
+            let mut data_ranges = Vec::with_capacity(MAX_GROUP_TICKETS);
 
             'collect: while next_ticket < ticket_end {
                 let Some(pending) = state.pending.get(&next_ticket) else {
@@ -3286,40 +4767,31 @@ impl WalV8ParallelIo {
                         && pending.file_offset.is_multiple_of(FRAME_LEN_U64),
                     "v8 worker DATA buffer is not frame aligned"
                 );
+                #[cfg(test)]
+                let write_start = cursor;
                 cursor = cursor
                     .checked_add(u64::try_from(pending.buffer.len())?)
                     .context("v8 worker DATA end overflows")?;
+                #[cfg(test)]
+                data_ranges.push(write_start..cursor);
                 selected.push(next_ticket);
+                selected_count = selected_count
+                    .checked_add(1)
+                    .context("v8 worker selected ticket count overflows")?;
                 next_ticket = next_ticket
                     .checked_add(1)
                     .context("v8 worker ticket overflows")?;
             }
-            if selected.is_empty() {
+            if selected_count == 0 {
                 return Ok(0);
             }
 
             self.ensure_extent_prepared_through(cursor)?;
             let mut writes = Vec::with_capacity(selected.len());
-            for ticket in &selected {
-                let pending = state
-                    .pending
-                    .remove(ticket)
-                    .context("v8 worker pending DATA disappeared")?;
-                let write_len = pending.buffer.len();
-                let write_end = pending
-                    .file_offset
-                    .checked_add(u64::try_from(write_len)?)
-                    .context("v8 DATA source-credit range overflows")?;
-                // The driver transfers credit for FRONTIER gaps separately.
-                self.consume_extent_source_credit(pending.file_offset, write_end)?;
-                let write = WriteBuffer::new(pending.buffer, pending.file_offset, write_len);
-                #[cfg(feature = "bench")]
-                let write = match pending.frame_ready_at {
-                    Some(frame_ready_at) => write.with_ticket_timeline(*ticket, frame_ready_at),
-                    None => write,
-                };
-                writes.push(write);
+            for ticket in selected {
+                writes.push(self.take_pending_write(state, ticket)?);
             }
+            let writes: WriteGroupBuffers<WalV8DataBuffer> = writes.into();
 
             let group = WriteGroup::new_with_frontiers(
                 state.next_ticket..next_ticket,
@@ -3328,6 +4800,15 @@ impl WalV8ParallelIo {
                 &frontier_offsets,
             )
             .map_err(|error| anyhow::anyhow!("build v8 DATA worker group: {error:?}"))?;
+            #[cfg(test)]
+            state
+                .submitted_group_snapshots
+                .push(WalV8SubmittedGroupSnapshot {
+                    tickets: state.next_ticket..next_ticket,
+                    allocation_range: allocation_start..cursor,
+                    data_ranges,
+                    frontier_offsets: frontier_offsets.clone(),
+                });
             self.client
                 .submit_group(group)
                 .context("submit v8 DATA worker group")?;
@@ -3343,10 +4824,36 @@ impl WalV8ParallelIo {
                 self.update_data_submit_hol(state);
             }
 
-            return Ok(selected.len());
+            return Ok(selected_count);
         }
 
         Ok(0)
+    }
+
+    fn take_pending_write(
+        &self,
+        state: &mut WalV8SubmissionState,
+        ticket: u64,
+    ) -> Result<WriteBuffer<WalV8DataBuffer>> {
+        let pending = state
+            .pending
+            .remove(&ticket)
+            .context("v8 worker pending DATA disappeared")?;
+        let write_len = pending.buffer.len();
+        let write_end = pending
+            .file_offset
+            .checked_add(u64::try_from(write_len)?)
+            .context("v8 DATA source-credit range overflows")?;
+        // The driver transfers credit for FRONTIER gaps separately.
+        self.consume_extent_source_credit(pending.file_offset, write_end)?;
+        let write = WriteBuffer::new(pending.buffer, pending.file_offset, write_len);
+        #[cfg(feature = "bench")]
+        let write = match pending.frame_ready_at {
+            Some(frame_ready_at) => write.with_ticket_timeline(ticket, frame_ready_at),
+            None => write,
+        };
+
+        Ok(write)
     }
 }
 
@@ -3518,7 +5025,11 @@ impl WalV8FrameJob<'_> {
     }
 
     pub(crate) fn finish(self) -> Result<digest::WalV8DigestMetrics> {
-        self.finish_with_point_direct_frame(Self::point_direct_frame_enabled())
+        #[cfg(feature = "bench")]
+        let enabled = self.io.point_direct_frame_enabled;
+        #[cfg(not(feature = "bench"))]
+        let enabled = false;
+        self.finish_with_point_direct_frame(enabled)
     }
 
     #[cfg(feature = "bench")]
@@ -3526,10 +5037,8 @@ impl WalV8FrameJob<'_> {
         self,
     ) -> Result<(digest::WalV8DigestMetrics, WalV8ProducerCpuPhases)> {
         let mut phases = WalV8ProducerCpuPhases::default();
-        let metrics = self.finish_with_point_direct_frame_and_phases(
-            Self::point_direct_frame_enabled(),
-            Some(&mut phases),
-        )?;
+        let enabled = self.io.point_direct_frame_enabled;
+        let metrics = self.finish_with_point_direct_frame_and_phases(enabled, Some(&mut phases))?;
         Ok((metrics, phases))
     }
 
@@ -3538,20 +5047,6 @@ impl WalV8FrameJob<'_> {
         direct_point_enabled: bool,
     ) -> Result<digest::WalV8DigestMetrics> {
         self.finish_with_point_direct_frame_and_phases(direct_point_enabled, None)
-    }
-
-    fn point_direct_frame_enabled() -> bool {
-        #[cfg(feature = "bench")]
-        {
-            static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            *ENABLED.get_or_init(|| {
-                std::env::var("TOYKV_BENCH_V8_POINT_DIRECT_FRAME").as_deref() == Ok("1")
-            })
-        }
-        #[cfg(not(feature = "bench"))]
-        {
-            false
-        }
     }
 
     fn finish_with_point_direct_frame_and_phases(
@@ -3607,9 +5102,12 @@ impl WalV8FrameJob<'_> {
             .map(|_| (Instant::now(), digest::thread_cpu_time_ns()));
         let digest_ready = encoded.digest_ready()?;
         #[cfg(feature = "bench")]
-        let ordered_link_hash_cpu_ns = self.coordinator.mark_digest_ready_with_cpu(digest_ready)?;
+        let ordered_link_hash_cpu_ns = self
+            .coordinator
+            .mark_digest_ready_before_data(digest_ready)?;
         #[cfg(not(feature = "bench"))]
-        self.coordinator.mark_digest_ready(digest_ready)?;
+        self.coordinator
+            .mark_digest_ready_before_data(digest_ready)?;
         #[cfg(feature = "bench")]
         if let (Some(phases), Some((wall_started, cpu_started))) =
             (phases.as_deref_mut(), digest_started)
@@ -3745,7 +5243,6 @@ impl WalV8AdmissionPublisher for WalV8LeaderAdmissionPublisher<'_> {
         &self,
         plan: WalV8AdmissionPlan,
     ) -> Result<(WalV8BatchAssignment, Self::Guard)> {
-        #[cfg(feature = "bench")]
         let admitted = self
             .coordinator
             .admit_and_publish_with(plan, |assignment| {
@@ -3767,8 +5264,6 @@ impl WalV8AdmissionPublisher for WalV8LeaderAdmissionPublisher<'_> {
 
                 Ok(())
             })?;
-        #[cfg(not(feature = "bench"))]
-        let admitted = self.coordinator.admit_and_publish(plan)?;
         if let Some(reservation) = self.reservation.borrow_mut().as_mut() {
             reservation.mark_admitted();
         }
@@ -3891,7 +5386,7 @@ impl WalV8LeaderWriter {
                 max_inflight_tickets: MAX_PARALLEL_INFLIGHT_TICKETS,
                 max_inflight_bytes: max_file_size,
                 max_file_size,
-                progress_ring_enabled: false,
+                progress_mode: WalV8ProgressMode::Eager,
             },
         )?;
         ensure!(
@@ -3909,6 +5404,63 @@ impl WalV8LeaderWriter {
             extent_preparation: None,
             sliding_extent_preparation: None,
             progress_ring_enabled: false,
+            progress_cursor_enabled: false,
+            cursor_direct_completion_enabled: false,
+            cursor_direct_completion_select_wake_enabled: false,
+            coalesce_ready_target: None,
+            coalesce_ready_target_hits: 0,
+            coalesce_target_policy: "disabled",
+            coalesce_target_eligible_cycles: 0,
+            coalesce_target_mixed_fallback_cycles: 0,
+            coalesce_target_initial_hits: 0,
+            coalesce_target_after_wake_hits: 0,
+            cursor_singleton_submission_enabled: false,
+            admission_cursor_publish_fast_path_enabled: false,
+            point_buffer_preallocation_enabled: false,
+            independent_ack_waiter_enabled: false,
+            dedicated_durability_driver_enabled: false,
+            dedicated_durability_diagnostics_enabled: false,
+            dedicated_durability_requests: 0,
+            dedicated_durability_wake_signals: 0,
+            dedicated_durability_coalesced_wakes: 0,
+            dedicated_durability_advance_attempts: 0,
+            caller_durability_driver_election_attempts: 0,
+            point_buffer_preallocation_attempts: 0,
+            point_buffer_preallocation_hits: 0,
+            point_buffer_preallocation_fallbacks: 0,
+            point_resource_retirement_mode: 0,
+            point_resource_retirement_detached_prefixes: 0,
+            point_resource_retirement_detached_tickets: 0,
+            point_resource_retirement_batched_prefixes: 0,
+            point_buffer_preallocations_in_flight: 0,
+            point_resource_preclaim_enabled: false,
+            point_resource_preclaim_sum_cache_enabled: false,
+            point_resource_preclaim_after_buffer_enabled: false,
+            point_resource_preclaim_attempts: 0,
+            point_resource_preclaim_granted: 0,
+            point_resource_preclaim_promoted: 0,
+            point_resource_preclaim_invalidated: 0,
+            point_resource_preclaim_owner_trylock_busy: 0,
+            point_resource_preclaim_owner_retired: 0,
+            point_resource_preclaim_ledger_trylock_busy: 0,
+            point_resource_preclaim_max_preclaims: 0,
+            point_resource_preclaim_max_live: 0,
+            point_resource_preclaim_logical_quota_rejected: 0,
+            point_resource_preclaim_source_spool_quota_rejected: 0,
+            point_resource_preclaim_buffer_quota_rejected: 0,
+            point_resource_preclaim_seal_index_quota_rejected: 0,
+            point_resource_preclaim_recovery_workspace_rejected: 0,
+            point_resource_preclaim_arithmetic_rejected: 0,
+            point_resource_preclaim_invalid_charge_rejected: 0,
+            point_resource_preclaim_fallbacks: 0,
+            point_resource_preclaim_revoked: 0,
+            point_resource_preclaim_abandoned: 0,
+            point_resource_preclaim_cpu_sample_every: 0,
+            point_resource_preclaim_cpu_ns: 0,
+            point_resource_preclaim_cpu_samples: 0,
+            point_resource_preclaim_promotion_cpu_ns: 0,
+            point_resource_preclaim_promotion_cpu_samples: 0,
+            progress_diagnostics: None,
         };
 
         Ok(Self {
@@ -3986,18 +5538,80 @@ impl WalV8LeaderWriter {
         self,
         worker_file: File,
     ) -> Result<WalV8ParallelWriter> {
-        #[cfg(feature = "bench")]
-        let progress_ring_enabled = progress_ring_enabled_from_environment()?;
-        #[cfg(not(feature = "bench"))]
-        let progress_ring_enabled = false;
-
-        self.into_parallel_with_worker_file_and_progress_ring(worker_file, progress_ring_enabled)
+        let requested = WalV8RequestedConfig::from_environment()?;
+        self.into_parallel_with_worker_file_and_config(worker_file, requested)
     }
 
-    fn into_parallel_with_worker_file_and_progress_ring(
+    /// Transfer the validated image and coordinator to the concurrent
+    /// producer path using a pre-parsed requested configuration.
+    pub(crate) fn into_parallel_with_worker_file_and_config(
+        self,
+        worker_file: File,
+        requested: WalV8RequestedConfig,
+    ) -> Result<WalV8ParallelWriter> {
+        self.into_parallel_with_worker_file_config_and_overrides(
+            worker_file,
+            requested,
+            #[cfg(test)]
+            None,
+            #[cfg(test)]
+            None,
+        )
+    }
+
+    fn into_parallel_with_worker_file_and_progress_mode(
+        self,
+        worker_file: File,
+        progress_mode: WalV8ProgressMode,
+    ) -> Result<WalV8ParallelWriter> {
+        #[cfg(feature = "bench")]
+        let direct_completion_enabled =
+            cursor_direct_completion_enabled_from_environment(progress_mode)?;
+        #[cfg(not(feature = "bench"))]
+        let direct_completion_enabled =
+            production_direct_completion_enabled_from_environment(progress_mode)?;
+        let requested = WalV8RequestedConfig::from_environment()?
+            .with_progress_and_completion(progress_mode, direct_completion_enabled);
+
+        self.into_parallel_with_worker_file_config_and_overrides(
+            worker_file,
+            requested,
+            #[cfg(test)]
+            None,
+            #[cfg(test)]
+            None,
+        )
+    }
+
+    fn into_parallel_with_worker_file_progress_and_completion(
+        self,
+        worker_file: File,
+        progress_mode: WalV8ProgressMode,
+        direct_completion_enabled: bool,
+        frontier_mode: WalV8FrontierWriteMode,
+        #[cfg(test)] worker_group_limit: Option<usize>,
+        #[cfg(test)] extent_strategy_override: Option<(WalV8ExtentPreparationStrategy, u64)>,
+    ) -> Result<WalV8ParallelWriter> {
+        let mut requested = WalV8RequestedConfig::from_environment()?
+            .with_progress_and_completion(progress_mode, direct_completion_enabled);
+        requested.frontier_mode = frontier_mode;
+
+        self.into_parallel_with_worker_file_config_and_overrides(
+            worker_file,
+            requested,
+            #[cfg(test)]
+            worker_group_limit,
+            #[cfg(test)]
+            extent_strategy_override,
+        )
+    }
+
+    fn into_parallel_with_worker_file_config_and_overrides(
         mut self,
         worker_file: File,
-        progress_ring_enabled: bool,
+        requested: WalV8RequestedConfig,
+        #[cfg(test)] worker_group_limit: Option<usize>,
+        #[cfg(test)] extent_strategy_override: Option<(WalV8ExtentPreparationStrategy, u64)>,
     ) -> Result<WalV8ParallelWriter> {
         validate_positional_write_handle(&worker_file)
             .context("validate v8 WAL I/O worker handle")?;
@@ -4010,14 +5624,24 @@ impl WalV8LeaderWriter {
                 && worker_metadata.len() >= self.coordinator.last_frontier_end(),
             "v8 WAL I/O worker handle does not refer to the installed Active inode"
         );
+        let effective_config = WalV8EffectiveConfig::resolve_with_test_override(
+            &requested,
+            &worker_file,
+            self.reservation_owner.is_some(),
+            #[cfg(test)]
+            extent_strategy_override,
+        )?;
         self.coordinator = self
             .coordinator
-            .with_progress_ring_mode(self.header, progress_ring_enabled)?;
+            .with_progress_mode(self.header, effective_config.progress_mode)?;
+        #[cfg(feature = "bench")]
+        self.coordinator
+            .set_progress_counters_enabled(effective_config.progress_counters_enabled)?;
         #[cfg(feature = "bench")]
         let profile = self.profile.load_full();
         #[cfg(feature = "bench")]
         if let Some(profile) = &profile {
-            if progress_ring_enabled {
+            if effective_config.progress_mode.uses_ring() {
                 profile.validate_v8_progress_ring_compatibility()?;
             }
             self.coordinator
@@ -4027,175 +5651,182 @@ impl WalV8LeaderWriter {
         }
         #[cfg(feature = "bench")]
         let mut io_diagnostics = self.io_diagnostics;
-        #[cfg(feature = "bench")]
-        let coalesce_budget_override_us = coalesce_budget_override_from_environment()?;
-        #[cfg(feature = "bench")]
-        let batch_point_frontier_credits = point_frontier_credit_batch_from_environment()?;
+        let coalesce_ready_target = effective_config.coalesce_policy;
+        let point_buffer_preallocation_enabled =
+            effective_config.point_buffer_preallocation_enabled;
         #[cfg(feature = "bench")]
         {
             io_diagnostics.data = WalIoHandleMetadata::from_file(&worker_file)?;
-            io_diagnostics.progress_ring_enabled = progress_ring_enabled;
+            io_diagnostics.progress_ring_enabled = effective_config.progress_mode.uses_ring();
+            io_diagnostics.progress_cursor_enabled = self.coordinator.progress_cursor_enabled();
+            io_diagnostics.cursor_direct_completion_enabled =
+                effective_config.direct_completion_enabled;
+            io_diagnostics.cursor_direct_completion_select_wake_enabled = false;
+            io_diagnostics.cursor_singleton_submission_enabled = false;
+            io_diagnostics.point_buffer_preallocation_enabled = point_buffer_preallocation_enabled;
         }
         #[cfg(feature = "bench")]
-        let (extent_preallocator, extent_preparation) =
-            match WalExtentPreparationMode::from_environment()? {
-                Some((mode, window_bytes)) if mode.is_sliding() => {
-                    let start_offset = self.coordinator.last_frontier_end();
-                    let owned_preallocator = match mode {
-                        WalExtentPreparationMode::SlidingLookahead => {
-                            let owner = self.reservation_owner.as_ref().context(
-                                "sliding lookahead benchmark requires PITR quota accounting",
-                            )?;
-                            Some(Arc::new(WalV8ExtentPreallocator::new_with_lookahead(
-                                worker_file
-                                    .try_clone()
-                                    .context("clone v8 WAL handle for sliding extent lookahead")?,
+        type ExtentPrep = Option<Arc<WalV8SlidingExtentPreparation>>;
+        #[cfg(not(feature = "bench"))]
+        type ExtentPrep = Option<()>;
+        let (extent_preallocator, _extent_preparation): (
+            Option<Arc<WalV8ExtentPreallocator>>,
+            ExtentPrep,
+        ) = {
+            let start_offset = self.coordinator.last_frontier_end();
+            #[cfg(feature = "bench")]
+            let extent_policy_storage = effective_config.extent_policy_storage;
+            #[cfg(not(feature = "bench"))]
+            let extent_policy_storage = WalV8ExtentPolicyStorageKind::Vec;
+            #[cfg(feature = "bench")]
+            let extent_policy_scan_diagnostics_enabled =
+                effective_config.extent_policy_scan_diagnostics_enabled;
+            #[cfg(not(feature = "bench"))]
+            let extent_policy_scan_diagnostics_enabled = false;
+
+            let preallocate_with_strategy = |strategy: WalV8ExtentPreparationStrategy,
+                                             owner: &Arc<WalV8ReservationOwner>|
+             -> Result<Arc<WalV8ExtentPreallocator>> {
+                Ok(Arc::new(
+                    WalV8ExtentPreallocator::new_with_strategy_and_policy_config(
+                        worker_file
+                            .try_clone()
+                            .context("clone v8 WAL handle for extent preparation")?,
+                        &self.sync_file,
+                        start_offset,
+                        self.max_file_size,
+                        effective_config.extent_window_bytes,
+                        Some(Arc::clone(owner)),
+                        strategy,
+                        extent_policy_storage,
+                        extent_policy_scan_diagnostics_enabled,
+                    )?,
+                ))
+            };
+
+            match effective_config.extent_policy {
+                WalV8ExtentPreparationPolicy::Disabled => (None, None),
+                WalV8ExtentPreparationPolicy::FallocateOnly
+                | WalV8ExtentPreparationPolicy::Lookahead
+                | WalV8ExtentPreparationPolicy::PointOnlyLookahead => {
+                    let strategy = match effective_config.extent_policy {
+                        WalV8ExtentPreparationPolicy::FallocateOnly => {
+                            WalV8ExtentPreparationStrategy::FallocateOnly
+                        }
+                        WalV8ExtentPreparationPolicy::Lookahead => {
+                            WalV8ExtentPreparationStrategy::Lookahead
+                        }
+                        WalV8ExtentPreparationPolicy::PointOnlyLookahead => {
+                            WalV8ExtentPreparationStrategy::PointOnlyLookahead
+                        }
+                        _ => unreachable!(),
+                    };
+                    if let Some(owner) = &self.reservation_owner {
+                        let preallocator = preallocate_with_strategy(strategy, owner)?;
+                        #[cfg(feature = "bench")]
+                        {
+                            io_diagnostics.sliding_extent_preparation =
+                                Some(preallocator.diagnostics());
+                        }
+                        (Some(preallocator), None)
+                    } else {
+                        #[cfg(feature = "bench")]
+                        {
+                            let preparation = Arc::new(WalV8SlidingExtentPreparation::new(
+                                worker_file.try_clone().context(
+                                    "clone v8 WAL handle for sliding extent preparation",
+                                )?,
                                 &self.sync_file,
                                 start_offset,
                                 self.max_file_size,
-                                window_bytes,
-                                Some(Arc::clone(owner)),
-                                true,
-                            )?))
+                                effective_config.extent_window_bytes,
+                                WalExtentPreparationMode::SlidingFallocate,
+                            )?);
+                            io_diagnostics.sliding_extent_preparation =
+                                Some(preparation.diagnostics());
+                            (None, Some(preparation))
                         }
-                        WalExtentPreparationMode::SlidingPointLookahead => {
-                            let owner = self.reservation_owner.as_ref().context(
-                                "point-only sliding lookahead benchmark requires PITR quota accounting",
-                            )?;
-                            Some(Arc::new(
-                                WalV8ExtentPreallocator::new_with_point_only_lookahead(
-                                    worker_file.try_clone().context(
-                                        "clone v8 WAL handle for point-only extent lookahead",
-                                    )?,
-                                    &self.sync_file,
-                                    start_offset,
-                                    self.max_file_size,
-                                    window_bytes,
-                                    Arc::clone(owner),
-                                )?,
-                            ))
-                        }
-                        WalExtentPreparationMode::SlidingFallocate => {
-                            if let Some(owner) = &self.reservation_owner {
-                                Some(Arc::new(WalV8ExtentPreallocator::new(
-                                    worker_file.try_clone().context(
-                                        "clone v8 WAL handle for sliding extent preparation",
-                                    )?,
-                                    &self.sync_file,
-                                    start_offset,
-                                    self.max_file_size,
-                                    window_bytes,
-                                    Some(Arc::clone(owner)),
-                                )?))
-                            } else {
-                                None
-                            }
-                        }
-                        WalExtentPreparationMode::SlidingInitialize => None,
-                        WalExtentPreparationMode::Fallocate
-                        | WalExtentPreparationMode::Initialize => {
-                            anyhow::bail!("invalid sliding V8 extent preparation mode")
-                        }
-                    };
-                    if let Some(preallocator) = owned_preallocator {
-                        io_diagnostics.sliding_extent_preparation =
-                            Some(preallocator.diagnostics());
-
-                        (Some(preallocator), None)
-                    } else {
-                        // Unit tests and non-PITR benchmark constructors have
-                        // no image quota owner. Preserve their explicit
-                        // benchmark preparation behavior without enabling it
-                        // in the production path.
-                        let preparation = Arc::new(WalV8SlidingExtentPreparation::new(
-                            worker_file
-                                .try_clone()
-                                .context("clone v8 WAL handle for sliding extent preparation")?,
-                            &self.sync_file,
-                            start_offset,
-                            self.max_file_size,
-                            window_bytes,
-                            mode,
-                        )?);
-                        io_diagnostics.sliding_extent_preparation = Some(preparation.diagnostics());
-
-                        (None, Some(preparation))
+                        #[cfg(not(feature = "bench"))]
+                        (None, None)
                     }
                 }
-                Some((mode, bytes)) => {
+                #[cfg(feature = "bench")]
+                WalV8ExtentPreparationPolicy::SlidingInitialize => {
+                    let preparation = Arc::new(WalV8SlidingExtentPreparation::new(
+                        worker_file
+                            .try_clone()
+                            .context("clone v8 WAL handle for sliding extent preparation")?,
+                        &self.sync_file,
+                        start_offset,
+                        self.max_file_size,
+                        effective_config.extent_window_bytes,
+                        WalExtentPreparationMode::SlidingInitialize,
+                    )?);
+                    io_diagnostics.sliding_extent_preparation = Some(preparation.diagnostics());
+                    (None, Some(preparation))
+                }
+                #[cfg(feature = "bench")]
+                WalV8ExtentPreparationPolicy::OneShotFallocate => {
                     io_diagnostics.extent_preparation = Some(prepare_v8_extent_suffix(
                         &worker_file,
                         &self.sync_file,
-                        self.coordinator.last_frontier_end(),
+                        start_offset,
                         self.max_file_size,
-                        mode,
-                        bytes,
+                        WalExtentPreparationMode::Fallocate,
+                        effective_config.extent_window_bytes,
                     )?);
-
                     (None, None)
                 }
-                None => (None, None),
-            };
-        #[cfg(feature = "bench")]
-        let frontier_file = match WalV8FrontierWriteMode::from_environment()? {
-            WalV8FrontierWriteMode::Buffered => self.write_file,
-            WalV8FrontierWriteMode::Direct => {
-                ensure!(
-                    io_diagnostics.data.o_direct == Some(true),
-                    "direct FRONTIER experiment requires an O_DIRECT DATA worker"
-                );
-                worker_file
-                    .try_clone()
-                    .context("clone direct V8 WAL DATA handle for FRONTIER writes")?
+                #[cfg(feature = "bench")]
+                WalV8ExtentPreparationPolicy::OneShotInitialize => {
+                    io_diagnostics.extent_preparation = Some(prepare_v8_extent_suffix(
+                        &worker_file,
+                        &self.sync_file,
+                        start_offset,
+                        self.max_file_size,
+                        WalExtentPreparationMode::Initialize,
+                        effective_config.extent_window_bytes,
+                    )?);
+                    (None, None)
+                }
             }
         };
+        let frontier_file = match effective_config.frontier_mode {
+            WalV8FrontierWriteMode::Buffered => self.write_file,
+            WalV8FrontierWriteMode::Direct => worker_file
+                .try_clone()
+                .context("clone direct V8 WAL DATA handle for FRONTIER writes")?,
+        };
+        let frontier_metadata = frontier_file
+            .metadata()
+            .context("inspect v8 WAL FRONTIER handle")?;
+        ensure!(
+            frontier_metadata.dev() == self.installed_dev
+                && frontier_metadata.ino() == self.installed_ino,
+            "V8 WAL FRONTIER handle does not refer to the installed Active inode"
+        );
         #[cfg(feature = "bench")]
         {
             io_diagnostics.frontier = WalIoHandleMetadata::from_file(&frontier_file)?;
-            ensure!(
-                io_diagnostics.frontier.device == io_diagnostics.data.device
-                    && io_diagnostics.frontier.inode == io_diagnostics.data.inode,
-                "V8 WAL FRONTIER handle does not refer to the DATA inode"
-            );
         }
-        #[cfg(not(feature = "bench"))]
-        let frontier_file = self.write_file;
-        #[cfg(not(feature = "bench"))]
-        let extent_preallocator = {
-            let lookahead = wal_v8_extent_lookahead_from_environment()?;
-            let eligible = self.reservation_owner.is_some()
-                && is_ext_family_filesystem(&worker_file)
-                && is_o_direct_file(&worker_file)?;
-            ensure!(
-                !lookahead || eligible,
-                "{WAL_V8_EXTENT_LOOKAHEAD_ENV} requires an ext4 WAL, an O_DIRECT DATA worker, and a quota owner"
-            );
-            if let Some(owner) = &self.reservation_owner
-                && eligible
-            {
-                Some(Arc::new(WalV8ExtentPreallocator::new_with_lookahead(
-                    worker_file
-                        .try_clone()
-                        .context("clone v8 WAL handle for production extent preparation")?,
-                    &self.sync_file,
-                    self.coordinator.last_frontier_end(),
-                    self.max_file_size,
-                    WAL_V8_PRODUCTION_EXTENT_WINDOW_BYTES,
-                    Some(Arc::clone(owner)),
-                    lookahead,
-                )?))
-            } else {
-                None
-            }
-        };
         let initial_ticket = self.coordinator.next_ticket();
         let io = WalV8ParallelIo::spawn(
             worker_file,
             self.coordinator.clone(),
             initial_ticket,
             extent_preallocator,
-            #[cfg(feature = "bench")]
-            extent_preparation,
+            WalV8ParallelIoConfig {
+                #[cfg(feature = "bench")]
+                extent_preparation: _extent_preparation,
+                direct_completion_enabled: effective_config.direct_completion_enabled,
+                coalesce_ready_target,
+                #[cfg(feature = "bench")]
+                data_submit_ready_order: effective_config.data_submit_ready_order,
+                #[cfg(feature = "bench")]
+                point_direct_frame_enabled: effective_config.point_direct_frame_enabled,
+                #[cfg(test)]
+                worker_group_limit,
+            },
         )?;
         #[cfg(feature = "bench")]
         if let Some(profile) = profile {
@@ -4226,10 +5857,17 @@ impl WalV8LeaderWriter {
             initial_ticket,
             #[cfg(feature = "bench")]
             io_diagnostics,
+            point_buffer_preallocation_enabled,
+            effective_config,
+            #[cfg(test)]
+            point_buffer_preallocation_test_override: AtomicBool::new(false),
             #[cfg(feature = "bench")]
-            coalesce_budget_override_us,
+            point_buffer_preallocation_attempts: AtomicU64::new(0),
+            #[cfg(any(test, feature = "bench"))]
+            point_buffer_preallocation_hits: AtomicU64::new(0),
             #[cfg(feature = "bench")]
-            batch_point_frontier_credits,
+            point_buffer_preallocation_fallbacks: AtomicU64::new(0),
+            point_buffer_preallocations_in_flight: Arc::new(AtomicUsize::new(0)),
             #[cfg(feature = "bench")]
             profile: self.profile,
         })
@@ -4798,13 +6436,107 @@ impl WalV8ParallelWriter {
         self.coordinator.progress_ring_enabled()
     }
 
+    #[cfg(test)]
+    pub(crate) fn uses_cursor_direct_completion(&self) -> bool {
+        self.coordinator.progress_cursor_enabled()
+            && self.io.direct_completions.is_some()
+            && self.io.completion_events.is_none()
+            && self.io.completion_thread.lock().is_none()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn uses_direct_frontier(&self) -> Result<bool> {
+        is_o_direct_file(&self.frontier_file)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn effective_config(&self) -> WalV8EffectiveConfig {
+        self.effective_config
+    }
+
     #[cfg(feature = "bench")]
     pub(crate) fn io_diagnostics(&self) -> WalIoDiagnostics {
         let mut diagnostics = self.io_diagnostics;
         diagnostics.sliding_extent_preparation = self.io.extent_preparation_diagnostics();
         diagnostics.progress_ring_enabled = self.coordinator.progress_ring_enabled();
+        diagnostics.progress_cursor_enabled = self.coordinator.progress_cursor_enabled();
+        diagnostics.coalesce_ready_target = self.io.coalesce_ready_target.target_count();
+        diagnostics.coalesce_ready_target_hits =
+            self.io.coalesce_ready_target_hits.load(Ordering::Relaxed);
+        diagnostics.coalesce_target_policy = self.io.coalesce_ready_target.policy_name();
+        diagnostics.coalesce_target_eligible_cycles = self
+            .io
+            .coalesce_target_eligible_cycles
+            .load(Ordering::Relaxed);
+        diagnostics.coalesce_target_mixed_fallback_cycles = self
+            .io
+            .coalesce_target_mixed_fallback_cycles
+            .load(Ordering::Relaxed);
+        diagnostics.coalesce_target_initial_hits =
+            self.io.coalesce_target_initial_hits.load(Ordering::Relaxed);
+        diagnostics.coalesce_target_after_wake_hits = self
+            .io
+            .coalesce_target_after_wake_hits
+            .load(Ordering::Relaxed);
+        diagnostics.progress_diagnostics = self.coordinator.progress_diagnostics();
+        diagnostics.point_buffer_preallocation_attempts = self
+            .point_buffer_preallocation_attempts
+            .load(Ordering::Relaxed);
+        diagnostics.point_buffer_preallocation_hits =
+            self.point_buffer_preallocation_hits.load(Ordering::Relaxed);
+        diagnostics.point_buffer_preallocation_fallbacks = self
+            .point_buffer_preallocation_fallbacks
+            .load(Ordering::Relaxed);
+        diagnostics.point_buffer_preallocations_in_flight = u64::try_from(
+            self.point_buffer_preallocations_in_flight
+                .load(Ordering::Relaxed),
+        )
+        .expect("outstanding preallocation permits fit in u64");
+        #[cfg(test)]
+        {
+            diagnostics.point_buffer_preallocation_enabled |= self
+                .point_buffer_preallocation_test_override
+                .load(Ordering::Relaxed);
+        }
 
         diagnostics
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_point_buffer_preallocation_for_test(&self, enabled: bool) {
+        self.point_buffer_preallocation_test_override
+            .store(enabled, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn point_buffer_preallocation_enabled_for_test(&self) -> bool {
+        self.should_preallocate_point_buffer()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn point_buffer_preallocations_in_flight_for_test(&self) -> usize {
+        self.point_buffer_preallocations_in_flight
+            .load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn point_buffer_preallocation_hits_for_test(&self) -> u64 {
+        self.point_buffer_preallocation_hits.load(Ordering::Relaxed)
+    }
+
+    fn should_preallocate_point_buffer(&self) -> bool {
+        #[cfg(test)]
+        {
+            self.point_buffer_preallocation_enabled
+                || self
+                    .point_buffer_preallocation_test_override
+                    .load(Ordering::Relaxed)
+        }
+
+        #[cfg(not(test))]
+        {
+            self.point_buffer_preallocation_enabled
+        }
     }
 
     #[cfg(feature = "bench")]
@@ -4971,6 +6703,81 @@ impl WalV8ParallelWriter {
         self.admit_prepared_batch_inner(prepared, commit_ts, recorded_at, || {})
     }
 
+    /// Prepare optional Point scratch before the sequencer. The return value
+    /// indicates whether the DATA buffer was preallocated.
+    pub(crate) fn try_preallocate_point_buffer(
+        &self,
+        scratch: &mut WalV8PointAdmissionScratch<'_>,
+    ) -> bool {
+        self.try_preallocate_point_buffer_only(scratch)
+    }
+
+    fn try_preallocate_point_buffer_only(
+        &self,
+        scratch: &mut WalV8PointAdmissionScratch<'_>,
+    ) -> bool {
+        if !self.should_preallocate_point_buffer() {
+            return false;
+        }
+        #[cfg(feature = "bench")]
+        self.point_buffer_preallocation_attempts
+            .fetch_add(1, Ordering::Relaxed);
+
+        if scratch.prepared.write_class() != WalV8WriteClass::Point
+            || scratch.prepared.frame_buffer_bytes() != WAL_V8_FRAME_LEN
+        {
+            #[cfg(feature = "bench")]
+            self.point_buffer_preallocation_fallbacks
+                .fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        let Some(permit) = WalV8PointBufferPreallocationPermit::try_acquire(
+            &self.point_buffer_preallocations_in_flight,
+        ) else {
+            #[cfg(feature = "bench")]
+            self.point_buffer_preallocation_fallbacks
+                .fetch_add(1, Ordering::Relaxed);
+            return false;
+        };
+
+        // This allocation is bounded to one frame and never charges shared
+        // quota. An abandoned attempt drops both the buffer and its permit.
+        let data_buffer = DirectBufAllocation::new(scratch.prepared.frame_buffer_bytes());
+        scratch.set_preallocated_buffer(WalV8PointBufferPreallocation {
+            data_buffer,
+            _permit: permit,
+        });
+        #[cfg(any(test, feature = "bench"))]
+        self.point_buffer_preallocation_hits
+            .fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
+    /// Admit a Point scratch object using ordered quota reservation and then
+    /// consume its optional speculative DATA buffer.
+    pub(crate) fn admit_prepared_point_batch<'a>(
+        &self,
+        scratch: WalV8PointAdmissionScratch<'a>,
+        commit_ts: u64,
+        recorded_at: crate::pitr::RecordedAt,
+    ) -> Result<WalV8FrameJob<'a>> {
+        let WalV8PointAdmissionScratch {
+            prepared,
+            preallocated_buffer,
+        } = scratch;
+        ensure!(!self.is_poisoned(), "v8 Parallel WAL is poisoned");
+        let logical_bytes = u64::try_from(prepared.logical_batch_bytes())?;
+        let frame_bytes = u64::try_from(prepared.frame_buffer_bytes())?;
+        let resources = self.reserve_and_allocate_batch_resources(
+            logical_bytes,
+            frame_bytes,
+            prepared.frame_buffer_bytes(),
+            preallocated_buffer,
+        )?;
+
+        self.admit_prepared_batch_with_resources(prepared, commit_ts, recorded_at, resources, || {})
+    }
+
     fn reserve_batch_resources(
         &self,
         logical_bytes: u64,
@@ -5009,29 +6816,63 @@ impl WalV8ParallelWriter {
         ensure!(!self.is_poisoned(), "v8 Parallel WAL is poisoned");
         let logical_bytes = u64::try_from(prepared.logical_batch_bytes())?;
         let frame_bytes = u64::try_from(prepared.frame_buffer_bytes())?;
-        let mut reservation = self.reserve_batch_resources(logical_bytes, frame_bytes)?;
+        let resources = self.reserve_and_allocate_batch_resources(
+            logical_bytes,
+            frame_bytes,
+            prepared.frame_buffer_bytes(),
+            None,
+        )?;
+        self.admit_prepared_batch_with_resources(
+            prepared,
+            commit_ts,
+            recorded_at,
+            resources,
+            after_admission,
+        )
+    }
 
+    fn reserve_and_allocate_batch_resources(
+        &self,
+        logical_bytes: u64,
+        frame_bytes: u64,
+        buffer_bytes: usize,
+        preallocated_buffer: Option<WalV8PointBufferPreallocation>,
+    ) -> Result<WalV8AdmissionResources> {
+        let reservation = self.reserve_batch_resources(logical_bytes, frame_bytes)?;
+        let data_buffer = preallocated_buffer
+            .map(WalV8PointBufferPreallocation::into_data_buffer)
+            .unwrap_or_else(|| DirectBufAllocation::new(buffer_bytes));
         // Own the allocation before publishing the ticket. Initialization is
         // payload-sized work, so defer it to finish after the MVCC sequencer
         // has been released.
-        let data_buffer = DirectBufAllocation::new(prepared.frame_buffer_bytes());
+        Ok(WalV8AdmissionResources {
+            data_buffer,
+            reservation,
+        })
+    }
+
+    fn admit_prepared_batch_with_resources<'a, F>(
+        &self,
+        prepared: WalV8PreparedBatch<'a>,
+        commit_ts: u64,
+        recorded_at: crate::pitr::RecordedAt,
+        mut resources: WalV8AdmissionResources,
+        after_admission: F,
+    ) -> Result<WalV8FrameJob<'a>>
+    where
+        F: FnOnce(),
+    {
         let publisher = WalV8LeaderAdmissionPublisher {
             coordinator: &self.coordinator,
-            reservation: RefCell::new(&mut reservation),
+            reservation: RefCell::new(&mut resources.reservation),
             extent_preallocator: self.io.extent_preallocator.as_deref(),
         };
         let admitted = prepared.admit_with_metadata(commit_ts, recorded_at, &publisher)?;
         let assignment = admitted.assignment();
-        #[cfg(feature = "bench")]
-        let write_class = admitted.write_class();
-        if let Some(reservation) = reservation.take() {
+        if let Some(reservation) = resources.reservation.take() {
             let previous = self.frontier_resources.lock().insert(
                 assignment.segment_ticket,
-                WalV8FrontierResource {
-                    reservation,
-                    #[cfg(feature = "bench")]
-                    write_class,
-                },
+                WalV8FrontierResource { reservation },
             );
             if previous.is_some() {
                 self.coordinator.poison();
@@ -5046,7 +6887,7 @@ impl WalV8ParallelWriter {
             coordinator: self.coordinator.clone(),
             producer_guards: Arc::clone(&self.producer_guards),
             io: Arc::clone(&self.io),
-            data_buffer: Some(data_buffer),
+            data_buffer: Some(resources.data_buffer),
             #[cfg(feature = "bench")]
             profile: self.profile.load_full(),
         })
@@ -5059,7 +6900,7 @@ impl WalV8ParallelWriter {
         let Some(mut driver) = self.coordinator.acquire_durability_driver(ticket_end)? else {
             return Ok(());
         };
-        let result = self.drive_frontier_through(ticket_end, &driver);
+        let result = self.drive_frontier_through(ticket_end, &mut driver);
         if result.is_ok() {
             driver.complete();
         }
@@ -5070,7 +6911,7 @@ impl WalV8ParallelWriter {
     fn drive_frontier_through(
         &self,
         ticket_end: u64,
-        driver: &WalV8DurabilityDriver,
+        driver: &mut WalV8DurabilityDriver,
     ) -> Result<()> {
         let progress_ring_enabled = self.coordinator.progress_ring_enabled();
         loop {
@@ -5119,12 +6960,17 @@ impl WalV8ParallelWriter {
             #[cfg(feature = "bench")]
             let mut coalescing_detail = None;
             #[cfg(feature = "bench")]
+            let mut coalescing_attempted = false;
+            #[cfg(feature = "bench")]
             let mut coalescing_wall_ns = 0_u64;
             #[cfg(feature = "bench")]
             let mut coalescing_cpu_ns = 0_u64;
             #[cfg(feature = "bench")]
+            let mut coalescing_budget_us = None;
+            #[cfg(feature = "bench")]
             let mut snapshot = if progress_ring_enabled {
-                self.io.advance_and_snapshot(driver, diagnostics_enabled)?
+                self.io
+                    .advance_and_snapshot_after_wake(driver, diagnostics_enabled)?
             } else if diagnostics_enabled {
                 self.coordinator.frontier_ready_snapshot_with_monotonic_ns()
             } else {
@@ -5132,7 +6978,7 @@ impl WalV8ParallelWriter {
             };
             #[cfg(not(feature = "bench"))]
             let mut snapshot = if progress_ring_enabled {
-                self.io.advance_and_snapshot(driver, false)?
+                self.io.advance_and_snapshot_after_wake(driver, false)?
             } else {
                 self.coordinator.frontier_ready_snapshot()
             };
@@ -5148,6 +6994,9 @@ impl WalV8ParallelWriter {
             #[cfg(feature = "bench")]
             let phase_sample_id = has_ready_prefix.then_some(phase_sample_candidate).flatten();
             #[cfg(feature = "bench")]
+            let mut cursor_coalescing_timing = (progress_ring_enabled && phase_sample_id.is_some())
+                .then(WalV8CursorCoalescingTiming::default);
+            #[cfg(feature = "bench")]
             let phase_sample_guard = phase_sample_id
                 .and_then(|_| profile.as_ref().cloned())
                 .map(WalV8DurabilityPhaseSampleGuard::new);
@@ -5155,15 +7004,6 @@ impl WalV8ParallelWriter {
                 && snapshot.ready_prefix.len() < snapshot.admitted_ticket_count
                 && let Some(latency) = previous.last_sync_latency
             {
-                #[cfg(feature = "bench")]
-                let budget_us = self.coalesce_budget_override_us.unwrap_or_else(|| {
-                    if latency >= Duration::from_micros(100) {
-                        400
-                    } else {
-                        100
-                    }
-                });
-                #[cfg(not(feature = "bench"))]
                 let budget_us = if latency >= Duration::from_micros(100) {
                     400
                 } else {
@@ -5174,6 +7014,11 @@ impl WalV8ParallelWriter {
                 let ready_tickets_before_coalescing = snapshot.ready_prefix.len() as u64;
                 #[cfg(feature = "bench")]
                 let admitted_tickets_before_coalescing = snapshot.admitted_ticket_count as u64;
+                #[cfg(feature = "bench")]
+                {
+                    coalescing_attempted = true;
+                    coalescing_budget_us = Some(budget_us);
+                }
                 #[cfg(feature = "bench")]
                 let started = profile.as_ref().map(|_| Instant::now());
                 #[cfg(feature = "bench")]
@@ -5187,6 +7032,7 @@ impl WalV8ParallelWriter {
                         &mut snapshot,
                         budget,
                         diagnostics_enabled,
+                        cursor_coalescing_timing.as_mut(),
                     )?
                 } else if phase_sample_id.is_some() {
                     let observation = self.coordinator.coalesce_frontier_ready_sampled(budget);
@@ -5289,14 +7135,9 @@ impl WalV8ParallelWriter {
                     if snapshot.closed {
                         anyhow::bail!("v8 Parallel WAL closed before the ticket became durable");
                     }
-                    let _ = self.io.wait_for_progress(Duration::from_secs(1))?;
+                    self.io.wait_for_progress(Duration::from_secs(1))?;
                     if self.coordinator.is_poisoned() {
                         anyhow::bail!("v8 Parallel WAL was poisoned while waiting for durability");
-                    }
-                    if self.coordinator.is_closed()
-                        && self.coordinator.durable_ticket_end() < ticket_end
-                    {
-                        anyhow::bail!("v8 Parallel WAL closed before the ticket became durable");
                     }
                 }
                 continue;
@@ -5307,10 +7148,9 @@ impl WalV8ParallelWriter {
                 .checked_add(u64::try_from(ready.len())?)
                 .context("v8 Parallel frontier ticket end overflows")?;
             let last = ready
-                .last()
+                .tail()
                 .context("v8 Parallel ready prefix unexpectedly empty")?;
             let last_data_end = last
-                .assignment
                 .first_data_offset
                 .checked_add(u64::try_from(last.frame_buffer_bytes)?)
                 .context("v8 Parallel durable DATA end overflows")?;
@@ -5350,7 +7190,7 @@ impl WalV8ParallelWriter {
                     .context("v8 FRONTIER generation overflows")?,
                 ticket_end: frontier_ticket_end,
                 durable_end,
-                last_commit_ts: last.assignment.commit_ts,
+                last_commit_ts: last.commit_ts,
                 prefix_digest: reservation.prefix_digest,
                 previous_frontier_offset: previous.offset,
                 previous_frontier_digest: previous.digest,
@@ -5403,9 +7243,7 @@ impl WalV8ParallelWriter {
             let frontier_write_ns = if let (Some(profile), Some(started)) =
                 (&profile, frontier_write_started)
             {
-                let data_bytes = ready.iter().fold(0_u64, |total, progress| {
-                    total.saturating_add(progress.frame_buffer_bytes as u64)
-                });
+                let data_bytes = ready.data_bytes();
                 let groups = ready.len() as u64;
                 let frontier_write_ns = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
                 profile.record_wal_commit_group(groups, data_bytes);
@@ -5476,10 +7314,15 @@ impl WalV8ParallelWriter {
                         groups_covered: groups,
                         tickets_covered: Some(frontier_ticket_end - first_ticket),
                         frontier_write_ns: frontier_write_ns.unwrap_or(0),
-                        data_completion_to_frontier_start_ns: data_completion_to_frontier_start_ns(
-                            &ready,
-                            frontier_write_started,
-                        ),
+                        data_completion_to_frontier_start_ns: match &ready {
+                            WalV8ReadyPrefix::Tickets(tickets) => {
+                                data_completion_to_frontier_start_ns(
+                                    tickets,
+                                    frontier_write_started,
+                                )
+                            }
+                            WalV8ReadyPrefix::Cursor { .. } => None,
+                        },
                         coalescing_budget_us: coalescing_observation.map(|value| value.0),
                         coalescing_waited: coalescing_observation.map(|value| value.1),
                         coalescing_wait_ns: coalescing_observation.map(|value| value.2),
@@ -5585,20 +7428,69 @@ impl WalV8ParallelWriter {
                         frontier_lock_wait_ns,
                         coalescing_wall_ns,
                         coalescing_cpu_ns,
-                        coalescing_active_wall_ns: coalescing_wall_ns.saturating_sub(
-                            coalescing_detail.map_or(0, |detail| {
-                                detail
-                                    .state_lock_wait_wall_ns
-                                    .saturating_add(detail.condvar_wait_wall_ns)
-                            }),
+                        coalescing_active_wall_ns: coalescing_active_duration_ns(
+                            coalescing_wall_ns,
+                            coalescing_detail
+                                .map(|detail| {
+                                    detail
+                                        .state_lock_wait_wall_ns
+                                        .saturating_add(detail.condvar_wait_wall_ns)
+                                })
+                                .or_else(|| {
+                                    cursor_coalescing_timing
+                                        .map(|timing| timing.progress_wait_wall_ns)
+                                }),
+                            coalescing_attempted,
                         ),
-                        coalescing_active_cpu_ns: coalescing_cpu_ns.saturating_sub(
-                            coalescing_detail.map_or(0, |detail| {
-                                detail
-                                    .state_lock_wait_cpu_ns
-                                    .saturating_add(detail.condvar_wait_cpu_ns)
-                            }),
+                        coalescing_active_cpu_ns: coalescing_active_duration_ns(
+                            coalescing_cpu_ns,
+                            coalescing_detail
+                                .map(|detail| {
+                                    detail
+                                        .state_lock_wait_cpu_ns
+                                        .saturating_add(detail.condvar_wait_cpu_ns)
+                                })
+                                .or_else(|| {
+                                    cursor_coalescing_timing
+                                        .map(|timing| timing.progress_wait_cpu_ns)
+                                }),
+                            coalescing_attempted,
                         ),
+                        coalescing_wait_breakdown_available: !coalescing_attempted
+                            || coalescing_detail.is_some(),
+                        coalescing_budget_us,
+                        coalescing_progress_wait_wall_ns: cursor_coalescing_timing
+                            .map(|timing| timing.progress_wait_wall_ns),
+                        coalescing_progress_wait_cpu_ns: cursor_coalescing_timing
+                            .map(|timing| timing.progress_wait_cpu_ns),
+                        coalescing_completion_drain_wall_ns: cursor_coalescing_timing
+                            .map(|timing| timing.completion_drain_wall_ns),
+                        coalescing_completion_drain_cpu_ns: cursor_coalescing_timing
+                            .map(|timing| timing.completion_drain_cpu_ns),
+                        coalescing_coordinator_lock_wait_wall_ns: cursor_coalescing_timing
+                            .map(|timing| timing.advance.coordinator_lock_wait_wall_ns),
+                        coalescing_coordinator_lock_wait_cpu_ns: cursor_coalescing_timing
+                            .map(|timing| timing.advance.coordinator_lock_wait_cpu_ns),
+                        coalescing_coordinator_lock_hold_wall_ns: cursor_coalescing_timing
+                            .map(|timing| timing.advance.coordinator_lock_hold_wall_ns),
+                        coalescing_coordinator_lock_hold_cpu_ns: cursor_coalescing_timing
+                            .map(|timing| timing.advance.coordinator_lock_hold_cpu_ns),
+                        coalescing_completion_apply_wall_ns: cursor_coalescing_timing
+                            .map(|timing| timing.advance.completion_apply_wall_ns),
+                        coalescing_completion_apply_cpu_ns: cursor_coalescing_timing
+                            .map(|timing| timing.advance.completion_apply_cpu_ns),
+                        coalescing_digest_fold_wall_ns: cursor_coalescing_timing
+                            .map(|timing| timing.advance.digest_fold_wall_ns),
+                        coalescing_digest_fold_cpu_ns: cursor_coalescing_timing
+                            .map(|timing| timing.advance.digest_fold_cpu_ns),
+                        coalescing_cursor_advance_wall_ns: cursor_coalescing_timing
+                            .map(|timing| timing.advance.cursor_advance_wall_ns),
+                        coalescing_cursor_advance_cpu_ns: cursor_coalescing_timing
+                            .map(|timing| timing.advance.cursor_advance_cpu_ns),
+                        coalescing_iterations: cursor_coalescing_timing
+                            .map(|timing| timing.iterations),
+                        coalescing_ready_tickets_gained: cursor_coalescing_timing
+                            .map(|timing| timing.ready_tickets_gained),
                         coalescing_state_lock_wait_wall_ns: coalescing_detail
                             .map_or(0, |detail| detail.state_lock_wait_wall_ns),
                         coalescing_state_lock_wait_cpu_ns: coalescing_detail
@@ -5651,6 +7543,7 @@ impl WalV8ParallelWriter {
                             resource_retire_before_publish.finish_cpu_ns,
                         resource_retire_before_publish_batched_point_credits:
                             resource_retire_before_publish.batch_point_frontier_credits,
+                        resource_retire_before_publish_point_prefix_detached: false,
                         resource_retire_after_publish_wall_ns: resource_retire_after_publish
                             .wall_ns,
                         resource_retire_after_publish_cpu_ns: resource_retire_after_publish.cpu_ns,
@@ -5717,14 +7610,8 @@ impl WalV8ParallelWriter {
         let lock_hold_cpu_started = sample.then(digest::thread_cpu_time_ns);
         #[cfg(feature = "bench")]
         let collect_started = sample.then(digest::thread_cpu_time_ns);
-        #[cfg(feature = "bench")]
-        let mut point_only_prefix = true;
         let mut tickets = Vec::with_capacity(expected);
-        for (&ticket, _resource) in resources.range(first_ticket..ticket_end) {
-            #[cfg(feature = "bench")]
-            {
-                point_only_prefix &= _resource.write_class == WalV8WriteClass::Point;
-            }
+        for (&ticket, _) in resources.range(first_ticket..ticket_end) {
             tickets.push(ticket);
         }
         #[cfg(feature = "bench")]
@@ -5737,32 +7624,6 @@ impl WalV8ParallelWriter {
             tickets.len() == expected,
             "v8 Parallel durable prefix is missing resource reservations"
         );
-
-        #[cfg(feature = "bench")]
-        let batch_point_frontier_credits =
-            self.batch_point_frontier_credits && point_only_prefix && expected > 1;
-        #[cfg(not(feature = "bench"))]
-        let batch_point_frontier_credits = false;
-
-        if batch_point_frontier_credits {
-            #[cfg(feature = "bench")]
-            let step_started = sample.then(digest::thread_cpu_time_ns);
-            let mut reservations: Vec<&mut WalV7OwnedBatchReservation> = resources
-                .range_mut(first_ticket..ticket_end)
-                .skip(1)
-                .map(|(_, resource)| &mut resource.reservation)
-                .collect();
-            WalV7OwnedBatchReservation::release_unused_frontier_credits_batch(&mut reservations)
-                .context("release batched Point v8 FRONTIER credits")?;
-            #[cfg(feature = "bench")]
-            {
-                release_cpu_ns = release_cpu_ns.saturating_add(
-                    step_started
-                        .map(|t| digest::thread_cpu_time_ns().saturating_sub(t))
-                        .unwrap_or_default(),
-                );
-            }
-        }
 
         for (index, ticket) in tickets.into_iter().enumerate() {
             #[cfg(feature = "bench")]
@@ -5779,7 +7640,7 @@ impl WalV8ParallelWriter {
                 );
             }
             let mut reservation = resource.reservation;
-            if index > 0 && !batch_point_frontier_credits {
+            if index > 0 {
                 #[cfg(feature = "bench")]
                 let step_started = sample.then(digest::thread_cpu_time_ns);
                 if let Err(error) = reservation.release_unused_frontier_credit() {
@@ -5827,7 +7688,7 @@ impl WalV8ParallelWriter {
             observation.remove_cpu_ns = remove_cpu_ns;
             observation.release_cpu_ns = release_cpu_ns;
             observation.finish_cpu_ns = finish_cpu_ns;
-            observation.batch_point_frontier_credits = batch_point_frontier_credits;
+            observation.batch_point_frontier_credits = false;
             observation.tickets = u64::try_from(expected).unwrap_or(u64::MAX);
             observation.wall_ns = started
                 .map(|started| started.elapsed().as_nanos().min(u64::MAX as u128) as u64)
@@ -6028,6 +7889,36 @@ impl WalV8ParallelWriter {
         self.coordinator.last_frontier_end()
     }
 
+    pub(crate) fn quiesce_extent_preparation(&self) {
+        if let Some(preallocator) = &self.io.extent_preallocator {
+            preallocator.quiesce();
+        }
+        #[cfg(feature = "bench")]
+        if let Some(preparation) = &self.io.extent_preparation {
+            preparation.quiesce();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_lookahead_worker_hook_for_test(
+        &self,
+        hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) {
+        if let Some(preallocator) = &self.io.extent_preallocator {
+            preallocator.set_worker_hook_for_test(hook);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_lookahead_quiesce_hook_for_test(
+        &self,
+        hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) {
+        if let Some(preallocator) = &self.io.extent_preallocator {
+            preallocator.set_quiesce_hook_for_test(hook);
+        }
+    }
+
     pub(crate) fn active_boundaries(
         &self,
     ) -> Result<(
@@ -6136,6 +8027,9 @@ fn write_aligned_once(file: &File, bytes: &[u8], offset: u64) -> io::Result<()> 
 }
 
 fn fdatasync_once(file: &File) -> io::Result<()> {
+    #[cfg(all(test, feature = "chaos-testing"))]
+    crate::chaos::failpoint::before_parallel_wal_fdatasync_call();
+
     #[cfg(feature = "chaos-testing")]
     crate::chaos::failpoint::fail_point!("wal.v8.leader.fdatasync", |_| Err(io::Error::other(
         "injected v8 WAL sync failure"
@@ -6203,6 +8097,60 @@ mod tests {
     use crate::wal::v7::admission::{
         WalV7ResourceCharge, WalV7ResourceLedger, WalV7ResourceLimits, WalV7RetainedResources,
     };
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn coalescing_active_duration_is_unknown_without_a_wait_breakdown() {
+        assert_eq!(coalescing_active_duration_ns(120, None, true), None);
+        assert_eq!(coalescing_active_duration_ns(0, None, false), Some(0));
+        assert_eq!(coalescing_active_duration_ns(120, Some(35), true), Some(85));
+    }
+
+    #[test]
+    fn point_buffer_preallocation_permits_bound_and_release_speculation() {
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let permits = (0..MAX_POINT_BUFFER_PREALLOCATIONS)
+            .map(|_| {
+                WalV8PointBufferPreallocationPermit::try_acquire(&in_flight)
+                    .expect("permit should be available below the configured bound")
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            in_flight.load(Ordering::Relaxed),
+            MAX_POINT_BUFFER_PREALLOCATIONS
+        );
+        assert!(WalV8PointBufferPreallocationPermit::try_acquire(&in_flight).is_none());
+
+        let mut permits = permits;
+        let preallocated = WalV8PointBufferPreallocation {
+            data_buffer: DirectBufAllocation::new(WAL_V8_FRAME_LEN),
+            _permit: permits.pop().expect("one permit is available"),
+        };
+        assert_eq!(
+            in_flight.load(Ordering::Relaxed),
+            MAX_POINT_BUFFER_PREALLOCATIONS
+        );
+
+        let data_buffer = preallocated.into_data_buffer();
+        assert_eq!(data_buffer.cap(), WAL_V8_FRAME_LEN);
+        assert_eq!(
+            in_flight.load(Ordering::Relaxed),
+            MAX_POINT_BUFFER_PREALLOCATIONS - 1
+        );
+        drop(data_buffer);
+        drop(permits);
+        assert_eq!(in_flight.load(Ordering::Relaxed), 0);
+
+        // Dropping an abandoned pre-admission allocation releases its permit.
+        let abandoned = WalV8PointBufferPreallocation {
+            data_buffer: DirectBufAllocation::new(WAL_V8_FRAME_LEN),
+            _permit: WalV8PointBufferPreallocationPermit::try_acquire(&in_flight)
+                .expect("all permits were released"),
+        };
+        drop(abandoned);
+        assert_eq!(in_flight.load(Ordering::Relaxed), 0);
+    }
 
     #[test]
     fn extent_policy_vec_matches_btree_for_mixed_out_of_order_ranges() -> Result<()> {
@@ -6560,7 +8508,6 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(feature = "bench")]
     #[test]
     fn point_only_lookahead_keeps_batches_on_fallocate_path() -> Result<()> {
         const SEGMENT_LIMIT: u64 = 1024 * 1024;
@@ -6648,6 +8595,270 @@ mod tests {
                 .get(large_fixture.start_offset),
             Some(WalV8ExtentPolicy::FallocateOnly)
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn point_only_lookahead_respects_extent_window_boundaries_for_mixed_writes() -> Result<()> {
+        const SEGMENT_LIMIT: u64 = 1024 * 1024;
+        const WINDOW_BYTES: u64 = WAL_V8_EXTENT_PREPARATION_CHUNK_BYTES as u64;
+
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("point-only-mixed-boundary-v8.wal");
+        let fixture = point_only_extent_preallocator_fixture(&path, SEGMENT_LIMIT, WINDOW_BYTES)?;
+        let window0_start = fixture.start_offset;
+        let window1_start = window0_start + WINDOW_BYTES;
+
+        // Window 0 receives a single-frame Point write -> Lookahead (initialized).
+        fixture.preallocator.register_data_range(
+            window0_start,
+            window0_start + FRAME_LEN_U64,
+            WalV8WriteClass::Point,
+            FRAME_LEN_U64,
+        )?;
+        // Window 1 receives a Batch write -> FallocateOnly (not initialized).
+        fixture.preallocator.register_data_range(
+            window1_start,
+            window1_start + FRAME_LEN_U64,
+            WalV8WriteClass::Batch,
+            FRAME_LEN_U64,
+        )?;
+        fixture
+            .preallocator
+            .ensure_prepared_through(window1_start + FRAME_LEN_U64)?;
+
+        let state = fixture.preallocator.state.lock();
+        assert_eq!(state.prepared_end, window1_start + WINDOW_BYTES);
+        assert_eq!(state.initialized_bytes, WINDOW_BYTES);
+        assert_eq!(
+            state.extent_policies.get(window0_start),
+            Some(WalV8ExtentPolicy::Lookahead)
+        );
+        assert_eq!(
+            state.extent_policies.get(window1_start),
+            Some(WalV8ExtentPolicy::FallocateOnly)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn point_only_lookahead_writer_admission_classifies_policies_and_recovers() -> Result<()> {
+        const SEGMENT_LIMIT: u64 = 1024 * 1024;
+        const WINDOW_BYTES: u64 = FRAME_LEN_U64 * 4;
+
+        let open_point_only_writer = |path: &Path| -> Result<
+            Option<(WalV8ParallelWriter, Arc<WalV8ReservationOwner>, WalV8Header)>,
+        > {
+            let wal_header = header();
+            let installed = install_empty(path, wal_header)?;
+            let worker_file = match OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(libc::O_DIRECT)
+                .open(path)
+            {
+                Ok(file) => file,
+                Err(error) if error.raw_os_error() == Some(libc::EINVAL) => {
+                    eprintln!("skipping test (O_DIRECT unsupported on test fs): {error}");
+                    return Ok(None);
+                }
+                Err(error) => return Err(error.into()),
+            };
+            let sync_file = OpenOptions::new().read(true).write(true).open(path)?;
+            let (leader, owner) = open_accounted_writer(
+                path,
+                &installed,
+                SEGMENT_LIMIT,
+                2 * SEGMENT_LIMIT,
+                FRAME_LEN_U64,
+                sync_file,
+            )?;
+            let writer = match leader.into_parallel_with_worker_file_progress_and_completion(
+                worker_file,
+                WalV8ProgressMode::Cursor,
+                true,
+                WalV8FrontierWriteMode::Direct,
+                None,
+                Some((
+                    WalV8ExtentPreparationStrategy::PointOnlyLookahead,
+                    WINDOW_BYTES,
+                )),
+            ) {
+                Ok(writer) => writer,
+                Err(error) if is_io_uring_unavailable_error(&error) => {
+                    eprintln!("skipping test (io_uring unavailable): {error:#}");
+                    return Ok(None);
+                }
+                Err(error) => return Err(error),
+            };
+            Ok(Some((writer, owner, wal_header)))
+        };
+
+        // 1. Single-frame Point admission -> Lookahead + initialized_bytes > 0. Then Batch in the
+        //    same window -> preserves Point first-owner (Lookahead). Then Batch in the next window
+        //    -> FallocateOnly (not initialized).
+        let dir1 = tempfile::tempdir()?;
+        let path1 = dir1.path().join("writer-point-then-batch-v8.wal");
+        let Some((writer1, owner1, header1)) = open_point_only_writer(&path1)? else {
+            return Ok(());
+        };
+        let point1 = batch(10);
+        writer1.append_prepared_batch(
+            writer1.preflight_batch_with_write_class(
+                &point1,
+                LIVE_WAL_V5_LIMITS,
+                WalV8WriteClass::Point,
+            )?,
+            point1.commit_ts,
+            point1.recorded_at,
+        )?;
+        let window0_start = HEADER_LEN_U64 + FRAME_LEN_U64;
+        let window1_start = window0_start + WINDOW_BYTES;
+        {
+            let preallocator = writer1
+                .io
+                .extent_preallocator
+                .as_ref()
+                .expect("point-only preallocator installed");
+            let state = preallocator.state.lock();
+            assert_eq!(
+                state.extent_policies.get(window0_start),
+                Some(WalV8ExtentPolicy::Lookahead)
+            );
+            assert_eq!(state.initialized_bytes, WINDOW_BYTES);
+        }
+
+        // Batch in the same window keeps Lookahead first-owner.
+        let batch_same_win = batch(20);
+        writer1.append_prepared_batch(
+            writer1.preflight_batch_with_write_class(
+                &batch_same_win,
+                LIVE_WAL_V5_LIMITS,
+                WalV8WriteClass::Batch,
+            )?,
+            batch_same_win.commit_ts,
+            batch_same_win.recorded_at,
+        )?;
+        assert_eq!(
+            writer1
+                .io
+                .extent_preallocator
+                .as_ref()
+                .unwrap()
+                .state
+                .lock()
+                .extent_policies
+                .get(window0_start),
+            Some(WalV8ExtentPolicy::Lookahead)
+        );
+
+        // Advance into window 1 with a Batch write -> FallocateOnly, initialized_bytes stays
+        // WINDOW_BYTES.
+        let batch_next_win = multi_frame_batch(30);
+        writer1.append_prepared_batch(
+            writer1.preflight_batch_with_write_class(
+                &batch_next_win,
+                LIVE_WAL_V5_LIMITS,
+                WalV8WriteClass::Batch,
+            )?,
+            batch_next_win.commit_ts,
+            batch_next_win.recorded_at,
+        )?;
+        {
+            let preallocator = writer1.io.extent_preallocator.as_ref().unwrap();
+            let state = preallocator.state.lock();
+            assert_eq!(
+                state.extent_policies.get(window1_start),
+                Some(WalV8ExtentPolicy::FallocateOnly)
+            );
+            assert_eq!(state.initialized_bytes, WINDOW_BYTES);
+        }
+        let (_, boundary1) = writer1.active_boundaries()?;
+        drop(writer1);
+        let recovered1 = super::super::install::recover_and_install_active(
+            &path1,
+            &[boundary1],
+            header1.predecessor,
+            LIVE_WAL_V5_LIMITS,
+            SEGMENT_LIMIT,
+        )?;
+        assert_eq!(
+            replayed_batches(&path1, &recovered1)?,
+            [point1, batch_same_win, batch_next_win]
+        );
+        let charge = owner1.image_owner().snapshot();
+        assert_eq!(
+            charge.logical_wal_bytes,
+            recovered1.image_len - FIXED_IMAGE_TEST_BYTES
+        );
+        assert!(charge.source_spool_bytes >= recovered1.image_len);
+        assert_eq!(charge.buffer_memory_bytes, 0);
+
+        // 2. Single-frame Batch admission -> FallocateOnly, then Point in same window -> stays
+        //    FallocateOnly.
+        let dir2 = tempfile::tempdir()?;
+        let path2 = dir2.path().join("writer-batch-then-point-v8.wal");
+        let Some((writer2, _, _)) = open_point_only_writer(&path2)? else {
+            return Ok(());
+        };
+        let batch_first = batch(40);
+        writer2.append_prepared_batch(
+            writer2.preflight_batch_with_write_class(
+                &batch_first,
+                LIVE_WAL_V5_LIMITS,
+                WalV8WriteClass::Batch,
+            )?,
+            batch_first.commit_ts,
+            batch_first.recorded_at,
+        )?;
+        let point_second = batch(50);
+        writer2.append_prepared_batch(
+            writer2.preflight_batch_with_write_class(
+                &point_second,
+                LIVE_WAL_V5_LIMITS,
+                WalV8WriteClass::Point,
+            )?,
+            point_second.commit_ts,
+            point_second.recorded_at,
+        )?;
+        {
+            let preallocator = writer2.io.extent_preallocator.as_ref().unwrap();
+            let state = preallocator.state.lock();
+            assert_eq!(
+                state.extent_policies.get(window0_start),
+                Some(WalV8ExtentPolicy::FallocateOnly)
+            );
+            assert_eq!(state.initialized_bytes, 0);
+        }
+        drop(writer2);
+
+        // 3. Multi-frame Point admission -> FallocateOnly + initialized_bytes == 0.
+        let dir3 = tempfile::tempdir()?;
+        let path3 = dir3.path().join("writer-multiframe-point-v8.wal");
+        let Some((writer3, _, _)) = open_point_only_writer(&path3)? else {
+            return Ok(());
+        };
+        let large_point = multi_frame_batch(60);
+        writer3.append_prepared_batch(
+            writer3.preflight_batch_with_write_class(
+                &large_point,
+                LIVE_WAL_V5_LIMITS,
+                WalV8WriteClass::Point,
+            )?,
+            large_point.commit_ts,
+            large_point.recorded_at,
+        )?;
+        {
+            let preallocator = writer3.io.extent_preallocator.as_ref().unwrap();
+            let state = preallocator.state.lock();
+            assert_eq!(
+                state.extent_policies.get(window0_start),
+                Some(WalV8ExtentPolicy::FallocateOnly)
+            );
+            assert_eq!(state.initialized_bytes, 0);
+        }
+        drop(writer3);
 
         Ok(())
     }
@@ -6804,7 +9015,6 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(feature = "bench")]
     #[test]
     fn frontier_write_mode_parses_only_supported_values() {
         assert_eq!(
@@ -6820,6 +9030,8 @@ mod tests {
             WalV8FrontierWriteMode::Direct
         );
         assert!(WalV8FrontierWriteMode::from_value(Some(OsStr::new("invalid"))).is_err());
+        let non_utf8 = std::os::unix::ffi::OsStrExt::from_bytes(b"\xff");
+        assert!(WalV8FrontierWriteMode::from_value(Some(non_utf8)).is_err());
     }
 
     #[cfg(feature = "bench")]
@@ -6905,10 +9117,309 @@ mod tests {
     #[cfg(feature = "bench")]
     #[test]
     fn progress_ring_experiment_switch_is_explicitly_opt_in() {
-        assert!(!progress_ring_enabled_from_value(None).unwrap());
-        assert!(!progress_ring_enabled_from_value(Some(OsStr::new("0"))).unwrap());
-        assert!(progress_ring_enabled_from_value(Some(OsStr::new("1"))).unwrap());
-        assert!(progress_ring_enabled_from_value(Some(OsStr::new("true"))).is_err());
+        assert_eq!(
+            progress_mode_from_value(None).unwrap(),
+            WalV8ProgressMode::Eager
+        );
+        assert_eq!(
+            progress_mode_from_value(Some(OsStr::new("0"))).unwrap(),
+            WalV8ProgressMode::Eager
+        );
+        assert_eq!(
+            progress_mode_from_value(Some(OsStr::new("2"))).unwrap(),
+            WalV8ProgressMode::Cursor
+        );
+        assert!(progress_mode_from_value(Some(OsStr::new("1"))).is_err());
+        assert!(progress_mode_from_value(Some(OsStr::new("true"))).is_err());
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn cursor_direct_completion_switch_requires_cursor_mode() {
+        assert!(
+            !cursor_direct_completion_enabled_from_value(None, WalV8ProgressMode::Cursor).unwrap()
+        );
+        assert!(
+            !cursor_direct_completion_enabled_from_value(
+                Some(OsStr::new("0")),
+                WalV8ProgressMode::Cursor
+            )
+            .unwrap()
+        );
+        assert!(
+            cursor_direct_completion_enabled_from_value(
+                Some(OsStr::new("1")),
+                WalV8ProgressMode::Cursor
+            )
+            .unwrap()
+        );
+        assert!(
+            cursor_direct_completion_enabled_from_value(
+                Some(OsStr::new("1")),
+                WalV8ProgressMode::Eager
+            )
+            .is_err()
+        );
+        assert!(
+            cursor_direct_completion_enabled_from_value(
+                Some(OsStr::new("2")),
+                WalV8ProgressMode::Cursor
+            )
+            .is_err()
+        );
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn coalesce_ready_target_accepts_only_point_experiment_values() {
+        assert_eq!(
+            coalesce_ready_target_from_value(None, WalV8ProgressMode::Cursor, true).unwrap(),
+            None
+        );
+        for value in ["4", "8"] {
+            assert!(
+                coalesce_ready_target_from_value(
+                    Some(OsStr::new(value)),
+                    WalV8ProgressMode::Cursor,
+                    true
+                )
+                .unwrap()
+                .is_some()
+            );
+        }
+        for value in ["0", "1", "2", "3", "5", "6", "12", "100", "400", "invalid"] {
+            assert!(
+                coalesce_ready_target_from_value(
+                    Some(OsStr::new(value)),
+                    WalV8ProgressMode::Cursor,
+                    true
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            coalesce_ready_target_from_value(Some(OsStr::new("8")), WalV8ProgressMode::Eager, true)
+                .is_err()
+        );
+        assert!(
+            coalesce_ready_target_from_value(
+                Some(OsStr::new("4")),
+                WalV8ProgressMode::Cursor,
+                false
+            )
+            .is_err()
+        );
+    }
+
+    #[cfg(all(feature = "bench", unix))]
+    #[test]
+    fn coalesce_ready_target_rejects_non_utf8_values() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let invalid = OsStr::from_bytes(b"8\\xff");
+        assert!(
+            coalesce_ready_target_from_value(Some(invalid), WalV8ProgressMode::Cursor, true)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn ready_target_one_uses_current_prefix_without_waiting_for_successors() {
+        assert!(!WalV8ParallelIo::coalesce_ready_target_reached(0, Some(1)));
+        assert!(WalV8ParallelIo::coalesce_ready_target_reached(1, Some(1)));
+        assert!(WalV8ParallelIo::coalesce_ready_target_reached(2, Some(1)));
+        assert!(!WalV8ParallelIo::coalesce_ready_target_reached(0, Some(2)));
+        assert!(!WalV8ParallelIo::coalesce_ready_target_reached(1, Some(2)));
+        assert!(WalV8ParallelIo::coalesce_ready_target_reached(2, Some(2)));
+        assert!(!WalV8ParallelIo::coalesce_ready_target_reached(0, Some(8)));
+        assert!(!WalV8ParallelIo::coalesce_ready_target_reached(1, Some(8)));
+        assert!(!WalV8ParallelIo::coalesce_ready_target_reached(1, Some(12)));
+        assert!(WalV8ParallelIo::coalesce_ready_target_reached(8, Some(8)));
+        assert!(WalV8ParallelIo::coalesce_ready_target_reached(12, Some(12)));
+        assert!(!WalV8ParallelIo::coalesce_ready_target_reached(
+            11,
+            Some(12)
+        ));
+        assert!(!WalV8ParallelIo::coalesce_ready_target_reached(16, None));
+    }
+
+    #[cfg(feature = "bench")]
+    fn coalescing_test_snapshot(ready: usize, admitted: usize) -> WalV8FrontierReadySnapshot {
+        WalV8FrontierReadySnapshot {
+            ready_prefix: WalV8ReadyPrefix::Cursor {
+                ticket_count: ready,
+                tail: None,
+                data_bytes: 0,
+            },
+            admitted_ticket_count: admitted,
+            has_outstanding_batch_tickets: false,
+            closed: false,
+            frames_ready_prefix_count: ready,
+            data_complete_prefix_count: ready,
+            reserved_preparation_bytes: 0,
+            next_not_ready: None,
+            data_hol_blocker: None,
+            snapshot_monotonic_ns: None,
+        }
+    }
+
+    #[cfg(feature = "bench")]
+    fn set_coalescing_test_ready(snapshot: &mut WalV8FrontierReadySnapshot, ready: usize) {
+        snapshot.ready_prefix = WalV8ReadyPrefix::Cursor {
+            ticket_count: ready,
+            tail: None,
+            data_bytes: 0,
+        };
+        snapshot.frames_ready_prefix_count = ready;
+        snapshot.data_complete_prefix_count = ready;
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn coalescing_target_skips_wait_and_keeps_the_full_ready_prefix() -> Result<()> {
+        let mut at_target = coalescing_test_snapshot(8, 16);
+        let outcome = WalV8ParallelIo::coalesce_ready_prefix_with(
+            &mut at_target,
+            Duration::from_millis(100),
+            WalV8CoalesceTargetPolicy::Always(8),
+            |_, _| anyhow::bail!("coalescing should not wait after reaching the target"),
+        )?;
+
+        assert!(!outcome.waited);
+        assert!(outcome.target_hit);
+        assert_eq!(at_target.ready_prefix.len(), 8);
+
+        let mut beyond_target = coalescing_test_snapshot(10, 16);
+        let outcome = WalV8ParallelIo::coalesce_ready_prefix_with(
+            &mut beyond_target,
+            Duration::from_millis(100),
+            WalV8CoalesceTargetPolicy::Always(8),
+            |_, _| anyhow::bail!("coalescing should preserve an already-ready prefix"),
+        )?;
+
+        assert!(!outcome.waited);
+        assert!(outcome.target_hit);
+        assert_eq!(beyond_target.ready_prefix.len(), 10);
+
+        let mut complete_prefix = coalescing_test_snapshot(16, 16);
+        let outcome = WalV8ParallelIo::coalesce_ready_prefix_with(
+            &mut complete_prefix,
+            Duration::from_millis(100),
+            WalV8CoalesceTargetPolicy::Always(8),
+            |_, _| anyhow::bail!("coalescing should not wait when the full prefix is ready"),
+        )?;
+
+        assert!(!outcome.waited);
+        assert!(!outcome.target_hit);
+        assert_eq!(complete_prefix.ready_prefix.len(), 16);
+        Ok(())
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn coalescing_target_stops_after_wait_without_truncating_ready_prefix() -> Result<()> {
+        let mut snapshot = coalescing_test_snapshot(4, 16);
+        let mut calls = 0;
+        let outcome = WalV8ParallelIo::coalesce_ready_prefix_with(
+            &mut snapshot,
+            Duration::from_millis(100),
+            WalV8CoalesceTargetPolicy::Always(8),
+            |_, snapshot| {
+                calls += 1;
+                set_coalescing_test_ready(snapshot, 10);
+                Ok(true)
+            },
+        )?;
+
+        assert_eq!(calls, 1);
+        assert!(outcome.waited);
+        assert!(outcome.target_hit);
+        assert_eq!(snapshot.ready_prefix.len(), 10);
+        Ok(())
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn coalescing_below_target_keeps_the_original_deadline() -> Result<()> {
+        let mut snapshot = coalescing_test_snapshot(4, 16);
+        let budget = Duration::from_millis(100);
+        let mut calls = 0;
+        let mut second_remaining = None;
+        let outcome = WalV8ParallelIo::coalesce_ready_prefix_with(
+            &mut snapshot,
+            budget,
+            WalV8CoalesceTargetPolicy::Always(8),
+            |remaining, snapshot| {
+                calls += 1;
+                if calls == 1 {
+                    thread::sleep(Duration::from_millis(20));
+                    set_coalescing_test_ready(snapshot, 6);
+                    Ok(true)
+                } else {
+                    second_remaining = Some(remaining);
+                    set_coalescing_test_ready(snapshot, 7);
+                    Ok(false)
+                }
+            },
+        )?;
+
+        assert_eq!(calls, 2);
+        assert!(
+            second_remaining
+                .is_some_and(|remaining| remaining < budget - Duration::from_millis(10))
+        );
+        assert!(outcome.waited);
+        assert!(!outcome.target_hit);
+        assert_eq!(snapshot.ready_prefix.len(), 7);
+        Ok(())
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn coalescing_without_target_preserves_deadline_behavior() -> Result<()> {
+        let mut snapshot = coalescing_test_snapshot(4, 16);
+        let mut calls = 0;
+        let outcome = WalV8ParallelIo::coalesce_ready_prefix_with(
+            &mut snapshot,
+            Duration::from_millis(100),
+            WalV8CoalesceTargetPolicy::Disabled,
+            |_, snapshot| {
+                calls += 1;
+                set_coalescing_test_ready(snapshot, 5);
+                Ok(false)
+            },
+        )?;
+
+        assert_eq!(calls, 1);
+        assert!(outcome.waited);
+        assert!(!outcome.target_hit);
+        assert_eq!(snapshot.ready_prefix.len(), 5);
+        Ok(())
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn lightweight_progress_counters_are_opt_in_for_cursor_mode() {
+        assert!(!progress_counters_enabled_from_value(None, WalV8ProgressMode::Cursor).unwrap());
+        assert!(
+            !progress_counters_enabled_from_value(Some(OsStr::new("0")), WalV8ProgressMode::Cursor)
+                .unwrap()
+        );
+        assert!(
+            progress_counters_enabled_from_value(Some(OsStr::new("1")), WalV8ProgressMode::Cursor)
+                .unwrap()
+        );
+        assert!(
+            progress_counters_enabled_from_value(Some(OsStr::new("1")), WalV8ProgressMode::Eager)
+                .is_err()
+        );
+        assert!(
+            progress_counters_enabled_from_value(
+                Some(OsStr::new("true")),
+                WalV8ProgressMode::Cursor
+            )
+            .is_err()
+        );
     }
 
     #[cfg(all(feature = "bench", unix))]
@@ -6917,7 +9428,35 @@ mod tests {
         use std::os::unix::ffi::OsStrExt;
 
         let non_utf8 = OsStr::from_bytes(b"\xff");
-        assert!(progress_ring_enabled_from_value(Some(non_utf8)).is_err());
+        assert!(progress_mode_from_value(Some(non_utf8)).is_err());
+    }
+
+    #[cfg(not(feature = "bench"))]
+    #[test]
+    fn production_progress_mode_is_eager_by_default_and_cursor_is_opt_in() {
+        assert_eq!(
+            production_progress_mode_from_value(None).unwrap(),
+            WalV8ProgressMode::Eager
+        );
+        assert_eq!(
+            production_progress_mode_from_value(Some(OsStr::new("eager"))).unwrap(),
+            WalV8ProgressMode::Eager
+        );
+        assert_eq!(
+            production_progress_mode_from_value(Some(OsStr::new("cursor"))).unwrap(),
+            WalV8ProgressMode::Cursor
+        );
+        assert!(production_progress_mode_from_value(Some(OsStr::new("1"))).is_err());
+        assert!(production_progress_mode_from_value(Some(OsStr::new("ring"))).is_err());
+    }
+
+    #[cfg(all(not(feature = "bench"), unix))]
+    #[test]
+    fn production_progress_mode_rejects_non_utf8_values() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let non_utf8 = OsStr::from_bytes(b"\xff");
+        assert!(production_progress_mode_from_value(Some(non_utf8)).is_err());
     }
 
     fn header() -> WalV8Header {
@@ -7112,8 +9651,10 @@ mod tests {
         let parallel_profile = Arc::new(crate::mem_table::WriteProfile::default());
         let parallel_leader = open_writer(&parallel_path, &parallel_installed)?;
         let worker_file = parallel_leader.write_file.try_clone()?;
-        let parallel =
-            parallel_leader.into_parallel_with_worker_file_and_progress_ring(worker_file, false)?;
+        let parallel = parallel_leader.into_parallel_with_worker_file_and_progress_mode(
+            worker_file,
+            WalV8ProgressMode::Eager,
+        )?;
         parallel.set_write_profile(Arc::clone(&parallel_profile))?;
         let first_batch = batch(10);
         let second_batch = batch(20);
@@ -7170,8 +9711,13 @@ mod tests {
                 LIVE_WAL_V5_LIMITS,
                 MAX_WAL_FILE_SIZE,
             )?;
+            let requested_direct_frontier =
+                std::env::var(CHILD_FRONTIER_MODE_ENV).as_deref() == Ok("direct");
+            let requested_candidate = std::env::var_os("TOYKV_WAL_V8_PROFILE").as_deref()
+                == Some(OsStr::new("candidate"));
             #[cfg(feature = "bench")]
-            let writer = if std::env::var(CHILD_FRONTIER_MODE_ENV).as_deref() == Ok("direct")
+            let writer = if requested_direct_frontier
+                || requested_candidate
                 || std::env::var_os(EXTENT_PREPARATION_ENV).is_some()
             {
                 let worker_file = OpenOptions::new()
@@ -7179,12 +9725,13 @@ mod tests {
                     .write(true)
                     .custom_flags(libc::O_DIRECT)
                     .open(wal_path)?;
-                if std::env::var_os(EXTENT_PREPARATION_ENV)
-                    .as_deref()
-                    .is_some_and(|mode| {
-                        mode == OsStr::new("sliding-lookahead")
-                            || mode == OsStr::new("sliding-point-lookahead")
-                    })
+                if requested_candidate
+                    || std::env::var_os(EXTENT_PREPARATION_ENV)
+                        .as_deref()
+                        .is_some_and(|mode| {
+                            mode == OsStr::new("sliding-lookahead")
+                                || mode == OsStr::new("sliding-point-lookahead")
+                        })
                 {
                     let sync_file = OpenOptions::new().read(true).write(true).open(wal_path)?;
                     let (leader, _owner) = open_accounted_writer(
@@ -7230,39 +9777,119 @@ mod tests {
                 );
             }
             #[cfg(not(feature = "bench"))]
-            let writer = open_writer(wal_path, &installed)?.into_parallel()?;
-            #[cfg(feature = "bench")]
+            let writer = if requested_candidate {
+                let worker_file = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .custom_flags(libc::O_DIRECT)
+                    .open(wal_path)?;
+                let sync_file = OpenOptions::new().read(true).write(true).open(wal_path)?;
+                let (leader, _owner) = open_accounted_writer(
+                    wal_path,
+                    &installed,
+                    MAX_WAL_FILE_SIZE,
+                    2 * MAX_WAL_FILE_SIZE,
+                    FRAME_LEN_U64,
+                    sync_file,
+                )?;
+                leader.into_parallel_with_worker_file(worker_file)?
+            } else if requested_direct_frontier {
+                let worker_file = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .custom_flags(libc::O_DIRECT)
+                    .open(wal_path)?;
+                open_writer(wal_path, &installed)?.into_parallel_with_worker_file(worker_file)?
+            } else {
+                open_writer(wal_path, &installed)?.into_parallel()?
+            };
             assert_eq!(
-                writer.progress_ring_enabled(),
-                std::env::var_os(WAL_V8_POINT_PROGRESS_RING_ENV).as_deref()
-                    == Some(OsStr::new("1")),
-                "child writer must use the requested progress mode"
+                writer.uses_direct_frontier()?,
+                requested_direct_frontier,
+                "child writer must use the requested FRONTIER mode"
             );
             #[cfg(feature = "bench")]
-            let value = if std::env::var_os(EXTENT_PREPARATION_ENV).as_deref()
-                == Some(OsStr::new("sliding-initialize"))
-            {
-                multi_window_batch(10)
-            } else {
+            if !requested_candidate {
+                let requested = std::env::var(WAL_V8_POINT_PROGRESS_RING_ENV)?;
+                assert_eq!(
+                    writer.progress_ring_enabled(),
+                    matches!(requested.as_str(), "1" | "2"),
+                    "child writer must use the requested progress ring mode"
+                );
+                assert_eq!(
+                    writer.coordinator.progress_cursor_enabled(),
+                    requested == "2",
+                    "child writer must use the requested progress cursor mode"
+                );
+            }
+            if requested_candidate {
+                let effective = writer.effective_config();
+                assert_eq!(effective.profile, WalV8Profile::Candidate);
+                assert!(writer.uses_cursor_direct_completion());
+                assert!(writer.point_buffer_preallocation_enabled_for_test());
+                assert_eq!(
+                    effective.coalesce_policy,
+                    WalV8CoalesceTargetPolicy::PointOnly(8)
+                );
+            }
+            let value = if requested_candidate {
                 batch(10)
+            } else {
+                #[cfg(feature = "bench")]
+                {
+                    if std::env::var_os(EXTENT_PREPARATION_ENV).as_deref()
+                        == Some(OsStr::new("sliding-initialize"))
+                    {
+                        multi_window_batch(10)
+                    } else {
+                        batch(10)
+                    }
+                }
+                #[cfg(not(feature = "bench"))]
+                {
+                    batch(10)
+                }
             };
-            #[cfg(not(feature = "bench"))]
-            let value = batch(10);
-            writer.append_prepared_batch(
-                writer.preflight_batch(&value, LIVE_WAL_V5_LIMITS)?,
-                10,
-                value.recorded_at,
-            )?;
+            if requested_candidate {
+                let effective = writer.effective_config();
+                if effective.ext_family_filesystem && effective.o_direct_worker {
+                    assert_eq!(
+                        effective.extent_policy,
+                        WalV8ExtentPreparationPolicy::PointOnlyLookahead
+                    );
+                }
+                let prepared = writer.preflight_batch_with_write_class(
+                    &value,
+                    LIVE_WAL_V5_LIMITS,
+                    WalV8WriteClass::Point,
+                )?;
+                let mut scratch = WalV8PointAdmissionScratch::new(prepared);
+                assert!(writer.try_preallocate_point_buffer(&mut scratch));
+                let job = writer.admit_prepared_point_batch(scratch, 10, value.recorded_at)?;
+                let ticket = job.assignment().segment_ticket;
+                let _ = job.finish()?;
+                writer.wait_durable(ticket)?;
+                if effective.ext_family_filesystem && effective.o_direct_worker {
+                    assert!(
+                        std::fs::metadata(wal_path)?.len()
+                            >= installed.image_len + WAL_V8_PRODUCTION_EXTENT_WINDOW_BYTES,
+                        "PointOnlyLookahead must extend the physical WAL image on eligible ext4/O_DIRECT filesystems"
+                    );
+                }
+            } else {
+                writer.append_prepared_batch(
+                    writer.preflight_batch(&value, LIVE_WAL_V5_LIMITS)?,
+                    10,
+                    value.recorded_at,
+                )?;
+            }
             std::fs::write(ack_path, b"acknowledged")?;
             anyhow::bail!("configured V8 writer crash point did not stop the child")
         }
 
         let parent = Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/wal-v8-tests");
         std::fs::create_dir_all(&parent)?;
-        #[cfg(feature = "bench")]
         let frontier_modes = ["buffered", "direct"];
-        #[cfg(not(feature = "bench"))]
-        let frontier_modes = ["buffered"];
         #[cfg(feature = "bench")]
         let extent_preparation_modes = [
             "none",
@@ -7279,7 +9906,7 @@ mod tests {
         for frontier_mode in frontier_modes {
             for extent_preparation_mode in extent_preparation_modes {
                 let mut cases = CRASH_POINTS
-                    .map(|(point, min, max)| (false, point, min, max))
+                    .map(|(point, min, max)| ("0", "legacy", point, min, max))
                     .to_vec();
                 if cfg!(feature = "bench")
                     && matches!(
@@ -7287,16 +9914,43 @@ mod tests {
                         ("buffered", "none") | ("direct", "sliding-point-lookahead")
                     )
                 {
-                    cases.extend(CRASH_POINTS.map(|(point, min, max)| (true, point, min, max)));
+                    cases.extend(
+                        CRASH_POINTS.map(|(point, min, max)| ("2", "legacy", point, min, max)),
+                    );
                 }
-                for (ring_enabled, crash_point, expected_min_ticket_end, expected_max_ticket_end) in
-                    cases
+                if frontier_mode == "direct" && extent_preparation_mode == "none" {
+                    cases.extend(
+                        CRASH_POINTS.map(|(point, min, max)| ("2", "candidate", point, min, max)),
+                    );
+                }
+                for (
+                    progress_mode,
+                    profile,
+                    crash_point,
+                    expected_min_ticket_end,
+                    expected_max_ticket_end,
+                ) in cases
                 {
                     let directory = tempfile::tempdir_in(&parent)?;
                     let wal_path = directory.path().join("active-v8.wal");
                     let ack_path = directory.path().join("acknowledged");
                     let marker_path = directory.path().join("crash.marker");
                     let anchor = create_empty_active(&wal_path, header())?;
+                    if frontier_mode == "direct"
+                        && let Err(error) = OpenOptions::new()
+                            .read(true)
+                            .write(true)
+                            .custom_flags(libc::O_DIRECT)
+                            .open(&wal_path)
+                    {
+                        if error.raw_os_error() == Some(libc::EINVAL) {
+                            eprintln!(
+                                "skipping {crash_point} in direct mode (O_DIRECT unsupported on test fs): {error}"
+                            );
+                            continue;
+                        }
+                        return Err(error.into());
+                    }
 
                     let mut child = Command::new(std::env::current_exe()?);
                     child
@@ -7307,6 +9961,7 @@ mod tests {
                         .env(CHILD_ACK_ENV, &ack_path)
                         .env(CHILD_FRONTIER_MODE_ENV, frontier_mode)
                         .env(FRONTIER_MODE_ENV, frontier_mode)
+                        .env("TOYKV_WAL_V8_PROFILE", profile)
                         .env_remove(EXTENT_PREPARATION_ENV)
                         .env_remove(EXTENT_PREPARATION_BYTES_ENV)
                         .env(
@@ -7324,10 +9979,7 @@ mod tests {
                         .stdout(Stdio::null())
                         .stderr(Stdio::inherit());
                     #[cfg(feature = "bench")]
-                    child.env(
-                        WAL_V8_POINT_PROGRESS_RING_ENV,
-                        if ring_enabled { "1" } else { "0" },
-                    );
+                    child.env(WAL_V8_POINT_PROGRESS_RING_ENV, progress_mode);
                     #[cfg(feature = "bench")]
                     if extent_preparation_mode != "none" {
                         child
@@ -7345,14 +9997,14 @@ mod tests {
                         }
                         if let Some(status) = child.try_wait()? {
                             anyhow::bail!(
-                                "V8 writer child exited before reaching {crash_point} in {frontier_mode}/{extent_preparation_mode} mode (ring={ring_enabled}): {status}"
+                                "V8 writer child exited before reaching {crash_point} in {frontier_mode}/{extent_preparation_mode} mode (progress mode={progress_mode}): {status}"
                             );
                         }
                         if Instant::now() >= deadline {
                             let _ = child.kill();
                             let _ = child.wait();
                             anyhow::bail!(
-                                "V8 writer child did not reach {crash_point} in {frontier_mode}/{extent_preparation_mode} mode (ring={ring_enabled})"
+                                "V8 writer child did not reach {crash_point} in {frontier_mode}/{extent_preparation_mode} mode (progress mode={progress_mode})"
                             );
                         }
                         thread::sleep(Duration::from_millis(10));
@@ -7516,8 +10168,10 @@ mod tests {
             .write(true)
             .custom_flags(libc::O_DIRECT)
             .open(&path)?;
-        let error = match leader.into_parallel_with_worker_file_and_progress_ring(worker_file, true)
-        {
+        let error = match leader.into_parallel_with_worker_file_and_progress_mode(
+            worker_file,
+            WalV8ProgressMode::Cursor,
+        ) {
             Ok(writer) => {
                 drop(writer);
                 anyhow::bail!("parallel conversion accepted an incompatible inherited profile")
@@ -7531,46 +10185,95 @@ mod tests {
 
     #[cfg(feature = "bench")]
     #[test]
-    fn progress_ring_rejects_unsupported_diagnostics_when_profile_is_attached() -> Result<()> {
+    fn progress_ring_rejects_hol_and_timeline_but_samples_durability_phases() -> Result<()> {
         let directory = tempfile::tempdir()?;
-        let path = directory.path().join("progress-ring-profile-v8.wal");
-        let installed = install_empty(&path, header())?;
-        let writer = match open_parallel_with_progress_mode(&path, &installed, true) {
-            Ok(writer) => writer,
-            Err(error) if is_io_uring_unavailable_error(&error) => {
-                eprintln!("skipping test (io_uring unavailable): {error:#}");
-                return Ok(());
+        for direct_completion in [false, true] {
+            let mode_name = if direct_completion { "direct" } else { "relay" };
+            let path = directory
+                .path()
+                .join(format!("progress-ring-profile-{mode_name}-v8.wal"));
+            let installed = install_empty(&path, header())?;
+            let writer = if direct_completion {
+                open_parallel_with_direct_completion(
+                    &path,
+                    &installed,
+                    WalV8ProgressMode::Cursor,
+                    None,
+                )
+            } else {
+                open_parallel_with_progress_mode(&path, &installed, WalV8ProgressMode::Cursor)
+            };
+            let writer = match writer {
+                Ok(writer) => writer,
+                Err(error) if is_io_uring_unavailable_error(&error) => {
+                    eprintln!("skipping {mode_name} case (io_uring unavailable): {error:#}");
+                    if direct_completion {
+                        continue;
+                    }
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            };
+            if !direct_completion {
+                let hol_profile = Arc::new(crate::mem_table::WriteProfile::default());
+                hol_profile.set_wal_hol_diagnostics_enabled(true);
+                let error = writer
+                    .set_write_profile(Arc::clone(&hol_profile))
+                    .expect_err("Cursor writer must reject preconfigured HOL diagnostics");
+                assert!(error.to_string().contains("V8 HOL diagnostics"));
+
+                let timeline_profile = Arc::new(crate::mem_table::WriteProfile::default());
+                timeline_profile.set_wal_v8_completion_timeline_sample_every(1);
+                let error = writer
+                    .set_write_profile(Arc::clone(&timeline_profile))
+                    .expect_err("Cursor writer must reject a preconfigured completion timeline");
+                assert!(
+                    error
+                        .to_string()
+                        .contains("completion timeline diagnostics")
+                );
             }
-            Err(error) => return Err(error),
-        };
-        let wal = crate::wal::Wal::from_v8_parallel(writer, &installed)?;
 
-        let hol_profile = Arc::new(crate::mem_table::WriteProfile::default());
-        hol_profile.set_wal_hol_diagnostics_enabled(true);
-        let error = wal
-            .set_write_profile(Arc::clone(&hol_profile))
-            .expect_err("ring writer must reject preconfigured HOL diagnostics");
-        assert!(error.to_string().contains("V8 HOL diagnostics"));
+            let durability_profile = Arc::new(crate::mem_table::WriteProfile::default());
+            writer.set_write_profile(Arc::clone(&durability_profile))?;
+            let unsampled = batch(1);
+            let prepared = writer.preflight_batch(&unsampled, LIVE_WAL_V5_LIMITS)?;
+            writer.append_prepared_batch(prepared, unsampled.commit_ts, unsampled.recorded_at)?;
+            writer.sync()?;
+            assert!(
+                durability_profile
+                    .wal_v8_durability_phase_observations()
+                    .is_empty()
+            );
 
-        let timeline_profile = Arc::new(crate::mem_table::WriteProfile::default());
-        timeline_profile.set_wal_v8_completion_timeline_sample_every(1);
-        let error = wal
-            .set_write_profile(Arc::clone(&timeline_profile))
-            .expect_err("ring writer must reject a preconfigured completion timeline");
-        assert!(
-            error
-                .to_string()
-                .contains("completion timeline diagnostics")
-        );
+            durability_profile.set_wal_v8_durability_sample_every(1);
+            for writer_index in 0..4 {
+                let mut sampled = batch(writer_index + 2);
+                sampled.entries[0] = WalEntry::Put {
+                    key: format!("sampled-{writer_index}").into_bytes(),
+                    value: b"value".to_vec(),
+                };
+                let prepared = writer.preflight_batch(&sampled, LIVE_WAL_V5_LIMITS)?;
+                writer.append_prepared_batch(prepared, sampled.commit_ts, sampled.recorded_at)?;
+            }
+            writer.sync()?;
 
-        let durability_profile = Arc::new(crate::mem_table::WriteProfile::default());
-        durability_profile.set_wal_v8_durability_sample_every(1);
-        let error = wal
-            .set_write_profile(Arc::clone(&durability_profile))
-            .expect_err("ring writer must reject preconfigured durability sampling");
-        assert!(error.to_string().contains("durability phase diagnostics"));
-
-        wal.set_write_profile(Arc::new(crate::mem_table::WriteProfile::default()))?;
+            let observations = durability_profile.wal_v8_durability_phase_observations();
+            assert!(
+                !observations.is_empty(),
+                "Cursor {mode_name} must emit durability phase samples"
+            );
+            assert!(observations.iter().all(|observation| {
+                observation.coalescing_iterations.is_some()
+                    && observation.coalescing_progress_wait_wall_ns.is_some()
+                    && observation.coalescing_progress_wait_cpu_ns.is_some()
+                    && observation.coalescing_completion_drain_wall_ns.is_some()
+                    && observation.coalescing_completion_apply_wall_ns.is_some()
+                    && observation.coalescing_digest_fold_cpu_ns.is_some()
+                    && observation.coalescing_cursor_advance_cpu_ns.is_some()
+                    && observation.coalescing_ready_tickets_gained.is_some()
+            }));
+        }
 
         Ok(())
     }
@@ -7646,6 +10349,333 @@ mod tests {
         )?;
 
         Ok((writer, owner))
+    }
+
+    fn open_accounted_parallel_writer(
+        path: &Path,
+        installed: &WalV8InstalledRecovery,
+        max_file_size: u64,
+        max_source_spool_bytes: u64,
+        allocation_unit: u64,
+    ) -> Result<(WalV8ParallelWriter, Arc<WalV8ReservationOwner>)> {
+        let sync_file = OpenOptions::new().read(true).write(true).open(path)?;
+        let (leader, owner) = open_accounted_writer(
+            path,
+            installed,
+            max_file_size,
+            max_source_spool_bytes,
+            allocation_unit,
+            sync_file,
+        )?;
+        let worker_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_DIRECT)
+            .open(path)?;
+        let mut writer = leader.into_parallel_with_worker_file_and_progress_mode(
+            worker_file,
+            WalV8ProgressMode::Eager,
+        )?;
+        writer.point_buffer_preallocation_enabled = true;
+
+        Ok((writer, owner))
+    }
+
+    #[test]
+    fn point_buffer_preallocation_does_not_reserve_quota_before_admission() -> Result<()> {
+        const SEGMENT_LIMIT: u64 = 64 * 1024;
+        const INITIAL_SOURCE_CHARGE: u64 = HEADER_LEN_U64 + FRAME_LEN_U64;
+        const SOURCE_SPOOL_LIMIT: u64 = SEGMENT_LIMIT + INITIAL_SOURCE_CHARGE;
+
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("point-prealloc-quota-v8.wal");
+        let installed = install_empty(&path, header())?;
+        let (writer, owner) = match open_accounted_parallel_writer(
+            &path,
+            &installed,
+            SEGMENT_LIMIT,
+            SOURCE_SPOOL_LIMIT,
+            4096,
+        ) {
+            Ok(writer) => writer,
+            Err(error) if is_io_uring_unavailable_error(&error) => {
+                eprintln!("skipping test (io_uring unavailable): {error:#}");
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        let point = batch(10);
+        let prepared = writer.preflight_batch_with_write_class(
+            &point,
+            LIVE_WAL_V5_LIMITS,
+            WalV8WriteClass::Point,
+        )?;
+        let mut scratch = WalV8PointAdmissionScratch::new(prepared);
+
+        let quota_before = owner.image_owner().snapshot();
+        assert!(writer.try_preallocate_point_buffer(&mut scratch));
+        assert_eq!(owner.image_owner().snapshot(), quota_before);
+        assert_eq!(
+            writer
+                .point_buffer_preallocations_in_flight
+                .load(Ordering::Relaxed),
+            1
+        );
+
+        let error = writer
+            .admit_prepared_point_batch(scratch, point.commit_ts, point.recorded_at)
+            .err()
+            .expect("the exhausted source-spool quota must reject serialized admission");
+        assert!(format!("{error:#}").contains("source spool limit"));
+        assert_eq!(writer.coordinator.next_ticket(), 0);
+        assert_eq!(owner.image_owner().snapshot(), quota_before);
+        assert_eq!(
+            writer
+                .point_buffer_preallocations_in_flight
+                .load(Ordering::Relaxed),
+            0,
+            "failed admission drops its speculative buffer and permit"
+        );
+        #[cfg(feature = "bench")]
+        {
+            let diagnostics = writer.io_diagnostics();
+            assert_eq!(diagnostics.point_buffer_preallocation_attempts, 1);
+            assert_eq!(diagnostics.point_buffer_preallocation_hits, 1);
+            assert_eq!(diagnostics.point_buffer_preallocation_fallbacks, 0);
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn point_buffer_preallocation_does_not_consume_quota_before_admission() -> Result<()> {
+        point_buffer_preallocation_preserves_ordered_quota_admission()
+    }
+
+    fn point_buffer_preallocation_preserves_ordered_quota_admission() -> Result<()> {
+        const SEGMENT_LIMIT: u64 = 64 * 1024;
+        const INITIAL_SOURCE_CHARGE: u64 = HEADER_LEN_U64 + FRAME_LEN_U64;
+        const ONE_BATCH_SOURCE_CHARGE: u64 = 2 * WAL_V8_FRAME_LEN as u64;
+        const SOURCE_SPOOL_LIMIT: u64 =
+            SEGMENT_LIMIT + INITIAL_SOURCE_CHARGE + ONE_BATCH_SOURCE_CHARGE;
+
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("point-prealloc-order-v8.wal");
+        let installed = install_empty(&path, header())?;
+        let (writer, owner) = match open_accounted_parallel_writer(
+            &path,
+            &installed,
+            SEGMENT_LIMIT,
+            SOURCE_SPOOL_LIMIT,
+            4096,
+        ) {
+            Ok(writer) => writer,
+            Err(error) if is_io_uring_unavailable_error(&error) => {
+                eprintln!("skipping test (io_uring unavailable): {error:#}");
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        let earlier = batch(10);
+        let later = batch(20);
+        let earlier_scratch =
+            WalV8PointAdmissionScratch::new(writer.preflight_batch_with_write_class(
+                &earlier,
+                LIVE_WAL_V5_LIMITS,
+                WalV8WriteClass::Point,
+            )?);
+        let mut later_scratch =
+            WalV8PointAdmissionScratch::new(writer.preflight_batch_with_write_class(
+                &later,
+                LIVE_WAL_V5_LIMITS,
+                WalV8WriteClass::Point,
+            )?);
+
+        let quota_before_admission = owner.image_owner().snapshot();
+        assert!(writer.try_preallocate_point_buffer(&mut later_scratch));
+        assert_eq!(owner.image_owner().snapshot(), quota_before_admission);
+
+        let earlier_job = writer.admit_prepared_point_batch(
+            earlier_scratch,
+            earlier.commit_ts,
+            earlier.recorded_at,
+        )?;
+        let earlier_ticket = earlier_job.assignment().segment_ticket;
+        earlier_job.finish()?;
+        writer.wait_durable(earlier_ticket)?;
+
+        let quota_after_earlier_admission = owner.image_owner().snapshot();
+        assert_eq!(
+            quota_after_earlier_admission.source_spool_bytes,
+            quota_before_admission.source_spool_bytes + ONE_BATCH_SOURCE_CHARGE
+        );
+        let error = writer
+            .admit_prepared_point_batch(later_scratch, later.commit_ts, later.recorded_at)
+            .err()
+            .expect("the later admission exceeds the remaining source-spool quota");
+        assert!(format!("{error:#}").contains("source spool limit"));
+        assert_eq!(writer.coordinator.next_ticket(), 1);
+        assert_eq!(
+            owner.image_owner().snapshot(),
+            quota_after_earlier_admission
+        );
+        assert_eq!(
+            writer
+                .point_buffer_preallocations_in_flight
+                .load(Ordering::Relaxed),
+            0,
+            "failed later admission releases its speculative buffer permit"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn point_buffer_preallocation_exhaustion_falls_back_to_normal_admission() -> Result<()> {
+        const SEGMENT_LIMIT: u64 = 256 * 1024;
+        const INITIAL_SOURCE_CHARGE: u64 = HEADER_LEN_U64 + FRAME_LEN_U64;
+        const BATCH_COUNT: usize = MAX_POINT_BUFFER_PREALLOCATIONS + 1;
+
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("point-prealloc-bound-v8.wal");
+        let installed = install_empty(&path, header())?;
+        let (writer, _owner) = match open_accounted_parallel_writer(
+            &path,
+            &installed,
+            SEGMENT_LIMIT,
+            2 * SEGMENT_LIMIT,
+            4096,
+        ) {
+            Ok(writer) => writer,
+            Err(error) if is_io_uring_unavailable_error(&error) => {
+                eprintln!("skipping test (io_uring unavailable): {error:#}");
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        let batches = (1..=BATCH_COUNT)
+            .map(|ticket| batch(ticket as u64))
+            .collect::<Vec<_>>();
+        let mut scratches = Vec::with_capacity(BATCH_COUNT);
+
+        // Keep the first 16 buffers live so the next Point falls back to the
+        // ordinary in-sequencer allocation path.
+        for (index, point) in batches.iter().enumerate() {
+            let prepared = writer.preflight_batch_with_write_class(
+                point,
+                LIVE_WAL_V5_LIMITS,
+                WalV8WriteClass::Point,
+            )?;
+            let mut scratch = WalV8PointAdmissionScratch::new(prepared);
+            let preallocated = writer.try_preallocate_point_buffer(&mut scratch);
+            assert_eq!(
+                preallocated,
+                index < MAX_POINT_BUFFER_PREALLOCATIONS,
+                "the bounded permit pool should fall back after its configured limit"
+            );
+            scratches.push(scratch);
+        }
+
+        assert_eq!(
+            writer
+                .point_buffer_preallocations_in_flight
+                .load(Ordering::Relaxed),
+            MAX_POINT_BUFFER_PREALLOCATIONS
+        );
+        let fallback = scratches.pop().expect("the last scratch used fallback");
+        let fallback_point = batches.last().expect("one fallback batch exists");
+        let job = writer.admit_prepared_point_batch(
+            fallback,
+            fallback_point.commit_ts,
+            fallback_point.recorded_at,
+        )?;
+        let ticket = job.assignment().segment_ticket;
+        job.finish()?;
+        writer.wait_durable(ticket)?;
+        assert_eq!(
+            writer
+                .point_buffer_preallocations_in_flight
+                .load(Ordering::Relaxed),
+            MAX_POINT_BUFFER_PREALLOCATIONS,
+            "the ordinary allocation fallback must not consume another permit"
+        );
+
+        drop(scratches);
+        assert_eq!(
+            writer
+                .point_buffer_preallocations_in_flight
+                .load(Ordering::Relaxed),
+            0,
+            "abandoned pre-admission buffers release all permits"
+        );
+        #[cfg(feature = "bench")]
+        {
+            let diagnostics = writer.io_diagnostics();
+            assert_eq!(
+                diagnostics.point_buffer_preallocation_attempts,
+                BATCH_COUNT as u64
+            );
+            assert_eq!(
+                diagnostics.point_buffer_preallocation_hits,
+                MAX_POINT_BUFFER_PREALLOCATIONS as u64
+            );
+            assert_eq!(diagnostics.point_buffer_preallocation_fallbacks, 1);
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn point_buffer_preallocation_rejects_non_point_and_multiframe_writes() -> Result<()> {
+        const SEGMENT_LIMIT: u64 = 128 * 1024;
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("point-prealloc-eligibility-v8.wal");
+        let installed = install_empty(&path, header())?;
+        let (writer, _owner) = match open_accounted_parallel_writer(
+            &path,
+            &installed,
+            SEGMENT_LIMIT,
+            2 * SEGMENT_LIMIT,
+            4096,
+        ) {
+            Ok(writer) => writer,
+            Err(error) if is_io_uring_unavailable_error(&error) => {
+                eprintln!("skipping test (io_uring unavailable): {error:#}");
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+
+        let single_point = batch(10);
+        let single_batch = batch(20);
+        let multi_point = multi_frame_batch(30);
+        let multi_batch = multi_frame_batch(40);
+
+        let mut single_point_scratch =
+            WalV8PointAdmissionScratch::new(writer.preflight_batch_with_write_class(
+                &single_point,
+                LIVE_WAL_V5_LIMITS,
+                WalV8WriteClass::Point,
+            )?);
+        assert!(writer.try_preallocate_point_buffer(&mut single_point_scratch));
+        assert_eq!(writer.point_buffer_preallocations_in_flight_for_test(), 1);
+        drop(single_point_scratch);
+        assert_eq!(writer.point_buffer_preallocations_in_flight_for_test(), 0);
+
+        for (input, class) in [
+            (&single_batch, WalV8WriteClass::Batch),
+            (&multi_point, WalV8WriteClass::Point),
+            (&multi_batch, WalV8WriteClass::Batch),
+        ] {
+            let mut scratch = WalV8PointAdmissionScratch::new(
+                writer.preflight_batch_with_write_class(input, LIVE_WAL_V5_LIMITS, class)?,
+            );
+            assert!(!writer.try_preallocate_point_buffer(&mut scratch));
+            assert_eq!(writer.point_buffer_preallocations_in_flight_for_test(), 0);
+        }
+
+        assert_eq!(writer.point_buffer_preallocation_hits_for_test(), 1);
+        Ok(())
     }
 
     #[test]
@@ -7804,7 +10834,6 @@ mod tests {
         })
     }
 
-    #[cfg(feature = "bench")]
     fn point_only_extent_preallocator_fixture(
         path: &Path,
         max_file_size: u64,
@@ -9198,7 +12227,7 @@ mod tests {
     fn open_parallel_with_progress_mode(
         path: &Path,
         installed: &WalV8InstalledRecovery,
-        enabled: bool,
+        mode: WalV8ProgressMode,
     ) -> Result<WalV8ParallelWriter> {
         let worker_file = std::fs::OpenOptions::new()
             .read(true)
@@ -9206,16 +12235,997 @@ mod tests {
             .custom_flags(libc::O_DIRECT)
             .open(path)?;
         open_writer(path, installed)?
-            .into_parallel_with_worker_file_and_progress_ring(worker_file, enabled)
+            .into_parallel_with_worker_file_and_progress_mode(worker_file, mode)
+    }
+
+    fn open_parallel_with_direct_completion(
+        path: &Path,
+        installed: &WalV8InstalledRecovery,
+        mode: WalV8ProgressMode,
+        worker_group_limit: Option<usize>,
+    ) -> Result<WalV8ParallelWriter> {
+        let worker_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_DIRECT)
+            .open(path)?;
+        open_writer(path, installed)?.into_parallel_with_worker_file_progress_and_completion(
+            worker_file,
+            mode,
+            true,
+            WalV8FrontierWriteMode::Buffered,
+            worker_group_limit,
+            None,
+        )
+    }
+
+    fn cursor_completion_coordinator() -> Result<(WalV8ParallelCoordinator, Receiver<()>)> {
+        let wal_header = header();
+        let durable_prefix_digest = wal_header.initial_prefix_digest()?;
+        let coordinator = WalV8ParallelCoordinator::new(
+            wal_header,
+            WalV8ParallelConfig {
+                next_ticket: 0,
+                next_data_offset: HEADER_LEN_U64 + FRAME_LEN_U64,
+                last_commit_ts: 0,
+                last_recorded_at: None,
+                durable_prefix_digest,
+                max_inflight_tickets: 1,
+                max_inflight_bytes: FRAME_LEN_U64,
+                max_file_size: MAX_WAL_FILE_SIZE,
+                progress_mode: WalV8ProgressMode::Cursor,
+            },
+        )?;
+        let control_tokens = coordinator
+            .take_progress_token_receiver()?
+            .context("Cursor coordinator has no control-token receiver")?;
+        Ok((coordinator, control_tokens))
     }
 
     #[test]
-    fn progress_ring_driver_scan_to_park_observes_late_data_completion() -> Result<()> {
+    fn cursor_direct_completion_writes_reopens_and_recovers_without_reaper() -> Result<()> {
+        check_cursor_direct_completion_writes_reopens_and_recovers()
+    }
+
+    #[test]
+    fn cursor_direct_completion_token_wakes_driver_after_empty_scan() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("cursor-token-scan-to-park-v8.wal");
+        let wal_header = header();
+        let installed = install_empty(&path, wal_header)?;
+        let writer = match open_parallel_with_direct_completion(
+            &path,
+            &installed,
+            WalV8ProgressMode::Cursor,
+            None,
+        ) {
+            Ok(writer) => Arc::new(writer),
+            Err(error) if is_io_uring_unavailable_error(&error) => {
+                eprintln!("skipping test (io_uring unavailable): {error:#}");
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+
+        let input = batch(10);
+        let job = writer.admit_prepared_batch(
+            writer.preflight_batch(&input, LIVE_WAL_V5_LIMITS)?,
+            input.commit_ts,
+            input.recorded_at,
+        )?;
+        let ticket = job.assignment().segment_ticket;
+        let (wait_entered_tx, wait_entered_rx) = crossbeam_channel::bounded(1);
+        let (release_wait_tx, release_wait_rx) = crossbeam_channel::bounded(1);
+        let first_wait = Arc::new(AtomicBool::new(false));
+        writer.io.set_progress_wait_hook(Arc::new({
+            let first_wait = Arc::clone(&first_wait);
+            move |event| {
+                if matches!(event, WalV8ProgressWaitTestEvent::BeforeWait)
+                    && !first_wait.swap(true, Ordering::AcqRel)
+                {
+                    let _ = wait_entered_tx.send(());
+                    let _ = release_wait_rx.recv_timeout(Duration::from_secs(5));
+                }
+            }
+        }));
+
+        let (driver_result_tx, driver_result_rx) = mpsc::channel();
+        let (finish_result_tx, finish_result_rx) = mpsc::channel();
+        thread::scope(|scope| -> Result<()> {
+            let driver_writer = Arc::clone(&writer);
+            let driver = scope.spawn(move || {
+                let _ = driver_result_tx.send(driver_writer.advance_frontier_through(ticket));
+            });
+            wait_entered_rx
+                .recv_timeout(Duration::from_secs(5))
+                .context("durability driver did not reach its empty-prefix wait")?;
+
+            let finish = scope.spawn(move || {
+                let _ = finish_result_tx.send(job.finish().map(|_| ()));
+            });
+            let completion_deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < completion_deadline {
+                let completion_queued = writer
+                    .io
+                    .direct_completions
+                    .as_ref()
+                    .is_some_and(|completions| !completions.is_empty());
+                let progress_signaled = writer
+                    .io
+                    .progress_tokens
+                    .as_ref()
+                    .is_some_and(|tokens| !tokens.is_empty());
+                if completion_queued && progress_signaled {
+                    break;
+                }
+                thread::yield_now();
+            }
+            ensure!(
+                writer
+                    .io
+                    .direct_completions
+                    .as_ref()
+                    .is_some_and(|completions| !completions.is_empty()),
+                "worker did not enqueue DATA completion while the driver was paused"
+            );
+            ensure!(
+                writer
+                    .io
+                    .progress_tokens
+                    .as_ref()
+                    .is_some_and(|tokens| !tokens.is_empty()),
+                "direct DATA completion did not signal the progress token"
+            );
+
+            release_wait_tx.send(())?;
+            driver_result_rx
+                .recv_timeout(Duration::from_secs(5))
+                .context("token-mode driver did not scan the queued completion")??;
+            finish_result_rx
+                .recv_timeout(Duration::from_secs(5))
+                .context("Point waiter did not receive its durable ACK")??;
+            driver
+                .join()
+                .map_err(|_| anyhow::anyhow!("token-mode durability driver panicked"))?;
+            finish
+                .join()
+                .map_err(|_| anyhow::anyhow!("token-mode Point finisher panicked"))?;
+            Ok(())
+        })?;
+
+        assert_eq!(writer.active_boundaries()?.1.ticket_end, 1);
+        drop(writer);
+        let recovered = super::super::install::recover_and_install_active(
+            &path,
+            &[installed.active_boundary],
+            wal_header.predecessor,
+            LIVE_WAL_V5_LIMITS,
+            MAX_WAL_FILE_SIZE,
+        )?;
+        assert_eq!(recovered.active_boundary.ticket_end, 1);
+        assert_eq!(replayed_batches(&path, &recovered)?, [input]);
+
+        Ok(())
+    }
+
+    fn check_cursor_direct_completion_writes_reopens_and_recovers() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("cursor-direct-completion-v8.wal");
+        let wal_header = header();
+        let installed = install_empty(&path, wal_header)?;
+        let writer = match open_parallel_with_direct_completion(
+            &path,
+            &installed,
+            WalV8ProgressMode::Cursor,
+            None,
+        ) {
+            Ok(writer) => writer,
+            Err(error) if is_io_uring_unavailable_error(&error) => {
+                eprintln!("skipping test (io_uring unavailable): {error:#}");
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+
+        assert!(writer.io.completion_thread.lock().is_none());
+        assert!(writer.io.completion_events.is_none());
+        assert!(writer.io.direct_completions.is_some());
+        #[cfg(feature = "bench")]
+        {
+            assert!(writer.io_diagnostics().cursor_direct_completion_enabled);
+            assert!(
+                !writer
+                    .io_diagnostics()
+                    .cursor_direct_completion_select_wake_enabled
+            );
+        }
+
+        let first_batch = batch(10);
+        writer.append_prepared_batch(
+            writer.preflight_batch(&first_batch, LIVE_WAL_V5_LIMITS)?,
+            first_batch.commit_ts,
+            first_batch.recorded_at,
+        )?;
+        let second_batch = batch(20);
+        writer.append_prepared_batch(
+            writer.preflight_batch(&second_batch, LIVE_WAL_V5_LIMITS)?,
+            second_batch.commit_ts,
+            second_batch.recorded_at,
+        )?;
+        let (_, first_boundary) = writer.active_boundaries()?;
+        assert_eq!(first_boundary.ticket_end, 2);
+        drop(writer);
+
+        let recovered = super::super::install::recover_and_install_active(
+            &path,
+            &[first_boundary],
+            wal_header.predecessor,
+            LIVE_WAL_V5_LIMITS,
+            MAX_WAL_FILE_SIZE,
+        )?;
+        assert_eq!(
+            replayed_batches(&path, &recovered)?,
+            [first_batch.clone(), second_batch.clone()]
+        );
+
+        let reopened = open_parallel_with_direct_completion(
+            &path,
+            &recovered,
+            WalV8ProgressMode::Cursor,
+            None,
+        )?;
+        let third_batch = batch(30);
+        reopened.append_prepared_batch(
+            reopened.preflight_batch(&third_batch, LIVE_WAL_V5_LIMITS)?,
+            third_batch.commit_ts,
+            third_batch.recorded_at,
+        )?;
+        let (_, final_boundary) = reopened.active_boundaries()?;
+        assert_eq!(final_boundary.ticket_end, 3);
+        drop(reopened);
+
+        let final_recovered = super::super::install::recover_and_install_active(
+            &path,
+            &[final_boundary],
+            wal_header.predecessor,
+            LIVE_WAL_V5_LIMITS,
+            MAX_WAL_FILE_SIZE,
+        )?;
+        assert_eq!(
+            replayed_batches(&path, &final_recovered)?,
+            [first_batch, second_batch, third_batch]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn cursor_submission_preserves_groups_ranges_and_recovery() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("cursor-submission-v8.wal");
+        let wal_header = header();
+        let installed = install_empty(&path, wal_header)?;
+        let writer = match open_parallel_with_direct_completion(
+            &path,
+            &installed,
+            WalV8ProgressMode::Cursor,
+            None,
+        ) {
+            Ok(writer) => writer,
+            Err(error) if is_io_uring_unavailable_error(&error) => {
+                eprintln!("skipping test (io_uring unavailable): {error:#}");
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        let input_batches = [batch(10), multi_frame_batch(20), batch(30)];
+        for input in &input_batches {
+            writer.append_prepared_batch(
+                writer.preflight_batch(input, LIVE_WAL_V5_LIMITS)?,
+                input.commit_ts,
+                input.recorded_at,
+            )?;
+        }
+        let (_, boundary) = writer.active_boundaries()?;
+        let snapshots = writer
+            .io
+            .submission
+            .lock()
+            .submitted_group_snapshots
+            .clone();
+        assert!(
+            snapshots
+                .iter()
+                .any(|group| !group.frontier_offsets.is_empty())
+        );
+        assert!(
+            snapshots
+                .iter()
+                .all(|group| group.tickets.end - group.tickets.start == 1)
+        );
+        assert!(snapshots.iter().any(|group| {
+            group
+                .data_ranges
+                .iter()
+                .any(|range| range.end - range.start > WAL_V8_FRAME_LEN as u64)
+        }));
+        drop(writer);
+
+        let recovered = super::super::install::recover_and_install_active(
+            &path,
+            &[boundary],
+            wal_header.predecessor,
+            LIVE_WAL_V5_LIMITS,
+            MAX_WAL_FILE_SIZE,
+        )?;
+        assert_eq!(replayed_batches(&path, &recovered)?, input_batches);
+        Ok(())
+    }
+
+    #[test]
+    fn cursor_submission_preserves_multi_ticket_groups_and_recovery() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("cursor-multi-ticket-v8.wal");
+        let wal_header = header();
+        let installed = install_empty(&path, wal_header)?;
+        let writer = match open_parallel_with_direct_completion(
+            &path,
+            &installed,
+            WalV8ProgressMode::Cursor,
+            None,
+        ) {
+            Ok(writer) => writer,
+            Err(error) if is_io_uring_unavailable_error(&error) => {
+                eprintln!("skipping test (io_uring unavailable): {error:#}");
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        writer
+            .io
+            .group_join_micros
+            .store(2_000_000, std::sync::atomic::Ordering::Relaxed);
+        let input_batches = [multi_frame_batch(10), batch(20), batch(30)];
+        let first = &input_batches[0];
+        let second = &input_batches[1];
+        let first_job = writer.admit_prepared_batch(
+            writer.preflight_batch(first, LIVE_WAL_V5_LIMITS)?,
+            first.commit_ts,
+            first.recorded_at,
+        )?;
+        let second_job = writer.admit_prepared_batch(
+            writer.preflight_batch(second, LIVE_WAL_V5_LIMITS)?,
+            second.commit_ts,
+            second.recorded_at,
+        )?;
+
+        thread::scope(|scope| -> Result<()> {
+            let first_handle = scope.spawn(move || first_job.finish());
+            wait_for_data_group_cutoff(&writer, 2)?;
+
+            let third = &input_batches[2];
+            let third_job = writer.admit_prepared_batch(
+                writer.preflight_batch(third, LIVE_WAL_V5_LIMITS)?,
+                third.commit_ts,
+                third.recorded_at,
+            )?;
+            second_job.finish()?;
+            wait_for_data_group_cutoff(&writer, 3)?;
+            third_job.finish()?;
+            first_handle
+                .join()
+                .map_err(|_| anyhow::anyhow!("first v8 DATA producer panicked"))??;
+            Ok(())
+        })?;
+
+        writer.wait_durable(2)?;
+        let (_, boundary) = writer.active_boundaries()?;
+        let snapshots = writer
+            .io
+            .submission
+            .lock()
+            .submitted_group_snapshots
+            .clone();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].tickets, 0..3);
+        assert_eq!(snapshots[0].data_ranges.len(), input_batches.len());
+        drop(writer);
+
+        let recovered = super::super::install::recover_and_install_active(
+            &path,
+            &[boundary],
+            wal_header.predecessor,
+            LIVE_WAL_V5_LIMITS,
+            MAX_WAL_FILE_SIZE,
+        )?;
+        assert_eq!(replayed_batches(&path, &recovered)?, input_batches);
+        Ok(())
+    }
+
+    #[cfg(feature = "chaos-testing")]
+    #[test]
+    fn failpoint_cursor_direct_worker_failure_unblocks_sync_and_slot_waiters() -> Result<()> {
+        use std::sync::mpsc;
+
+        use crate::chaos::failpoint::{
+            FailScenario, arm_parallel_wal_completion_drain_gate, arm_parallel_wal_sync_gate,
+            parallel_wal_injected_negative_cqe_count, reset_parallel_wal_failure_test_counters,
+        };
+
+        const GROUP_LIMIT: usize = 8;
+        const TIMEOUT: Duration = Duration::from_secs(5);
+
+        let _scenario = FailScenario::setup();
+        reset_parallel_wal_failure_test_counters();
+
+        let directory = tempfile::tempdir()?;
+        let path = directory
+            .path()
+            .join("cursor-direct-completion-failure-v8.wal");
+        let wal_header = header();
+        let installed = install_empty(&path, wal_header)?;
+        let writer = match open_parallel_with_direct_completion(
+            &path,
+            &installed,
+            WalV8ProgressMode::Cursor,
+            Some(GROUP_LIMIT),
+        ) {
+            Ok(writer) => Arc::new(writer),
+            Err(error) if is_io_uring_unavailable_error(&error) => {
+                eprintln!("skipping test (io_uring unavailable): {error:#}");
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+
+        let first_batch = batch(10);
+        let first_job = writer.admit_prepared_batch(
+            writer.preflight_batch(&first_batch, LIVE_WAL_V5_LIMITS)?,
+            first_batch.commit_ts,
+            first_batch.recorded_at,
+        )?;
+        assert_eq!(first_job.assignment().segment_ticket, 0);
+
+        let later_batches: Vec<_> = (11..=19).map(batch).collect();
+        let mut later_jobs = later_batches
+            .iter()
+            .map(|input| {
+                writer.admit_prepared_batch(
+                    writer.preflight_batch(input, LIVE_WAL_V5_LIMITS)?,
+                    input.commit_ts,
+                    input.recorded_at,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        assert_eq!(later_jobs.len(), GROUP_LIMIT + 1);
+        let blocked_producer_job = later_jobs.pop().expect("ticket 9 job exists");
+
+        let sync_gate = arm_parallel_wal_sync_gate();
+
+        thread::scope(|scope| -> Result<()> {
+            let (first_tx, first_rx) = mpsc::channel();
+            let first_writer = Arc::clone(&writer);
+            let first_handle = scope.spawn(move || {
+                let finish = first_job
+                    .finish()
+                    .map(|_| ())
+                    .map_err(|error| format!("{error:#}"));
+                let durable = first_writer
+                    .wait_durable(0)
+                    .map_err(|error| format!("{error:#}"));
+                let _ = first_tx.send((finish, durable));
+            });
+
+            ensure!(
+                sync_gate.wait_until_entered(TIMEOUT),
+                "first durability driver did not reach fdatasync"
+            );
+
+            // Let ticket 0 reach its sync before pausing CQE draining. The
+            // worker must be free to publish its completion first; otherwise
+            // the durability driver cannot enter the frontier sync at all.
+            let completion_gate = arm_parallel_wal_completion_drain_gate();
+
+            for (index, job) in later_jobs.into_iter().enumerate() {
+                assert_eq!(job.assignment().segment_ticket, index as u64 + 1);
+                job.finish()?;
+                if index == 0 {
+                    ensure!(
+                        completion_gate.wait_until_entered(TIMEOUT),
+                        "worker did not pause with a DATA SQE awaiting CQE processing"
+                    );
+                }
+            }
+
+            let active_groups = writer
+                .io
+                .worker
+                .lock()
+                .as_ref()
+                .context("direct completion worker was already removed")?
+                .active_group_count_for_test();
+            assert_eq!(
+                active_groups, GROUP_LIMIT,
+                "the test must fill every Worker GroupSlot before blocking the next producer"
+            );
+
+            let (waiter_started_tx, waiter_started_rx) = mpsc::channel();
+            let (waiter_result_tx, waiter_result_rx) = mpsc::channel();
+            for ticket in 1..=GROUP_LIMIT as u64 {
+                let waiter_writer = Arc::clone(&writer);
+                let started = waiter_started_tx.clone();
+                let results = waiter_result_tx.clone();
+                scope.spawn(move || {
+                    let _ = started.send(ticket);
+                    let result = waiter_writer
+                        .wait_durable(ticket)
+                        .map_err(|error| format!("{error:#}"));
+                    let _ = results.send((ticket, result));
+                });
+            }
+            drop(waiter_started_tx);
+            drop(waiter_result_tx);
+            for _ in 1..=GROUP_LIMIT {
+                waiter_started_rx
+                    .recv_timeout(TIMEOUT)
+                    .context("durability waiter did not start")?;
+            }
+
+            let (producer_started_tx, producer_started_rx) = mpsc::channel();
+            let (producer_result_tx, producer_result_rx) = mpsc::channel();
+            let producer_handle = scope.spawn(move || {
+                let _ = producer_started_tx.send(());
+                let result = blocked_producer_job
+                    .finish()
+                    .map(|_| ())
+                    .map_err(|error| format!("{error:#}"));
+                let _ = producer_result_tx.send(result);
+            });
+            producer_started_rx
+                .recv_timeout(TIMEOUT)
+                .context("blocked producer did not start")?;
+            assert!(
+                matches!(
+                    producer_result_rx.recv_timeout(Duration::from_millis(50)),
+                    Err(mpsc::RecvTimeoutError::Timeout)
+                ),
+                "producer should wait while all worker group slots are occupied"
+            );
+
+            fail::cfg("parallel_wal.negative_cqe", "return").map_err(anyhow::Error::msg)?;
+            completion_gate.release();
+
+            let poison_deadline = Instant::now() + TIMEOUT;
+            while !writer.is_poisoned() && Instant::now() < poison_deadline {
+                thread::sleep(Duration::from_millis(1));
+            }
+            ensure!(
+                writer.is_poisoned(),
+                "direct worker failure did not poison the V8 coordinator"
+            );
+            assert_eq!(parallel_wal_injected_negative_cqe_count(), 1);
+
+            // Unblock the driver only after the worker has failed, so the
+            // test exercises failure while it is parked at the FRONTIER sync
+            // call, before that ticket can be acknowledged.
+            sync_gate.release();
+            let (first_finish, first_durable) = first_rx
+                .recv_timeout(TIMEOUT)
+                .context("first producer or durability driver did not unblock")?;
+            first_handle
+                .join()
+                .map_err(|_| anyhow::anyhow!("first producer panicked"))?;
+            assert!(
+                first_finish.is_ok(),
+                "first DATA job failed: {first_finish:?}"
+            );
+            assert!(
+                first_durable.is_err(),
+                "ticket 0 must not be acknowledged after the coordinator is poisoned"
+            );
+
+            let mut waiter_results = Vec::with_capacity(GROUP_LIMIT);
+            for _ in 1..=GROUP_LIMIT {
+                waiter_results.push(
+                    waiter_result_rx
+                        .recv_timeout(TIMEOUT)
+                        .context("durability waiter remained blocked after worker failure")?,
+                );
+            }
+            for (ticket, result) in waiter_results {
+                assert!(
+                    result.is_err(),
+                    "ticket {ticket} received an invalid durability ACK"
+                );
+            }
+
+            let blocked_producer = producer_result_rx
+                .recv_timeout(TIMEOUT)
+                .context("GroupSlots waiter remained blocked after worker failure")?;
+            assert!(
+                blocked_producer.is_err(),
+                "blocked producer was admitted after worker failure"
+            );
+            producer_handle
+                .join()
+                .map_err(|_| anyhow::anyhow!("blocked producer panicked"))?;
+
+            assert!(writer.is_poisoned());
+            assert_eq!(
+                writer.coordinator.durable_ticket_end(),
+                0,
+                "a ticket was acknowledged after the worker failure poisoned the coordinator"
+            );
+
+            let worker = writer
+                .io
+                .worker
+                .lock()
+                .take()
+                .context("direct completion worker was already removed")?;
+            // Joining a failed or stopped worker must complete after it has
+            // closed GroupSlots and released permits for queued commands.
+            let _ = worker.close();
+            assert_eq!(
+                writer.coordinator.durable_ticket_end(),
+                0,
+                "a FRONTIER prefix must not advance after the worker failure poisoned the coordinator"
+            );
+
+            Ok(())
+        })?;
+
+        let durable_boundary = writer.active_boundaries()?.1;
+        assert_eq!(durable_boundary.ticket_end, 0);
+        drop(writer);
+        let recovered = super::super::install::recover_and_install_active(
+            &path,
+            &[durable_boundary],
+            wal_header.predecessor,
+            LIVE_WAL_V5_LIMITS,
+            MAX_WAL_FILE_SIZE,
+        )?;
+        let replayed = replayed_batches(&path, &recovered)?;
+        assert!(
+            replayed.len() <= 1,
+            "recovery accepted DATA beyond the FRONTIER sync that was in progress"
+        );
+        if let Some(replayed_batch) = replayed.first() {
+            // The failure is injected before the fdatasync syscall. Once the
+            // gate is released, ticket 0's sync may reach disk even though
+            // poison prevents the caller from receiving an ACK.
+            assert_eq!(replayed_batch, &first_batch);
+        }
+
+        Ok(())
+    }
+
+    fn run_coalescing_snapshot_refresh_case(
+        filename: &str,
+        budget: Duration,
+        drop_token_before_wait: bool,
+        expected_wait: WalV8ProgressTokenWait,
+    ) -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join(filename);
+        let wal_header = header();
+        let installed = install_empty(&path, wal_header)?;
+        let writer = match open_parallel_with_direct_completion(
+            &path,
+            &installed,
+            WalV8ProgressMode::Cursor,
+            None,
+        ) {
+            Ok(writer) => writer,
+            Err(error) if is_io_uring_unavailable_error(&error) => {
+                eprintln!("skipping test (io_uring unavailable): {error:#}");
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+
+        let first = batch(10);
+        let second = batch(20);
+        let mut first_job = writer.admit_prepared_batch(
+            writer.preflight_batch(&first, LIVE_WAL_V5_LIMITS)?,
+            first.commit_ts,
+            first.recorded_at,
+        )?;
+        let mut second_job = writer.admit_prepared_batch(
+            writer.preflight_batch(&second, LIVE_WAL_V5_LIMITS)?,
+            second.commit_ts,
+            second.recorded_at,
+        )?;
+        let encoded_first = first_job
+            .admitted
+            .take()
+            .expect("admitted batch exists")
+            .encode()?;
+        let first_digest = encoded_first.digest_ready()?;
+        writer.coordinator.mark_digest_ready(first_digest)?;
+        let encoded_second = second_job
+            .admitted
+            .take()
+            .expect("admitted batch exists")
+            .encode()?;
+        let second_digest = encoded_second.digest_ready()?;
+        writer.coordinator.mark_digest_ready(second_digest)?;
+        writer.coordinator.mark_frames_ready(0)?;
+        writer.coordinator.mark_frames_ready(1)?;
+        writer.coordinator.mark_data_group_complete(0..1)?;
+
+        let mut driver = writer
+            .coordinator
+            .acquire_durability_driver(1)?
+            .expect("test acquires durability driver");
+        let mut snapshot = writer.io.advance_and_snapshot(&mut driver, false)?;
+        assert_eq!(snapshot.ready_prefix.len(), 1);
+        assert_eq!(snapshot.admitted_ticket_count, 2);
+
+        let wait_outcomes = Arc::new(Mutex::new(Vec::new()));
+        let injected = Arc::new(AtomicBool::new(false));
+        writer.io.set_progress_wait_hook(Arc::new({
+            let coordinator = writer.coordinator.clone();
+            let progress_tokens = writer.io.progress_tokens.clone();
+            let wait_outcomes = Arc::clone(&wait_outcomes);
+            let injected = Arc::clone(&injected);
+            move |event| match event {
+                WalV8ProgressWaitTestEvent::BeforeWait => {
+                    if !injected.swap(true, Ordering::AcqRel) {
+                        coordinator
+                            .mark_data_group_complete(1..2)
+                            .expect("mark ticket 1 complete for coalescing refresh test");
+                        if drop_token_before_wait {
+                            if let Some(tokens) = progress_tokens.as_ref() {
+                                while tokens.try_recv().is_ok() {}
+                            }
+                        } else {
+                            coordinator
+                                .worker_completion_handle()
+                                .notify_completion_queued()
+                                .expect("signal progress token for coalescing refresh test");
+                        }
+                    }
+                }
+                WalV8ProgressWaitTestEvent::AfterWait(status) => {
+                    wait_outcomes.lock().push(status);
+                }
+            }
+        }));
+
+        let waited = writer.io.coalesce_progress_ring(
+            &mut driver,
+            &mut snapshot,
+            budget,
+            false,
+            #[cfg(feature = "bench")]
+            None,
+        )?;
+        assert!(waited);
+        assert_eq!(wait_outcomes.lock().as_slice(), &[expected_wait]);
+        assert_eq!(snapshot.ready_prefix.len(), 2);
+
+        drop(driver);
+        drop(first_job);
+        drop(second_job);
+        Ok(())
+    }
+
+    #[test]
+    fn coalescing_progress_ring_refreshes_snapshot_after_token_wake() -> Result<()> {
+        run_coalescing_snapshot_refresh_case(
+            "coalesce-token-wake-v8.wal",
+            Duration::from_secs(5),
+            false,
+            WalV8ProgressTokenWait::Signaled,
+        )
+    }
+
+    #[test]
+    fn coalescing_progress_ring_refreshes_snapshot_on_timeout_final_scan() -> Result<()> {
+        run_coalescing_snapshot_refresh_case(
+            "coalesce-timeout-final-scan-v8.wal",
+            Duration::from_millis(5),
+            true,
+            WalV8ProgressTokenWait::TimedOut,
+        )
+    }
+
+    #[test]
+    fn direct_frontier_uses_o_direct_data_descriptor_and_recovers() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("direct-frontier-v8.wal");
+        let wal_header = header();
+        let installed = install_empty(&path, wal_header)?;
+        let worker_file = match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_DIRECT)
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(error) if error.raw_os_error() == Some(libc::EINVAL) => {
+                eprintln!("skipping test (O_DIRECT unsupported on test fs): {error}");
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let writer = match open_writer(&path, &installed)?
+            .into_parallel_with_worker_file_progress_and_completion(
+                worker_file,
+                WalV8ProgressMode::Cursor,
+                true,
+                WalV8FrontierWriteMode::Direct,
+                None,
+                None,
+            ) {
+            Ok(writer) => writer,
+            Err(error) if is_io_uring_unavailable_error(&error) => {
+                eprintln!("skipping test (io_uring unavailable): {error:#}");
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        assert!(writer.uses_direct_frontier()?);
+
+        let inputs = [batch(10), batch(20)];
+        for input in &inputs {
+            writer.append_prepared_batch(
+                writer.preflight_batch(input, LIVE_WAL_V5_LIMITS)?,
+                input.commit_ts,
+                input.recorded_at,
+            )?;
+        }
+        let (_, boundary) = writer.active_boundaries()?;
+        drop(writer);
+
+        let recovered = super::super::install::recover_and_install_active(
+            &path,
+            &[boundary],
+            wal_header.predecessor,
+            LIVE_WAL_V5_LIMITS,
+            MAX_WAL_FILE_SIZE,
+        )?;
+        assert_eq!(replayed_batches(&path, &recovered)?, inputs);
+        Ok(())
+    }
+
+    #[test]
+    fn direct_frontier_falls_back_to_buffered_when_data_worker_is_buffered() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("direct-frontier-fallback-v8.wal");
+        let wal_header = header();
+        let installed = install_empty(&path, wal_header)?;
+        let worker_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)?;
+        let writer = match open_writer(&path, &installed)?
+            .into_parallel_with_worker_file_progress_and_completion(
+                worker_file,
+                WalV8ProgressMode::Eager,
+                false,
+                WalV8FrontierWriteMode::Direct,
+                None,
+                None,
+            ) {
+            Ok(writer) => writer,
+            Err(error) if is_io_uring_unavailable_error(&error) => {
+                eprintln!("skipping test (io_uring unavailable): {error:#}");
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        assert!(!writer.uses_direct_frontier()?);
+
+        let input = batch(30);
+        writer.append_prepared_batch(
+            writer.preflight_batch(&input, LIVE_WAL_V5_LIMITS)?,
+            input.commit_ts,
+            input.recorded_at,
+        )?;
+        let (_, boundary) = writer.active_boundaries()?;
+        drop(writer);
+
+        let recovered = super::super::install::recover_and_install_active(
+            &path,
+            &[boundary],
+            wal_header.predecessor,
+            LIVE_WAL_V5_LIMITS,
+            MAX_WAL_FILE_SIZE,
+        )?;
+        assert_eq!(replayed_batches(&path, &recovered)?, [input]);
+        Ok(())
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn progress_ring_sync_diagnostics_survive_warmup_measurement_reset() -> Result<()> {
+        let mode = WalV8ProgressMode::Cursor;
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("progress-warmup-v8.wal");
+        let installed = install_empty(&path, header())?;
+        let writer = match open_parallel_with_progress_mode(&path, &installed, mode) {
+            Ok(writer) => writer,
+            Err(error) if is_io_uring_unavailable_error(&error) => {
+                eprintln!("skipping test (io_uring unavailable): {error:#}");
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        let profile = Arc::new(crate::mem_table::WriteProfile::default());
+        writer.coordinator.set_progress_counters_enabled(true)?;
+        writer.set_write_profile(Arc::clone(&profile))?;
+        writer.set_wal_sync_diagnostics_enabled(&profile, true)?;
+
+        let append = |commit_ts| -> Result<()> {
+            let input = batch(commit_ts);
+            let prepared = writer.preflight_batch(&input, LIVE_WAL_V5_LIMITS)?;
+            writer.append_prepared_batch(prepared, input.commit_ts, input.recorded_at)?;
+            Ok(())
+        };
+
+        append(10)?;
+        assert_eq!(profile.wal_sync_observations().len(), 1);
+        profile.reset_measurements();
+        assert!(profile.wal_sync_diagnostics_enabled());
+        assert!(profile.wal_sync_observations().is_empty());
+        let start = writer
+            .io_diagnostics()
+            .progress_diagnostics
+            .context("warm writer lost progress diagnostics")?;
+
+        append(20)?;
+        // The wakeup can let the driver finish before the sender records its
+        // diagnostic counter, so wait for that trailing update before checking.
+        let token_deadline = Instant::now() + Duration::from_secs(5);
+        let mut end = writer
+            .io_diagnostics()
+            .progress_diagnostics
+            .context("timed writer lost progress diagnostics")?;
+        while end.token_attempts <= start.token_attempts && Instant::now() < token_deadline {
+            std::thread::yield_now();
+            end = writer
+                .io_diagnostics()
+                .progress_diagnostics
+                .context("timed writer lost progress diagnostics")?;
+        }
+        assert!(
+            end.token_attempts > start.token_attempts,
+            "{mode:?}: progress token attempts did not advance ({} -> {})",
+            start.token_attempts,
+            end.token_attempts
+        );
+        assert!(
+            end.owner_scans > start.owner_scans,
+            "{mode:?}: owner scans did not advance ({} -> {})",
+            start.owner_scans,
+            end.owner_scans
+        );
+        assert_eq!(
+            end.completion_events_drained - start.completion_events_drained,
+            1,
+            "{mode:?}"
+        );
+        let observed = profile.wal_sync_observations();
+        assert_eq!(observed.len(), 1, "{mode:?}");
+        assert_eq!(observed[0].written_frontier_start, 1, "{mode:?}");
+        assert_eq!(observed[0].written_frontier_end, 2, "{mode:?}");
+
+        Ok(())
+    }
+
+    #[test]
+    fn progress_cursor_driver_scan_to_park_observes_its_only_completion_wake() -> Result<()> {
+        check_progress_scan_to_park(WalV8ProgressMode::Cursor)
+    }
+
+    fn check_progress_scan_to_park(mode: WalV8ProgressMode) -> Result<()> {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("progress-ring-scan-to-park-v8.wal");
         let header = header();
         let installed = install_empty(&path, header)?;
-        let writer = match open_parallel_with_progress_mode(&path, &installed, true) {
+        let writer = match open_parallel_with_progress_mode(&path, &installed, mode) {
             Ok(writer) => Arc::new(writer),
             Err(error) if is_io_uring_unavailable_error(&error) => {
                 eprintln!("skipping test (io_uring unavailable): {error:#}");
@@ -9225,27 +13235,17 @@ mod tests {
         };
 
         let (first_wait_entered_tx, first_wait_entered_rx) = crossbeam_channel::bounded(1);
-        let (second_wait_entered_tx, second_wait_entered_rx) = crossbeam_channel::bounded(1);
         let (release_first_wait_tx, release_first_wait_rx) = crossbeam_channel::bounded(1);
-        let (release_second_wait_tx, release_second_wait_rx) = crossbeam_channel::bounded(1);
         let (wait_result_tx, wait_result_rx) = crossbeam_channel::bounded(4);
         let first_wait = Arc::new(AtomicBool::new(false));
-        let second_wait = Arc::new(AtomicBool::new(false));
         writer.io.set_progress_wait_hook(Arc::new({
             let first_wait = Arc::clone(&first_wait);
-            let second_wait = Arc::clone(&second_wait);
             move |event| match event {
                 WalV8ProgressWaitTestEvent::BeforeWait
                     if !first_wait.swap(true, Ordering::AcqRel) =>
                 {
                     let _ = first_wait_entered_tx.send(());
                     let _ = release_first_wait_rx.recv_timeout(Duration::from_secs(5));
-                }
-                WalV8ProgressWaitTestEvent::BeforeWait
-                    if !second_wait.swap(true, Ordering::AcqRel) =>
-                {
-                    let _ = second_wait_entered_tx.send(());
-                    let _ = release_second_wait_rx.recv_timeout(Duration::from_secs(5));
                 }
                 WalV8ProgressWaitTestEvent::AfterWait(result) => {
                     let _ = wait_result_tx.send(result);
@@ -9309,7 +13309,7 @@ mod tests {
                 coordinator: writer.coordinator.clone(),
                 releases: vec![
                     Some(release_first_wait_tx),
-                    Some(release_second_wait_tx),
+                    None,
                     Some(release_completion_before_tx),
                     Some(release_completion_after_tx),
                 ],
@@ -9324,38 +13324,35 @@ mod tests {
                 .recv_timeout(Duration::from_secs(5))
                 .context("durability driver did not reach its first post-scan wait")?;
 
-            // The first readiness scan has completed. Finish and submit DATA,
-            // then pause the reaper after CQE receipt but before it queues the
-            // completion event. This lets readiness wake the driver without
-            // allowing DATA-complete publication to race ahead of its next scan.
+            // Finish DATA after the first scan. Pause the Reaper before
+            // enqueueing completion so it cannot race ahead of the driver.
             job.finish()?;
             completion_received_rx
                 .recv_timeout(Duration::from_secs(5))
                 .context("completion reaper did not receive the DATA result")?;
-            cleanup.release(0);
-
-            // The driver consumed the readiness token, rescanned while the
-            // completion event queue was still empty, and is now paused before
-            // parking with the ticket still DATA-incomplete.
-            second_wait_entered_rx
-                .recv_timeout(Duration::from_secs(5))
-                .context("durability driver did not reach the DATA-incomplete wait")?;
+            // Cursor does not emit the eager digest wake. The driver must
+            // remain parked until DATA completion is published.
+            assert!(
+                writer
+                    .io
+                    .progress_tokens
+                    .as_ref()
+                    .context("missing progress token receiver")?
+                    .is_empty(),
+                "the cursor must rely on the completion wake after a before-DATA digest"
+            );
             cleanup.release(2);
             completion_published_rx
                 .recv_timeout(Duration::from_secs(5))
                 .context("completion reaper did not queue and signal the DATA result")?;
-            cleanup.release(1);
+            cleanup.release(0);
             cleanup.release(3);
 
-            let first_wait_result = wait_result_rx
-                .recv_timeout(Duration::from_secs(5))
-                .context("driver's readiness wait did not return")?;
-            let second_wait_result = wait_result_rx
+            let completion_wait_result = wait_result_rx
                 .recv_timeout(Duration::from_secs(5))
                 .context("driver's completion wait did not return")?;
-            assert_eq!(first_wait_result, WalV8ProgressTokenWait::Signaled);
             assert_eq!(
-                second_wait_result,
+                completion_wait_result,
                 WalV8ProgressTokenWait::Signaled,
                 "late DATA-completion publication must wake the driver without timeout polling"
             );
@@ -9393,14 +13390,15 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("progress-ring-clean-close.wal");
         let installed = install_empty(&path, header())?;
-        let writer = match open_parallel_with_progress_mode(&path, &installed, true) {
-            Ok(writer) => writer,
-            Err(error) if is_io_uring_unavailable_error(&error) => {
-                eprintln!("skipping test (io_uring unavailable): {error:#}");
-                return Ok(());
-            }
-            Err(error) => return Err(error),
-        };
+        let writer =
+            match open_parallel_with_progress_mode(&path, &installed, WalV8ProgressMode::Cursor) {
+                Ok(writer) => writer,
+                Err(error) if is_io_uring_unavailable_error(&error) => {
+                    eprintln!("skipping test (io_uring unavailable): {error:#}");
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            };
 
         let (reaped_tx, reaped_rx) = mpsc::sync_channel(1);
         writer.io.set_completion_reap_hook(Arc::new(move |event| {
@@ -9442,7 +13440,7 @@ mod tests {
         writer.io.set_progress_wait_hook(Arc::new(|event| {
             assert!(
                 !matches!(event, WalV8ProgressWaitTestEvent::BeforeWait),
-                "closed progress ring attempted to park"
+                "closed progress cursor attempted to park"
             );
         }));
         writer.coordinator.close();
@@ -9457,6 +13455,122 @@ mod tests {
     }
 
     #[test]
+    fn v8_progress_cursor_recovers_mixed_point_and_batch_after_out_of_order_frame_readiness()
+    -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("cursor-v8.wal");
+        let header = header();
+        let installed = install_empty(&path, header)?;
+        let writer = Arc::new(
+            match open_parallel_with_progress_mode(&path, &installed, WalV8ProgressMode::Cursor) {
+                Ok(writer) => writer,
+                Err(error) if is_io_uring_unavailable_error(&error) => {
+                    eprintln!("skipping test (io_uring unavailable): {error:#}");
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            },
+        );
+        let point = batch(10);
+        let mut multi_put = batch(20);
+        multi_put.entries.push(crate::pitr::WalEntry::Put {
+            key: b"multi-frame".to_vec(),
+            value: vec![0x37; WAL_V8_FRAME_LEN * 2],
+        });
+        let point_job = writer.admit_prepared_batch(
+            writer.preflight_batch_with_write_class(
+                &point,
+                LIVE_WAL_V5_LIMITS,
+                WalV8WriteClass::Point,
+            )?,
+            point.commit_ts,
+            point.recorded_at,
+        )?;
+        let batch_job = writer.admit_prepared_batch(
+            writer.preflight_batch(&multi_put, LIVE_WAL_V5_LIMITS)?,
+            multi_put.commit_ts,
+            multi_put.recorded_at,
+        )?;
+        let last_ticket = batch_job.assignment().segment_ticket;
+        let (driver_result_tx, driver_result_rx) = mpsc::channel();
+        let (driver_waiting_tx, driver_waiting_rx) = crossbeam_channel::bounded(2);
+        writer.io.set_progress_wait_hook(Arc::new(move |event| {
+            if matches!(event, WalV8ProgressWaitTestEvent::BeforeWait) {
+                let _ = driver_waiting_tx.try_send(());
+            }
+        }));
+        thread::scope(|scope| -> Result<()> {
+            struct DriverCleanup {
+                coordinator: WalV8ParallelCoordinator,
+                armed: bool,
+            }
+            impl Drop for DriverCleanup {
+                fn drop(&mut self) {
+                    if self.armed {
+                        self.coordinator.poison();
+                    }
+                }
+            }
+
+            let mut cleanup = DriverCleanup {
+                coordinator: writer.coordinator.clone(),
+                armed: true,
+            };
+            let driver_writer = Arc::clone(&writer);
+            let driver = scope.spawn(move || {
+                let _ = driver_result_tx.send(driver_writer.advance_frontier_through(last_ticket));
+            });
+
+            driver_waiting_rx
+                .recv_timeout(Duration::from_secs(5))
+                .context("durability driver did not wait for the first Point ticket")?;
+            batch_job.finish()?;
+            assert_eq!(writer.coordinator.durable_ticket_end(), 0);
+            assert!(
+                matches!(
+                    driver_result_rx.recv_timeout(Duration::from_millis(20)),
+                    Err(mpsc::RecvTimeoutError::Timeout)
+                ),
+                "durability driver advanced through the later Batch while the earlier Point was not frame-ready"
+            );
+
+            point_job.finish()?;
+            driver_result_rx
+                .recv_timeout(Duration::from_secs(5))
+                .context("durability driver did not advance after the Point became ready")??;
+            driver
+                .join()
+                .map_err(|_| anyhow::anyhow!("durability driver panicked"))?;
+            cleanup.armed = false;
+            Ok(())
+        })?;
+        let (_, frontier) = writer.active_boundaries()?;
+        assert_eq!(frontier.ticket_end, 2);
+        drop(writer);
+
+        let recovered = super::super::install::recover_and_install_active(
+            &path,
+            &[frontier],
+            header.predecessor,
+            LIVE_WAL_V5_LIMITS,
+            MAX_WAL_FILE_SIZE,
+        )?;
+        assert_eq!(replayed_batches(&path, &recovered)?, [point, multi_put]);
+        let reopened =
+            open_parallel_with_progress_mode(&path, &recovered, WalV8ProgressMode::Cursor)?;
+        assert!(reopened.coordinator.progress_cursor_enabled());
+        let next = batch(30);
+        reopened.append_prepared_batch(
+            reopened.preflight_batch(&next, LIVE_WAL_V5_LIMITS)?,
+            next.commit_ts,
+            next.recorded_at,
+        )?;
+        assert_eq!(reopened.active_boundaries()?.1.ticket_end, 3);
+
+        Ok(())
+    }
+
+    #[test]
     fn v8_progress_ring_parallel_write_reopen_and_recovery() -> Result<()> {
         let parent = Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/wal-v8-tests");
         std::fs::create_dir_all(&parent)?;
@@ -9464,14 +13578,15 @@ mod tests {
         let path = directory.path().join("progress-ring-active-v8.wal");
         let wal_header = header();
         let installed = install_empty(&path, wal_header)?;
-        let writer = match open_parallel_with_progress_mode(&path, &installed, false) {
-            Ok(writer) => writer,
-            Err(error) if is_io_uring_unavailable_error(&error) => {
-                eprintln!("skipping test (io_uring unavailable): {error:#}");
-                return Ok(());
-            }
-            Err(error) => return Err(error),
-        };
+        let writer =
+            match open_parallel_with_progress_mode(&path, &installed, WalV8ProgressMode::Eager) {
+                Ok(writer) => writer,
+                Err(error) if is_io_uring_unavailable_error(&error) => {
+                    eprintln!("skipping test (io_uring unavailable): {error:#}");
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            };
         assert!(!writer.progress_ring_enabled());
 
         let first_batch = batch(10);
@@ -9500,7 +13615,8 @@ mod tests {
 
         // Reopen the nonempty Active image in ring mode. Its new ring starts
         // at the recovered absolute ticket and digest boundary.
-        let ring_writer = open_parallel_with_progress_mode(&path, &ring_recovered, true)?;
+        let ring_writer =
+            open_parallel_with_progress_mode(&path, &ring_recovered, WalV8ProgressMode::Cursor)?;
         assert!(ring_writer.progress_ring_enabled());
         assert_eq!(
             ring_writer.coordinator.durable_ticket_end(),
@@ -9534,7 +13650,8 @@ mod tests {
             replayed_batches(&path, &eager_recovered)?,
             [first_batch.clone(), second_batch.clone()]
         );
-        let eager_writer = open_parallel_with_progress_mode(&path, &eager_recovered, false)?;
+        let eager_writer =
+            open_parallel_with_progress_mode(&path, &eager_recovered, WalV8ProgressMode::Eager)?;
         assert!(!eager_writer.progress_ring_enabled());
         let third_batch = batch(30);
         eager_writer.append_prepared_batch(
@@ -9572,9 +13689,958 @@ mod tests {
         };
         let fresh_segment_path = directory.path().join("progress-ring-fresh-segment-v8.wal");
         let fresh_segment_installed = install_empty(&fresh_segment_path, fresh_segment_header)?;
-        let fresh_segment_writer =
-            open_parallel_with_progress_mode(&fresh_segment_path, &fresh_segment_installed, true)?;
+        let fresh_segment_writer = open_parallel_with_progress_mode(
+            &fresh_segment_path,
+            &fresh_segment_installed,
+            WalV8ProgressMode::Cursor,
+        )?;
         assert!(fresh_segment_writer.progress_ring_enabled());
+
+        Ok(())
+    }
+
+    #[test]
+    fn wal_v8_extent_lookahead_from_value_rejects_non_utf8() {
+        use std::os::unix::ffi::OsStrExt;
+
+        assert!(!wal_v8_extent_lookahead_from_value(None).unwrap());
+        assert!(!wal_v8_extent_lookahead_from_value(Some(OsStr::new("0"))).unwrap());
+        assert!(!wal_v8_extent_lookahead_from_value(Some(OsStr::new("false"))).unwrap());
+        assert!(wal_v8_extent_lookahead_from_value(Some(OsStr::new("1"))).unwrap());
+        assert!(wal_v8_extent_lookahead_from_value(Some(OsStr::new("true"))).unwrap());
+        assert!(wal_v8_extent_lookahead_from_value(Some(OsStr::new("yes"))).is_err());
+
+        let non_utf8 = OsStr::from_bytes(b"\xff\xfe");
+        let err = wal_v8_extent_lookahead_from_value(Some(non_utf8))
+            .expect_err("non-UTF-8 extent lookahead env value must fail");
+        assert!(err.to_string().contains("not valid UTF-8"));
+    }
+
+    #[test]
+    fn wal_v8_requested_config_defaults_to_candidate_and_preserves_legacy() {
+        let defaults = WalV8RequestedConfig::default();
+        assert_eq!(defaults, WalV8RequestedConfig::candidate());
+        assert_eq!(defaults.profile, WalV8Profile::Candidate);
+        assert_eq!(defaults.progress_mode, WalV8ProgressMode::Cursor);
+        assert!(defaults.direct_completion_enabled);
+        assert_eq!(defaults.frontier_mode, WalV8FrontierWriteMode::Direct);
+        assert!(!defaults.extent_lookahead);
+        assert!(defaults.point_buffer_preallocation_enabled);
+        assert_eq!(
+            defaults.coalesce_policy,
+            WalV8CoalesceTargetPolicy::PointOnly(8)
+        );
+
+        let legacy = WalV8RequestedConfig::legacy();
+        assert_eq!(legacy.profile, WalV8Profile::Legacy);
+        assert_eq!(legacy.progress_mode, WalV8ProgressMode::Eager);
+        assert!(!legacy.direct_completion_enabled);
+        assert_eq!(legacy.frontier_mode, WalV8FrontierWriteMode::Buffered);
+        assert!(!legacy.extent_lookahead);
+        assert!(!legacy.point_buffer_preallocation_enabled);
+        assert_eq!(legacy.coalesce_policy, WalV8CoalesceTargetPolicy::Disabled);
+    }
+
+    #[test]
+    fn wal_v8_effective_config_resolves_frontier_fallback_and_owner() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("effective-config.wal");
+        let buffered_file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&path)?;
+
+        let requested = WalV8RequestedConfig {
+            progress_mode: WalV8ProgressMode::Cursor,
+            direct_completion_enabled: true,
+            frontier_mode: WalV8FrontierWriteMode::Direct,
+            extent_lookahead: false,
+            ..WalV8RequestedConfig::legacy()
+        };
+        let buffered_effective = WalV8EffectiveConfig::resolve(&requested, &buffered_file, false)?;
+        assert_eq!(buffered_effective.progress_mode, WalV8ProgressMode::Cursor);
+        assert!(buffered_effective.direct_completion_enabled);
+        assert!(!buffered_effective.o_direct_worker);
+        assert_eq!(
+            buffered_effective.frontier_mode,
+            WalV8FrontierWriteMode::Buffered
+        );
+        assert_eq!(
+            buffered_effective.extent_policy,
+            WalV8ExtentPreparationPolicy::Disabled
+        );
+        assert_eq!(buffered_effective.extent_window_bytes, 0);
+        assert!(!buffered_effective.has_reservation_owner);
+
+        if let Ok(direct_file) = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_DIRECT)
+            .open(&path)
+        {
+            let direct_effective = WalV8EffectiveConfig::resolve(&requested, &direct_file, true)?;
+            assert!(direct_effective.o_direct_worker);
+            assert_eq!(
+                direct_effective.frontier_mode,
+                WalV8FrontierWriteMode::Direct
+            );
+            assert!(direct_effective.has_reservation_owner);
+            let expected_policy =
+                if cfg!(not(feature = "bench")) && direct_effective.ext_family_filesystem {
+                    WalV8ExtentPreparationPolicy::FallocateOnly
+                } else {
+                    WalV8ExtentPreparationPolicy::Disabled
+                };
+            assert_eq!(direct_effective.extent_policy, expected_policy);
+        }
+
+        let lookahead_requested = WalV8RequestedConfig {
+            extent_lookahead: true,
+            ..WalV8RequestedConfig::default()
+        };
+        assert!(
+            WalV8EffectiveConfig::resolve(&lookahead_requested, &buffered_file, false).is_err()
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn point_only_target8_stops_only_when_no_batch_tickets_are_outstanding() -> Result<()> {
+        use crate::wal::v8::parallel::WalV8ReadyPrefix;
+
+        let make_prefix = |ticket_count: usize| WalV8ReadyPrefix::Cursor {
+            ticket_count,
+            tail: None,
+            #[cfg(feature = "bench")]
+            data_bytes: 0,
+        };
+        let make_snapshot = |ready: usize, has_batch: bool| WalV8FrontierReadySnapshot {
+            ready_prefix: make_prefix(ready),
+            admitted_ticket_count: 16,
+            has_outstanding_batch_tickets: has_batch,
+            closed: false,
+            #[cfg(feature = "bench")]
+            frames_ready_prefix_count: ready,
+            #[cfg(feature = "bench")]
+            data_complete_prefix_count: ready,
+            #[cfg(feature = "bench")]
+            reserved_preparation_bytes: 0,
+            #[cfg(feature = "bench")]
+            next_not_ready: None,
+            #[cfg(feature = "bench")]
+            data_hol_blocker: None,
+            #[cfg(feature = "bench")]
+            snapshot_monotonic_ns: None,
+        };
+
+        let mut point_only_at_8 = make_snapshot(8, false);
+        let outcome = WalV8ParallelIo::coalesce_ready_prefix_with(
+            &mut point_only_at_8,
+            Duration::from_millis(100),
+            WalV8CoalesceTargetPolicy::PointOnly(8),
+            |_, _| anyhow::bail!("PointOnly(8) should stop without waiting at 8 ready Points"),
+        )?;
+        assert!(!outcome.waited);
+
+        // Scenario B: 8 Point tickets are ready, but an unready Batch ticket is
+        // outstanding in the admitted window -> must keep Dynamic coalescing.
+        let mut mixed_at_8 = make_snapshot(8, true);
+        let mut wait_calls = 0;
+        let outcome = WalV8ParallelIo::coalesce_ready_prefix_with(
+            &mut mixed_at_8,
+            Duration::from_millis(100),
+            WalV8CoalesceTargetPolicy::PointOnly(8),
+            |_, snapshot| {
+                wait_calls += 1;
+                snapshot.ready_prefix = make_prefix(9);
+                Ok(false)
+            },
+        )?;
+        assert!(outcome.waited);
+        assert_eq!(wait_calls, 1);
+        assert_eq!(mixed_at_8.ready_prefix.len(), 9);
+
+        // Transition mid-wait: starts Point-only below target (4 ready), then a
+        // Batch ticket is admitted before reaching 8 -> continues Dynamic wait.
+        let mut transition = make_snapshot(4, false);
+        let mut transition_calls = 0;
+        let outcome = WalV8ParallelIo::coalesce_ready_prefix_with(
+            &mut transition,
+            Duration::from_millis(100),
+            WalV8CoalesceTargetPolicy::PointOnly(8),
+            |_, snapshot| {
+                transition_calls += 1;
+                if transition_calls == 1 {
+                    snapshot.has_outstanding_batch_tickets = true;
+                    snapshot.ready_prefix = make_prefix(8);
+                    Ok(true)
+                } else {
+                    snapshot.ready_prefix = make_prefix(10);
+                    Ok(false)
+                }
+            },
+        )?;
+        assert!(outcome.waited);
+        assert_eq!(transition_calls, 2);
+        assert_eq!(transition.ready_prefix.len(), 10);
+
+        Ok(())
+    }
+
+    #[test]
+    fn coordinator_tracks_outstanding_batch_tickets_across_admission_and_retirement() -> Result<()>
+    {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("outstanding-batch.wal");
+        let header = header();
+        let installed = install_empty(&path, header)?;
+        let writer = open_writer(&path, &installed)?.into_parallel_with_worker_file_and_config(
+            OpenOptions::new().read(true).write(true).open(&path)?,
+            WalV8RequestedConfig::candidate(),
+        )?;
+
+        // 1. Admit a Point ticket -> no outstanding Batch tickets.
+        let point_batch = batch(10);
+        let point_prepared = writer.preflight_batch_with_write_class(
+            &point_batch,
+            LIVE_WAL_V5_LIMITS,
+            WalV8WriteClass::Point,
+        )?;
+        let mut point_scratch = WalV8PointAdmissionScratch::new(point_prepared);
+        assert!(writer.try_preallocate_point_buffer(&mut point_scratch));
+        let point_job = writer.admit_prepared_point_batch(
+            point_scratch,
+            point_batch.commit_ts,
+            point_batch.recorded_at,
+        )?;
+        assert!(
+            !writer
+                .coordinator
+                .frontier_ready_snapshot()
+                .has_outstanding_batch_tickets
+        );
+
+        // 2. Admit an unready Batch ticket -> outstanding Batch flag becomes true.
+        let batch_write = batch(20);
+        let batch_prepared = writer.preflight_batch_with_write_class(
+            &batch_write,
+            LIVE_WAL_V5_LIMITS,
+            WalV8WriteClass::Batch,
+        )?;
+        let batch_job = writer.admit_prepared_batch(
+            batch_prepared,
+            batch_write.commit_ts,
+            batch_write.recorded_at,
+        )?;
+        assert!(
+            writer
+                .coordinator
+                .frontier_ready_snapshot()
+                .has_outstanding_batch_tickets
+        );
+
+        // 3. Complete and sync both tickets -> outstanding Batch flag clears.
+        let _ = point_job.finish()?;
+        let _ = batch_job.finish()?;
+        writer.sync()?;
+        assert!(
+            !writer
+                .coordinator
+                .frontier_ready_snapshot()
+                .has_outstanding_batch_tickets
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn candidate_profile_resolves_all_components_and_preserves_legacy_defaults() -> Result<()> {
+        use std::os::unix::ffi::OsStrExt;
+
+        assert_eq!(WalV8Profile::from_value(None)?, WalV8Profile::Candidate);
+        assert_eq!(
+            WalV8Profile::from_value(Some(OsStr::new("legacy")))?,
+            WalV8Profile::Legacy
+        );
+        assert_eq!(
+            WalV8Profile::from_value(Some(OsStr::new("candidate")))?,
+            WalV8Profile::Candidate
+        );
+        assert!(WalV8Profile::from_value(Some(OsStr::new("unknown"))).is_err());
+        assert!(WalV8Profile::from_value(Some(OsStr::from_bytes(b"\xff"))).is_err());
+
+        let legacy = WalV8RequestedConfig::legacy();
+        assert_eq!(legacy.profile, WalV8Profile::Legacy);
+        assert_eq!(legacy.progress_mode, WalV8ProgressMode::Eager);
+        assert!(!legacy.direct_completion_enabled);
+        assert_eq!(legacy.frontier_mode, WalV8FrontierWriteMode::Buffered);
+        assert!(!legacy.point_buffer_preallocation_enabled);
+        assert_eq!(legacy.coalesce_policy, WalV8CoalesceTargetPolicy::Disabled);
+
+        let candidate = WalV8RequestedConfig::candidate();
+        assert_eq!(candidate.profile, WalV8Profile::Candidate);
+        assert_eq!(candidate.progress_mode, WalV8ProgressMode::Cursor);
+        assert!(candidate.direct_completion_enabled);
+        assert_eq!(candidate.frontier_mode, WalV8FrontierWriteMode::Direct);
+        assert!(candidate.point_buffer_preallocation_enabled);
+        assert_eq!(
+            candidate.coalesce_policy,
+            WalV8CoalesceTargetPolicy::PointOnly(8)
+        );
+
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("candidate-profile.wal");
+        let buffered_file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&path)?;
+        let buffered_effective = WalV8EffectiveConfig::resolve(&candidate, &buffered_file, true)?;
+        assert_eq!(
+            buffered_effective.frontier_mode,
+            WalV8FrontierWriteMode::Buffered
+        );
+        assert_eq!(
+            buffered_effective.extent_policy,
+            WalV8ExtentPreparationPolicy::Disabled
+        );
+        assert_eq!(
+            buffered_effective.coalesce_policy,
+            WalV8CoalesceTargetPolicy::PointOnly(8)
+        );
+        assert!(buffered_effective.point_buffer_preallocation_enabled);
+
+        if let Ok(direct_file) = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_DIRECT)
+            .open(&path)
+        {
+            let direct_effective = WalV8EffectiveConfig::resolve(&candidate, &direct_file, true)?;
+            assert_eq!(
+                direct_effective.frontier_mode,
+                WalV8FrontierWriteMode::Direct
+            );
+            if direct_effective.ext_family_filesystem {
+                assert_eq!(
+                    direct_effective.extent_policy,
+                    WalV8ExtentPreparationPolicy::PointOnlyLookahead
+                );
+                assert_eq!(
+                    direct_effective.extent_window_bytes,
+                    WAL_V8_PRODUCTION_EXTENT_WINDOW_BYTES
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn point_direct_frame_from_value_rejects_invalid_values() {
+        use std::os::unix::ffi::OsStrExt;
+
+        assert!(!point_direct_frame_from_value(None).unwrap());
+        assert!(!point_direct_frame_from_value(Some(OsStr::new("0"))).unwrap());
+        assert!(point_direct_frame_from_value(Some(OsStr::new("1"))).unwrap());
+        assert!(point_direct_frame_from_value(Some(OsStr::new("true"))).is_err());
+        assert!(point_direct_frame_from_value(Some(OsStr::new("2"))).is_err());
+        assert!(point_direct_frame_from_value(Some(OsStr::from_bytes(b"\xff"))).is_err());
+    }
+
+    #[test]
+    fn coalescing_override_parses_dynamic_and_point_target8() -> Result<()> {
+        use std::os::unix::ffi::OsStrExt;
+
+        assert_eq!(
+            WalV8CoalesceTargetPolicy::from_value(None, WalV8ProgressMode::Eager, false)?,
+            None
+        );
+        assert_eq!(
+            WalV8CoalesceTargetPolicy::from_value(
+                Some(OsStr::new("dynamic")),
+                WalV8ProgressMode::Eager,
+                false,
+            )?,
+            Some(WalV8CoalesceTargetPolicy::Disabled)
+        );
+        assert_eq!(
+            WalV8CoalesceTargetPolicy::from_value(
+                Some(OsStr::new("dynamic")),
+                WalV8ProgressMode::Cursor,
+                true,
+            )?,
+            Some(WalV8CoalesceTargetPolicy::Disabled)
+        );
+        assert_eq!(
+            WalV8CoalesceTargetPolicy::from_value(
+                Some(OsStr::new("point-target8")),
+                WalV8ProgressMode::Cursor,
+                true,
+            )?,
+            Some(WalV8CoalesceTargetPolicy::PointOnly(8))
+        );
+        assert!(
+            WalV8CoalesceTargetPolicy::from_value(
+                Some(OsStr::new("point-target8")),
+                WalV8ProgressMode::Eager,
+                false,
+            )
+            .is_err()
+        );
+        assert!(
+            WalV8CoalesceTargetPolicy::from_value(
+                Some(OsStr::new("always-8")),
+                WalV8ProgressMode::Cursor,
+                true,
+            )
+            .is_err()
+        );
+        assert!(
+            WalV8CoalesceTargetPolicy::from_value(
+                Some(OsStr::from_bytes(b"\xff")),
+                WalV8ProgressMode::Cursor,
+                true,
+            )
+            .is_err()
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn v8_candidate_mixed_target8_falls_back_to_dynamic_on_real_admission() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut next_ts = 10u64;
+
+        let open_warmed_writer =
+            |name: &str, ts: &mut u64| -> Result<Option<WalV8ParallelWriter>> {
+                let path = dir.path().join(name);
+                let installed = install_empty(&path, header())?;
+                let writer = match open_writer(&path, &installed)?
+                    .into_parallel_with_worker_file_and_config(
+                        OpenOptions::new().read(true).write(true).open(&path)?,
+                        WalV8RequestedConfig::candidate(),
+                    ) {
+                    Ok(writer) => writer,
+                    Err(error) if is_io_uring_unavailable_error(&error) => {
+                        eprintln!("skipping test (io_uring unavailable): {error:#}");
+                        return Ok(None);
+                    }
+                    Err(error) => return Err(error),
+                };
+                let warmup = batch(*ts);
+                *ts += 10;
+                let warmup_prepared = writer.preflight_batch_with_write_class(
+                    &warmup,
+                    LIVE_WAL_V5_LIMITS,
+                    WalV8WriteClass::Point,
+                )?;
+                let mut warmup_scratch = WalV8PointAdmissionScratch::new(warmup_prepared);
+                assert!(writer.try_preallocate_point_buffer(&mut warmup_scratch));
+                let warmup_job = writer.admit_prepared_point_batch(
+                    warmup_scratch,
+                    warmup.commit_ts,
+                    warmup.recorded_at,
+                )?;
+                let _ = warmup_job.finish()?;
+                writer.sync()?;
+                Ok(Some(writer))
+            };
+
+        let wait_until_ready = |writer: &WalV8ParallelWriter,
+                                driver: &mut WalV8DurabilityDriver,
+                                expected_ready: usize,
+                                expected_admitted: usize|
+         -> Result<WalV8FrontierReadySnapshot> {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let snapshot = writer.io.advance_and_snapshot(driver, false)?;
+                if snapshot.ready_prefix.len() == expected_ready
+                    && snapshot.admitted_ticket_count == expected_admitted
+                {
+                    return Ok(snapshot);
+                }
+                ensure!(
+                    Instant::now() < deadline,
+                    "timed out waiting for ready_prefix={expected_ready}, admitted={expected_admitted} (got ready={}, admitted={})",
+                    snapshot.ready_prefix.len(),
+                    snapshot.admitted_ticket_count
+                );
+                thread::sleep(Duration::from_millis(2));
+            }
+        };
+
+        // Case 1: 8 ready Points + 1 pending Point -> Target8 stops without waiting.
+        let Some(writer1) = open_warmed_writer("case1.wal", &mut next_ts)? else {
+            return Ok(());
+        };
+        let mut case1_batches = Vec::new();
+        for _ in 0..9 {
+            case1_batches.push(batch(next_ts));
+            next_ts += 10;
+        }
+        let mut case1_jobs = Vec::new();
+        for b in &case1_batches {
+            let prepared = writer1.preflight_batch_with_write_class(
+                b,
+                LIVE_WAL_V5_LIMITS,
+                WalV8WriteClass::Point,
+            )?;
+            let mut scratch = WalV8PointAdmissionScratch::new(prepared);
+            assert!(writer1.try_preallocate_point_buffer(&mut scratch));
+            case1_jobs.push(writer1.admit_prepared_point_batch(
+                scratch,
+                b.commit_ts,
+                b.recorded_at,
+            )?);
+        }
+        let case1_pending = case1_jobs.pop().unwrap();
+        for job in case1_jobs {
+            let _ = job.finish()?;
+        }
+        let mut driver1 = writer1
+            .coordinator
+            .acquire_durability_driver(writer1.next_ticket())?
+            .context("acquire driver for Case 1")?;
+        let mut snapshot1 = wait_until_ready(&writer1, &mut driver1, 8, 9)?;
+        assert!(!snapshot1.has_outstanding_batch_tickets);
+        let waited1 = writer1.io.coalesce_progress_ring(
+            &mut driver1,
+            &mut snapshot1,
+            Duration::from_millis(50),
+            false,
+            #[cfg(feature = "bench")]
+            None,
+        )?;
+        assert!(
+            !waited1,
+            "Point-only window at 8 ready Points must stop without coalescing wait"
+        );
+        drop(driver1);
+        drop(case1_pending);
+        drop(writer1);
+
+        // Case 2: 8 ready Points + 1 pending Batch -> Target8 suppressed, Dynamic waits.
+        let writer2 = open_warmed_writer("case2.wal", &mut next_ts)?.unwrap();
+        let mut case2_point_batches = Vec::new();
+        for _ in 0..8 {
+            case2_point_batches.push(batch(next_ts));
+            next_ts += 10;
+        }
+        let mut case2_jobs = Vec::new();
+        for b in &case2_point_batches {
+            let prepared = writer2.preflight_batch_with_write_class(
+                b,
+                LIVE_WAL_V5_LIMITS,
+                WalV8WriteClass::Point,
+            )?;
+            let mut scratch = WalV8PointAdmissionScratch::new(prepared);
+            assert!(writer2.try_preallocate_point_buffer(&mut scratch));
+            case2_jobs.push(writer2.admit_prepared_point_batch(
+                scratch,
+                b.commit_ts,
+                b.recorded_at,
+            )?);
+        }
+        let case2_batch = batch(next_ts);
+        next_ts += 10;
+        let case2_pending_batch = writer2.admit_prepared_batch(
+            writer2.preflight_batch_with_write_class(
+                &case2_batch,
+                LIVE_WAL_V5_LIMITS,
+                WalV8WriteClass::Batch,
+            )?,
+            case2_batch.commit_ts,
+            case2_batch.recorded_at,
+        )?;
+        for job in case2_jobs {
+            let _ = job.finish()?;
+        }
+        let mut driver2 = writer2
+            .coordinator
+            .acquire_durability_driver(writer2.next_ticket())?
+            .context("acquire driver for Case 2")?;
+        let mut snapshot2 = wait_until_ready(&writer2, &mut driver2, 8, 9)?;
+        assert_eq!(snapshot2.ready_prefix.len(), 8);
+        assert_eq!(snapshot2.admitted_ticket_count, 9);
+        assert!(snapshot2.has_outstanding_batch_tickets);
+
+        let parked = Arc::new(AtomicBool::new(false));
+        writer2.io.set_progress_wait_hook(Arc::new({
+            let parked = Arc::clone(&parked);
+            move |event| {
+                if matches!(event, WalV8ProgressWaitTestEvent::BeforeWait) {
+                    parked.store(true, Ordering::Release);
+                }
+            }
+        }));
+        let waited2 = writer2.io.coalesce_progress_ring(
+            &mut driver2,
+            &mut snapshot2,
+            Duration::from_millis(30),
+            false,
+            #[cfg(feature = "bench")]
+            None,
+        )?;
+        assert!(waited2, "mixed window must enter Dynamic coalescing wait");
+        assert!(parked.load(Ordering::Acquire));
+        drop(driver2);
+        drop(case2_pending_batch);
+        drop(writer2);
+
+        // Case 3: 10 ready Points + 1 pending Point -> preserves full 10-ticket prefix.
+        let writer3 = open_warmed_writer("case3.wal", &mut next_ts)?.unwrap();
+        let mut case3_batches = Vec::new();
+        for _ in 0..11 {
+            case3_batches.push(batch(next_ts));
+            next_ts += 10;
+        }
+        let mut case3_jobs = Vec::new();
+        for b in &case3_batches {
+            let prepared = writer3.preflight_batch_with_write_class(
+                b,
+                LIVE_WAL_V5_LIMITS,
+                WalV8WriteClass::Point,
+            )?;
+            let mut scratch = WalV8PointAdmissionScratch::new(prepared);
+            assert!(writer3.try_preallocate_point_buffer(&mut scratch));
+            case3_jobs.push(writer3.admit_prepared_point_batch(
+                scratch,
+                b.commit_ts,
+                b.recorded_at,
+            )?);
+        }
+        let case3_pending = case3_jobs.pop().unwrap();
+        for job in case3_jobs {
+            let _ = job.finish()?;
+        }
+        let mut driver3 = writer3
+            .coordinator
+            .acquire_durability_driver(writer3.next_ticket())?
+            .context("acquire driver for Case 3")?;
+        let mut snapshot3 = wait_until_ready(&writer3, &mut driver3, 10, 11)?;
+        assert!(!snapshot3.has_outstanding_batch_tickets);
+        let waited3 = writer3.io.coalesce_progress_ring(
+            &mut driver3,
+            &mut snapshot3,
+            Duration::from_millis(50),
+            false,
+            #[cfg(feature = "bench")]
+            None,
+        )?;
+        assert!(!waited3);
+        assert_eq!(snapshot3.ready_prefix.len(), 10);
+        // Drive FRONTIER through ticket 11 (1 warmup + 10 ready Points) and
+        // verify all 10 ready Points are committed without truncation at 8.
+        writer3.drive_frontier_through(11, &mut driver3)?;
+        assert_eq!(writer3.active_boundaries()?.1.ticket_end, 11);
+        drop(driver3);
+        drop(case3_pending);
+        drop(writer3);
+
+        // Case 4: Starts Point-only below target (4 ready Points), then a real
+        // Batch ticket is admitted during the wait while 4 more Points finish
+        // (reaching 8 ready Points) -> Target8 is cancelled and falls back to Dynamic.
+        let writer4 = Arc::new(open_warmed_writer("case4.wal", &mut next_ts)?.unwrap());
+        let mut case4_initial_batches = Vec::new();
+        for _ in 0..5 {
+            case4_initial_batches.push(batch(next_ts));
+            next_ts += 10;
+        }
+        let mut case4_jobs = Vec::new();
+        for b in &case4_initial_batches {
+            let prepared = writer4.preflight_batch_with_write_class(
+                b,
+                LIVE_WAL_V5_LIMITS,
+                WalV8WriteClass::Point,
+            )?;
+            let mut scratch = WalV8PointAdmissionScratch::new(prepared);
+            assert!(writer4.try_preallocate_point_buffer(&mut scratch));
+            case4_jobs.push(writer4.admit_prepared_point_batch(
+                scratch,
+                b.commit_ts,
+                b.recorded_at,
+            )?);
+        }
+        let case4_fifth = case4_jobs.pop().unwrap();
+        for job in case4_jobs {
+            let _ = job.finish()?;
+        }
+        let mut driver4 = writer4
+            .coordinator
+            .acquire_durability_driver(writer4.next_ticket())?
+            .context("acquire driver for Case 4")?;
+        let mut snapshot4 = wait_until_ready(&writer4, &mut driver4, 4, 5)?;
+        assert!(!snapshot4.has_outstanding_batch_tickets);
+
+        let wait_calls = Arc::new(AtomicU64::new(0));
+        let injected = Arc::new(AtomicBool::new(false));
+        let (trigger_tx, trigger_rx) = crossbeam_channel::bounded::<()>(1);
+        let (done_tx, done_rx) = crossbeam_channel::bounded::<()>(1);
+        let hook_batches: Vec<_> = (0..3).map(|i| batch(next_ts + i * 10)).collect();
+        next_ts += 30;
+        let hook_batch_write = batch(next_ts);
+        writer4.io.set_progress_wait_hook(Arc::new({
+            let wait_calls = Arc::clone(&wait_calls);
+            let injected = Arc::clone(&injected);
+            move |event| {
+                if matches!(event, WalV8ProgressWaitTestEvent::BeforeWait) {
+                    wait_calls.fetch_add(1, Ordering::AcqRel);
+                    if !injected.swap(true, Ordering::AcqRel) {
+                        let _ = trigger_tx.send(());
+                        let _ = done_rx.recv_timeout(Duration::from_secs(5));
+                    }
+                }
+            }
+        }));
+        let waited4 = thread::scope(|scope| -> Result<bool> {
+            let injector = scope.spawn(|| -> Result<()> {
+                if trigger_rx.recv_timeout(Duration::from_secs(5)).is_ok() {
+                    let _ = case4_fifth.finish()?;
+                    for b in &hook_batches {
+                        let prepared = writer4.preflight_batch_with_write_class(
+                            b,
+                            LIVE_WAL_V5_LIMITS,
+                            WalV8WriteClass::Point,
+                        )?;
+                        let mut scratch = WalV8PointAdmissionScratch::new(prepared);
+                        assert!(writer4.try_preallocate_point_buffer(&mut scratch));
+                        let job = writer4.admit_prepared_point_batch(
+                            scratch,
+                            b.commit_ts,
+                            b.recorded_at,
+                        )?;
+                        let _ = job.finish()?;
+                    }
+                    let prepared_batch = writer4.preflight_batch_with_write_class(
+                        &hook_batch_write,
+                        LIVE_WAL_V5_LIMITS,
+                        WalV8WriteClass::Batch,
+                    )?;
+                    let batch_job = writer4.admit_prepared_batch(
+                        prepared_batch,
+                        hook_batch_write.commit_ts,
+                        hook_batch_write.recorded_at,
+                    )?;
+                    let _ = done_tx.send(());
+                    thread::sleep(Duration::from_millis(60));
+                    let _ = batch_job.finish()?;
+                }
+                Ok(())
+            });
+            let waited = writer4.io.coalesce_progress_ring(
+                &mut driver4,
+                &mut snapshot4,
+                Duration::from_millis(40),
+                false,
+                #[cfg(feature = "bench")]
+                None,
+            )?;
+            injector.join().expect("case4 injector panicked")?;
+            Ok(waited)
+        })?;
+        assert!(waited4);
+        assert!(snapshot4.has_outstanding_batch_tickets);
+        assert!(
+            wait_calls.load(Ordering::Acquire) >= 2,
+            "reaching 8 ready Points after Batch admission must continue Dynamic waiting"
+        );
+        drop(driver4);
+
+        Ok(())
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn target8_diagnostics_distinguish_eligible_mixed_and_hit_phases() -> Result<()> {
+        use crate::wal::v8::parallel::WalV8ReadyPrefix;
+
+        assert_eq!(
+            WalV8CoalesceTargetPolicy::Disabled.policy_name(),
+            "disabled"
+        );
+        assert_eq!(WalV8CoalesceTargetPolicy::Always(8).policy_name(), "always");
+        assert_eq!(
+            WalV8CoalesceTargetPolicy::PointOnly(8).policy_name(),
+            "point_only"
+        );
+
+        let make_snapshot = |ready: usize, has_batch: bool| WalV8FrontierReadySnapshot {
+            ready_prefix: WalV8ReadyPrefix::Cursor {
+                ticket_count: ready,
+                tail: None,
+                data_bytes: 0,
+            },
+            admitted_ticket_count: 16,
+            has_outstanding_batch_tickets: has_batch,
+            closed: false,
+            frames_ready_prefix_count: ready,
+            data_complete_prefix_count: ready,
+            reserved_preparation_bytes: 0,
+            next_not_ready: None,
+            data_hol_blocker: None,
+            snapshot_monotonic_ns: None,
+        };
+
+        // Initial hit on Point-only cycle.
+        let mut initial_hit = make_snapshot(8, false);
+        let outcome = WalV8ParallelIo::coalesce_ready_prefix_with(
+            &mut initial_hit,
+            Duration::from_millis(50),
+            WalV8CoalesceTargetPolicy::PointOnly(8),
+            |_, _| unreachable!(),
+        )?;
+        assert!(outcome.eligible_cycle);
+        assert!(!outcome.mixed_fallback_cycle);
+        assert!(outcome.target_hit);
+        assert!(!outcome.waited);
+
+        // After-wake hit on Point-only cycle.
+        let mut after_wake_hit = make_snapshot(4, false);
+        let outcome = WalV8ParallelIo::coalesce_ready_prefix_with(
+            &mut after_wake_hit,
+            Duration::from_millis(50),
+            WalV8CoalesceTargetPolicy::PointOnly(8),
+            |_, snapshot| {
+                snapshot.ready_prefix = WalV8ReadyPrefix::Cursor {
+                    ticket_count: 8,
+                    tail: None,
+                    data_bytes: 0,
+                };
+                Ok(true)
+            },
+        )?;
+        assert!(outcome.eligible_cycle);
+        assert!(!outcome.mixed_fallback_cycle);
+        assert!(outcome.target_hit);
+        assert!(outcome.waited);
+
+        // Mixed fallback cycle (unready Batch in window).
+        let mut mixed = make_snapshot(8, true);
+        let outcome = WalV8ParallelIo::coalesce_ready_prefix_with(
+            &mut mixed,
+            Duration::from_millis(50),
+            WalV8CoalesceTargetPolicy::PointOnly(8),
+            |_, snapshot| {
+                snapshot.ready_prefix = WalV8ReadyPrefix::Cursor {
+                    ticket_count: 9,
+                    tail: None,
+                    data_bytes: 0,
+                };
+                Ok(false)
+            },
+        )?;
+        assert!(!outcome.eligible_cycle);
+        assert!(outcome.mixed_fallback_cycle);
+        assert!(!outcome.target_hit);
+        assert!(outcome.waited);
+
+        Ok(())
+    }
+
+    #[test]
+    fn v8_candidate_stage_a_source_spool_exhaustion_and_recovery() -> Result<()> {
+        const SEGMENT_LIMIT: u64 = 64 * 1024;
+        const INITIAL_SOURCE_CHARGE: u64 = HEADER_LEN_U64 + FRAME_LEN_U64;
+        const ONE_BATCH_SOURCE_CHARGE: u64 = 2 * WAL_V8_FRAME_LEN as u64;
+        const SOURCE_SPOOL_LIMIT: u64 =
+            SEGMENT_LIMIT + INITIAL_SOURCE_CHARGE + ONE_BATCH_SOURCE_CHARGE;
+
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("candidate-quota.wal");
+        let installed = install_empty(&path, header())?;
+        let sync_file = OpenOptions::new().read(true).write(true).open(&path)?;
+        let (leader, owner) = open_accounted_writer(
+            &path,
+            &installed,
+            SEGMENT_LIMIT,
+            SOURCE_SPOOL_LIMIT,
+            FRAME_LEN_U64,
+            sync_file,
+        )?;
+        let writer = match leader.into_parallel_with_worker_file_and_config(
+            OpenOptions::new().read(true).write(true).open(&path)?,
+            WalV8RequestedConfig::candidate(),
+        ) {
+            Ok(writer) => writer,
+            Err(error) if is_io_uring_unavailable_error(&error) => {
+                eprintln!("skipping test (io_uring unavailable): {error:#}");
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+
+        let pt_batch = batch(10);
+        let prepared = writer.preflight_batch_with_write_class(
+            &pt_batch,
+            LIVE_WAL_V5_LIMITS,
+            WalV8WriteClass::Point,
+        )?;
+        let quota_initial = owner.image_owner().snapshot();
+
+        // 1. Hold one exact-sized batch reservation to exhaust source-spool quota.
+        let held_reservation = owner.reserve_batch(
+            u64::try_from(prepared.logical_batch_bytes())?,
+            u64::try_from(prepared.frame_buffer_bytes())?,
+        )?;
+        let quota_while_held = owner.image_owner().snapshot();
+        assert_eq!(
+            quota_while_held.source_spool_bytes,
+            quota_initial.source_spool_bytes + ONE_BATCH_SOURCE_CHARGE
+        );
+
+        // 2. Single-frame Point write hits Stage A without charging quota, fails
+        // at admission with SourceSpoolLimit, releases its Stage A permit, and
+        // leaves quota and writer unpoisoned.
+        let mut scratch = WalV8PointAdmissionScratch::new(prepared);
+        assert!(writer.try_preallocate_point_buffer(&mut scratch));
+        assert!(writer.point_buffer_preallocation_hits_for_test() >= 1);
+        assert_eq!(writer.point_buffer_preallocations_in_flight_for_test(), 1);
+        assert_eq!(owner.image_owner().snapshot(), quota_while_held);
+
+        let err = match writer.admit_prepared_point_batch(
+            scratch,
+            pt_batch.commit_ts,
+            pt_batch.recorded_at,
+        ) {
+            Ok(_) => anyhow::bail!("expected SourceSpoolLimit when quota is exhausted"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(
+                err.downcast_ref::<crate::wal::v7::admission::WalV7ReservationError>(),
+                Some(crate::wal::v7::admission::WalV7ReservationError::SourceSpoolLimit { .. })
+            ),
+            "expected SourceSpoolLimit, got {err:#}"
+        );
+        assert_eq!(writer.point_buffer_preallocations_in_flight_for_test(), 0);
+        assert_eq!(owner.image_owner().snapshot(), quota_while_held);
+        assert!(!writer.is_poisoned());
+
+        // 3. Release held reservation -> quota restores and Point write succeeds.
+        drop(held_reservation);
+        assert_eq!(owner.image_owner().snapshot(), quota_initial);
+        let prepared_ok = writer.preflight_batch_with_write_class(
+            &pt_batch,
+            LIVE_WAL_V5_LIMITS,
+            WalV8WriteClass::Point,
+        )?;
+        let mut scratch_ok = WalV8PointAdmissionScratch::new(prepared_ok);
+        assert!(writer.try_preallocate_point_buffer(&mut scratch_ok));
+        let job = writer.admit_prepared_point_batch(
+            scratch_ok,
+            pt_batch.commit_ts,
+            pt_batch.recorded_at,
+        )?;
+        let _ = job.finish()?;
+        writer.sync()?;
+        assert_eq!(writer.point_buffer_preallocations_in_flight_for_test(), 0);
 
         Ok(())
     }

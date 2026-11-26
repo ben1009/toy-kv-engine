@@ -1359,9 +1359,23 @@ impl LsmMvccInner {
         }
         let prepared = prepared_result?;
 
+        let mut point_scratch = crate::wal::v8::leader::WalV8PointAdmissionScratch::new(prepared);
+        #[cfg(feature = "bench")]
+        let phase_timer = WalCpuPhaseTimer::start(cpu_attribution.is_some());
+        let point_buffer_preallocated =
+            memtable.try_preallocate_prepared_v8_point_buffer_only(&mut point_scratch);
+        #[cfg(feature = "bench")]
+        if let Some(sample) = cpu_attribution.as_mut() {
+            let (wall_ns, cpu_ns) = phase_timer.finish();
+            sample.observation.point_buffer_preallocation_wall_ns = wall_ns;
+            sample.observation.point_buffer_preallocation_cpu_ns = cpu_ns;
+        }
+
         #[cfg(feature = "bench")]
         let phase_timer = WalCpuPhaseTimer::start(cpu_attribution.is_some());
         let write_guard = self.write_lock.lock();
+        #[cfg(feature = "bench")]
+        let hold_timer = WalCpuPhaseTimer::start(cpu_attribution.is_some());
         #[cfg(feature = "bench")]
         if let Some(sample) = cpu_attribution.as_mut() {
             let (wall_ns, cpu_ns) = phase_timer.finish();
@@ -1392,8 +1406,16 @@ impl LsmMvccInner {
 
         #[cfg(feature = "bench")]
         let phase_timer = WalCpuPhaseTimer::start(cpu_attribution.is_some());
-        let admission_result =
-            memtable.admit_prepared_v8_pitr_wal_batch_only(prepared, commit_ts, recorded_at);
+        let admission_result = if point_buffer_preallocated {
+            memtable.admit_prepared_v8_point_pitr_wal_batch_only(
+                point_scratch,
+                commit_ts,
+                recorded_at,
+            )
+        } else {
+            let prepared = point_scratch.into_prepared();
+            memtable.admit_prepared_v8_pitr_wal_batch_only(prepared, commit_ts, recorded_at)
+        };
         #[cfg(feature = "bench")]
         if let Some(sample) = cpu_attribution.as_mut() {
             let (wall_ns, cpu_ns) = phase_timer.finish();
@@ -1410,6 +1432,12 @@ impl LsmMvccInner {
         #[cfg(feature = "bench")]
         if let Some(sample) = cpu_attribution.as_mut() {
             sample.observation.ticket = ticket;
+        }
+        #[cfg(feature = "bench")]
+        if let Some(sample) = cpu_attribution.as_mut() {
+            let (wall_ns, cpu_ns) = hold_timer.finish();
+            sample.observation.sequencer_hold_wall_ns = wall_ns;
+            sample.observation.sequencer_hold_cpu_ns = cpu_ns;
         }
         drop(write_guard);
         if let Some(frame_job) = frame_job {

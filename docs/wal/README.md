@@ -51,9 +51,24 @@ Preparation, durability progress and durable publication use separate
 notifications. One driver forms FRONTIERs. The WAL's published cursor path
 lets a durable follower return without taking the physical FRONTIER mutex.
 The direct writer append path takes that mutex to construct commit metadata.
+The historical RFC 028 Dedicated Driver and Independent ACK experiments did
+not establish a broad throughput gain and are no longer live benchmark modes.
+Caller-driven durability and the legacy coordinator ACK path remain in use.
 See the [notification rerun](benchmarks/rfc-026-v8-notification-rerun-20261102.md)
 for the evidence and the [implementation plan](rfc-026-implementation-plan.md)
 for the current runtime.
+
+## Current Point experiment status
+
+The production default remains Eager progress with relayed DATA completions and
+Dynamic coalescing. Cursor progress can be selected as an opt-in mode, but it
+has not passed the Point throughput qualification gate. Direct Completion,
+Point buffer preallocation, and Ready Target controls remain benchmark-only.
+Ready Target4 and Target8 are retained only in the explicit V7/V8 final
+comparison; neither is a production default. Historical singleton submission,
+fixed-budget, target-scan, cursor-publication, resource-retirement, ACK, and
+Dedicated Driver suites are blocked from live execution. Their reports and
+archive verifiers remain available for review.
 
 Dated filenames identify individual measurements and follow-ups. Their defaults,
 candidate decisions and validation counts describe the measured revision;
@@ -61,12 +76,71 @@ the adoption notes above define current selection. The
 [benchmark overview](benchmarks/rfc-024-parallel-wal-benchmark.md) connects
 the retained and rejected experiments.
 
-## V8 Point performance proposal
+## RFC 027 qualification result
 
-The [V8 Point Progress Ring](../../rfcs/027-v8-point-progress-ring.md) proposes moving
-producer readiness to a bounded ring and having the elected driver apply
-queued completions in batches. The plan starts with an isolated prototype,
-followed by correctness tests and paired Point and Batch64 benchmarks.
+The [V8 Point Progress Ring](../../rfcs/027-v8-point-progress-ring.md) proposed
+moving producer readiness to a bounded ring and having the elected driver apply
+queued completions in batches. Ring did not pass its Point8/Point16 throughput
+promotion gates. Cursor remains opt-in and is not the default: the latest
+qualification did not pass the throughput gate, and non-bench production-path
+qualification is still required. See the [Ring qualification](benchmarks/rfc-027-v8-point-progress-ring-gcp-20261121.md),
+[archived three-arm Cursor qualification](benchmarks/rfc-027-v8-point-progress-cursor-gcp-20261122.md),
+[Cursor direct-completion comparison](benchmarks/rfc-027-v8-cursor-direct-completion-gcp-20261122.md),
+[Cursor singleton-submission comparison](benchmarks/rfc-027-v8-cursor-singleton-submission-gcp-20261122.md),
+and the [implementation plan](rfc-027-v8-point-progress-ring-implementation-plan.md).
+The [RFC 028 Point16 critical-path diagnostic](benchmarks/rfc-028-v8-point16-critical-path-gcp-20261122.md)
+compares Cursor Relay and Direct Completion phase timings at 8 and 16 writers;
+it is diagnostic only and does not establish a throughput winner or a runtime
+bottleneck.
+The [Cursor coalescing follow-up](benchmarks/rfc-028-v8-cursor-coalescing-gcp-20261123.md)
+shows progress-token waiting dominates the sampled coalescing wall time, while
+completion drain and coordinator-lock wait remain small. It also records a
+stale availability flag despite populated phase fields; these single-run
+diagnostics do not establish a performance winner.
+The [Point Resource Preclaim final A/B](benchmarks/rfc-028-v8-point-resource-preclaim-final-gcp-20261124.md)
+compares Stage A with the optimized Stage A+B3 across five paired Point8,
+Point16, and Batch64 runs. B3 missed both Point throughput gates; keep Stage A
+and stop the preclaim optimization.
+The [Resource Retirement Ledger lock A/B](benchmarks/rfc-028-v8-resource-retirement-lock-gcp-20261124.md)
+compares the pre- and post-lock-merge implementations across V8 Point1/8/16,
+V7 Point16, and Batch64. Point16's paired throughput gain was 0.36% (3/5 wins),
+with unchanged Puts/Sync; the experiment did not establish a stable performance
+benefit. Its report documents the custom-plan validation and artifact recovery.
+The [V8 Point Resource Retirement C2 A/B](benchmarks/rfc-028-v8-point-resource-retirement-c2-gcp-20261124.md)
+compares per-ticket retirement, C1 detach, and C2 batch retirement across Point8,
+Point16, and Batch64. C2 improved paired Point throughput by 2.07% and 3.27%,
+below the 5% retention gate; it is not performance-qualified for default use.
+The [Stage A plus C2 follow-up](benchmarks/rfc-028-v8-point-resource-retirement-stage-a-c2-gcp-20261124.md)
+repeats the three-way comparison with Point buffer preallocation enabled. The
+combined C2 gain was 4.70% at Point8 and 1.25% at Point16, still below the 5%
+gate; Batch64 remained effectively unchanged.
+The [coalescing-budget A/B](benchmarks/rfc-028-v8-cursor-coalescing-budget-gcp-20261123.md)
+found fixed 400 μs consistently ahead of Dynamic at 8 and 16 writers, but its
+paired throughput gains stayed below the 5% qualification threshold. Dynamic
+remains the default.
+The [ready-target A/B](benchmarks/rfc-028-v8-cursor-coalescing-ready-target-gcp-20261125.md)
+missed the overall gate: Target8 gained 7.57% at Point16, but lost 3.44% at
+Point8; Target12 stayed below the Point16 threshold. Dynamic remains the default.
+The [ready-target parameter scan](benchmarks/rfc-028-v8-cursor-coalescing-ready-target-scan-gcp-20261125.md)
+found Target4 ahead at Point16 (+10.02%) and Point8 (+3.03%), but it missed the
+5% gate at Point8. CPU/Put rose and Puts/Sync fell; Dynamic remains the default.
+The [small ready-target scan](benchmarks/rfc-028-v8-cursor-coalescing-ready-target-small-scan-gcp-20261125.md)
+found Target4 strongest in paired median throughput at Point8 (+3.68%) and
+Point16 (+7.22%), but it still missed the Point8 gate and raised CPU/Put.
+Dynamic remains the default pending broader qualification.
+The [V7/V8 final ready-target comparison](benchmarks/rfc-028-v7-v8-ready-target-final-gcp-20261125.md)
+found Target4 2.22% ahead of V7 at Point16 (3/5 wins), but Point8 remained
+1.48% behind and sampled p99 was higher for every V8 Point arm. Batch64 stayed
+within 0.9% of V7 throughput. No V8 target matched V7 across Point throughput,
+tail latency, and CPU cost; Dynamic remains the default.
+The [D1 ACK-check A/B](benchmarks/rfc-028-v8-point-ack-d1-gcp-20261124.md)
+found no stable throughput gain from consolidating the Coordinator ACK checks;
+Point16 was 1.86% slower in paired median.
+The [D3a Dedicated Driver](benchmarks/rfc-028-v8-dedicated-durability-driver-gcp-20261124.md)
+and [D3b Independent ACK](benchmarks/rfc-028-v8-independent-ack-gcp-20261125.md)
+comparisons also failed to show a broad throughput win. RFC 027/028 runtime
+experiments are closed; the reports remain historical evidence, not pending
+qualification or defaults.
 
 ## Implementation and adoption
 
@@ -259,6 +333,26 @@ experiments. Each report records its own outcome and measurement limits.
 - [Context switches and worker retirement, 2026-10-04](experiments/rfc-024-context-switch-and-worker-retirement-20261004.md)
 - [RFC 026 Point borrowed-input experiment — no stable gain, 2026-11-18](experiments/rfc-026-point-borrowed-input-gcp-20261118.md)
 - [RFC 026 V8 Point single-frame direct encoding GCP qualification — below throughput gate, 2026-11-18](experiments/rfc-026-point-direct-frame-v1-20261118.md)
+- [RFC 027 V8 Point Progress Ring GCP qualification — promotion gates failed, 2026-11-21](benchmarks/rfc-027-v8-point-progress-ring-gcp-20261121.md)
+- [RFC 027 V8 Point Progress Cursor GCP qualification — promotion gates failed, 2026-11-22](benchmarks/rfc-027-v8-point-progress-cursor-gcp-20261122.md)
+- [RFC 027 V8 Cursor direct-completion GCP qualification — Point16 gate failed, 2026-11-22](benchmarks/rfc-027-v8-cursor-direct-completion-gcp-20261122.md)
+- [RFC 027 V8 Cursor singleton-submission GCP qualification — throughput gate failed, 2026-11-22](benchmarks/rfc-027-v8-cursor-singleton-submission-gcp-20261122.md)
+- [RFC 028 V8 Point critical-path GCP diagnostic — no single bottleneck established, 2026-11-22](benchmarks/rfc-028-v8-point16-critical-path-gcp-20261122.md)
+- [RFC 028 V8 Point D1 ACK-check GCP A/B — no stable throughput gain, 2026-11-24](benchmarks/rfc-028-v8-point-ack-d1-gcp-20261124.md)
+- [RFC 028 V8 Dedicated Durability Driver D3a GCP A/B — no broad throughput win, 2026-11-24](benchmarks/rfc-028-v8-dedicated-durability-driver-gcp-20261124.md)
+- [RFC 028 V8 Independent ACK Waiter D3b GCP A/B — no throughput win, 2026-11-25](benchmarks/rfc-028-v8-independent-ack-gcp-20261125.md)
+- [RFC 028 V8 Cursor Direct Completion Wake Token/Select GCP A/B — no throughput win, 2026-11-25](benchmarks/rfc-028-v8-cursor-direct-completion-wake-gcp-20261125.md)
+- [RFC 028 V8 cursor publication D2a/D2b historical GCP A/B — baseline was not a full pre-D2 restore, 2026-11-24](benchmarks/rfc-028-v8-cursor-publication-d2-gcp-20261124.md)
+- [RFC 028 V8 cursor publication D2a requalification — below throughput gate, 2026-11-24](benchmarks/rfc-028-v8-cursor-publication-d2a-gcp-requalification-20261124.md)
+- [RFC 028 V8 Cursor coalescing GCP diagnostic — progress-token wait dominates sampled coalescing wall time, 2026-11-23](benchmarks/rfc-028-v8-cursor-coalescing-gcp-20261123.md)
+- [RFC 028 V8 Cursor coalescing-budget A/B — fixed 400 μs wins consistently but misses the throughput gate, 2026-11-23](benchmarks/rfc-028-v8-cursor-coalescing-budget-gcp-20261123.md)
+- [RFC 028 V8 Cursor coalescing ready-target A/B — Point16 Target8 gain, overall gate failed, 2026-11-25](benchmarks/rfc-028-v8-cursor-coalescing-ready-target-gcp-20261125.md)
+- [RFC 028 V8 Cursor coalescing ready-target parameter scan — Target4 led Point16, Point8 gate missed, 2026-11-25](benchmarks/rfc-028-v8-cursor-coalescing-ready-target-scan-gcp-20261125.md)
+- [RFC 028 V8 Cursor coalescing small ready-target scan — Target4 led the scan, Point8 gate missed, 2026-11-25](benchmarks/rfc-028-v8-cursor-coalescing-ready-target-small-scan-gcp-20261125.md)
+- [RFC 028 V7/V8 final same-host Ready Target4/8 comparison — no Point parity across throughput, tail latency, and CPU, 2026-11-25](benchmarks/rfc-028-v7-v8-ready-target-final-gcp-20261125.md)
+- [RFC 028 V8 Point buffer preallocation GCP A/B — Point8 +9.59%, Point16 +3.88%, 2026-11-23](benchmarks/rfc-028-v8-point-buffer-preallocation-gcp-20261123.md)
+- [RFC 028 V7/V8 Point buffer preallocation same-host qualification — Point8 +9.78%, Point16 +4.15%, 2026-11-23](benchmarks/rfc-028-v7-v8-point-preallocation-same-host-gcp-20261123.md)
+- [RFC 028 V8 Point resource preclaim Stage B A/B — throughput gate failed, 2026-11-23](benchmarks/rfc-028-v8-point-resource-preclaim-stage-b-gcp-20261123.md)
 - [RFC 026 V7/V8 Point admission and sync diagnostic — sequencer wait is real but not demonstrably saturated, 2026-11-19](experiments/rfc-026-v8-point-admission-sync-diagnostic-20261119.md)
 - [Deferred task work with native completion waiting](experiments/rfc-024-deferred-ring-wait-20261003.md)
 - [Extent preparation for large batches](experiments/rfc-024-large-batch-preallocation-20261004.md)

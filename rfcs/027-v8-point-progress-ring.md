@@ -2,7 +2,7 @@
 
 | Field | Value |
 | --- | --- |
-| Status | F0 design proposal. Prototype, runtime tests and A/B pending. |
+| Status | F0 prototype implemented; GCP performance gates failed and the candidate is stopped. Not promoted. |
 | Date | 2026-11-21 |
 | Scope | V8 Parallel only; Point throughput target, shared Point/Batch correctness |
 | Base | [PR #558 squash commit](https://github.com/ben1009/toy-kv-engine/commit/58c79208a760bbb9cdeb02341107eb49c2a0ae7f) |
@@ -174,14 +174,52 @@ The throughput target is +10% Point16 under the same gates. If F0 fails the loca
 
 ## 9. Implementation status
 
-The proposal specifies F0.1 as an isolated ring prototype. The integrated
-runtime experiment requires the ownership, wakeup and crash tests in Section 7.
-Section 8 defines when to advance from local testing to GCP and what constitutes
-a passing A/B.
+F0.1–F0.4 were implemented and passed their correctness review before the
+qualification run. F0.5 completed its 40-run GCP matrix, but Point8 and Point16
+failed the throughput promotion gates. The candidate is stopped and is not
+qualified for production promotion. See the
+[GCP qualification report](../docs/wal/benchmarks/rfc-027-v8-point-progress-ring-gcp-20261121.md).
+The subsequent [Cursor direct-completion comparison](../docs/wal/benchmarks/rfc-027-v8-cursor-direct-completion-gcp-20261122.md)
+improved Point1 and Point8, but missed the Point16 promotion threshold and
+does not change the production-default decision.
+
+### Post-qualification source review
+
+In the scored F0 revision (`d04a0bba`), readiness scans and FRONTIER
+validation repeatedly lock ticket cells. Admission locks each cell before
+and after range registration, and retirement allocates a vector of cell
+guards for each FRONTIER. The Reaper sends completions through a second
+queue, which the driver drains under a scratch buffer mutex. The first
+accepted digest for a ticket can also wake the driver before its DATA is
+ready. The qualification measured aggregate CPU and throughput. The cost
+each operation contributed to the CPU difference remains unmeasured.
+[Source review](https://github.com/ben1009/toy-kv-engine/pull/562#issuecomment-7071356609)
+
+The bench candidate uses a Coordinator-owned ready prefix cursor. Whole-group
+DATA completion validates frame readiness, and the ordered digest fold confirms
+the accepted digest. The driver carries this validated cutoff across scans and
+uses it to reserve and publish a FRONTIER. Retirement validates the entire
+prefix before clearing the ring cells without allocating a guard vector.
+Admission checks and initializes the cell once after range registration. The
+elected driver owns the completion drain buffer until handoff. Digest publication
+before DATA submission relies on the completion wake. Independent digest
+publication still signals the driver.
+
+Select eager mode with `TOYKV_BENCH_V8_POINT_PROGRESS_RING=0` or by leaving it
+unset. Mode `1` selects the original ring, and mode `2` selects the cursor
+candidate. Bench output reports `progress_cursor_enabled` at both I/O snapshots.
+Set `TOYKV_BENCH_V8_PROGRESS_COUNTERS=1` with mode `2` to collect lightweight
+progress token attempts, accepted tokens, owner scans, scans that found no new
+ready tickets, and drained completion events without enabling detailed
+snapshots. This keeps the Cursor snapshot on its constant-time path. In
+contrast, `--wal-sync-diagnostics` enables detailed per-sync snapshots and
+therefore scans progress cells in Cursor mode; use it only for diagnostic runs.
+The sync observations report the number of tickets covered. F0 remains off by
+default after its qualification result.
 
 ## Appendix A. Historical alternatives — not part of the implementation plan
 
-This appendix consolidates the former progress-simplification RFC. F0 (Sections 3–8) is the **only active candidate**; neither A0 nor P0 is a prerequisite or fallback, and P1 requires an independently approved experiment. The [archived full analysis at commit 01c6c6e8](https://github.com/ben1009/toy-kv-engine/blob/01c6c6e87317d8e00379b5e1ca67c63fe0d52a5b/docs/wal/rfc-026-v8-point-progress-simplification.md) preserves the earlier detailed review history, not an alternative implementation specification.
+This appendix consolidates the former progress-simplification RFC. F0 (Sections 3–8) was the sole candidate and is now stopped after the failed qualification; neither A0 nor P0 is a fallback, and P1 requires an independently approved experiment. The [archived full analysis at commit 01c6c6e8](https://github.com/ben1009/toy-kv-engine/blob/01c6c6e87317d8e00379b5e1ca67c63fe0d52a5b/docs/wal/rfc-026-v8-point-progress-simplification.md) preserves the earlier detailed review history, not an alternative implementation specification.
 
 | Historical candidate | Decision and rationale |
 | --- | --- |
