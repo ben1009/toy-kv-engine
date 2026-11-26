@@ -2627,9 +2627,27 @@ impl WalV8ParallelCoordinator {
             if let Some(retired) = state.tickets.pop_front()
                 && retired.plan.write_class == WalV8WriteClass::Batch
             {
-                state.outstanding_batch_tickets = state.outstanding_batch_tickets.saturating_sub(1);
+                debug_assert!(
+                    state.outstanding_batch_tickets > 0,
+                    "outstanding_batch_tickets underflow on Batch retirement"
+                );
+                if let Some(next) = state.outstanding_batch_tickets.checked_sub(1) {
+                    state.outstanding_batch_tickets = next;
+                } else {
+                    poison_locked(&self.inner, &mut state);
+                    anyhow::bail!("v8 outstanding_batch_tickets underflowed on Batch retirement");
+                }
             }
         }
+        debug_assert_eq!(
+            state.outstanding_batch_tickets,
+            state
+                .tickets
+                .iter()
+                .filter(|ticket| ticket.plan.write_class == WalV8WriteClass::Batch)
+                .count(),
+            "outstanding_batch_tickets out of sync after retirement"
+        );
         #[cfg(feature = "bench")]
         if let (Some(cursor), Some(data_bytes)) =
             (&mut state.ready_cursor, remaining_ready_data_bytes)
@@ -3613,6 +3631,15 @@ fn frontier_ready_snapshot_locked(
         return Ok(snapshot);
     }
     snapshot.admitted_ticket_count = state.tickets.len();
+    debug_assert_eq!(
+        state.outstanding_batch_tickets,
+        state
+            .tickets
+            .iter()
+            .filter(|ticket| ticket.plan.write_class == WalV8WriteClass::Batch)
+            .count(),
+        "outstanding_batch_tickets out of sync in snapshot"
+    );
     snapshot.has_outstanding_batch_tickets = state.outstanding_batch_tickets > 0;
     if inner.progress_ring.is_none() {
         snapshot.ready_prefix = WalV8ReadyPrefix::Tickets(
@@ -3722,6 +3749,15 @@ fn cursor_frontier_snapshot_locked(
         data_bytes: cursor.data_bytes,
     };
     snapshot.admitted_ticket_count = state.tickets.len();
+    debug_assert_eq!(
+        state.outstanding_batch_tickets,
+        state
+            .tickets
+            .iter()
+            .filter(|ticket| ticket.plan.write_class == WalV8WriteClass::Batch)
+            .count(),
+        "outstanding_batch_tickets out of sync in snapshot"
+    );
     snapshot.has_outstanding_batch_tickets = state.outstanding_batch_tickets > 0;
     snapshot.closed = state.closed;
     enforce_frontier_ticket_floor(state, &mut snapshot);

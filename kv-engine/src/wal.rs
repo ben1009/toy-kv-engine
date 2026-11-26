@@ -173,6 +173,17 @@ pub struct WalIoDiagnostics {
     pub coalesce_ready_target: Option<usize>,
     /// Number of coalescing cycles ended at the target before the full admitted prefix was ready.
     pub coalesce_ready_target_hits: u64,
+    /// Coalescing target policy (`"disabled"`, `"always"`, or `"point_only"`).
+    pub coalesce_target_policy: &'static str,
+    /// Number of coalescing cycles where the target policy was eligible.
+    pub coalesce_target_eligible_cycles: u64,
+    /// Number of coalescing cycles where Point-only Target fell back to Dynamic due to outstanding
+    /// Batch tickets.
+    pub coalesce_target_mixed_fallback_cycles: u64,
+    /// Number of coalescing cycles that hit the target before waiting.
+    pub coalesce_target_initial_hits: u64,
+    /// Number of coalescing cycles that hit the target after waking.
+    pub coalesce_target_after_wake_hits: u64,
     /// Whether Cursor DATA submissions use the benchmark-only allocation-free group
     /// representation.
     pub cursor_singleton_submission_enabled: bool,

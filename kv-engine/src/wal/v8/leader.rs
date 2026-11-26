@@ -770,6 +770,52 @@ impl WalV8CoalesceTargetPolicy {
             Self::PointOnly(target) => Some(target),
         }
     }
+
+    #[cfg(feature = "bench")]
+    fn policy_name(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Always(_) => "always",
+            Self::PointOnly(_) => "point_only",
+        }
+    }
+
+    fn from_value(
+        value: Option<&OsStr>,
+        progress_mode: WalV8ProgressMode,
+        direct_completion_enabled: bool,
+    ) -> Result<Option<Self>> {
+        let Some(value) = value else {
+            return Ok(None);
+        };
+        let value = value
+            .to_str()
+            .context("TOYKV_WAL_V8_COALESCING is not valid UTF-8")?;
+        match value {
+            "dynamic" => Ok(Some(Self::Disabled)),
+            "point-target8" => {
+                ensure!(
+                    progress_mode == WalV8ProgressMode::Cursor && direct_completion_enabled,
+                    "TOYKV_WAL_V8_COALESCING=point-target8 requires Cursor progress mode and direct completion"
+                );
+                Ok(Some(Self::PointOnly(8)))
+            }
+            _ => anyhow::bail!(
+                "invalid TOYKV_WAL_V8_COALESCING {value:?}; expected `dynamic` or `point-target8`"
+            ),
+        }
+    }
+
+    fn from_environment(
+        progress_mode: WalV8ProgressMode,
+        direct_completion_enabled: bool,
+    ) -> Result<Option<Self>> {
+        Self::from_value(
+            std::env::var_os("TOYKV_WAL_V8_COALESCING").as_deref(),
+            progress_mode,
+            direct_completion_enabled,
+        )
+    }
 }
 
 #[cfg(feature = "bench")]
@@ -944,23 +990,32 @@ impl WalV8RequestedConfig {
         #[cfg(not(feature = "bench"))]
         let point_buffer_preallocation_enabled = base.point_buffer_preallocation_enabled;
 
+        let explicit_coalescing =
+            WalV8CoalesceTargetPolicy::from_environment(progress_mode, direct_completion_enabled)?;
         #[cfg(feature = "bench")]
         let coalesce_policy = if let Some(target) =
             coalesce_ready_target_from_environment(progress_mode, direct_completion_enabled)?
         {
+            ensure!(
+                explicit_coalescing.is_none(),
+                "TOYKV_WAL_V8_COALESCING and {WAL_V8_COALESCE_READY_TARGET_ENV} cannot both be set"
+            );
             WalV8CoalesceTargetPolicy::Always(target)
+        } else if let Some(policy) = explicit_coalescing {
+            policy
         } else if progress_mode == WalV8ProgressMode::Cursor && direct_completion_enabled {
             base.coalesce_policy
         } else {
             WalV8CoalesceTargetPolicy::Disabled
         };
         #[cfg(not(feature = "bench"))]
-        let coalesce_policy =
-            if progress_mode == WalV8ProgressMode::Cursor && direct_completion_enabled {
-                base.coalesce_policy
-            } else {
-                WalV8CoalesceTargetPolicy::Disabled
-            };
+        let coalesce_policy = if let Some(policy) = explicit_coalescing {
+            policy
+        } else if progress_mode == WalV8ProgressMode::Cursor && direct_completion_enabled {
+            base.coalesce_policy
+        } else {
+            WalV8CoalesceTargetPolicy::Disabled
+        };
 
         #[cfg(feature = "bench")]
         let progress_counters_enabled = progress_counters_enabled_from_environment(progress_mode)?;
@@ -3477,6 +3532,14 @@ struct WalV8ParallelIo {
     coalesce_ready_target: WalV8CoalesceTargetPolicy,
     #[cfg(feature = "bench")]
     coalesce_ready_target_hits: AtomicU64,
+    #[cfg(feature = "bench")]
+    coalesce_target_eligible_cycles: AtomicU64,
+    #[cfg(feature = "bench")]
+    coalesce_target_mixed_fallback_cycles: AtomicU64,
+    #[cfg(feature = "bench")]
+    coalesce_target_initial_hits: AtomicU64,
+    #[cfg(feature = "bench")]
+    coalesce_target_after_wake_hits: AtomicU64,
     #[cfg(test)]
     progress_wait_hook: Mutex<Option<WalV8ProgressWaitHook>>,
     #[cfg(test)]
@@ -3491,6 +3554,10 @@ struct WalV8CoalesceOutcome {
     waited: bool,
     #[cfg(feature = "bench")]
     target_hit: bool,
+    #[cfg(feature = "bench")]
+    eligible_cycle: bool,
+    #[cfg(feature = "bench")]
+    mixed_fallback_cycle: bool,
 }
 
 struct WalV8ParallelIoConfig {
@@ -3734,6 +3801,14 @@ impl WalV8ParallelIo {
             coalesce_ready_target,
             #[cfg(feature = "bench")]
             coalesce_ready_target_hits: AtomicU64::new(0),
+            #[cfg(feature = "bench")]
+            coalesce_target_eligible_cycles: AtomicU64::new(0),
+            #[cfg(feature = "bench")]
+            coalesce_target_mixed_fallback_cycles: AtomicU64::new(0),
+            #[cfg(feature = "bench")]
+            coalesce_target_initial_hits: AtomicU64::new(0),
+            #[cfg(feature = "bench")]
+            coalesce_target_after_wake_hits: AtomicU64::new(0),
             #[cfg(test)]
             progress_wait_hook: Mutex::new(None),
             #[cfg(test)]
@@ -3952,6 +4027,10 @@ impl WalV8ParallelIo {
         mut wait_and_advance: impl FnMut(Duration, &mut WalV8FrontierReadySnapshot) -> Result<bool>,
     ) -> Result<WalV8CoalesceOutcome> {
         let deadline = Instant::now() + budget;
+        #[cfg(feature = "bench")]
+        let mut saw_mixed_fallback =
+            matches!(coalesce_policy, WalV8CoalesceTargetPolicy::PointOnly(_))
+                && snapshot.has_outstanding_batch_tickets;
         let mut outcome = WalV8CoalesceOutcome {
             waited: false,
             #[cfg(feature = "bench")]
@@ -3961,6 +4040,10 @@ impl WalV8ParallelIo {
                     snapshot.ready_prefix.len(),
                     coalesce_policy.target_for_snapshot(snapshot),
                 ),
+            #[cfg(feature = "bench")]
+            eligible_cycle: false,
+            #[cfg(feature = "bench")]
+            mixed_fallback_cycle: false,
         };
 
         while !snapshot.closed
@@ -3974,12 +4057,22 @@ impl WalV8ParallelIo {
             let signaled = wait_and_advance(remaining, snapshot)?;
             let current_target = coalesce_policy.target_for_snapshot(snapshot);
             #[cfg(feature = "bench")]
-            if signaled
-                && !snapshot.closed
-                && snapshot.ready_prefix.len() < snapshot.admitted_ticket_count
-                && Self::coalesce_ready_target_reached(snapshot.ready_prefix.len(), current_target)
             {
-                outcome.target_hit = true;
+                if matches!(coalesce_policy, WalV8CoalesceTargetPolicy::PointOnly(_))
+                    && snapshot.has_outstanding_batch_tickets
+                {
+                    saw_mixed_fallback = true;
+                }
+                if signaled
+                    && !snapshot.closed
+                    && snapshot.ready_prefix.len() < snapshot.admitted_ticket_count
+                    && Self::coalesce_ready_target_reached(
+                        snapshot.ready_prefix.len(),
+                        current_target,
+                    )
+                {
+                    outcome.target_hit = true;
+                }
             }
             if !signaled
                 || snapshot.ready_prefix.is_empty()
@@ -3987,6 +4080,23 @@ impl WalV8ParallelIo {
                 || Self::coalesce_ready_target_reached(snapshot.ready_prefix.len(), current_target)
             {
                 break;
+            }
+        }
+
+        #[cfg(feature = "bench")]
+        if !snapshot.closed {
+            match coalesce_policy {
+                WalV8CoalesceTargetPolicy::Disabled => {}
+                WalV8CoalesceTargetPolicy::Always(_) => {
+                    outcome.eligible_cycle = true;
+                }
+                WalV8CoalesceTargetPolicy::PointOnly(_) => {
+                    if saw_mixed_fallback {
+                        outcome.mixed_fallback_cycle = true;
+                    } else {
+                        outcome.eligible_cycle = true;
+                    }
+                }
             }
         }
 
@@ -4059,9 +4169,26 @@ impl WalV8ParallelIo {
             },
         )?;
         #[cfg(feature = "bench")]
-        if outcome.target_hit {
-            self.coalesce_ready_target_hits
-                .fetch_add(1, Ordering::Relaxed);
+        {
+            if outcome.eligible_cycle {
+                self.coalesce_target_eligible_cycles
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            if outcome.mixed_fallback_cycle {
+                self.coalesce_target_mixed_fallback_cycles
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            if outcome.target_hit {
+                self.coalesce_ready_target_hits
+                    .fetch_add(1, Ordering::Relaxed);
+                if outcome.waited {
+                    self.coalesce_target_after_wake_hits
+                        .fetch_add(1, Ordering::Relaxed);
+                } else {
+                    self.coalesce_target_initial_hits
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            }
         }
         Ok(outcome.waited)
     }
@@ -5158,6 +5285,11 @@ impl WalV8LeaderWriter {
             cursor_direct_completion_select_wake_enabled: false,
             coalesce_ready_target: None,
             coalesce_ready_target_hits: 0,
+            coalesce_target_policy: "disabled",
+            coalesce_target_eligible_cycles: 0,
+            coalesce_target_mixed_fallback_cycles: 0,
+            coalesce_target_initial_hits: 0,
+            coalesce_target_after_wake_hits: 0,
             cursor_singleton_submission_enabled: false,
             admission_cursor_publish_fast_path_enabled: false,
             point_buffer_preallocation_enabled: false,
@@ -6207,6 +6339,21 @@ impl WalV8ParallelWriter {
         diagnostics.coalesce_ready_target = self.io.coalesce_ready_target.target_count();
         diagnostics.coalesce_ready_target_hits =
             self.io.coalesce_ready_target_hits.load(Ordering::Relaxed);
+        diagnostics.coalesce_target_policy = self.io.coalesce_ready_target.policy_name();
+        diagnostics.coalesce_target_eligible_cycles = self
+            .io
+            .coalesce_target_eligible_cycles
+            .load(Ordering::Relaxed);
+        diagnostics.coalesce_target_mixed_fallback_cycles = self
+            .io
+            .coalesce_target_mixed_fallback_cycles
+            .load(Ordering::Relaxed);
+        diagnostics.coalesce_target_initial_hits =
+            self.io.coalesce_target_initial_hits.load(Ordering::Relaxed);
+        diagnostics.coalesce_target_after_wake_hits = self
+            .io
+            .coalesce_target_after_wake_hits
+            .load(Ordering::Relaxed);
         diagnostics.progress_diagnostics = self.coordinator.progress_diagnostics();
         diagnostics.point_buffer_preallocation_attempts = self
             .point_buffer_preallocation_attempts
@@ -13660,5 +13807,153 @@ mod tests {
         assert!(point_direct_frame_from_value(Some(OsStr::new("true"))).is_err());
         assert!(point_direct_frame_from_value(Some(OsStr::new("2"))).is_err());
         assert!(point_direct_frame_from_value(Some(OsStr::from_bytes(b"\xff"))).is_err());
+    }
+
+    #[test]
+    fn coalescing_override_parses_dynamic_and_point_target8() -> Result<()> {
+        use std::os::unix::ffi::OsStrExt;
+
+        assert_eq!(
+            WalV8CoalesceTargetPolicy::from_value(None, WalV8ProgressMode::Eager, false)?,
+            None
+        );
+        assert_eq!(
+            WalV8CoalesceTargetPolicy::from_value(
+                Some(OsStr::new("dynamic")),
+                WalV8ProgressMode::Eager,
+                false,
+            )?,
+            Some(WalV8CoalesceTargetPolicy::Disabled)
+        );
+        assert_eq!(
+            WalV8CoalesceTargetPolicy::from_value(
+                Some(OsStr::new("dynamic")),
+                WalV8ProgressMode::Cursor,
+                true,
+            )?,
+            Some(WalV8CoalesceTargetPolicy::Disabled)
+        );
+        assert_eq!(
+            WalV8CoalesceTargetPolicy::from_value(
+                Some(OsStr::new("point-target8")),
+                WalV8ProgressMode::Cursor,
+                true,
+            )?,
+            Some(WalV8CoalesceTargetPolicy::PointOnly(8))
+        );
+        assert!(
+            WalV8CoalesceTargetPolicy::from_value(
+                Some(OsStr::new("point-target8")),
+                WalV8ProgressMode::Eager,
+                false,
+            )
+            .is_err()
+        );
+        assert!(
+            WalV8CoalesceTargetPolicy::from_value(
+                Some(OsStr::new("always-8")),
+                WalV8ProgressMode::Cursor,
+                true,
+            )
+            .is_err()
+        );
+        assert!(
+            WalV8CoalesceTargetPolicy::from_value(
+                Some(OsStr::from_bytes(b"\xff")),
+                WalV8ProgressMode::Cursor,
+                true,
+            )
+            .is_err()
+        );
+
+        Ok(())
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn target8_diagnostics_distinguish_eligible_mixed_and_hit_phases() -> Result<()> {
+        use crate::wal::v8::parallel::WalV8ReadyPrefix;
+
+        assert_eq!(
+            WalV8CoalesceTargetPolicy::Disabled.policy_name(),
+            "disabled"
+        );
+        assert_eq!(WalV8CoalesceTargetPolicy::Always(8).policy_name(), "always");
+        assert_eq!(
+            WalV8CoalesceTargetPolicy::PointOnly(8).policy_name(),
+            "point_only"
+        );
+
+        let make_snapshot = |ready: usize, has_batch: bool| WalV8FrontierReadySnapshot {
+            ready_prefix: WalV8ReadyPrefix::Cursor {
+                ticket_count: ready,
+                tail: None,
+                data_bytes: 0,
+            },
+            admitted_ticket_count: 16,
+            has_outstanding_batch_tickets: has_batch,
+            closed: false,
+            frames_ready_prefix_count: ready,
+            data_complete_prefix_count: ready,
+            reserved_preparation_bytes: 0,
+            next_not_ready: None,
+            data_hol_blocker: None,
+            snapshot_monotonic_ns: None,
+        };
+
+        // Initial hit on Point-only cycle.
+        let mut initial_hit = make_snapshot(8, false);
+        let outcome = WalV8ParallelIo::coalesce_ready_prefix_with(
+            &mut initial_hit,
+            Duration::from_millis(50),
+            WalV8CoalesceTargetPolicy::PointOnly(8),
+            |_, _| unreachable!(),
+        )?;
+        assert!(outcome.eligible_cycle);
+        assert!(!outcome.mixed_fallback_cycle);
+        assert!(outcome.target_hit);
+        assert!(!outcome.waited);
+
+        // After-wake hit on Point-only cycle.
+        let mut after_wake_hit = make_snapshot(4, false);
+        let outcome = WalV8ParallelIo::coalesce_ready_prefix_with(
+            &mut after_wake_hit,
+            Duration::from_millis(50),
+            WalV8CoalesceTargetPolicy::PointOnly(8),
+            |_, snapshot| {
+                snapshot.ready_prefix = WalV8ReadyPrefix::Cursor {
+                    ticket_count: 8,
+                    tail: None,
+                    data_bytes: 0,
+                };
+                Ok(true)
+            },
+        )?;
+        assert!(outcome.eligible_cycle);
+        assert!(!outcome.mixed_fallback_cycle);
+        assert!(outcome.target_hit);
+        assert!(outcome.waited);
+
+        // Mixed fallback cycle (unready Batch in window).
+        let mut mixed = make_snapshot(8, true);
+        let outcome = WalV8ParallelIo::coalesce_ready_prefix_with(
+            &mut mixed,
+            Duration::from_millis(50),
+            WalV8CoalesceTargetPolicy::PointOnly(8),
+            |_, snapshot| {
+                snapshot.ready_prefix = WalV8ReadyPrefix::Cursor {
+                    ticket_count: 9,
+                    tail: None,
+                    data_bytes: 0,
+                };
+                Ok(false)
+            },
+        )?;
+        assert!(!outcome.eligible_cycle);
+        assert!(outcome.mixed_fallback_cycle);
+        assert!(!outcome.target_hit);
+        assert!(outcome.waited);
+
+        Ok(())
     }
 }
