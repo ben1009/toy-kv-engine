@@ -3338,14 +3338,16 @@ impl Drop for WalV8DurabilityDriver {
         }
         drop(state);
         #[cfg(test)]
-        if let Some(hook) = self
-            .coordinator
-            .inner
-            .driver_drop_hook_for_test
-            .lock()
-            .take()
         {
-            hook();
+            let hook = self
+                .coordinator
+                .inner
+                .driver_drop_hook_for_test
+                .lock()
+                .take();
+            if let Some(hook) = hook {
+                hook();
+            }
         }
     }
 }

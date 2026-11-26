@@ -9,15 +9,16 @@
 
 ## 1. 40-Run Counterbalanced A/B Results (5 Pairs per Workload)
 
-| Workload | Baseline Median | Candidate Median | Paired Median Delta | Wins (C vs B) |
+| Workload | Baseline Median | Candidate Median | Paired Median Delta (ops/s · CPU/put · p99) | Wins (C vs B: ops/s · CPU · p99) |
 | --- | ---: | ---: | ---: | ---: |
-| **Point1** (20k puts, 1t) | 8,128.0 puts/s · 52.28 μs/put · 0.541 ms p99 | 8,211.8 puts/s · 52.61 μs/put · 0.626 ms p99 | +0.54% ops/s · +0.71% CPU/put | 3/5 ops/s · 1/5 CPU |
-| **Point8** (100k puts, 8t) | 33,605.6 puts/s · 47.58 μs/put · 0.846 ms p99 | 34,001.8 puts/s · 47.11 μs/put · 0.828 ms p99 | +1.18% ops/s · -0.93% CPU/put | 3/5 ops/s · 3/5 CPU |
-| **Point16** (100k puts, 16t) | 49,100.8 puts/s · 74.75 μs/put · 1.048 ms p99 | **49,642.0 puts/s** · **70.92 μs/put** · **0.948 ms p99** | **+1.86% ops/s · -5.78% CPU/put** | **5/5 ops/s · 5/5 CPU** |
-| **Batch64/w16** (100k puts, 16t) | 627,235.3 puts/s · 4.88 μs/put · 2.337 ms p99 | 629,128.6 puts/s · 4.77 μs/put · 2.440 ms p99 | +0.30% ops/s · -2.12% CPU/put | 4/5 ops/s · 3/5 CPU |
+| **Point1** (20k puts, 1t) | 8,128.0 puts/s · 52.28 μs/put · 0.541 ms p99 | 8,211.8 puts/s · 52.61 μs/put · 0.626 ms p99 | +0.54% · +0.71% · +16.61% | 3/5 · 1/5 · 2/5 |
+| **Point8** (100k puts, 8t) | 33,605.6 puts/s · 47.58 μs/put · 0.846 ms p99 | 34,001.8 puts/s · 47.11 μs/put · 0.828 ms p99 | +1.18% · -0.93% · +5.81% | 3/5 · 3/5 · 2/5 |
+| **Point16** (100k puts, 16t) | 49,100.8 puts/s · 74.75 μs/put · 1.048 ms p99 | **49,642.0 puts/s** · **70.92 μs/put** · **0.948 ms p99** | **+1.86% · -5.78% · +0.47%** | **5/5 · 5/5 · 2/5** |
+| **Batch64/w16** (100k puts, 16t) | 627,235.3 puts/s · 4.88 μs/put · 2.337 ms p99 | 629,128.6 puts/s · 4.77 μs/put · 2.440 ms p99 | +0.30% · -2.12% · +8.86% | 4/5 · 3/5 · 2/5 |
 
-- At **Point16**, Candidate won **5/5** pairs on both throughput (**+1.86%**) and CPU/Put (**-5.78%**, `74.75 μs` → `70.92 μs`), while reducing sampled p99 median from `1.048 ms` to `0.948 ms`.
-- **Batch64/w16** had no regression (+0.30% ops/s, -2.12% CPU/put).
+- At **Point16**, Candidate won **5/5** pairs on both throughput (**+1.86%**) and CPU/Put (**-5.78%**, `74.75 μs` → `70.92 μs`), while sampled p99 median improved from `1.048 ms` to `0.948 ms` (`+0.47%` paired median due to two high tail outliers in pairs 4–5: `1.261` and `1.661 ms` vs `0.919–0.948 ms` in pairs 1–3).
+- At **Point1** and **Batch64/w16**, sampled p99 paired medians were `+16.61%` (`2/5` wins; baseline ranged `0.458–0.928 ms` vs candidate `0.551–0.639 ms`) and `+8.86%` (`2/5` wins; `1.657–3.083 ms` vs `1.781–4.836 ms`), reflecting run-to-run sampled tail variance rather than a consistent directional shift (`2/5` wins across all four workloads).
+- **Batch64/w16** throughput and CPU/Put had no regression (+0.30% ops/s, -2.12% CPU/put).
 
 ## 2. Point16 Diagnostic Comparison (`--wal-v8-durability-sample-every 64`, 100k puts)
 
