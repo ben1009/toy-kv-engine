@@ -28,7 +28,6 @@ use crossbeam_queue::ArrayQueue;
 use parking_lot::{Condvar, Mutex};
 
 use super::{BUFFER_POOL_BUF_SIZE, DirectBuf, MAX_WAL_FILE_SIZE, RING_SIZE, WAL_FD_INDEX};
-#[cfg(feature = "bench")]
 use crate::wal::v8::parallel::WalV8WorkerCompletionHandle;
 
 /// Benchmark-only observations shared by the WAL worker and sync coordinator.
@@ -1175,17 +1174,16 @@ pub(crate) struct GroupWriteResult {
 /// The I/O worker publishes it to a bounded queue without waiting for the
 /// durability driver; the driver remains responsible for validating and
 /// applying the result.
-#[cfg(feature = "bench")]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DirectGroupWriteCompletion {
     pub(crate) result: GroupWriteResult,
+    #[cfg(feature = "bench")]
     pub(crate) completion_observed_at: Option<Instant>,
 }
 
 #[derive(Clone)]
 enum WorkerCompletionSender {
     Relay(Sender<GroupWriteResult>),
-    #[cfg(feature = "bench")]
     CursorDirect {
         sender: Sender<DirectGroupWriteCompletion>,
         handle: WalV8WorkerCompletionHandle,
@@ -1201,24 +1199,12 @@ struct WorkerCompletionConfig {
 }
 
 impl WorkerCompletionSender {
-    #[cfg(feature = "bench")]
     fn supports_completion_timeline(&self) -> bool {
         !matches!(self, Self::CursorDirect { .. })
     }
 
-    #[cfg(not(feature = "bench"))]
-    fn supports_completion_timeline(&self) -> bool {
-        true
-    }
-
-    #[cfg(feature = "bench")]
     fn fail_stop_after_delivery_error(&self) -> bool {
         matches!(self, Self::CursorDirect { .. })
-    }
-
-    #[cfg(not(feature = "bench"))]
-    fn fail_stop_after_delivery_error(&self) -> bool {
-        false
     }
 
     fn send(&self, result: GroupWriteResult) -> Result<()> {
@@ -1226,7 +1212,6 @@ impl WorkerCompletionSender {
             Self::Relay(sender) => sender
                 .send(result)
                 .map_err(|error| anyhow!("WAL worker completion receiver stopped: {error}")),
-            #[cfg(feature = "bench")]
             Self::CursorDirect { sender, handle } => {
                 if let Some(error) = &result.error {
                     bail!("WAL DATA worker reported terminal failure: {error}");
@@ -1236,6 +1221,7 @@ impl WorkerCompletionSender {
 
                 let event = DirectGroupWriteCompletion {
                     result,
+                    #[cfg(feature = "bench")]
                     completion_observed_at: handle.capture_data_completion_time(),
                 };
                 sender.try_send(event).map_err(|error| {
@@ -1255,22 +1241,18 @@ impl WorkerCompletionSender {
             Self::Relay(sender) => {
                 let _ = sender.send(result);
             }
-            #[cfg(feature = "bench")]
             Self::CursorDirect { .. } => {}
         }
     }
 
-    #[cfg(feature = "bench")]
     fn failure_handle(&self) -> Option<WalV8WorkerCompletionHandle> {
         match self {
             Self::Relay(_) => None,
-            #[cfg(feature = "bench")]
             Self::CursorDirect { handle, .. } => Some(handle.clone()),
         }
     }
 }
 
-#[cfg(feature = "bench")]
 struct WorkerCompletionExitGuard {
     slots: Arc<GroupSlots>,
     failure_handle: Option<WalV8WorkerCompletionHandle>,
@@ -1281,7 +1263,6 @@ struct WorkerCompletionExitGuard {
     failure_reported: bool,
 }
 
-#[cfg(feature = "bench")]
 impl WorkerCompletionExitGuard {
     fn new(
         slots: Arc<GroupSlots>,
@@ -1306,7 +1287,6 @@ impl WorkerCompletionExitGuard {
     }
 }
 
-#[cfg(feature = "bench")]
 impl Drop for WorkerCompletionExitGuard {
     fn drop(&mut self) {
         if self.completed || self.failure_handle.is_none() {
@@ -2424,7 +2404,6 @@ impl<B: WorkerBuffer> IoWorker<B> {
         )
     }
 
-    #[cfg(feature = "bench")]
     pub(crate) fn spawn_cursor_direct_completions(
         wal_file: Arc<File>,
         buffer_pool: Arc<ArrayQueue<B>>,
@@ -2451,7 +2430,7 @@ impl<B: WorkerBuffer> IoWorker<B> {
         )
     }
 
-    #[cfg(all(test, feature = "bench"))]
+    #[cfg(test)]
     pub(crate) fn spawn_cursor_direct_completions_with_group_limit(
         wal_file: Arc<File>,
         buffer_pool: Arc<ArrayQueue<B>>,
@@ -2503,18 +2482,14 @@ impl<B: WorkerBuffer> IoWorker<B> {
         let worker_file = Arc::clone(&wal_file);
         let wake = Arc::new(WorkerWake::new().context("failed to create WAL worker wakeup")?);
         let worker_wake = Arc::clone(&wake);
-        #[cfg(feature = "bench")]
         let failure_slots = Arc::clone(&slots);
-        #[cfg(feature = "bench")]
         let worker_failure_handle = completion_sender.failure_handle();
         let join = thread::Builder::new()
             .name("wal-io-worker".to_owned())
             .spawn(move || {
-                #[cfg(feature = "bench")]
                 let completion_sender_keepalive = worker_failure_handle
                     .as_ref()
                     .map(|_| completion_sender.clone());
-                #[cfg(feature = "bench")]
                 let mut exit_guard = WorkerCompletionExitGuard::new(
                     failure_slots,
                     worker_failure_handle.clone(),
@@ -2585,7 +2560,6 @@ impl<B: WorkerBuffer> IoWorker<B> {
                     async_write_min_bytes,
                     allow_out_of_order_groups,
                 );
-                #[cfg(feature = "bench")]
                 match &result {
                     Ok(()) => exit_guard.complete(),
                     Err(_) => {
@@ -3425,24 +3399,18 @@ mod tests {
 
     #[cfg(feature = "bench")]
     use super::SyncProgressSnapshot;
-    #[cfg(feature = "bench")]
-    use super::WorkerCompletionExitGuard;
-    #[cfg(feature = "bench")]
-    use super::process_worker_events;
     use super::{
         DIRECT_IO_ALIGNMENT, DirectBuf, GroupId, GroupPermit, GroupSlots, GroupWriteResult,
         IoWorker, MAX_INFLIGHT_GROUPS, RequestId, SlotState, WalSyncProgress, WorkerCommand,
-        WorkerCompletionSender, WorkerCore, WorkerError, WorkerEvent, WorkerWake, WriteBuffer,
-        WriteGroup, WriteGroupBuffers, close_group_admission, enqueue_group_command,
-        fail_shutdown_reply, flush_staged_writes, process_completions, retry_interrupted,
-        wait_for_worker_progress,
+        WorkerCompletionExitGuard, WorkerCompletionSender, WorkerCore, WorkerError, WorkerEvent,
+        WorkerWake, WriteBuffer, WriteGroup, WriteGroupBuffers, close_group_admission,
+        enqueue_group_command, fail_shutdown_reply, flush_staged_writes, process_completions,
+        process_worker_events, retry_interrupted, wait_for_worker_progress,
     };
-    #[cfg(feature = "bench")]
     use crossbeam_channel::bounded;
     use crossbeam_queue::ArrayQueue;
     use parking_lot::{Condvar, Mutex};
 
-    #[cfg(feature = "bench")]
     fn cursor_completion_coordinator() -> anyhow::Result<(
         crate::wal::v8::parallel::WalV8ParallelCoordinator,
         crossbeam_channel::Receiver<()>,
@@ -3485,7 +3453,6 @@ mod tests {
         Ok((coordinator, progress_tokens))
     }
 
-    #[cfg(feature = "bench")]
     fn direct_completion_result(group_id: u64, ticket: u64) -> GroupWriteResult {
         GroupWriteResult {
             group_id,
@@ -3496,7 +3463,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "bench")]
     fn process_one_direct_completion(
         completion_sender: &WorkerCompletionSender,
         slots: &Arc<GroupSlots>,
@@ -3527,7 +3493,6 @@ mod tests {
         )
     }
 
-    #[cfg(feature = "bench")]
     fn finish_failed_direct_worker(
         coordinator: &crate::wal::v8::parallel::WalV8ParallelCoordinator,
         slots: &Arc<GroupSlots>,
@@ -5034,12 +4999,10 @@ mod tests {
         assert!(worker.join.is_none());
     }
 
-    #[cfg(feature = "bench")]
     fn direct_completion_slots() -> Arc<GroupSlots> {
         Arc::new(GroupSlots::new())
     }
 
-    #[cfg(feature = "bench")]
     fn assert_delivery_failure_cleanup(
         coordinator: &crate::wal::v8::parallel::WalV8ParallelCoordinator,
         slots: Arc<GroupSlots>,
@@ -5071,7 +5034,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "bench")]
     #[test]
     fn cursor_direct_completion_queue_overflow_cleans_up_and_poisons() -> anyhow::Result<()> {
         let (coordinator, progress_tokens) = cursor_completion_coordinator()?;
@@ -5104,7 +5066,6 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(feature = "bench")]
     #[test]
     fn cursor_direct_completion_enqueues_once_and_signals_progress() -> anyhow::Result<()> {
         let (coordinator, progress_tokens) = cursor_completion_coordinator()?;
@@ -5131,7 +5092,6 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(feature = "bench")]
     #[test]
     fn cursor_direct_completion_disconnect_cleans_up_and_poisons() -> anyhow::Result<()> {
         let (coordinator, _progress_tokens) = cursor_completion_coordinator()?;
@@ -5157,7 +5117,6 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(feature = "bench")]
     #[test]
     fn cursor_direct_worker_failure_publishes_poison_before_queue_disconnect() -> anyhow::Result<()>
     {
@@ -5194,7 +5153,6 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(feature = "bench")]
     #[test]
     fn cursor_direct_completion_notification_failure_poison_after_enqueue() -> anyhow::Result<()> {
         let (coordinator, progress_tokens) = cursor_completion_coordinator()?;
@@ -5228,7 +5186,6 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(feature = "bench")]
     #[test]
     fn cursor_direct_worker_exit_wakes_waiters_and_clean_shutdown_stays_open() -> anyhow::Result<()>
     {

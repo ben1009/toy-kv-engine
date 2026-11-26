@@ -40439,7 +40439,7 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(all(target_os = "linux", feature = "bench"))]
+    #[cfg(target_os = "linux")]
     #[test]
     fn v8_cursor_direct_completion_mode_is_inherited_across_engine_rotation_and_recovery()
     -> anyhow::Result<()> {
@@ -40493,6 +40493,7 @@ mod tests {
 
             let first_memtable = engine.inner.state.load().memtable.clone();
             assert!(first_memtable.uses_v8_wal());
+            #[cfg(feature = "bench")]
             assert!(
                 first_memtable
                     .benchmark_wal_io_diagnostics()
@@ -40509,6 +40510,7 @@ mod tests {
             let second_memtable = engine.inner.state.load().memtable.clone();
             assert!(second_memtable.uses_v8_wal());
             assert!(!Arc::ptr_eq(&first_memtable, &second_memtable));
+            #[cfg(feature = "bench")]
             assert!(
                 second_memtable
                     .benchmark_wal_io_diagnostics()
@@ -40529,6 +40531,7 @@ mod tests {
             options.pitr_repository = Some(repository);
             let reopened =
                 KvEngine::open_with_wal_io_mode(&database, options, WalIoMode::Parallel)?;
+            #[cfg(feature = "bench")]
             assert!(
                 reopened
                     .inner
