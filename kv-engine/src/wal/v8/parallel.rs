@@ -10,7 +10,7 @@ use std::{
     ops::Range,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -145,8 +145,14 @@ impl WalV8WorkerCompletionHandle {
     }
 }
 
+const COORDINATOR_FLAG_POISONED: u8 = 1 << 0;
+const COORDINATOR_FLAG_CLOSED: u8 = 1 << 1;
+
 struct CoordinatorInner {
     state: Mutex<CoordinatorState>,
+    /// Monotonic lifecycle bits (`POISONED | CLOSED`) mirrored on transition so
+    /// lock-free preflight and health checks avoid acquiring `state`.
+    lifecycle_flags: AtomicU8,
     changed: Condvar,
     /// Preparation and admission changes cannot make a durability waiter
     /// useful. Subscribe frontier formation to DATA/prefix progress instead.
@@ -1238,6 +1244,7 @@ impl WalV8ParallelCoordinator {
                 changed: Condvar::new(),
                 durability_changed: Condvar::new(),
                 durable_published: Condvar::new(),
+                lifecycle_flags: AtomicU8::new(0),
                 admitted_ticket_end: AtomicU64::new(config.next_ticket),
                 #[cfg(feature = "bench")]
                 data_completion_timestamps_enabled: std::sync::atomic::AtomicBool::new(false),
@@ -2900,6 +2907,9 @@ impl WalV8ParallelCoordinator {
 
         if !state.closed {
             state.closed = true;
+            self.inner
+                .lifecycle_flags
+                .fetch_or(COORDINATOR_FLAG_CLOSED, Ordering::Release);
             signal_change(&self.inner, &mut state);
             signal_durability_progress(&self.inner, &mut state);
             #[cfg(feature = "bench")]
@@ -2918,11 +2928,11 @@ impl WalV8ParallelCoordinator {
     }
 
     pub(crate) fn is_poisoned(&self) -> bool {
-        self.inner.state.lock().poisoned
+        (self.inner.lifecycle_flags.load(Ordering::Acquire) & COORDINATOR_FLAG_POISONED) != 0
     }
 
     pub(crate) fn is_closed(&self) -> bool {
-        self.inner.state.lock().closed
+        (self.inner.lifecycle_flags.load(Ordering::Acquire) & COORDINATOR_FLAG_CLOSED) != 0
     }
 
     #[cfg(feature = "bench")]
@@ -3251,6 +3261,21 @@ impl WalV8ParallelCoordinator {
             bytes <= self.inner.max_inflight_bytes,
             "v8 preparation index exceeds the configured byte window"
         );
+        if bytes == 0 {
+            let flags = self.inner.lifecycle_flags.load(Ordering::Acquire);
+            ensure!(
+                (flags & COORDINATOR_FLAG_POISONED) == 0,
+                "v8 Parallel coordinator is poisoned"
+            );
+            ensure!(
+                (flags & COORDINATOR_FLAG_CLOSED) == 0,
+                "v8 Parallel coordinator is closed"
+            );
+            return Ok(WalV8PreparationReservation {
+                coordinator: self.clone(),
+                bytes: 0,
+            });
+        }
         let mut state = self.inner.state.lock();
         ensure!(!state.poisoned, "v8 Parallel coordinator is poisoned");
         ensure!(!state.closed, "v8 Parallel coordinator is closed");
@@ -4176,6 +4201,9 @@ fn try_signal_progress_token(inner: &CoordinatorInner) -> Result<()> {
 fn poison_locked(inner: &CoordinatorInner, state: &mut CoordinatorState) {
     if !state.poisoned {
         state.poisoned = true;
+        inner
+            .lifecycle_flags
+            .fetch_or(COORDINATOR_FLAG_POISONED, Ordering::Release);
         if let Some(ring) = &inner.progress_ring {
             ring.poisoned.store(true, Ordering::Release);
         }
