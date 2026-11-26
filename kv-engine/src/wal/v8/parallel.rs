@@ -506,6 +506,14 @@ struct CoordinatorState {
     last_durability_notify_waiters: u64,
     #[cfg(feature = "bench")]
     durable_publish_sample_timestamps: BTreeMap<u64, Instant>,
+    #[cfg(any(test, feature = "bench"))]
+    publish_notify_all_count: u64,
+    #[cfg(any(test, feature = "bench"))]
+    publish_notify_skipped_count: u64,
+    #[cfg(any(test, feature = "bench"))]
+    driver_drop_notify_all_count: u64,
+    #[cfg(any(test, feature = "bench"))]
+    driver_drop_notify_one_count: u64,
 }
 
 #[cfg(feature = "bench")]
@@ -1216,6 +1224,14 @@ impl WalV8ParallelCoordinator {
                     last_durability_notify_waiters: 0,
                     #[cfg(feature = "bench")]
                     durable_publish_sample_timestamps: BTreeMap::new(),
+                    #[cfg(any(test, feature = "bench"))]
+                    publish_notify_all_count: 0,
+                    #[cfg(any(test, feature = "bench"))]
+                    publish_notify_skipped_count: 0,
+                    #[cfg(any(test, feature = "bench"))]
+                    driver_drop_notify_all_count: 0,
+                    #[cfg(any(test, feature = "bench"))]
+                    driver_drop_notify_one_count: 0,
                 }),
                 changed: Condvar::new(),
                 durability_changed: Condvar::new(),
@@ -2731,10 +2747,19 @@ impl WalV8ParallelCoordinator {
         if state.durability_driver_waiters > 0
             && state.min_waiting_ticket_end <= state.durable_ticket_end
         {
+            #[cfg(any(test, feature = "bench"))]
+            {
+                state.publish_notify_all_count += 1;
+            }
             #[cfg(feature = "bench")]
-            record_durable_notification_for_waiters(&mut state);
+            record_durable_notification_for_waiters(&self.inner, &mut state, false);
             state.min_waiting_ticket_end = u64::MAX;
             self.inner.durable_published.notify_all();
+        } else if state.durability_driver_waiters > 0 {
+            #[cfg(any(test, feature = "bench"))]
+            {
+                state.publish_notify_skipped_count += 1;
+            }
         }
         #[cfg(feature = "bench")]
         let notify_all_wall_ns = notify_started
@@ -2861,7 +2886,8 @@ impl WalV8ParallelCoordinator {
             signal_change(&self.inner, &mut state);
             signal_durability_progress(&self.inner, &mut state);
             #[cfg(feature = "bench")]
-            record_durable_notification_for_waiters(&mut state);
+            record_durable_notification_for_waiters(&self.inner, &mut state, false);
+            state.min_waiting_ticket_end = u64::MAX;
             self.inner.durable_published.notify_all();
         }
         drop(state);
@@ -3261,13 +3287,21 @@ impl Drop for WalV8DurabilityDriver {
             || (state.durability_driver_waiters > 0
                 && state.min_waiting_ticket_end <= state.durable_ticket_end)
         {
+            #[cfg(any(test, feature = "bench"))]
+            if state.durability_driver_waiters > 0 {
+                state.driver_drop_notify_all_count += 1;
+            }
             #[cfg(feature = "bench")]
-            record_durable_notification_for_waiters(&mut state);
+            record_durable_notification_for_waiters(&self.coordinator.inner, &mut state, false);
             state.min_waiting_ticket_end = u64::MAX;
             self.coordinator.inner.durable_published.notify_all();
         } else if state.durability_driver_waiters > 0 {
+            #[cfg(any(test, feature = "bench"))]
+            {
+                state.driver_drop_notify_one_count += 1;
+            }
             #[cfg(feature = "bench")]
-            record_durable_notification_for_waiters(&mut state);
+            record_durable_notification_for_waiters(&self.coordinator.inner, &mut state, true);
             self.coordinator.inner.durable_published.notify_one();
         }
     }
@@ -4043,10 +4077,24 @@ fn signal_durability_progress(inner: &CoordinatorInner, state: &mut CoordinatorS
 }
 
 #[cfg(feature = "bench")]
-fn record_durable_notification_for_waiters(state: &mut CoordinatorState) {
-    if state.durability_driver_waiters > 0 {
+fn record_durable_notification_for_waiters(
+    inner: &CoordinatorInner,
+    state: &mut CoordinatorState,
+    notify_one: bool,
+) {
+    if state.durability_driver_waiters > 0
+        && inner
+            .profile
+            .load()
+            .as_ref()
+            .is_some_and(|profile| profile.wal_v8_durability_sample_every() > 0)
+    {
         state.last_durability_notify_at = Some(Instant::now());
-        state.last_durability_notify_waiters = state.durability_driver_waiters;
+        state.last_durability_notify_waiters = if notify_one {
+            1
+        } else {
+            state.durability_driver_waiters
+        };
     }
 }
 
@@ -4090,7 +4138,7 @@ fn poison_locked(inner: &CoordinatorInner, state: &mut CoordinatorState) {
         signal_change(inner, state);
         signal_durability_progress(inner, state);
         #[cfg(feature = "bench")]
-        record_durable_notification_for_waiters(state);
+        record_durable_notification_for_waiters(inner, state, false);
         state.min_waiting_ticket_end = u64::MAX;
         inner.durable_published.notify_all();
     }
@@ -6782,6 +6830,257 @@ mod tests {
             coordinator.inner.state.lock().min_waiting_ticket_end,
             u64::MAX
         );
+
+        Ok(())
+    }
+
+    fn wakeup_counts(coordinator: &WalV8ParallelCoordinator) -> (u64, u64, u64, u64) {
+        let state = coordinator.inner.state.lock();
+        (
+            state.publish_notify_all_count,
+            state.publish_notify_skipped_count,
+            state.driver_drop_notify_all_count,
+            state.driver_drop_notify_one_count,
+        )
+    }
+
+    fn wait_for_waiter_count(coordinator: &WalV8ParallelCoordinator, expected: u64) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while coordinator.inner.state.lock().durability_driver_waiters < expected {
+            assert!(Instant::now() < deadline, "followers did not park in time");
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn publish_skips_wakeup_when_no_follower_is_covered() -> Result<()> {
+        let coordinator = coordinator(8)?;
+        let mut first_encoded = admit(&batch(10), &coordinator)?.encode()?;
+        let mut second_encoded = admit(&batch(20), &coordinator)?.encode()?;
+        mark_producer_ready(&mut first_encoded, &coordinator, true)?;
+        mark_producer_ready(&mut second_encoded, &coordinator, true)?;
+
+        let mut driver1 = coordinator
+            .acquire_durability_driver(1)?
+            .context("missing first driver")?;
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let coord_f = coordinator.clone();
+        let follower = std::thread::spawn(move || {
+            let res = (|| -> Result<()> {
+                if let Some(mut d) = coord_f.acquire_durability_driver(2)? {
+                    if coord_f.durable_ticket_end() < 2 {
+                        let f = coord_f.reserve_frontier(2)?;
+                        coord_f.publish_durable_frontier(f)?;
+                    }
+                    d.complete();
+                }
+                Ok(())
+            })();
+            let _ = tx.send(res);
+        });
+        wait_for_waiter_count(&coordinator, 1);
+
+        let f1 = coordinator.reserve_frontier(1)?;
+        coordinator.publish_durable_frontier(f1)?;
+        first_encoded.disarm_after_durable();
+
+        // Publish covered only ticket 1 while follower waits for 2: no wakeup should fire.
+        assert_eq!(wakeup_counts(&coordinator), (0, 1, 0, 0));
+        assert_eq!(coordinator.inner.state.lock().durability_driver_waiters, 1);
+
+        driver1.complete();
+        drop(driver1);
+
+        rx.recv_timeout(Duration::from_secs(2))??;
+        follower.join().expect("follower panicked");
+        second_encoded.disarm_after_durable();
+        assert_eq!(wakeup_counts(&coordinator), (0, 1, 0, 1));
+        assert_eq!(coordinator.durable_ticket_end(), 2);
+
+        Ok(())
+    }
+
+    #[test]
+    fn partial_publish_wakes_covered_follower_and_reregisters_uncovered_min_bound() -> Result<()> {
+        let coordinator = coordinator(8)?;
+        let mut e1 = admit(&batch(10), &coordinator)?.encode()?;
+        mark_producer_ready(&mut e1, &coordinator, true)?;
+
+        let mut driver1 = coordinator
+            .acquire_durability_driver(1)?
+            .context("missing first driver")?;
+        // Reserve f1 before admitting e2/e3 so f1's preceding_ticket_end is 1,
+        // allowing a later partial frontier for ticket 2 before ticket 3.
+        let f1 = coordinator.reserve_frontier(1)?;
+
+        let mut e2 = admit(&batch(20), &coordinator)?.encode()?;
+        let mut e3 = admit(&batch(30), &coordinator)?.encode()?;
+        mark_producer_ready(&mut e2, &coordinator, true)?;
+        mark_producer_ready(&mut e3, &coordinator, true)?;
+
+        // Follower A waits for ticket 1 (covered by round 1).
+        let (tx_a, rx_a) = std::sync::mpsc::channel();
+        let coord_a = coordinator.clone();
+        let fa = std::thread::spawn(move || {
+            let res = coord_a.acquire_durability_driver(1).map(|d| d.is_none());
+            let _ = tx_a.send(res);
+        });
+
+        // Follower B waits for ticket 3 (uncovered by round 1 and round 2).
+        let (tx_b, rx_b) = std::sync::mpsc::channel();
+        let coord_b = coordinator.clone();
+        let fb = std::thread::spawn(move || {
+            let res = (|| -> Result<()> {
+                if let Some(mut d) = coord_b.acquire_durability_driver(3)? {
+                    if coord_b.durable_ticket_end() < 3 {
+                        let f = coord_b.reserve_frontier(3)?;
+                        coord_b.publish_durable_frontier(f)?;
+                    }
+                    d.complete();
+                }
+                Ok(())
+            })();
+            let _ = tx_b.send(res);
+        });
+
+        wait_for_waiter_count(&coordinator, 2);
+
+        // Round 1: publish ticket 1 while driver1 stays active -> wakes A (returns immediately) and
+        // B (re-parks and re-registers min_waiting_ticket_end = 3).
+        coordinator.publish_durable_frontier(f1)?;
+        e1.disarm_after_durable();
+        assert!(
+            rx_a.recv_timeout(Duration::from_secs(2))??,
+            "covered follower A must return while driver1 is still active"
+        );
+        fa.join().expect("follower A panicked");
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while coordinator.inner.state.lock().min_waiting_ticket_end != 3 {
+            assert!(
+                Instant::now() < deadline,
+                "follower B did not re-register min_waiting_ticket_end=3"
+            );
+            std::thread::yield_now();
+        }
+
+        // Round 2: publish ticket 2 -> min_waiting_ticket_end (3) > 2, so publish skips wakeup.
+        let f2 = coordinator.reserve_frontier(2)?;
+        coordinator.publish_durable_frontier(f2)?;
+        e2.disarm_after_durable();
+        assert_eq!(wakeup_counts(&coordinator), (1, 1, 0, 0));
+
+        // Drop driver1 -> notify_one wakes B to finish ticket 3.
+        driver1.complete();
+        drop(driver1);
+        rx_b.recv_timeout(Duration::from_secs(2))??;
+        fb.join().expect("follower B panicked");
+        e3.disarm_after_durable();
+        assert_eq!(wakeup_counts(&coordinator), (1, 1, 0, 1));
+        assert_eq!(coordinator.durable_ticket_end(), 3);
+
+        Ok(())
+    }
+
+    #[test]
+    fn new_caller_preempting_driver_after_notify_one_does_not_strand_follower() -> Result<()> {
+        let coordinator = coordinator(8)?;
+        let mut e1 = admit(&batch(10), &coordinator)?.encode()?;
+        let mut e2 = admit(&batch(20), &coordinator)?.encode()?;
+        mark_producer_ready(&mut e1, &coordinator, true)?;
+        mark_producer_ready(&mut e2, &coordinator, true)?;
+
+        let mut driver1 = coordinator
+            .acquire_durability_driver(1)?
+            .context("missing first driver")?;
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let coord_f = coordinator.clone();
+        let follower = std::thread::spawn(move || {
+            let res = (|| -> Result<()> {
+                if let Some(mut d) = coord_f.acquire_durability_driver(2)? {
+                    if coord_f.durable_ticket_end() < 2 {
+                        let f = coord_f.reserve_frontier(2)?;
+                        coord_f.publish_durable_frontier(f)?;
+                    }
+                    d.complete();
+                }
+                Ok(())
+            })();
+            let _ = tx.send(res);
+        });
+        wait_for_waiter_count(&coordinator, 1);
+
+        let f1 = coordinator.reserve_frontier(1)?;
+        coordinator.publish_durable_frontier(f1)?;
+        e1.disarm_after_durable();
+
+        // Hold state lock briefly across driver1 teardown so a new caller can preempt
+        // driver ownership right after notify_one() fires.
+        driver1.complete();
+        {
+            let mut state = coordinator.inner.state.lock();
+            state.durability_driver_active = false;
+            state.driver_drop_notify_one_count += 1;
+            coordinator.inner.durable_published.notify_one();
+            std::mem::forget(driver1);
+            // Preempt driver ownership before releasing state lock.
+            state.durability_driver_active = true;
+        }
+
+        let mut preempt_driver = WalV8DurabilityDriver {
+            coordinator: coordinator.clone(),
+            completed: false,
+            completion_batch: Some(Vec::new()),
+        };
+        let f2 = coordinator.reserve_frontier(2)?;
+        coordinator.publish_durable_frontier(f2)?;
+        e2.disarm_after_durable();
+        preempt_driver.complete();
+        drop(preempt_driver);
+
+        rx.recv_timeout(Duration::from_secs(2))??;
+        follower.join().expect("follower panicked");
+        assert_eq!(coordinator.durable_ticket_end(), 2);
+
+        Ok(())
+    }
+
+    #[test]
+    fn multiple_parked_followers_all_exit_when_coordinator_is_poisoned() -> Result<()> {
+        let coordinator = coordinator(8)?;
+        let _e1 = admit(&batch(10), &coordinator)?.encode()?;
+        let driver = coordinator
+            .acquire_durability_driver(1)?
+            .context("missing driver")?;
+
+        let mut receivers = Vec::new();
+        let mut handles = Vec::new();
+        for _ in 0..3 {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let coord = coordinator.clone();
+            handles.push(std::thread::spawn(move || {
+                let err = coord
+                    .acquire_durability_driver(1)
+                    .map(|d| d.is_some())
+                    .expect_err("poisoned coordinator must reject all parked followers");
+                let _ = tx.send(err.to_string());
+            }));
+            receivers.push(rx);
+        }
+        wait_for_waiter_count(&coordinator, 3);
+
+        drop(driver);
+        for rx in receivers {
+            let msg = rx.recv_timeout(Duration::from_secs(2))?;
+            assert!(msg.contains("poisoned"), "unexpected error: {msg}");
+        }
+        for handle in handles {
+            handle.join().expect("follower panicked");
+        }
+        assert_eq!(wakeup_counts(&coordinator), (0, 0, 1, 0));
+        assert!(coordinator.is_poisoned());
 
         Ok(())
     }
