@@ -19,7 +19,7 @@
 
 ## 2. High-Level Point16 CPU Budget
 
-- **Unprofiled Point16 median CPU/Put** (40-run A/B): `74.75 μs` (baseline `20d83e81`) → **`70.92 μs`** (candidate `30c9092d`, `-5.78%`).
+- **Unprofiled Point16 median CPU/Put** (40-run A/B): `74.75 μs` (baseline `20d83e81`) → **`70.92 μs`** (candidate `30c9092d`, `-5.12%` by arm medians; `-5.78%` paired median across the 5 counterbalanced pairs).
 - **Diagnostic Point16 total CPU/Put** (`--wal-v8-durability-sample-every 64`): `79.23 μs` (baseline, `11,943` syncs) → **`73.33 μs`** (candidate, `11,961` syncs).
 - **Target**: `<= 60.00 μs/put` (`~10.9 μs/put` remaining gap from `70.92 μs`).
 
@@ -44,6 +44,7 @@ Inclusive vs. exclusive relationships are marked explicitly so sub-phases are no
 | **FRONTIER Prep (`preparation_cpu_ns`)** | Exclusive | 0.910 | **0.961** | Extent check, reservation, frame encode + digest |
 | **Coordinator Publish (`coordinator_publish_cpu_ns`)** | Exclusive | 0.608 | **0.611** | `publish_durable_frontier_sampled()` |
 | **fdatasync (`fdatasync_cpu_ns`)** | Exclusive | 0.440 | **0.408** | Syscall CPU only |
+| **Unattributed Driver Remainder** | Residual | 1.187 | **0.947** | `driver_cpu_ns` minus measured driver sub-phases (`advance_and_snapshot_after_wake`, `frontier.lock()`, `mark_durable`, loop/sampling overhead) |
 
 ## 4. Post-WAL / MVCC & Digest Signals
 
