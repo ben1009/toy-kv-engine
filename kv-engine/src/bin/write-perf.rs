@@ -1457,6 +1457,10 @@ struct WalV8DurabilityDiagnosticsRunRecord {
     completed_advances: u64,
     sampled_advances: u64,
     dropped_samples: u64,
+    publish_notify_all_count: u64,
+    publish_notify_skipped_count: u64,
+    driver_drop_notify_all_count: u64,
+    driver_drop_notify_one_count: u64,
     phases: Vec<WalV8DurabilityPhaseRecord>,
     follower_wait_dropped_samples: u64,
     follower_waits: Vec<WalV8FollowerWaitRecord>,
@@ -2404,6 +2408,10 @@ fn wal_pipeline_record(
             completed_advances: counts.completed_advances,
             sampled_advances: counts.sampled_advances,
             dropped_samples: counts.dropped_samples,
+            publish_notify_all_count: counts.publish_notify_all_count,
+            publish_notify_skipped_count: counts.publish_notify_skipped_count,
+            driver_drop_notify_all_count: counts.driver_drop_notify_all_count,
+            driver_drop_notify_one_count: counts.driver_drop_notify_one_count,
             phases: engine
                 .wal_v8_durability_phase_observations()
                 .into_iter()

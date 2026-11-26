@@ -184,6 +184,8 @@ struct CoordinatorInner {
     progress_token_attempts: AtomicU64,
     #[cfg(feature = "bench")]
     progress_token_accepts: AtomicU64,
+    #[cfg(test)]
+    driver_drop_hook_for_test: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -506,13 +508,13 @@ struct CoordinatorState {
     last_durability_notify_waiters: u64,
     #[cfg(feature = "bench")]
     durable_publish_sample_timestamps: BTreeMap<u64, Instant>,
-    #[cfg(any(test, feature = "bench"))]
+    #[cfg(test)]
     publish_notify_all_count: u64,
-    #[cfg(any(test, feature = "bench"))]
+    #[cfg(test)]
     publish_notify_skipped_count: u64,
-    #[cfg(any(test, feature = "bench"))]
+    #[cfg(test)]
     driver_drop_notify_all_count: u64,
-    #[cfg(any(test, feature = "bench"))]
+    #[cfg(test)]
     driver_drop_notify_one_count: u64,
 }
 
@@ -1224,13 +1226,13 @@ impl WalV8ParallelCoordinator {
                     last_durability_notify_waiters: 0,
                     #[cfg(feature = "bench")]
                     durable_publish_sample_timestamps: BTreeMap::new(),
-                    #[cfg(any(test, feature = "bench"))]
+                    #[cfg(test)]
                     publish_notify_all_count: 0,
-                    #[cfg(any(test, feature = "bench"))]
+                    #[cfg(test)]
                     publish_notify_skipped_count: 0,
-                    #[cfg(any(test, feature = "bench"))]
+                    #[cfg(test)]
                     driver_drop_notify_all_count: 0,
-                    #[cfg(any(test, feature = "bench"))]
+                    #[cfg(test)]
                     driver_drop_notify_one_count: 0,
                 }),
                 changed: Condvar::new(),
@@ -1259,6 +1261,8 @@ impl WalV8ParallelCoordinator {
                 progress_token_attempts: AtomicU64::new(0),
                 #[cfg(feature = "bench")]
                 progress_token_accepts: AtomicU64::new(0),
+                #[cfg(test)]
+                driver_drop_hook_for_test: Mutex::new(None),
             }),
         })
     }
@@ -2747,18 +2751,31 @@ impl WalV8ParallelCoordinator {
         if state.durability_driver_waiters > 0
             && state.min_waiting_ticket_end <= state.durable_ticket_end
         {
-            #[cfg(any(test, feature = "bench"))]
+            #[cfg(test)]
             {
                 state.publish_notify_all_count += 1;
             }
             #[cfg(feature = "bench")]
-            record_durable_notification_for_waiters(&self.inner, &mut state, false);
+            {
+                if let Some(profile) = self.inner.profile.load().as_ref()
+                    && profile.wal_v8_durability_sample_every() > 0
+                {
+                    profile.record_wal_v8_publish_notify_all();
+                }
+                record_durable_notification_for_waiters(&self.inner, &mut state, false);
+            }
             state.min_waiting_ticket_end = u64::MAX;
             self.inner.durable_published.notify_all();
         } else if state.durability_driver_waiters > 0 {
-            #[cfg(any(test, feature = "bench"))]
+            #[cfg(test)]
             {
                 state.publish_notify_skipped_count += 1;
+            }
+            #[cfg(feature = "bench")]
+            if let Some(profile) = self.inner.profile.load().as_ref()
+                && profile.wal_v8_durability_sample_every() > 0
+            {
+                profile.record_wal_v8_publish_notify_skipped();
             }
         }
         #[cfg(feature = "bench")]
@@ -3287,22 +3304,48 @@ impl Drop for WalV8DurabilityDriver {
             || (state.durability_driver_waiters > 0
                 && state.min_waiting_ticket_end <= state.durable_ticket_end)
         {
-            #[cfg(any(test, feature = "bench"))]
+            #[cfg(test)]
             if state.durability_driver_waiters > 0 {
                 state.driver_drop_notify_all_count += 1;
             }
             #[cfg(feature = "bench")]
-            record_durable_notification_for_waiters(&self.coordinator.inner, &mut state, false);
+            {
+                if state.durability_driver_waiters > 0
+                    && let Some(profile) = self.coordinator.inner.profile.load().as_ref()
+                    && profile.wal_v8_durability_sample_every() > 0
+                {
+                    profile.record_wal_v8_driver_drop_notify_all();
+                }
+                record_durable_notification_for_waiters(&self.coordinator.inner, &mut state, false);
+            }
             state.min_waiting_ticket_end = u64::MAX;
             self.coordinator.inner.durable_published.notify_all();
         } else if state.durability_driver_waiters > 0 {
-            #[cfg(any(test, feature = "bench"))]
+            #[cfg(test)]
             {
                 state.driver_drop_notify_one_count += 1;
             }
             #[cfg(feature = "bench")]
-            record_durable_notification_for_waiters(&self.coordinator.inner, &mut state, true);
+            {
+                if let Some(profile) = self.coordinator.inner.profile.load().as_ref()
+                    && profile.wal_v8_durability_sample_every() > 0
+                {
+                    profile.record_wal_v8_driver_drop_notify_one();
+                }
+                record_durable_notification_for_waiters(&self.coordinator.inner, &mut state, true);
+            }
             self.coordinator.inner.durable_published.notify_one();
+        }
+        drop(state);
+        #[cfg(test)]
+        if let Some(hook) = self
+            .coordinator
+            .inner
+            .driver_drop_hook_for_test
+            .lock()
+            .take()
+        {
+            hook();
         }
     }
 }
@@ -7016,33 +7059,39 @@ mod tests {
         coordinator.publish_durable_frontier(f1)?;
         e1.disarm_after_durable();
 
-        // Hold state lock briefly across driver1 teardown so a new caller can preempt
-        // driver ownership right after notify_one() fires.
-        driver1.complete();
-        {
-            let mut state = coordinator.inner.state.lock();
-            state.durability_driver_active = false;
-            state.driver_drop_notify_one_count += 1;
-            coordinator.inner.durable_published.notify_one();
-            std::mem::forget(driver1);
-            // Preempt driver ownership before releasing state lock.
-            state.durability_driver_active = true;
-        }
+        // Install a real driver-drop hook that attempts to preempt driver ownership
+        // immediately after driver1's Drop releases the coordinator lock and notifies one.
+        let coord_preempt = coordinator.clone();
+        let preempt_ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let preempt_ran_hook = Arc::clone(&preempt_ran);
+        *coordinator.inner.driver_drop_hook_for_test.lock() = Some(Arc::new(move || {
+            preempt_ran_hook.store(true, Ordering::Release);
+            if let Some(mut preempt_driver) = coord_preempt
+                .acquire_durability_driver(2)
+                .expect("preempting caller must not fail")
+            {
+                if coord_preempt.durable_ticket_end() < 2 {
+                    let f2 = coord_preempt
+                        .reserve_frontier(2)
+                        .expect("reserve preempt frontier");
+                    coord_preempt
+                        .publish_durable_frontier(f2)
+                        .expect("publish preempt frontier");
+                }
+                preempt_driver.complete();
+                drop(preempt_driver);
+            }
+        }));
 
-        let mut preempt_driver = WalV8DurabilityDriver {
-            coordinator: coordinator.clone(),
-            completed: false,
-            completion_batch: Some(Vec::new()),
-        };
-        let f2 = coordinator.reserve_frontier(2)?;
-        coordinator.publish_durable_frontier(f2)?;
-        e2.disarm_after_durable();
-        preempt_driver.complete();
-        drop(preempt_driver);
+        driver1.complete();
+        drop(driver1);
+        assert!(preempt_ran.load(Ordering::Acquire));
 
         rx.recv_timeout(Duration::from_secs(2))??;
         follower.join().expect("follower panicked");
+        e2.disarm_after_durable();
         assert_eq!(coordinator.durable_ticket_end(), 2);
+        assert_eq!(coordinator.inner.state.lock().durability_driver_waiters, 0);
 
         Ok(())
     }
