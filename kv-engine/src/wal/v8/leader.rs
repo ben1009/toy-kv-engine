@@ -6903,8 +6903,6 @@ impl WalV8ParallelWriter {
         let result = self.drive_frontier_through(ticket_end, &mut driver);
         if result.is_ok() {
             driver.complete();
-        } else {
-            self.coordinator.poison();
         }
 
         result
@@ -6917,13 +6915,6 @@ impl WalV8ParallelWriter {
     ) -> Result<()> {
         let progress_ring_enabled = self.coordinator.progress_ring_enabled();
         loop {
-            if self.coordinator.is_poisoned() {
-                anyhow::bail!("v8 Parallel WAL is poisoned");
-            }
-            if self.coordinator.durable_ticket_end() >= ticket_end {
-                return Ok(());
-            }
-
             #[cfg(feature = "bench")]
             let profile = self.profile.load_full();
             #[cfg(feature = "bench")]
@@ -6949,9 +6940,6 @@ impl WalV8ParallelWriter {
             let frontier_lock_wait_ns = frontier_lock_wait_started
                 .map(|started| started.elapsed().as_nanos().min(u64::MAX as u128) as u64)
                 .unwrap_or_default();
-            if self.coordinator.durable_ticket_end() >= ticket_end {
-                return Ok(());
-            }
 
             #[cfg(feature = "bench")]
             let diagnostics_enabled = profile
@@ -6984,6 +6972,12 @@ impl WalV8ParallelWriter {
             } else {
                 self.coordinator.frontier_ready_snapshot()
             };
+            if snapshot.poisoned {
+                anyhow::bail!("v8 Parallel WAL is poisoned");
+            }
+            if snapshot.durable_ticket_end >= ticket_end {
+                return Ok(());
+            }
             #[cfg(feature = "bench")]
             let has_ready_prefix = !snapshot.ready_prefix.is_empty();
             #[cfg(feature = "bench")]
@@ -7145,7 +7139,7 @@ impl WalV8ParallelWriter {
                 continue;
             }
 
-            let first_ticket = self.coordinator.durable_ticket_end();
+            let first_ticket = snapshot.durable_ticket_end;
             let frontier_ticket_end = first_ticket
                 .checked_add(u64::try_from(ready.len())?)
                 .context("v8 Parallel frontier ticket end overflows")?;
@@ -9235,6 +9229,8 @@ mod tests {
                 tail: None,
                 data_bytes: 0,
             },
+            durable_ticket_end: 0,
+            poisoned: false,
             admitted_ticket_count: admitted,
             has_outstanding_batch_tickets: false,
             closed: false,
@@ -13803,6 +13799,8 @@ mod tests {
         };
         let make_snapshot = |ready: usize, has_batch: bool| WalV8FrontierReadySnapshot {
             ready_prefix: make_prefix(ready),
+            durable_ticket_end: 0,
+            poisoned: false,
             admitted_ticket_count: 16,
             has_outstanding_batch_tickets: has_batch,
             closed: false,
@@ -14461,6 +14459,8 @@ mod tests {
                 tail: None,
                 data_bytes: 0,
             },
+            durable_ticket_end: 0,
+            poisoned: false,
             admitted_ticket_count: 16,
             has_outstanding_batch_tickets: has_batch,
             closed: false,

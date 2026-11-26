@@ -844,6 +844,8 @@ impl WalV8ReadyPrefix {
 /// and readiness details only when a diagnostic timestamp is requested.
 pub(crate) struct WalV8FrontierReadySnapshot {
     pub(crate) ready_prefix: WalV8ReadyPrefix,
+    pub(crate) durable_ticket_end: u64,
+    pub(crate) poisoned: bool,
     pub(crate) admitted_ticket_count: usize,
     pub(crate) has_outstanding_batch_tickets: bool,
     pub(crate) closed: bool,
@@ -3581,6 +3583,8 @@ fn ticket_is_frontier_ready(inner: &CoordinatorInner, ticket: &TicketState) -> R
 fn empty_frontier_ready_snapshot() -> WalV8FrontierReadySnapshot {
     WalV8FrontierReadySnapshot {
         ready_prefix: WalV8ReadyPrefix::Tickets(Vec::new()),
+        durable_ticket_end: 0,
+        poisoned: false,
         admitted_ticket_count: 0,
         has_outstanding_batch_tickets: false,
         closed: false,
@@ -3635,6 +3639,8 @@ fn frontier_ready_snapshot_locked(
     #[cfg(not(feature = "bench"))]
     let _ = capture_monotonic_ns;
     let mut snapshot = empty_frontier_ready_snapshot();
+    snapshot.durable_ticket_end = state.durable_ticket_end;
+    snapshot.poisoned = state.poisoned;
     snapshot.closed = state.closed;
     if state.poisoned {
         return Ok(snapshot);
@@ -3751,6 +3757,8 @@ fn cursor_frontier_snapshot_locked(
         })
     };
     let mut snapshot = empty_frontier_ready_snapshot();
+    snapshot.durable_ticket_end = state.durable_ticket_end;
+    snapshot.poisoned = state.poisoned;
     snapshot.ready_prefix = WalV8ReadyPrefix::Cursor {
         ticket_count,
         tail,
