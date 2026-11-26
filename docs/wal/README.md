@@ -164,6 +164,7 @@ qualification or defaults.
 
 ## Benchmarks and qualification
 
+- [Issue #570 Point16 CPU attribution breakdown (from retained GCP archive), 2026-11-26](benchmarks/issue-570-v8-point16-cpu-attribution-20261126.md)
 - [Issue #570 V8 Point lock-merge + ACK wakeup cumulative GCP A/B, 2026-11-26](benchmarks/issue-570-v8-point-lock-merge-ack-gcp-20261126.md)
 - [RFC 028 V8 D2 Candidate Target8 80-run qualification on GCP, 2026-11-26](benchmarks/rfc-028-v8-d2-qualification-gcp-20261126.md)
 - [RFC 028 V8 equal-throughput paced latency verification on GCP, 2026-11-26](benchmarks/rfc-028-v8-equal-throughput-gcp-20261126.md)
