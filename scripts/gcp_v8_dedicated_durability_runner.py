@@ -385,8 +385,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--ssd-count", type=int, required=True)
     parser.add_argument("--ssd-gib", type=int, required=True)
     parser.add_argument("--runner-bundle-sha256", required=True)
-    args = parser.parse_args(argv)
-    return run_suite(args)
+    parser.parse_args(argv)
+    parser.error(
+        "D3 dedicated durability/independent ACK qualification is a retired historical experiment; "
+        "archived results remain verifiable but cannot be executed"
+    )
 
 
 if __name__ == "__main__":

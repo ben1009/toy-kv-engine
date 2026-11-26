@@ -1270,19 +1270,19 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     suite_group.add_argument("--v8-cursor-direct-completion-ab", action="store_true",
                              help="Compare Cursor relay and direct completion with Point/Batch guardrails")
     suite_group.add_argument("--v8-cursor-direct-completion-wake-ab", action="store_true",
-                             help="Compare Token and Select wake modes with Cursor Direct Completion")
+                             help="Retired historical suite; archived results are verifiable but cannot be rerun")
     suite_group.add_argument("--v8-cursor-singleton-submission-ab", action="store_true",
-                             help="Compare allocation-free singleton DATA submission with Point/Batch guardrails")
+                             help="Retired historical suite; archived results are verifiable but cannot be rerun")
     suite_group.add_argument("--v8-cursor-coalescing-budget-ab", action="store_true",
-                             help="Compare Cursor Direct Point Dynamic, 100, and 400 μs coalescing budgets")
+                             help="Retired historical suite; archived results are verifiable but cannot be rerun")
     suite_group.add_argument("--v8-cursor-coalescing-ready-target-ab", action="store_true",
-                             help="Compare Dynamic, Target8, and Target12 for Point1/8/16 and Batch64")
+                             help="Retired historical suite; use the V7/V8 final Target4/8 comparison instead")
     suite_group.add_argument("--v8-cursor-coalescing-ready-target-scan-ab", action="store_true",
-                             help="Scan Dynamic, Target4, Target6, and Target8 for Point8/16")
+                             help="Retired historical suite; archived results are verifiable but cannot be rerun")
     suite_group.add_argument("--v8-cursor-coalescing-ready-target-small-scan-ab", action="store_true",
-                             help="Scan Dynamic and Target1–4 for Point8/16")
+                             help="Retired historical suite; archived results are verifiable but cannot be rerun")
     suite_group.add_argument("--v8-cursor-publication-ab", action="store_true",
-                             help="Requalify D2a admission publication with a two-arm, 40-run Point/Batch matrix")
+                             help="Retired historical suite; archived results are verifiable but cannot be rerun")
     suite_group.add_argument("--v8-extent-policy-storage-ab", action="store_true",
                              help="Compare V8 BTreeMap and Vec extent-policy storage with Point/Batch guardrails")
     suite_group.add_argument("--v7-v8-point-preallocation-ab", action="store_true",
@@ -1294,11 +1294,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     suite_group.add_argument("--v8-point-resource-retirement-stage-a-ab", action="store_true",
                              help="Retired historical suite; kept only to provide an explanatory error")
     suite_group.add_argument("--v8-point-ack-d1-ab", action="store_true",
-                             help="Compare D1 Coordinator ACK checks with Stage A enabled and retirement mode 0")
+                             help="Retired historical suite; archived results are verifiable but cannot be rerun")
     suite_group.add_argument(
         "--v8-independent-ack-ab", "--v8-dedicated-durability-driver-ab",
         dest="v8_dedicated_durability_driver_ab", action="store_true",
-        help="Compare legacy ACK, CallerDriven independent ACK, and Dedicated independent ACK (60 score runs)",
+        help="Retired historical suite; archived results are verifiable but cannot be rerun",
     )
     parser.add_argument("--baseline-commit", help="Full source commit used as the source A/B baseline")
     parser.add_argument("--source-patch-sha256",
@@ -1332,11 +1332,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Use a manually verified SSH source CIDR when the HTTPS lookup cannot verify that route",
     )
     args = parser.parse_args(argv)
-    if args.v8_point_resource_retirement_ab or args.v8_point_resource_retirement_stage_a_ab:
-        parser.error(
-            "Point resource-retirement suites are retired historical experiments; "
-            "their archived results remain verifiable but cannot be executed"
-        )
     point_cursor_direct_completion_suite = args.v8_cursor_direct_completion_ab
     point_cursor_direct_completion_wake_suite = args.v8_cursor_direct_completion_wake_ab
     point_cursor_singleton_submission_suite = args.v8_cursor_singleton_submission_ab
@@ -3724,7 +3719,37 @@ def provision_and_run(
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = parse_args(sys.argv[1:] if argv is None else argv)
+    raw_argv = sys.argv[1:] if argv is None else argv
+    retired_live_suites = (
+        ("v8_cursor_direct_completion_wake_ab", "--v8-cursor-direct-completion-wake-ab"),
+        ("v8_cursor_singleton_submission_ab", "--v8-cursor-singleton-submission-ab"),
+        ("v8_cursor_coalescing_budget_ab", "--v8-cursor-coalescing-budget-ab"),
+        ("v8_cursor_coalescing_ready_target_ab", "--v8-cursor-coalescing-ready-target-ab"),
+        ("v8_cursor_coalescing_ready_target_scan_ab", "--v8-cursor-coalescing-ready-target-scan-ab"),
+        ("v8_cursor_coalescing_ready_target_small_scan_ab", "--v8-cursor-coalescing-ready-target-small-scan-ab"),
+        ("v8_cursor_publication_ab", "--v8-cursor-publication-ab"),
+        ("v8_point_resource_retirement_ab", "--v8-point-resource-retirement-ab"),
+        ("v8_point_resource_retirement_stage_a_ab", "--v8-point-resource-retirement-stage-a-ab"),
+        ("v8_point_ack_d1_ab", "--v8-point-ack-d1-ab"),
+        ("v8_dedicated_durability_driver_ab", "--v8-independent-ack-ab"),
+    )
+    for _, option in retired_live_suites:
+        if option in raw_argv:
+            print(
+                f"{option} is a retired historical experiment; "
+                "archived results remain verifiable but cannot be executed",
+                file=sys.stderr,
+            )
+            return 2
+    args = parse_args(raw_argv)
+    for attribute, option in retired_live_suites:
+        if getattr(args, attribute):
+            print(
+                f"{option} is a retired historical experiment; "
+                "archived results remain verifiable but cannot be executed",
+                file=sys.stderr,
+            )
+            return 2
     point_cursor_direct_completion_suite = args.v8_cursor_direct_completion_ab
     point_cursor_direct_completion_wake_suite = args.v8_cursor_direct_completion_wake_ab
     point_cursor_singleton_submission_suite = args.v8_cursor_singleton_submission_ab

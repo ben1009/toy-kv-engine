@@ -1657,15 +1657,44 @@ class PointProgressRingQualificationTests(unittest.TestCase):
         ]
         for flag in ("--v8-point-resource-retirement-ab", "--v8-point-resource-retirement-stage-a-ab"):
             stderr = StringIO()
-            with self.subTest(flag=flag), redirect_stderr(stderr), self.assertRaises(SystemExit) as raised:
-                BENCH.parse_args([*base_args, flag])
-            self.assertEqual(raised.exception.code, 2)
-            self.assertIn("retired historical experiments", stderr.getvalue())
+            with self.subTest(flag=flag), redirect_stderr(stderr):
+                status = BENCH.main([*base_args, flag])
+            self.assertEqual(status, 2)
+            self.assertIn("retired historical experiment", stderr.getvalue())
+
+    def test_all_retired_suite_flags_stop_before_gcp_preflight(self) -> None:
+        base_args = [
+            "--commit", "a" * 40, "--project", "test-project", "--zone", "us-central1-a",
+            "--network", "isolated-bench", "--subnet", "isolated-subnet",
+            "--ssh-source-range", "192.0.2.1/32", "--machine-type", "c4-standard-16-lssd",
+            "--max-runtime-minutes", "60", "--estimated-hourly-cost-usd", "0.01",
+            "--max-estimated-spend-usd", "1", "--preflight-only",
+        ]
+        retired_flags = (
+            "--v8-cursor-direct-completion-wake-ab",
+            "--v8-cursor-singleton-submission-ab",
+            "--v8-cursor-coalescing-budget-ab",
+            "--v8-cursor-coalescing-ready-target-ab",
+            "--v8-cursor-coalescing-ready-target-scan-ab",
+            "--v8-cursor-coalescing-ready-target-small-scan-ab",
+            "--v8-cursor-publication-ab",
+            "--v8-point-resource-retirement-ab",
+            "--v8-point-resource-retirement-stage-a-ab",
+            "--v8-point-ack-d1-ab",
+            "--v8-independent-ack-ab",
+        )
+        with patch.object(BENCH, "Gcloud", side_effect=AssertionError("cloud preflight must not run")):
+            for flag in retired_flags:
+                stderr = StringIO()
+                with self.subTest(flag=flag), redirect_stderr(stderr):
+                    status = BENCH.main([*base_args, flag])
+                self.assertEqual(status, 2)
+                self.assertIn("retired historical experiment", stderr.getvalue())
 
         runner_args = [
-            "--binary", "/tmp/write-perf",
-            "--results-dir", "/tmp/results",
-            "--db-root", "/tmp/db",
+            "--binary", "scripts/missing-write-perf",
+            "--results-dir", "results-not-created",
+            "--db-root", "db-not-created",
             "--writers", "8,16",
             "--safe-deadline-epoch", "4102444800",
             "--commit", "a" * 40,
@@ -1674,21 +1703,75 @@ class PointProgressRingQualificationTests(unittest.TestCase):
             "--ssd-count", "2",
             "--ssd-gib", "750",
         ]
-        for candidate_mode in ("point-resource-retirement", "point-resource-retirement-stage-a"):
-            stderr = StringIO()
-            with (
-                self.subTest(candidate_mode=candidate_mode),
-                redirect_stderr(stderr),
-                self.assertRaises(SystemExit) as raised,
-            ):
-                progress_ring_runner.parse_args([
-                    *runner_args, "--candidate-mode", candidate_mode,
-                ])
+        retired_modes = (
+            "completion-wake", "singleton-submission", "cursor-publication", "coalescing-budget",
+            "coalescing-ready-target", "coalescing-ready-target-scan",
+            "coalescing-ready-target-small-scan", "point-resource-retirement",
+            "point-resource-retirement-stage-a",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            results_dir = Path(temporary) / "results"
+            db_root = Path(temporary) / "db"
+            runner_args[runner_args.index("results-not-created")] = str(results_dir)
+            runner_args[runner_args.index("db-not-created")] = str(db_root)
+            for candidate_mode in retired_modes:
+                stderr = StringIO()
+                with self.subTest(candidate_mode=candidate_mode), redirect_stderr(stderr):
+                    status = progress_ring_runner.main([
+                        *runner_args, "--candidate-mode", candidate_mode,
+                    ])
+                self.assertEqual(status, 2)
+                self.assertIn("retired historical experiment", stderr.getvalue())
+                self.assertFalse(results_dir.exists())
+                self.assertFalse(db_root.exists())
+
+    def test_retired_ack_and_driver_runners_stop_before_writing_results(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            results_dir = root / "results"
+            db_root = root / "db"
+            d1_args = [
+                "--baseline-binary", str(root / "missing-baseline"),
+                "--candidate-binary", str(root / "missing-candidate"),
+                "--results-dir", str(results_dir), "--db-root", str(db_root),
+                "--writers", "8,16", "--safe-deadline-epoch", "4102444800",
+                "--baseline-commit", "a" * 40, "--candidate-commit", "b" * 40,
+                "--source-patch-sha256", "c" * 64, "--baseline-binary-sha256", "d" * 64,
+                "--candidate-binary-sha256", "e" * 64, "--machine-type", "c4-standard-16-lssd",
+                "--ssd-count", "2", "--ssd-gib", "750",
+            ]
+            with redirect_stderr(StringIO()):
+                self.assertEqual(ack_d1_runner.main(d1_args), 2)
+            self.assertFalse(results_dir.exists())
+
+            d3_args = [
+                "--binary", str(root / "missing-binary"), "--binary-sha256", "f" * 64,
+                "--commit", "a" * 40, "--results-dir", str(results_dir), "--db-root", str(db_root),
+                "--writers", "8,16", "--safe-deadline-epoch", "4102444800",
+                "--machine-type", "c4-standard-16-lssd", "--ssd-count", "2", "--ssd-gib", "750",
+                "--runner-bundle-sha256", "1" * 64,
+            ]
+            with redirect_stderr(StringIO()), self.assertRaises(SystemExit) as raised:
+                dedicated_durability_runner.main(d3_args)
             self.assertEqual(raised.exception.code, 2)
+            self.assertFalse(results_dir.exists())
 
     def test_remote_runner_rejects_retired_point_resource_retirement_suite(self) -> None:
         remote_script = Path(__file__).with_name("gcp-free-trial-wal-bench-remote.sh")
-        for suite in ("v8-point-resource-retirement", "v8-point-resource-retirement-stage-a"):
+        retired_suites = (
+            "v8-cursor-direct-completion-wake",
+            "v8-cursor-singleton-submission",
+            "v8-cursor-coalescing-budget",
+            "v8-cursor-coalescing-ready-target",
+            "v8-cursor-coalescing-ready-target-scan",
+            "v8-cursor-coalescing-ready-target-small-scan",
+            "v8-cursor-publication",
+            "v8-point-resource-retirement",
+            "v8-point-resource-retirement-stage-a",
+            "v8-point-ack-d1",
+            "v8-dedicated-durability-driver",
+        )
+        for suite in retired_suites:
             with self.subTest(suite=suite):
                 completed = subprocess.run(
                     [
@@ -2187,55 +2270,41 @@ class PointProgressRingQualificationTests(unittest.TestCase):
         with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
             BENCH.parse_args([*valid, "--num", "100001"])
 
-    def test_ready_target_small_scan_preflight_records_the_fixed_plan(self) -> None:
+    def test_ready_target_small_scan_preflight_is_rejected_before_cloud_checks(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             results = Path(temporary) / "preflight"
-            with (
-                patch.object(BENCH, "Gcloud", return_value=Mock()),
-                patch.object(BENCH, "preflight", return_value={"zone": "us-east1-b"}),
-                patch.object(BENCH, "audit_ssh_firewall_rules"),
-            ):
-                status = BENCH.main([
-                    "--project", "test-project", "--zone", "us-east1-b", "--commit", "a" * 40,
-                    "--network", "walbench-isolated", "--subnet", "walbench-subnet",
-                    "--ssh-source-range", "192.0.2.10/32", "--skip-ssh-egress-check",
-                    "--max-runtime-minutes", "60", "--estimated-hourly-cost-usd", "1.5",
-                    "--max-estimated-spend-usd", "2", "--v8-cursor-coalescing-ready-target-small-scan-ab",
-                    "--preflight-only", "--results-dir", str(results),
-                ])
-            self.assertEqual(status, 0)
-            report = json.loads((results / "preflight.json").read_text(encoding="utf-8"))
-            self.assertEqual(report["benchmark_suite"], "v8-cursor-coalescing-ready-target-small-scan")
-            self.assertEqual(report["writer_counts"], [8, 16])
-            self.assertEqual(report["benchmark_plan"]["runs_planned"], 50)
-            self.assertEqual(
-                report["benchmark_plan"]["arms"], list(CURSOR_COALESCING_READY_TARGET_SMALL_SCAN_ARMS),
-            )
+            stderr = StringIO()
+            with patch.object(BENCH, "Gcloud", side_effect=AssertionError("cloud preflight must not run")):
+                with redirect_stderr(stderr):
+                    status = BENCH.main([
+                        "--project", "test-project", "--zone", "us-east1-b", "--commit", "a" * 40,
+                        "--network", "walbench-isolated", "--subnet", "walbench-subnet",
+                        "--ssh-source-range", "192.0.2.10/32", "--skip-ssh-egress-check",
+                        "--max-runtime-minutes", "60", "--estimated-hourly-cost-usd", "1.5",
+                        "--max-estimated-spend-usd", "2", "--v8-cursor-coalescing-ready-target-small-scan-ab",
+                        "--preflight-only", "--results-dir", str(results),
+                    ])
+            self.assertEqual(status, 2)
+            self.assertIn("retired historical experiment", stderr.getvalue())
+            self.assertFalse(results.exists())
 
-    def test_ready_target_scan_preflight_records_the_fixed_plan(self) -> None:
+    def test_ready_target_scan_preflight_is_rejected_before_cloud_checks(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             results = Path(temporary) / "preflight"
-            with (
-                patch.object(BENCH, "Gcloud", return_value=Mock()),
-                patch.object(BENCH, "preflight", return_value={"zone": "us-east1-b"}),
-                patch.object(BENCH, "audit_ssh_firewall_rules"),
-            ):
-                status = BENCH.main([
-                    "--project", "test-project", "--zone", "us-east1-b", "--commit", "a" * 40,
-                    "--network", "walbench-isolated", "--subnet", "walbench-subnet",
-                    "--ssh-source-range", "192.0.2.10/32", "--skip-ssh-egress-check",
-                    "--max-runtime-minutes", "60", "--estimated-hourly-cost-usd", "1.5",
-                    "--max-estimated-spend-usd", "2", "--v8-cursor-coalescing-ready-target-scan-ab",
-                    "--preflight-only", "--results-dir", str(results),
-                ])
-            self.assertEqual(status, 0)
-            report = json.loads((results / "preflight.json").read_text(encoding="utf-8"))
-            self.assertEqual(report["benchmark_suite"], "v8-cursor-coalescing-ready-target-scan")
-            self.assertEqual(report["writer_counts"], [8, 16])
-            self.assertEqual(report["benchmark_plan"]["runs_planned"], 40)
-            self.assertEqual(
-                report["benchmark_plan"]["arms"], list(CURSOR_COALESCING_READY_TARGET_SCAN_ARMS),
-            )
+            stderr = StringIO()
+            with patch.object(BENCH, "Gcloud", side_effect=AssertionError("cloud preflight must not run")):
+                with redirect_stderr(stderr):
+                    status = BENCH.main([
+                        "--project", "test-project", "--zone", "us-east1-b", "--commit", "a" * 40,
+                        "--network", "walbench-isolated", "--subnet", "walbench-subnet",
+                        "--ssh-source-range", "192.0.2.10/32", "--skip-ssh-egress-check",
+                        "--max-runtime-minutes", "60", "--estimated-hourly-cost-usd", "1.5",
+                        "--max-estimated-spend-usd", "2", "--v8-cursor-coalescing-ready-target-scan-ab",
+                        "--preflight-only", "--results-dir", str(results),
+                    ])
+            self.assertEqual(status, 2)
+            self.assertIn("retired historical experiment", stderr.getvalue())
+            self.assertFalse(results.exists())
 
     def test_remote_runner_accepts_direct_completion_suite_only_for_fixed_matrix(self) -> None:
         remote_script = Path(__file__).with_name("gcp-free-trial-wal-bench-remote.sh")
@@ -2257,85 +2326,61 @@ class PointProgressRingQualificationTests(unittest.TestCase):
         self.assertEqual(rejected.returncode, 64)
         self.assertIn("requires c4-standard-16-lssd, writers 1,8,16", rejected.stderr)
 
-    def test_remote_runner_accepts_singleton_submission_suite_only_for_fixed_matrix(self) -> None:
+    def test_remote_runner_rejects_retired_singleton_submission_suite(self) -> None:
         remote_script = Path(__file__).with_name("gcp-free-trial-wal-bench-remote.sh")
         command = [
             "bash", str(remote_script), "a" * 40, "100000", "test-project", "us-central1-a",
             "wal-test", "4102444800", "c4-standard-16-lssd", "1,8,16",
             "v8-cursor-singleton-submission", "-", "-",
         ]
-        accepted = subprocess.run(
+        rejected = subprocess.run(
             command, cwd=Path(__file__).resolve().parents[1], capture_output=True,
             check=False, text=True, timeout=5,
-            env={**os.environ, "TOYKV_GCP_BENCH_VALIDATE_ONLY": "1"},
-        )
-        self.assertNotEqual(accepted.returncode, 64, accepted.stderr)
-        rejected = subprocess.run(
-            [*command[:9], "16", *command[10:]], cwd=Path(__file__).resolve().parents[1],
-            capture_output=True, check=False, text=True, timeout=5,
         )
         self.assertEqual(rejected.returncode, 64)
-        self.assertIn("requires c4-standard-16-lssd, writers 1,8,16", rejected.stderr)
+        self.assertIn("retired historical benchmark suite", rejected.stderr)
 
-    def test_remote_runner_accepts_ready_target_suite_only_for_fixed_matrix(self) -> None:
+    def test_remote_runner_rejects_retired_ready_target_suite(self) -> None:
         remote_script = Path(__file__).with_name("gcp-free-trial-wal-bench-remote.sh")
         command = [
             "bash", str(remote_script), "a" * 40, "100000", "test-project", "us-central1-a",
             "wal-test", "4102444800", "c4-standard-16-lssd", "1,8,16",
             "v8-cursor-coalescing-ready-target", "-", "-",
         ]
-        accepted = subprocess.run(
+        rejected = subprocess.run(
             command, cwd=Path(__file__).resolve().parents[1], capture_output=True,
             check=False, text=True, timeout=5,
-            env={**os.environ, "TOYKV_GCP_BENCH_VALIDATE_ONLY": "1"},
-        )
-        self.assertNotEqual(accepted.returncode, 64, accepted.stderr)
-        rejected = subprocess.run(
-            [*command[:9], "16", *command[10:]], cwd=Path(__file__).resolve().parents[1],
-            capture_output=True, check=False, text=True, timeout=5,
         )
         self.assertEqual(rejected.returncode, 64)
-        self.assertIn("requires c4-standard-16-lssd, writers 1,8,16", rejected.stderr)
+        self.assertIn("retired historical benchmark suite", rejected.stderr)
 
-    def test_remote_runner_accepts_ready_target_scan_only_for_fixed_matrix(self) -> None:
+    def test_remote_runner_rejects_retired_ready_target_scan_suite(self) -> None:
         remote_script = Path(__file__).with_name("gcp-free-trial-wal-bench-remote.sh")
         command = [
             "bash", str(remote_script), "a" * 40, "100000", "test-project", "us-central1-a",
             "wal-test", "4102444800", "c4-standard-16-lssd", "8,16",
             "v8-cursor-coalescing-ready-target-scan", "-", "-",
         ]
-        accepted = subprocess.run(
+        rejected = subprocess.run(
             command, cwd=Path(__file__).resolve().parents[1], capture_output=True,
             check=False, text=True, timeout=5,
-            env={**os.environ, "TOYKV_GCP_BENCH_VALIDATE_ONLY": "1"},
-        )
-        self.assertNotEqual(accepted.returncode, 64, accepted.stderr)
-        rejected = subprocess.run(
-            [*command[:9], "16", *command[10:]], cwd=Path(__file__).resolve().parents[1],
-            capture_output=True, check=False, text=True, timeout=5,
         )
         self.assertEqual(rejected.returncode, 64)
-        self.assertIn("writers 8,16", rejected.stderr)
+        self.assertIn("retired historical benchmark suite", rejected.stderr)
 
-    def test_remote_runner_accepts_small_ready_target_scan_only_for_fixed_matrix(self) -> None:
+    def test_remote_runner_rejects_retired_small_ready_target_scan_suite(self) -> None:
         remote_script = Path(__file__).with_name("gcp-free-trial-wal-bench-remote.sh")
         command = [
             "bash", str(remote_script), "a" * 40, "100000", "test-project", "us-central1-a",
             "wal-test", "4102444800", "c4-standard-16-lssd", "8,16",
             "v8-cursor-coalescing-ready-target-small-scan", "-", "-",
         ]
-        accepted = subprocess.run(
+        rejected = subprocess.run(
             command, cwd=Path(__file__).resolve().parents[1], capture_output=True,
             check=False, text=True, timeout=5,
-            env={**os.environ, "TOYKV_GCP_BENCH_VALIDATE_ONLY": "1"},
-        )
-        self.assertNotEqual(accepted.returncode, 64, accepted.stderr)
-        rejected = subprocess.run(
-            [*command[:9], "16", *command[10:]], cwd=Path(__file__).resolve().parents[1],
-            capture_output=True, check=False, text=True, timeout=5,
         )
         self.assertEqual(rejected.returncode, 64)
-        self.assertIn("writers 8,16", rejected.stderr)
+        self.assertIn("retired historical benchmark suite", rejected.stderr)
 
     def test_progress_ring_preflight_audits_isolated_ingress(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2872,7 +2917,7 @@ class PointProgressRingQualificationTests(unittest.TestCase):
             (results_dir / "source.patch").write_bytes(b"changed patch")
             self.assertFalse(ack_d1_runner.verify_results_directory(results_dir)["verified"])
 
-    def test_d1_remote_suite_requires_fixed_shape_and_source_identity(self) -> None:
+    def test_d1_remote_suite_is_rejected_as_retired_even_with_valid_args(self) -> None:
         remote_script = Path(__file__).with_name("gcp-free-trial-wal-bench-remote.sh")
         environment = {**os.environ, "TOYKV_GCP_BENCH_VALIDATE_ONLY": "1"}
         valid = [
@@ -2880,17 +2925,10 @@ class PointProgressRingQualificationTests(unittest.TestCase):
             "us-central1-a", "wal-test", "4102444800", "c4-standard-16-lssd", "8,16",
             "v8-point-ack-d1", "c" * 64, "b" * 40,
         ]
-        accepted = subprocess.run(valid, cwd=Path(__file__).resolve().parents[1], env=environment,
+        rejected = subprocess.run(valid, cwd=Path(__file__).resolve().parents[1], env=environment,
                                   capture_output=True, text=True, timeout=5)
-        self.assertEqual(accepted.returncode, 0, accepted.stderr)
-
-        for index, value in ((3, "99999"), (9, "16,8"), (11, "-"), (12, "-")):
-            with self.subTest(argument=index, value=value):
-                invalid = list(valid)
-                invalid[index] = value
-                rejected = subprocess.run(invalid, cwd=Path(__file__).resolve().parents[1], env=environment,
-                                          capture_output=True, text=True, timeout=5)
-                self.assertEqual(rejected.returncode, 64)
+        self.assertEqual(rejected.returncode, 64, rejected.stderr)
+        self.assertIn("retired historical benchmark suite", rejected.stderr)
 
     def test_d1_preflight_requires_isolated_network_and_fixed_budget(self) -> None:
         common = [

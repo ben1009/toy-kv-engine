@@ -19,11 +19,16 @@ SOURCE_PATCH_SHA256="${10}"
 BASELINE_COMMIT="${11}"
 REPETITIONS="${12:-1}"
 RUNNER_BUNDLE_SHA256="${13:--}"
-if [[ "$SUITE" == "v8-point-resource-retirement" || \
-    "$SUITE" == "v8-point-resource-retirement-stage-a" ]]; then
+case "$SUITE" in
+    v8-cursor-direct-completion-wake|v8-cursor-singleton-submission|v8-cursor-coalescing-budget|\
+    v8-cursor-coalescing-ready-target|v8-cursor-coalescing-ready-target-scan|\
+    v8-cursor-coalescing-ready-target-small-scan|v8-cursor-publication|\
+    v8-point-resource-retirement|v8-point-resource-retirement-stage-a|\
+    v8-point-ack-d1|v8-dedicated-durability-driver)
     echo "retired historical benchmark suite; archived results remain verifiable but cannot be executed: $SUITE" >&2
     exit 64
-fi
+    ;;
+esac
 if [[ ! "$REPETITIONS" =~ ^[1-9][0-9]*$ ]]; then
     echo "repetitions must be a positive integer: $REPETITIONS" >&2
     exit 64

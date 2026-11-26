@@ -370,5 +370,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def main(argv: list[str] | None = None) -> int:
+    parse_args(argv)
+    print(
+        "D1 ACK qualification is a retired historical experiment; "
+        "archived results remain verifiable but cannot be executed",
+        file=sys.stderr,
+    )
+    return 2
+
+
 if __name__ == "__main__":
-    sys.exit(run_suite(parse_args()))
+    sys.exit(main())

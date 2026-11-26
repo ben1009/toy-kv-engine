@@ -294,14 +294,6 @@ pub(crate) struct WalV8ParallelWriter {
     initial_ticket: u64,
     #[cfg(feature = "bench")]
     io_diagnostics: WalIoDiagnostics,
-    /// Benchmark-only budget for eligible coalescing calls, independent of
-    /// detailed sync-observation capture.
-    #[cfg(feature = "bench")]
-    coalesce_budget_override_us: Option<u64>,
-    /// Benchmark-only experiment that batches credit release for Point-only
-    /// durable prefixes. Batch and mixed prefixes retain the existing path.
-    #[cfg(feature = "bench")]
-    batch_point_frontier_credits: bool,
     #[cfg(feature = "bench")]
     point_buffer_preallocation_enabled: bool,
     #[cfg(all(test, feature = "bench"))]
@@ -320,8 +312,6 @@ pub(crate) struct WalV8ParallelWriter {
 
 struct WalV8FrontierResource {
     reservation: WalV7OwnedBatchReservation,
-    #[cfg(feature = "bench")]
-    write_class: WalV8WriteClass,
 }
 
 #[cfg(feature = "bench")]
@@ -466,7 +456,6 @@ const WAL_V8_EXTENT_PREPARATION_ENV: &str = "TOYKV_BENCH_V8_EXTENT_PREP";
 #[cfg(feature = "bench")]
 const WAL_V8_EXTENT_PREPARATION_BYTES_ENV: &str = "TOYKV_BENCH_V8_EXTENT_PREP_BYTES";
 #[cfg(feature = "bench")]
-const WAL_V8_POINT_FRONTIER_CREDIT_BATCH_ENV: &str = "TOYKV_BENCH_V8_POINT_FRONTIER_CREDIT_BATCH";
 #[cfg(feature = "bench")]
 const WAL_V8_POINT_PROGRESS_RING_ENV: &str = "TOYKV_BENCH_V8_POINT_PROGRESS_RING";
 #[cfg(feature = "bench")]
@@ -474,10 +463,7 @@ const WAL_V8_POINT_PROGRESS_COUNTERS_ENV: &str = "TOYKV_BENCH_V8_PROGRESS_COUNTE
 #[cfg(feature = "bench")]
 const WAL_V8_CURSOR_DIRECT_COMPLETION_ENV: &str = "TOYKV_BENCH_V8_CURSOR_DIRECT_COMPLETION";
 #[cfg(feature = "bench")]
-#[cfg(feature = "bench")]
 const WAL_V8_COALESCE_READY_TARGET_ENV: &str = "TOYKV_BENCH_V8_COALESCE_READY_TARGET";
-#[cfg(feature = "bench")]
-const WAL_V8_CURSOR_SINGLETON_SUBMISSION_ENV: &str = "TOYKV_BENCH_V8_CURSOR_SINGLETON_SUBMISSION";
 #[cfg(not(feature = "bench"))]
 const WAL_V8_PROGRESS_MODE_ENV: &str = "TOYKV_WAL_V8_PROGRESS_MODE";
 const WAL_V8_EXTENT_PREPARATION_CHUNK_BYTES: usize = 128 * 1024;
@@ -630,36 +616,6 @@ fn cursor_direct_completion_enabled_from_environment(
     }
     cursor_direct_completion_enabled_from_value(
         std::env::var_os(WAL_V8_CURSOR_DIRECT_COMPLETION_ENV).as_deref(),
-        progress_mode,
-    )
-}
-
-#[cfg(feature = "bench")]
-fn cursor_singleton_submission_enabled_from_value(
-    value: Option<&OsStr>,
-    progress_mode: WalV8ProgressMode,
-) -> Result<bool> {
-    let enabled = match value {
-        None => false,
-        Some(value) if value.to_str() == Some("0") => false,
-        Some(value) if value.to_str() == Some("1") => true,
-        Some(value) => anyhow::bail!(
-            "invalid {WAL_V8_CURSOR_SINGLETON_SUBMISSION_ENV} {value:?}; expected `0` or `1`"
-        ),
-    };
-    ensure!(
-        !enabled || progress_mode == WalV8ProgressMode::Cursor,
-        "{WAL_V8_CURSOR_SINGLETON_SUBMISSION_ENV}=1 requires Cursor progress mode"
-    );
-    Ok(enabled)
-}
-
-#[cfg(feature = "bench")]
-fn cursor_singleton_submission_enabled_from_environment(
-    progress_mode: WalV8ProgressMode,
-) -> Result<bool> {
-    cursor_singleton_submission_enabled_from_value(
-        std::env::var_os(WAL_V8_CURSOR_SINGLETON_SUBMISSION_ENV).as_deref(),
         progress_mode,
     )
 }
@@ -2725,25 +2681,6 @@ fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> &str {
 }
 
 #[cfg(feature = "bench")]
-fn coalesce_budget_override_from_environment() -> Result<Option<u64>> {
-    let Some(value) = std::env::var_os("TOYKV_WAL_V8_COALESCE_BUDGET_US") else {
-        return Ok(None);
-    };
-    let value = value
-        .to_str()
-        .context("TOYKV_WAL_V8_COALESCE_BUDGET_US is not valid UTF-8")?;
-    let budget_us = value.parse::<u64>().with_context(|| {
-        format!("invalid TOYKV_WAL_V8_COALESCE_BUDGET_US {value:?}; expected `100` or `400`")
-    })?;
-    ensure!(
-        matches!(budget_us, 100 | 400),
-        "invalid TOYKV_WAL_V8_COALESCE_BUDGET_US {value:?}; expected `100` or `400`"
-    );
-
-    Ok(Some(budget_us))
-}
-
-#[cfg(feature = "bench")]
 fn coalesce_ready_target_from_value(
     value: Option<&OsStr>,
     progress_mode: WalV8ProgressMode,
@@ -2756,13 +2693,11 @@ fn coalesce_ready_target_from_value(
         .to_str()
         .with_context(|| format!("{WAL_V8_COALESCE_READY_TARGET_ENV} is not valid UTF-8"))?;
     let target = value.parse::<usize>().with_context(|| {
-            format!(
-                "invalid {WAL_V8_COALESCE_READY_TARGET_ENV} {value:?}; expected `1`, `2`, `3`, `4`, `6`, `8`, or `12`"
-            )
+        format!("invalid {WAL_V8_COALESCE_READY_TARGET_ENV} {value:?}; expected `4` or `8`")
     })?;
     ensure!(
-        matches!(target, 1 | 2 | 3 | 4 | 6 | 8 | 12),
-        "invalid {WAL_V8_COALESCE_READY_TARGET_ENV} {value:?}; expected `1`, `2`, `3`, `4`, `6`, `8`, or `12`"
+        matches!(target, 4 | 8),
+        "invalid {WAL_V8_COALESCE_READY_TARGET_ENV} {value:?}; expected `4` or `8`"
     );
     ensure!(
         progress_mode == WalV8ProgressMode::Cursor && direct_completion_enabled,
@@ -2781,23 +2716,6 @@ fn coalesce_ready_target_from_environment(
         progress_mode,
         direct_completion_enabled,
     )
-}
-
-#[cfg(feature = "bench")]
-fn point_frontier_credit_batch_from_environment() -> Result<bool> {
-    let Some(value) = std::env::var_os(WAL_V8_POINT_FRONTIER_CREDIT_BATCH_ENV) else {
-        return Ok(false);
-    };
-    let value = value
-        .to_str()
-        .with_context(|| format!("{WAL_V8_POINT_FRONTIER_CREDIT_BATCH_ENV} is not valid UTF-8"))?;
-    match value {
-        "0" => Ok(false),
-        "1" => Ok(true),
-        _ => anyhow::bail!(
-            "invalid {WAL_V8_POINT_FRONTIER_CREDIT_BATCH_ENV} {value:?}; expected `0` or `1`"
-        ),
-    }
 }
 
 #[cfg(feature = "bench")]
@@ -2874,10 +2792,6 @@ struct WalV8SubmissionState {
     packing: bool,
     #[cfg(test)]
     group_wait_cutoff: Option<u64>,
-    #[cfg(test)]
-    /// Explicit selected-ticket and write-buffer `Vec` constructions in DATA submission.
-    /// Does not count the required FRONTIER offset list or test-only snapshots.
-    temporary_ticket_and_write_vec_constructions: usize,
     #[cfg(test)]
     submitted_group_snapshots: Vec<WalV8SubmittedGroupSnapshot>,
     #[cfg(feature = "bench")]
@@ -3025,8 +2939,6 @@ struct WalV8ParallelIo {
     profile: arc_swap::ArcSwapOption<crate::mem_table::WriteProfile>,
     #[cfg(feature = "bench")]
     hol_diagnostics_enabled: std::sync::atomic::AtomicBool,
-    #[cfg(feature = "bench")]
-    singleton_submission_enabled: bool,
     extent_preallocator: Option<Arc<WalV8ExtentPreallocator>>,
     #[cfg(feature = "bench")]
     extent_preparation: Option<Arc<WalV8SlidingExtentPreparation>>,
@@ -3059,7 +2971,6 @@ struct WalV8ParallelIoConfig {
     direct_completion_enabled: bool,
     #[cfg(feature = "bench")]
     coalesce_ready_target: Option<usize>,
-    singleton_submission_enabled: bool,
     #[cfg(all(test, feature = "bench"))]
     worker_group_limit: Option<usize>,
 }
@@ -3077,7 +2988,6 @@ impl WalV8ParallelIo {
         let direct_completion_enabled = config.direct_completion_enabled;
         #[cfg(feature = "bench")]
         let coalesce_ready_target = config.coalesce_ready_target;
-        let singleton_submission_enabled = config.singleton_submission_enabled;
         #[cfg(all(test, feature = "bench"))]
         let worker_group_limit = config.worker_group_limit;
 
@@ -3085,14 +2995,10 @@ impl WalV8ParallelIo {
             !direct_completion_enabled || coordinator.progress_cursor_enabled(),
             "Cursor direct completion requires Cursor progress mode"
         );
-        ensure!(
-            !singleton_submission_enabled || coordinator.progress_cursor_enabled(),
-            "Cursor singleton submission requires Cursor progress mode"
-        );
         #[cfg(not(feature = "bench"))]
         ensure!(
-            !direct_completion_enabled && !singleton_submission_enabled,
-            "Cursor direct completion and singleton submission are available only with the bench feature"
+            !direct_completion_enabled,
+            "Cursor direct completion is available only with the bench feature"
         );
 
         let (completion_event_sender, completion_events) =
@@ -3283,8 +3189,6 @@ impl WalV8ParallelIo {
                 #[cfg(test)]
                 group_wait_cutoff: None,
                 #[cfg(test)]
-                temporary_ticket_and_write_vec_constructions: 0,
-                #[cfg(test)]
                 submitted_group_snapshots: Vec::new(),
                 #[cfg(feature = "bench")]
                 data_submit_hol: None,
@@ -3300,8 +3204,6 @@ impl WalV8ParallelIo {
             profile: arc_swap::ArcSwapOption::empty(),
             #[cfg(feature = "bench")]
             hol_diagnostics_enabled: std::sync::atomic::AtomicBool::new(false),
-            #[cfg(feature = "bench")]
-            singleton_submission_enabled,
             extent_preallocator,
             #[cfg(feature = "bench")]
             extent_preparation,
@@ -4077,19 +3979,7 @@ impl WalV8ParallelIo {
             let allocation_start = state.next_file_offset.unwrap_or(first.file_offset);
             let mut cursor = allocation_start;
             let mut next_ticket = state.next_ticket;
-            #[cfg(feature = "bench")]
-            let singleton_submission_experiment = self.singleton_submission_enabled;
-            #[cfg(not(feature = "bench"))]
-            let singleton_submission_experiment = false;
-            let mut selected = if singleton_submission_experiment {
-                None
-            } else {
-                #[cfg(test)]
-                {
-                    state.temporary_ticket_and_write_vec_constructions += 1;
-                }
-                Some(Vec::with_capacity(MAX_GROUP_TICKETS))
-            };
+            let mut selected = Vec::with_capacity(MAX_GROUP_TICKETS);
             let mut selected_count = 0usize;
             let mut frontier_offsets = Vec::new();
             #[cfg(test)]
@@ -4125,9 +4015,7 @@ impl WalV8ParallelIo {
                     .context("v8 worker DATA end overflows")?;
                 #[cfg(test)]
                 data_ranges.push(write_start..cursor);
-                if let Some(selected) = &mut selected {
-                    selected.push(next_ticket);
-                }
+                selected.push(next_ticket);
                 selected_count = selected_count
                     .checked_add(1)
                     .context("v8 worker selected ticket count overflows")?;
@@ -4140,32 +4028,11 @@ impl WalV8ParallelIo {
             }
 
             self.ensure_extent_prepared_through(cursor)?;
-            // Keep the experiment limited to singleton groups. Multi-ticket
-            // groups continue through the existing Vec-backed representation
-            // so this switch measures only the common one-ticket case.
-            if selected.is_none() && selected_count > 1 {
-                #[cfg(test)]
-                {
-                    state.temporary_ticket_and_write_vec_constructions += 1;
-                }
-                selected = Some((state.next_ticket..next_ticket).collect());
+            let mut writes = Vec::with_capacity(selected.len());
+            for ticket in selected {
+                writes.push(self.take_pending_write(state, ticket)?);
             }
-            let writes: WriteGroupBuffers<WalV8DataBuffer> = if let Some(selected) = selected {
-                #[cfg(test)]
-                {
-                    state.temporary_ticket_and_write_vec_constructions += 1;
-                }
-                let mut writes = Vec::with_capacity(selected.len());
-                for ticket in selected {
-                    writes.push(self.take_pending_write(state, ticket)?);
-                }
-                writes.into()
-            } else {
-                debug_assert_eq!(selected_count, 1);
-                let mut writes = WriteGroupBuffers::with_capacity(1);
-                writes.push(self.take_pending_write(state, state.next_ticket)?);
-                writes
-            };
+            let writes: WriteGroupBuffers<WalV8DataBuffer> = writes.into();
 
             let group = WriteGroup::new_with_frontiers(
                 state.next_ticket..next_ticket,
@@ -4938,19 +4805,13 @@ impl WalV8LeaderWriter {
         #[cfg(feature = "bench")]
         let direct_completion_enabled =
             cursor_direct_completion_enabled_from_environment(progress_mode)?;
-        #[cfg(feature = "bench")]
-        let singleton_submission_enabled =
-            cursor_singleton_submission_enabled_from_environment(progress_mode)?;
         #[cfg(not(feature = "bench"))]
         let direct_completion_enabled = false;
-        #[cfg(not(feature = "bench"))]
-        let singleton_submission_enabled = false;
 
         self.into_parallel_with_worker_file_progress_and_completion(
             worker_file,
             progress_mode,
             direct_completion_enabled,
-            singleton_submission_enabled,
             #[cfg(all(test, feature = "bench"))]
             None,
         )
@@ -4961,7 +4822,6 @@ impl WalV8LeaderWriter {
         worker_file: File,
         progress_mode: WalV8ProgressMode,
         direct_completion_enabled: bool,
-        singleton_submission_enabled: bool,
         #[cfg(all(test, feature = "bench"))] worker_group_limit: Option<usize>,
     ) -> Result<WalV8ParallelWriter> {
         validate_positional_write_handle(&worker_file)
@@ -4997,12 +4857,8 @@ impl WalV8LeaderWriter {
         #[cfg(feature = "bench")]
         let mut io_diagnostics = self.io_diagnostics;
         #[cfg(feature = "bench")]
-        let coalesce_budget_override_us = coalesce_budget_override_from_environment()?;
-        #[cfg(feature = "bench")]
         let coalesce_ready_target =
             coalesce_ready_target_from_environment(progress_mode, direct_completion_enabled)?;
-        #[cfg(feature = "bench")]
-        let batch_point_frontier_credits = point_frontier_credit_batch_from_environment()?;
         #[cfg(feature = "bench")]
         let point_buffer_preallocation_enabled = point_buffer_preallocation_from_environment()?;
         #[cfg(feature = "bench")]
@@ -5012,7 +4868,7 @@ impl WalV8LeaderWriter {
             io_diagnostics.progress_cursor_enabled = self.coordinator.progress_cursor_enabled();
             io_diagnostics.cursor_direct_completion_enabled = direct_completion_enabled;
             io_diagnostics.cursor_direct_completion_select_wake_enabled = false;
-            io_diagnostics.cursor_singleton_submission_enabled = singleton_submission_enabled;
+            io_diagnostics.cursor_singleton_submission_enabled = false;
             io_diagnostics.point_buffer_preallocation_enabled = point_buffer_preallocation_enabled;
         }
         #[cfg(feature = "bench")]
@@ -5179,7 +5035,6 @@ impl WalV8LeaderWriter {
                 direct_completion_enabled,
                 #[cfg(feature = "bench")]
                 coalesce_ready_target,
-                singleton_submission_enabled,
                 #[cfg(all(test, feature = "bench"))]
                 worker_group_limit,
             },
@@ -5213,10 +5068,6 @@ impl WalV8LeaderWriter {
             initial_ticket,
             #[cfg(feature = "bench")]
             io_diagnostics,
-            #[cfg(feature = "bench")]
-            coalesce_budget_override_us,
-            #[cfg(feature = "bench")]
-            batch_point_frontier_credits,
             #[cfg(feature = "bench")]
             point_buffer_preallocation_enabled,
             #[cfg(all(test, feature = "bench"))]
@@ -6196,16 +6047,10 @@ impl WalV8ParallelWriter {
         };
         let admitted = prepared.admit_with_metadata(commit_ts, recorded_at, &publisher)?;
         let assignment = admitted.assignment();
-        #[cfg(feature = "bench")]
-        let write_class = admitted.write_class();
         if let Some(reservation) = resources.reservation.take() {
             let previous = self.frontier_resources.lock().insert(
                 assignment.segment_ticket,
-                WalV8FrontierResource {
-                    reservation,
-                    #[cfg(feature = "bench")]
-                    write_class,
-                },
+                WalV8FrontierResource { reservation },
             );
             if previous.is_some() {
                 self.coordinator.poison();
@@ -6337,15 +6182,6 @@ impl WalV8ParallelWriter {
                 && snapshot.ready_prefix.len() < snapshot.admitted_ticket_count
                 && let Some(latency) = previous.last_sync_latency
             {
-                #[cfg(feature = "bench")]
-                let budget_us = self.coalesce_budget_override_us.unwrap_or_else(|| {
-                    if latency >= Duration::from_micros(100) {
-                        400
-                    } else {
-                        100
-                    }
-                });
-                #[cfg(not(feature = "bench"))]
                 let budget_us = if latency >= Duration::from_micros(100) {
                     400
                 } else {
@@ -6952,14 +6788,8 @@ impl WalV8ParallelWriter {
         let lock_hold_cpu_started = sample.then(digest::thread_cpu_time_ns);
         #[cfg(feature = "bench")]
         let collect_started = sample.then(digest::thread_cpu_time_ns);
-        #[cfg(feature = "bench")]
-        let mut point_only_prefix = true;
         let mut tickets = Vec::with_capacity(expected);
-        for (&ticket, _resource) in resources.range(first_ticket..ticket_end) {
-            #[cfg(feature = "bench")]
-            {
-                point_only_prefix &= _resource.write_class == WalV8WriteClass::Point;
-            }
+        for (&ticket, _) in resources.range(first_ticket..ticket_end) {
             tickets.push(ticket);
         }
         #[cfg(feature = "bench")]
@@ -6972,32 +6802,6 @@ impl WalV8ParallelWriter {
             tickets.len() == expected,
             "v8 Parallel durable prefix is missing resource reservations"
         );
-
-        #[cfg(feature = "bench")]
-        let batch_point_frontier_credits =
-            self.batch_point_frontier_credits && point_only_prefix && expected > 1;
-        #[cfg(not(feature = "bench"))]
-        let batch_point_frontier_credits = false;
-
-        if batch_point_frontier_credits {
-            #[cfg(feature = "bench")]
-            let step_started = sample.then(digest::thread_cpu_time_ns);
-            let mut reservations: Vec<&mut WalV7OwnedBatchReservation> = resources
-                .range_mut(first_ticket..ticket_end)
-                .skip(1)
-                .map(|(_, resource)| &mut resource.reservation)
-                .collect();
-            WalV7OwnedBatchReservation::release_unused_frontier_credits_batch(&mut reservations)
-                .context("release batched Point v8 FRONTIER credits")?;
-            #[cfg(feature = "bench")]
-            {
-                release_cpu_ns = release_cpu_ns.saturating_add(
-                    step_started
-                        .map(|t| digest::thread_cpu_time_ns().saturating_sub(t))
-                        .unwrap_or_default(),
-                );
-            }
-        }
 
         for (index, ticket) in tickets.into_iter().enumerate() {
             #[cfg(feature = "bench")]
@@ -7014,7 +6818,7 @@ impl WalV8ParallelWriter {
                 );
             }
             let mut reservation = resource.reservation;
-            if index > 0 && !batch_point_frontier_credits {
+            if index > 0 {
                 #[cfg(feature = "bench")]
                 let step_started = sample.then(digest::thread_cpu_time_ns);
                 if let Err(error) = reservation.release_unused_frontier_credit() {
@@ -7062,7 +6866,7 @@ impl WalV8ParallelWriter {
             observation.remove_cpu_ns = remove_cpu_ns;
             observation.release_cpu_ns = release_cpu_ns;
             observation.finish_cpu_ns = finish_cpu_ns;
-            observation.batch_point_frontier_credits = batch_point_frontier_credits;
+            observation.batch_point_frontier_credits = false;
             observation.tickets = u64::try_from(expected).unwrap_or(u64::MAX);
             observation.wall_ns = started
                 .map(|started| started.elapsed().as_nanos().min(u64::MAX as u128) as u64)
@@ -8257,7 +8061,7 @@ mod tests {
             coalesce_ready_target_from_value(None, WalV8ProgressMode::Cursor, true).unwrap(),
             None
         );
-        for value in ["1", "2", "3", "4", "6", "8", "12"] {
+        for value in ["4", "8"] {
             assert!(
                 coalesce_ready_target_from_value(
                     Some(OsStr::new(value)),
@@ -8268,7 +8072,7 @@ mod tests {
                 .is_some()
             );
         }
-        for value in ["0", "5", "100", "400", "invalid"] {
+        for value in ["0", "1", "2", "3", "5", "6", "12", "100", "400", "invalid"] {
             assert!(
                 coalesce_ready_target_from_value(
                     Some(OsStr::new(value)),
@@ -8284,7 +8088,7 @@ mod tests {
         );
         assert!(
             coalesce_ready_target_from_value(
-                Some(OsStr::new("12")),
+                Some(OsStr::new("4")),
                 WalV8ProgressMode::Cursor,
                 false
             )
@@ -8475,43 +8279,6 @@ mod tests {
         assert!(!outcome.target_hit);
         assert_eq!(snapshot.ready_prefix.len(), 5);
         Ok(())
-    }
-
-    #[cfg(feature = "bench")]
-    #[test]
-    fn cursor_singleton_submission_switch_requires_cursor_mode() {
-        assert!(
-            !cursor_singleton_submission_enabled_from_value(None, WalV8ProgressMode::Cursor)
-                .unwrap()
-        );
-        assert!(
-            !cursor_singleton_submission_enabled_from_value(
-                Some(OsStr::new("0")),
-                WalV8ProgressMode::Cursor
-            )
-            .unwrap()
-        );
-        assert!(
-            cursor_singleton_submission_enabled_from_value(
-                Some(OsStr::new("1")),
-                WalV8ProgressMode::Cursor
-            )
-            .unwrap()
-        );
-        assert!(
-            cursor_singleton_submission_enabled_from_value(
-                Some(OsStr::new("1")),
-                WalV8ProgressMode::Eager
-            )
-            .is_err()
-        );
-        assert!(
-            cursor_singleton_submission_enabled_from_value(
-                Some(OsStr::new("2")),
-                WalV8ProgressMode::Cursor
-            )
-            .is_err()
-        );
     }
 
     #[cfg(feature = "bench")]
@@ -11200,28 +10967,6 @@ mod tests {
     }
 
     #[cfg(feature = "bench")]
-    fn open_parallel_with_cursor_submission_experiment(
-        path: &Path,
-        installed: &WalV8InstalledRecovery,
-        mode: WalV8ProgressMode,
-        singleton_submission_enabled: bool,
-        worker_group_limit: Option<usize>,
-    ) -> Result<WalV8ParallelWriter> {
-        let worker_file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .custom_flags(libc::O_DIRECT)
-            .open(path)?;
-        open_writer(path, installed)?.into_parallel_with_worker_file_progress_and_completion(
-            worker_file,
-            mode,
-            false,
-            singleton_submission_enabled,
-            worker_group_limit,
-        )
-    }
-
-    #[cfg(feature = "bench")]
     fn open_parallel_with_direct_completion(
         path: &Path,
         installed: &WalV8InstalledRecovery,
@@ -11237,7 +10982,6 @@ mod tests {
             worker_file,
             mode,
             true,
-            false,
             worker_group_limit,
         )
     }
@@ -11485,203 +11229,146 @@ mod tests {
 
     #[cfg(feature = "bench")]
     #[test]
-    fn cursor_singleton_submission_preserves_groups_ranges_and_recovery() -> Result<()> {
+    fn cursor_submission_preserves_groups_ranges_and_recovery() -> Result<()> {
         let directory = tempfile::tempdir()?;
-        let baseline_path = directory.path().join("cursor-singleton-baseline-v8.wal");
-        let candidate_path = directory.path().join("cursor-singleton-candidate-v8.wal");
+        let path = directory.path().join("cursor-submission-v8.wal");
         let wal_header = header();
-        let baseline_installed = install_empty(&baseline_path, wal_header)?;
-        let candidate_installed = install_empty(&candidate_path, wal_header)?;
-
-        let mut snapshots = Vec::new();
-        let mut ticket_write_vec_constructions = Vec::new();
-        let mut boundaries = Vec::new();
-        let input_batches = [batch(10), multi_frame_batch(20), batch(30)];
-
-        for (path, installed, singleton_submission_enabled) in [
-            (&baseline_path, &baseline_installed, false),
-            (&candidate_path, &candidate_installed, true),
-        ] {
-            let writer = match open_parallel_with_cursor_submission_experiment(
-                path,
-                installed,
-                WalV8ProgressMode::Cursor,
-                singleton_submission_enabled,
-                None,
-            ) {
-                Ok(writer) => writer,
-                Err(error) if is_io_uring_unavailable_error(&error) => {
-                    eprintln!("skipping test (io_uring unavailable): {error:#}");
-                    return Ok(());
-                }
-                Err(error) => return Err(error),
-            };
-            assert_eq!(
-                writer.io_diagnostics().cursor_singleton_submission_enabled,
-                singleton_submission_enabled
-            );
-
-            for input in &input_batches {
-                writer.append_prepared_batch(
-                    writer.preflight_batch(input, LIVE_WAL_V5_LIMITS)?,
-                    input.commit_ts,
-                    input.recorded_at,
-                )?;
+        let installed = install_empty(&path, wal_header)?;
+        let writer = match open_parallel_with_direct_completion(
+            &path,
+            &installed,
+            WalV8ProgressMode::Cursor,
+            None,
+        ) {
+            Ok(writer) => writer,
+            Err(error) if is_io_uring_unavailable_error(&error) => {
+                eprintln!("skipping test (io_uring unavailable): {error:#}");
+                return Ok(());
             }
-            let (_, boundary) = writer.active_boundaries()?;
-            boundaries.push(boundary);
-            let submission = writer.io.submission.lock();
-            snapshots.push(submission.submitted_group_snapshots.clone());
-            ticket_write_vec_constructions
-                .push(submission.temporary_ticket_and_write_vec_constructions);
+            Err(error) => return Err(error),
+        };
+        let input_batches = [batch(10), multi_frame_batch(20), batch(30)];
+        for input in &input_batches {
+            writer.append_prepared_batch(
+                writer.preflight_batch(input, LIVE_WAL_V5_LIMITS)?,
+                input.commit_ts,
+                input.recorded_at,
+            )?;
         }
-
-        assert_eq!(snapshots[0], snapshots[1]);
+        let (_, boundary) = writer.active_boundaries()?;
+        let snapshots = writer
+            .io
+            .submission
+            .lock()
+            .submitted_group_snapshots
+            .clone();
         assert!(
-            snapshots[0]
+            snapshots
                 .iter()
                 .any(|group| !group.frontier_offsets.is_empty())
         );
         assert!(
-            snapshots[0]
+            snapshots
                 .iter()
                 .all(|group| group.tickets.end - group.tickets.start == 1)
         );
-        assert!(snapshots[0].iter().any(|group| {
+        assert!(snapshots.iter().any(|group| {
             group
                 .data_ranges
                 .iter()
                 .any(|range| range.end - range.start > WAL_V8_FRAME_LEN as u64)
         }));
-        assert!(ticket_write_vec_constructions[0] > 0);
-        assert_eq!(ticket_write_vec_constructions[1], 0);
-        assert_eq!(boundaries[0].ticket_end, boundaries[1].ticket_end);
+        drop(writer);
 
-        let mut recovered_batches = Vec::new();
-        for (path, boundary) in [
-            (&baseline_path, boundaries[0]),
-            (&candidate_path, boundaries[1]),
-        ] {
-            let recovered = super::super::install::recover_and_install_active(
-                path,
-                &[boundary],
-                wal_header.predecessor,
-                LIVE_WAL_V5_LIMITS,
-                MAX_WAL_FILE_SIZE,
-            )?;
-            recovered_batches.push(replayed_batches(path, &recovered)?);
-        }
-        assert_eq!(recovered_batches[0], input_batches);
-        assert_eq!(recovered_batches[0], recovered_batches[1]);
-
+        let recovered = super::super::install::recover_and_install_active(
+            &path,
+            &[boundary],
+            wal_header.predecessor,
+            LIVE_WAL_V5_LIMITS,
+            MAX_WAL_FILE_SIZE,
+        )?;
+        assert_eq!(replayed_batches(&path, &recovered)?, input_batches);
         Ok(())
     }
 
     #[cfg(feature = "bench")]
     #[test]
-    fn cursor_singleton_submission_preserves_multi_ticket_group_fallback() -> Result<()> {
+    fn cursor_submission_preserves_multi_ticket_groups_and_recovery() -> Result<()> {
         let directory = tempfile::tempdir()?;
-        let baseline_path = directory.path().join("cursor-multi-ticket-baseline-v8.wal");
-        let candidate_path = directory
-            .path()
-            .join("cursor-multi-ticket-candidate-v8.wal");
+        let path = directory.path().join("cursor-multi-ticket-v8.wal");
         let wal_header = header();
-        let baseline_installed = install_empty(&baseline_path, wal_header)?;
-        let candidate_installed = install_empty(&candidate_path, wal_header)?;
+        let installed = install_empty(&path, wal_header)?;
+        let writer = match open_parallel_with_direct_completion(
+            &path,
+            &installed,
+            WalV8ProgressMode::Cursor,
+            None,
+        ) {
+            Ok(writer) => writer,
+            Err(error) if is_io_uring_unavailable_error(&error) => {
+                eprintln!("skipping test (io_uring unavailable): {error:#}");
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        writer
+            .io
+            .group_join_micros
+            .store(2_000_000, std::sync::atomic::Ordering::Relaxed);
         let input_batches = [multi_frame_batch(10), batch(20), batch(30)];
+        let first = &input_batches[0];
+        let second = &input_batches[1];
+        let first_job = writer.admit_prepared_batch(
+            writer.preflight_batch(first, LIVE_WAL_V5_LIMITS)?,
+            first.commit_ts,
+            first.recorded_at,
+        )?;
+        let second_job = writer.admit_prepared_batch(
+            writer.preflight_batch(second, LIVE_WAL_V5_LIMITS)?,
+            second.commit_ts,
+            second.recorded_at,
+        )?;
 
-        let mut snapshots = Vec::new();
-        let mut vector_constructions = Vec::new();
-        let mut boundaries = Vec::new();
-        for (path, installed, singleton_submission_enabled) in [
-            (&baseline_path, &baseline_installed, false),
-            (&candidate_path, &candidate_installed, true),
-        ] {
-            let writer = match open_parallel_with_cursor_submission_experiment(
-                path,
-                installed,
-                WalV8ProgressMode::Cursor,
-                singleton_submission_enabled,
-                None,
-            ) {
-                Ok(writer) => writer,
-                Err(error) if is_io_uring_unavailable_error(&error) => {
-                    eprintln!("skipping test (io_uring unavailable): {error:#}");
-                    return Ok(());
-                }
-                Err(error) => return Err(error),
-            };
-            writer
-                .io
-                .group_join_micros
-                .store(2_000_000, std::sync::atomic::Ordering::Relaxed);
+        thread::scope(|scope| -> Result<()> {
+            let first_handle = scope.spawn(move || first_job.finish());
+            wait_for_data_group_cutoff(&writer, 2)?;
 
-            let first = &input_batches[0];
-            let second = &input_batches[1];
-            let first_job = writer.admit_prepared_batch(
-                writer.preflight_batch(first, LIVE_WAL_V5_LIMITS)?,
-                first.commit_ts,
-                first.recorded_at,
+            let third = &input_batches[2];
+            let third_job = writer.admit_prepared_batch(
+                writer.preflight_batch(third, LIVE_WAL_V5_LIMITS)?,
+                third.commit_ts,
+                third.recorded_at,
             )?;
-            let second_job = writer.admit_prepared_batch(
-                writer.preflight_batch(second, LIVE_WAL_V5_LIMITS)?,
-                second.commit_ts,
-                second.recorded_at,
-            )?;
+            second_job.finish()?;
+            wait_for_data_group_cutoff(&writer, 3)?;
+            third_job.finish()?;
+            first_handle
+                .join()
+                .map_err(|_| anyhow::anyhow!("first v8 DATA producer panicked"))??;
+            Ok(())
+        })?;
 
-            thread::scope(|scope| -> Result<()> {
-                let first_handle = scope.spawn(move || first_job.finish());
-                wait_for_data_group_cutoff(&writer, 2)?;
+        writer.wait_durable(2)?;
+        let (_, boundary) = writer.active_boundaries()?;
+        let snapshots = writer
+            .io
+            .submission
+            .lock()
+            .submitted_group_snapshots
+            .clone();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].tickets, 0..3);
+        assert_eq!(snapshots[0].data_ranges.len(), input_batches.len());
+        drop(writer);
 
-                let third = &input_batches[2];
-                let third_job = writer.admit_prepared_batch(
-                    writer.preflight_batch(third, LIVE_WAL_V5_LIMITS)?,
-                    third.commit_ts,
-                    third.recorded_at,
-                )?;
-                second_job.finish()?;
-                wait_for_data_group_cutoff(&writer, 3)?;
-                third_job.finish()?;
-                first_handle
-                    .join()
-                    .map_err(|_| anyhow::anyhow!("first v8 DATA producer panicked"))??;
-
-                Ok(())
-            })?;
-
-            writer.wait_durable(2)?;
-            let (_, boundary) = writer.active_boundaries()?;
-            boundaries.push(boundary);
-            let submission = writer.io.submission.lock();
-            snapshots.push(submission.submitted_group_snapshots.clone());
-            vector_constructions.push(submission.temporary_ticket_and_write_vec_constructions);
-        }
-
-        assert_eq!(snapshots[0], snapshots[1]);
-        assert_eq!(snapshots[0].len(), 1);
-        assert_eq!(snapshots[0][0].tickets, 0..3);
-        assert_eq!(snapshots[0][0].data_ranges.len(), input_batches.len());
-        assert_eq!(vector_constructions[0], vector_constructions[1]);
-        assert!(vector_constructions[1] > 0);
-        assert_eq!(boundaries[0].ticket_end, boundaries[1].ticket_end);
-
-        let mut recovered_batches = Vec::new();
-        for (path, boundary) in [
-            (&baseline_path, boundaries[0]),
-            (&candidate_path, boundaries[1]),
-        ] {
-            let recovered = super::super::install::recover_and_install_active(
-                path,
-                &[boundary],
-                wal_header.predecessor,
-                LIVE_WAL_V5_LIMITS,
-                MAX_WAL_FILE_SIZE,
-            )?;
-            recovered_batches.push(replayed_batches(path, &recovered)?);
-        }
-        assert_eq!(recovered_batches[0], input_batches);
-        assert_eq!(recovered_batches[0], recovered_batches[1]);
-
+        let recovered = super::super::install::recover_and_install_active(
+            &path,
+            &[boundary],
+            wal_header.predecessor,
+            LIVE_WAL_V5_LIMITS,
+            MAX_WAL_FILE_SIZE,
+        )?;
+        assert_eq!(replayed_batches(&path, &recovered)?, input_batches);
         Ok(())
     }
 

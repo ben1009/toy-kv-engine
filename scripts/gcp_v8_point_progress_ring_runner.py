@@ -2946,6 +2946,7 @@ def _coalescing_ready_target_small_scan_summary(
 
 
 def run_suite(args: argparse.Namespace) -> int:
+    candidate_mode = getattr(args, "candidate_mode", "cursor")
     if len(args.commit) != 40 or any(char not in "0123456789abcdef" for char in args.commit):
         raise ValueError("commit must be a full lowercase 40-character SHA")
     if len(args.binary_sha256) != 64 or any(char not in "0123456789abcdef" for char in args.binary_sha256):
@@ -2953,12 +2954,6 @@ def run_suite(args: argparse.Namespace) -> int:
     binary = args.binary.expanduser().resolve(strict=True)
     if _sha256_file(binary) != args.binary_sha256:
         raise ValueError("write-perf binary SHA-256 does not match its recorded identity")
-    candidate_mode = getattr(args, "candidate_mode", "cursor")
-    if candidate_mode in ("point-resource-retirement", "point-resource-retirement-stage-a"):
-        raise ValueError(
-            "Point resource-retirement modes are retired historical experiments; "
-            "archived results may be verified but the suite cannot be executed"
-        )
     if args.machine_type != "c4-standard-16-lssd" or args.ssd_count != 2 or args.ssd_gib != 750:
         raise ValueError("Cursor qualification requires c4-standard-16-lssd and two Local SSDs")
     writers = tuple(int(value) for value in args.writers.split(","))
@@ -4185,8 +4180,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=(
             "cursor", "direct-completion", "completion-wake", "singleton-submission", "cursor-publication",
             "coalescing-budget", "coalescing-ready-target",
-            "coalescing-ready-target-scan",
-            "coalescing-ready-target-small-scan",
+            "coalescing-ready-target-scan", "coalescing-ready-target-small-scan",
+            "point-resource-retirement", "point-resource-retirement-stage-a",
             "v7-v8-point-preallocation",
             "v7-v8-ready-target-final",
         ),
@@ -4195,5 +4190,28 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    retired_candidate_modes = {
+        "completion-wake",
+        "singleton-submission",
+        "cursor-publication",
+        "coalescing-budget",
+        "coalescing-ready-target",
+        "coalescing-ready-target-scan",
+        "coalescing-ready-target-small-scan",
+        "point-resource-retirement",
+        "point-resource-retirement-stage-a",
+    }
+    if args.candidate_mode in retired_candidate_modes:
+        print(
+            f"{args.candidate_mode} is a retired historical experiment; "
+            "archived results may be verified but the suite cannot be executed",
+            file=sys.stderr,
+        )
+        return 2
+    return run_suite(args)
+
+
 if __name__ == "__main__":
-    sys.exit(run_suite(parse_args()))
+    sys.exit(main())

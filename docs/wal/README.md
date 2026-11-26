@@ -51,12 +51,24 @@ Preparation, durability progress and durable publication use separate
 notifications. One driver forms FRONTIERs. The WAL's published cursor path
 lets a durable follower return without taking the physical FRONTIER mutex.
 The direct writer append path takes that mutex to construct commit metadata.
-The benchmark-only [RFC 028 dedicated durability driver](../../rfcs/028-v8-dedicated-durability-driver.md)
-tests moving driver execution to an independently owned thread; caller-driven
-durability remains the default while D3a is being qualified.
+The historical RFC 028 Dedicated Driver and Independent ACK experiments did
+not establish a broad throughput gain and are no longer live benchmark modes.
+Caller-driven durability and the legacy coordinator ACK path remain in use.
 See the [notification rerun](benchmarks/rfc-026-v8-notification-rerun-20261102.md)
 for the evidence and the [implementation plan](rfc-026-implementation-plan.md)
 for the current runtime.
+
+## Current Point experiment status
+
+The production default remains Eager progress with relayed DATA completions and
+Dynamic coalescing. Cursor progress can be selected as an opt-in mode, but it
+has not passed the Point throughput qualification gate. Direct Completion,
+Point buffer preallocation, and Ready Target controls remain benchmark-only.
+Ready Target4 and Target8 are retained only in the explicit V7/V8 final
+comparison; neither is a production default. Historical singleton submission,
+fixed-budget, target-scan, cursor-publication, resource-retirement, ACK, and
+Dedicated Driver suites are blocked from live execution. Their reports and
+archive verifiers remain available for review.
 
 Dated filenames identify individual measurements and follow-ups. Their defaults,
 candidate decisions and validation counts describe the measured revision;
@@ -124,6 +136,11 @@ tail latency, and CPU cost; Dynamic remains the default.
 The [D1 ACK-check A/B](benchmarks/rfc-028-v8-point-ack-d1-gcp-20261124.md)
 found no stable throughput gain from consolidating the Coordinator ACK checks;
 Point16 was 1.86% slower in paired median.
+The [D3a Dedicated Driver](benchmarks/rfc-028-v8-dedicated-durability-driver-gcp-20261124.md)
+and [D3b Independent ACK](benchmarks/rfc-028-v8-independent-ack-gcp-20261125.md)
+comparisons also failed to show a broad throughput win. RFC 027/028 runtime
+experiments are closed; the reports remain historical evidence, not pending
+qualification or defaults.
 
 ## Implementation and adoption
 
