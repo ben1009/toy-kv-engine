@@ -4239,6 +4239,21 @@ impl MemTable {
         false
     }
 
+    pub(crate) fn pre_reserve_v8_point_resources(
+        &self,
+        scratch: &mut crate::wal::v8::leader::WalV8PointAdmissionScratch<'_>,
+    ) -> Result<()> {
+        let wal = self
+            .wal
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("PITR WAL is not configured"))?;
+        anyhow::ensure!(
+            wal.is_v8() && wal.is_parallel(),
+            "prepared v8 batch requires a Parallel v8 WAL"
+        );
+        wal.pre_reserve_v8_point_resources(scratch)
+    }
+
     pub(crate) fn admit_prepared_v8_point_pitr_wal_batch_only<'a>(
         &self,
         scratch: crate::wal::v8::leader::WalV8PointAdmissionScratch<'a>,

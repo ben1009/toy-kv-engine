@@ -123,6 +123,7 @@ pub(crate) type WalV8PreparedBatch<'a> = PreparedWalV8Batch<'a, WalV8PreflightRe
 pub(crate) struct WalV8PointAdmissionScratch<'a> {
     prepared: WalV8PreparedBatch<'a>,
     preallocated_buffer: Option<WalV8PointBufferPreallocation>,
+    pre_reserved_resources: Option<WalV8AdmissionResources>,
 }
 
 /// A bounded speculative DATA buffer allocation. It has no quota reservation;
@@ -162,6 +163,7 @@ impl<'a> WalV8PointAdmissionScratch<'a> {
         Self {
             prepared,
             preallocated_buffer: None,
+            pre_reserved_resources: None,
         }
     }
 
@@ -171,6 +173,7 @@ impl<'a> WalV8PointAdmissionScratch<'a> {
 
     fn set_preallocated_buffer(&mut self, preallocated_buffer: WalV8PointBufferPreallocation) {
         debug_assert!(self.preallocated_buffer.is_none());
+        debug_assert!(self.pre_reserved_resources.is_none());
         self.preallocated_buffer = Some(preallocated_buffer);
     }
 }
@@ -276,7 +279,7 @@ pub(crate) struct WalV8ParallelWriter {
     io: Arc<WalV8ParallelIo>,
     reservation_owner: Option<Arc<WalV8ReservationOwner>>,
     frontier: Mutex<WalV8ParallelFrontier>,
-    frontier_resources: Mutex<BTreeMap<u64, WalV8FrontierResource>>,
+    frontier_resources: Arc<Mutex<BTreeMap<u64, WalV8FrontierResource>>>,
     producer_guards: Arc<Mutex<BTreeMap<u64, EncodedWalV8Batch<WalV8ParallelAdmissionGuard>>>>,
     max_file_size: u64,
     installed_dev: u64,
@@ -4996,9 +4999,11 @@ pub(crate) struct WalV8FrameJob<'a> {
         Option<AdmittedWalV8Batch<'a, WalV8ParallelAdmissionGuard, WalV8PreflightReservation>>,
     assignment: WalV8BatchAssignment,
     coordinator: WalV8ParallelCoordinator,
+    frontier_resources: Arc<Mutex<BTreeMap<u64, WalV8FrontierResource>>>,
     producer_guards: Arc<Mutex<BTreeMap<u64, EncodedWalV8Batch<WalV8ParallelAdmissionGuard>>>>,
     io: Arc<WalV8ParallelIo>,
     data_buffer: Option<DirectBufAllocation>,
+    reservation: Option<WalV7OwnedBatchReservation>,
     #[cfg(feature = "bench")]
     profile: Option<Arc<crate::mem_table::WriteProfile>>,
 }
@@ -5059,6 +5064,16 @@ impl WalV8FrameJob<'_> {
             .admitted
             .take()
             .context("v8 producer job lost its admitted batch")?;
+        if let Some(reservation) = self.reservation.take() {
+            let previous = self.frontier_resources.lock().insert(
+                self.assignment.segment_ticket,
+                WalV8FrontierResource { reservation },
+            );
+            if previous.is_some() {
+                self.coordinator.poison();
+                anyhow::bail!("v8 Parallel ticket already owns a resource reservation");
+            }
+        }
         // The selector is injectable in unit tests. Production only enables it
         // through the bench-only OnceLock above.
         let direct_point = direct_point_enabled && admitted.can_encode_point_single_frame();
@@ -5848,7 +5863,7 @@ impl WalV8LeaderWriter {
                 digest: self.frontier_digest,
                 last_sync_latency: None,
             }),
-            frontier_resources: Mutex::new(BTreeMap::new()),
+            frontier_resources: Arc::new(Mutex::new(BTreeMap::new())),
             producer_guards: Arc::new(Mutex::new(BTreeMap::new())),
             max_file_size: self.max_file_size,
             installed_dev: self.installed_dev,
@@ -6753,6 +6768,28 @@ impl WalV8ParallelWriter {
         true
     }
 
+    /// Reserve source-spool quota and ensure a DATA buffer is owned before
+    /// acquiring the serialized MVCC sequencer lock.
+    pub(crate) fn pre_reserve_point_resources(
+        &self,
+        scratch: &mut WalV8PointAdmissionScratch<'_>,
+    ) -> Result<()> {
+        if scratch.pre_reserved_resources.is_some() {
+            return Ok(());
+        }
+        ensure!(!self.is_poisoned(), "v8 Parallel WAL is poisoned");
+        let logical_bytes = u64::try_from(scratch.prepared.logical_batch_bytes())?;
+        let frame_bytes = u64::try_from(scratch.prepared.frame_buffer_bytes())?;
+        let resources = self.reserve_and_allocate_batch_resources(
+            logical_bytes,
+            frame_bytes,
+            scratch.prepared.frame_buffer_bytes(),
+            scratch.preallocated_buffer.take(),
+        )?;
+        scratch.pre_reserved_resources = Some(resources);
+        Ok(())
+    }
+
     /// Admit a Point scratch object using ordered quota reservation and then
     /// consume its optional speculative DATA buffer.
     pub(crate) fn admit_prepared_point_batch<'a>(
@@ -6764,16 +6801,22 @@ impl WalV8ParallelWriter {
         let WalV8PointAdmissionScratch {
             prepared,
             preallocated_buffer,
+            pre_reserved_resources,
         } = scratch;
-        ensure!(!self.is_poisoned(), "v8 Parallel WAL is poisoned");
-        let logical_bytes = u64::try_from(prepared.logical_batch_bytes())?;
-        let frame_bytes = u64::try_from(prepared.frame_buffer_bytes())?;
-        let resources = self.reserve_and_allocate_batch_resources(
-            logical_bytes,
-            frame_bytes,
-            prepared.frame_buffer_bytes(),
-            preallocated_buffer,
-        )?;
+        let resources = match pre_reserved_resources {
+            Some(resources) => resources,
+            None => {
+                ensure!(!self.is_poisoned(), "v8 Parallel WAL is poisoned");
+                let logical_bytes = u64::try_from(prepared.logical_batch_bytes())?;
+                let frame_bytes = u64::try_from(prepared.frame_buffer_bytes())?;
+                self.reserve_and_allocate_batch_resources(
+                    logical_bytes,
+                    frame_bytes,
+                    prepared.frame_buffer_bytes(),
+                    preallocated_buffer,
+                )?
+            }
+        };
 
         self.admit_prepared_batch_with_resources(prepared, commit_ts, recorded_at, resources, || {})
     }
@@ -6869,25 +6912,18 @@ impl WalV8ParallelWriter {
         };
         let admitted = prepared.admit_with_metadata(commit_ts, recorded_at, &publisher)?;
         let assignment = admitted.assignment();
-        if let Some(reservation) = resources.reservation.take() {
-            let previous = self.frontier_resources.lock().insert(
-                assignment.segment_ticket,
-                WalV8FrontierResource { reservation },
-            );
-            if previous.is_some() {
-                self.coordinator.poison();
-                anyhow::bail!("v8 Parallel ticket already owns a resource reservation");
-            }
-        }
+        let reservation = resources.reservation.take();
         after_admission();
 
         Ok(WalV8FrameJob {
             admitted: Some(admitted),
             assignment,
             coordinator: self.coordinator.clone(),
+            frontier_resources: Arc::clone(&self.frontier_resources),
             producer_guards: Arc::clone(&self.producer_guards),
             io: Arc::clone(&self.io),
             data_buffer: Some(resources.data_buffer),
+            reservation,
             #[cfg(feature = "bench")]
             profile: self.profile.load_full(),
         })
@@ -14701,6 +14737,82 @@ mod tests {
             .wait_durable(ticket + 10)
             .expect_err("poisoned coordinator must reject unassigned wait_durable");
         assert!(poisoned_unassigned.to_string().contains("poisoned"));
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pre_reserve_point_resources_registers_frontier_resource_only_on_finish() -> Result<()> {
+        const SEGMENT_LIMIT: u64 = 64 * 1024;
+        const INITIAL_SOURCE_CHARGE: u64 = HEADER_LEN_U64 + FRAME_LEN_U64;
+        const ONE_BATCH_SOURCE_CHARGE: u64 = 2 * WAL_V8_FRAME_LEN as u64;
+        const SOURCE_SPOOL_LIMIT: u64 =
+            SEGMENT_LIMIT + INITIAL_SOURCE_CHARGE + ONE_BATCH_SOURCE_CHARGE;
+
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("pre-reserve-point.wal");
+        let installed = install_empty(&path, header())?;
+        let sync_file = OpenOptions::new().read(true).write(true).open(&path)?;
+        let (leader, owner) = open_accounted_writer(
+            &path,
+            &installed,
+            SEGMENT_LIMIT,
+            SOURCE_SPOOL_LIMIT,
+            FRAME_LEN_U64,
+            sync_file,
+        )?;
+        let writer = match leader.into_parallel_with_worker_file_and_config(
+            OpenOptions::new().read(true).write(true).open(&path)?,
+            WalV8RequestedConfig::candidate(),
+        ) {
+            Ok(writer) => writer,
+            Err(error) if is_io_uring_unavailable_error(&error) => return Ok(()),
+            Err(error) => return Err(error),
+        };
+
+        let pt_batch = batch(10);
+        let prepared = writer.preflight_batch_with_write_class(
+            &pt_batch,
+            LIVE_WAL_V5_LIMITS,
+            WalV8WriteClass::Point,
+        )?;
+        let held_reservation = owner.reserve_batch(
+            u64::try_from(prepared.logical_batch_bytes())?,
+            u64::try_from(prepared.frame_buffer_bytes())?,
+        )?;
+
+        // Pre-reserving while quota is exhausted fails before admission without poisoning.
+        let mut scratch = WalV8PointAdmissionScratch::new(prepared);
+        assert!(writer.try_preallocate_point_buffer(&mut scratch));
+        assert!(writer.pre_reserve_point_resources(&mut scratch).is_err());
+        drop(scratch);
+        assert!(!writer.is_poisoned());
+        assert!(writer.frontier_resources.lock().is_empty());
+
+        // Release held quota, pre-reserve, and admit: frontier_resources stays empty until
+        // finish().
+        drop(held_reservation);
+        let prepared_ok = writer.preflight_batch_with_write_class(
+            &pt_batch,
+            LIVE_WAL_V5_LIMITS,
+            WalV8WriteClass::Point,
+        )?;
+        let mut scratch_ok = WalV8PointAdmissionScratch::new(prepared_ok);
+        assert!(writer.try_preallocate_point_buffer(&mut scratch_ok));
+        writer.pre_reserve_point_resources(&mut scratch_ok)?;
+        let job = writer.admit_prepared_point_batch(
+            scratch_ok,
+            pt_batch.commit_ts,
+            pt_batch.recorded_at,
+        )?;
+        let ticket = job.assignment().segment_ticket;
+        assert!(!writer.frontier_resources.lock().contains_key(&ticket));
+
+        let _ = job.finish()?;
+        writer.sync()?;
+        assert!(!writer.frontier_resources.lock().contains_key(&ticket));
+        assert_eq!(writer.point_buffer_preallocations_in_flight_for_test(), 0);
 
         Ok(())
     }

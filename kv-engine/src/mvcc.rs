@@ -1362,7 +1362,7 @@ impl LsmMvccInner {
         let mut point_scratch = crate::wal::v8::leader::WalV8PointAdmissionScratch::new(prepared);
         #[cfg(feature = "bench")]
         let phase_timer = WalCpuPhaseTimer::start(cpu_attribution.is_some());
-        let point_buffer_preallocated =
+        let _point_buffer_preallocated =
             memtable.try_preallocate_prepared_v8_point_buffer_only(&mut point_scratch);
         #[cfg(feature = "bench")]
         if let Some(sample) = cpu_attribution.as_mut() {
@@ -1370,6 +1370,7 @@ impl LsmMvccInner {
             sample.observation.point_buffer_preallocation_wall_ns = wall_ns;
             sample.observation.point_buffer_preallocation_cpu_ns = cpu_ns;
         }
+        memtable.pre_reserve_v8_point_resources(&mut point_scratch)?;
 
         #[cfg(feature = "bench")]
         let phase_timer = WalCpuPhaseTimer::start(cpu_attribution.is_some());
@@ -1395,7 +1396,6 @@ impl LsmMvccInner {
             .write_profile()
             .record_commit_order_timestamp_reserved(commit_ts);
         let _unwind_guard = self.guard_versioned_commit_unwind(memtable, commit_ts);
-        let encoded_key = encode_internal_key(user_key, commit_ts);
         let recorded_at = self.pitr_recorded_at_for_commit(commit_ts)?;
         #[cfg(feature = "bench")]
         if let Some(sample) = cpu_attribution.as_mut() {
@@ -1406,16 +1406,11 @@ impl LsmMvccInner {
 
         #[cfg(feature = "bench")]
         let phase_timer = WalCpuPhaseTimer::start(cpu_attribution.is_some());
-        let admission_result = if point_buffer_preallocated {
-            memtable.admit_prepared_v8_point_pitr_wal_batch_only(
-                point_scratch,
-                commit_ts,
-                recorded_at,
-            )
-        } else {
-            let prepared = point_scratch.into_prepared();
-            memtable.admit_prepared_v8_pitr_wal_batch_only(prepared, commit_ts, recorded_at)
-        };
+        let admission_result = memtable.admit_prepared_v8_point_pitr_wal_batch_only(
+            point_scratch,
+            commit_ts,
+            recorded_at,
+        );
         #[cfg(feature = "bench")]
         if let Some(sample) = cpu_attribution.as_mut() {
             let (wall_ns, cpu_ns) = phase_timer.finish();
@@ -1440,6 +1435,7 @@ impl LsmMvccInner {
             sample.observation.sequencer_hold_cpu_ns = cpu_ns;
         }
         drop(write_guard);
+        let encoded_key = encode_internal_key(user_key, commit_ts);
         if let Some(frame_job) = frame_job {
             #[cfg(feature = "bench")]
             let phase_timer = WalCpuPhaseTimer::start(cpu_attribution.is_some());

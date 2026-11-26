@@ -2756,6 +2756,31 @@ impl Wal {
         false
     }
 
+    pub(crate) fn pre_reserve_v8_point_resources(
+        &self,
+        scratch: &mut v8::leader::WalV8PointAdmissionScratch<'_>,
+    ) -> Result<()> {
+        ensure!(
+            self.format_version == WAL_FORMAT_VERSION_V8,
+            "v8 batch admission selected for format {}",
+            self.format_version
+        );
+        ensure!(
+            !self.poisoned.load(Ordering::Acquire),
+            "WAL is poisoned due to a previous I/O error"
+        );
+        let writer = self
+            .v8_parallel
+            .as_ref()
+            .context("v8 WAL has no Parallel writer")?;
+        if let Err(error) = writer.pre_reserve_point_resources(scratch) {
+            self.record_v8_parallel_error(writer, &error);
+            return Err(error);
+        }
+
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) fn set_v8_point_buffer_preallocation_for_test(&self, enabled: bool) -> Result<()> {
         self.v8_parallel
