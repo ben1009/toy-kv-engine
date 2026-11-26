@@ -1424,102 +1424,70 @@ class PointProgressRingQualificationTests(unittest.TestCase):
         self.assertEqual(metadata["format_version"], 7)
         self.assertEqual(metadata["sync_count"], 1000)
 
-    def test_run_suite_writes_ready_target_scan_plan_and_schedule(self) -> None:
-        binary = Path("scripts/gcp_v8_point_progress_ring_runner.py")
-        binary_sha256 = self._sha256(binary)
-        commit = "a" * 40
+    def test_run_suite_rejects_retired_candidate_modes(self) -> None:
+        for mode in sorted(progress_ring_runner.RETIRED_CANDIDATE_MODES):
+            args = SimpleNamespace(candidate_mode=mode)
+            with self.subTest(candidate_mode=mode), self.assertRaisesRegex(ValueError, "retired historical experiment"):
+                progress_ring_runner.run_suite(args)
 
-        def fake_run_one(**kwargs: object) -> dict[str, object]:
-            row = kwargs["row"]
-            kwargs["on_subprocess_started"]()
-            raw = self._raw_record(row)
-            return {
+    def test_ready_target_scan_plan_schedule_and_summary_remain_verifiable(self) -> None:
+        commit = "a" * 40
+        schedule = progress_ring_runner.build_cursor_coalescing_ready_target_scan_schedule()
+        plan = progress_ring_runner.build_cursor_coalescing_ready_target_scan_plan(
+            machine_type="c4-standard-16-lssd",
+            machine_spec={"vcpus": 16, "ssd_count": 2, "ssd_gib": 750},
+            commit=commit,
+        )
+        rows = [
+            {
                 **row,
                 "source_commit": commit,
-                "binary_sha256": binary_sha256,
+                "binary_sha256": "b" * 64,
                 "exit_code": 0,
                 "duration_seconds": 5.0,
-                **progress_ring_runner._validate_record(raw, row),
+                **progress_ring_runner._validate_record(self._raw_record(row), row),
             }
+            for row in schedule
+        ]
+        summary = progress_ring_runner._coalescing_ready_target_scan_summary(
+            rows, (8, 16), plan["runs_planned"]
+        )
+        self.assertEqual(len(schedule), 40)
+        self.assertEqual({row["writer"] for row in schedule}, {8, 16})
+        self.assertEqual({row["arm"] for row in schedule}, set(CURSOR_COALESCING_READY_TARGET_SCAN_ARMS))
+        self.assertEqual(plan["suite"], "v8-cursor-coalescing-ready-target-scan")
+        self.assertEqual(plan["runs_planned"], 40)
+        self.assertEqual(summary["suite"], "v8-cursor-coalescing-ready-target-scan")
+        self.assertTrue(summary["complete"])
 
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            args = SimpleNamespace(
-                commit=commit,
-                binary=binary,
-                binary_sha256=binary_sha256,
-                machine_type="c4-standard-16-lssd",
-                ssd_count=2,
-                ssd_gib=750,
-                writers="8,16",
-                results_dir=root / "results",
-                db_root=root / "db",
-                safe_deadline_epoch=4_000_000_000,
-                candidate_mode="coalescing-ready-target-scan",
-            )
-            with patch.object(progress_ring_runner, "_run_one", side_effect=fake_run_one):
-                status = progress_ring_runner.run_suite(args)
-            self.assertEqual(status, 0)
-            schedule_path = args.results_dir / "cursor-coalescing-ready-target-scan-schedule.tsv"
-            self.assertTrue(schedule_path.is_file())
-            with schedule_path.open(encoding="utf-8", newline="") as stream:
-                schedule = list(csv.DictReader(stream, delimiter="\t"))
-            self.assertEqual(len(schedule), 40)
-            self.assertEqual({row["writer"] for row in schedule}, {"8", "16"})
-            self.assertEqual({row["arm"] for row in schedule}, set(CURSOR_COALESCING_READY_TARGET_SCAN_ARMS))
-            plan = json.loads((args.results_dir / "benchmark-plan.json").read_text(encoding="utf-8"))
-            summary = json.loads((args.results_dir / "summary.json").read_text(encoding="utf-8"))
-            self.assertEqual(plan["suite"], "v8-cursor-coalescing-ready-target-scan")
-            self.assertEqual(plan["runs_planned"], 40)
-            self.assertEqual(summary["suite"], "v8-cursor-coalescing-ready-target-scan")
-            self.assertTrue(summary["complete"])
-
-    def test_run_suite_writes_ready_target_small_scan_plan_and_schedule(self) -> None:
-        binary = Path("scripts/gcp_v8_point_progress_ring_runner.py")
-        binary_sha256 = self._sha256(binary)
+    def test_ready_target_small_scan_plan_schedule_and_summary_remain_verifiable(self) -> None:
         commit = "a" * 40
-
-        def fake_run_one(**kwargs: object) -> dict[str, object]:
-            row = kwargs["row"]
-            kwargs["on_subprocess_started"]()
-            raw = self._raw_record(row)
-            return {
+        schedule = progress_ring_runner.build_cursor_coalescing_ready_target_small_scan_schedule()
+        plan = progress_ring_runner.build_cursor_coalescing_ready_target_small_scan_plan(
+            machine_type="c4-standard-16-lssd",
+            machine_spec={"vcpus": 16, "ssd_count": 2, "ssd_gib": 750},
+            commit=commit,
+        )
+        rows = [
+            {
                 **row,
                 "source_commit": commit,
-                "binary_sha256": binary_sha256,
+                "binary_sha256": "b" * 64,
                 "exit_code": 0,
                 "duration_seconds": 5.0,
-                **progress_ring_runner._validate_record(raw, row),
+                **progress_ring_runner._validate_record(self._raw_record(row), row),
             }
-
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            args = SimpleNamespace(
-                commit=commit,
-                binary=binary,
-                binary_sha256=binary_sha256,
-                machine_type="c4-standard-16-lssd",
-                ssd_count=2,
-                ssd_gib=750,
-                writers="8,16",
-                results_dir=root / "results",
-                db_root=root / "db",
-                safe_deadline_epoch=4_000_000_000,
-                candidate_mode="coalescing-ready-target-small-scan",
-            )
-            with patch.object(progress_ring_runner, "_run_one", side_effect=fake_run_one):
-                self.assertEqual(progress_ring_runner.run_suite(args), 0)
-            plan = json.loads((args.results_dir / "benchmark-plan.json").read_text(encoding="utf-8"))
-            schedule_path = args.results_dir / "cursor-coalescing-ready-target-small-scan-schedule.tsv"
-            with schedule_path.open(encoding="utf-8", newline="") as stream:
-                rows = list(csv.DictReader(stream, delimiter="\t"))
-            self.assertEqual(plan["suite"], "v8-cursor-coalescing-ready-target-small-scan")
-            self.assertEqual(plan["runs_planned"], 50)
-            self.assertEqual(len(rows), 50)
-            summary = json.loads((args.results_dir / "summary.json").read_text(encoding="utf-8"))
-            self.assertEqual(summary["suite"], plan["suite"])
-            self.assertTrue(summary["complete"])
-            self.assertEqual(summary["runs_completed"], 50)
+            for row in schedule
+        ]
+        summary = progress_ring_runner._coalescing_ready_target_small_scan_summary(
+            rows, (8, 16), plan["runs_planned"]
+        )
+        self.assertEqual(plan["suite"], "v8-cursor-coalescing-ready-target-small-scan")
+        self.assertEqual(plan["runs_planned"], 50)
+        self.assertEqual(len(schedule), 50)
+        self.assertEqual(summary["suite"], plan["suite"])
+        self.assertTrue(summary["complete"])
+        self.assertEqual(summary["runs_completed"], 50)
 
     def test_cursor_publication_fixture_verifies_d2a_only_requalification(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1826,7 +1794,7 @@ class PointProgressRingQualificationTests(unittest.TestCase):
             self.assertEqual(summary["arms"], list(CURSOR_DIRECT_COMPLETION_ARMS))
             self.assertTrue(summary["complete"])
 
-    def test_run_suite_writes_singleton_submission_plan_and_schedule(self) -> None:
+    def test_singleton_submission_plan_schedule_and_summary_remain_verifiable(self) -> None:
         binary = Path("scripts/gcp_v8_point_progress_ring_runner.py")
         binary_sha256 = self._sha256(binary)
         commit = "a" * 40
@@ -1839,142 +1807,91 @@ class PointProgressRingQualificationTests(unittest.TestCase):
         ])
         self.assertEqual(parsed.candidate_mode, "singleton-submission")
 
-        def fake_run_one(**kwargs: object) -> dict[str, object]:
-            row = kwargs["row"]
-            kwargs["on_subprocess_started"]()
-            raw = self._raw_record(row)
-            return {
+        schedule = progress_ring_runner.build_cursor_singleton_submission_schedule(POINT_PROGRESS_RING_WRITERS)
+        plan = progress_ring_runner.build_cursor_singleton_submission_plan(
+            writers=POINT_PROGRESS_RING_WRITERS,
+            machine_type="c4-standard-16-lssd",
+            machine_spec={"vcpus": 16, "ssd_count": 2, "ssd_gib": 750},
+            commit=commit,
+            binary_sha256=binary_sha256,
+        )
+        rows = [
+            {
                 **row,
                 "source_commit": commit,
                 "binary_sha256": binary_sha256,
                 "exit_code": 0,
                 "duration_seconds": 5.0,
-                **progress_ring_runner._validate_record(raw, row),
+                **progress_ring_runner._validate_record(self._raw_record(row), row),
             }
+            for row in schedule
+        ]
+        summary = progress_ring_runner._singleton_submission_summary(
+            rows, POINT_PROGRESS_RING_WRITERS, plan["runs_planned"]
+        )
+        self.assertEqual(plan["suite"], "v8-cursor-singleton-submission")
+        self.assertEqual(summary["suite"], "v8-cursor-singleton-submission")
+        self.assertEqual(summary["arms"], list(CURSOR_SINGLETON_SUBMISSION_ARMS))
+        self.assertTrue(summary["complete"])
 
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            args = SimpleNamespace(
-                commit=commit, binary=binary, binary_sha256=binary_sha256,
-                machine_type="c4-standard-16-lssd", ssd_count=2, ssd_gib=750,
-                writers=",".join(map(str, POINT_PROGRESS_RING_WRITERS)),
-                results_dir=root / "results", db_root=root / "db", safe_deadline_epoch=4_000_000_000,
-                candidate_mode="singleton-submission",
-            )
-            with patch.object(progress_ring_runner, "_run_one", side_effect=fake_run_one):
-                status = progress_ring_runner.run_suite(args)
-            self.assertEqual(status, 0)
-            self.assertTrue((args.results_dir / "cursor-singleton-submission-schedule.tsv").is_file())
-            self.assertFalse((args.results_dir / "point-progress-cursor-schedule.tsv").exists())
-            plan = json.loads((args.results_dir / "benchmark-plan.json").read_text(encoding="utf-8"))
-            summary = json.loads((args.results_dir / "summary.json").read_text(encoding="utf-8"))
-            self.assertEqual(plan["suite"], "v8-cursor-singleton-submission")
-            self.assertEqual(summary["suite"], "v8-cursor-singleton-submission")
-            self.assertEqual(summary["arms"], list(CURSOR_SINGLETON_SUBMISSION_ARMS))
-            self.assertTrue(summary["complete"])
-
-    def test_run_suite_writes_coalescing_budget_plan_and_counterbalanced_schedule(self) -> None:
-        binary = Path("scripts/gcp_v8_point_progress_ring_runner.py")
-        binary_sha256 = self._sha256(binary)
+    def test_coalescing_budget_plan_schedule_and_summary_remain_verifiable(self) -> None:
         commit = "a" * 40
-
-        def fake_run_one(**kwargs: object) -> dict[str, object]:
-            row = kwargs["row"]
-            kwargs["on_subprocess_started"]()
-            raw = self._raw_record(row)
-            return {
+        schedule = progress_ring_runner.build_cursor_coalescing_budget_schedule((8, 16))
+        plan = progress_ring_runner.build_cursor_coalescing_budget_plan(
+            machine_type="c4-standard-16-lssd",
+            machine_spec={"vcpus": 16, "ssd_count": 2, "ssd_gib": 750},
+            commit=commit,
+        )
+        rows = [
+            {
                 **row,
                 "source_commit": commit,
-                "binary_sha256": binary_sha256,
+                "binary_sha256": "b" * 64,
                 "exit_code": 0,
                 "duration_seconds": 5.0,
-                **progress_ring_runner._validate_record(raw, row),
+                **progress_ring_runner._validate_record(self._raw_record(row), row),
             }
+            for row in schedule
+        ]
+        summary = progress_ring_runner._coalescing_budget_summary(rows, (8, 16), plan["runs_planned"])
+        self.assertEqual(len(schedule), 30)
+        self.assertEqual({row["writer"] for row in schedule}, {8, 16})
+        self.assertEqual({row["arm"] for row in schedule}, set(CURSOR_COALESCING_BUDGET_ARMS))
+        self.assertEqual(plan["suite"], "v8-cursor-coalescing-budget")
+        self.assertEqual(plan["runs_planned"], 30)
+        self.assertEqual(summary["suite"], "v8-cursor-coalescing-budget")
+        self.assertTrue(summary["complete"])
 
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            args = SimpleNamespace(
-                commit=commit,
-                binary=binary,
-                binary_sha256=binary_sha256,
-                machine_type="c4-standard-16-lssd",
-                ssd_count=2,
-                ssd_gib=750,
-                writers="8,16",
-                results_dir=root / "results",
-                db_root=root / "db",
-                safe_deadline_epoch=4_000_000_000,
-                candidate_mode="coalescing-budget",
-            )
-            with patch.object(progress_ring_runner, "_run_one", side_effect=fake_run_one):
-                status = progress_ring_runner.run_suite(args)
-            self.assertEqual(status, 0)
-            schedule_path = args.results_dir / "cursor-coalescing-budget-schedule.tsv"
-            self.assertTrue(schedule_path.is_file())
-            with schedule_path.open(encoding="utf-8", newline="") as stream:
-                schedule = list(csv.DictReader(stream, delimiter="\t"))
-            self.assertEqual(len(schedule), 30)
-            self.assertEqual({row["writer"] for row in schedule}, {"8", "16"})
-            self.assertEqual({row["arm"] for row in schedule}, set(CURSOR_COALESCING_BUDGET_ARMS))
-            self.assertFalse((args.results_dir / "point-progress-cursor-schedule.tsv").exists())
-            plan = json.loads((args.results_dir / "benchmark-plan.json").read_text(encoding="utf-8"))
-            summary = json.loads((args.results_dir / "summary.json").read_text(encoding="utf-8"))
-            self.assertEqual(plan["suite"], "v8-cursor-coalescing-budget")
-            self.assertEqual(plan["runs_planned"], 30)
-            self.assertEqual(summary["suite"], "v8-cursor-coalescing-budget")
-            self.assertTrue(summary["complete"])
-
-    def test_run_suite_writes_ready_target_plan_and_counterbalanced_schedule(self) -> None:
-        binary = Path("scripts/gcp_v8_point_progress_ring_runner.py")
-        binary_sha256 = self._sha256(binary)
+    def test_ready_target_plan_schedule_and_summary_remain_verifiable(self) -> None:
         commit = "a" * 40
-
-        def fake_run_one(**kwargs: object) -> dict[str, object]:
-            row = kwargs["row"]
-            kwargs["on_subprocess_started"]()
-            raw = self._raw_record(row)
-            return {
+        schedule = progress_ring_runner.build_cursor_coalescing_ready_target_schedule()
+        plan = progress_ring_runner.build_cursor_coalescing_ready_target_plan(
+            machine_type="c4-standard-16-lssd",
+            machine_spec={"vcpus": 16, "ssd_count": 2, "ssd_gib": 750},
+            commit=commit,
+        )
+        rows = [
+            {
                 **row,
                 "source_commit": commit,
-                "binary_sha256": binary_sha256,
+                "binary_sha256": "b" * 64,
                 "exit_code": 0,
                 "duration_seconds": 5.0,
-                **progress_ring_runner._validate_record(raw, row),
+                **progress_ring_runner._validate_record(self._raw_record(row), row),
             }
-
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            args = SimpleNamespace(
-                commit=commit,
-                binary=binary,
-                binary_sha256=binary_sha256,
-                machine_type="c4-standard-16-lssd",
-                ssd_count=2,
-                ssd_gib=750,
-                writers="1,8,16",
-                results_dir=root / "results",
-                db_root=root / "db",
-                safe_deadline_epoch=4_000_000_000,
-                candidate_mode="coalescing-ready-target",
-            )
-            with patch.object(progress_ring_runner, "_run_one", side_effect=fake_run_one):
-                status = progress_ring_runner.run_suite(args)
-            self.assertEqual(status, 0)
-            schedule_path = args.results_dir / "cursor-coalescing-ready-target-schedule.tsv"
-            self.assertTrue(schedule_path.is_file())
-            with schedule_path.open(encoding="utf-8", newline="") as stream:
-                schedule = list(csv.DictReader(stream, delimiter="\t"))
-            self.assertEqual(len(schedule), 60)
-            self.assertEqual({row["writer"] for row in schedule}, {"1", "8", "16"})
-            self.assertEqual({row["arm"] for row in schedule}, set(CURSOR_COALESCING_READY_TARGET_ARMS))
-            self.assertFalse((args.results_dir / "point-progress-cursor-schedule.tsv").exists())
-            plan = json.loads((args.results_dir / "benchmark-plan.json").read_text(encoding="utf-8"))
-            summary = json.loads((args.results_dir / "summary.json").read_text(encoding="utf-8"))
-            self.assertEqual(plan["suite"], "v8-cursor-coalescing-ready-target")
-            self.assertEqual(plan["runs_planned"], 60)
-            self.assertEqual(summary["suite"], "v8-cursor-coalescing-ready-target")
-            self.assertTrue(summary["complete"])
-            self.assertEqual(len(summary["target_usage"]), 12)
+            for row in schedule
+        ]
+        summary = progress_ring_runner._coalescing_ready_target_summary(
+            rows, (1, 8, 16), plan["runs_planned"]
+        )
+        self.assertEqual(len(schedule), 60)
+        self.assertEqual({row["writer"] for row in schedule}, {1, 8, 16})
+        self.assertEqual({row["arm"] for row in schedule}, set(CURSOR_COALESCING_READY_TARGET_ARMS))
+        self.assertEqual(plan["suite"], "v8-cursor-coalescing-ready-target")
+        self.assertEqual(plan["runs_planned"], 60)
+        self.assertEqual(summary["suite"], "v8-cursor-coalescing-ready-target")
+        self.assertTrue(summary["complete"])
+        self.assertEqual(len(summary["target_usage"]), 12)
 
     def test_historical_progress_plan_schemas_remain_verifiable(self) -> None:
         self.assertEqual(

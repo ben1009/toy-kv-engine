@@ -2945,8 +2945,26 @@ def _coalescing_ready_target_small_scan_summary(
     }
 
 
+RETIRED_CANDIDATE_MODES = frozenset({
+    "completion-wake",
+    "singleton-submission",
+    "cursor-publication",
+    "coalescing-budget",
+    "coalescing-ready-target",
+    "coalescing-ready-target-scan",
+    "coalescing-ready-target-small-scan",
+    "point-resource-retirement",
+    "point-resource-retirement-stage-a",
+})
+
+
 def run_suite(args: argparse.Namespace) -> int:
     candidate_mode = getattr(args, "candidate_mode", "cursor")
+    if candidate_mode in RETIRED_CANDIDATE_MODES:
+        raise ValueError(
+            f"{candidate_mode} is a retired historical experiment; "
+            "archived results may be verified but the suite cannot be executed"
+        )
     if len(args.commit) != 40 or any(char not in "0123456789abcdef" for char in args.commit):
         raise ValueError("commit must be a full lowercase 40-character SHA")
     if len(args.binary_sha256) != 64 or any(char not in "0123456789abcdef" for char in args.binary_sha256):
@@ -4192,18 +4210,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    retired_candidate_modes = {
-        "completion-wake",
-        "singleton-submission",
-        "cursor-publication",
-        "coalescing-budget",
-        "coalescing-ready-target",
-        "coalescing-ready-target-scan",
-        "coalescing-ready-target-small-scan",
-        "point-resource-retirement",
-        "point-resource-retirement-stage-a",
-    }
-    if args.candidate_mode in retired_candidate_modes:
+    if args.candidate_mode in RETIRED_CANDIDATE_MODES:
         print(
             f"{args.candidate_mode} is a retired historical experiment; "
             "archived results may be verified but the suite cannot be executed",
