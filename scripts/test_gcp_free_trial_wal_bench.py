@@ -1743,6 +1743,57 @@ class PointProgressRingQualificationTests(unittest.TestCase):
             self.assertEqual(metadata["median_outstanding_tickets_at_sync"], 5.0)
             self.assertEqual(metadata["outstanding_write_sqes_max"], 8)
 
+            # Verify run_suite() writer validation accepts (8, 16) for v8-equal-throughput
+            fake_bin = root / "write-perf"
+            fake_bin.write_bytes(b"fake")
+            fake_sha = hashlib.sha256(b"fake").hexdigest()
+            def _make_mock_popen(cmd, **_kwargs):
+                run_id = Path(cmd[cmd.index("--path") + 1]).name
+                matching = next(r for r in schedule if progress_ring_runner._run_id(r) == run_id)
+                r_raw = self._raw_record(matching)
+                r_raw["params"]["offered_rate_ops_per_sec"] = matching["offered_rate_ops_per_sec"]
+                r_raw["result"]["service_latency"] = {"p50_ms": 0.25, "p95_ms": 0.45, "p99_ms": 0.65}
+                r_raw["result"]["schedule_lag"] = {"p50_ms": 0.01, "p95_ms": 0.03, "p99_ms": 0.05}
+                r_raw["result"]["wal_pipeline"].update({
+                    "inflight_groups_max": 4,
+                    "outstanding_write_sqes_max": 8,
+                    "v8_data_submit_hol_wait_ns": 100,
+                    "v8_data_completion_hol_wait_ns": 200,
+                    "sync_coalesce_wait_ns": 300,
+                    "wal_sync_wait_ns": 400,
+                    "sync_observations": [{
+                        "admitted_ticket_count": 5,
+                        "data_completion_to_frontier_start_ns": 1200,
+                        "coalescing_wait_ns": 2500,
+                    }],
+                })
+                proc = Mock()
+                proc.args = cmd
+                proc.returncode = 0
+                proc.communicate.return_value = (json.dumps(r_raw), "")
+                return proc
+
+            with patch.object(progress_ring_runner.subprocess, "Popen", side_effect=_make_mock_popen):
+                rc = progress_ring_runner.main([
+                    "--binary", str(fake_bin),
+                    "--results-dir", str(root / "suite-results"),
+                    "--db-root", str(root / "suite-db"),
+                    "--writers", "8,16",
+                    "--safe-deadline-epoch", str(int(time.time()) + 3600),
+                    "--commit", "a" * 40,
+                    "--binary-sha256", fake_sha,
+                    "--machine-type", "c4-standard-16-lssd",
+                    "--ssd-count", "2",
+                    "--ssd-gib", "750",
+                    "--candidate-mode", "v8-equal-throughput",
+                ])
+            self.assertEqual(rc, 0)
+            self.assertTrue(
+                progress_ring_runner.verify_v8_equal_throughput_results_directory(
+                    root / "suite-results"
+                )["verified"]
+            )
+
         common = [
             "--project", "test-project", "--zone", "us-central1-c", "--commit", "a" * 40,
             "--machine-type", "c4-standard-16-lssd", "--writers", "8", "16",

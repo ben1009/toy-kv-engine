@@ -3643,6 +3643,7 @@ def run_suite(args: argparse.Namespace) -> int:
         raise ValueError("Cursor qualification requires c4-standard-16-lssd and two Local SSDs")
     writers = tuple(int(value) for value in args.writers.split(","))
     expected_writers = (
+        V8_EQUAL_THROUGHPUT_WRITERS if candidate_mode == "v8-equal-throughput" else
         V7_V8_READY_TARGET_FINAL_WRITERS if candidate_mode == "v7-v8-ready-target-final" else
         POINT_PREALLOCATION_WRITERS if candidate_mode == "v7-v8-point-preallocation" else
         CURSOR_PUBLICATION_WRITERS if candidate_mode == "cursor-publication" else
