@@ -41212,43 +41212,80 @@ mod tests {
             runtime: PitrRuntimeOptions::default(),
         })?;
 
-        for round in 0..4u32 {
-            // Retain an Arc to the active memtable across the seal so its Drop
-            // cannot mask an unquiesced background extent worker.
-            let retained_source = engine.inner.state.load().memtable.clone();
-            let source_wal_path = retained_source
-                .wal_path()
-                .expect("active V8 WAL path")
-                .to_path_buf();
-            let source_segment_id = retained_source.v8_active_boundaries()?.1.segment_id;
-            for i in 0..16u32 {
-                let key = format!("seal-k-{round:02}-{i:02}").into_bytes();
-                engine.put(&key, b"point-payload")?;
-            }
-            let crate::pitr::api::RecoveryPointOutcome::Durable(_) =
-                engine.create_recovery_point()?
-            else {
-                anyhow::bail!("expected durable recovery point");
-            };
-            let manifest = engine.inner.pitr_state.lock().clone();
-            let obligation = manifest
-                .obligations
-                .get(&source_segment_id)
-                .expect("sealed obligation recorded in manifest");
-            let expected_sealed_end = obligation
-                .immutable_boundary
-                .expect("immutable boundary recorded on sealed obligation")
-                .sealed_end;
-            let sealed_len = std::fs::metadata(&source_wal_path)?.len();
-            assert_eq!(sealed_len, expected_sealed_end);
-            std::thread::sleep(std::time::Duration::from_millis(25));
-            assert_eq!(
-                std::fs::metadata(&source_wal_path)?.len(),
-                expected_sealed_end,
-                "sealed WAL file length must not change after PITR seal"
-            );
-            drop(retained_source);
+        // Retain an Arc to the active memtable across the seal so its Drop
+        // cannot mask an unquiesced background extent worker.
+        let retained_source = engine.inner.state.load().memtable.clone();
+        let source_effective = retained_source
+            .v8_effective_config_for_test()
+            .expect("active V8 WAL exposes effective config");
+        if source_effective.extent_policy
+            != crate::wal::v8::leader::WalV8ExtentPreparationPolicy::PointOnlyLookahead
+        {
+            // PointOnlyLookahead requires O_DIRECT + ext-family filesystem; skip
+            // deterministically on filesystems where lookahead is ineligible.
+            engine.close()?;
+            return Ok(());
         }
+        let source_wal_path = retained_source
+            .wal_path()
+            .expect("active V8 WAL path")
+            .to_path_buf();
+        let source_segment_id = retained_source.v8_active_boundaries()?.1.segment_id;
+
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let entered_worker = Arc::clone(&entered);
+        let release_worker = Arc::clone(&release);
+        retained_source.set_v8_lookahead_worker_hook_for_test(Some(Arc::new(move || {
+            entered_worker.wait();
+            release_worker.wait();
+        })));
+
+        // Trigger Point-only Lookahead: `put` returns once the requested prefix
+        // is ready, while the background worker blocks inside the slack zero-fill loop.
+        engine.put(b"seal-k-00", b"point-payload")?;
+        entered.wait();
+
+        let seal_completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seal_completed_thread = Arc::clone(&seal_completed);
+        let seal_engine = Arc::clone(&engine);
+        let seal_handle = std::thread::spawn(move || -> anyhow::Result<()> {
+            let outcome = seal_engine.create_recovery_point()?;
+            anyhow::ensure!(matches!(
+                outcome,
+                crate::pitr::api::RecoveryPointOutcome::Durable(_)
+            ));
+            seal_completed_thread.store(true, std::sync::atomic::Ordering::Release);
+            Ok(())
+        });
+
+        // Give the seal thread time to reach `quiesce_extent_preparation`: it
+        // must remain blocked while the background lookahead worker is active.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(
+            !seal_completed.load(std::sync::atomic::Ordering::Acquire),
+            "PITR seal must wait for the background extent lookahead worker before truncating"
+        );
+
+        release.wait();
+        seal_handle.join().expect("seal thread panicked")?;
+        assert!(seal_completed.load(std::sync::atomic::Ordering::Acquire));
+
+        let manifest = engine.inner.pitr_state.lock().clone();
+        let obligation = manifest
+            .obligations
+            .get(&source_segment_id)
+            .expect("sealed obligation recorded in manifest");
+        let expected_sealed_end = obligation
+            .immutable_boundary
+            .expect("immutable boundary recorded on sealed obligation")
+            .sealed_end;
+        assert_eq!(
+            std::fs::metadata(&source_wal_path)?.len(),
+            expected_sealed_end,
+            "sealed WAL file length must equal sealed_end after quiesce and truncation"
+        );
+        drop(retained_source);
 
         engine.close()?;
         Ok(())

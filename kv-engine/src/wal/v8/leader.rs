@@ -387,38 +387,43 @@ struct WalV8RetirementObservation {
     batch_point_frontier_credits: bool,
 }
 
+#[cfg(test)]
+type WalV8LookaheadWorkerHook = Arc<Mutex<Option<Arc<dyn Fn() + Send + Sync>>>>;
+
 struct WalV8ExtentWorkerHandle<T> {
-    request_sender: Option<mpsc::Sender<T>>,
-    worker: Option<thread::JoinHandle<()>>,
+    request_sender: Mutex<Option<mpsc::Sender<T>>>,
+    worker: Mutex<Option<thread::JoinHandle<()>>>,
+    /// Serializes `quiesce` callers so concurrent callers both observe worker exit.
+    join_lock: Mutex<()>,
 }
 
 impl<T: Send + Sync + 'static> WalV8ExtentWorkerHandle<T> {
     fn new(
         request_sender: Option<mpsc::Sender<T>>,
         worker: Option<thread::JoinHandle<()>>,
-    ) -> Mutex<Self> {
-        Mutex::new(Self {
-            request_sender,
-            worker,
-        })
+    ) -> Self {
+        Self {
+            request_sender: Mutex::new(request_sender),
+            worker: Mutex::new(worker),
+            join_lock: Mutex::new(()),
+        }
     }
 
-    fn send(handle: &Mutex<Self>, msg: T, unavailable: &str, stopped: &str) -> Result<()> {
-        let guard = handle.lock();
-        let sender = guard
-            .request_sender
-            .as_ref()
-            .with_context(|| unavailable.to_owned())?;
+    fn send(&self, msg: T, unavailable: &str, stopped: &str) -> Result<()> {
+        let guard = self.request_sender.lock();
+        let sender = guard.as_ref().with_context(|| unavailable.to_owned())?;
         sender.send(msg).with_context(|| stopped.to_owned())?;
         Ok(())
     }
 
-    fn quiesce(handle: &Mutex<Self>, panic_msg: &str) {
-        let (sender, worker) = {
-            let mut guard = handle.lock();
-            (guard.request_sender.take(), guard.worker.take())
-        };
+    /// Close the request channel and join the background worker.
+    /// Serialized by `join_lock` so concurrent callers never return before
+    /// the worker thread has exited.
+    fn quiesce(&self, panic_msg: &str) {
+        let _join_guard = self.join_lock.lock();
+        let sender = self.request_sender.lock().take();
         drop(sender);
+        let worker = self.worker.lock().take();
         if let Some(worker) = worker
             && worker.join().is_err()
         {
@@ -436,7 +441,7 @@ struct WalV8SlidingExtentPreparation {
     mode: WalExtentPreparationMode,
     state: Arc<Mutex<WalV8SlidingExtentPreparationState>>,
     prepared: Arc<Condvar>,
-    worker_handle: Mutex<WalV8ExtentWorkerHandle<u64>>,
+    worker_handle: WalV8ExtentWorkerHandle<u64>,
 }
 
 #[cfg(feature = "bench")]
@@ -1557,10 +1562,8 @@ impl WalV8SlidingExtentPreparation {
     }
 
     fn quiesce(&self) {
-        WalV8ExtentWorkerHandle::quiesce(
-            &self.worker_handle,
-            "V8 background extent initializer panicked",
-        );
+        self.worker_handle
+            .quiesce("V8 background extent initializer panicked");
     }
 
     fn ensure_prepared_through(&self, required_end: u64) -> Result<()> {
@@ -1636,8 +1639,7 @@ impl WalV8SlidingExtentPreparation {
             return Ok(());
         }
         if required_end > state.requested_end {
-            WalV8ExtentWorkerHandle::send(
-                &self.worker_handle,
+            self.worker_handle.send(
                 required_end,
                 "V8 background extent initializer is unavailable",
                 "V8 background extent initializer stopped unexpectedly",
@@ -2089,7 +2091,9 @@ struct WalV8ExtentPreallocator {
     state: Arc<Mutex<WalV8ExtentPreallocationState>>,
     prepared: Arc<Condvar>,
     preparation_lock: Arc<Mutex<()>>,
-    worker_handle: Mutex<WalV8ExtentWorkerHandle<()>>,
+    worker_handle: WalV8ExtentWorkerHandle<()>,
+    #[cfg(test)]
+    worker_hook_for_test: WalV8LookaheadWorkerHook,
 }
 
 impl WalV8ExtentPreallocator {
@@ -2279,6 +2283,8 @@ impl WalV8ExtentPreallocator {
         }));
         let prepared = Arc::new(Condvar::new());
         let preparation_lock = Arc::new(Mutex::new(()));
+        #[cfg(test)]
+        let worker_hook_for_test: WalV8LookaheadWorkerHook = Arc::new(Mutex::new(None));
         let (request_sender, worker) = if lookahead {
             let worker_file = data_file
                 .try_clone()
@@ -2286,6 +2292,8 @@ impl WalV8ExtentPreallocator {
             let worker_state = Arc::clone(&state);
             let worker_prepared = Arc::clone(&prepared);
             let worker_preparation_lock = Arc::clone(&preparation_lock);
+            #[cfg(test)]
+            let worker_hook = Arc::clone(&worker_hook_for_test);
             let worker_owner = Arc::clone(
                 reservation_owner
                     .as_ref()
@@ -2307,6 +2315,8 @@ impl WalV8ExtentPreallocator {
                             max_file_size,
                             window_bytes,
                             point_only_lookahead,
+                            #[cfg(test)]
+                            worker_hook,
                         }
                         .run()
                     }));
@@ -2342,14 +2352,19 @@ impl WalV8ExtentPreallocator {
             prepared,
             preparation_lock,
             worker_handle: WalV8ExtentWorkerHandle::new(request_sender, worker),
+            #[cfg(test)]
+            worker_hook_for_test,
         })
     }
 
+    #[cfg(test)]
+    fn set_worker_hook_for_test(&self, hook: Option<Arc<dyn Fn() + Send + Sync>>) {
+        *self.worker_hook_for_test.lock() = hook;
+    }
+
     fn quiesce(&self) {
-        WalV8ExtentWorkerHandle::quiesce(
-            &self.worker_handle,
-            "V8 extent lookahead worker panicked",
-        );
+        self.worker_handle
+            .quiesce("V8 extent lookahead worker panicked");
     }
 
     fn register_data_range(
@@ -2642,8 +2657,7 @@ impl WalV8ExtentPreallocator {
         }
 
         if !state.background_request_pending {
-            WalV8ExtentWorkerHandle::send(
-                &self.worker_handle,
+            self.worker_handle.send(
                 (),
                 "V8 extent lookahead worker is unavailable",
                 "V8 extent lookahead worker stopped unexpectedly",
@@ -2827,6 +2841,8 @@ struct WalV8ExtentLookaheadWorker {
     max_file_size: u64,
     window_bytes: u64,
     point_only_lookahead: bool,
+    #[cfg(test)]
+    worker_hook: WalV8LookaheadWorkerHook,
 }
 
 impl WalV8ExtentLookaheadWorker {
@@ -2842,6 +2858,8 @@ impl WalV8ExtentLookaheadWorker {
             max_file_size,
             window_bytes,
             point_only_lookahead,
+            #[cfg(test)]
+            worker_hook,
         } = self;
         let chunk_bytes = WAL_V8_EXTENT_PREPARATION_CHUNK_BYTES as u64;
         #[cfg(feature = "bench")]
@@ -2993,6 +3011,13 @@ impl WalV8ExtentLookaheadWorker {
                     );
                     drop(state_guard);
                     drop(_extent_state_timer);
+
+                    #[cfg(test)]
+                    if initialized_start >= required_end
+                        && let Some(hook) = worker_hook.lock().take()
+                    {
+                        hook();
+                    }
 
                     let initialization_started = Instant::now();
                     initialize_v8_extent_chunk(&state, initialized_start, initialized_end, || {
@@ -7858,6 +7883,16 @@ impl WalV8ParallelWriter {
         #[cfg(feature = "bench")]
         if let Some(preparation) = &self.io.extent_preparation {
             preparation.quiesce();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_lookahead_worker_hook_for_test(
+        &self,
+        hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) {
+        if let Some(preallocator) = &self.io.extent_preallocator {
+            preallocator.set_worker_hook_for_test(hook);
         }
     }
 

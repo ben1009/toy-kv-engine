@@ -3587,6 +3587,16 @@ impl MemTable {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_v8_lookahead_worker_hook_for_test(
+        &self,
+        hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) {
+        if let Some(wal) = &self.wal {
+            wal.set_v8_lookahead_worker_hook_for_test(hook);
+        }
+    }
+
     #[allow(dead_code)]
     pub(crate) fn wal_v7_seal_index(&self) -> Option<Vec<u64>> {
         self.wal_v7_seal_index

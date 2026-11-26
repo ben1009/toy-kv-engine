@@ -1906,6 +1906,16 @@ impl Wal {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_v8_lookahead_worker_hook_for_test(
+        &self,
+        hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) {
+        if let Some(writer) = &self.v8_parallel {
+            writer.set_lookahead_worker_hook_for_test(hook);
+        }
+    }
+
     /// Return the writer's latest v7 FRONTIER after its durability barrier
     /// completes. The caller must stop admission before capturing this value.
     pub(crate) fn v7_frontier_cursor(&self) -> Result<WalV7FrontierCursor> {
