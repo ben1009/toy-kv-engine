@@ -339,6 +339,14 @@ pub struct WriteProfile {
     wal_v8_follower_waits: Mutex<Vec<WalV8FollowerWaitObservation>>,
     #[cfg(feature = "bench")]
     wal_v8_follower_wait_dropped_samples: AtomicU64,
+    #[cfg(feature = "bench")]
+    wal_v8_publish_notify_all_count: AtomicU64,
+    #[cfg(feature = "bench")]
+    wal_v8_publish_notify_skipped_count: AtomicU64,
+    #[cfg(feature = "bench")]
+    wal_v8_driver_drop_notify_all_count: AtomicU64,
+    #[cfg(feature = "bench")]
+    wal_v8_driver_drop_notify_one_count: AtomicU64,
     /// Remaining reservations in the bounded Point-write ordering trace.
     #[cfg(feature = "bench")]
     commit_order_trace_remaining: AtomicU64,
@@ -886,6 +894,18 @@ pub struct WalV8DurabilityDiagnosticCounts {
     pub sampled_advances: u64,
     /// Selected phase observations not retained due to a failed cycle or sample cap.
     pub dropped_samples: u64,
+    /// `durable_published.notify_all()` calls from `publish_durable_frontier_with_metrics` while
+    /// sampling was enabled.
+    pub publish_notify_all_count: u64,
+    /// Skipped `publish_durable_frontier_with_metrics` wakeups when no parked follower was covered
+    /// while sampling was enabled.
+    pub publish_notify_skipped_count: u64,
+    /// `durable_published.notify_all()` calls from `WalV8DurabilityDriver::drop` while sampling
+    /// was enabled.
+    pub driver_drop_notify_all_count: u64,
+    /// `durable_published.notify_one()` handoffs from `WalV8DurabilityDriver::drop` while sampling
+    /// was enabled.
+    pub driver_drop_notify_one_count: u64,
 }
 
 /// One sampled caller that waited for the current V8 durability driver.
@@ -1882,7 +1902,43 @@ impl WriteProfile {
             completed_advances: self.wal_v8_durability_completed_advance_sequence(),
             sampled_advances: self.wal_v8_durability_phase_sample_count(),
             dropped_samples: self.wal_v8_durability_phase_dropped_samples(),
+            publish_notify_all_count: self
+                .wal_v8_publish_notify_all_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+            publish_notify_skipped_count: self
+                .wal_v8_publish_notify_skipped_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+            driver_drop_notify_all_count: self
+                .wal_v8_driver_drop_notify_all_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+            driver_drop_notify_one_count: self
+                .wal_v8_driver_drop_notify_one_count
+                .load(std::sync::atomic::Ordering::Relaxed),
         }
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn record_wal_v8_publish_notify_all(&self) {
+        self.wal_v8_publish_notify_all_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn record_wal_v8_publish_notify_skipped(&self) {
+        self.wal_v8_publish_notify_skipped_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn record_wal_v8_driver_drop_notify_all(&self) {
+        self.wal_v8_driver_drop_notify_all_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn record_wal_v8_driver_drop_notify_one(&self) {
+        self.wal_v8_driver_drop_notify_one_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     #[cfg(feature = "bench")]
