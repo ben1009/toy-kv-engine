@@ -387,6 +387,46 @@ struct WalV8RetirementObservation {
     batch_point_frontier_credits: bool,
 }
 
+struct WalV8ExtentWorkerHandle<T> {
+    request_sender: Option<mpsc::Sender<T>>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl<T: Send + Sync + 'static> WalV8ExtentWorkerHandle<T> {
+    fn new(
+        request_sender: Option<mpsc::Sender<T>>,
+        worker: Option<thread::JoinHandle<()>>,
+    ) -> Mutex<Self> {
+        Mutex::new(Self {
+            request_sender,
+            worker,
+        })
+    }
+
+    fn send(handle: &Mutex<Self>, msg: T, unavailable: &str, stopped: &str) -> Result<()> {
+        let guard = handle.lock();
+        let sender = guard
+            .request_sender
+            .as_ref()
+            .with_context(|| unavailable.to_owned())?;
+        sender.send(msg).with_context(|| stopped.to_owned())?;
+        Ok(())
+    }
+
+    fn quiesce(handle: &Mutex<Self>, panic_msg: &str) {
+        let (sender, worker) = {
+            let mut guard = handle.lock();
+            (guard.request_sender.take(), guard.worker.take())
+        };
+        drop(sender);
+        if let Some(worker) = worker
+            && worker.join().is_err()
+        {
+            log::error!("{panic_msg}");
+        }
+    }
+}
+
 #[cfg(feature = "bench")]
 struct WalV8SlidingExtentPreparation {
     data_file: File,
@@ -396,8 +436,7 @@ struct WalV8SlidingExtentPreparation {
     mode: WalExtentPreparationMode,
     state: Arc<Mutex<WalV8SlidingExtentPreparationState>>,
     prepared: Arc<Condvar>,
-    request_sender: Option<mpsc::Sender<u64>>,
-    worker: Option<thread::JoinHandle<()>>,
+    worker_handle: Mutex<WalV8ExtentWorkerHandle<u64>>,
 }
 
 #[cfg(feature = "bench")]
@@ -484,6 +523,18 @@ thread_local! {
 /// process-wide environment variables observed by parallel tests.
 #[cfg(test)]
 pub(crate) fn with_candidate_profile_for_test<T>(run: impl FnOnce() -> T) -> T {
+    with_v8_profile_for_test(WalV8Profile::Candidate, run)
+}
+
+/// Run an engine-level test with the Legacy V8 profile without mutating
+/// process-wide environment variables observed by parallel tests.
+#[cfg(test)]
+pub(crate) fn with_legacy_profile_for_test<T>(run: impl FnOnce() -> T) -> T {
+    with_v8_profile_for_test(WalV8Profile::Legacy, run)
+}
+
+#[cfg(test)]
+fn with_v8_profile_for_test<T>(profile: WalV8Profile, run: impl FnOnce() -> T) -> T {
     struct Restore(Option<WalV8Profile>);
 
     impl Drop for Restore {
@@ -492,8 +543,7 @@ pub(crate) fn with_candidate_profile_for_test<T>(run: impl FnOnce() -> T) -> T {
         }
     }
 
-    let previous =
-        WAL_V8_TEST_PROFILE_OVERRIDE.with(|current| current.replace(Some(WalV8Profile::Candidate)));
+    let previous = WAL_V8_TEST_PROFILE_OVERRIDE.with(|current| current.replace(Some(profile)));
     let _restore = Restore(previous);
     run()
 }
@@ -1502,9 +1552,15 @@ impl WalV8SlidingExtentPreparation {
             mode,
             state,
             prepared,
-            request_sender,
-            worker,
+            worker_handle: WalV8ExtentWorkerHandle::new(request_sender, worker),
         })
+    }
+
+    fn quiesce(&self) {
+        WalV8ExtentWorkerHandle::quiesce(
+            &self.worker_handle,
+            "V8 background extent initializer panicked",
+        );
     }
 
     fn ensure_prepared_through(&self, required_end: u64) -> Result<()> {
@@ -1580,13 +1636,12 @@ impl WalV8SlidingExtentPreparation {
             return Ok(());
         }
         if required_end > state.requested_end {
-            let sender = self
-                .request_sender
-                .as_ref()
-                .context("V8 background extent initializer is unavailable")?;
-            sender
-                .send(required_end)
-                .context("V8 background extent initializer stopped unexpectedly")?;
+            WalV8ExtentWorkerHandle::send(
+                &self.worker_handle,
+                required_end,
+                "V8 background extent initializer is unavailable",
+                "V8 background extent initializer stopped unexpectedly",
+            )?;
             state.requested_end = required_end;
         }
 
@@ -2034,8 +2089,7 @@ struct WalV8ExtentPreallocator {
     state: Arc<Mutex<WalV8ExtentPreallocationState>>,
     prepared: Arc<Condvar>,
     preparation_lock: Arc<Mutex<()>>,
-    request_sender: Option<mpsc::Sender<()>>,
-    worker: Option<thread::JoinHandle<()>>,
+    worker_handle: Mutex<WalV8ExtentWorkerHandle<()>>,
 }
 
 impl WalV8ExtentPreallocator {
@@ -2287,9 +2341,15 @@ impl WalV8ExtentPreallocator {
             state,
             prepared,
             preparation_lock,
-            request_sender,
-            worker,
+            worker_handle: WalV8ExtentWorkerHandle::new(request_sender, worker),
         })
+    }
+
+    fn quiesce(&self) {
+        WalV8ExtentWorkerHandle::quiesce(
+            &self.worker_handle,
+            "V8 extent lookahead worker panicked",
+        );
     }
 
     fn register_data_range(
@@ -2582,13 +2642,12 @@ impl WalV8ExtentPreallocator {
         }
 
         if !state.background_request_pending {
-            let sender = self
-                .request_sender
-                .as_ref()
-                .context("V8 extent lookahead worker is unavailable")?;
-            sender
-                .send(())
-                .context("V8 extent lookahead worker stopped unexpectedly")?;
+            WalV8ExtentWorkerHandle::send(
+                &self.worker_handle,
+                (),
+                "V8 extent lookahead worker is unavailable",
+                "V8 extent lookahead worker stopped unexpectedly",
+            )?;
             state.background_request_pending = true;
         }
         state.requested_end = required_end;
@@ -2753,12 +2812,7 @@ impl WalV8ExtentPreallocator {
 
 impl Drop for WalV8ExtentPreallocator {
     fn drop(&mut self) {
-        self.request_sender.take();
-        if let Some(worker) = self.worker.take()
-            && worker.join().is_err()
-        {
-            log::error!("V8 extent lookahead worker panicked");
-        }
+        self.quiesce();
     }
 }
 
@@ -3140,12 +3194,7 @@ fn is_ext_family_filesystem(file: &File) -> bool {
 #[cfg(feature = "bench")]
 impl Drop for WalV8SlidingExtentPreparation {
     fn drop(&mut self) {
-        self.request_sender.take();
-        if let Some(worker) = self.worker.take()
-            && worker.join().is_err()
-        {
-            log::error!("V8 background extent initializer panicked");
-        }
+        self.quiesce();
     }
 }
 
@@ -7800,6 +7849,16 @@ impl WalV8ParallelWriter {
 
     pub(crate) fn logical_tail(&self) -> u64 {
         self.coordinator.last_frontier_end()
+    }
+
+    pub(crate) fn quiesce_extent_preparation(&self) {
+        if let Some(preallocator) = &self.io.extent_preallocator {
+            preallocator.quiesce();
+        }
+        #[cfg(feature = "bench")]
+        if let Some(preparation) = &self.io.extent_preparation {
+            preparation.quiesce();
+        }
     }
 
     pub(crate) fn active_boundaries(

@@ -1900,6 +1900,12 @@ impl Wal {
             .image_len()
     }
 
+    pub(crate) fn quiesce_v8_extent_preparation(&self) {
+        if let Some(writer) = &self.v8_parallel {
+            writer.quiesce_extent_preparation();
+        }
+    }
+
     /// Return the writer's latest v7 FRONTIER after its durability barrier
     /// completes. The caller must stop admission before capturing this value.
     pub(crate) fn v7_frontier_cursor(&self) -> Result<WalV7FrontierCursor> {

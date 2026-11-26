@@ -3581,6 +3581,12 @@ impl MemTable {
         self.wal_v8_reservation_owner.clone()
     }
 
+    pub(crate) fn quiesce_v8_wal_extent_preparation(&self) {
+        if let Some(wal) = &self.wal {
+            wal.quiesce_v8_extent_preparation();
+        }
+    }
+
     #[allow(dead_code)]
     pub(crate) fn wal_v7_seal_index(&self) -> Option<Vec<u64>> {
         self.wal_v7_seal_index

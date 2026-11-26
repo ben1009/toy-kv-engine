@@ -42,8 +42,9 @@ Based on the saturated throughput/latency parity with V7 (`48.8k` puts/s, `0.815
 
 ### 2.3 Safety & Functional Verification
 
-- **Non-bench & ext4**: Default-feature (`--lib`) and `--all-features` tests run on local ext4 (`wal::v8::leader::tests`, `lsm_storage::tests::v8_candidate_*`) verify Cursor, Direct completion, Direct FRONTIER + Buffered fallback, Point-only Lookahead eligibility, Stage A preallocation, and rotation config inheritance.
-- **ext4 Crashpoint**: `lsm_storage::tests::failpoint_v8_candidate_profile_crash_recovery` verifies real Lookahead initialization (`initialized_bytes > 0`) and crash recovery on ext4.
+- **Non-bench & ext4**: Default-feature (`--lib`) and `--all-features` tests run on local ext4 (`wal::v8::leader::tests`, `lsm_storage::tests::v8_candidate_*`, `v8_pitr_rotation_inherits_requested_config_and_reopen_reparses`) verify Cursor, Direct completion, Direct FRONTIER + Buffered fallback, Point-only Lookahead eligibility, Stage A preallocation, rotation inheritance, and reopen re-parsing. Real `initialized_bytes > 0` on ext4 RAID0 is verified in the GCP D2 qualification (`413,138,944` / `405,798,912` bytes at Point16).
+- **ext4 Crashpoint**: `lsm_storage::tests::failpoint_v8_candidate_profile_crash_recovery` verifies Candidate profile crash recovery at durability/publication boundaries on ext4.
+- **PITR Seal Quiesce**: `lsm_storage::tests::v8_pitr_seal_quiesces_extent_preparation_and_keeps_sealed_length` and `backup::tests::pitr_restore_cancellation_discards_the_staging_directory` verify that PITR sealing quiesces background extent preparation before truncating/syncing the sealed predecessor so its file length remains equal to `boundary.sealed_end`.
 - **Mixed Workload**: `wal::v8::leader::tests::v8_candidate_mixed_target8_falls_back_to_dynamic_on_real_admission` verifies that concurrent Point + Batch admissions fall back to Dynamic coalescing without Target8 early exit.
 - **PITR / Recovery**: `v8_candidate_profile_point_mixed_and_rotations` and `v8_candidate_profile_auto_pitr_rotation_inherits_config` verify PITR barriers, manual/automatic rotations, and full data recovery.
 

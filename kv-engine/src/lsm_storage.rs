@@ -21792,6 +21792,10 @@ impl LsmStorageInner {
                 && source_memtable.v8_active_boundaries()?.1 == prepared.seal.boundary.active,
             "v8 seal preparation no longer names the current source WAL"
         );
+        // Quiesce any background extent lookahead/preparation worker on the
+        // stopped source WAL before truncating to `sealed_end`, so no in-flight
+        // fallocate or zero-fill chunk can re-extend the sealed predecessor.
+        source_memtable.quiesce_v8_wal_extent_preparation();
         let sealed_end = prepared.seal.boundary.sealed_end;
         let wal = std::fs::OpenOptions::new()
             .write(true)
@@ -41042,7 +41046,6 @@ mod tests {
         use crate::pitr::api::{PersistedPitrConfig, PitrOptions, PitrRuntimeOptions};
         use crate::tests::harness::is_io_uring_unavailable_error;
         use crate::wal::WalIoMode;
-        use crate::wal::v8::leader::with_cursor_direct_completion_for_test;
         use crate::wal::v8::parallel::WalV8ProgressMode;
 
         const MAX_SEGMENT_BYTES: u64 = 4 * 1024 * 1024;
@@ -41056,39 +41059,32 @@ mod tests {
             ..LsmStorageOptions::default_for_test()
         };
 
-        let (engine, source_effective) = with_cursor_direct_completion_for_test(|| {
-            let engine = match KvEngine::open_with_wal_io_mode(
-                &database,
-                options.clone(),
-                WalIoMode::Parallel,
-            ) {
-                Ok(engine) => engine,
-                Err(error) if is_io_uring_unavailable_error(&error) => {
-                    return Ok((None, None));
-                }
-                Err(error) => return Err(error),
-            };
-            engine.enable_pitr(PitrOptions {
-                repository: repository.clone(),
-                config: PersistedPitrConfig {
-                    archive_interval: std::time::Duration::from_millis(100),
-                    max_segment_bytes: MAX_SEGMENT_BYTES,
-                    max_unarchived_bytes: 16 * 1024 * 1024,
-                    max_source_spool_bytes: 64 * 1024 * 1024,
-                },
-                runtime: PitrRuntimeOptions::default(),
-            })?;
-            let source = engine.inner.state.load().memtable.clone();
-            let source_effective = source
-                .v8_effective_config_for_test()
-                .expect("active V8 WAL exposes effective config");
-            assert!(source.uses_v8_cursor_direct_completion());
-            Ok((Some(engine), Some(source_effective)))
-        })?;
-        let Some(engine) = engine else {
-            return Ok(());
+        // 1. Open with default (Candidate), verify manual and automatic PITR
+        // rotations inherit Candidate.
+        let engine = match KvEngine::open_with_wal_io_mode(
+            &database,
+            options.clone(),
+            WalIoMode::Parallel,
+        ) {
+            Ok(engine) => engine,
+            Err(error) if is_io_uring_unavailable_error(&error) => return Ok(()),
+            Err(error) => return Err(error),
         };
-        let source_effective = source_effective.expect("source effective config");
+        engine.enable_pitr(PitrOptions {
+            repository: repository.clone(),
+            config: PersistedPitrConfig {
+                archive_interval: std::time::Duration::from_millis(100),
+                max_segment_bytes: MAX_SEGMENT_BYTES,
+                max_unarchived_bytes: 16 * 1024 * 1024,
+                max_source_spool_bytes: 64 * 1024 * 1024,
+            },
+            runtime: PitrRuntimeOptions::default(),
+        })?;
+        let source = engine.inner.state.load().memtable.clone();
+        let source_effective = source
+            .v8_effective_config_for_test()
+            .expect("active V8 WAL exposes effective config");
+        assert!(source.uses_v8_cursor_direct_completion());
         assert_eq!(source_effective.progress_mode, WalV8ProgressMode::Cursor);
         assert!(source_effective.direct_completion_enabled);
         assert!(source_effective.has_reservation_owner);
@@ -41140,23 +41136,121 @@ mod tests {
         drop(source);
         drop(engine);
 
-        // Reopen without the override: recovery re-parses environment/defaults
-        // because requested config is not serialized on disk.
+        // 2. Reopen with explicit Legacy override: recovery re-parses and uses Legacy.
+        let mut legacy_options = options.clone();
+        legacy_options.pitr_repository = Some(repository.clone());
+        let legacy_reopened = crate::wal::v8::leader::with_legacy_profile_for_test(|| {
+            KvEngine::open_with_wal_io_mode(&database, legacy_options, WalIoMode::Parallel)
+        })?;
+        let legacy_active = legacy_reopened.inner.state.load().memtable.clone();
+        assert!(!legacy_active.uses_v8_cursor_direct_completion());
+        let legacy_effective = legacy_active
+            .v8_effective_config_for_test()
+            .expect("legacy-reopened V8 WAL exposes effective config");
+        assert_eq!(legacy_effective.progress_mode, WalV8ProgressMode::Eager);
+        assert!(!legacy_effective.direct_completion_enabled);
+        assert!(legacy_effective.has_reservation_owner);
+        assert_eq!(legacy_reopened.get(b"k1")?.as_deref(), Some(&b"v1"[..]));
+        legacy_reopened.put(b"k2", b"v2")?;
+        drop(legacy_active);
+        legacy_reopened.close()?;
+        drop(legacy_reopened);
+
+        // 3. Reopen without override: recovery re-parses defaults back to Candidate.
         let mut reopen_options = options;
         reopen_options.pitr_repository = Some(repository);
         let reopened =
             KvEngine::open_with_wal_io_mode(&database, reopen_options, WalIoMode::Parallel)?;
         let reopened_active = reopened.inner.state.load().memtable.clone();
-        assert!(!reopened_active.uses_v8_cursor_direct_completion());
+        assert!(reopened_active.uses_v8_cursor_direct_completion());
         let reopened_effective = reopened_active
             .v8_effective_config_for_test()
             .expect("reopened V8 WAL exposes effective config");
-        assert_eq!(reopened_effective.progress_mode, WalV8ProgressMode::Eager);
-        assert!(!reopened_effective.direct_completion_enabled);
+        assert_eq!(reopened_effective.progress_mode, WalV8ProgressMode::Cursor);
+        assert!(reopened_effective.direct_completion_enabled);
         assert!(reopened_effective.has_reservation_owner);
         assert_eq!(reopened.get(b"k1")?.as_deref(), Some(&b"v1"[..]));
+        assert_eq!(reopened.get(b"k2")?.as_deref(), Some(&b"v2"[..]));
         reopened.close()?;
 
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn v8_pitr_seal_quiesces_extent_preparation_and_keeps_sealed_length() -> anyhow::Result<()> {
+        use crate::pitr::api::{PersistedPitrConfig, PitrOptions, PitrRuntimeOptions};
+        use crate::tests::harness::is_io_uring_unavailable_error;
+        use crate::wal::WalIoMode;
+
+        let directory = tempdir()?;
+        let database = directory.path().join("db");
+        let repository = directory.path().join("repository");
+        let options = LsmStorageOptions {
+            enable_wal: true,
+            target_sst_size: 1 << 30,
+            ..LsmStorageOptions::default_for_test()
+        };
+
+        let engine = match KvEngine::open_with_wal_io_mode(
+            &database,
+            options.clone(),
+            WalIoMode::Parallel,
+        ) {
+            Ok(engine) => engine,
+            Err(error) if is_io_uring_unavailable_error(&error) => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        engine.enable_pitr(PitrOptions {
+            repository: repository.clone(),
+            config: PersistedPitrConfig {
+                archive_interval: std::time::Duration::from_secs(3600),
+                max_segment_bytes: 2 * 1024 * 1024,
+                max_unarchived_bytes: 8 * 1024 * 1024,
+                max_source_spool_bytes: 32 * 1024 * 1024,
+            },
+            runtime: PitrRuntimeOptions::default(),
+        })?;
+
+        for round in 0..4u32 {
+            // Retain an Arc to the active memtable across the seal so its Drop
+            // cannot mask an unquiesced background extent worker.
+            let retained_source = engine.inner.state.load().memtable.clone();
+            let source_wal_path = retained_source
+                .wal_path()
+                .expect("active V8 WAL path")
+                .to_path_buf();
+            let source_segment_id = retained_source.v8_active_boundaries()?.1.segment_id;
+            for i in 0..16u32 {
+                let key = format!("seal-k-{round:02}-{i:02}").into_bytes();
+                engine.put(&key, b"point-payload")?;
+            }
+            let crate::pitr::api::RecoveryPointOutcome::Durable(_) =
+                engine.create_recovery_point()?
+            else {
+                anyhow::bail!("expected durable recovery point");
+            };
+            let manifest = engine.inner.pitr_state.lock().clone();
+            let obligation = manifest
+                .obligations
+                .get(&source_segment_id)
+                .expect("sealed obligation recorded in manifest");
+            let expected_sealed_end = obligation
+                .immutable_boundary
+                .expect("immutable boundary recorded on sealed obligation")
+                .sealed_end;
+            let sealed_len = std::fs::metadata(&source_wal_path)?.len();
+            assert_eq!(sealed_len, expected_sealed_end);
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            assert_eq!(
+                std::fs::metadata(&source_wal_path)?.len(),
+                expected_sealed_end,
+                "sealed WAL file length must not change after PITR seal"
+            );
+            drop(retained_source);
+        }
+
+        engine.close()?;
         Ok(())
     }
 
