@@ -40,7 +40,21 @@
 - Moving `encode_internal_key()` and `frontier_resources` registration out of `write_lock` reduced `Sequencer Hold` by `0.400 μs/put` (`-6.08%`) and `Sequencer Wait` by `0.579 μs/put` (`-11.73%`), while shifting `frontier_resources` registration cost from `Admission` (`-0.368 μs`) into `Frame Finish` (`+0.857 μs`).
 - Total Producer CPU remained essentially flat (`25.044 → 25.302 μs`), while the shorter `write_lock` critical section improved Point16 throughput and p99 tail latency across all 5 unprofiled pairs.
 
-## 3. Cleanup Verification
+## 3. Point1 Dense-Sampling Verification (`--latency-sample-every 1`, 10 Pairs)
 
-- Verified local archive checksum (`639f83c4a52f6ad0fbe38b956b5e209dcacb6d5e6edae78ffebe042518b6e524`), `summary.json` (`complete: true`, `50/50`), and `remote-exit.json` (`failed: false`, `runs_started: 50`) before teardown.
-- Deleted the benchmark VM, temporary SSH firewall rule, and destroyed the isolated Terraform VPC, subnet, and egress route (`Listed 0 items` for instances, firewalls, and networks).
+To verify whether the `+13.67%` Point1 p99 delta (`1/5` wins) observed under `--latency-sample-every 100` was a real regression, we ran 10 counterbalanced pairs (20 runs, 100k puts/run, 100,000 latency samples/run) on `c4-standard-16-lssd` (`us-central1-c`) with the same effective WAL configuration (`bench-results/gcp-pr574-point1-dense-20261127/point1-dense.tar.gz`, `sha256: 497114ec9690098aaf2a3ed15145387bd900c18085ad1ad82e74b3945d8d8de5` verified via `sha256sum -c`).
+
+| Metric | Baseline Median | Candidate Median | Paired Median Delta | Wins (C vs B) |
+| --- | ---: | ---: | ---: | ---: |
+| **Throughput** | 8,734.7 puts/s | 8,742.4 puts/s | +1.29% | 7/10 |
+| **CPU / Put** | 52.34 μs/put | 52.19 μs/put | -0.02% | 5/10 |
+| **p50** | 0.105 ms | 0.105 ms | -0.36% | 7/10 |
+| **p95** | 0.123 ms | 0.123 ms | -0.50% | 7/10 |
+| **p99** | 0.396 ms | **0.384 ms** | **-11.58%** | **8/10** |
+
+- With 100% latency sampling (`100,000` samples/run) across 10 pairs, Candidate showed no Point1 regression: throughput (`+1.29%`, `7/10`), p50/p95 (`-0.36%` / `-0.50%`, `7/10`), and p99 (`-11.58%`, `8/10`) all favored Candidate, while CPU/Put was flat (`-0.02%`, `5/10`).
+
+## 4. Cleanup Verification
+
+- Verified local archive checksums (`639f83c4a52f6ad0fbe38b956b5e209dcacb6d5e6edae78ffebe042518b6e524` for the 50-run A/B bundle, and `point1-dense.tar.gz.sha256` for the 10-pair Point1 dense-sampling bundle), `summary.json` (`complete: true`, `50/50`), and `remote-exit.json` (`failed: false`, `runs_started: 50`) before teardown.
+- Deleted all benchmark VMs, temporary SSH firewall rules, and destroyed the isolated Terraform VPCs, subnets, and routes (`Listed 0 items` for instances, firewalls, and networks).
