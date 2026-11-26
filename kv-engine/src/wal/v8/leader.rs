@@ -732,19 +732,22 @@ fn wal_v8_extent_lookahead_from_environment() -> Result<bool> {
     wal_v8_extent_lookahead_from_value(std::env::var_os(WAL_V8_EXTENT_LOOKAHEAD_ENV).as_deref())
 }
 
-/// Opt-in V8 WAL configuration profile.
-/// Production defaults to [`WalV8Profile::Legacy`] until Phase D qualification.
+/// V8 WAL configuration profile.
+/// Production defaults to [`WalV8Profile::Candidate`] (`Cursor`, Direct
+/// completion, Direct FRONTIER with Buffered fallback, Point-only 1 MiB
+/// lookahead when eligible, Stage A on, Dynamic + Point-only Target8);
+/// `TOYKV_WAL_V8_PROFILE=legacy` remains available as a full fallback.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) enum WalV8Profile {
-    #[default]
     Legacy,
+    #[default]
     Candidate,
 }
 
 impl WalV8Profile {
     fn from_value(value: Option<&OsStr>) -> Result<Self> {
         match value {
-            None => Ok(Self::Legacy),
+            None => Ok(Self::Candidate),
             Some(value) => match value.to_str() {
                 Some("legacy") => Ok(Self::Legacy),
                 Some("candidate") => Ok(Self::Candidate),
@@ -897,9 +900,17 @@ pub(crate) struct WalV8RequestedConfig {
     point_direct_frame_enabled: bool,
 }
 
-#[allow(clippy::derivable_impls)]
 impl Default for WalV8RequestedConfig {
     fn default() -> Self {
+        Self::candidate()
+    }
+}
+
+impl WalV8RequestedConfig {
+    /// Construct the legacy V8 profile (`Eager`, Relay completion, Buffered
+    /// FRONTIER, 1 MiB fallocate-only extent preparation, Stage A off,
+    /// Dynamic coalescing), retained as the `TOYKV_WAL_V8_PROFILE=legacy` fallback.
+    pub(crate) fn legacy() -> Self {
         Self {
             profile: WalV8Profile::Legacy,
             progress_mode: WalV8ProgressMode::default(),
@@ -922,10 +933,8 @@ impl Default for WalV8RequestedConfig {
             point_direct_frame_enabled: false,
         }
     }
-}
 
-impl WalV8RequestedConfig {
-    /// Construct the opt-in Phase C candidate profile (`Cursor`, Direct
+    /// Construct the promoted V8 Candidate Target8 profile (`Cursor`, Direct
     /// completion, Direct FRONTIER with Buffered fallback, Point-only 1 MiB
     /// lookahead when eligible, Stage A on, Dynamic + Point-only Target8).
     #[allow(clippy::needless_update)]
@@ -938,7 +947,7 @@ impl WalV8RequestedConfig {
             extent_lookahead: false,
             point_buffer_preallocation_enabled: true,
             coalesce_policy: WalV8CoalesceTargetPolicy::PointOnly(8),
-            ..Self::default()
+            ..Self::legacy()
         }
     }
 
@@ -953,7 +962,7 @@ impl WalV8RequestedConfig {
             None => WalV8Profile::from_environment()?,
         };
         let base = match profile {
-            WalV8Profile::Legacy => Self::default(),
+            WalV8Profile::Legacy => Self::legacy(),
             WalV8Profile::Candidate => Self::candidate(),
         };
 
@@ -13591,13 +13600,28 @@ mod tests {
     }
 
     #[test]
-    fn wal_v8_requested_config_defaults_unchanged() {
+    fn wal_v8_requested_config_defaults_to_candidate_and_preserves_legacy() {
         let defaults = WalV8RequestedConfig::default();
-        assert_eq!(defaults.progress_mode, WalV8ProgressMode::Eager);
-        assert!(!defaults.direct_completion_enabled);
-        assert_eq!(defaults.frontier_mode, WalV8FrontierWriteMode::Buffered);
+        assert_eq!(defaults, WalV8RequestedConfig::candidate());
+        assert_eq!(defaults.profile, WalV8Profile::Candidate);
+        assert_eq!(defaults.progress_mode, WalV8ProgressMode::Cursor);
+        assert!(defaults.direct_completion_enabled);
+        assert_eq!(defaults.frontier_mode, WalV8FrontierWriteMode::Direct);
         assert!(!defaults.extent_lookahead);
-        assert!(!defaults.point_buffer_preallocation_enabled);
+        assert!(defaults.point_buffer_preallocation_enabled);
+        assert_eq!(
+            defaults.coalesce_policy,
+            WalV8CoalesceTargetPolicy::PointOnly(8)
+        );
+
+        let legacy = WalV8RequestedConfig::legacy();
+        assert_eq!(legacy.profile, WalV8Profile::Legacy);
+        assert_eq!(legacy.progress_mode, WalV8ProgressMode::Eager);
+        assert!(!legacy.direct_completion_enabled);
+        assert_eq!(legacy.frontier_mode, WalV8FrontierWriteMode::Buffered);
+        assert!(!legacy.extent_lookahead);
+        assert!(!legacy.point_buffer_preallocation_enabled);
+        assert_eq!(legacy.coalesce_policy, WalV8CoalesceTargetPolicy::Disabled);
     }
 
     #[test]
@@ -13616,7 +13640,7 @@ mod tests {
             direct_completion_enabled: true,
             frontier_mode: WalV8FrontierWriteMode::Direct,
             extent_lookahead: false,
-            ..WalV8RequestedConfig::default()
+            ..WalV8RequestedConfig::legacy()
         };
         let buffered_effective = WalV8EffectiveConfig::resolve(&requested, &buffered_file, false)?;
         assert_eq!(buffered_effective.progress_mode, WalV8ProgressMode::Cursor);
@@ -13819,7 +13843,7 @@ mod tests {
     fn candidate_profile_resolves_all_components_and_preserves_legacy_defaults() -> Result<()> {
         use std::os::unix::ffi::OsStrExt;
 
-        assert_eq!(WalV8Profile::from_value(None)?, WalV8Profile::Legacy);
+        assert_eq!(WalV8Profile::from_value(None)?, WalV8Profile::Candidate);
         assert_eq!(
             WalV8Profile::from_value(Some(OsStr::new("legacy")))?,
             WalV8Profile::Legacy
@@ -13831,7 +13855,7 @@ mod tests {
         assert!(WalV8Profile::from_value(Some(OsStr::new("unknown"))).is_err());
         assert!(WalV8Profile::from_value(Some(OsStr::from_bytes(b"\xff"))).is_err());
 
-        let legacy = WalV8RequestedConfig::default();
+        let legacy = WalV8RequestedConfig::legacy();
         assert_eq!(legacy.profile, WalV8Profile::Legacy);
         assert_eq!(legacy.progress_mode, WalV8ProgressMode::Eager);
         assert!(!legacy.direct_completion_enabled);
