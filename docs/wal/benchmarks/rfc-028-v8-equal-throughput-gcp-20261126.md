@@ -2,18 +2,18 @@
 
 ## Result
 
-Measuring end-to-end latency from scheduled request arrival timestamps (`--offered-rate-ops-per-sec`) confirms that the higher unpaced P99 seen in the 80-run D2 qualification was a saturated-load queue-depth effect rather than a latency regression:
+Measuring end-to-end latency from scheduled request arrival timestamps (`--offered-rate-ops-per-sec`) separates saturated-queue effects at `Point8` from tail behavior at `Point16`, while **preserving the original 80-run `point_p99_vs_legacy_le_105pct = false` gate result** (the unpaced P99 difference cannot be attributed solely to queue depth):
 
 - **Point8 @ 20,000 puts/s** (near `v8_legacy`'s ~21,390 puts/s saturation limit):
   - `v8_legacy` fell behind its arrival schedule (`e2e P50 = 50.244 ms`, `P95 = 107.632 ms`, `P99 = 111.666 ms`, schedule lag `P99 = 111.299 ms`, service `P99 = 1.343 ms`).
   - `v8_candidate_dynamic` sustained 19,999 puts/s with **`e2e P50 = 0.245 ms`, `P95 = 0.590 ms`, `P99 = 0.824 ms`** (service `P99 = 0.613 ms`).
   - `v8_candidate_target8` sustained 19,999 puts/s with **`e2e P50 = 0.250 ms`, `P95 = 0.603 ms`, `P99 = 2.393 ms`** (service `P99 = 0.597 ms`).
 - **Point16 @ 28,000 puts/s** (below `v8_legacy`'s ~30,415 puts/s saturation limit):
-  - `v8_legacy`: `e2e P50 = 0.644 ms`, `P95 = 1.204 ms`, `P99 = 4.149 ms` (service `P50 = 0.530 ms`, `P99 = 0.769 ms`, median outstanding tickets at sync `16.0`, coalescing wait `204.1 μs`).
-  - `v8_candidate_dynamic`: `e2e P50 = 0.282 ms`, `P95 = 0.799 ms`, `P99 = 5.201 ms` (service `P50 = 0.279 ms`, `P99 = 0.822 ms`, median outstanding tickets `7.0`, coalescing wait `117.9 μs`).
-  - `v8_candidate_target8`: **`e2e P50 = 0.273 ms`, `P95 = 0.565 ms`, `P99 = 0.793 ms`** (service `P50 = 0.270 ms`, `P99 = 0.678 ms`, median outstanding tickets `7.0`, coalescing wait `113.5 μs`, `2,949` median Target8 hits).
+  - `v8_legacy`: `e2e P50 = 0.644 ms`, `P95 = 1.204 ms`, `P99 = 4.149 ms` (service `P50 = 0.530 ms`, `P99 = 0.769 ms`, `lag P99 = 3.626 ms`, median outstanding tickets at sync `16.0`, coalescing wait `204.1 μs`).
+  - `v8_candidate_dynamic`: `e2e P50 = 0.282 ms`, `P95 = 0.799 ms`, `P99 = 5.201 ms` (service `P50 = 0.279 ms`, `P99 = 0.822 ms`, `lag P99 = 4.786 ms`, median outstanding tickets `7.0`, coalescing wait `117.9 μs`). Dynamic still exhibited higher `e2e P99` than Legacy at 28,000 puts/s, driven primarily by `schedule_lag` rather than `service_latency`.
+  - `v8_candidate_target8`: **`e2e P50 = 0.273 ms`, `P95 = 0.565 ms`, `P99 = 0.793 ms`** (~81% lower `e2e P99` than `v8_legacy` and ~85% lower than `v8_candidate_dynamic`; service `P50 = 0.270 ms`, `P99 = 0.678 ms`, `lag P99 = 0.273 ms`, median outstanding tickets `7.0`, coalescing wait `113.5 μs`, `2,949` median Target8 hits).
 
-Note: `cpu_us_per_put` in paced mode (`~160–172 μs/Put` for Candidate, `60.9 / 109.4 μs/Put` for Legacy) includes user-space `spin_loop()` waiting on the final `250 μs` of each scheduled arrival slot; unpaced CPU/Put was measured separately in the 80-run D2 qualification (`rfc-028-v8-d2-qualification-gcp-20261126.md`).
+Note on pacing interference: `write-perf` uses `spin_loop()` during the final `250 μs` before each scheduled arrival timestamp. On 16 writers / 16 vCPUs, this spinning competes with WAL background workers for CPU; consequently, paced `cpu_us_per_put` (`~160–172 μs/Put` for Candidate, `60.9 / 109.4 μs/Put` for Legacy) does not measure WAL CPU cost, and `schedule_lag` tails may include thread-scheduling interference. Unpaced CPU/Put and throughput are reported in [rfc-028-v8-d2-qualification-gcp-20261126.md](rfc-028-v8-d2-qualification-gcp-20261126.md).
 
 ## Experiment
 
