@@ -286,6 +286,7 @@ pub(crate) struct WalV8ParallelWriter {
     #[cfg(feature = "bench")]
     io_diagnostics: WalIoDiagnostics,
     point_buffer_preallocation_enabled: bool,
+    effective_config: WalV8EffectiveConfig,
     #[cfg(test)]
     point_buffer_preallocation_test_override: AtomicBool,
     #[cfg(feature = "bench")]
@@ -416,8 +417,9 @@ struct WalV8SlidingExtentPreparationState {
     failure: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum WalV8FrontierWriteMode {
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum WalV8FrontierWriteMode {
+    #[default]
     Buffered,
     Direct,
 }
@@ -690,17 +692,179 @@ impl WalExtentPreparationMode {
 }
 
 fn wal_v8_extent_lookahead_from_value(value: Option<&OsStr>) -> Result<bool> {
-    match value.and_then(OsStr::to_str) {
-        None | Some("0" | "false") => Ok(false),
-        Some("1" | "true") => Ok(true),
-        Some(value) => anyhow::bail!(
-            "invalid {WAL_V8_EXTENT_LOOKAHEAD_ENV} {value:?}; expected `0`, `1`, `false`, or `true`"
-        ),
+    match value {
+        None => Ok(false),
+        Some(value) => match value.to_str() {
+            Some("0" | "false") => Ok(false),
+            Some("1" | "true") => Ok(true),
+            Some(value) => anyhow::bail!(
+                "invalid {WAL_V8_EXTENT_LOOKAHEAD_ENV} {value:?}; expected `0`, `1`, `false`, or `true`"
+            ),
+            None => anyhow::bail!(
+                "{WAL_V8_EXTENT_LOOKAHEAD_ENV} is not valid UTF-8; expected `0`, `1`, `false`, or `true`"
+            ),
+        },
     }
 }
 
 fn wal_v8_extent_lookahead_from_environment() -> Result<bool> {
     wal_v8_extent_lookahead_from_value(std::env::var_os(WAL_V8_EXTENT_LOOKAHEAD_ENV).as_deref())
+}
+
+/// Process-wide V8 WAL configuration requested at Engine open and inherited
+/// across automatic and PITR WAL rotations without on-disk serialization.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct WalV8RequestedConfig {
+    pub(crate) progress_mode: WalV8ProgressMode,
+    pub(crate) direct_completion_enabled: bool,
+    pub(crate) frontier_mode: WalV8FrontierWriteMode,
+    pub(crate) extent_lookahead: bool,
+    pub(crate) point_buffer_preallocation_enabled: bool,
+    #[cfg(feature = "bench")]
+    progress_counters_enabled: bool,
+    #[cfg(feature = "bench")]
+    coalesce_ready_target: Option<usize>,
+    #[cfg(feature = "bench")]
+    extent_preparation: Option<(WalExtentPreparationMode, u64)>,
+}
+
+impl WalV8RequestedConfig {
+    /// Parse V8 WAL configuration from environment variables and test overrides.
+    pub(crate) fn from_environment() -> Result<Self> {
+        #[cfg(feature = "bench")]
+        let progress_mode = progress_mode_from_environment()?;
+        #[cfg(not(feature = "bench"))]
+        let progress_mode = production_progress_mode_from_environment()?;
+
+        #[cfg(feature = "bench")]
+        let direct_completion_enabled =
+            cursor_direct_completion_enabled_from_environment(progress_mode)?;
+        #[cfg(not(feature = "bench"))]
+        let direct_completion_enabled =
+            production_direct_completion_enabled_from_environment(progress_mode)?;
+
+        let frontier_mode = WalV8FrontierWriteMode::from_environment()?;
+        let extent_lookahead = wal_v8_extent_lookahead_from_environment()?;
+
+        #[cfg(feature = "bench")]
+        let point_buffer_preallocation_enabled = point_buffer_preallocation_from_environment()?;
+        #[cfg(not(feature = "bench"))]
+        let point_buffer_preallocation_enabled = false;
+
+        #[cfg(feature = "bench")]
+        let progress_counters_enabled = progress_counters_enabled_from_environment(progress_mode)?;
+        #[cfg(feature = "bench")]
+        let coalesce_ready_target =
+            coalesce_ready_target_from_environment(progress_mode, direct_completion_enabled)?;
+        #[cfg(feature = "bench")]
+        let extent_preparation = WalExtentPreparationMode::from_environment()?;
+
+        Ok(Self {
+            progress_mode,
+            direct_completion_enabled,
+            frontier_mode,
+            extent_lookahead,
+            point_buffer_preallocation_enabled,
+            #[cfg(feature = "bench")]
+            progress_counters_enabled,
+            #[cfg(feature = "bench")]
+            coalesce_ready_target,
+            #[cfg(feature = "bench")]
+            extent_preparation,
+        })
+    }
+
+    pub(crate) fn with_progress_and_completion(
+        mut self,
+        progress_mode: WalV8ProgressMode,
+        direct_completion_enabled: bool,
+    ) -> Self {
+        self.progress_mode = progress_mode;
+        self.direct_completion_enabled = direct_completion_enabled;
+        self
+    }
+}
+
+/// Per-WAL effective V8 configuration resolved from [`WalV8RequestedConfig`]
+/// and the actual worker file, filesystem, and quota owner of one WAL segment.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct WalV8EffectiveConfig {
+    pub(crate) progress_mode: WalV8ProgressMode,
+    pub(crate) direct_completion_enabled: bool,
+    pub(crate) frontier_mode: WalV8FrontierWriteMode,
+    pub(crate) extent_lookahead: bool,
+    pub(crate) point_buffer_preallocation_enabled: bool,
+    pub(crate) o_direct_worker: bool,
+    pub(crate) ext_family_filesystem: bool,
+    pub(crate) has_reservation_owner: bool,
+    #[cfg(feature = "bench")]
+    pub(crate) progress_counters_enabled: bool,
+    #[cfg(feature = "bench")]
+    pub(crate) coalesce_ready_target: Option<usize>,
+}
+
+impl WalV8EffectiveConfig {
+    /// Resolve effective settings for one V8 WAL instance before spawning its worker.
+    pub(crate) fn resolve(
+        requested: &WalV8RequestedConfig,
+        worker_file: &File,
+        has_reservation_owner: bool,
+    ) -> Result<Self> {
+        ensure!(
+            !requested.direct_completion_enabled
+                || requested.progress_mode == WalV8ProgressMode::Cursor,
+            "direct completion requires Cursor progress mode"
+        );
+        let o_direct_worker = is_o_direct_file(worker_file)?;
+        let ext_family_filesystem = is_ext_family_filesystem(worker_file);
+        let frontier_mode = match requested.frontier_mode {
+            WalV8FrontierWriteMode::Buffered => WalV8FrontierWriteMode::Buffered,
+            WalV8FrontierWriteMode::Direct => {
+                if o_direct_worker {
+                    WalV8FrontierWriteMode::Direct
+                } else {
+                    WalV8FrontierWriteMode::Buffered
+                }
+            }
+        };
+
+        #[cfg(not(feature = "bench"))]
+        {
+            let extent_eligible = has_reservation_owner && ext_family_filesystem && o_direct_worker;
+            ensure!(
+                !requested.extent_lookahead || extent_eligible,
+                "{WAL_V8_EXTENT_LOOKAHEAD_ENV} requires an ext4 WAL, an O_DIRECT DATA worker, and a quota owner"
+            );
+        }
+
+        #[cfg(feature = "bench")]
+        let extent_lookahead = match requested.extent_preparation {
+            Some((
+                WalExtentPreparationMode::SlidingLookahead
+                | WalExtentPreparationMode::SlidingPointLookahead,
+                _,
+            )) => true,
+            Some(_) => false,
+            None => requested.extent_lookahead,
+        };
+        #[cfg(not(feature = "bench"))]
+        let extent_lookahead = requested.extent_lookahead;
+
+        Ok(Self {
+            progress_mode: requested.progress_mode,
+            direct_completion_enabled: requested.direct_completion_enabled,
+            frontier_mode,
+            extent_lookahead,
+            point_buffer_preallocation_enabled: requested.point_buffer_preallocation_enabled,
+            o_direct_worker,
+            ext_family_filesystem,
+            has_reservation_owner,
+            #[cfg(feature = "bench")]
+            progress_counters_enabled: requested.progress_counters_enabled,
+            #[cfg(feature = "bench")]
+            coalesce_ready_target: requested.coalesce_ready_target,
+        })
+    }
 }
 
 #[cfg(feature = "bench")]
@@ -4759,12 +4923,25 @@ impl WalV8LeaderWriter {
         self,
         worker_file: File,
     ) -> Result<WalV8ParallelWriter> {
-        #[cfg(feature = "bench")]
-        let progress_mode = progress_mode_from_environment()?;
-        #[cfg(not(feature = "bench"))]
-        let progress_mode = production_progress_mode_from_environment()?;
+        let requested = WalV8RequestedConfig::from_environment()?;
+        self.into_parallel_with_worker_file_and_config(worker_file, requested)
+    }
 
-        self.into_parallel_with_worker_file_and_progress_mode(worker_file, progress_mode)
+    /// Transfer the validated image and coordinator to the concurrent
+    /// producer path using a pre-parsed requested configuration.
+    pub(crate) fn into_parallel_with_worker_file_and_config(
+        self,
+        worker_file: File,
+        requested: WalV8RequestedConfig,
+    ) -> Result<WalV8ParallelWriter> {
+        self.into_parallel_with_worker_file_config_and_overrides(
+            worker_file,
+            requested,
+            #[cfg(test)]
+            None,
+            #[cfg(test)]
+            None,
+        )
     }
 
     fn into_parallel_with_worker_file_and_progress_mode(
@@ -4778,14 +4955,12 @@ impl WalV8LeaderWriter {
         #[cfg(not(feature = "bench"))]
         let direct_completion_enabled =
             production_direct_completion_enabled_from_environment(progress_mode)?;
+        let requested = WalV8RequestedConfig::from_environment()?
+            .with_progress_and_completion(progress_mode, direct_completion_enabled);
 
-        let frontier_mode = WalV8FrontierWriteMode::from_environment()?;
-
-        self.into_parallel_with_worker_file_progress_and_completion(
+        self.into_parallel_with_worker_file_config_and_overrides(
             worker_file,
-            progress_mode,
-            direct_completion_enabled,
-            frontier_mode,
+            requested,
             #[cfg(test)]
             None,
             #[cfg(test)]
@@ -4794,11 +4969,32 @@ impl WalV8LeaderWriter {
     }
 
     fn into_parallel_with_worker_file_progress_and_completion(
-        mut self,
+        self,
         worker_file: File,
         progress_mode: WalV8ProgressMode,
         direct_completion_enabled: bool,
         frontier_mode: WalV8FrontierWriteMode,
+        #[cfg(test)] worker_group_limit: Option<usize>,
+        #[cfg(test)] extent_strategy_override: Option<(WalV8ExtentPreparationStrategy, u64)>,
+    ) -> Result<WalV8ParallelWriter> {
+        let mut requested = WalV8RequestedConfig::from_environment()?
+            .with_progress_and_completion(progress_mode, direct_completion_enabled);
+        requested.frontier_mode = frontier_mode;
+
+        self.into_parallel_with_worker_file_config_and_overrides(
+            worker_file,
+            requested,
+            #[cfg(test)]
+            worker_group_limit,
+            #[cfg(test)]
+            extent_strategy_override,
+        )
+    }
+
+    fn into_parallel_with_worker_file_config_and_overrides(
+        mut self,
+        worker_file: File,
+        requested: WalV8RequestedConfig,
         #[cfg(test)] worker_group_limit: Option<usize>,
         #[cfg(test)] extent_strategy_override: Option<(WalV8ExtentPreparationStrategy, u64)>,
     ) -> Result<WalV8ParallelWriter> {
@@ -4813,18 +5009,22 @@ impl WalV8LeaderWriter {
                 && worker_metadata.len() >= self.coordinator.last_frontier_end(),
             "v8 WAL I/O worker handle does not refer to the installed Active inode"
         );
+        let effective_config = WalV8EffectiveConfig::resolve(
+            &requested,
+            &worker_file,
+            self.reservation_owner.is_some(),
+        )?;
         self.coordinator = self
             .coordinator
-            .with_progress_mode(self.header, progress_mode)?;
+            .with_progress_mode(self.header, effective_config.progress_mode)?;
         #[cfg(feature = "bench")]
-        self.coordinator.set_progress_counters_enabled(
-            progress_counters_enabled_from_environment(progress_mode)?,
-        )?;
+        self.coordinator
+            .set_progress_counters_enabled(effective_config.progress_counters_enabled)?;
         #[cfg(feature = "bench")]
         let profile = self.profile.load_full();
         #[cfg(feature = "bench")]
         if let Some(profile) = &profile {
-            if progress_mode.uses_ring() {
+            if effective_config.progress_mode.uses_ring() {
                 profile.validate_v8_progress_ring_compatibility()?;
             }
             self.coordinator
@@ -4835,18 +5035,16 @@ impl WalV8LeaderWriter {
         #[cfg(feature = "bench")]
         let mut io_diagnostics = self.io_diagnostics;
         #[cfg(feature = "bench")]
-        let coalesce_ready_target =
-            coalesce_ready_target_from_environment(progress_mode, direct_completion_enabled)?;
-        #[cfg(feature = "bench")]
-        let point_buffer_preallocation_enabled = point_buffer_preallocation_from_environment()?;
-        #[cfg(not(feature = "bench"))]
-        let point_buffer_preallocation_enabled = false;
+        let coalesce_ready_target = effective_config.coalesce_ready_target;
+        let point_buffer_preallocation_enabled =
+            effective_config.point_buffer_preallocation_enabled;
         #[cfg(feature = "bench")]
         {
             io_diagnostics.data = WalIoHandleMetadata::from_file(&worker_file)?;
-            io_diagnostics.progress_ring_enabled = progress_mode.uses_ring();
+            io_diagnostics.progress_ring_enabled = effective_config.progress_mode.uses_ring();
             io_diagnostics.progress_cursor_enabled = self.coordinator.progress_cursor_enabled();
-            io_diagnostics.cursor_direct_completion_enabled = direct_completion_enabled;
+            io_diagnostics.cursor_direct_completion_enabled =
+                effective_config.direct_completion_enabled;
             io_diagnostics.cursor_direct_completion_select_wake_enabled = false;
             io_diagnostics.cursor_singleton_submission_enabled = false;
             io_diagnostics.point_buffer_preallocation_enabled = point_buffer_preallocation_enabled;
@@ -4875,7 +5073,7 @@ impl WalV8LeaderWriter {
                 )?);
                 (Some(preallocator), None)
             } else {
-                match WalExtentPreparationMode::from_environment()? {
+                match requested.extent_preparation {
                     Some((mode, window_bytes)) if mode.is_sliding() => {
                         let start_offset = self.coordinator.last_frontier_end();
                         let owned_preallocator = match mode {
@@ -4976,17 +5174,11 @@ impl WalV8LeaderWriter {
                 }
             }
         };
-        let frontier_file = match frontier_mode {
+        let frontier_file = match effective_config.frontier_mode {
             WalV8FrontierWriteMode::Buffered => self.write_file,
-            WalV8FrontierWriteMode::Direct => {
-                if is_o_direct_file(&worker_file)? {
-                    worker_file
-                        .try_clone()
-                        .context("clone direct V8 WAL DATA handle for FRONTIER writes")?
-                } else {
-                    self.write_file
-                }
-            }
+            WalV8FrontierWriteMode::Direct => worker_file
+                .try_clone()
+                .context("clone direct V8 WAL DATA handle for FRONTIER writes")?,
         };
         let frontier_metadata = frontier_file
             .metadata()
@@ -5006,14 +5198,10 @@ impl WalV8LeaderWriter {
             let test_strategy_override = extent_strategy_override;
             #[cfg(not(test))]
             let test_strategy_override: Option<(WalV8ExtentPreparationStrategy, u64)> = None;
-            let lookahead = wal_v8_extent_lookahead_from_environment()?;
-            let eligible = self.reservation_owner.is_some()
-                && is_ext_family_filesystem(&worker_file)
-                && is_o_direct_file(&worker_file)?;
-            ensure!(
-                !lookahead || eligible,
-                "{WAL_V8_EXTENT_LOOKAHEAD_ENV} requires an ext4 WAL, an O_DIRECT DATA worker, and a quota owner"
-            );
+            let lookahead = effective_config.extent_lookahead;
+            let eligible = effective_config.has_reservation_owner
+                && effective_config.ext_family_filesystem
+                && effective_config.o_direct_worker;
             if let Some(owner) = &self.reservation_owner
                 && (eligible || test_strategy_override.is_some())
             {
@@ -5064,7 +5252,7 @@ impl WalV8LeaderWriter {
             WalV8ParallelIoConfig {
                 #[cfg(feature = "bench")]
                 extent_preparation,
-                direct_completion_enabled,
+                direct_completion_enabled: effective_config.direct_completion_enabled,
                 #[cfg(feature = "bench")]
                 coalesce_ready_target,
                 #[cfg(test)]
@@ -5101,6 +5289,7 @@ impl WalV8LeaderWriter {
             #[cfg(feature = "bench")]
             io_diagnostics,
             point_buffer_preallocation_enabled,
+            effective_config,
             #[cfg(test)]
             point_buffer_preallocation_test_override: AtomicBool::new(false),
             #[cfg(feature = "bench")]
@@ -5689,6 +5878,11 @@ impl WalV8ParallelWriter {
     #[cfg(test)]
     pub(crate) fn uses_direct_frontier(&self) -> Result<bool> {
         is_o_direct_file(&self.frontier_file)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn effective_config(&self) -> WalV8EffectiveConfig {
+        self.effective_config
     }
 
     #[cfg(feature = "bench")]
@@ -12811,6 +13005,90 @@ mod tests {
             WalV8ProgressMode::Cursor,
         )?;
         assert!(fresh_segment_writer.progress_ring_enabled());
+
+        Ok(())
+    }
+
+    #[test]
+    fn wal_v8_extent_lookahead_from_value_rejects_non_utf8() {
+        use std::os::unix::ffi::OsStrExt;
+
+        assert!(!wal_v8_extent_lookahead_from_value(None).unwrap());
+        assert!(!wal_v8_extent_lookahead_from_value(Some(OsStr::new("0"))).unwrap());
+        assert!(!wal_v8_extent_lookahead_from_value(Some(OsStr::new("false"))).unwrap());
+        assert!(wal_v8_extent_lookahead_from_value(Some(OsStr::new("1"))).unwrap());
+        assert!(wal_v8_extent_lookahead_from_value(Some(OsStr::new("true"))).unwrap());
+        assert!(wal_v8_extent_lookahead_from_value(Some(OsStr::new("yes"))).is_err());
+
+        let non_utf8 = OsStr::from_bytes(b"\xff\xfe");
+        let err = wal_v8_extent_lookahead_from_value(Some(non_utf8))
+            .expect_err("non-UTF-8 extent lookahead env value must fail");
+        assert!(err.to_string().contains("not valid UTF-8"));
+    }
+
+    #[test]
+    fn wal_v8_requested_config_defaults_unchanged() {
+        let defaults = WalV8RequestedConfig::default();
+        assert_eq!(defaults.progress_mode, WalV8ProgressMode::Eager);
+        assert!(!defaults.direct_completion_enabled);
+        assert_eq!(defaults.frontier_mode, WalV8FrontierWriteMode::Buffered);
+        assert!(!defaults.extent_lookahead);
+        assert!(!defaults.point_buffer_preallocation_enabled);
+    }
+
+    #[test]
+    fn wal_v8_effective_config_resolves_frontier_fallback_and_owner() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("effective-config.wal");
+        let buffered_file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&path)?;
+
+        let requested = WalV8RequestedConfig {
+            progress_mode: WalV8ProgressMode::Cursor,
+            direct_completion_enabled: true,
+            frontier_mode: WalV8FrontierWriteMode::Direct,
+            extent_lookahead: false,
+            ..WalV8RequestedConfig::default()
+        };
+        let buffered_effective = WalV8EffectiveConfig::resolve(&requested, &buffered_file, false)?;
+        assert_eq!(buffered_effective.progress_mode, WalV8ProgressMode::Cursor);
+        assert!(buffered_effective.direct_completion_enabled);
+        assert!(!buffered_effective.o_direct_worker);
+        assert_eq!(
+            buffered_effective.frontier_mode,
+            WalV8FrontierWriteMode::Buffered
+        );
+        assert!(!buffered_effective.has_reservation_owner);
+
+        if let Ok(direct_file) = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_DIRECT)
+            .open(&path)
+        {
+            let direct_effective = WalV8EffectiveConfig::resolve(&requested, &direct_file, true)?;
+            assert!(direct_effective.o_direct_worker);
+            assert_eq!(
+                direct_effective.frontier_mode,
+                WalV8FrontierWriteMode::Direct
+            );
+            assert!(direct_effective.has_reservation_owner);
+        }
+
+        #[cfg(not(feature = "bench"))]
+        {
+            let lookahead_requested = WalV8RequestedConfig {
+                extent_lookahead: true,
+                ..WalV8RequestedConfig::default()
+            };
+            assert!(
+                WalV8EffectiveConfig::resolve(&lookahead_requested, &buffered_file, false).is_err()
+            );
+        }
 
         Ok(())
     }

@@ -69,8 +69,9 @@ pub(crate) fn wait_for_progress_token(
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) enum WalV8ProgressMode {
+    #[default]
     Eager,
     Cursor,
 }

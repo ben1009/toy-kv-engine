@@ -3020,6 +3020,7 @@ impl MemTable {
         max_file_size: u64,
         retained_resources: Arc<WalV7RetainedResources>,
         io_mode: WalIoMode,
+        wal_v8_config: crate::wal::v8::leader::WalV8RequestedConfig,
         create_owner: F,
     ) -> Result<(Self, Arc<crate::wal::v8::resource::WalV8ReservationOwner>)>
     where
@@ -3081,6 +3082,7 @@ impl MemTable {
             installed,
             max_file_size,
             io_mode,
+            wal_v8_config,
             create_owner,
         )?;
         ensure!(
@@ -3294,12 +3296,14 @@ impl MemTable {
         installed: crate::wal::v8::install::WalV8InstalledRecovery,
         max_file_size: u64,
     ) -> Result<(Self, u64)> {
+        let wal_v8_config = crate::wal::v8::leader::WalV8RequestedConfig::from_environment()?;
         Self::recover_from_v8_active_inner(
             id,
             vlog_enabled,
             path,
             installed,
             WalIoMode::Parallel,
+            wal_v8_config,
             |write, sync, installed| {
                 let writer = crate::wal::v8::leader::WalV8LeaderWriter::new(
                     write,
@@ -3316,6 +3320,7 @@ impl MemTable {
     /// Replay under the caller's recovery reservation, then attach an
     /// image-bound owner before the recovered WAL can accept writes.
     #[cfg(target_os = "linux")]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn recover_from_v8_active_with_owner<F>(
         id: usize,
         vlog_enabled: bool,
@@ -3323,6 +3328,7 @@ impl MemTable {
         installed: crate::wal::v8::install::WalV8InstalledRecovery,
         max_file_size: u64,
         io_mode: WalIoMode,
+        wal_v8_config: crate::wal::v8::leader::WalV8RequestedConfig,
         create_owner: F,
     ) -> Result<(Self, u64)>
     where
@@ -3336,6 +3342,7 @@ impl MemTable {
             path,
             installed,
             io_mode,
+            wal_v8_config,
             |write, sync, installed| {
                 let owner = create_owner(installed)?;
                 let writer = crate::wal::v8::leader::WalV8LeaderWriter::new_with_reservation_owner(
@@ -3358,6 +3365,7 @@ impl MemTable {
         path: impl AsRef<Path>,
         installed: crate::wal::v8::install::WalV8InstalledRecovery,
         io_mode: WalIoMode,
+        wal_v8_config: crate::wal::v8::leader::WalV8RequestedConfig,
         create_writer: F,
     ) -> Result<(Self, u64)>
     where
@@ -3410,8 +3418,9 @@ impl MemTable {
         ret.wal = Some(match io_mode {
             WalIoMode::Leader => Wal::from_v8_leader(writer, &installed)?,
             WalIoMode::Parallel => Wal::from_v8_parallel(
-                writer.into_parallel_with_worker_file(
+                writer.into_parallel_with_worker_file_and_config(
                     worker_file.context("v8 Parallel WAL has no worker file handle")?,
+                    wal_v8_config,
                 )?,
                 &installed,
             )?,
@@ -4423,6 +4432,15 @@ impl MemTable {
         self.wal
             .as_ref()
             .map_or(0, Wal::v8_point_buffer_preallocation_hits_for_test)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn v8_effective_config_for_test(
+        &self,
+    ) -> Option<crate::wal::v8::leader::WalV8EffectiveConfig> {
+        self.wal
+            .as_ref()
+            .and_then(Wal::v8_effective_config_for_test)
     }
 
     pub(crate) fn uses_pitr_batch_wal(&self) -> bool {

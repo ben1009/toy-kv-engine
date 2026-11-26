@@ -2751,6 +2751,13 @@ impl Wal {
         )
     }
 
+    #[cfg(test)]
+    pub(crate) fn v8_effective_config_for_test(&self) -> Option<v8::leader::WalV8EffectiveConfig> {
+        self.v8_parallel
+            .as_ref()
+            .map(v8::leader::WalV8ParallelWriter::effective_config)
+    }
+
     pub(crate) fn admit_v8_prepared_parallel_point_batch<'a>(
         &self,
         scratch: v8::leader::WalV8PointAdmissionScratch<'a>,
