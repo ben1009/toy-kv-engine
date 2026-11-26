@@ -475,6 +475,27 @@ thread_local! {
     static WAL_V8_TEST_MODE_OVERRIDE: std::cell::Cell<Option<WalV8TestModeOverride>> = const {
         std::cell::Cell::new(None)
     };
+    static WAL_V8_TEST_PROFILE_OVERRIDE: std::cell::Cell<Option<WalV8Profile>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+/// Run an engine-level test with the Candidate V8 profile without mutating
+/// process-wide environment variables observed by parallel tests.
+#[cfg(test)]
+pub(crate) fn with_candidate_profile_for_test<T>(run: impl FnOnce() -> T) -> T {
+    struct Restore(Option<WalV8Profile>);
+
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            WAL_V8_TEST_PROFILE_OVERRIDE.with(|current| current.set(self.0));
+        }
+    }
+
+    let previous =
+        WAL_V8_TEST_PROFILE_OVERRIDE.with(|current| current.replace(Some(WalV8Profile::Candidate)));
+    let _restore = Restore(previous);
+    run()
 }
 
 /// Run an engine-level test with Cursor direct completion without mutating
@@ -923,7 +944,14 @@ impl WalV8RequestedConfig {
 
     /// Parse V8 WAL configuration from environment variables and test overrides.
     pub(crate) fn from_environment() -> Result<Self> {
-        let profile = WalV8Profile::from_environment()?;
+        #[cfg(test)]
+        let test_profile = WAL_V8_TEST_PROFILE_OVERRIDE.with(std::cell::Cell::get);
+        #[cfg(not(test))]
+        let test_profile: Option<WalV8Profile> = None;
+        let profile = match test_profile {
+            Some(profile) => profile,
+            None => WalV8Profile::from_environment()?,
+        };
         let base = match profile {
             WalV8Profile::Legacy => Self::default(),
             WalV8Profile::Candidate => Self::candidate(),
