@@ -1359,11 +1359,9 @@ impl LsmMvccInner {
         }
         let prepared = prepared_result?;
 
-        #[cfg(feature = "bench")]
         let mut point_scratch = crate::wal::v8::leader::WalV8PointAdmissionScratch::new(prepared);
         #[cfg(feature = "bench")]
         let phase_timer = WalCpuPhaseTimer::start(cpu_attribution.is_some());
-        #[cfg(feature = "bench")]
         let point_buffer_preallocated =
             memtable.try_preallocate_prepared_v8_point_buffer_only(&mut point_scratch);
         #[cfg(feature = "bench")]
@@ -1408,7 +1406,6 @@ impl LsmMvccInner {
 
         #[cfg(feature = "bench")]
         let phase_timer = WalCpuPhaseTimer::start(cpu_attribution.is_some());
-        #[cfg(feature = "bench")]
         let admission_result = if point_buffer_preallocated {
             memtable.admit_prepared_v8_point_pitr_wal_batch_only(
                 point_scratch,
@@ -1419,9 +1416,6 @@ impl LsmMvccInner {
             let prepared = point_scratch.into_prepared();
             memtable.admit_prepared_v8_pitr_wal_batch_only(prepared, commit_ts, recorded_at)
         };
-        #[cfg(not(feature = "bench"))]
-        let admission_result =
-            memtable.admit_prepared_v8_pitr_wal_batch_only(prepared, commit_ts, recorded_at);
         #[cfg(feature = "bench")]
         if let Some(sample) = cpu_attribution.as_mut() {
             let (wall_ns, cpu_ns) = phase_timer.finish();

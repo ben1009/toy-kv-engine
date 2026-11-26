@@ -2708,7 +2708,6 @@ impl Wal {
         self.finish_v8_parallel_admission(writer, job)
     }
 
-    #[cfg(feature = "bench")]
     pub(crate) fn try_preallocate_v8_point_buffer(
         &self,
         scratch: &mut v8::leader::WalV8PointAdmissionScratch<'_>,
@@ -2720,7 +2719,7 @@ impl Wal {
         false
     }
 
-    #[cfg(all(test, feature = "bench"))]
+    #[cfg(test)]
     pub(crate) fn set_v8_point_buffer_preallocation_for_test(&self, enabled: bool) -> Result<()> {
         self.v8_parallel
             .as_ref()
@@ -2729,7 +2728,21 @@ impl Wal {
         Ok(())
     }
 
-    #[cfg(feature = "bench")]
+    #[cfg(test)]
+    pub(crate) fn v8_point_buffer_preallocation_enabled_for_test(&self) -> bool {
+        self.v8_parallel.as_ref().is_some_and(
+            v8::leader::WalV8ParallelWriter::point_buffer_preallocation_enabled_for_test,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn v8_point_buffer_preallocations_in_flight_for_test(&self) -> usize {
+        self.v8_parallel.as_ref().map_or(
+            0,
+            v8::leader::WalV8ParallelWriter::point_buffer_preallocations_in_flight_for_test,
+        )
+    }
+
     pub(crate) fn admit_v8_prepared_parallel_point_batch<'a>(
         &self,
         scratch: v8::leader::WalV8PointAdmissionScratch<'a>,

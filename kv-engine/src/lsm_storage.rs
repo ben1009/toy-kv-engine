@@ -1882,7 +1882,7 @@ pub(crate) struct LsmStorageInner {
     pub(crate) active_memtable_lock: ActiveMemtableGate,
     #[cfg(test)]
     native_write_pause: Mutex<Option<Arc<native_write::NativeWritePause>>>,
-    #[cfg(all(test, feature = "bench"))]
+    #[cfg(test)]
     point_buffer_preallocation_test_override: AtomicBool,
     path: PathBuf,
     /// Held from before manifest replay through Active V7/V8 installation, then
@@ -15346,7 +15346,7 @@ impl LsmStorageInner {
             active_memtable_lock: ActiveMemtableGate::default(),
             #[cfg(test)]
             native_write_pause: Mutex::new(None),
-            #[cfg(all(test, feature = "bench"))]
+            #[cfg(test)]
             point_buffer_preallocation_test_override: AtomicBool::new(false),
             path: plan.path,
             wal_v7_open_lock: Mutex::new(plan.wal_v7_open_lock),
@@ -19048,7 +19048,7 @@ impl LsmStorageInner {
         self.rotate_after_wal_full(error, expected_memtable, retries, false)
     }
 
-    #[cfg(all(test, feature = "bench"))]
+    #[cfg(test)]
     fn set_v8_point_buffer_preallocation_for_test(&self, enabled: bool) -> Result<()> {
         self.point_buffer_preallocation_test_override
             .store(enabled, Ordering::Relaxed);
@@ -19455,7 +19455,7 @@ impl LsmStorageInner {
         )
     }
 
-    #[cfg(all(test, feature = "bench"))]
+    #[cfg(test)]
     fn put_with_native_write_pause_before_admission_for_test(
         &self,
         key: &[u8],
@@ -21239,7 +21239,7 @@ impl LsmStorageInner {
                 ))
             },
         )?;
-        #[cfg(all(test, feature = "bench"))]
+        #[cfg(test)]
         if self
             .point_buffer_preallocation_test_override
             .load(Ordering::Relaxed)
@@ -40263,7 +40263,7 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(all(target_os = "linux", feature = "bench"))]
+    #[cfg(target_os = "linux")]
     fn put_through_transient_pitr_barrier(
         engine: &KvEngine,
         key: &[u8],
@@ -40285,7 +40285,7 @@ mod tests {
         }
     }
 
-    #[cfg(all(target_os = "linux", feature = "bench"))]
+    #[cfg(target_os = "linux")]
     #[test]
     fn v8_point_buffer_preallocation_is_inherited_across_rotation_and_recovery()
     -> anyhow::Result<()> {
@@ -40354,6 +40354,8 @@ mod tests {
         let successor = engine.inner.state.load().memtable.clone();
         assert!(successor.uses_v8_wal());
         assert_ne!(successor.id(), initial_id);
+        assert!(successor.v8_point_buffer_preallocation_enabled_for_test());
+        #[cfg(feature = "bench")]
         assert!(
             successor
                 .benchmark_wal_io_diagnostics()
@@ -40384,42 +40386,56 @@ mod tests {
                 .iter()
                 .any(|memtable| memtable.id() == successor_id)
         );
-        let diagnostics = v8_memtables
-            .iter()
-            .map(|memtable| {
-                memtable
-                    .benchmark_wal_io_diagnostics()
-                    .expect("V8 memtable has benchmark I/O diagnostics")
-            })
-            .collect::<Vec<_>>();
         assert!(
-            !diagnostics.is_empty()
-                && diagnostics
+            !v8_memtables.is_empty()
+                && v8_memtables
                     .iter()
-                    .all(|item| { item.point_buffer_preallocation_enabled }),
-            "the test preallocation setting should be inherited by every V8 successor"
+                    .all(|memtable| memtable.v8_point_buffer_preallocation_enabled_for_test())
+                && v8_memtables.iter().all(|memtable| memtable
+                    .v8_point_buffer_preallocations_in_flight_for_test()
+                    == 0),
+            "the test preallocation setting should be inherited by every V8 successor with no leaked permits"
         );
-        assert!(
-            diagnostics
+        #[cfg(feature = "bench")]
+        {
+            let diagnostics = v8_memtables
                 .iter()
-                .map(|item| item.point_buffer_preallocation_hits)
-                .sum::<u64>()
-                > 0,
-            "Point admissions should consume preallocated buffers"
-        );
-        assert!(
-            v8_memtables.iter().any(|memtable| {
-                memtable.id() == successor_id
-                    && memtable
+                .map(|memtable| {
+                    memtable
                         .benchmark_wal_io_diagnostics()
-                        .is_some_and(|item| item.point_buffer_preallocation_hits > 0)
-            }),
-            "a rotated V8 memtable should record a preallocation hit"
-        );
-        assert!(diagnostics.iter().all(|item| {
-            item.point_buffer_preallocation_attempts
-                == item.point_buffer_preallocation_hits + item.point_buffer_preallocation_fallbacks
-        }));
+                        .expect("V8 memtable has benchmark I/O diagnostics")
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                !diagnostics.is_empty()
+                    && diagnostics
+                        .iter()
+                        .all(|item| { item.point_buffer_preallocation_enabled }),
+                "the test preallocation setting should be inherited by every V8 successor"
+            );
+            assert!(
+                diagnostics
+                    .iter()
+                    .map(|item| item.point_buffer_preallocation_hits)
+                    .sum::<u64>()
+                    > 0,
+                "Point admissions should consume preallocated buffers"
+            );
+            assert!(
+                v8_memtables.iter().any(|memtable| {
+                    memtable.id() == successor_id
+                        && memtable
+                            .benchmark_wal_io_diagnostics()
+                            .is_some_and(|item| item.point_buffer_preallocation_hits > 0)
+                }),
+                "a rotated V8 memtable should record a preallocation hit"
+            );
+            assert!(diagnostics.iter().all(|item| {
+                item.point_buffer_preallocation_attempts
+                    == item.point_buffer_preallocation_hits
+                        + item.point_buffer_preallocation_fallbacks
+            }));
+        }
 
         for index in 0..(2 * WRITES_PER_SEGMENT) {
             let key = format!("point-{index:03}");
@@ -40561,14 +40577,14 @@ mod tests {
         })
     }
 
-    #[cfg(all(target_os = "linux", feature = "bench"))]
+    #[cfg(target_os = "linux")]
     #[test]
     fn v8_point_buffer_preallocation_survives_concurrent_rotation_and_recovery()
     -> anyhow::Result<()> {
         exercise_point_preallocation_rotation(8)
     }
 
-    #[cfg(all(target_os = "linux", feature = "bench"))]
+    #[cfg(target_os = "linux")]
     fn exercise_point_preallocation_rotation(writer_count: usize) -> anyhow::Result<()> {
         use crate::pitr::api::{PersistedPitrConfig, PitrOptions, PitrRuntimeOptions};
         use crate::tests::harness::is_io_uring_unavailable_error;
@@ -40715,36 +40731,52 @@ mod tests {
 
         assert_eq!(test_memtables.len(), PHASE_COUNT + 1);
         assert!(test_memtables.iter().all(|memtable| memtable.uses_v8_wal()));
-        let diagnostics = test_memtables
-            .iter()
-            .map(|memtable| {
-                memtable
-                    .benchmark_wal_io_diagnostics()
-                    .expect("V8 memtable exposes benchmark I/O diagnostics")
-            })
-            .collect::<Vec<_>>();
         assert!(
-            diagnostics
+            test_memtables
                 .iter()
-                .all(|item| item.point_buffer_preallocation_enabled),
+                .all(|memtable| memtable.v8_point_buffer_preallocation_enabled_for_test()),
             "every V8 WAL used by the test must have preallocation enabled"
         );
         assert!(
-            diagnostics
+            test_memtables
                 .iter()
-                .all(|item| item.point_buffer_preallocations_in_flight == 0),
+                .all(|memtable| memtable.v8_point_buffer_preallocations_in_flight_for_test() == 0),
             "rotation must not strand speculative buffer permits"
         );
-        assert!(
-            diagnostics
+        #[cfg(feature = "bench")]
+        {
+            let diagnostics = test_memtables
                 .iter()
-                .all(|item| item.point_buffer_preallocation_hits > 0),
-            "every WAL created across rotations should record a preallocation hit"
-        );
-        assert!(diagnostics.iter().all(|item| {
-            item.point_buffer_preallocation_attempts
-                == item.point_buffer_preallocation_hits + item.point_buffer_preallocation_fallbacks
-        }));
+                .map(|memtable| {
+                    memtable
+                        .benchmark_wal_io_diagnostics()
+                        .expect("V8 memtable exposes benchmark I/O diagnostics")
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                diagnostics
+                    .iter()
+                    .all(|item| item.point_buffer_preallocation_enabled),
+                "every V8 WAL used by the test must have preallocation enabled"
+            );
+            assert!(
+                diagnostics
+                    .iter()
+                    .all(|item| item.point_buffer_preallocations_in_flight == 0),
+                "rotation must not strand speculative buffer permits"
+            );
+            assert!(
+                diagnostics
+                    .iter()
+                    .all(|item| item.point_buffer_preallocation_hits > 0),
+                "every WAL created across rotations should record a preallocation hit"
+            );
+            assert!(diagnostics.iter().all(|item| {
+                item.point_buffer_preallocation_attempts
+                    == item.point_buffer_preallocation_hits
+                        + item.point_buffer_preallocation_fallbacks
+            }));
+        }
         drop(test_memtables);
 
         engine.close()?;
@@ -40760,7 +40792,7 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(all(target_os = "linux", feature = "bench"))]
+    #[cfg(target_os = "linux")]
     #[test]
     fn v8_point_buffer_preallocation_admission_overlaps_rotation_and_recovers() -> anyhow::Result<()>
     {
@@ -40885,31 +40917,50 @@ mod tests {
 
         let successor = engine.inner.state.load().memtable.clone();
         assert!(!Arc::ptr_eq(&source, &successor));
-        let source_diagnostics = source
-            .benchmark_wal_io_diagnostics()
-            .expect("source V8 WAL exposes preallocation diagnostics");
-        assert_eq!(source_diagnostics.point_buffer_preallocation_attempts, 1);
-        assert_eq!(source_diagnostics.point_buffer_preallocation_hits, 1);
-        assert_eq!(source_diagnostics.point_buffer_preallocations_in_flight, 0);
-        let successor_diagnostics = successor
-            .benchmark_wal_io_diagnostics()
-            .expect("successor V8 WAL exposes preallocation diagnostics");
-        assert!(successor_diagnostics.point_buffer_preallocation_enabled);
         assert_eq!(
-            successor_diagnostics.point_buffer_preallocations_in_flight,
+            source.v8_point_buffer_preallocations_in_flight_for_test(),
             0
         );
+        assert!(successor.v8_point_buffer_preallocation_enabled_for_test());
+        assert_eq!(
+            successor.v8_point_buffer_preallocations_in_flight_for_test(),
+            0
+        );
+        #[cfg(feature = "bench")]
+        {
+            let source_diagnostics = source
+                .benchmark_wal_io_diagnostics()
+                .expect("source V8 WAL exposes preallocation diagnostics");
+            assert_eq!(source_diagnostics.point_buffer_preallocation_attempts, 1);
+            assert_eq!(source_diagnostics.point_buffer_preallocation_hits, 1);
+            assert_eq!(source_diagnostics.point_buffer_preallocations_in_flight, 0);
+            let successor_diagnostics = successor
+                .benchmark_wal_io_diagnostics()
+                .expect("successor V8 WAL exposes preallocation diagnostics");
+            assert!(successor_diagnostics.point_buffer_preallocation_enabled);
+            assert_eq!(
+                successor_diagnostics.point_buffer_preallocations_in_flight,
+                0
+            );
+        }
         assert_eq!(engine.get(KEY)?, None);
         engine.put(KEY, VALUE)?;
-        let successor_diagnostics = successor
-            .benchmark_wal_io_diagnostics()
-            .expect("successor V8 WAL exposes benchmark I/O diagnostics");
-        assert_eq!(successor_diagnostics.point_buffer_preallocation_attempts, 1);
-        assert_eq!(successor_diagnostics.point_buffer_preallocation_hits, 1);
         assert_eq!(
-            successor_diagnostics.point_buffer_preallocations_in_flight,
+            successor.v8_point_buffer_preallocations_in_flight_for_test(),
             0
         );
+        #[cfg(feature = "bench")]
+        {
+            let successor_diagnostics = successor
+                .benchmark_wal_io_diagnostics()
+                .expect("successor V8 WAL exposes benchmark I/O diagnostics");
+            assert_eq!(successor_diagnostics.point_buffer_preallocation_attempts, 1);
+            assert_eq!(successor_diagnostics.point_buffer_preallocation_hits, 1);
+            assert_eq!(
+                successor_diagnostics.point_buffer_preallocations_in_flight,
+                0
+            );
+        }
         assert_eq!(engine.get(KEY)?.as_deref(), Some(VALUE));
 
         engine.close()?;

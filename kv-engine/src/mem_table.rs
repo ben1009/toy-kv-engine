@@ -4137,7 +4137,6 @@ impl MemTable {
         Ok((Some(ticket), Some(frame_job)))
     }
 
-    #[cfg(feature = "bench")]
     pub(crate) fn try_preallocate_prepared_v8_point_buffer_only(
         &self,
         scratch: &mut crate::wal::v8::leader::WalV8PointAdmissionScratch<'_>,
@@ -4149,7 +4148,6 @@ impl MemTable {
         false
     }
 
-    #[cfg(feature = "bench")]
     pub(crate) fn admit_prepared_v8_point_pitr_wal_batch_only<'a>(
         &self,
         scratch: crate::wal::v8::leader::WalV8PointAdmissionScratch<'a>,
@@ -4398,12 +4396,26 @@ impl MemTable {
         self.wal.as_ref().and_then(Wal::benchmark_io_diagnostics)
     }
 
-    #[cfg(all(test, feature = "bench"))]
+    #[cfg(test)]
     pub(crate) fn set_v8_point_buffer_preallocation_for_test(&self, enabled: bool) -> Result<()> {
         self.wal
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("memtable has no WAL"))?
             .set_v8_point_buffer_preallocation_for_test(enabled)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn v8_point_buffer_preallocation_enabled_for_test(&self) -> bool {
+        self.wal
+            .as_ref()
+            .is_some_and(Wal::v8_point_buffer_preallocation_enabled_for_test)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn v8_point_buffer_preallocations_in_flight_for_test(&self) -> usize {
+        self.wal
+            .as_ref()
+            .map_or(0, Wal::v8_point_buffer_preallocations_in_flight_for_test)
     }
 
     pub(crate) fn uses_pitr_batch_wal(&self) -> bool {
