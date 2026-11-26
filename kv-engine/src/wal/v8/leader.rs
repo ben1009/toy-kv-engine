@@ -9743,6 +9743,13 @@ mod tests {
                 let ticket = job.assignment().segment_ticket;
                 let _ = job.finish()?;
                 writer.wait_durable(ticket)?;
+                if effective.ext_family_filesystem && effective.o_direct_worker {
+                    assert!(
+                        std::fs::metadata(wal_path)?.len()
+                            >= installed.image_len + WAL_V8_PRODUCTION_EXTENT_WINDOW_BYTES,
+                        "PointOnlyLookahead must extend the physical WAL image on eligible ext4/O_DIRECT filesystems"
+                    );
+                }
             } else {
                 writer.append_prepared_batch(
                     writer.preflight_batch(&value, LIVE_WAL_V5_LIMITS)?,
@@ -14188,9 +14195,122 @@ mod tests {
         )?;
         assert!(!waited3);
         assert_eq!(snapshot3.ready_prefix.len(), 10);
+        // Drive FRONTIER through ticket 11 (1 warmup + 10 ready Points) and
+        // verify all 10 ready Points are committed without truncation at 8.
+        writer3.drive_frontier_through(11, &mut driver3)?;
+        assert_eq!(writer3.active_boundaries()?.1.ticket_end, 11);
         drop(driver3);
         drop(case3_pending);
         drop(writer3);
+
+        // Case 4: Starts Point-only below target (4 ready Points), then a real
+        // Batch ticket is admitted during the wait while 4 more Points finish
+        // (reaching 8 ready Points) -> Target8 is cancelled and falls back to Dynamic.
+        let writer4 = Arc::new(open_warmed_writer("case4.wal", &mut next_ts)?.unwrap());
+        let mut case4_initial_batches = Vec::new();
+        for _ in 0..5 {
+            case4_initial_batches.push(batch(next_ts));
+            next_ts += 10;
+        }
+        let mut case4_jobs = Vec::new();
+        for b in &case4_initial_batches {
+            let prepared = writer4.preflight_batch_with_write_class(
+                b,
+                LIVE_WAL_V5_LIMITS,
+                WalV8WriteClass::Point,
+            )?;
+            let mut scratch = WalV8PointAdmissionScratch::new(prepared);
+            assert!(writer4.try_preallocate_point_buffer(&mut scratch));
+            case4_jobs.push(writer4.admit_prepared_point_batch(
+                scratch,
+                b.commit_ts,
+                b.recorded_at,
+            )?);
+        }
+        let case4_fifth = case4_jobs.pop().unwrap();
+        for job in case4_jobs {
+            let _ = job.finish()?;
+        }
+        let mut driver4 = writer4
+            .coordinator
+            .acquire_durability_driver(writer4.next_ticket())?
+            .context("acquire driver for Case 4")?;
+        let mut snapshot4 = wait_until_ready(&writer4, &mut driver4, 4, 5)?;
+        assert!(!snapshot4.has_outstanding_batch_tickets);
+
+        let wait_calls = Arc::new(AtomicU64::new(0));
+        let injected = Arc::new(AtomicBool::new(false));
+        let (trigger_tx, trigger_rx) = crossbeam_channel::bounded::<()>(1);
+        let (done_tx, done_rx) = crossbeam_channel::bounded::<()>(1);
+        let hook_batches: Vec<_> = (0..3).map(|i| batch(next_ts + i * 10)).collect();
+        next_ts += 30;
+        let hook_batch_write = batch(next_ts);
+        writer4.io.set_progress_wait_hook(Arc::new({
+            let wait_calls = Arc::clone(&wait_calls);
+            let injected = Arc::clone(&injected);
+            move |event| {
+                if matches!(event, WalV8ProgressWaitTestEvent::BeforeWait) {
+                    wait_calls.fetch_add(1, Ordering::AcqRel);
+                    if !injected.swap(true, Ordering::AcqRel) {
+                        let _ = trigger_tx.send(());
+                        let _ = done_rx.recv_timeout(Duration::from_secs(5));
+                    }
+                }
+            }
+        }));
+        let waited4 = thread::scope(|scope| -> Result<bool> {
+            let injector = scope.spawn(|| -> Result<()> {
+                if trigger_rx.recv_timeout(Duration::from_secs(5)).is_ok() {
+                    let _ = case4_fifth.finish()?;
+                    for b in &hook_batches {
+                        let prepared = writer4.preflight_batch_with_write_class(
+                            b,
+                            LIVE_WAL_V5_LIMITS,
+                            WalV8WriteClass::Point,
+                        )?;
+                        let mut scratch = WalV8PointAdmissionScratch::new(prepared);
+                        assert!(writer4.try_preallocate_point_buffer(&mut scratch));
+                        let job = writer4.admit_prepared_point_batch(
+                            scratch,
+                            b.commit_ts,
+                            b.recorded_at,
+                        )?;
+                        let _ = job.finish()?;
+                    }
+                    let prepared_batch = writer4.preflight_batch_with_write_class(
+                        &hook_batch_write,
+                        LIVE_WAL_V5_LIMITS,
+                        WalV8WriteClass::Batch,
+                    )?;
+                    let batch_job = writer4.admit_prepared_batch(
+                        prepared_batch,
+                        hook_batch_write.commit_ts,
+                        hook_batch_write.recorded_at,
+                    )?;
+                    let _ = done_tx.send(());
+                    thread::sleep(Duration::from_millis(60));
+                    let _ = batch_job.finish()?;
+                }
+                Ok(())
+            });
+            let waited = writer4.io.coalesce_progress_ring(
+                &mut driver4,
+                &mut snapshot4,
+                Duration::from_millis(40),
+                false,
+                #[cfg(feature = "bench")]
+                None,
+            )?;
+            injector.join().expect("case4 injector panicked")?;
+            Ok(waited)
+        })?;
+        assert!(waited4);
+        assert!(snapshot4.has_outstanding_batch_tickets);
+        assert!(
+            wait_calls.load(Ordering::Acquire) >= 2,
+            "reaching 8 ready Points after Batch admission must continue Dynamic waiting"
+        );
+        drop(driver4);
 
         Ok(())
     }
@@ -14284,7 +14404,7 @@ mod tests {
     }
 
     #[test]
-    fn v8_candidate_stage_a_logical_quota_exhaustion_and_recovery() -> Result<()> {
+    fn v8_candidate_stage_a_source_spool_exhaustion_and_recovery() -> Result<()> {
         const SEGMENT_LIMIT: u64 = 64 * 1024;
         const INITIAL_SOURCE_CHARGE: u64 = HEADER_LEN_U64 + FRAME_LEN_U64;
         const ONE_BATCH_SOURCE_CHARGE: u64 = 2 * WAL_V8_FRAME_LEN as u64;
