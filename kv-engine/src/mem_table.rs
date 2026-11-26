@@ -7356,7 +7356,7 @@ mod tests {
             installed,
             segment_limit,
             WalIoMode::Parallel,
-            crate::wal::v8::leader::WalV8RequestedConfig::from_environment()?,
+            crate::wal::v8::leader::WalV8RequestedConfig::candidate(),
             |installed| {
                 Ok(Arc::new(
                     crate::wal::v8::resource::WalV8ReservationOwner::new_with_retained_resources(
