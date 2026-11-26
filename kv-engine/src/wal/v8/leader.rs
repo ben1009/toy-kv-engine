@@ -9706,21 +9706,50 @@ mod tests {
                     WalV8CoalesceTargetPolicy::PointOnly(8)
                 );
             }
-            #[cfg(feature = "bench")]
-            let value = if std::env::var_os(EXTENT_PREPARATION_ENV).as_deref()
-                == Some(OsStr::new("sliding-initialize"))
-            {
-                multi_window_batch(10)
-            } else {
+            let value = if requested_candidate {
                 batch(10)
+            } else {
+                #[cfg(feature = "bench")]
+                {
+                    if std::env::var_os(EXTENT_PREPARATION_ENV).as_deref()
+                        == Some(OsStr::new("sliding-initialize"))
+                    {
+                        multi_window_batch(10)
+                    } else {
+                        batch(10)
+                    }
+                }
+                #[cfg(not(feature = "bench"))]
+                {
+                    batch(10)
+                }
             };
-            #[cfg(not(feature = "bench"))]
-            let value = batch(10);
-            writer.append_prepared_batch(
-                writer.preflight_batch(&value, LIVE_WAL_V5_LIMITS)?,
-                10,
-                value.recorded_at,
-            )?;
+            if requested_candidate {
+                let effective = writer.effective_config();
+                if effective.ext_family_filesystem && effective.o_direct_worker {
+                    assert_eq!(
+                        effective.extent_policy,
+                        WalV8ExtentPreparationPolicy::PointOnlyLookahead
+                    );
+                }
+                let prepared = writer.preflight_batch_with_write_class(
+                    &value,
+                    LIVE_WAL_V5_LIMITS,
+                    WalV8WriteClass::Point,
+                )?;
+                let mut scratch = WalV8PointAdmissionScratch::new(prepared);
+                assert!(writer.try_preallocate_point_buffer(&mut scratch));
+                let job = writer.admit_prepared_point_batch(scratch, 10, value.recorded_at)?;
+                let ticket = job.assignment().segment_ticket;
+                let _ = job.finish()?;
+                writer.wait_durable(ticket)?;
+            } else {
+                writer.append_prepared_batch(
+                    writer.preflight_batch(&value, LIVE_WAL_V5_LIMITS)?,
+                    10,
+                    value.recorded_at,
+                )?;
+            }
             std::fs::write(ack_path, b"acknowledged")?;
             anyhow::bail!("configured V8 writer crash point did not stop the child")
         }
@@ -13939,89 +13968,229 @@ mod tests {
     #[test]
     fn v8_candidate_mixed_target8_falls_back_to_dynamic_on_real_admission() -> Result<()> {
         let dir = tempfile::tempdir()?;
-        let path = dir.path().join("candidate-mixed-target8.wal");
-        let header = header();
-        let installed = install_empty(&path, header)?;
-        let writer = Arc::new(
-            match open_writer(&path, &installed)?.into_parallel_with_worker_file_and_config(
-                OpenOptions::new().read(true).write(true).open(&path)?,
-                WalV8RequestedConfig::candidate(),
-            ) {
-                Ok(writer) => writer,
-                Err(error) if is_io_uring_unavailable_error(&error) => {
-                    eprintln!("skipping test (io_uring unavailable): {error:#}");
-                    return Ok(());
-                }
-                Err(error) => return Err(error),
-            },
-        );
+        let mut next_ts = 10u64;
 
-        // Admit 8 Point tickets + 1 Batch ticket so all 9 are in the outstanding
-        // window simultaneously, with the Batch ticket still unready.
-        let point_batches: Vec<_> = (0..8u64).map(|i| batch((i + 1) * 10)).collect();
-        let mut point_jobs = Vec::new();
-        for b in &point_batches {
-            let prepared = writer.preflight_batch_with_write_class(
+        let open_warmed_writer =
+            |name: &str, ts: &mut u64| -> Result<Option<WalV8ParallelWriter>> {
+                let path = dir.path().join(name);
+                let installed = install_empty(&path, header())?;
+                let writer = match open_writer(&path, &installed)?
+                    .into_parallel_with_worker_file_and_config(
+                        OpenOptions::new().read(true).write(true).open(&path)?,
+                        WalV8RequestedConfig::candidate(),
+                    ) {
+                    Ok(writer) => writer,
+                    Err(error) if is_io_uring_unavailable_error(&error) => {
+                        eprintln!("skipping test (io_uring unavailable): {error:#}");
+                        return Ok(None);
+                    }
+                    Err(error) => return Err(error),
+                };
+                let warmup = batch(*ts);
+                *ts += 10;
+                let warmup_prepared = writer.preflight_batch_with_write_class(
+                    &warmup,
+                    LIVE_WAL_V5_LIMITS,
+                    WalV8WriteClass::Point,
+                )?;
+                let mut warmup_scratch = WalV8PointAdmissionScratch::new(warmup_prepared);
+                assert!(writer.try_preallocate_point_buffer(&mut warmup_scratch));
+                let warmup_job = writer.admit_prepared_point_batch(
+                    warmup_scratch,
+                    warmup.commit_ts,
+                    warmup.recorded_at,
+                )?;
+                let _ = warmup_job.finish()?;
+                writer.sync()?;
+                Ok(Some(writer))
+            };
+
+        let wait_until_ready = |writer: &WalV8ParallelWriter,
+                                driver: &mut WalV8DurabilityDriver,
+                                expected_ready: usize,
+                                expected_admitted: usize|
+         -> Result<WalV8FrontierReadySnapshot> {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let snapshot = writer.io.advance_and_snapshot(driver, false)?;
+                if snapshot.ready_prefix.len() == expected_ready
+                    && snapshot.admitted_ticket_count == expected_admitted
+                {
+                    return Ok(snapshot);
+                }
+                ensure!(
+                    Instant::now() < deadline,
+                    "timed out waiting for ready_prefix={expected_ready}, admitted={expected_admitted} (got ready={}, admitted={})",
+                    snapshot.ready_prefix.len(),
+                    snapshot.admitted_ticket_count
+                );
+                thread::sleep(Duration::from_millis(2));
+            }
+        };
+
+        // Case 1: 8 ready Points + 1 pending Point -> Target8 stops without waiting.
+        let Some(writer1) = open_warmed_writer("case1.wal", &mut next_ts)? else {
+            return Ok(());
+        };
+        let mut case1_batches = Vec::new();
+        for _ in 0..9 {
+            case1_batches.push(batch(next_ts));
+            next_ts += 10;
+        }
+        let mut case1_jobs = Vec::new();
+        for b in &case1_batches {
+            let prepared = writer1.preflight_batch_with_write_class(
                 b,
                 LIVE_WAL_V5_LIMITS,
                 WalV8WriteClass::Point,
             )?;
             let mut scratch = WalV8PointAdmissionScratch::new(prepared);
-            assert!(writer.try_preallocate_point_buffer(&mut scratch));
-            point_jobs.push(writer.admit_prepared_point_batch(
+            assert!(writer1.try_preallocate_point_buffer(&mut scratch));
+            case1_jobs.push(writer1.admit_prepared_point_batch(
                 scratch,
                 b.commit_ts,
                 b.recorded_at,
             )?);
         }
-        let batch_write = batch(100);
-        let batch_job = writer.admit_prepared_batch(
-            writer.preflight_batch_with_write_class(
-                &batch_write,
+        let case1_pending = case1_jobs.pop().unwrap();
+        for job in case1_jobs {
+            let _ = job.finish()?;
+        }
+        let mut driver1 = writer1
+            .coordinator
+            .acquire_durability_driver(writer1.next_ticket())?
+            .context("acquire driver for Case 1")?;
+        let mut snapshot1 = wait_until_ready(&writer1, &mut driver1, 8, 9)?;
+        assert!(!snapshot1.has_outstanding_batch_tickets);
+        let waited1 = writer1.io.coalesce_progress_ring(
+            &mut driver1,
+            &mut snapshot1,
+            Duration::from_millis(50),
+            false,
+            #[cfg(feature = "bench")]
+            None,
+        )?;
+        assert!(
+            !waited1,
+            "Point-only window at 8 ready Points must stop without coalescing wait"
+        );
+        drop(driver1);
+        drop(case1_pending);
+        drop(writer1);
+
+        // Case 2: 8 ready Points + 1 pending Batch -> Target8 suppressed, Dynamic waits.
+        let writer2 = open_warmed_writer("case2.wal", &mut next_ts)?.unwrap();
+        let mut case2_point_batches = Vec::new();
+        for _ in 0..8 {
+            case2_point_batches.push(batch(next_ts));
+            next_ts += 10;
+        }
+        let mut case2_jobs = Vec::new();
+        for b in &case2_point_batches {
+            let prepared = writer2.preflight_batch_with_write_class(
+                b,
+                LIVE_WAL_V5_LIMITS,
+                WalV8WriteClass::Point,
+            )?;
+            let mut scratch = WalV8PointAdmissionScratch::new(prepared);
+            assert!(writer2.try_preallocate_point_buffer(&mut scratch));
+            case2_jobs.push(writer2.admit_prepared_point_batch(
+                scratch,
+                b.commit_ts,
+                b.recorded_at,
+            )?);
+        }
+        let case2_batch = batch(next_ts);
+        next_ts += 10;
+        let case2_pending_batch = writer2.admit_prepared_batch(
+            writer2.preflight_batch_with_write_class(
+                &case2_batch,
                 LIVE_WAL_V5_LIMITS,
                 WalV8WriteClass::Batch,
             )?,
-            batch_write.commit_ts,
-            batch_write.recorded_at,
+            case2_batch.commit_ts,
+            case2_batch.recorded_at,
         )?;
-        let last_ticket = batch_job.assignment().segment_ticket;
-
-        // Finish all 8 Point jobs while keeping the 9th Batch job unready.
-        for job in point_jobs {
+        for job in case2_jobs {
             let _ = job.finish()?;
         }
-        let snapshot = writer.coordinator.frontier_ready_snapshot();
-        assert!(snapshot.has_outstanding_batch_tickets);
+        let mut driver2 = writer2
+            .coordinator
+            .acquire_durability_driver(writer2.next_ticket())?
+            .context("acquire driver for Case 2")?;
+        let mut snapshot2 = wait_until_ready(&writer2, &mut driver2, 8, 9)?;
+        assert_eq!(snapshot2.ready_prefix.len(), 8);
+        assert_eq!(snapshot2.admitted_ticket_count, 9);
+        assert!(snapshot2.has_outstanding_batch_tickets);
 
-        // Drive durability for the 8th Point ticket: because an unready Batch
-        // ticket is outstanding, Target8 must be suppressed and the driver must
-        // enter Dynamic coalescing (`BeforeWait`) instead of stopping early at 8.
-        let (wait_tx, wait_rx) = crossbeam_channel::bounded(4);
-        writer.io.set_progress_wait_hook(Arc::new(move |event| {
-            if matches!(event, WalV8ProgressWaitTestEvent::BeforeWait) {
-                let _ = wait_tx.try_send(());
+        let parked = Arc::new(AtomicBool::new(false));
+        writer2.io.set_progress_wait_hook(Arc::new({
+            let parked = Arc::clone(&parked);
+            move |event| {
+                if matches!(event, WalV8ProgressWaitTestEvent::BeforeWait) {
+                    parked.store(true, Ordering::Release);
+                }
             }
         }));
-        thread::scope(|scope| -> Result<()> {
-            let driver = scope.spawn({
-                let writer = Arc::clone(&writer);
-                move || writer.wait_durable(last_ticket)
-            });
-            wait_rx
-                .recv_timeout(Duration::from_secs(5))
-                .context("mixed outstanding window should park in Dynamic coalescing")?;
-            let _ = batch_job.finish()?;
-            driver.join().expect("durability driver thread panicked")?;
-            Ok(())
-        })?;
+        let waited2 = writer2.io.coalesce_progress_ring(
+            &mut driver2,
+            &mut snapshot2,
+            Duration::from_millis(30),
+            false,
+            #[cfg(feature = "bench")]
+            None,
+        )?;
+        assert!(waited2, "mixed window must enter Dynamic coalescing wait");
+        assert!(parked.load(Ordering::Acquire));
+        drop(driver2);
+        drop(case2_pending_batch);
+        drop(writer2);
 
-        assert!(
-            !writer
-                .coordinator
-                .frontier_ready_snapshot()
-                .has_outstanding_batch_tickets
-        );
-        assert_eq!(writer.active_boundaries()?.1.ticket_end, last_ticket + 1);
+        // Case 3: 10 ready Points + 1 pending Point -> preserves full 10-ticket prefix.
+        let writer3 = open_warmed_writer("case3.wal", &mut next_ts)?.unwrap();
+        let mut case3_batches = Vec::new();
+        for _ in 0..11 {
+            case3_batches.push(batch(next_ts));
+            next_ts += 10;
+        }
+        let mut case3_jobs = Vec::new();
+        for b in &case3_batches {
+            let prepared = writer3.preflight_batch_with_write_class(
+                b,
+                LIVE_WAL_V5_LIMITS,
+                WalV8WriteClass::Point,
+            )?;
+            let mut scratch = WalV8PointAdmissionScratch::new(prepared);
+            assert!(writer3.try_preallocate_point_buffer(&mut scratch));
+            case3_jobs.push(writer3.admit_prepared_point_batch(
+                scratch,
+                b.commit_ts,
+                b.recorded_at,
+            )?);
+        }
+        let case3_pending = case3_jobs.pop().unwrap();
+        for job in case3_jobs {
+            let _ = job.finish()?;
+        }
+        let mut driver3 = writer3
+            .coordinator
+            .acquire_durability_driver(writer3.next_ticket())?
+            .context("acquire driver for Case 3")?;
+        let mut snapshot3 = wait_until_ready(&writer3, &mut driver3, 10, 11)?;
+        assert!(!snapshot3.has_outstanding_batch_tickets);
+        let waited3 = writer3.io.coalesce_progress_ring(
+            &mut driver3,
+            &mut snapshot3,
+            Duration::from_millis(50),
+            false,
+            #[cfg(feature = "bench")]
+            None,
+        )?;
+        assert!(!waited3);
+        assert_eq!(snapshot3.ready_prefix.len(), 10);
+        drop(driver3);
+        drop(case3_pending);
+        drop(writer3);
 
         Ok(())
     }
@@ -14116,69 +14285,86 @@ mod tests {
 
     #[test]
     fn v8_candidate_stage_a_logical_quota_exhaustion_and_recovery() -> Result<()> {
+        const SEGMENT_LIMIT: u64 = 64 * 1024;
+        const INITIAL_SOURCE_CHARGE: u64 = HEADER_LEN_U64 + FRAME_LEN_U64;
+        const ONE_BATCH_SOURCE_CHARGE: u64 = 2 * WAL_V8_FRAME_LEN as u64;
+        const SOURCE_SPOOL_LIMIT: u64 =
+            SEGMENT_LIMIT + INITIAL_SOURCE_CHARGE + ONE_BATCH_SOURCE_CHARGE;
+
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("candidate-quota.wal");
         let installed = install_empty(&path, header())?;
         let sync_file = OpenOptions::new().read(true).write(true).open(&path)?;
-        let logical_limit = 2 * MAX_WAL_FILE_SIZE;
         let (leader, owner) = open_accounted_writer(
             &path,
             &installed,
-            MAX_WAL_FILE_SIZE,
-            logical_limit,
+            SEGMENT_LIMIT,
+            SOURCE_SPOOL_LIMIT,
             FRAME_LEN_U64,
             sync_file,
         )?;
-        let writer = leader.into_parallel_with_worker_file_and_config(
+        let writer = match leader.into_parallel_with_worker_file_and_config(
             OpenOptions::new().read(true).write(true).open(&path)?,
             WalV8RequestedConfig::candidate(),
-        )?;
-
-        // 1. Exhaust logical quota deterministically to < 16 bytes remaining.
-        let mut held_reservations = Vec::new();
-        for chunk in [64 * 1024, 16 * 1024, 4096, 1024, 256, 64, 16] {
-            while let Ok(reservation) = owner.reserve_batch(chunk, FRAME_LEN_U64) {
-                held_reservations.push(reservation);
+        ) {
+            Ok(writer) => writer,
+            Err(error) if is_io_uring_unavailable_error(&error) => {
+                eprintln!("skipping test (io_uring unavailable): {error:#}");
+                return Ok(());
             }
-        }
-        assert!(!held_reservations.is_empty());
+            Err(error) => return Err(error),
+        };
 
-        // 2. Single-frame Point write hits Stage A, fails at admission with
-        // LogicalWalLimit, releases its Stage A permit, and does not poison writer.
         let pt_batch = batch(10);
         let prepared = writer.preflight_batch_with_write_class(
             &pt_batch,
             LIVE_WAL_V5_LIMITS,
             WalV8WriteClass::Point,
         )?;
+        let quota_initial = owner.image_owner().snapshot();
+
+        // 1. Hold one exact-sized batch reservation to exhaust source-spool quota.
+        let held_reservation = owner.reserve_batch(
+            u64::try_from(prepared.logical_batch_bytes())?,
+            u64::try_from(prepared.frame_buffer_bytes())?,
+        )?;
+        let quota_while_held = owner.image_owner().snapshot();
+        assert_eq!(
+            quota_while_held.source_spool_bytes,
+            quota_initial.source_spool_bytes + ONE_BATCH_SOURCE_CHARGE
+        );
+
+        // 2. Single-frame Point write hits Stage A without charging quota, fails
+        // at admission with SourceSpoolLimit, releases its Stage A permit, and
+        // leaves quota and writer unpoisoned.
         let mut scratch = WalV8PointAdmissionScratch::new(prepared);
         assert!(writer.try_preallocate_point_buffer(&mut scratch));
         assert!(writer.point_buffer_preallocation_hits_for_test() >= 1);
         assert_eq!(writer.point_buffer_preallocations_in_flight_for_test(), 1);
+        assert_eq!(owner.image_owner().snapshot(), quota_while_held);
 
         let err = match writer.admit_prepared_point_batch(
             scratch,
             pt_batch.commit_ts,
             pt_batch.recorded_at,
         ) {
-            Ok(_) => anyhow::bail!("expected LogicalWalLimit when quota is exhausted"),
+            Ok(_) => anyhow::bail!("expected SourceSpoolLimit when quota is exhausted"),
             Err(err) => err,
         };
         assert!(
             matches!(
                 err.downcast_ref::<crate::wal::v7::admission::WalV7ReservationError>(),
-                Some(
-                    crate::wal::v7::admission::WalV7ReservationError::LogicalWalLimit
-                        | crate::wal::v7::admission::WalV7ReservationError::SourceSpoolLimit { .. }
-                )
+                Some(crate::wal::v7::admission::WalV7ReservationError::SourceSpoolLimit { .. })
             ),
-            "expected V7 quota exhaustion error, got {err:#}"
+            "expected SourceSpoolLimit, got {err:#}"
         );
         assert_eq!(writer.point_buffer_preallocations_in_flight_for_test(), 0);
+        assert_eq!(owner.image_owner().snapshot(), quota_while_held);
         assert!(!writer.is_poisoned());
 
-        // 3. Release quota and verify a subsequent single-frame Point write succeeds.
-        drop(held_reservations);
+        // 3. Release held reservation -> quota restores and Point write succeeds.
+        drop(held_reservation);
+        assert_eq!(owner.image_owner().snapshot(), quota_initial);
         let prepared_ok = writer.preflight_batch_with_write_class(
             &pt_batch,
             LIVE_WAL_V5_LIMITS,

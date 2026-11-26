@@ -41633,15 +41633,18 @@ mod tests {
             saw_point_capacity_error && !committed.is_empty(),
             "single-frame Point writes should hit deterministic capacity exhaustion"
         );
+        let active_at_failure = engine.inner.state.load().memtable.clone();
         assert_eq!(
-            active.v8_point_buffer_preallocations_in_flight_for_test(),
+            active_at_failure.v8_point_buffer_preallocations_in_flight_for_test(),
             0
         );
+        assert!(active_at_failure.uses_v8_cursor_direct_completion());
         // Existing committed data remains readable (writer/engine is not poisoned).
         assert_eq!(
             engine.get(&committed[0].0)?.as_deref(),
             Some(committed[0].1.as_slice())
         );
+        drop(active_at_failure);
         drop(active);
         engine.close()?;
         drop(engine);
@@ -41653,6 +41656,11 @@ mod tests {
         for (key, value) in &committed {
             assert_eq!(reopened.get(key)?.as_deref(), Some(value.as_slice()));
         }
+        reopened.put(b"quota-after-reopen", b"ok")?;
+        assert_eq!(
+            reopened.get(b"quota-after-reopen")?.as_deref(),
+            Some(&b"ok"[..])
+        );
         reopened.close()?;
 
         Ok(())
