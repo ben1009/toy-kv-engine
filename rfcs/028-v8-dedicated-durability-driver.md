@@ -1,7 +1,6 @@
 # RFC 028: V8 Dedicated Durability Driver
 
-Status: D3a implemented as a benchmark-only, default-off experiment; performance
-qualification pending.
+Status: Closed — D3a was not promoted (caller-driven durability remains default); RFC 028 closed out by promoting V8 Candidate Target8 (`docs/wal/rfc-028-v8-candidate-target8-default-20261126.md`).
 
 ## Context
 

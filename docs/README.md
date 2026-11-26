@@ -16,19 +16,20 @@ in the [RFC directory](../rfcs/).
 
 Start with the [WAL documentation index](wal/README.md) for the current
 parallel WAL policy and its measured results. Ordinary WALs use V4 Parallel;
-new PITR WALs use V8 Parallel, with V6/V7 available as explicit compatibility
-preferences. The V8 default is a maintainer adoption decision while performance
-qualification remains open. Dated reports preserve their measured revisions
-and do not define the current writer selection.
+new PITR WALs use V8 Parallel (defaulting to Candidate Target8 per the
+[RFC 028 closeout](wal/rfc-028-v8-candidate-target8-default-20261126.md)), with
+V6/V7 available as explicit compatibility preferences. Dated reports preserve
+their measured revisions and do not define the current writer selection.
 
 ## WAL implementation
 
+- [RFC 028 closeout: V8 Candidate Target8 default promotion](wal/rfc-028-v8-candidate-target8-default-20261126.md)
 - [V8 PITR WAL default adoption](wal/rfc-026-v8-default-20261103.md)
 - [RFC 024: Parallel WAL Implementation Plan](wal/rfc-024-parallel-wal-implementation-plan.md)
 - [RFC 025 Implementation Plan: Parallel WAL with Embedded Frontiers and One Sync](wal/rfc-025-parallel-wal-embedded-frontiers-implementation-plan.md)
 - [RFC 026 Implementation Plan: Composable WAL Prefix Digests](wal/rfc-026-implementation-plan.md)
 - [V8 Point Progress Ring (F0 stopped after GCP qualification)](../rfcs/027-v8-point-progress-ring.md)
-- [RFC 028: V8 Dedicated Durability Driver (D3a experiment)](../rfcs/028-v8-dedicated-durability-driver.md)
+- [RFC 028: V8 Dedicated Durability Driver (D3a not promoted; Candidate Target8 promoted as V8 default)](../rfcs/028-v8-dedicated-durability-driver.md)
 - [RFC 027 V8 Point Progress Ring GCP qualification, 2026-11-21](wal/benchmarks/rfc-027-v8-point-progress-ring-gcp-20261121.md)
 - [RFC 027 V8 Cursor direct-completion GCP qualification, 2026-11-22](wal/benchmarks/rfc-027-v8-cursor-direct-completion-gcp-20261122.md)
 - [RFC 028 V8 Cursor coalescing GCP diagnostic, 2026-11-23](wal/benchmarks/rfc-028-v8-cursor-coalescing-gcp-20261123.md)
@@ -49,6 +50,8 @@ and do not define the current writer selection.
 - [Io_uring Benchmark Results](benchmarks/io-uring-bench.md)
 - [Performance Profiling Report](benchmarks/perf-profile.md)
 - [GCP Free Trial WAL benchmark runner](wal/benchmarks/gcp-free-trial-wal-bench.md)
+- [RFC 028 V8 D2 Candidate Target8 80-run qualification on GCP, 2026-11-26](wal/benchmarks/rfc-028-v8-d2-qualification-gcp-20261126.md)
+- [RFC 028 V8 equal-throughput paced latency verification on GCP, 2026-11-26](wal/benchmarks/rfc-028-v8-equal-throughput-gcp-20261126.md)
 - [RFC 028 V8 Cursor coalescing GCP diagnostic, 2026-11-23](wal/benchmarks/rfc-028-v8-cursor-coalescing-gcp-20261123.md)
 - [RFC 028 V7/V8 final same-host Ready Target4/8 comparison, 2026-11-25](wal/benchmarks/rfc-028-v7-v8-ready-target-final-gcp-20261125.md)
 - [GCP V8 point sync diagnostic, 2026-11-10](wal/benchmarks/rfc-026-v8-point-sync-gcp-20261110.md)

@@ -374,7 +374,8 @@ The [parallel WAL overview](docs/wal/benchmarks/rfc-024-parallel-wal-benchmark.m
 the current default, retained optimizations, and failed qualification controls.
 Its V4 Leader comparisons distinguish the October 5 one-put matrix from
 the October 6 batch64 rerun. V8 was selected as the PITR default by maintainer
-decision; its performance matrix remains unqualified. The
+decision and now defaults to Candidate Target8 per the
+[RFC 028 closeout](docs/wal/rfc-028-v8-candidate-target8-default-20261126.md). The
 [V7/V8 calibration report](docs/wal/benchmarks/rfc-026-v8-calibrated-states-20261103.md)
 records why the local SSD results do not establish parity. Dated benchmark
 reports describe their measured revisions; their format defaults and candidate
@@ -444,6 +445,7 @@ requires both p95 and p99 to pass, and allows at most 5% regression per metric.
 - [RFC 024 Parallel WAL Implementation Plan](docs/wal/rfc-024-parallel-wal-implementation-plan.md)
 - [RFC 025 Embedded-Frontier WAL Implementation Plan](docs/wal/rfc-025-parallel-wal-embedded-frontiers-implementation-plan.md)
 - [RFC 026 Composable Prefix Digest Implementation Plan](docs/wal/rfc-026-implementation-plan.md)
+- [RFC 028 V8 Candidate Target8 Default Promotion](docs/wal/rfc-028-v8-candidate-target8-default-20261126.md)
 - [V8 PITR WAL Default Adoption](docs/wal/rfc-026-v8-default-20261103.md)
 - [Parallel v4 WAL Default Adoption](docs/wal/rfc-024-parallel-wal-default-20261005.md)
 
@@ -476,6 +478,7 @@ requires both p95 and p99 to pass, and allows at most 5% regression per metric.
 - [025: Parallel WAL with Embedded Frontiers and One Sync (implemented V7 compatibility format)](rfcs/025-parallel-wal-embedded-frontiers.md)
 - [026: Composable WAL Prefix Digests (implemented; default for new PITR WALs)](rfcs/026-composable-wal-prefix-digest.md)
 - [RFC 027: V8 Point Progress Ring](rfcs/027-v8-point-progress-ring.md)
+- [RFC 028: V8 Dedicated Durability Driver](rfcs/028-v8-dedicated-durability-driver.md)
 
 ## License
 

@@ -60,15 +60,19 @@ for the current runtime.
 
 ## Current Point experiment status
 
-The production default remains Eager progress with relayed DATA completions and
-Dynamic coalescing. Cursor progress can be selected as an opt-in mode, but it
-has not passed the Point throughput qualification gate. Direct Completion,
-Point buffer preallocation, and Ready Target controls remain benchmark-only.
-Ready Target4 and Target8 are retained only in the explicit V7/V8 final
-comparison; neither is a production default. Historical singleton submission,
-fixed-budget, target-scan, cursor-publication, resource-retirement, ACK, and
-Dedicated Driver suites are blocked from live execution. Their reports and
-archive verifiers remain available for review.
+`WalV8Profile` and `WalV8RequestedConfig::default()` now default to **Candidate
+Target8** (`Cursor` progress, `Direct` DATA completion, `Direct` FRONTIER with
+`Buffered` fallback, `PointOnlyLookahead` on eligible ext-family `O_DIRECT`
+files, `Stage A` single-frame Point preallocation, `Dynamic` + `PointOnly(8)`
+coalescing, `CallerDriven` durability, and `Legacy` ACK).
+`TOYKV_WAL_V8_PROFILE=legacy` remains supported as a full profile fallback, and
+`TOYKV_WAL_V8_COALESCING=dynamic` remains supported as an independent coalescing
+fallback. See the [RFC 028 closeout decision](rfc-028-v8-candidate-target8-default-20261126.md),
+the [80-run D2 qualification](benchmarks/rfc-028-v8-d2-qualification-gcp-20261126.md),
+and the [18-run equal-throughput verification](benchmarks/rfc-028-v8-equal-throughput-gcp-20261126.md).
+Historical singleton submission, fixed-budget, target-scan, cursor-publication,
+resource-retirement, ACK, and Dedicated Driver suites are blocked from live
+execution. Their reports and archive verifiers remain available for review.
 
 Dated filenames identify individual measurements and follow-ups. Their defaults,
 candidate decisions and validation counts describe the measured revision;
@@ -144,6 +148,7 @@ qualification or defaults.
 
 ## Implementation and adoption
 
+- [RFC 028 closeout: V8 Candidate Target8 default promotion](rfc-028-v8-candidate-target8-default-20261126.md)
 - [V8 PITR WAL default adoption](rfc-026-v8-default-20261103.md)
 - [Parallel WAL default adoption](rfc-024-parallel-wal-default-20261005.md)
 - [Parallel WAL Implementation Plan](rfc-024-parallel-wal-implementation-plan.md)
@@ -159,6 +164,8 @@ qualification or defaults.
 
 ## Benchmarks and qualification
 
+- [RFC 028 V8 D2 Candidate Target8 80-run qualification on GCP, 2026-11-26](benchmarks/rfc-028-v8-d2-qualification-gcp-20261126.md)
+- [RFC 028 V8 equal-throughput paced latency verification on GCP, 2026-11-26](benchmarks/rfc-028-v8-equal-throughput-gcp-20261126.md)
 - [V8 Point ticket lookup A/B on GCP](benchmarks/rfc-026-v8-ticket-index-gcp-20261120.md)
 - [V7/V8 Point Frame Finish to DATA submission on GCP](benchmarks/rfc-026-v8-frame-finish-gcp-20261120.md)
 - [V7/V8 Point worker notifications on GCP](benchmarks/rfc-026-v7-v8-worker-notifications-gcp-20261120.md)
