@@ -7075,6 +7075,9 @@ impl WalV8ParallelWriter {
                 if !progress_ring_enabled {
                     snapshot = self.coordinator.frontier_ready_snapshot();
                 }
+                if snapshot.poisoned {
+                    anyhow::bail!("v8 Parallel WAL is poisoned");
+                }
                 #[cfg(feature = "bench")]
                 if diagnostics_enabled {
                     let ready_tickets_after_coalescing = snapshot.ready_prefix.len() as u64;
@@ -7567,6 +7570,9 @@ impl WalV8ParallelWriter {
                         notify_all_wall_ns: publish_metrics.notify_all_wall_ns,
                         followers_waiting_at_publish: publish_metrics.followers_waiting,
                     });
+            }
+            if frontier_ticket_end >= ticket_end {
+                return Ok(());
             }
         }
     }

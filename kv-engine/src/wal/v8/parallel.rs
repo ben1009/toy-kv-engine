@@ -1573,8 +1573,12 @@ impl WalV8ParallelCoordinator {
         match frontier_ready_snapshot_locked(&self.inner, &state, capture_monotonic_ns) {
             Ok(snapshot) => snapshot,
             Err(_) => {
+                let durable_ticket_end = state.durable_ticket_end;
                 poison_locked(&self.inner, &mut state);
-                empty_frontier_ready_snapshot()
+                let mut snapshot = empty_frontier_ready_snapshot();
+                snapshot.durable_ticket_end = durable_ticket_end;
+                snapshot.poisoned = true;
+                snapshot
             }
         }
     }
