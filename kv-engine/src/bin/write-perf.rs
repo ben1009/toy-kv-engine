@@ -1197,6 +1197,8 @@ struct WalPipelineRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     v8_point_direct_frame_enabled: Option<bool>,
     v8_point_direct_frame_encoded_count: u64,
+    retire_durable_fast_path_count: u64,
+    retire_durable_pinned_fallback_count: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     v8_hol_diagnostics_enabled: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2500,6 +2502,8 @@ fn wal_pipeline_record(
                     && std::env::var("TOYKV_BENCH_V8_POINT_DIRECT_FRAME").as_deref() == Ok("1"),
             ),
         v8_point_direct_frame_encoded_count: profile.wal_v8_point_direct_frame_encoded,
+        retire_durable_fast_path_count: profile.retire_durable_fast_path_count,
+        retire_durable_pinned_fallback_count: profile.retire_durable_pinned_fallback_count,
         v8_hol_diagnostics_enabled: (wal_run_info.format_version == 8
             && wal_run_info.io_mode == "parallel")
             .then_some(hol_diagnostics_enabled),

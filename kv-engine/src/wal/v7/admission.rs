@@ -823,6 +823,13 @@ impl WalV7ReservationOwner {
     }
 }
 
+/// Execution path taken by [`WalV7OwnedBatchReservation::retire_durable`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WalV7DurableRetirementPath {
+    ConsolidatedFastPath,
+    PinnedFallback,
+}
+
 impl WalV7OwnedBatchReservation {
     /// Mark the reservation persistent immediately after coordinates advance.
     pub(crate) fn mark_admitted(&mut self) {
@@ -876,7 +883,7 @@ impl WalV7OwnedBatchReservation {
     pub(crate) fn retire_durable(
         self,
         release_unused_frontier_credit: bool,
-    ) -> Result<(), WalV7ReservationError> {
+    ) -> Result<WalV7DurableRetirementPath, WalV7ReservationError> {
         if !self.operation.admitted.load(Ordering::Acquire) {
             return Err(WalV7ReservationError::ReservationMismatch);
         }
@@ -888,7 +895,7 @@ impl WalV7OwnedBatchReservation {
                     .then_some(frontier_source_credit);
                 let result = operation.owner.finish_durable_batch(operation.id, credit);
                 operation.finished = true;
-                result
+                result.map(|()| WalV7DurableRetirementPath::ConsolidatedFastPath)
             }
             Err(operation) => {
                 let mut pinned = Self {
@@ -899,7 +906,9 @@ impl WalV7OwnedBatchReservation {
                 if release_unused_frontier_credit {
                     pinned.release_unused_frontier_credit()?;
                 }
-                pinned.finish_after_io()
+                pinned
+                    .finish_after_io()
+                    .map(|()| WalV7DurableRetirementPath::PinnedFallback)
             }
         }
     }
@@ -2578,7 +2587,8 @@ mod tests {
         let before = ledger.snapshot();
         let gen_before = ledger.source_spool_generation();
         let work_gen_before = ledger.inner.state.lock().source_spool_work_generation;
-        r1.retire_durable(true).unwrap();
+        let path1 = r1.retire_durable(true).unwrap();
+        assert_eq!(path1, WalV7DurableRetirementPath::ConsolidatedFastPath);
         let after = ledger.snapshot();
         assert_eq!(after.buffer_memory_bytes, 0);
         assert_eq!(
@@ -2595,7 +2605,8 @@ mod tests {
         let mut r2 = owner.reserve_batch(4096).unwrap();
         let pin = r2.pin_buffer();
         r2.mark_admitted();
-        r2.retire_durable(true).unwrap();
+        let path2 = r2.retire_durable(true).unwrap();
+        assert_eq!(path2, WalV7DurableRetirementPath::PinnedFallback);
         assert!(ledger.snapshot().buffer_memory_bytes > 0);
         assert_eq!(owner.state.lock().active_batch_operations, 1);
         drop(pin);

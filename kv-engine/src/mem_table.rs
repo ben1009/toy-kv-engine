@@ -222,6 +222,10 @@ pub struct WriteProfile {
     pub wal_v8_cpu_timing_sampled_tickets: AtomicU64,
     /// Point requests encoded directly into their final DATA frame.
     pub wal_v8_point_direct_frame_encoded: AtomicU64,
+    /// Durable tickets retired via the consolidated unpinned fast path.
+    pub retire_durable_fast_path_count: AtomicU64,
+    /// Durable tickets that fell back to pinned retirement due to remaining buffer pins.
+    pub retire_durable_pinned_fallback_count: AtomicU64,
     /// Aggregate time in v8 Leader's synchronous positional DATA write calls.
     /// Parallel mode uses the shared worker's submission/CQE counters instead.
     pub wal_v8_data_write_call_ns: AtomicU64,
@@ -1304,6 +1308,8 @@ impl WriteProfile {
         self.wal_v8_post_encode_hash_reread_bytes.store(0, o);
         self.wal_v8_cpu_timing_sampled_tickets.store(0, o);
         self.wal_v8_point_direct_frame_encoded.store(0, o);
+        self.retire_durable_fast_path_count.store(0, o);
+        self.retire_durable_pinned_fallback_count.store(0, o);
         self.wal_v8_data_write_call_ns.store(0, o);
         self.wal_v8_data_submit_hol_episodes.store(0, o);
         self.wal_v8_data_submit_hol_wait_ns.store(0, o);
@@ -1385,6 +1391,8 @@ impl WriteProfile {
             wal_v8_post_encode_hash_reread_bytes: self.wal_v8_post_encode_hash_reread_bytes.load(o),
             wal_v8_cpu_timing_sampled_tickets: self.wal_v8_cpu_timing_sampled_tickets.load(o),
             wal_v8_point_direct_frame_encoded: self.wal_v8_point_direct_frame_encoded.load(o),
+            retire_durable_fast_path_count: self.retire_durable_fast_path_count.load(o),
+            retire_durable_pinned_fallback_count: self.retire_durable_pinned_fallback_count.load(o),
             wal_v8_data_write_call_ns: self.wal_v8_data_write_call_ns.load(o),
             wal_v8_data_submit_hol_episodes: self.wal_v8_data_submit_hol_episodes.load(o),
             wal_v8_data_submit_hol_wait_ns: self.wal_v8_data_submit_hol_wait_ns.load(o),
@@ -2170,6 +2178,18 @@ impl WriteProfile {
     }
 
     #[cfg(feature = "bench")]
+    pub(crate) fn record_wal_v8_retire_durable_counts(&self, fast_path: u64, pinned_fallback: u64) {
+        if fast_path > 0 {
+            self.retire_durable_fast_path_count
+                .fetch_add(fast_path, std::sync::atomic::Ordering::Relaxed);
+        }
+        if pinned_fallback > 0 {
+            self.retire_durable_pinned_fallback_count
+                .fetch_add(pinned_fallback, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    #[cfg(feature = "bench")]
     pub(crate) fn record_wal_validate_ns(&self, nanos: u64) {
         self.wal_validate_ns
             .fetch_add(nanos, std::sync::atomic::Ordering::Relaxed);
@@ -2307,6 +2327,8 @@ pub struct WriteProfileSnapshot {
     pub wal_v8_post_encode_hash_reread_bytes: u64,
     pub wal_v8_cpu_timing_sampled_tickets: u64,
     pub wal_v8_point_direct_frame_encoded: u64,
+    pub retire_durable_fast_path_count: u64,
+    pub retire_durable_pinned_fallback_count: u64,
     pub wal_v8_data_write_call_ns: u64,
     pub wal_v8_data_submit_hol_episodes: u64,
     pub wal_v8_data_submit_hol_wait_ns: u64,
@@ -2456,6 +2478,12 @@ impl WriteProfileSnapshot {
             wal_v8_point_direct_frame_encoded: self
                 .wal_v8_point_direct_frame_encoded
                 .saturating_sub(before.wal_v8_point_direct_frame_encoded),
+            retire_durable_fast_path_count: self
+                .retire_durable_fast_path_count
+                .saturating_sub(before.retire_durable_fast_path_count),
+            retire_durable_pinned_fallback_count: self
+                .retire_durable_pinned_fallback_count
+                .saturating_sub(before.retire_durable_pinned_fallback_count),
             wal_v8_data_write_call_ns: self
                 .wal_v8_data_write_call_ns
                 .saturating_sub(before.wal_v8_data_write_call_ns),
