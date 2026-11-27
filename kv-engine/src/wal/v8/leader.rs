@@ -5207,10 +5207,8 @@ impl WalV8FrameJob<'_> {
                 .mark_data_write_started(self.assignment.segment_ticket)?;
         }
         let ticket = self.assignment.segment_ticket;
-        let previous = self
-            .producer_guards
-            .lock()
-            .insert(ticket, encoded.into_durability_guard());
+        let guard = encoded.into_durability_guard();
+        let previous = self.producer_guards.lock().insert(ticket, guard);
         if previous.is_some() {
             self.coordinator.poison();
             anyhow::bail!("v8 Parallel ticket already owns a producer guard");

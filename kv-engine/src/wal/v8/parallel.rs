@@ -4330,9 +4330,17 @@ mod tests {
 
     #[test]
     fn disarm_after_durable_prefix_check_keeps_covered_guard_unarmed() -> Result<()> {
+        assert!(
+            std::mem::size_of::<
+                crate::wal::v8::prepare::WalV8DurabilityGuard<WalV8ParallelAdmissionGuard>,
+            >() < std::mem::size_of::<
+                crate::wal::v8::prepare::EncodedWalV8Batch<WalV8ParallelAdmissionGuard>,
+            >()
+        );
+
         let coordinator = coordinator(4)?;
-        let batch = batch(1);
-        let mut encoded = admit(&batch, &coordinator)?.encode()?;
+        let batch1 = batch(1);
+        let mut encoded = admit(&batch1, &coordinator)?.encode()?;
         coordinator.inner.state.lock().durable_ticket_end = 1;
 
         let prefix_check = coordinator.poison_ticket_prefix_if_pending(1);
@@ -4341,20 +4349,42 @@ mod tests {
 
         assert!(!coordinator.is_poisoned());
 
+        let batch2 = batch(2);
+        let mut guard = admit(&batch2, &coordinator)?
+            .encode()?
+            .into_durability_guard();
+        coordinator.inner.state.lock().durable_ticket_end = 2;
+        let prefix_check2 = coordinator.poison_ticket_prefix_if_pending(2);
+        guard.disarm_after_durable_prefix_check(&prefix_check2);
+        drop(guard);
+
+        assert!(!coordinator.is_poisoned());
+
         Ok(())
     }
 
     #[test]
     fn disarm_after_durable_prefix_check_keeps_uncovered_guard_fail_safe() -> Result<()> {
-        let coordinator = coordinator(4)?;
+        let coordinator_encoded = coordinator(4)?;
         let batch = batch(1);
-        let mut encoded = admit(&batch, &coordinator)?.encode()?;
-        let prefix_check = coordinator.poison_ticket_prefix_if_pending(0);
+        let mut encoded = admit(&batch, &coordinator_encoded)?.encode()?;
+        let prefix_check = coordinator_encoded.poison_ticket_prefix_if_pending(0);
 
         encoded.disarm_after_durable_prefix_check(&prefix_check);
         drop(encoded);
 
-        assert!(coordinator.is_poisoned());
+        assert!(coordinator_encoded.is_poisoned());
+
+        let coordinator_guard = coordinator(4)?;
+        let mut guard = admit(&batch, &coordinator_guard)?
+            .encode()?
+            .into_durability_guard();
+        let prefix_check_guard = coordinator_guard.poison_ticket_prefix_if_pending(0);
+
+        guard.disarm_after_durable_prefix_check(&prefix_check_guard);
+        drop(guard);
+
+        assert!(coordinator_guard.is_poisoned());
 
         Ok(())
     }
@@ -4372,6 +4402,16 @@ mod tests {
         drop(encoded);
 
         assert!(writer_coordinator.is_poisoned());
+        assert!(!other_coordinator.is_poisoned());
+
+        let writer_guard_coordinator = coordinator(4)?;
+        let mut guard = admit(&batch, &writer_guard_coordinator)?
+            .encode()?
+            .into_durability_guard();
+        guard.disarm_after_durable_prefix_check(&foreign_check);
+        drop(guard);
+
+        assert!(writer_guard_coordinator.is_poisoned());
         assert!(!other_coordinator.is_poisoned());
 
         Ok(())
