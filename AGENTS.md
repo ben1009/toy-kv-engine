@@ -393,10 +393,11 @@ Before creating the benchmark VM:
 Run the smallest experiment that answers the current diagnostic question. Keep
 experimental source patches and runner changes isolated from PR branches; record
 the source commit and patch checksum with the results. When computing
-`--source-patch-sha256` locally with `git diff --binary`, always pass
-`--no-ext-diff --abbrev=7` so local external diff tools (such as `difft`) and
-full-repo `core.abbrev` auto-scaling (8 chars locally vs 7 chars in the VM's
-shallow clone) do not alter the patch SHA-256 relative to the remote runner.
+`--source-patch-sha256` locally, always run
+`git diff --no-ext-diff --no-textconv --full-index --binary` (the remote runner
+uses the same flags) so local external diff tools (such as `difft`), textconv
+filters, and abbreviated object IDs (which auto-scale in the full local repo but
+not in the VM's shallow clone) cannot alter the patch SHA-256.
 Profiling or Hotpath runs
 are diagnostic and must not be reported as unprofiled throughput scores.
 
