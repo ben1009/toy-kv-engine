@@ -164,6 +164,7 @@ qualification or defaults.
 
 ## Benchmarks and qualification
 
+- [Issue #570 V8 Point admission coordination and retirement consolidation GCP A/B, 2026-11-27](benchmarks/issue-570-v8-point-admission-retirement-gcp-20261127.md)
 - [Issue #570 V8 Point sequencer critical-section GCP A/B, 2026-11-27](benchmarks/issue-570-v8-point-sequencer-gcp-20261127.md)
 - [Issue #570 full Point-write CPU attribution (Point1 vs. Point16), 2026-11-26](benchmarks/issue-570-full-point-cpu-attribution-20261126.md)
 - [Issue #570 Point16 CPU attribution breakdown (from retained GCP archive), 2026-11-26](benchmarks/issue-570-v8-point16-cpu-attribution-20261126.md)
