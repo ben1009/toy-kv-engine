@@ -7163,4 +7163,102 @@ mod tests {
 
         Ok(())
     }
+
+    #[test]
+    fn zero_byte_preparation_and_lifecycle_flags_reject_closed_and_poisoned() -> Result<()> {
+        // 1. Zero-byte preparation leaves accounting unchanged and Drop is a no-op.
+        let coord = coordinator(8)?;
+        let zero_res = coord.reserve_preparation(0)?;
+        assert_eq!(coord.inner.state.lock().reserved_preparation_bytes, 0);
+        assert!(!coord.is_closed());
+        assert!(!coord.is_poisoned());
+        drop(zero_res);
+        assert_eq!(coord.inner.state.lock().reserved_preparation_bytes, 0);
+
+        // 2. Poison between zero-byte preflight and admission rejects admission without ticket.
+        let coord_poison = coordinator(8)?;
+        let _prep = coord_poison.reserve_preparation(0)?;
+        coord_poison.poison();
+        assert!(coord_poison.is_poisoned());
+        assert!(!coord_poison.is_closed());
+        let err = coord_poison
+            .reserve_preparation(0)
+            .err()
+            .expect("poisoned coordinator must reject zero-byte preparation");
+        assert!(err.to_string().contains("poisoned"));
+        let admit_err = admit(&batch(10), &coord_poison)
+            .err()
+            .expect("poisoned coordinator must reject admission");
+        assert!(admit_err.to_string().contains("poisoned"));
+        assert_eq!(coord_poison.admitted_ticket_end(), 0);
+
+        // 3. Close rejects zero-byte preparation, and subsequent poison preserves both bits.
+        let coord_close = coordinator(8)?;
+        coord_close.close();
+        assert!(coord_close.is_closed());
+        assert!(!coord_close.is_poisoned());
+        let close_err = coord_close
+            .reserve_preparation(0)
+            .err()
+            .expect("closed coordinator must reject zero-byte preparation");
+        assert!(close_err.to_string().contains("closed"));
+        coord_close.poison();
+        assert!(coord_close.is_closed());
+        assert!(coord_close.is_poisoned());
+
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_admitted_ticket_end_never_regresses_or_misses_tickets() -> Result<()> {
+        let coord = coordinator(8)?;
+        let published = AtomicU64::new(0);
+        let sequencer = Mutex::new(1u64);
+
+        std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for _ in 0..3 {
+                handles.push(scope.spawn(|| {
+                    let mut seen = Vec::with_capacity(2);
+                    for _ in 0..2 {
+                        let mut next_ts = sequencer.lock();
+                        let ts = *next_ts;
+                        *next_ts += 1;
+                        let batch_item = batch(ts);
+                        let encoded = admit(&batch_item, &coord)
+                            .expect("admit")
+                            .encode()
+                            .expect("encode");
+                        drop(next_ts);
+                        let ticket = encoded.assignment().segment_ticket;
+                        let cursor = coord.admitted_ticket_end();
+                        assert!(cursor > ticket);
+                        let prev = published.fetch_max(cursor, Ordering::AcqRel);
+                        assert!(published.load(Ordering::Acquire) >= prev);
+                        seen.push((ticket, encoded));
+                    }
+                    seen
+                }));
+            }
+            let mut all_tickets = Vec::new();
+            let mut all_encoded = Vec::new();
+            for handle in handles {
+                for (ticket, encoded) in handle.join().expect("worker panicked") {
+                    all_tickets.push(ticket);
+                    all_encoded.push(encoded);
+                }
+            }
+            coord.inner.state.lock().durable_ticket_end = 6;
+            for mut encoded in all_encoded {
+                encoded.disarm_after_durable();
+            }
+            all_tickets.sort_unstable();
+            assert_eq!(all_tickets, (0..6).collect::<Vec<u64>>());
+        });
+
+        assert_eq!(coord.admitted_ticket_end(), 6);
+        assert_eq!(published.load(Ordering::Acquire), 6);
+
+        Ok(())
+    }
 }

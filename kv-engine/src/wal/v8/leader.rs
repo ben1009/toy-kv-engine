@@ -7877,6 +7877,10 @@ impl WalV8ParallelWriter {
         self.coordinator.next_ticket()
     }
 
+    pub(crate) fn admitted_ticket_end(&self) -> u64 {
+        self.coordinator.admitted_ticket_end()
+    }
+
     /// Completing callers consume published state without waiting for the
     /// physical FRONTIER mutex, which may already cover a later sync cycle.
     pub(crate) fn published_cursor(&self) -> (u64, u64, u64) {

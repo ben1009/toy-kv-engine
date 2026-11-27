@@ -2742,7 +2742,7 @@ impl Wal {
                 return Err(error);
             }
         };
-        self.finish_v8_parallel_admission(job)
+        self.finish_v8_parallel_admission(writer, job)
     }
 
     pub(crate) fn try_preallocate_v8_point_buffer(
@@ -2821,23 +2821,21 @@ impl Wal {
                 return Err(error);
             }
         };
-        self.finish_v8_parallel_admission(job)
+        self.finish_v8_parallel_admission(writer, job)
     }
 
     fn finish_v8_parallel_admission<'a>(
         &self,
+        writer: &v8::leader::WalV8ParallelWriter,
         job: v8::leader::WalV8FrameJob<'a>,
     ) -> Result<(u64, v8::leader::WalV8FrameJob<'a>)> {
         let assignment = job.assignment();
-        let next_ticket = assignment
-            .segment_ticket
-            .checked_add(1)
-            .context("v8 Parallel ticket cursor overflows after admission")?;
         let data_end = assignment
             .first_data_offset
             .checked_add(u64::try_from(job.frame_buffer_bytes())?)
             .context("v8 Parallel DATA allocation end overflows after admission")?;
-        self.next_ticket.fetch_max(next_ticket, Ordering::Release);
+        self.next_ticket
+            .fetch_max(writer.admitted_ticket_end(), Ordering::Release);
         self.alloc_offset.fetch_max(data_end, Ordering::Release);
         self.preallocated_size
             .fetch_max(data_end, Ordering::Release);
