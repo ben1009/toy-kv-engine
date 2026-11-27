@@ -738,13 +738,8 @@ where
         pos == expected_len,
         "v5 entry stream length changed while encoding"
     );
-    let mut observed_pos = 0;
-    while pos - observed_pos >= WAL_V8_OBSERVER_CHUNK_BYTES {
-        observe(&dst[observed_pos..observed_pos + WAL_V8_OBSERVER_CHUNK_BYTES])?;
-        observed_pos += WAL_V8_OBSERVER_CHUNK_BYTES;
-    }
-    if observed_pos < pos {
-        observe(&dst[observed_pos..pos])?;
+    if pos > 0 {
+        observe(&dst[..pos])?;
     }
 
     Ok((pos, crc.finalize()))
