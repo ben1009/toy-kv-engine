@@ -1,7 +1,7 @@
 # Issue #570 Full CPU Attribution & `perf` Flamegraph Diagnostic (`a599fd33`)
 
 - **Date**: 2026-11-27
-- **Issue / Baseline**: [#570](https://github.com/ben1009/toy-kv-engine/issues/570) / `a599fd33a2c4a55f2a2a0b4a9a9b9f17a26a0c6d` (`main`, post-#580)
+- **Issue / Baseline**: [#570](https://github.com/ben1009/toy-kv-engine/issues/570) / `a599fd33a298f1ee10dd6f5de81ec8f1a889d213` (`main`, post-#580)
 - **Environment**: `c4-standard-16-lssd` (`us-central1-c`), 16 vCPUs, 2× NVMe Local SSD RAID0 (`/mnt/gcp-wal-bench`, `ext4`), `write-perf --bench wal_concurrent --wal --pitr --pitr-format v8 --wal-io-mode parallel --num 100000 --value-size 1024 --compaction none --latency-sample-every 100` (`TOYKV_BENCH_V8_EXTENT_PREP=sliding-point-lookahead`, `TOYKV_BENCH_V8_EXTENT_PREP_BYTES=1048576`, `TOYKV_WAL_V8_FRONTIER_MODE=direct`, `TOYKV_BENCH_V8_POINT_DIRECT_FRAME=0`).
 - **Local archive**: `bench-results/gcp-cpu-attr-a599fd33` (`cpu-attr-a599fd33.tar.gz` sha256: `0c4c5df20e9867aa0b7ca5b44b814bd3558c04f81aa9b647e4a0d578b69502c9`, 6 attribution JSONs + 2 `perf` DWARF captures).
 
@@ -14,12 +14,12 @@
 
 `perf` DWARF profiling (`5,952` samples on **Point16**) and mutex lock diagnostics reveal that **the single largest CPU bottleneck in Point16 is no longer WAL submission or durability—it is MVCC timestamp publication (`LsmMvccInner::publish_commit_ts_impl`)**:
 
-1. **`LsmMvccInner::publish_commit_ts_impl` accounts for 19.88% of self-CPU (23.44% inclusive) in Point16** (~13–16 μs/Put out of 68.77 μs/Put instrumented / 64.56 μs/Put unprofiled).
+1. **`LsmMvccInner::publish_commit_ts_impl` accounts for 19.88% of `perf` self-CPU in Point16** (inclusive `perf` share is 23.44%, which is not mutually exclusive with leaf categories; in-app `mvcc_publication_diagnostics` measures **mean 12.17 μs/Put** / **median 7.05 μs/Put** thread CPU inside `publish_commit_ts`).
 2. **Root cause in [`mvcc.rs`](../../../kv-engine/src/mvcc.rs#L27-L30)**:
    - `PUBLICATION_SPIN_LIMIT = 1 << 12` (**4,096 spin iterations**), while `PUBLICATION_CONTENTION_THRESHOLD = 32` and `PUBLICATION_DISTANCE_THRESHOLD = 16`.
-   - Under **Point16** (16 writers), `in_flight <= 16`, so `in_flight > 32` and `in_flight > 16` are **never true**. Every out-of-order writer spins up to **4,096 times** on `self.frontier.load(Ordering::Acquire)` + `spin_loop()` before falling back to `Condvar::wait`.
-   - In addition, after `await_publication` returns, `publish_commit_ts_impl` **re-acquires the `mvcc_publication` mutex a second time** (`169,888` acquisitions for `100,000` ops, **42.1% contended**, `~2.40 μs/Put` lock wait).
-3. **Second largest non-WAL / coordination cluster**: `parking_lot` mutex/condvar slow paths and kernel futex/schedule transitions account for **~19.15%** of Point16 leaf samples (shared across `mvcc_publication`, `reservation_owner`, `v8_extent_state`, and `WalV8ParallelCoordinator` follower/driver wakeups).
+   - Under **Point16** (16 writers), `in_flight <= 16`, so `in_flight > 32` and `in_flight > 16` are **never true**. Every out-of-order writer (`57.2%` of Point16 calls) gets `spin_limit = 4,096`, spinning **median 846 / mean 1,193.8 / p95 3,839 iterations** on `self.frontier.load(Ordering::Acquire)` before either seeing `frontier` advance (`54.8%`) or exhausting the budget (`2.4%`) into `Condvar::wait`.
+   - In addition, after `await_publication` returns, `publish_commit_ts_impl` **re-acquires the `mvcc_publication` mutex a second time** (`169,888` acquisitions for `100,000` ops, **42.1% contended**). Note that lock wait wall time (`240.42 ms` / `2.40 μs/Put`) includes sleep/deschedule time and is not directly equal to CPU; in-app `publication_lock_wait_cpu_ns` measures **mean 1.52 μs/Put** (`2.08 μs` on out-of-order calls).
+3. **Second largest non-WAL / coordination cluster**: `parking_lot` mutex/condvar slow paths and kernel futex/schedule transitions account for **19.15%** of Point16 leaf samples (shared across `mvcc_publication`, `reservation_owner`, `v8_extent_state`, and `WalV8ParallelCoordinator` follower/driver wakeups).
 
 ---
 
@@ -68,6 +68,25 @@
 | `resource_ledger` | 400,000 · 0 (0.0%) · 20.21 ms | 310,746 · 0 (0.0%) · 25.70 ms (0.26 μs/put) |
 | `v8_extent_preparation` | 197,506 · 0 (0.0%) · 19.61 ms | 97,349 · 128 (0.1%) · 8.35 ms |
 
+> [!NOTE]
+> `wait_total` above is wall-clock mutex wait time from `mutex_lock_diagnostics` (which includes futex sleep/deschedule time and does not equal CPU consumption).
+
+### 2.4 MVCC Publication Diagnostics (`--mvcc-publication-sample-every 64`, 1,562 Samples/Run)
+
+| Metric | Point1 (All `in_order`) | Point16 (All) | Point16 (`in_order`, 42.8%) | Point16 (`out_of_order`, 57.2%) |
+| --- | ---: | ---: | ---: | ---: |
+| Sample count (3-run median) | 1,562 (100.0%) | 1,562 (100.0%) | 668 (42.8%) | 894 (57.2%) |
+| `spin_exit`: `not_required` | 1,562 (100.0%) | 668 (42.8%) | 668 (100.0%) | 0 (0.0%) |
+| `spin_exit`: `frontier_advanced` | 0 (0.0%) | 856 (54.8%) | 0 (0.0%) | 856 (95.7%) |
+| `spin_exit`: `budget_exhausted` | 0 (0.0%) | 38 (2.4%) | 0 (0.0%) | 38 (4.3%) |
+| `spin_limit` (med / mean / p95) | 0 / 0 / 0 | 4,096 / 2,344.3 / 4,096 | 0 / 0 / 0 | **4,096 / 4,096 / 4,096** |
+| `spin_iterations` (med / mean / p95) | 0 / 0 / 0 | 150.5 / 706.9 / 3,137 | 0 / 0 / 0 | **846.0 / 1,193.8 / 3,839** |
+| `distance_at_decision` (med / mean / p95) | 0 / 0 / 0 | 1.0 / 2.3 / 7.0 | 0 / 0 / 0 | 4.0 / 3.9 / 8.0 |
+| `publication_lock_acquisitions` (med / mean) | 1.0 / 1.0 | 2.0 / 1.6 | 1.0 / 1.0 | **2.0 / 2.0** |
+| `publication_lock_wait_cpu_ns` (med / mean / p95) | 328 / 336 / 348 ns | 940 / 1,523 / 4,670 ns | 407 / 778 / 2,400 ns | 1,289 / 2,085 / 6,019 ns |
+| `condvar_wait_cpu_ns` (mean) | 0.0 ns | 158.1 ns | 0.0 ns | 276.2 ns |
+| **`total_thread_cpu_ns` (med / mean / p95)** | **843 / 864 / 888 ns** | **7,046 / 12,174 / 42,956 ns** | **1,784 / 2,572 / 7,447 ns** | **14,994 / 18,940 / 52,483 ns** |
+
 ---
 
 ## 3. `perf` DWARF CPU Flamegraph Hotspots (`perf record -F 999 -g --call-graph dwarf,16384`)
@@ -106,7 +125,7 @@
 
 | Bucket | Point1 | Point16 |
 | --- | ---: | ---: |
-| **MVCC `publish_commit_ts_impl` (spin + lock)** | 0.88% | **23.44% (~15 μs/Put)** |
+| **MVCC `publish_commit_ts_impl` (`perf` inclusive, overlaps lock/futex below)** | 0.88% | **23.44%** (self: 19.88%; in-app mean: **12.17 μs/Put**) |
 | **Kernel total (futex, sched, syscalls, io_uring)** | 46.26% | 33.57% |
 | **Futex / Schedule / `parking_lot` leaf** | 19.89% | 19.15% |
 | **`wal-io-worker` thread total** | 35.92% | 13.00% |
@@ -116,11 +135,13 @@
 
 ## 4. Recommended Next Optimization Directions (Target: 2–3+ μs/Put)
 
-1. **P0 — Fix MVCC `publish_commit_ts_impl` spin & double-lock (Est. potential: 8–12 μs/Put)**:
-   - Under `Point16`, `in_flight <= 16` never triggers `CONTENDED_PUBLICATION_SPIN_LIMIT`, causing every out-of-order publisher to spin **4,096 iterations** (`19.88%` of total CPU!) and then re-acquire `mvcc_publication` mutex a second time (`42.1%` contended, `2.40 μs/Put`).
-   - Direction: eliminate the 4,096-iteration blind spin under multi-writer contention (or use a small bounded spin e.g. 0–64 when `in_flight > 1` / `commit_ts != next_to_publish`), and avoid re-acquiring `self.publication` after `await_publication` returns (decrement `in_flight` atomically / check poison without a second mutex round-trip).
-2. **P1 — Reduce `parking_lot` / Futex wakeup churn across Driver ↔ Follower & `mvcc_publication` (Est. potential: 2–3 μs/Put)**:
-   - `Condvar::notify_all` / `lock_slow` + kernel futex/schedule accounts for ~19% of leaf samples; targeted/single-waiter wakeups or batching publication advances can cut futex wakeups.
+1. **Step 1 — Reduce MVCC `await_publication` Spin Budget (`PUBLICATION_SPIN_LIMIT`)**:
+   - Under `Point16`, `57.2%` of calls enter `out_of_order` with `spin_limit = 4,096` and spin **mean 1,193.8 iterations** (`total_thread_cpu_ns` mean **18.94 μs** vs **2.57 μs** for `in_order`).
+   - Test lower spin budgets (**Candidate A: `256`**, **Candidate B: `64`** vs Baseline `4,096`) without changing frontier, ready set, or visibility semantics, and measure net Point16 CPU/Put & throughput in a clean A/B.
+2. **Step 2 — Eliminate Duplicate `mvcc_publication` Lock Acquisition (Separate Commit)**:
+   - On the `Condvar::wait` path, the caller already holds `self.publication` and can retire `in_flight` / notify the PITR drain barrier before releasing the lock.
+   - On the spin-success path, design lock-free retirement carefully to preserve `in_flight`, poison handling, and PITR commit-admission barrier drain semantics (`stop_commit_admission()`, `reserve_commit_ts()`, `poison_commit_ts()`).
+3. **P1 — Reduce `parking_lot` / Futex wakeup churn** across Driver ↔ Follower & `mvcc_publication` (`19.15%` of Point16 leaf samples).
 
 ---
 
