@@ -7649,13 +7649,18 @@ impl WalV8ParallelWriter {
     where
         F: FnMut(usize, u64, V) -> Result<()>,
     {
-        let expected = usize::try_from(ticket_end - first_ticket)?;
+        let expected_u64 = ticket_end
+            .checked_sub(first_ticket)
+            .context("v8 ticket retirement range moves backwards")?;
+        let expected = usize::try_from(expected_u64)?;
+        if expected == 0 {
+            return Ok((0, 0, 0, 0));
+        }
         #[cfg(feature = "bench")]
         let collect_started = sample.then(digest::thread_cpu_time_ns);
+        let first_key = map.first_key_value().map(|(&k, _)| k);
         let all_in_range = map.len() == expected
-            && map
-                .first_key_value()
-                .is_some_and(|(&first, _)| first >= first_ticket)
+            && first_key.is_some_and(|first| first >= first_ticket)
             && map
                 .last_key_value()
                 .is_some_and(|(&last, _)| last < ticket_end);
@@ -7677,19 +7682,18 @@ impl WalV8ParallelWriter {
         #[cfg(not(feature = "bench"))]
         let (remove_cpu_ns, finish_cpu_ns) = (0u64, 0u64);
 
+        let drain_from_front = first_key == Some(first_ticket);
         for index in 0..expected {
             let expected_ticket = first_ticket + u64::try_from(index)?;
             #[cfg(feature = "bench")]
             let step_started = sample.then(digest::thread_cpu_time_ns);
-            let (ticket, value) = if map
-                .first_key_value()
-                .is_some_and(|(&k, _)| k == expected_ticket)
-            {
+            let (ticket, value) = if drain_from_front {
                 map.pop_first().context(disappeared_msg)?
             } else {
                 let value = map.remove(&expected_ticket).context(disappeared_msg)?;
                 (expected_ticket, value)
             };
+            ensure!(ticket == expected_ticket, "{disappeared_msg}");
             #[cfg(feature = "bench")]
             {
                 remove_cpu_ns = remove_cpu_ns.saturating_add(
@@ -14985,6 +14989,147 @@ mod tests {
             after_sync.seal_index_bytes,
             initial_quota.seal_index_bytes + 24
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn drain_ticket_prefix_handles_exact_partial_non_front_missing_and_fail_stop() -> Result<()> {
+        let make_map =
+            |keys: &[u64]| -> BTreeMap<u64, u64> { keys.iter().map(|&k| (k, k * 10)).collect() };
+
+        // 1. Exact prefix [1, 4) from [1, 2, 3].
+        let mut m1 = make_map(&[1, 2, 3]);
+        let mut seen = Vec::new();
+        let (count, _, _, _) = WalV8ParallelWriter::drain_ticket_prefix(
+            &mut m1,
+            1,
+            4,
+            "missing",
+            "disappeared",
+            false,
+            |idx, ticket, val| {
+                seen.push((idx, ticket, val));
+                Ok(())
+            },
+        )?;
+        assert_eq!(count, 3);
+        assert_eq!(seen, vec![(0, 1, 10), (1, 2, 20), (2, 3, 30)]);
+        assert!(m1.is_empty());
+
+        // 2. Partial prefix [1, 3) from [1, 2, 3, 4] retains 3, 4.
+        let mut m2 = make_map(&[1, 2, 3, 4]);
+        let (count, _, _, _) = WalV8ParallelWriter::drain_ticket_prefix(
+            &mut m2,
+            1,
+            3,
+            "missing",
+            "disappeared",
+            false,
+            |_, _, _| Ok(()),
+        )?;
+        assert_eq!(count, 2);
+        assert_eq!(m2.keys().copied().collect::<Vec<_>>(), vec![3, 4]);
+
+        // 3. Non-front range [1, 3) from [0, 1, 2, 3] retains 0, 3.
+        let mut m3 = make_map(&[0, 1, 2, 3]);
+        let mut seen3 = Vec::new();
+        let (count, _, _, _) = WalV8ParallelWriter::drain_ticket_prefix(
+            &mut m3,
+            1,
+            3,
+            "missing",
+            "disappeared",
+            false,
+            |idx, ticket, val| {
+                seen3.push((idx, ticket, val));
+                Ok(())
+            },
+        )?;
+        assert_eq!(count, 2);
+        assert_eq!(seen3, vec![(0, 1, 10), (1, 2, 20)]);
+        assert_eq!(m3.keys().copied().collect::<Vec<_>>(), vec![0, 3]);
+
+        // 4. Missing middle ticket [1, 4) from [1, 3, 4] errors without mutating map.
+        let mut m4 = make_map(&[1, 3, 4]);
+        assert!(
+            WalV8ParallelWriter::drain_ticket_prefix(
+                &mut m4,
+                1,
+                4,
+                "missing",
+                "disappeared",
+                false,
+                |_, _, _| Ok(()),
+            )
+            .is_err()
+        );
+        assert_eq!(m4.keys().copied().collect::<Vec<_>>(), vec![1, 3, 4]);
+
+        // 5. Missing start ticket [1, 4) from [2, 3, 4] errors without mutating map.
+        let mut m5 = make_map(&[2, 3, 4]);
+        assert!(
+            WalV8ParallelWriter::drain_ticket_prefix(
+                &mut m5,
+                1,
+                4,
+                "missing",
+                "disappeared",
+                false,
+                |_, _, _| Ok(()),
+            )
+            .is_err()
+        );
+        assert_eq!(m5.keys().copied().collect::<Vec<_>>(), vec![2, 3, 4]);
+
+        // 6. Empty range [1, 1) on empty map is a no-op.
+        let mut m6 = BTreeMap::<u64, u64>::new();
+        let (count, _, _, _) = WalV8ParallelWriter::drain_ticket_prefix(
+            &mut m6,
+            1,
+            1,
+            "missing",
+            "disappeared",
+            false,
+            |_, _, _| Ok(()),
+        )?;
+        assert_eq!(count, 0);
+
+        // 7. Reverse range returns Err without panicking or mutating map.
+        let mut m7 = make_map(&[1, 2]);
+        assert!(
+            WalV8ParallelWriter::drain_ticket_prefix(
+                &mut m7,
+                4,
+                2,
+                "missing",
+                "disappeared",
+                false,
+                |_, _, _| Ok(()),
+            )
+            .is_err()
+        );
+        assert_eq!(m7.keys().copied().collect::<Vec<_>>(), vec![1, 2]);
+
+        // 8. Callback error preserves fail-stop semantics.
+        let mut m8 = make_map(&[1, 2, 3]);
+        let mut visited = Vec::new();
+        let err = WalV8ParallelWriter::drain_ticket_prefix(
+            &mut m8,
+            1,
+            4,
+            "missing",
+            "disappeared",
+            false,
+            |_, ticket, _| {
+                visited.push(ticket);
+                anyhow::ensure!(ticket != 2, "fail on 2");
+                Ok(())
+            },
+        );
+        assert!(err.is_err());
+        assert_eq!(visited, vec![1, 2]);
+        assert_eq!(m8.keys().copied().collect::<Vec<_>>(), vec![3]);
 
         Ok(())
     }
