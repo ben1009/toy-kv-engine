@@ -277,8 +277,7 @@ pub(crate) struct WalV8ParallelWriter {
     io: Arc<WalV8ParallelIo>,
     reservation_owner: Option<Arc<WalV8ReservationOwner>>,
     frontier: Mutex<WalV8ParallelFrontier>,
-    frontier_resources: Arc<Mutex<BTreeMap<u64, WalV8FrontierResource>>>,
-    producer_guards: Arc<Mutex<BTreeMap<u64, WalV8DurabilityGuard<WalV8ParallelAdmissionGuard>>>>,
+    ticket_resources: Arc<Mutex<BTreeMap<u64, WalV8TicketResources>>>,
     max_file_size: u64,
     installed_dev: u64,
     installed_ino: u64,
@@ -301,8 +300,9 @@ pub(crate) struct WalV8ParallelWriter {
     profile: arc_swap::ArcSwapOption<crate::mem_table::WriteProfile>,
 }
 
-struct WalV8FrontierResource {
-    reservation: WalV7OwnedBatchReservation,
+struct WalV8TicketResources {
+    reservation: Option<WalV7OwnedBatchReservation>,
+    guard: Option<WalV8DurabilityGuard<WalV8ParallelAdmissionGuard>>,
 }
 
 #[cfg(feature = "bench")]
@@ -4997,8 +4997,7 @@ pub(crate) struct WalV8FrameJob<'a> {
         Option<AdmittedWalV8Batch<'a, WalV8ParallelAdmissionGuard, WalV8PreflightReservation>>,
     assignment: WalV8BatchAssignment,
     coordinator: WalV8ParallelCoordinator,
-    frontier_resources: Arc<Mutex<BTreeMap<u64, WalV8FrontierResource>>>,
-    producer_guards: Arc<Mutex<BTreeMap<u64, WalV8DurabilityGuard<WalV8ParallelAdmissionGuard>>>>,
+    ticket_resources: Arc<Mutex<BTreeMap<u64, WalV8TicketResources>>>,
     io: Arc<WalV8ParallelIo>,
     data_buffer: Option<DirectBufAllocation>,
     reservation: Option<WalV7OwnedBatchReservation>,
@@ -5062,16 +5061,6 @@ impl WalV8FrameJob<'_> {
             .admitted
             .take()
             .context("v8 producer job lost its admitted batch")?;
-        if let Some(reservation) = self.reservation.take() {
-            let previous = self.frontier_resources.lock().insert(
-                self.assignment.segment_ticket,
-                WalV8FrontierResource { reservation },
-            );
-            if previous.is_some() {
-                self.coordinator.poison();
-                anyhow::bail!("v8 Parallel ticket already owns a resource reservation");
-            }
-        }
         let merge_digest_and_frames_ready = self.coordinator.progress_ring_enabled()
             && self.coordinator.progress_cursor_enabled()
             && admitted.can_encode_point_single_frame();
@@ -5233,10 +5222,32 @@ impl WalV8FrameJob<'_> {
         }
         let ticket = self.assignment.segment_ticket;
         let guard = encoded.into_durability_guard();
-        let previous = self.producer_guards.lock().insert(ticket, guard);
-        if previous.is_some() {
-            self.coordinator.poison();
-            anyhow::bail!("v8 Parallel ticket already owns a producer guard");
+        let reservation = self.reservation.take();
+        {
+            let mut ticket_resources = self.ticket_resources.lock();
+            match ticket_resources.entry(ticket) {
+                std::collections::btree_map::Entry::Occupied(mut occupied) => {
+                    let entry = occupied.get_mut();
+                    if entry.guard.is_some() {
+                        self.coordinator.poison();
+                        anyhow::bail!("v8 Parallel ticket already owns a producer guard");
+                    }
+                    if reservation.is_some() {
+                        if entry.reservation.is_some() {
+                            self.coordinator.poison();
+                            anyhow::bail!("v8 Parallel ticket already owns a resource reservation");
+                        }
+                        entry.reservation = reservation;
+                    }
+                    entry.guard = Some(guard);
+                }
+                std::collections::btree_map::Entry::Vacant(vacant) => {
+                    vacant.insert(WalV8TicketResources {
+                        reservation,
+                        guard: Some(guard),
+                    });
+                }
+            }
         }
         let write_result = self.io.publish_data(
             ticket,
@@ -5887,8 +5898,7 @@ impl WalV8LeaderWriter {
                 digest: self.frontier_digest,
                 last_sync_latency: None,
             }),
-            frontier_resources: Arc::new(Mutex::new(BTreeMap::new())),
-            producer_guards: Arc::new(Mutex::new(BTreeMap::new())),
+            ticket_resources: Arc::new(Mutex::new(BTreeMap::new())),
             max_file_size: self.max_file_size,
             installed_dev: self.installed_dev,
             installed_ino: self.installed_ino,
@@ -6921,13 +6931,22 @@ impl WalV8ParallelWriter {
             resources.reservation.take()
         } else {
             if let Some(reservation) = resources.reservation.take() {
-                let previous = self.frontier_resources.lock().insert(
-                    assignment.segment_ticket,
-                    WalV8FrontierResource { reservation },
-                );
-                if previous.is_some() {
-                    self.coordinator.poison();
-                    anyhow::bail!("v8 Parallel ticket already owns a resource reservation");
+                let mut ticket_resources = self.ticket_resources.lock();
+                match ticket_resources.entry(assignment.segment_ticket) {
+                    std::collections::btree_map::Entry::Occupied(mut occupied) => {
+                        let entry = occupied.get_mut();
+                        if entry.reservation.is_some() {
+                            self.coordinator.poison();
+                            anyhow::bail!("v8 Parallel ticket already owns a resource reservation");
+                        }
+                        entry.reservation = Some(reservation);
+                    }
+                    std::collections::btree_map::Entry::Vacant(vacant) => {
+                        vacant.insert(WalV8TicketResources {
+                            reservation: Some(reservation),
+                            guard: None,
+                        });
+                    }
                 }
             }
             None
@@ -6938,8 +6957,7 @@ impl WalV8ParallelWriter {
             admitted: Some(admitted),
             assignment,
             coordinator: self.coordinator.clone(),
-            frontier_resources: Arc::clone(&self.frontier_resources),
-            producer_guards: Arc::clone(&self.producer_guards),
+            ticket_resources: Arc::clone(&self.ticket_resources),
             io: Arc::clone(&self.io),
             data_buffer: Some(resources.data_buffer),
             reservation,
@@ -7733,11 +7751,18 @@ impl WalV8ParallelWriter {
         if self.reservation_owner.is_none() {
             return Ok(WalV8RetirementObservation::default());
         }
+        let expected_u64 = ticket_end
+            .checked_sub(first_ticket)
+            .context("v8 ticket retirement range moves backwards")?;
+        let expected = usize::try_from(expected_u64)?;
+        if expected == 0 {
+            return Ok(WalV8RetirementObservation::default());
+        }
         #[cfg(feature = "bench")]
         let lock_wait_started = sample.then(Instant::now);
         #[cfg(feature = "bench")]
         let lock_wait_cpu_started = sample.then(digest::thread_cpu_time_ns);
-        let mut resources = self.frontier_resources.lock();
+        let mut resources = self.ticket_resources.lock();
         #[cfg(feature = "bench")]
         let lock_wait_wall_ns = lock_wait_started
             .map(|started| started.elapsed().as_nanos().min(u64::MAX as u128) as u64)
@@ -7751,20 +7776,42 @@ impl WalV8ParallelWriter {
         #[cfg(feature = "bench")]
         let lock_hold_cpu_started = sample.then(digest::thread_cpu_time_ns);
         #[cfg(feature = "bench")]
+        let collect_started = sample.then(digest::thread_cpu_time_ns);
+        let first_key = resources.first_key_value().map(|(&k, _)| k);
+        let all_in_range = resources.len() == expected
+            && first_key.is_some_and(|first| first >= first_ticket)
+            && resources
+                .last_key_value()
+                .is_some_and(|(&last, _)| last < ticket_end);
+        let present = if all_in_range {
+            expected
+        } else {
+            resources.range(first_ticket..ticket_end).count()
+        };
+        #[cfg(feature = "bench")]
+        let collect_cpu_ns = collect_started
+            .map(|t| digest::thread_cpu_time_ns().saturating_sub(t))
+            .unwrap_or_default();
+        ensure!(
+            present == expected,
+            "v8 Parallel durable prefix is missing resource reservations"
+        );
+        #[cfg(feature = "bench")]
+        let mut finish_cpu_ns = 0u64;
+        #[cfg(feature = "bench")]
         let (mut fast_path_count, mut pinned_fallback_count) = (0u64, 0u64);
-        let (expected, collect_cpu_ns, remove_cpu_ns, finish_cpu_ns) = Self::drain_ticket_prefix(
-            &mut resources,
-            first_ticket,
-            ticket_end,
-            "v8 Parallel durable prefix is missing resource reservations",
-            "v8 Parallel resource reservation disappeared",
-            sample,
-            |index, _ticket, resource| {
-                let outcome = resource
-                    .reservation
-                    .retire_durable(index > 0)
-                    .context("retire durable v8 batch resources")?;
-                #[cfg(feature = "bench")]
+        for (index, (_ticket, entry)) in resources.range_mut(first_ticket..ticket_end).enumerate() {
+            let reservation = entry
+                .reservation
+                .take()
+                .context("v8 Parallel resource reservation disappeared")?;
+            #[cfg(feature = "bench")]
+            let step_started = sample.then(digest::thread_cpu_time_ns);
+            let outcome = reservation
+                .retire_durable(index > 0)
+                .context("retire durable v8 batch resources")?;
+            #[cfg(feature = "bench")]
+            {
                 match outcome {
                     crate::wal::v7::admission::WalV7DurableRetirementPath::ConsolidatedFastPath => {
                         fast_path_count += 1;
@@ -7773,13 +7820,19 @@ impl WalV8ParallelWriter {
                         pinned_fallback_count += 1;
                     }
                 }
-                #[cfg(not(feature = "bench"))]
-                let _ = outcome;
-                Ok(())
-            },
-        )?;
+                finish_cpu_ns = finish_cpu_ns.saturating_add(
+                    step_started
+                        .map(|t| digest::thread_cpu_time_ns().saturating_sub(t))
+                        .unwrap_or_default(),
+                );
+            }
+            #[cfg(not(feature = "bench"))]
+            let _ = outcome;
+        }
         #[cfg(not(feature = "bench"))]
-        let _ = (expected, collect_cpu_ns, remove_cpu_ns, finish_cpu_ns);
+        let _ = expected;
+        #[cfg(feature = "bench")]
+        let remove_cpu_ns = 0u64;
         #[cfg(feature = "bench")]
         if (fast_path_count > 0 || pinned_fallback_count > 0)
             && let Some(profile) = self.profile.load_full()
@@ -7842,7 +7895,7 @@ impl WalV8ParallelWriter {
         let lock_wait_started = sample.then(Instant::now);
         #[cfg(feature = "bench")]
         let lock_wait_cpu_started = sample.then(digest::thread_cpu_time_ns);
-        let mut guards = self.producer_guards.lock();
+        let mut guards = self.ticket_resources.lock();
         #[cfg(feature = "bench")]
         let lock_wait_wall_ns = lock_wait_started
             .map(|started| started.elapsed().as_nanos().min(u64::MAX as u128) as u64)
@@ -7862,7 +7915,10 @@ impl WalV8ParallelWriter {
             "v8 Parallel durable prefix is missing producer guards",
             "v8 Parallel producer guard disappeared",
             sample,
-            |_index, ticket, mut guard| {
+            |_index, ticket, entry| {
+                let mut guard = entry
+                    .guard
+                    .context("v8 Parallel producer guard disappeared")?;
                 ensure!(
                     guard.segment_ticket() == ticket
                         && (first_ticket..ticket_end).contains(&ticket),
@@ -14833,7 +14889,7 @@ mod tests {
         assert!(writer.try_preallocate_point_buffer(&mut s1));
         let j1 = writer.admit_prepared_point_batch(s1, b1.commit_ts, b1.recorded_at)?;
         let t1 = j1.assignment().segment_ticket;
-        assert!(!writer.frontier_resources.lock().contains_key(&t1));
+        assert!(!writer.ticket_resources.lock().contains_key(&t1));
 
         let b2 = batch(20);
         let p2 = writer.preflight_batch_with_write_class(
@@ -14845,16 +14901,16 @@ mod tests {
         assert!(writer.try_preallocate_point_buffer(&mut s2));
         let j2 = writer.admit_prepared_point_batch(s2, b2.commit_ts, b2.recorded_at)?;
         let t2 = j2.assignment().segment_ticket;
-        assert!(!writer.frontier_resources.lock().contains_key(&t2));
+        assert!(!writer.ticket_resources.lock().contains_key(&t2));
 
         let _ = j2.finish()?;
-        assert!(writer.frontier_resources.lock().contains_key(&t2));
+        assert!(writer.ticket_resources.lock().contains_key(&t2));
 
         let _ = j1.finish()?;
         writer.sync()?;
-        assert!(!writer.frontier_resources.lock().contains_key(&t1));
-        assert!(!writer.frontier_resources.lock().contains_key(&t2));
-        assert!(writer.frontier_resources.lock().is_empty());
+        assert!(!writer.ticket_resources.lock().contains_key(&t1));
+        assert!(!writer.ticket_resources.lock().contains_key(&t2));
+        assert!(writer.ticket_resources.lock().is_empty());
         assert_eq!(writer.point_buffer_preallocations_in_flight_for_test(), 0);
 
         Ok(())
@@ -14911,7 +14967,7 @@ mod tests {
         );
         drop(job);
         assert!(writer.is_poisoned());
-        assert!(writer.frontier_resources.lock().is_empty());
+        assert!(writer.ticket_resources.lock().is_empty());
         assert_eq!(
             owner.image_owner().snapshot().buffer_memory_bytes,
             initial_quota.buffer_memory_bytes
@@ -14979,7 +15035,7 @@ mod tests {
         let _ = j2.finish()?;
         let _ = j1.finish()?;
         writer.sync()?;
-        assert!(writer.frontier_resources.lock().is_empty());
+        assert!(writer.ticket_resources.lock().is_empty());
         let after_sync = owner.image_owner().snapshot();
         assert_eq!(
             after_sync.buffer_memory_bytes,
