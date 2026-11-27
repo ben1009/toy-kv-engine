@@ -4514,24 +4514,46 @@ impl WalV8ParallelIo {
             ticket >= submission.next_ticket,
             "v8 DATA ticket was already submitted"
         );
-        if !submission.submit_any_ready_ticket
-            && !submission.packing
-            && submission.pending.is_empty()
-            && ticket == submission.next_ticket
-            && buffer.len() == WAL_V8_FRAME_LEN
-            && file_offset.is_multiple_of(FRAME_LEN_U64)
-            && submission
-                .next_file_offset
-                .is_none_or(|next_offset| next_offset == file_offset)
-        {
-            return self.submit_ordered_single_frame_locked(
-                &mut submission,
-                ticket,
-                file_offset,
-                buffer,
+        if !submission.submit_any_ready_ticket {
+            if ticket != submission.next_ticket {
                 #[cfg(feature = "bench")]
-                frame_ready_at,
-            );
+                if let Some(profile) = self.profile.load_full() {
+                    profile.record_wal_v8_ordered_fast_path_fallback_out_of_order();
+                }
+            } else if !submission.pending.is_empty() {
+                #[cfg(feature = "bench")]
+                if let Some(profile) = self.profile.load_full() {
+                    profile.record_wal_v8_ordered_fast_path_fallback_pending_nonempty();
+                }
+            } else if submission.packing {
+                #[cfg(feature = "bench")]
+                if let Some(profile) = self.profile.load_full() {
+                    profile.record_wal_v8_ordered_fast_path_fallback_packing();
+                }
+            } else if buffer.len() != WAL_V8_FRAME_LEN || !file_offset.is_multiple_of(FRAME_LEN_U64)
+            {
+                #[cfg(feature = "bench")]
+                if let Some(profile) = self.profile.load_full() {
+                    profile.record_wal_v8_ordered_fast_path_fallback_multi_frame();
+                }
+            } else if submission
+                .next_file_offset
+                .is_some_and(|next_offset| next_offset != file_offset)
+            {
+                #[cfg(feature = "bench")]
+                if let Some(profile) = self.profile.load_full() {
+                    profile.record_wal_v8_ordered_fast_path_fallback_frontier_gap();
+                }
+            } else {
+                return self.submit_ordered_single_frame_locked(
+                    &mut submission,
+                    ticket,
+                    file_offset,
+                    buffer,
+                    #[cfg(feature = "bench")]
+                    frame_ready_at,
+                );
+            }
         }
         ensure!(
             submission
@@ -4688,6 +4710,7 @@ impl WalV8ParallelIo {
         #[cfg(feature = "bench")]
         if let Some(profile) = self.profile.load_full() {
             profile.record_wal_v8_ordered_single_frame_submit();
+            profile.record_wal_v8_data_group_size(1);
         }
         #[cfg(feature = "bench")]
         self.update_data_submit_hol(state);
@@ -4904,6 +4927,10 @@ impl WalV8ParallelIo {
             }
             state.next_ticket = next_ticket;
             state.next_file_offset = Some(cursor);
+            #[cfg(feature = "bench")]
+            if let Some(profile) = self.profile.load_full() {
+                profile.record_wal_v8_data_group_size(selected_count);
+            }
             #[cfg(feature = "bench")]
             if !state.submit_any_ready_ticket {
                 self.update_data_submit_hol(state);

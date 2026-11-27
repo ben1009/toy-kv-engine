@@ -230,6 +230,23 @@ pub struct WriteProfile {
     pub merged_digest_frames_ready_count: AtomicU64,
     /// Ordered single-frame DATA tickets submitted directly via the pending-map bypass.
     pub ordered_single_frame_submit_count: AtomicU64,
+    /// Ordered single-frame fast-path fallbacks: ticket != next_ticket.
+    pub fallback_out_of_order_count: AtomicU64,
+    /// Ordered single-frame fast-path fallbacks: pending map non-empty.
+    pub fallback_pending_nonempty_count: AtomicU64,
+    /// Ordered single-frame fast-path fallbacks: physical file offset gap (FRONTIER gap).
+    pub fallback_frontier_gap_count: AtomicU64,
+    /// Ordered single-frame fast-path fallbacks: packer active.
+    pub fallback_packing_count: AtomicU64,
+    /// Ordered single-frame fast-path fallbacks: multi-frame or unaligned buffer.
+    pub fallback_multi_frame_count: AtomicU64,
+    /// V8 DATA WriteGroup size histogram buckets (tickets per group).
+    pub v8_data_group_size_1_count: AtomicU64,
+    pub v8_data_group_size_2_count: AtomicU64,
+    pub v8_data_group_size_3_4_count: AtomicU64,
+    pub v8_data_group_size_5_8_count: AtomicU64,
+    pub v8_data_group_size_9_16_count: AtomicU64,
+    pub v8_data_group_size_17_plus_count: AtomicU64,
     /// Aggregate time in v8 Leader's synchronous positional DATA write calls.
     /// Parallel mode uses the shared worker's submission/CQE counters instead.
     pub wal_v8_data_write_call_ns: AtomicU64,
@@ -1316,6 +1333,17 @@ impl WriteProfile {
         self.retire_durable_pinned_fallback_count.store(0, o);
         self.merged_digest_frames_ready_count.store(0, o);
         self.ordered_single_frame_submit_count.store(0, o);
+        self.fallback_out_of_order_count.store(0, o);
+        self.fallback_pending_nonempty_count.store(0, o);
+        self.fallback_frontier_gap_count.store(0, o);
+        self.fallback_packing_count.store(0, o);
+        self.fallback_multi_frame_count.store(0, o);
+        self.v8_data_group_size_1_count.store(0, o);
+        self.v8_data_group_size_2_count.store(0, o);
+        self.v8_data_group_size_3_4_count.store(0, o);
+        self.v8_data_group_size_5_8_count.store(0, o);
+        self.v8_data_group_size_9_16_count.store(0, o);
+        self.v8_data_group_size_17_plus_count.store(0, o);
         self.wal_v8_data_write_call_ns.store(0, o);
         self.wal_v8_data_submit_hol_episodes.store(0, o);
         self.wal_v8_data_submit_hol_wait_ns.store(0, o);
@@ -1401,6 +1429,17 @@ impl WriteProfile {
             retire_durable_pinned_fallback_count: self.retire_durable_pinned_fallback_count.load(o),
             merged_digest_frames_ready_count: self.merged_digest_frames_ready_count.load(o),
             ordered_single_frame_submit_count: self.ordered_single_frame_submit_count.load(o),
+            fallback_out_of_order_count: self.fallback_out_of_order_count.load(o),
+            fallback_pending_nonempty_count: self.fallback_pending_nonempty_count.load(o),
+            fallback_frontier_gap_count: self.fallback_frontier_gap_count.load(o),
+            fallback_packing_count: self.fallback_packing_count.load(o),
+            fallback_multi_frame_count: self.fallback_multi_frame_count.load(o),
+            v8_data_group_size_1_count: self.v8_data_group_size_1_count.load(o),
+            v8_data_group_size_2_count: self.v8_data_group_size_2_count.load(o),
+            v8_data_group_size_3_4_count: self.v8_data_group_size_3_4_count.load(o),
+            v8_data_group_size_5_8_count: self.v8_data_group_size_5_8_count.load(o),
+            v8_data_group_size_9_16_count: self.v8_data_group_size_9_16_count.load(o),
+            v8_data_group_size_17_plus_count: self.v8_data_group_size_17_plus_count.load(o),
             wal_v8_data_write_call_ns: self.wal_v8_data_write_call_ns.load(o),
             wal_v8_data_submit_hol_episodes: self.wal_v8_data_submit_hol_episodes.load(o),
             wal_v8_data_submit_hol_wait_ns: self.wal_v8_data_submit_hol_wait_ns.load(o),
@@ -2198,6 +2237,62 @@ impl WriteProfile {
     }
 
     #[cfg(feature = "bench")]
+    pub(crate) fn record_wal_v8_ordered_fast_path_fallback_out_of_order(&self) {
+        self.fallback_out_of_order_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn record_wal_v8_ordered_fast_path_fallback_pending_nonempty(&self) {
+        self.fallback_pending_nonempty_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn record_wal_v8_ordered_fast_path_fallback_frontier_gap(&self) {
+        self.fallback_frontier_gap_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn record_wal_v8_ordered_fast_path_fallback_packing(&self) {
+        self.fallback_packing_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn record_wal_v8_ordered_fast_path_fallback_multi_frame(&self) {
+        self.fallback_multi_frame_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn record_wal_v8_data_group_size(&self, tickets: usize) {
+        let o = std::sync::atomic::Ordering::Relaxed;
+        match tickets {
+            0 => {}
+            1 => {
+                self.v8_data_group_size_1_count.fetch_add(1, o);
+            }
+            2 => {
+                self.v8_data_group_size_2_count.fetch_add(1, o);
+            }
+            3..=4 => {
+                self.v8_data_group_size_3_4_count.fetch_add(1, o);
+            }
+            5..=8 => {
+                self.v8_data_group_size_5_8_count.fetch_add(1, o);
+            }
+            9..=16 => {
+                self.v8_data_group_size_9_16_count.fetch_add(1, o);
+            }
+            _ => {
+                self.v8_data_group_size_17_plus_count.fetch_add(1, o);
+            }
+        }
+    }
+
+    #[cfg(feature = "bench")]
     pub(crate) fn record_wal_v8_retire_durable_counts(&self, fast_path: u64, pinned_fallback: u64) {
         if fast_path > 0 {
             self.retire_durable_fast_path_count
@@ -2351,6 +2446,17 @@ pub struct WriteProfileSnapshot {
     pub retire_durable_pinned_fallback_count: u64,
     pub merged_digest_frames_ready_count: u64,
     pub ordered_single_frame_submit_count: u64,
+    pub fallback_out_of_order_count: u64,
+    pub fallback_pending_nonempty_count: u64,
+    pub fallback_frontier_gap_count: u64,
+    pub fallback_packing_count: u64,
+    pub fallback_multi_frame_count: u64,
+    pub v8_data_group_size_1_count: u64,
+    pub v8_data_group_size_2_count: u64,
+    pub v8_data_group_size_3_4_count: u64,
+    pub v8_data_group_size_5_8_count: u64,
+    pub v8_data_group_size_9_16_count: u64,
+    pub v8_data_group_size_17_plus_count: u64,
     pub wal_v8_data_write_call_ns: u64,
     pub wal_v8_data_submit_hol_episodes: u64,
     pub wal_v8_data_submit_hol_wait_ns: u64,
@@ -2512,6 +2618,39 @@ impl WriteProfileSnapshot {
             ordered_single_frame_submit_count: self
                 .ordered_single_frame_submit_count
                 .saturating_sub(before.ordered_single_frame_submit_count),
+            fallback_out_of_order_count: self
+                .fallback_out_of_order_count
+                .saturating_sub(before.fallback_out_of_order_count),
+            fallback_pending_nonempty_count: self
+                .fallback_pending_nonempty_count
+                .saturating_sub(before.fallback_pending_nonempty_count),
+            fallback_frontier_gap_count: self
+                .fallback_frontier_gap_count
+                .saturating_sub(before.fallback_frontier_gap_count),
+            fallback_packing_count: self
+                .fallback_packing_count
+                .saturating_sub(before.fallback_packing_count),
+            fallback_multi_frame_count: self
+                .fallback_multi_frame_count
+                .saturating_sub(before.fallback_multi_frame_count),
+            v8_data_group_size_1_count: self
+                .v8_data_group_size_1_count
+                .saturating_sub(before.v8_data_group_size_1_count),
+            v8_data_group_size_2_count: self
+                .v8_data_group_size_2_count
+                .saturating_sub(before.v8_data_group_size_2_count),
+            v8_data_group_size_3_4_count: self
+                .v8_data_group_size_3_4_count
+                .saturating_sub(before.v8_data_group_size_3_4_count),
+            v8_data_group_size_5_8_count: self
+                .v8_data_group_size_5_8_count
+                .saturating_sub(before.v8_data_group_size_5_8_count),
+            v8_data_group_size_9_16_count: self
+                .v8_data_group_size_9_16_count
+                .saturating_sub(before.v8_data_group_size_9_16_count),
+            v8_data_group_size_17_plus_count: self
+                .v8_data_group_size_17_plus_count
+                .saturating_sub(before.v8_data_group_size_17_plus_count),
             wal_v8_data_write_call_ns: self
                 .wal_v8_data_write_call_ns
                 .saturating_sub(before.wal_v8_data_write_call_ns),
