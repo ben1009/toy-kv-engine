@@ -35,8 +35,8 @@
 
 - **Key insight**:
   - Cutting `PUBLICATION_SPIN_LIMIT` from `4096` to `256` / `64` reduces Point16 process CPU/Put by **-4.64% to -6.74%** (`65.41 → 62.46 / 61.04 μs`, `5/5` wins) and Point8 CPU/Put by **-4.42% to -5.20%** (`5/5` wins).
-  - However, `budget_exhausted` jumps from **3.3%** (`4096`) to **52.9%** (`256`) and **60.9%** (`64`), increasing `Condvar` sleeps + `notify_all` wakeups by **18×–21×**. That extra wakeup latency trades **-2.29% to -2.60%** Point16 throughput (`0/5` wins).
-  - Even at `64` spins (`39.8` mean iterations), `mvcc_cpu` remains **12.0 μs/Put** (vs `14.1 μs/Put` at `4096`), showing that **the remaining ~12 μs/Put is dominated by `Condvar` sleep/wakeup and the duplicate `mvcc_publication` mutex acquisition**, not spinning alone.
+  - However, `budget_exhausted` jumps from **3.3%** (`4096`) to **52.9%** (`256`) and **60.9%** (`64`), increasing `condvar_wait_calls` by **18×–21×** (note that `condvar_wait_calls` counts user-space `Condvar::wait` entries, not necessarily the same multiplier on OS futex syscalls or `notify_all()` calls). That extra scheduling/wakeup latency trades **-2.29% to -2.60%** Point16 throughput (`0/5` wins).
+  - Even at `64` spins (`39.8` mean iterations), `mvcc_cpu` remains **12.0 μs/Put** (vs `14.1 μs/Put` at `4096`), showing that the remaining ~12 μs/Put includes `Condvar` wait/wakeup, duplicate `mvcc_publication` mutex acquisition, Ready Set (`BTreeSet`) management, and Frontier advancement.
 
 ---
 
