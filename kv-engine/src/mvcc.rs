@@ -205,12 +205,45 @@ struct PublicationState {
     /// prevents these timestamps from joining the visible prefix.
     ready: BTreeSet<u64>,
     poisoned_at: Option<u64>,
-    /// How many threads are waiting on `publication_condvar` - the barrier's
-    /// drain and any publisher waiting for an earlier timestamp. Publishers
-    /// only signal when this is nonzero, so the common path pays no wakeup.
-    /// It is a count rather than a flag because one waiter leaving must not
-    /// silence a signal another waiter still needs.
+    /// How many barrier drain callers are waiting on `publication_condvar`.
+    /// Publishers only signal `publication_condvar` when this is nonzero, so
+    /// the common path pays no condvar wakeup.
     waiters: usize,
+    /// Synchronous publishers whose spin budget exhausted, keyed by their
+    /// assigned `commit_ts` so frontier advancement / poison only unparks the
+    /// covered threads.
+    parked_publishers: BTreeMap<u64, std::thread::Thread>,
+}
+
+enum WakeThreads {
+    None,
+    One(std::thread::Thread),
+    Many(Vec<std::thread::Thread>),
+}
+
+impl WakeThreads {
+    fn push(&mut self, thread: std::thread::Thread) {
+        match std::mem::replace(self, Self::None) {
+            Self::None => *self = Self::One(thread),
+            Self::One(first) => *self = Self::Many(vec![first, thread]),
+            Self::Many(mut list) => {
+                list.push(thread);
+                *self = Self::Many(list);
+            }
+        }
+    }
+
+    fn unpark_all(self) {
+        match self {
+            Self::None => {}
+            Self::One(thread) => thread.unpark(),
+            Self::Many(list) => {
+                for thread in list {
+                    thread.unpark();
+                }
+            }
+        }
+    }
 }
 
 /// Ownership outcome of waiting in [`LsmMvccInner::await_publication`].
@@ -565,6 +598,7 @@ impl LsmMvccInner {
                 ready: BTreeSet::new(),
                 poisoned_at: None,
                 waiters: 0,
+                parked_publishers: BTreeMap::new(),
             }),
             commit_gate: AtomicBool::new(false),
             frontier: AtomicU64::new(initial_ts.saturating_add(1)),
@@ -748,15 +782,18 @@ impl LsmMvccInner {
                     );
             }
         }
-        publication.waiters += 1;
         while publication.next_to_publish <= commit_ts {
             if publication
                 .poisoned_at
                 .is_some_and(|poisoned| commit_ts >= poisoned)
             {
-                publication.waiters -= 1;
+                publication.parked_publishers.remove(&commit_ts);
                 anyhow::bail!("commit sequencer requires recovery after unknown WAL durability");
             }
+            publication
+                .parked_publishers
+                .entry(commit_ts)
+                .or_insert_with(std::thread::current);
             #[cfg(feature = "bench")]
             let frontier_before_wait = publication.next_to_publish;
             #[cfg(feature = "bench")]
@@ -769,23 +806,21 @@ impl LsmMvccInner {
             if let Some(sample) = sample.as_deref_mut() {
                 sample.observation.condvar_wait_calls += 1;
             }
+            drop(publication);
             let lock_wait_started = publication_lock_timer.pause_for_condvar();
-            #[cfg(feature = "bench")]
-            let timeout = self
-                .publication_condvar
-                .wait_for(&mut publication, DRAIN_RECHECK);
-            #[cfg(not(feature = "bench"))]
-            self.publication_condvar
-                .wait_for(&mut publication, DRAIN_RECHECK);
+            std::thread::park_timeout(DRAIN_RECHECK);
             publication_lock_timer.resume_after_condvar(lock_wait_started);
+            let (timer, guard) = crate::wal::mutex_diagnostics::lock(
+                &self.publication,
+                crate::wal::mutex_diagnostics::MutexLockKind::MvccPublication,
+            );
+            publication_lock_timer = timer;
+            publication = guard;
             #[cfg(feature = "bench")]
             if let Some(sample) = sample.as_deref_mut() {
                 sample.observation.condvar_returns += 1;
                 if publication.next_to_publish > frontier_before_wait {
                     sample.observation.condvar_frontier_advanced_returns += 1;
-                }
-                if timeout.timed_out() {
-                    sample.observation.condvar_timeout_returns += 1;
                 }
                 if let Some(started) = condvar_wait_started {
                     sample.observation.condvar_wait_wall_ns = sample
@@ -801,7 +836,7 @@ impl LsmMvccInner {
                 }
             }
         }
-        publication.waiters -= 1;
+        publication.parked_publishers.remove(&commit_ts);
         self.finish_publication_locked(&publication);
 
         Ok(PublicationWaitOutcome::RetiredUnderLock)
@@ -842,7 +877,7 @@ impl LsmMvccInner {
 
     /// Advance visibility only across completed work, never across a missing
     /// timestamp or the poison boundary. Retired timestamps carry no data.
-    fn advance_ready_publications(&self, publication: &mut PublicationState) {
+    fn advance_ready_publications(&self, publication: &mut PublicationState) -> WakeThreads {
         let previous_frontier = self.frontier.load(Ordering::Relaxed);
         let mut published = None;
         loop {
@@ -863,14 +898,23 @@ impl LsmMvccInner {
             self.current_ts.store(timestamp, Ordering::Release);
         }
         self.publish_frontier(publication);
+        let mut wake_threads = WakeThreads::None;
         if publication.next_to_publish != previous_frontier {
+            while publication
+                .parked_publishers
+                .first_key_value()
+                .is_some_and(|(&ts, _)| ts < publication.next_to_publish)
+            {
+                if let Some((_, thread)) = publication.parked_publishers.pop_first() {
+                    wake_threads.push(thread);
+                }
+            }
             self.async_publication_changed.notify_waiters();
+            if publication.waiters > 0 {
+                self.publication_condvar.notify_all();
+            }
         }
-
-        if publication.waiters > 0 && publication.next_to_publish != previous_frontier {
-            self.publication_condvar.notify_all();
-            self.async_publication_changed.notify_waiters();
-        }
+        wake_threads
     }
 
     fn guard_versioned_commit_unwind(
@@ -967,21 +1011,34 @@ impl LsmMvccInner {
             return;
         }
         publication.retired.insert(commit_ts);
-        self.advance_ready_publications(&mut publication);
+        let wake_threads = self.advance_ready_publications(&mut publication);
+        drop(publication);
+        wake_threads.unpark_all();
     }
 
     pub(crate) fn poison_commit_ts(&self, commit_ts: u64) {
         let mut publication = self.publication.lock();
-        publication.poisoned_at = Some(
-            publication
-                .poisoned_at
-                .map_or(commit_ts, |poisoned| poisoned.min(commit_ts)),
-        );
+        let poisoned = publication
+            .poisoned_at
+            .map_or(commit_ts, |existing| existing.min(commit_ts));
+        publication.poisoned_at = Some(poisoned);
         // Writes must fail closed from here on, including the ones that would
         // otherwise take the lock-free reservation path.
         self.commit_gate.store(true, Ordering::SeqCst);
+        let mut wake_threads = WakeThreads::None;
+        while publication
+            .parked_publishers
+            .last_key_value()
+            .is_some_and(|(&ts, _)| ts >= poisoned)
+        {
+            if let Some((_, thread)) = publication.parked_publishers.pop_last() {
+                wake_threads.push(thread);
+            }
+        }
         self.publication_condvar.notify_all();
         self.async_publication_changed.notify_waiters();
+        drop(publication);
+        wake_threads.unpark_all();
     }
 
     pub(crate) async fn publish_commit_ts_async(&self, commit_ts: u64) -> anyhow::Result<()> {
@@ -1004,7 +1061,9 @@ impl LsmMvccInner {
                 let inserted = publication.ready.insert(commit_ts);
                 debug_assert!(inserted, "commit publication is registered once");
             }
-            self.advance_ready_publications(&mut publication);
+            let wake_threads = self.advance_ready_publications(&mut publication);
+            drop(publication);
+            wake_threads.unpark_all();
         }
         let notification = self.async_publication_changed.notified();
         tokio::pin!(notification);
@@ -1157,7 +1216,7 @@ impl LsmMvccInner {
             let inserted = publication.ready.insert(commit_ts);
             debug_assert!(inserted, "commit publication is registered once");
         }
-        self.advance_ready_publications(&mut publication);
+        let wake_threads = self.advance_ready_publications(&mut publication);
         #[cfg(feature = "bench")]
         if let Some(sample) = sample.as_deref_mut() {
             sample.observation.frontier_timestamps_advanced = publication
@@ -1171,6 +1230,7 @@ impl LsmMvccInner {
             }
             drop(publication);
             drop(publication_lock_timer);
+            wake_threads.unpark_all();
             #[cfg(feature = "bench")]
             let outcome = self.await_publication(commit_ts, sample.as_deref_mut())?;
             #[cfg(not(feature = "bench"))]
@@ -1208,10 +1268,16 @@ impl LsmMvccInner {
                         );
                 }
             }
+            self.finish_publication_locked(&publication);
+            drop(publication);
+            drop(reacquired_publication_lock_timer);
+
+            return Ok(());
         }
         self.finish_publication_locked(&publication);
         drop(publication);
         drop(reacquired_publication_lock_timer);
+        wake_threads.unpark_all();
 
         Ok(())
     }
@@ -2801,7 +2867,7 @@ mod tests {
         };
         wait_for_ready(&mvcc, 1);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while mvcc.publication.lock().waiters == 0 {
+        while !mvcc.publication.lock().parked_publishers.contains_key(&ts2) {
             assert!(std::time::Instant::now() < deadline, "waiter did not park");
             std::thread::yield_now();
         }
@@ -2825,7 +2891,7 @@ mod tests {
         };
         wait_for_ready(&mvcc, 1);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while mvcc.publication.lock().waiters == 0 {
+        while !mvcc.publication.lock().parked_publishers.contains_key(&ts2) {
             assert!(std::time::Instant::now() < deadline, "waiter did not park");
             std::thread::yield_now();
         }
@@ -2847,7 +2913,7 @@ mod tests {
         };
         wait_for_ready(&mvcc, 1);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while mvcc.publication.lock().waiters == 0 {
+        while !mvcc.publication.lock().parked_publishers.contains_key(&ts2) {
             assert!(std::time::Instant::now() < deadline, "waiter did not park");
             std::thread::yield_now();
         }
