@@ -19,7 +19,7 @@
 | **Batch64/w16** (100k puts, 16t) | 631,796 puts/s · 4.77 μs/put · 2.599 ms p99 | 632,505 puts/s · 4.76 μs/put · 2.476 ms p99 | +0.06% · +0.26% · -3.34% | 4/5 · 1/5 · 4/5 |
 
 - At **Point16**, Candidate won **5/5** pairs on both throughput (**+2.89%**, `52,059 → 53,641 puts/s`) and CPU/Put (**-5.01%**, `70.22 → 66.66 μs/put`, `-3.56 μs/put`), while winning `4/5` on sampled p99 (`1.344 → 1.096 ms`).
-- At **Point8**, Candidate won **5/5** pairs on CPU/Put (`45.68 → 44.13 μs/put`, `-2.68%`).
+- At **Point8**, Candidate won **5/5** pairs on CPU/Put (`45.68 → 44.13 μs/put`, `-2.68%`), while sampled p99 was `+8.01%` (`1/5` wins) under `--latency-sample-every 100` (flagged for dense-sampling verification in the next round).
 - At **Point1**, Candidate improved throughput (`+0.65%`, `4/5`), CPU/Put (`-1.17%`, `3/5`), and sampled p99 (`-18.58%`, `5/5`).
 - **Batch16/w16** and **Batch64/w16** guardrails showed no regression.
 
@@ -37,7 +37,7 @@
 | `release_cpu_ns + finish_cpu_ns` / put | 1.345 μs | **0.948 μs** | **-0.397 μs (-29.5%)** |
 
 - Every durable ticket across all 3 sampled Point16 runs hit the consolidated `retire_durable` fast path (`100,000 / 100,000`, `0` pinned fallbacks).
-- Eliminating redundant coordinator/owner/ledger locks cut `resource_ledger` lock acquisitions per put by `37.7%` and `reservation_owner` lock acquisitions per put by `22.1%`, driving the `3.56 μs/put` (`-5.01%`) reduction in Point16 CPU/Put.
+- Eliminating redundant coordinator/owner/ledger locks cut `resource_ledger` lock acquisitions per put by `37.7%` and `reservation_owner` lock acquisitions per put by `22.1%`. Direct durability retirement savings measured `0.548 μs/put` (~15% of the `3.56 μs/put` overall Point16 CPU/Put reduction); the remaining ~`3.0 μs/put` likely reflects lock-free coordinator checks, reduced lock contention, and producer admission effects that were not separately attributed.
 
 ## 3. Cleanup Verification
 
