@@ -658,11 +658,25 @@ impl LsmMvccInner {
     /// without another handoff to this thread. A missing predecessor cannot
     /// cause unbounded spinning; prefix advancement or poison wakes parked
     /// callers, which always recheck the predicate under the publication lock.
+    /// Finish retiring an in-flight publication under `self.publication`.
+    fn finish_publication_locked(&self, publication: &PublicationState) {
+        self.in_flight.fetch_sub(1, Ordering::SeqCst);
+        // The barrier still drains callers whose ready timestamps were made
+        // visible by another publisher but whose calls have not yet finished.
+        if publication.waiters > 0 && !publication.admission_open {
+            self.publication_condvar.notify_all();
+            self.async_publication_changed.notify_waiters();
+        }
+    }
+
+    /// Wait until `commit_ts` is visible in `frontier`. Returns `Ok(true)` if
+    /// the caller retired `in_flight` under `self.publication` after waiting on
+    /// `publication_condvar`, or `Ok(false)` if the spin loop observed progress.
     fn await_publication(
         &self,
         commit_ts: u64,
         #[cfg(feature = "bench")] mut sample: Option<&mut MvccPublicationSampleBuilder>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<bool> {
         // Ready work can advance while this caller is parked. Under contention
         // or far behind a missing predecessor, leave CPU time for publishers
         // and WAL workers. Counts and distance are only scheduling hints; the
@@ -689,7 +703,7 @@ impl LsmMvccInner {
                     sample.observation.spin_exit = MvccPublicationSpinExit::FrontierAdvanced;
                 }
 
-                return Ok(());
+                return Ok(false);
             }
             std::hint::spin_loop();
         }
@@ -780,8 +794,9 @@ impl LsmMvccInner {
             }
         }
         publication.waiters -= 1;
+        self.finish_publication_locked(&publication);
 
-        Ok(())
+        Ok(true)
     }
 
     /// The error a writer deserves when the gate is closed. Read under the
@@ -1149,9 +1164,12 @@ impl LsmMvccInner {
             drop(publication);
             drop(publication_lock_timer);
             #[cfg(feature = "bench")]
-            self.await_publication(commit_ts, sample.as_deref_mut())?;
+            let finished_under_lock = self.await_publication(commit_ts, sample.as_deref_mut())?;
             #[cfg(not(feature = "bench"))]
-            self.await_publication(commit_ts)?;
+            let finished_under_lock = self.await_publication(commit_ts)?;
+            if finished_under_lock {
+                return Ok(());
+            }
             #[cfg(feature = "bench")]
             let lock_wait_started = sample.as_ref().map(|_| std::time::Instant::now());
             #[cfg(feature = "bench")]
@@ -1183,13 +1201,7 @@ impl LsmMvccInner {
                 }
             }
         }
-        self.in_flight.fetch_sub(1, Ordering::SeqCst);
-        // The barrier still drains callers whose ready timestamps were made
-        // visible by another publisher but whose calls have not yet finished.
-        if publication.waiters > 0 && !publication.admission_open {
-            self.publication_condvar.notify_all();
-            self.async_publication_changed.notify_waiters();
-        }
+        self.finish_publication_locked(&publication);
         drop(publication);
         drop(reacquired_publication_lock_timer);
 
