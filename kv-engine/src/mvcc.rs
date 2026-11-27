@@ -213,6 +213,17 @@ struct PublicationState {
     waiters: usize,
 }
 
+/// Ownership outcome of waiting in [`LsmMvccInner::await_publication`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PublicationWaitOutcome {
+    /// The spin loop observed `frontier > commit_ts`; the caller still owns
+    /// `in_flight` retirement.
+    SpinCompleted,
+    /// The waiter exhausted spinning, waited under `self.publication`, and
+    /// retired `in_flight` before releasing the lock.
+    RetiredUnderLock,
+}
+
 #[cfg(feature = "bench")]
 const MAX_PUBLICATION_DIAGNOSTIC_SAMPLES: usize = 16_384;
 
@@ -651,13 +662,6 @@ impl LsmMvccInner {
             .store(publication.next_to_publish, Ordering::Release);
     }
 
-    /// Wait until `commit_ts` and every earlier commit have published or retired.
-    ///
-    /// Spin briefly on the mirrored frontier before parking. The caller has
-    /// already registered its completed work, so a predecessor can publish it
-    /// without another handoff to this thread. A missing predecessor cannot
-    /// cause unbounded spinning; prefix advancement or poison wakes parked
-    /// callers, which always recheck the predicate under the publication lock.
     /// Finish retiring an in-flight publication under `self.publication`.
     fn finish_publication_locked(&self, publication: &PublicationState) {
         self.in_flight.fetch_sub(1, Ordering::SeqCst);
@@ -669,14 +673,18 @@ impl LsmMvccInner {
         }
     }
 
-    /// Wait until `commit_ts` is visible in `frontier`. Returns `Ok(true)` if
-    /// the caller retired `in_flight` under `self.publication` after waiting on
-    /// `publication_condvar`, or `Ok(false)` if the spin loop observed progress.
+    /// Wait until `commit_ts` and every earlier commit have published or retired.
+    ///
+    /// Spin briefly on the mirrored frontier before parking. The caller has
+    /// already registered its completed work, so a predecessor can publish it
+    /// without another handoff to this thread. A missing predecessor cannot
+    /// cause unbounded spinning; prefix advancement or poison wakes parked
+    /// callers, which always recheck the predicate under the publication lock.
     fn await_publication(
         &self,
         commit_ts: u64,
         #[cfg(feature = "bench")] mut sample: Option<&mut MvccPublicationSampleBuilder>,
-    ) -> anyhow::Result<bool> {
+    ) -> anyhow::Result<PublicationWaitOutcome> {
         // Ready work can advance while this caller is parked. Under contention
         // or far behind a missing predecessor, leave CPU time for publishers
         // and WAL workers. Counts and distance are only scheduling hints; the
@@ -703,7 +711,7 @@ impl LsmMvccInner {
                     sample.observation.spin_exit = MvccPublicationSpinExit::FrontierAdvanced;
                 }
 
-                return Ok(false);
+                return Ok(PublicationWaitOutcome::SpinCompleted);
             }
             std::hint::spin_loop();
         }
@@ -796,7 +804,7 @@ impl LsmMvccInner {
         publication.waiters -= 1;
         self.finish_publication_locked(&publication);
 
-        Ok(true)
+        Ok(PublicationWaitOutcome::RetiredUnderLock)
     }
 
     /// The error a writer deserves when the gate is closed. Read under the
@@ -1164,10 +1172,10 @@ impl LsmMvccInner {
             drop(publication);
             drop(publication_lock_timer);
             #[cfg(feature = "bench")]
-            let finished_under_lock = self.await_publication(commit_ts, sample.as_deref_mut())?;
+            let outcome = self.await_publication(commit_ts, sample.as_deref_mut())?;
             #[cfg(not(feature = "bench"))]
-            let finished_under_lock = self.await_publication(commit_ts)?;
-            if finished_under_lock {
+            let outcome = self.await_publication(commit_ts)?;
+            if outcome == PublicationWaitOutcome::RetiredUnderLock {
                 return Ok(());
             }
             #[cfg(feature = "bench")]
@@ -2746,6 +2754,116 @@ mod tests {
         assert_eq!(next, commit_ts + 1);
         mvcc.publish_commit_ts(next).unwrap();
         assert_eq!(mvcc.latest_commit_ts(), next);
+    }
+
+    #[test]
+    fn step2a_await_publication_spin_success_retires_via_caller() {
+        let mvcc = Arc::new(LsmMvccInner::new(0));
+        let ts1 = mvcc.reserve_commit_ts().unwrap();
+        let ts2 = mvcc.reserve_commit_ts().unwrap();
+        assert_eq!(mvcc.in_flight.load(Ordering::SeqCst), 2);
+
+        // Publish ts2 first so it registers in ready, then immediately publish ts1.
+        // We also test await_publication directly when frontier is already past commit_ts
+        // to deterministically exercise PublicationWaitOutcome::SpinCompleted.
+        mvcc.publish_commit_ts(ts1).unwrap();
+        assert_eq!(mvcc.in_flight.load(Ordering::SeqCst), 1);
+
+        // Simulate a caller whose spin loop observes frontier > ts2.
+        {
+            let mut publication = mvcc.publication.lock();
+            publication.ready.insert(ts2);
+            mvcc.advance_ready_publications(&mut publication);
+        }
+        #[cfg(feature = "bench")]
+        let outcome = mvcc.await_publication(ts2, None).unwrap();
+        #[cfg(not(feature = "bench"))]
+        let outcome = mvcc.await_publication(ts2).unwrap();
+        assert_eq!(outcome, PublicationWaitOutcome::SpinCompleted);
+        assert_eq!(mvcc.in_flight.load(Ordering::SeqCst), 1);
+        {
+            let publication = mvcc.publication.lock();
+            mvcc.finish_publication_locked(&publication);
+        }
+        assert_eq!(mvcc.in_flight.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn step2a_await_publication_condvar_wait_retires_once_without_double_retire() {
+        let mvcc = Arc::new(LsmMvccInner::new(0));
+        let ts1 = mvcc.reserve_commit_ts().unwrap();
+        let ts2 = mvcc.reserve_commit_ts().unwrap();
+        assert_eq!(mvcc.in_flight.load(Ordering::SeqCst), 2);
+
+        let waiter = {
+            let mvcc = Arc::clone(&mvcc);
+            std::thread::spawn(move || mvcc.publish_commit_ts(ts2))
+        };
+        wait_for_ready(&mvcc, 1);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while mvcc.publication.lock().waiters == 0 {
+            assert!(std::time::Instant::now() < deadline, "waiter did not park");
+            std::thread::yield_now();
+        }
+
+        mvcc.publish_commit_ts(ts1).unwrap();
+        waiter.join().unwrap().unwrap();
+        assert_eq!(mvcc.in_flight.load(Ordering::SeqCst), 0);
+        assert_eq!(mvcc.latest_commit_ts(), ts2);
+    }
+
+    #[test]
+    fn step2a_poison_during_condvar_wait_does_not_retire_failed_reservation() {
+        let mvcc = Arc::new(LsmMvccInner::new(0));
+        let ts1 = mvcc.reserve_commit_ts().unwrap();
+        let ts2 = mvcc.reserve_commit_ts().unwrap();
+        assert_eq!(mvcc.in_flight.load(Ordering::SeqCst), 2);
+
+        let waiter = {
+            let mvcc = Arc::clone(&mvcc);
+            std::thread::spawn(move || mvcc.publish_commit_ts(ts2))
+        };
+        wait_for_ready(&mvcc, 1);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while mvcc.publication.lock().waiters == 0 {
+            assert!(std::time::Instant::now() < deadline, "waiter did not park");
+            std::thread::yield_now();
+        }
+
+        mvcc.poison_commit_ts(ts1);
+        assert!(waiter.join().unwrap().is_err());
+        assert_eq!(mvcc.in_flight.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn step2a_barrier_closed_last_waiter_retires_and_wakes_barrier() {
+        let mvcc = Arc::new(LsmMvccInner::new(0));
+        let ts1 = mvcc.reserve_commit_ts().unwrap();
+        let ts2 = mvcc.reserve_commit_ts().unwrap();
+
+        let waiter = {
+            let mvcc = Arc::clone(&mvcc);
+            std::thread::spawn(move || mvcc.publish_commit_ts(ts2))
+        };
+        wait_for_ready(&mvcc, 1);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while mvcc.publication.lock().waiters == 0 {
+            assert!(std::time::Instant::now() < deadline, "waiter did not park");
+            std::thread::yield_now();
+        }
+
+        let barrier = {
+            let mvcc = Arc::clone(&mvcc);
+            std::thread::spawn(move || mvcc.stop_commit_admission_and_capture())
+        };
+        while mvcc.commit_admission_is_open() {
+            std::hint::spin_loop();
+        }
+
+        mvcc.publish_commit_ts(ts1).unwrap();
+        waiter.join().unwrap().unwrap();
+        assert_eq!(barrier.join().unwrap().unwrap(), Some(ts2));
+        assert_eq!(mvcc.in_flight.load(Ordering::SeqCst), 0);
     }
 
     fn wait_for_ready(mvcc: &LsmMvccInner, count: usize) {
