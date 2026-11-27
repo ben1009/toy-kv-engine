@@ -228,6 +228,8 @@ pub struct WriteProfile {
     pub retire_durable_pinned_fallback_count: AtomicU64,
     /// Cursor single-frame Point tickets that merged digest and frame-ready publication.
     pub merged_digest_frames_ready_count: AtomicU64,
+    /// Ordered single-frame DATA tickets submitted directly via the pending-map bypass.
+    pub ordered_single_frame_submit_count: AtomicU64,
     /// Aggregate time in v8 Leader's synchronous positional DATA write calls.
     /// Parallel mode uses the shared worker's submission/CQE counters instead.
     pub wal_v8_data_write_call_ns: AtomicU64,
@@ -1313,6 +1315,7 @@ impl WriteProfile {
         self.retire_durable_fast_path_count.store(0, o);
         self.retire_durable_pinned_fallback_count.store(0, o);
         self.merged_digest_frames_ready_count.store(0, o);
+        self.ordered_single_frame_submit_count.store(0, o);
         self.wal_v8_data_write_call_ns.store(0, o);
         self.wal_v8_data_submit_hol_episodes.store(0, o);
         self.wal_v8_data_submit_hol_wait_ns.store(0, o);
@@ -1397,6 +1400,7 @@ impl WriteProfile {
             retire_durable_fast_path_count: self.retire_durable_fast_path_count.load(o),
             retire_durable_pinned_fallback_count: self.retire_durable_pinned_fallback_count.load(o),
             merged_digest_frames_ready_count: self.merged_digest_frames_ready_count.load(o),
+            ordered_single_frame_submit_count: self.ordered_single_frame_submit_count.load(o),
             wal_v8_data_write_call_ns: self.wal_v8_data_write_call_ns.load(o),
             wal_v8_data_submit_hol_episodes: self.wal_v8_data_submit_hol_episodes.load(o),
             wal_v8_data_submit_hol_wait_ns: self.wal_v8_data_submit_hol_wait_ns.load(o),
@@ -2188,6 +2192,12 @@ impl WriteProfile {
     }
 
     #[cfg(feature = "bench")]
+    pub(crate) fn record_wal_v8_ordered_single_frame_submit(&self) {
+        self.ordered_single_frame_submit_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "bench")]
     pub(crate) fn record_wal_v8_retire_durable_counts(&self, fast_path: u64, pinned_fallback: u64) {
         if fast_path > 0 {
             self.retire_durable_fast_path_count
@@ -2340,6 +2350,7 @@ pub struct WriteProfileSnapshot {
     pub retire_durable_fast_path_count: u64,
     pub retire_durable_pinned_fallback_count: u64,
     pub merged_digest_frames_ready_count: u64,
+    pub ordered_single_frame_submit_count: u64,
     pub wal_v8_data_write_call_ns: u64,
     pub wal_v8_data_submit_hol_episodes: u64,
     pub wal_v8_data_submit_hol_wait_ns: u64,
@@ -2498,6 +2509,9 @@ impl WriteProfileSnapshot {
             merged_digest_frames_ready_count: self
                 .merged_digest_frames_ready_count
                 .saturating_sub(before.merged_digest_frames_ready_count),
+            ordered_single_frame_submit_count: self
+                .ordered_single_frame_submit_count
+                .saturating_sub(before.ordered_single_frame_submit_count),
             wal_v8_data_write_call_ns: self
                 .wal_v8_data_write_call_ns
                 .saturating_sub(before.wal_v8_data_write_call_ns),

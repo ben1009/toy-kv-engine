@@ -3510,6 +3510,8 @@ struct WalV8SubmissionState {
     group_wait_cutoff: Option<u64>,
     #[cfg(test)]
     submitted_group_snapshots: Vec<WalV8SubmittedGroupSnapshot>,
+    #[cfg(test)]
+    ordered_single_frame_submit_count: u64,
     #[cfg(feature = "bench")]
     data_submit_hol: Option<WalV8DataSubmitHol>,
 }
@@ -3902,6 +3904,8 @@ impl WalV8ParallelIo {
                 group_wait_cutoff: None,
                 #[cfg(test)]
                 submitted_group_snapshots: Vec::new(),
+                #[cfg(test)]
+                ordered_single_frame_submit_count: 0,
                 #[cfg(feature = "bench")]
                 data_submit_hol: None,
             }),
@@ -4640,6 +4644,10 @@ impl WalV8ParallelIo {
         buffer: WalV8DataBuffer,
         #[cfg(feature = "bench")] frame_ready_at: Option<Instant>,
     ) -> Result<()> {
+        ensure!(
+            ticket < self.coordinator.admitted_ticket_end(),
+            "v8 DATA ticket has not been admitted"
+        );
         let ticket_end = ticket
             .checked_add(1)
             .context("v8 worker ticket overflows")?;
@@ -4673,6 +4681,14 @@ impl WalV8ParallelIo {
             .context("submit v8 DATA worker group")?;
         state.next_ticket = ticket_end;
         state.next_file_offset = Some(allocation_end);
+        #[cfg(test)]
+        {
+            state.ordered_single_frame_submit_count += 1;
+        }
+        #[cfg(feature = "bench")]
+        if let Some(profile) = self.profile.load_full() {
+            profile.record_wal_v8_ordered_single_frame_submit();
+        }
         #[cfg(feature = "bench")]
         self.update_data_submit_hol(state);
 
@@ -15453,6 +15469,7 @@ mod tests {
             assert_eq!(submission.next_file_offset, Some(offset1 + FRAME_LEN_U64));
             assert_eq!(submission.submitted_group_snapshots.len(), 1);
             assert_eq!(submission.submitted_group_snapshots[0].tickets, t1..t1 + 1);
+            assert_eq!(submission.ordered_single_frame_submit_count, 1);
         }
 
         // 2. Out-of-order finish (t3 before t2) falls back to pending map until t2 arrives.
@@ -15491,9 +15508,29 @@ mod tests {
             assert!(submission.pending.is_empty());
             assert_eq!(submission.next_ticket, t3 + 1);
             assert_eq!(submission.next_file_offset, Some(offset3 + FRAME_LEN_U64));
+            assert_eq!(submission.ordered_single_frame_submit_count, 1);
         }
 
-        // 3. Stale ticket (< next_ticket) is rejected.
+        // 3. Unadmitted ticket at next_ticket is rejected by admission boundary check.
+        let mut data_unadmitted = WalV8DataBuffer(DirectBuf::new(WAL_V8_FRAME_LEN));
+        data_unadmitted.0.as_mut_slice().fill(0);
+        data_unadmitted.set_len(WAL_V8_FRAME_LEN);
+        let err = writer
+            .io
+            .publish_data(t3 + 1, offset3 + FRAME_LEN_U64, data_unadmitted, None)
+            .expect_err("unadmitted ticket must be rejected");
+        assert!(
+            err.to_string()
+                .contains("v8 DATA ticket has not been admitted"),
+            "unexpected error: {err:#}"
+        );
+        {
+            let submission = writer.io.submission.lock();
+            assert_eq!(submission.next_ticket, t3 + 1);
+            assert_eq!(submission.ordered_single_frame_submit_count, 1);
+        }
+
+        // 4. Stale ticket (< next_ticket) is rejected.
         let mut data_stale = WalV8DataBuffer(DirectBuf::new(WAL_V8_FRAME_LEN));
         data_stale.0.as_mut_slice().fill(0);
         data_stale.set_len(WAL_V8_FRAME_LEN);
