@@ -6656,25 +6656,6 @@ impl WalV8ParallelWriter {
         })
     }
 
-    pub(crate) fn preflight_point_put<'a>(
-        &self,
-        key: &'a [u8],
-        value: &'a [u8],
-        limits: WalV5Limits,
-    ) -> Result<WalV8PreparedBatch<'a>> {
-        ensure!(!self.is_poisoned(), "v8 Parallel WAL is poisoned");
-        let limits = bounded_limits(limits);
-
-        WalV8PreparedBatch::preflight_point_put(key, value, limits, || {
-            let coordinator = self.coordinator.reserve_preparation(0)?;
-
-            Ok(WalV8PreflightReservation {
-                _coordinator: coordinator,
-                _source: None,
-            })
-        })
-    }
-
     /// Admit, encode and write one ticket without serializing it behind other
     /// producers. The caller returns only after its ticket is covered by a
     /// successful embedded FRONTIER and WAL sync.

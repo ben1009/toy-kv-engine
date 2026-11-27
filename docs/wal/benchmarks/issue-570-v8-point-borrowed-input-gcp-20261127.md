@@ -19,8 +19,9 @@
 | **Batch64/w16** (100k puts, 16t) | 632,778 puts/s · 4.90 μs/put · 2.452 ms p99 | 629,766 puts/s · 4.89 μs/put · 2.506 ms p99 | -0.31% · +0.30% · +3.69% | 2/5 · 2/5 · 2/5 |
 
 - **No net improvement observed**: Borrowing `(user_key, &prefixed)` and bypassing `WalBatch`/`CanonicalWalEntryStream` did not reduce measured CPU/Put or improve throughput on `Point1` (`-0.75%` ops/s, `+0.78%` CPU/put), `Point8` (`-0.60%` ops/s, `+0.92%` CPU/put), or `Point16` (`-0.90%` ops/s, `+1.93%` CPU/put, `0/5` CPU wins).
-- **Sampled latency**: `Point8` p99 improved `-8.46%` (`5/5` wins under `--latency-sample-every 100`), while `Point1` and `Batch16` p99 medians varied within `1:100` sampling noise.
+- **Sampled latency**: `Point8` p99 improved `-8.46%` (`5/5` wins under `--latency-sample-every 100`), while `Point1` (`+24.95%`) and `Batch16` (`+33.27%`) p99 medians increased under `1:100` / `1:10` sampling.
 - **Batch guardrails**: `Batch16/w16` and `Batch64/w16` CPU/put stayed flat (`+0.01%` and `+0.30%`).
+- **Disposition**: Reverted the borrowed-input code changes from PR #576 (`178afa45` tested, not merged); retained this report only.
 
 ## 2. Cleanup Verification
 
