@@ -10,7 +10,7 @@ use std::{
     ops::Range,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -145,8 +145,14 @@ impl WalV8WorkerCompletionHandle {
     }
 }
 
+const COORDINATOR_FLAG_POISONED: u8 = 1 << 0;
+const COORDINATOR_FLAG_CLOSED: u8 = 1 << 1;
+
 struct CoordinatorInner {
     state: Mutex<CoordinatorState>,
+    /// Monotonic lifecycle bits (`POISONED | CLOSED`) mirrored on transition so
+    /// lock-free preflight and health checks avoid acquiring `state`.
+    lifecycle_flags: AtomicU8,
     changed: Condvar,
     /// Preparation and admission changes cannot make a durability waiter
     /// useful. Subscribe frontier formation to DATA/prefix progress instead.
@@ -1238,6 +1244,7 @@ impl WalV8ParallelCoordinator {
                 changed: Condvar::new(),
                 durability_changed: Condvar::new(),
                 durable_published: Condvar::new(),
+                lifecycle_flags: AtomicU8::new(0),
                 admitted_ticket_end: AtomicU64::new(config.next_ticket),
                 #[cfg(feature = "bench")]
                 data_completion_timestamps_enabled: std::sync::atomic::AtomicBool::new(false),
@@ -2900,6 +2907,9 @@ impl WalV8ParallelCoordinator {
 
         if !state.closed {
             state.closed = true;
+            self.inner
+                .lifecycle_flags
+                .fetch_or(COORDINATOR_FLAG_CLOSED, Ordering::Release);
             signal_change(&self.inner, &mut state);
             signal_durability_progress(&self.inner, &mut state);
             #[cfg(feature = "bench")]
@@ -2918,11 +2928,11 @@ impl WalV8ParallelCoordinator {
     }
 
     pub(crate) fn is_poisoned(&self) -> bool {
-        self.inner.state.lock().poisoned
+        (self.inner.lifecycle_flags.load(Ordering::Acquire) & COORDINATOR_FLAG_POISONED) != 0
     }
 
     pub(crate) fn is_closed(&self) -> bool {
-        self.inner.state.lock().closed
+        (self.inner.lifecycle_flags.load(Ordering::Acquire) & COORDINATOR_FLAG_CLOSED) != 0
     }
 
     #[cfg(feature = "bench")]
@@ -3251,6 +3261,21 @@ impl WalV8ParallelCoordinator {
             bytes <= self.inner.max_inflight_bytes,
             "v8 preparation index exceeds the configured byte window"
         );
+        if bytes == 0 {
+            let flags = self.inner.lifecycle_flags.load(Ordering::Acquire);
+            ensure!(
+                (flags & COORDINATOR_FLAG_POISONED) == 0,
+                "v8 Parallel coordinator is poisoned"
+            );
+            ensure!(
+                (flags & COORDINATOR_FLAG_CLOSED) == 0,
+                "v8 Parallel coordinator is closed"
+            );
+            return Ok(WalV8PreparationReservation {
+                coordinator: self.clone(),
+                bytes: 0,
+            });
+        }
         let mut state = self.inner.state.lock();
         ensure!(!state.poisoned, "v8 Parallel coordinator is poisoned");
         ensure!(!state.closed, "v8 Parallel coordinator is closed");
@@ -4176,6 +4201,9 @@ fn try_signal_progress_token(inner: &CoordinatorInner) -> Result<()> {
 fn poison_locked(inner: &CoordinatorInner, state: &mut CoordinatorState) {
     if !state.poisoned {
         state.poisoned = true;
+        inner
+            .lifecycle_flags
+            .fetch_or(COORDINATOR_FLAG_POISONED, Ordering::Release);
         if let Some(ring) = &inner.progress_ring {
             ring.poisoned.store(true, Ordering::Release);
         }
@@ -7132,6 +7160,104 @@ mod tests {
         }
         assert_eq!(wakeup_counts(&coordinator), (0, 0, 1, 0));
         assert!(coordinator.is_poisoned());
+
+        Ok(())
+    }
+
+    #[test]
+    fn zero_byte_preparation_and_lifecycle_flags_reject_closed_and_poisoned() -> Result<()> {
+        // 1. Zero-byte preparation leaves accounting unchanged and Drop is a no-op.
+        let coord = coordinator(8)?;
+        let zero_res = coord.reserve_preparation(0)?;
+        assert_eq!(coord.inner.state.lock().reserved_preparation_bytes, 0);
+        assert!(!coord.is_closed());
+        assert!(!coord.is_poisoned());
+        drop(zero_res);
+        assert_eq!(coord.inner.state.lock().reserved_preparation_bytes, 0);
+
+        // 2. Poison between zero-byte preflight and admission rejects admission without ticket.
+        let coord_poison = coordinator(8)?;
+        let _prep = coord_poison.reserve_preparation(0)?;
+        coord_poison.poison();
+        assert!(coord_poison.is_poisoned());
+        assert!(!coord_poison.is_closed());
+        let err = coord_poison
+            .reserve_preparation(0)
+            .err()
+            .expect("poisoned coordinator must reject zero-byte preparation");
+        assert!(err.to_string().contains("poisoned"));
+        let admit_err = admit(&batch(10), &coord_poison)
+            .err()
+            .expect("poisoned coordinator must reject admission");
+        assert!(admit_err.to_string().contains("poisoned"));
+        assert_eq!(coord_poison.admitted_ticket_end(), 0);
+
+        // 3. Close rejects zero-byte preparation, and subsequent poison preserves both bits.
+        let coord_close = coordinator(8)?;
+        coord_close.close();
+        assert!(coord_close.is_closed());
+        assert!(!coord_close.is_poisoned());
+        let close_err = coord_close
+            .reserve_preparation(0)
+            .err()
+            .expect("closed coordinator must reject zero-byte preparation");
+        assert!(close_err.to_string().contains("closed"));
+        coord_close.poison();
+        assert!(coord_close.is_closed());
+        assert!(coord_close.is_poisoned());
+
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_admitted_ticket_end_never_regresses_or_misses_tickets() -> Result<()> {
+        let coord = coordinator(8)?;
+        let published = AtomicU64::new(0);
+        let sequencer = Mutex::new(1u64);
+
+        std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for _ in 0..3 {
+                handles.push(scope.spawn(|| {
+                    let mut seen = Vec::with_capacity(2);
+                    for _ in 0..2 {
+                        let mut next_ts = sequencer.lock();
+                        let ts = *next_ts;
+                        *next_ts += 1;
+                        let batch_item = batch(ts);
+                        let encoded = admit(&batch_item, &coord)
+                            .expect("admit")
+                            .encode()
+                            .expect("encode");
+                        drop(next_ts);
+                        let ticket = encoded.assignment().segment_ticket;
+                        let cursor = coord.admitted_ticket_end();
+                        assert!(cursor > ticket);
+                        let prev = published.fetch_max(cursor, Ordering::AcqRel);
+                        assert!(published.load(Ordering::Acquire) >= prev);
+                        seen.push((ticket, encoded));
+                    }
+                    seen
+                }));
+            }
+            let mut all_tickets = Vec::new();
+            let mut all_encoded = Vec::new();
+            for handle in handles {
+                for (ticket, encoded) in handle.join().expect("worker panicked") {
+                    all_tickets.push(ticket);
+                    all_encoded.push(encoded);
+                }
+            }
+            coord.inner.state.lock().durable_ticket_end = 6;
+            for mut encoded in all_encoded {
+                encoded.disarm_after_durable();
+            }
+            all_tickets.sort_unstable();
+            assert_eq!(all_tickets, (0..6).collect::<Vec<u64>>());
+        });
+
+        assert_eq!(coord.admitted_ticket_end(), 6);
+        assert_eq!(published.load(Ordering::Acquire), 6);
 
         Ok(())
     }

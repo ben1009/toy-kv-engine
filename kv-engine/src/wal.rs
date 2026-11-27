@@ -2835,7 +2835,7 @@ impl Wal {
             .checked_add(u64::try_from(job.frame_buffer_bytes())?)
             .context("v8 Parallel DATA allocation end overflows after admission")?;
         self.next_ticket
-            .fetch_max(writer.next_ticket(), Ordering::Release);
+            .fetch_max(writer.admitted_ticket_end(), Ordering::Release);
         self.alloc_offset.fetch_max(data_end, Ordering::Release);
         self.preallocated_size
             .fetch_max(data_end, Ordering::Release);

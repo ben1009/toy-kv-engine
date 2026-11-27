@@ -7653,7 +7653,9 @@ impl WalV8ParallelWriter {
             .map(|t| digest::thread_cpu_time_ns().saturating_sub(t))
             .unwrap_or_default();
         #[cfg(feature = "bench")]
-        let (mut remove_cpu_ns, mut release_cpu_ns, mut finish_cpu_ns) = (0u64, 0u64, 0u64);
+        let (mut remove_cpu_ns, release_cpu_ns, mut finish_cpu_ns) = (0u64, 0u64, 0u64);
+        #[cfg(feature = "bench")]
+        let (mut fast_path_count, mut pinned_fallback_count) = (0u64, 0u64);
         ensure!(
             tickets.len() == expected,
             "v8 Parallel durable prefix is missing resource reservations"
@@ -7673,35 +7675,37 @@ impl WalV8ParallelWriter {
                         .unwrap_or_default(),
                 );
             }
-            let mut reservation = resource.reservation;
-            if index > 0 {
-                #[cfg(feature = "bench")]
-                let step_started = sample.then(digest::thread_cpu_time_ns);
-                if let Err(error) = reservation.release_unused_frontier_credit() {
-                    return Err(error).context("release coalesced v8 FRONTIER reservation");
-                }
-                #[cfg(feature = "bench")]
-                {
-                    release_cpu_ns = release_cpu_ns.saturating_add(
-                        step_started
-                            .map(|t| digest::thread_cpu_time_ns().saturating_sub(t))
-                            .unwrap_or_default(),
-                    );
-                }
-            }
+            let reservation = resource.reservation;
             #[cfg(feature = "bench")]
             let step_started = sample.then(digest::thread_cpu_time_ns);
-            if let Err(error) = reservation.finish_after_io() {
-                return Err(error).context("retire durable v8 batch resources");
-            }
+            let outcome = match reservation.retire_durable(index > 0) {
+                Ok(outcome) => outcome,
+                Err(error) => return Err(error).context("retire durable v8 batch resources"),
+            };
             #[cfg(feature = "bench")]
             {
+                match outcome {
+                    crate::wal::v7::admission::WalV7DurableRetirementPath::ConsolidatedFastPath => {
+                        fast_path_count += 1;
+                    }
+                    crate::wal::v7::admission::WalV7DurableRetirementPath::PinnedFallback => {
+                        pinned_fallback_count += 1;
+                    }
+                }
                 finish_cpu_ns = finish_cpu_ns.saturating_add(
                     step_started
                         .map(|t| digest::thread_cpu_time_ns().saturating_sub(t))
                         .unwrap_or_default(),
                 );
             }
+            #[cfg(not(feature = "bench"))]
+            let _ = outcome;
+        }
+        #[cfg(feature = "bench")]
+        if (fast_path_count > 0 || pinned_fallback_count > 0)
+            && let Some(profile) = self.profile.load_full()
+        {
+            profile.record_wal_v8_retire_durable_counts(fast_path_count, pinned_fallback_count);
         }
 
         #[cfg(feature = "bench")]
@@ -7875,6 +7879,10 @@ impl WalV8ParallelWriter {
 
     pub(crate) fn next_ticket(&self) -> u64 {
         self.coordinator.next_ticket()
+    }
+
+    pub(crate) fn admitted_ticket_end(&self) -> u64 {
+        self.coordinator.admitted_ticket_end()
     }
 
     /// Completing callers consume published state without waiting for the
