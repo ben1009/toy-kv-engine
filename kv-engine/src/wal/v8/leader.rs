@@ -4462,18 +4462,16 @@ impl WalV8ParallelIo {
         // was waiting for this physical gap to be assigned. Revisit the
         // queue now that the gap is known; otherwise its DATA can remain
         // pending forever when no later producer publishes another ticket.
+        self.frames_ready.notify_all();
         // This callback holds the coordinator's admission lock. An elected
         // packer will observe the gap after waking; otherwise drain ready
         // work directly without acquiring the coordinator in reverse order.
         if submission.submit_any_ready_ticket {
             self.drain_ready_tickets_locked(&mut submission)
                 .context("submit v8 DATA after registering a FRONTIER gap")?;
-        } else {
-            self.frames_ready.notify_all();
-            if !submission.packing {
-                self.drain_ready_locked(&mut submission)
-                    .context("submit v8 DATA after registering a FRONTIER gap")?;
-            }
+        } else if !submission.packing {
+            self.drain_ready_locked(&mut submission)
+                .context("submit v8 DATA after registering a FRONTIER gap")?;
         }
 
         Ok(())
@@ -4512,34 +4510,24 @@ impl WalV8ParallelIo {
             ticket >= submission.next_ticket,
             "v8 DATA ticket was already submitted"
         );
-        if submission.submit_any_ready_ticket {
-            ensure!(
-                !submission.pending.contains_key(&ticket),
-                "v8 DATA ticket was queued twice"
-            );
-            if submission.pending.is_empty() {
-                let admitted_end = self.coordinator.admitted_ticket_end();
-                ensure!(
-                    ticket < admitted_end,
-                    "v8 pending DATA ticket has not been admitted"
-                );
-                return self.submit_ready_ticket_locked(
-                    &mut submission,
-                    ticket,
-                    file_offset,
-                    buffer,
-                );
-            }
-            submission.pending.insert(
+        if !submission.submit_any_ready_ticket
+            && !submission.packing
+            && submission.pending.is_empty()
+            && ticket == submission.next_ticket
+            && buffer.len() == WAL_V8_FRAME_LEN
+            && file_offset.is_multiple_of(FRAME_LEN_U64)
+            && submission
+                .next_file_offset
+                .is_none_or(|next_offset| next_offset == file_offset)
+        {
+            return self.submit_ordered_single_frame_locked(
+                &mut submission,
                 ticket,
-                PendingV8DataWrite {
-                    file_offset,
-                    buffer,
-                    #[cfg(feature = "bench")]
-                    frame_ready_at,
-                },
+                file_offset,
+                buffer,
+                #[cfg(feature = "bench")]
+                frame_ready_at,
             );
-            return self.drain_ready_tickets_locked(&mut submission);
         }
         ensure!(
             submission
@@ -4558,7 +4546,12 @@ impl WalV8ParallelIo {
         );
         self.frames_ready.notify_all();
         #[cfg(feature = "bench")]
-        self.update_data_submit_hol(&mut submission);
+        if !submission.submit_any_ready_ticket {
+            self.update_data_submit_hol(&mut submission);
+        }
+        if submission.submit_any_ready_ticket {
+            return self.drain_ready_tickets_locked(&mut submission);
+        }
         if submission.packing || !submission.pending.contains_key(&submission.next_ticket) {
             return Ok(());
         }
@@ -4639,35 +4632,50 @@ impl WalV8ParallelIo {
         state.data_submit_hol = Some(hol);
     }
 
-    fn submit_ready_ticket_locked(
+    fn submit_ordered_single_frame_locked(
         &self,
         state: &mut WalV8SubmissionState,
         ticket: u64,
         file_offset: u64,
         buffer: WalV8DataBuffer,
+        #[cfg(feature = "bench")] frame_ready_at: Option<Instant>,
     ) -> Result<()> {
-        let write_len = buffer.len();
-        let allocation_end = file_offset
-            .checked_add(u64::try_from(write_len)?)
-            .context("v8 out-of-order DATA allocation end overflows")?;
         let ticket_end = ticket
             .checked_add(1)
-            .context("v8 out-of-order DATA ticket overflows")?;
+            .context("v8 worker ticket overflows")?;
+        let allocation_end = file_offset
+            .checked_add(u64::try_from(WAL_V8_FRAME_LEN)?)
+            .context("v8 worker DATA end overflows")?;
         self.ensure_extent_prepared_through(allocation_end)?;
         self.consume_extent_source_credit(file_offset, allocation_end)?;
-        let write = WriteBuffer::new(buffer, file_offset, write_len);
-        let group = WriteGroup::new(ticket..ticket_end, vec![write])
-            .map_err(|error| anyhow::anyhow!("build v8 out-of-order DATA group: {error:?}"))?;
+        let write = WriteBuffer::new(buffer, file_offset, WAL_V8_FRAME_LEN);
+        #[cfg(feature = "bench")]
+        let write = match frame_ready_at {
+            Some(frame_ready_at) => write.with_ticket_timeline(ticket, frame_ready_at),
+            None => write,
+        };
+        let mut writes = WriteGroupBuffers::with_capacity(1);
+        writes.push(write);
+        let group = WriteGroup::new(ticket..ticket_end, writes)
+            .map_err(|error| anyhow::anyhow!("build v8 DATA worker group: {error:?}"))?;
+        #[cfg(test)]
+        state
+            .submitted_group_snapshots
+            .push(WalV8SubmittedGroupSnapshot {
+                tickets: ticket..ticket_end,
+                allocation_range: file_offset..allocation_end,
+                #[allow(clippy::single_range_in_vec_init)]
+                data_ranges: vec![file_offset..allocation_end],
+                frontier_offsets: Vec::new(),
+            });
         self.client
             .submit_group(group)
-            .context("submit out-of-order v8 DATA ticket")?;
-        state.next_file_offset = Some(
-            state
-                .next_file_offset
-                .map_or(allocation_end, |next_offset| {
-                    next_offset.max(allocation_end)
-                }),
-        );
+            .context("submit v8 DATA worker group")?;
+        state.next_ticket = ticket_end;
+        state.next_file_offset = Some(allocation_end);
+        #[cfg(feature = "bench")]
+        self.update_data_submit_hol(state);
+
         Ok(())
     }
 
@@ -4685,7 +4693,31 @@ impl WalV8ParallelIo {
                 .pending
                 .remove(&ticket)
                 .context("v8 ready DATA ticket disappeared")?;
-            self.submit_ready_ticket_locked(state, ticket, pending.file_offset, pending.buffer)?;
+            let write_len = pending.buffer.len();
+            let allocation_end = pending
+                .file_offset
+                .checked_add(u64::try_from(write_len)?)
+                .context("v8 out-of-order DATA allocation end overflows")?;
+            let ticket_end = ticket
+                .checked_add(1)
+                .context("v8 out-of-order DATA ticket overflows")?;
+            self.ensure_extent_prepared_through(allocation_end)?;
+            self.consume_extent_source_credit(pending.file_offset, allocation_end)?;
+            let write = WriteBuffer::new(pending.buffer, pending.file_offset, write_len);
+            let mut writes = WriteGroupBuffers::with_capacity(1);
+            writes.push(write);
+            let group = WriteGroup::new(ticket..ticket_end, writes)
+                .map_err(|error| anyhow::anyhow!("build v8 out-of-order DATA group: {error:?}"))?;
+            self.client
+                .submit_group(group)
+                .context("submit out-of-order v8 DATA ticket")?;
+            state.next_file_offset = Some(
+                state
+                    .next_file_offset
+                    .map_or(allocation_end, |next_offset| {
+                        next_offset.max(allocation_end)
+                    }),
+            );
         }
 
         Ok(())
@@ -15376,7 +15408,7 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(all(target_os = "linux", feature = "bench"))]
+    #[cfg(target_os = "linux")]
     #[test]
     fn publish_data_single_ticket_fast_path_validates_and_bypasses_pending_map() -> Result<()> {
         let dir = tempfile::tempdir()?;
@@ -15391,38 +15423,17 @@ mod tests {
             FRAME_LEN_U64,
             sync_file,
         )?;
-        let config = WalV8RequestedConfig {
-            data_submit_ready_order: true,
-            ..WalV8RequestedConfig::candidate()
-        };
         let writer = match leader.into_parallel_with_worker_file_and_config(
             OpenOptions::new().read(true).write(true).open(&path)?,
-            config,
+            WalV8RequestedConfig::candidate(),
         ) {
             Ok(writer) => writer,
             Err(error) if is_io_uring_unavailable_error(&error) => return Ok(()),
             Err(error) => return Err(error),
         };
 
-        // 1. Unadmitted ticket is rejected without inserting into pending map.
-        let unadmitted_ticket = writer.coordinator.admitted_ticket_end() + 5;
-        let mut data_unadmitted = WalV8DataBuffer(DirectBuf::new(WAL_V8_FRAME_LEN));
-        data_unadmitted.0.as_mut_slice().fill(0);
-        data_unadmitted.set_len(WAL_V8_FRAME_LEN);
-        assert!(
-            writer
-                .io
-                .publish_data(
-                    unadmitted_ticket,
-                    HEADER_LEN_U64 + FRAME_LEN_U64,
-                    data_unadmitted,
-                    None,
-                )
-                .is_err()
-        );
-        assert!(writer.io.submission.lock().pending.is_empty());
-
-        // 2. Normal single-ticket Point finishes cleanly and leaves pending map empty.
+        // 1. Ordered single-frame Point (default production config) bypasses pending map and
+        // advances next_ticket and next_file_offset in strict order.
         let b1 = batch(10);
         let p1 = writer.preflight_batch_with_write_class(
             &b1,
@@ -15432,26 +15443,66 @@ mod tests {
         let mut s1 = WalV8PointAdmissionScratch::new(p1);
         assert!(writer.try_preallocate_point_buffer(&mut s1));
         let j1 = writer.admit_prepared_point_batch(s1, b1.commit_ts, b1.recorded_at)?;
+        let t1 = j1.assignment().segment_ticket;
         let offset1 = j1.assignment().first_data_offset;
         let _ = j1.finish()?;
         {
             let submission = writer.io.submission.lock();
             assert!(submission.pending.is_empty());
+            assert_eq!(submission.next_ticket, t1 + 1);
             assert_eq!(submission.next_file_offset, Some(offset1 + FRAME_LEN_U64));
+            assert_eq!(submission.submitted_group_snapshots.len(), 1);
+            assert_eq!(submission.submitted_group_snapshots[0].tickets, t1..t1 + 1);
+        }
+
+        // 2. Out-of-order finish (t3 before t2) falls back to pending map until t2 arrives.
+        let b2 = batch(20);
+        let p2 = writer.preflight_batch_with_write_class(
+            &b2,
+            LIVE_WAL_V5_LIMITS,
+            WalV8WriteClass::Point,
+        )?;
+        let mut s2 = WalV8PointAdmissionScratch::new(p2);
+        assert!(writer.try_preallocate_point_buffer(&mut s2));
+        let j2 = writer.admit_prepared_point_batch(s2, b2.commit_ts, b2.recorded_at)?;
+        let t2 = j2.assignment().segment_ticket;
+
+        let b3 = batch(30);
+        let p3 = writer.preflight_batch_with_write_class(
+            &b3,
+            LIVE_WAL_V5_LIMITS,
+            WalV8WriteClass::Point,
+        )?;
+        let mut s3 = WalV8PointAdmissionScratch::new(p3);
+        assert!(writer.try_preallocate_point_buffer(&mut s3));
+        let j3 = writer.admit_prepared_point_batch(s3, b3.commit_ts, b3.recorded_at)?;
+        let t3 = j3.assignment().segment_ticket;
+        let offset3 = j3.assignment().first_data_offset;
+
+        let _ = j3.finish()?;
+        {
+            let submission = writer.io.submission.lock();
+            assert!(submission.pending.contains_key(&t3));
+            assert_eq!(submission.next_ticket, t2);
+        }
+        let _ = j2.finish()?;
+        {
+            let submission = writer.io.submission.lock();
+            assert!(submission.pending.is_empty());
+            assert_eq!(submission.next_ticket, t3 + 1);
+            assert_eq!(submission.next_file_offset, Some(offset3 + FRAME_LEN_U64));
         }
 
         // 3. Stale ticket (< next_ticket) is rejected.
-        writer.io.submission.lock().next_ticket = 99;
         let mut data_stale = WalV8DataBuffer(DirectBuf::new(WAL_V8_FRAME_LEN));
         data_stale.0.as_mut_slice().fill(0);
         data_stale.set_len(WAL_V8_FRAME_LEN);
         assert!(
             writer
                 .io
-                .publish_data(1, offset1 + FRAME_LEN_U64, data_stale, None)
+                .publish_data(t1, offset3 + FRAME_LEN_U64, data_stale, None)
                 .is_err()
         );
-        writer.io.submission.lock().next_ticket = 0;
 
         writer.sync()?;
         Ok(())
