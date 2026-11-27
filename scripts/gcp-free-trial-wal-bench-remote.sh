@@ -504,7 +504,7 @@ if [[ "$BENCH_SUITE" == "v8-point-ack-d1" ]]; then
         exit 1
     fi
 
-    git -C "$REPO" diff --binary "$BENCH_BASELINE_COMMIT" "$ACTUAL_COMMIT" -- \
+    git -C "$REPO" diff --no-ext-diff --no-textconv --full-index --binary "$BENCH_BASELINE_COMMIT" "$ACTUAL_COMMIT" -- \
         kv-engine/src/wal/v8/leader.rs kv-engine/src/wal/v8/parallel.rs \
         >"$BENCH_RESULTS/source.patch"
     ACTUAL_SOURCE_PATCH_SHA256="$(sha256sum "$BENCH_RESULTS/source.patch" | cut -d' ' -f1)"
@@ -587,7 +587,7 @@ if [[ "$BENCH_SUITE" == "v8-point-borrowed-input" ]]; then
         echo "baseline and candidate Rust toolchains differ" >&2
         exit 1
     fi
-    ACTUAL_SOURCE_PATCH_SHA256="$(git -C "$REPO" diff --binary "$BENCH_BASELINE_COMMIT" "$ACTUAL_COMMIT" -- \
+    ACTUAL_SOURCE_PATCH_SHA256="$(git -C "$REPO" diff --no-ext-diff --no-textconv --full-index --binary "$BENCH_BASELINE_COMMIT" "$ACTUAL_COMMIT" -- \
         kv-engine/src/mem_table.rs kv-engine/src/mvcc.rs kv-engine/src/wal.rs \
         kv-engine/src/wal/v8/leader.rs kv-engine/src/wal/v8/prepare.rs | sha256sum | cut -d' ' -f1)"
     if [[ "$ACTUAL_SOURCE_PATCH_SHA256" != "$BENCH_SOURCE_PATCH_SHA256" ]]; then
