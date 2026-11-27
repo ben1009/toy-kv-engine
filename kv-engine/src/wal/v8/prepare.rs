@@ -1489,11 +1489,15 @@ mod tests {
     #[test]
     fn durability_guard_preserves_ticket_and_poison_on_drop_until_disarmed() -> Result<()> {
         let batch = batch(1);
-        let publisher = TestPublisher::new(WAL_V8_DATA_START);
-        let encoded = preflight(&batch)?.admit(&publisher)?.encode()?;
-        let ticket = encoded.assignment().segment_ticket;
+        let mut publisher = TestPublisher::new(WAL_V8_DATA_START);
+        publisher.assignment.segment_ticket = 17;
+        publisher.assignment.commit_ts = batch.commit_ts;
+        publisher.assignment.recorded_at = batch.recorded_at;
+        let encoded = preflight(&batch)?
+            .admit_with_metadata(batch.commit_ts, batch.recorded_at, &publisher)?
+            .encode()?;
         let mut guard = encoded.into_durability_guard();
-        assert_eq!(guard.segment_ticket(), ticket);
+        assert_eq!(guard.segment_ticket(), 17);
         assert!(!publisher.is_poisoned());
 
         guard.disarm_after_durable();
