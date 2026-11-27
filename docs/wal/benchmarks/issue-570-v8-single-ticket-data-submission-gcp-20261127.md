@@ -36,7 +36,35 @@
 | `producer_total_cpu_ns` | 21,705.0 ns | 21,721.5 ns | +0.08% (+16.5 ns) |
 | Process CPU / put (diagnostic run) | 67.01 μs | 67.37 μs | +0.55% |
 
-## 3. Cleanup Verification
+## 3. Candidate-Only Fast Path Hit Rate, Fallback Reasons, and DATA Group Size Distribution (`d7dc9918`)
+
+> [!NOTE]
+> Diagnostic runs only (`bench-results/gcp-wal-20261127T084357Z/diagnostics`, 2 repetitions per workload, built with `--features bench`).
+
+### Fast Path Hit Rate & Mutually Exclusive Fallback Reasons
+
+| Workload (Rep 1 / Rep 2) | Total `publish_data` | Fast Path Hit | `out_of_order` | `pending_nonempty` | `frontier_gap` | `packing` | `multi_frame` |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| **Point1** (1t) | 100,000 / 100,000 | **0.00% / 0.00%** (1 / 1) | 0.00% / 0.00% | 0.00% / 0.00% | **100.00% / 100.00%** (99,999 / 99,999) | 0.00% | 0.00% |
+| **Point8** (8t) | 100,000 / 100,000 | **80.00% / 79.29%** (80,001 / 79,289) | 4.03% / 4.40% | 3.34% / 3.69% | 12.63% / 12.62% | 0.00% | 0.00% |
+| **Point16** (16t) | 100,000 / 100,000 | **76.08% / 75.38%** (76,080 / 75,383) | 7.82% / 8.18% | 5.90% / 6.22% | 10.20% / 10.22% | 0.00% | 0.00% |
+| **Batch16** (16t) | 6,256 / 6,256 | **0.00% / 0.00%** (0 / 0) | **54.09% / 53.88%** (3,384 / 3,371) | 3.74% / 3.40% (234 / 213) | 0.00% | 0.00% | **42.17% / 42.71%** (2,638 / 2,672) |
+
+### DATA `WriteGroup` Size Distribution (Tickets per Group)
+
+| Workload (Rep 1 / Rep 2) | Total Groups | Size 1 | Size 2 | Size 3–4 | Size 5–8 | Size 9+ |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| **Point1** (1t) | 100,000 / 100,000 | **100.00% / 100.00%** | 0.00% | 0.00% | 0.00% | 0.00% |
+| **Point8** (8t) | 95,973 / 95,603 | **96.96% / 96.64%** | 2.23% / 2.50% | 0.73% / 0.77% | 0.08% / 0.09% | 0.00% |
+| **Point16** (16t) | 92,202 / 91,841 | **94.29% / 94.02%** | 4.07% / 4.22% | 1.39% / 1.49% | 0.25% / 0.27% | 0.00% |
+| **Batch16** (16t) | 2,875 / 2,885 | 24.97% / 23.99% | **45.57% / 46.97%** | 26.85% / 26.97% | 2.61% / 2.08% | 0.00% |
+
+- **Interpretation**:
+  - **Point1** hits `fallback_frontier_gap_count` on `99,999 / 100,000` calls because a single writer synchronously emits a FRONTIER frame after each put, leaving a 1-frame physical offset gap before the next DATA frame.
+  - **Point16** already achieves a **75.38%–76.08%** fast-path hit rate (and **94.02%–94.29%** of groups are size 1), while **Point8** achieves **79.29%–80.00%**. Because Point16 hit rate is already high yet 50-run CPU/Put and 3-pair CPU attribution (`-0.66%` / `-20 ns` on `v8_frames_ready_submit_cpu_ns`) show minimal net CPU reduction, bypassing `pending` + `notify_all` + `Vec` on ordered single-frame submission yields only marginal (~20 ns/put) CPU savings at 16 writers.
+  - **Batch16** never enters the fast path (`0.00%`).
+
+## 4. Cleanup Verification
 
 - Verified local archive checksum (`208fb9e7854dc9d44ad6ba2368cbd96a9dac2064ba4655e8c971888b9a428d69`), `summary.json` (`complete: true`, `50/50`), `remote-exit.json` (`failed: false`, `runs_started: 50`), and all 8 diagnostic JSON files before teardown.
 - Deleted the benchmark VM (`walbench-261127-080944-79d26db2`), temporary SSH firewall rule (`walbench-ssh-79d26db2`), and destroyed the isolated Terraform VPC (`walbench-isolated-vpc`), subnet (`walbench-isolated-subnet`), and egress route (`walbench-isolated-egress`), verifying `Listed 0 items.` across instances, disks, walbench firewalls, and walbench networks.
