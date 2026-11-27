@@ -38,7 +38,36 @@
 
 ---
 
-## 3. Cleanup Verification
+## 3. Targeted Publication Wakeup 4-Arm A/B/C/D Results (`a3c59293`, Point16, 5 Quadruples)
 
-- Verified local archive checksum (`1e328197820c637f3acdf5b38c675c29f553847bd377825e4bbbfb6934029985`) before teardown.
-- Deleted `walbench-step2a-vm`, `walbench-step2a-ssh`, and destroyed `walbench-isolated-vpc`, `walbench-isolated-subnet`, and `walbench-isolated-egress` (`Listed 0 items.` across instances, disks, walbench firewalls, and walbench networks).
+- **Arms tested**:
+  - **A (`4096 + Orig + Broadcast`)**: `ea65d941` (sha256 `752bf27a43592f8b938c26283403f12e43ad50b6c0cf3e805412e814397fd99d`)
+  - **B (`4096 + Step 2A + Broadcast`)**: `6b30a537` with `PUBLICATION_SPIN_LIMIT = 4096` (sha256 `3d49bf357740b601ffee575b5d7f305fb893718cb2ff7b742d046105d56678d9`)
+  - **C (`256 + Step 2A + Broadcast`)**: `6b30a537` (sha256 `0cd3e76b7dd71f710cfe9104067bb85dc66e3841c7b81ee7dad4e34a13779221`)
+  - **D (`256 + Step 2A + Targeted`)**: `a3c59293` (sha256 `4df6edb32169143b7c0fa573528e7c01f15b8d6db4094dda046e61161843ca36`)
+- **Local archive**: `bench-results/gcp-mvcc-targeted-20261127/targeted.tar.gz` (`sha256: 0c831dd22ee8f7b4dba852d2c6abfd1ff52bfbefe0fd50645c83d771a2a304b6`, 20 unprofiled runs + 4 diagnostic runs verified).
+
+### 3.1 Unprofiled Point16 Results (5 Counterbalanced Quadruples)
+
+| Arm | Ops/s (Median) | Process CPU/Put (Median) | P50 / P99 (Median) | Paired Delta vs A (`ops/s` · `CPU/put`) | Paired Delta vs C (`ops/s` · `CPU/put`) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| **A (`4096 + Orig + Bcast`)** | 53,690 | 65.13 μs | 0.259 / 0.927 ms | — | — |
+| **B (`4096 + 2A + Bcast`)** | **54,292** | 64.75 μs | 0.250 / 1.034 ms | **+1.12% (3/5)** · -0.57% (3/5) | — |
+| **C (`256 + 2A + Bcast`)** | 51,573 | 60.65 μs | 0.268 / 1.141 ms | -3.21% (0/5) · **-6.15% (5/5)** | — |
+| **D (`256 + 2A + Targeted`)** | 53,205 | **60.58 μs** | 0.263 / 1.039 ms | -1.65% (1/5) · **-7.43% (5/5)** | **+2.71% (5/5)** · +0.12% (2/5) |
+
+### 3.2 Diagnostic Verification (`--mvcc-publication-sample-every 64 --mutex-lock-sample-every 64`)
+
+| Arm | `ops/s` (diag) | `CPU/put` (diag) | `mvcc_publication` acq | `est_contended` | `wait_ms` (wall) | `mvcc_cpu` (all / waited mean) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| **A (`4096 + Orig + Bcast`)** | 53,565 | 64.44 μs | 168,937 | 64,274 | 208.36 ms | 13,166 / 19,548 ns |
+| **B (`4096 + 2A + Bcast`)** | 54,094 | 65.50 μs | 165,909 | 66,517 | 286.89 ms | 14,290 / 20,323 ns |
+| **C (`256 + 2A + Bcast`)** | 52,630 | 61.05 μs | 166,133 | 39,078 | 468.28 ms | 11,530 / 15,303 ns |
+| **D (`256 + 2A + Targeted`)** | 52,905 | **61.08 μs** | 220,286 | **36,340** | **96.18 ms (-79.5% vs C)** | **9,373 / 12,158 ns** |
+
+- **Key result**: Targeted wakeup (`D`) recovered **+2.71% (`5/5` wins)** Point16 throughput over `256 + 2A + Broadcast` (`C`, `51,573 → 53,205/s`), slashed `mvcc_publication` lock wait from **468.28 ms → 96.18 ms (-79.5%)**, cut `mvcc_cpu` from **13,166 ns → 9,373 ns (-28.8%)**, and kept Point16 process CPU/Put at **60.58 μs (-7.43% vs A, `5/5` wins)**.
+
+## 4. Cleanup Verification
+
+- Verified local archive checksums (`1e328197820c637f3acdf5b38c675c29f553847bd377825e4bbbfb6934029985`, `0c831dd22ee8f7b4dba852d2c6abfd1ff52bfbefe0fd50645c83d771a2a304b6`) before teardown.
+- Deleted `walbench-step2a-vm`, `walbench-step2a-ssh`, `walbench-targeted-vm`, `walbench-targeted-ssh`, and destroyed `walbench-isolated-vpc`, `walbench-isolated-subnet`, and `walbench-isolated-egress` (`Listed 0 items.` across instances, disks, walbench firewalls, and walbench networks).
