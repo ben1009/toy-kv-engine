@@ -510,6 +510,35 @@ pub(crate) struct WalV8DigestReady {
     pub(crate) batch_digest: digest::WalV8Digest,
 }
 
+/// Lightweight durability-only guard retained after DATA frame materialization
+/// so the encoded logical buffer and digests can be dropped before durability
+/// retirement.
+pub(crate) struct WalV8DurabilityGuard<G> {
+    segment_ticket: u64,
+    admission_guard: G,
+}
+
+impl<G: WalV8AdmissionGuard> WalV8DurabilityGuard<G> {
+    pub(crate) fn segment_ticket(&self) -> u64 {
+        self.segment_ticket
+    }
+
+    /// Disarm the ticket's poison guard only after durable publication.
+    #[cfg(test)]
+    pub(crate) fn disarm_after_durable(&mut self) {
+        self.admission_guard.disarm_after_durable();
+    }
+
+    /// Disarm after the caller validates that the complete covered prefix is durable.
+    pub(crate) fn disarm_after_durable_prefix_check(
+        &mut self,
+        prefix_check: &WalV8DurablePrefixCheck,
+    ) {
+        self.admission_guard
+            .disarm_after_durable_prefix_check(prefix_check);
+    }
+}
+
 /// Immutable canonical bytes and their digest, ready for independent framing.
 pub(crate) struct EncodedWalV8Batch<G> {
     storage: EncodedWalV8BatchStorage,
@@ -624,6 +653,22 @@ impl<G: WalV8AdmissionGuard> EncodedWalV8Batch<G> {
     ) {
         self.admission_guard
             .disarm_after_durable_prefix_check(prefix_check);
+    }
+
+    /// Release the encoded logical buffer and digests after DATA framing,
+    /// retaining only the ticket identity and admission guard until durable.
+    pub(crate) fn into_durability_guard(self) -> WalV8DurabilityGuard<G> {
+        let Self {
+            storage,
+            assignment,
+            admission_guard,
+            ..
+        } = self;
+        drop(storage);
+        WalV8DurabilityGuard {
+            segment_ticket: assignment.segment_ticket,
+            admission_guard,
+        }
     }
 
     /// Materialize the assigned logical bytes into the v8 physical DATA frames.
@@ -1437,6 +1482,29 @@ mod tests {
 
         assert!(encoded.encode_data_frames_into(&mut []).is_err());
         assert!(publisher.is_poisoned());
+
+        Ok(())
+    }
+
+    #[test]
+    fn durability_guard_preserves_ticket_and_poison_on_drop_until_disarmed() -> Result<()> {
+        let batch = batch(1);
+        let publisher = TestPublisher::new(WAL_V8_DATA_START);
+        let encoded = preflight(&batch)?.admit(&publisher)?.encode()?;
+        let ticket = encoded.assignment().segment_ticket;
+        let mut guard = encoded.into_durability_guard();
+        assert_eq!(guard.segment_ticket(), ticket);
+        assert!(!publisher.is_poisoned());
+
+        guard.disarm_after_durable();
+        drop(guard);
+        assert!(!publisher.is_poisoned());
+
+        let publisher_drop = TestPublisher::new(WAL_V8_DATA_START);
+        let encoded_drop = preflight(&batch)?.admit(&publisher_drop)?.encode()?;
+        let guard_drop = encoded_drop.into_durability_guard();
+        drop(guard_drop);
+        assert!(publisher_drop.is_poisoned());
 
         Ok(())
     }

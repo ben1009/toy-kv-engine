@@ -83,7 +83,8 @@ use super::{
     },
     prepare::{
         AdmittedWalV8Batch, EncodedWalV8Batch, PreparedWalV8Batch, WalV8AdmissionPlan,
-        WalV8AdmissionPublisher, WalV8BatchAssignment, WalV8DigestReady, WalV8WriteClass,
+        WalV8AdmissionPublisher, WalV8BatchAssignment, WalV8DigestReady, WalV8DurabilityGuard,
+        WalV8WriteClass,
     },
     resource::WalV8ReservationOwner,
 };
@@ -277,7 +278,7 @@ pub(crate) struct WalV8ParallelWriter {
     reservation_owner: Option<Arc<WalV8ReservationOwner>>,
     frontier: Mutex<WalV8ParallelFrontier>,
     frontier_resources: Arc<Mutex<BTreeMap<u64, WalV8FrontierResource>>>,
-    producer_guards: Arc<Mutex<BTreeMap<u64, EncodedWalV8Batch<WalV8ParallelAdmissionGuard>>>>,
+    producer_guards: Arc<Mutex<BTreeMap<u64, WalV8DurabilityGuard<WalV8ParallelAdmissionGuard>>>>,
     max_file_size: u64,
     installed_dev: u64,
     installed_ino: u64,
@@ -4997,7 +4998,7 @@ pub(crate) struct WalV8FrameJob<'a> {
     assignment: WalV8BatchAssignment,
     coordinator: WalV8ParallelCoordinator,
     frontier_resources: Arc<Mutex<BTreeMap<u64, WalV8FrontierResource>>>,
-    producer_guards: Arc<Mutex<BTreeMap<u64, EncodedWalV8Batch<WalV8ParallelAdmissionGuard>>>>,
+    producer_guards: Arc<Mutex<BTreeMap<u64, WalV8DurabilityGuard<WalV8ParallelAdmissionGuard>>>>,
     io: Arc<WalV8ParallelIo>,
     data_buffer: Option<DirectBufAllocation>,
     reservation: Option<WalV7OwnedBatchReservation>,
@@ -5206,7 +5207,10 @@ impl WalV8FrameJob<'_> {
                 .mark_data_write_started(self.assignment.segment_ticket)?;
         }
         let ticket = self.assignment.segment_ticket;
-        let previous = self.producer_guards.lock().insert(ticket, encoded);
+        let previous = self
+            .producer_guards
+            .lock()
+            .insert(ticket, encoded.into_durability_guard());
         if previous.is_some() {
             self.coordinator.poison();
             anyhow::bail!("v8 Parallel ticket already owns a producer guard");
@@ -7796,12 +7800,11 @@ impl WalV8ParallelWriter {
         for ticket in tickets {
             #[cfg(feature = "bench")]
             let step_started = sample.then(digest::thread_cpu_time_ns);
-            let mut encoded = guards
+            let mut guard = guards
                 .remove(&ticket)
                 .context("v8 Parallel producer guard disappeared")?;
             ensure!(
-                encoded.assignment().segment_ticket == ticket
-                    && (first_ticket..ticket_end).contains(&ticket),
+                guard.segment_ticket() == ticket && (first_ticket..ticket_end).contains(&ticket),
                 "v8 Parallel producer guard ticket does not match its durable prefix"
             );
             #[cfg(feature = "bench")]
@@ -7814,7 +7817,7 @@ impl WalV8ParallelWriter {
             }
             #[cfg(feature = "bench")]
             let step_started = sample.then(digest::thread_cpu_time_ns);
-            encoded.disarm_after_durable_prefix_check(&prefix_check);
+            guard.disarm_after_durable_prefix_check(&prefix_check);
             #[cfg(feature = "bench")]
             {
                 finish_cpu_ns = finish_cpu_ns.saturating_add(
