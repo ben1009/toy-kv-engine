@@ -696,6 +696,60 @@ impl<'a> CanonicalWalEntryStream<'a> {
     }
 }
 
+/// Validate limits and compute the canonical encoded byte length of a single
+/// `WalEntry::Put` without constructing a `WalBatch` or `CanonicalWalEntryStream`.
+pub(crate) fn point_put_encoded_len(
+    key_len: usize,
+    value_len: usize,
+    limits: WalV5Limits,
+) -> Result<usize> {
+    let limits = limits.validate()?;
+    ensure!(
+        limits.max_input_entry_count >= 1 && limits.max_entry_count >= 1,
+        "v5 entry count exceeds configured limit"
+    );
+    let data_len = point_put_encoded_len_inner(key_len, value_len, limits)?;
+    ensure!(
+        data_len <= limits.max_batch_data_bytes,
+        "v5 batch data exceeds configured limit"
+    );
+    Ok(data_len)
+}
+
+/// Encode a single borrowed `Put(key, value)` entry directly into `dst`,
+/// feeding the emitted bytes to both the entry CRC and `observe`.
+pub(crate) fn encode_point_put_into_with_observer<F>(
+    dst: &mut [u8],
+    key: &[u8],
+    value: &[u8],
+    expected_len: usize,
+    mut observe: F,
+) -> Result<(usize, u32)>
+where
+    F: FnMut(&[u8]) -> Result<()>,
+{
+    ensure!(
+        dst.len() >= expected_len,
+        "v5 entry stream output buffer is too small"
+    );
+    let mut crc = crc32fast::Hasher::new();
+    let pos = write_entry_fields_into(dst, 0, 1, &[key, value], &mut crc)?;
+    ensure!(
+        pos == expected_len,
+        "v5 entry stream length changed while encoding"
+    );
+    let mut observed_pos = 0;
+    while pos - observed_pos >= WAL_V8_OBSERVER_CHUNK_BYTES {
+        observe(&dst[observed_pos..observed_pos + WAL_V8_OBSERVER_CHUNK_BYTES])?;
+        observed_pos += WAL_V8_OBSERVER_CHUNK_BYTES;
+    }
+    if observed_pos < pos {
+        observe(&dst[observed_pos..pos])?;
+    }
+
+    Ok((pos, crc.finalize()))
+}
+
 /// Bound the number of streaming digest updates and associated benchmark timer
 /// reads while still hashing incrementally during canonical encoding.
 const WAL_V8_OBSERVER_CHUNK_BYTES: usize = 64 * 1024;
@@ -728,6 +782,16 @@ fn write_entry_into(
         WalEntry::PointDelete { key } => (2, &[key.as_slice()]),
         WalEntry::RangeDelete { start, end } => (3, &[start.as_slice(), end.as_slice()]),
     };
+    write_entry_fields_into(dst, pos, kind, fields, hasher)
+}
+
+fn write_entry_fields_into(
+    dst: &mut [u8],
+    pos: usize,
+    kind: u8,
+    fields: &[&[u8]],
+    hasher: &mut crc32fast::Hasher,
+) -> Result<usize> {
     let payload_len: usize = fields.iter().map(|field| 4 + field.len()).sum();
     let mut header = [0_u8; 6];
     header[0] = kind;
@@ -1157,15 +1221,32 @@ fn batch_data_len(batch: &WalBatch, limits: WalV5Limits) -> Result<usize> {
     Ok(data_len)
 }
 
+fn point_put_encoded_len_inner(
+    key_len: usize,
+    value_len: usize,
+    limits: WalV5Limits,
+) -> Result<usize> {
+    ensure!(
+        key_len <= limits.max_key_bytes,
+        "v5 key exceeds configured limit"
+    );
+    ensure!(
+        value_len <= limits.max_value_bytes,
+        "v5 value exceeds configured limit"
+    );
+    let payload_len = 8_usize
+        .checked_add(key_len)
+        .and_then(|length| length.checked_add(value_len))
+        .context("v5 entry payload size overflow")?;
+    payload_len.checked_add(6).context("v5 entry size overflow")
+}
+
 fn encoded_entry_len(entry: &WalEntry, limits: WalV5Limits) -> Result<usize> {
+    if let WalEntry::Put { key, value } = entry {
+        return point_put_encoded_len_inner(key.len(), value.len(), limits);
+    }
     let payload_len = match entry {
-        WalEntry::Put { key, value } => {
-            validate_field_len(key, limits.max_key_bytes, "key")?;
-            validate_field_len(value, limits.max_value_bytes, "value")?;
-            8_usize
-                .checked_add(key.len())
-                .and_then(|length| length.checked_add(value.len()))
-        }
+        WalEntry::Put { .. } => unreachable!(),
         WalEntry::PointDelete { key } => {
             validate_field_len(key, limits.max_key_bytes, "key")?;
             4_usize.checked_add(key.len())

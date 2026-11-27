@@ -2716,6 +2716,36 @@ impl Wal {
             .preflight_batch_with_write_class(batch, limits, write_class)
     }
 
+    pub(crate) fn prepare_v8_point_put_pitr_wal<'a>(
+        &self,
+        key: &'a [u8],
+        value: &'a [u8],
+        limits: crate::pitr::WalV5Limits,
+    ) -> Result<v8::leader::WalV8PreparedBatch<'a>> {
+        ensure!(
+            self.format_version == WAL_FORMAT_VERSION_V8,
+            "v8 point preparation selected for format {}",
+            self.format_version
+        );
+        ensure!(
+            !self.poisoned.load(Ordering::Acquire),
+            "WAL is poisoned due to a previous I/O error"
+        );
+        let writer = self
+            .v8_parallel
+            .as_ref()
+            .context("v8 WAL has no Parallel writer")?;
+        let prepared = match writer.preflight_point_put(key, value, limits) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.record_v8_parallel_error(writer, &error);
+                return Err(error);
+            }
+        };
+
+        Ok(prepared)
+    }
+
     pub(crate) fn admit_v8_prepared_parallel_batch<'a>(
         &self,
         prepared: v8::leader::WalV8PreparedBatch<'a>,

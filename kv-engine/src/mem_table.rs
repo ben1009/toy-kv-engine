@@ -4228,6 +4228,24 @@ impl MemTable {
         wal.preflight_v8_leader_batch_with_write_class(batch, limits, write_class)
     }
 
+    pub(crate) fn prepare_v8_point_put_pitr_wal<'a>(
+        &self,
+        key: &'a [u8],
+        value: &'a [u8],
+        limits: crate::pitr::WalV5Limits,
+    ) -> Result<crate::wal::v8::leader::WalV8PreparedBatch<'a>> {
+        let wal = self
+            .wal
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("PITR WAL is not configured"))?;
+        anyhow::ensure!(
+            wal.is_v8() && wal.is_parallel(),
+            "prepared v8 point requires a Parallel v8 WAL"
+        );
+
+        wal.prepare_v8_point_put_pitr_wal(key, value, limits)
+    }
+
     /// Admit a preflighted v8 batch with sequencer-allocated metadata. The
     /// returned producer job must be finished after releasing the MVCC
     /// sequencer, before waiting for the ticket's durability.

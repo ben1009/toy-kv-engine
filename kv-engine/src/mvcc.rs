@@ -1329,14 +1329,6 @@ impl LsmMvccInner {
         let mut prefixed = Vec::with_capacity(1 + value.len());
         prefixed.push(crate::vlog::KvKind::Inline as u8);
         prefixed.extend_from_slice(value);
-        let batch = crate::pitr::WalBatch {
-            commit_ts: 1,
-            recorded_at: crate::pitr::RecordedAt { secs: 0, nanos: 0 },
-            entries: vec![crate::pitr::WalEntry::Put {
-                key: user_key.to_vec(),
-                value: prefixed.clone(),
-            }],
-        };
         #[cfg(feature = "bench")]
         if let Some(sample) = cpu_attribution.as_mut() {
             let (wall_ns, cpu_ns) = phase_timer.finish();
@@ -1346,10 +1338,10 @@ impl LsmMvccInner {
 
         #[cfg(feature = "bench")]
         let phase_timer = WalCpuPhaseTimer::start(cpu_attribution.is_some());
-        let prepared_result = memtable.prepare_v8_pitr_wal_batch_with_write_class(
-            &batch,
+        let prepared_result = memtable.prepare_v8_point_put_pitr_wal(
+            user_key,
+            &prefixed,
             crate::pitr::LIVE_WAL_V5_LIMITS,
-            crate::wal::v8::prepare::WalV8WriteClass::Point,
         );
         #[cfg(feature = "bench")]
         if let Some(sample) = cpu_attribution.as_mut() {
