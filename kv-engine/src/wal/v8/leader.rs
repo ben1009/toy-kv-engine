@@ -7654,7 +7654,8 @@ impl WalV8ParallelWriter {
         }
     }
 
-    fn drain_ticket_prefix<V, F>(
+    #[allow(clippy::too_many_arguments)]
+    fn drain_ticket_prefix<V, P, F>(
         map: &mut BTreeMap<u64, V>,
         first_ticket: u64,
         ticket_end: u64,
@@ -7662,9 +7663,11 @@ impl WalV8ParallelWriter {
         disappeared_msg: &'static str,
         #[cfg(feature = "bench")] sample: bool,
         #[cfg(not(feature = "bench"))] _sample: bool,
+        mut validate_entry: P,
         mut on_entry: F,
     ) -> Result<(usize, u64, u64, u64)>
     where
+        P: FnMut(&V) -> Result<()>,
         F: FnMut(usize, u64, V) -> Result<()>,
     {
         let expected_u64 = ticket_end
@@ -7677,16 +7680,11 @@ impl WalV8ParallelWriter {
         #[cfg(feature = "bench")]
         let collect_started = sample.then(digest::thread_cpu_time_ns);
         let first_key = map.first_key_value().map(|(&k, _)| k);
-        let all_in_range = map.len() == expected
-            && first_key.is_some_and(|first| first >= first_ticket)
-            && map
-                .last_key_value()
-                .is_some_and(|(&last, _)| last < ticket_end);
-        let present = if all_in_range {
-            expected
-        } else {
-            map.range(first_ticket..ticket_end).count()
-        };
+        let mut present = 0usize;
+        for (_, value) in map.range(first_ticket..ticket_end) {
+            validate_entry(value)?;
+            present += 1;
+        }
         #[cfg(feature = "bench")]
         let collect_cpu_ns = collect_started
             .map(|t| digest::thread_cpu_time_ns().saturating_sub(t))
@@ -7777,17 +7775,14 @@ impl WalV8ParallelWriter {
         let lock_hold_cpu_started = sample.then(digest::thread_cpu_time_ns);
         #[cfg(feature = "bench")]
         let collect_started = sample.then(digest::thread_cpu_time_ns);
-        let first_key = resources.first_key_value().map(|(&k, _)| k);
-        let all_in_range = resources.len() == expected
-            && first_key.is_some_and(|first| first >= first_ticket)
-            && resources
-                .last_key_value()
-                .is_some_and(|(&last, _)| last < ticket_end);
-        let present = if all_in_range {
-            expected
-        } else {
-            resources.range(first_ticket..ticket_end).count()
-        };
+        let mut present = 0usize;
+        for (_, entry) in resources.range(first_ticket..ticket_end) {
+            ensure!(
+                entry.reservation.is_some() && entry.guard.is_some(),
+                "incomplete v8 ticket resources in durable prefix"
+            );
+            present += 1;
+        }
         #[cfg(feature = "bench")]
         let collect_cpu_ns = collect_started
             .map(|t| digest::thread_cpu_time_ns().saturating_sub(t))
@@ -7915,6 +7910,13 @@ impl WalV8ParallelWriter {
             "v8 Parallel durable prefix is missing producer guards",
             "v8 Parallel producer guard disappeared",
             sample,
+            |entry| {
+                ensure!(
+                    entry.reservation.is_none() && entry.guard.is_some(),
+                    "v8 Parallel ticket resources are not ready for guard retirement"
+                );
+                Ok(())
+            },
             |_index, ticket, entry| {
                 let mut guard = entry
                     .guard
@@ -15064,6 +15066,7 @@ mod tests {
             "missing",
             "disappeared",
             false,
+            |_| Ok(()),
             |idx, ticket, val| {
                 seen.push((idx, ticket, val));
                 Ok(())
@@ -15082,6 +15085,7 @@ mod tests {
             "missing",
             "disappeared",
             false,
+            |_| Ok(()),
             |_, _, _| Ok(()),
         )?;
         assert_eq!(count, 2);
@@ -15097,6 +15101,7 @@ mod tests {
             "missing",
             "disappeared",
             false,
+            |_| Ok(()),
             |idx, ticket, val| {
                 seen3.push((idx, ticket, val));
                 Ok(())
@@ -15116,6 +15121,7 @@ mod tests {
                 "missing",
                 "disappeared",
                 false,
+                |_| Ok(()),
                 |_, _, _| Ok(()),
             )
             .is_err()
@@ -15132,6 +15138,7 @@ mod tests {
                 "missing",
                 "disappeared",
                 false,
+                |_| Ok(()),
                 |_, _, _| Ok(()),
             )
             .is_err()
@@ -15147,6 +15154,7 @@ mod tests {
             "missing",
             "disappeared",
             false,
+            |_| Ok(()),
             |_, _, _| Ok(()),
         )?;
         assert_eq!(count, 0);
@@ -15161,6 +15169,7 @@ mod tests {
                 "missing",
                 "disappeared",
                 false,
+                |_| Ok(()),
                 |_, _, _| Ok(()),
             )
             .is_err()
@@ -15177,6 +15186,7 @@ mod tests {
             "missing",
             "disappeared",
             false,
+            |_| Ok(()),
             |_, ticket, _| {
                 visited.push(ticket);
                 anyhow::ensure!(ticket != 2, "fail on 2");
@@ -15186,6 +15196,146 @@ mod tests {
         assert!(err.is_err());
         assert_eq!(visited, vec![1, 2]);
         assert_eq!(m8.keys().copied().collect::<Vec<_>>(), vec![3]);
+
+        // 9. Pre-drain validator failure rejects before removing any entry.
+        let mut m9 = make_map(&[1, 2, 3]);
+        assert!(
+            WalV8ParallelWriter::drain_ticket_prefix(
+                &mut m9,
+                1,
+                4,
+                "missing",
+                "disappeared",
+                false,
+                |val| {
+                    anyhow::ensure!(*val != 20, "invalid entry 20");
+                    Ok(())
+                },
+                |_, _, _| unreachable!("must not invoke on_entry after validation failure"),
+            )
+            .is_err()
+        );
+        assert_eq!(m9.keys().copied().collect::<Vec<_>>(), vec![1, 2, 3]);
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ticket_resources_retirement_rejects_incomplete_or_unretired_entries_atomically() -> Result<()>
+    {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("incomplete-ticket-resources.wal");
+        let installed = install_empty(&path, header())?;
+        let sync_file = OpenOptions::new().read(true).write(true).open(&path)?;
+        let (leader, _owner) = open_accounted_writer(
+            &path,
+            &installed,
+            256 * 1024,
+            1024 * 1024,
+            FRAME_LEN_U64,
+            sync_file,
+        )?;
+        let writer = match leader.into_parallel_with_worker_file_and_config(
+            OpenOptions::new().read(true).write(true).open(&path)?,
+            WalV8RequestedConfig::candidate(),
+        ) {
+            Ok(writer) => writer,
+            Err(error) if is_io_uring_unavailable_error(&error) => return Ok(()),
+            Err(error) => return Err(error),
+        };
+
+        let b1 = batch(10);
+        let p1 = writer.preflight_batch_with_write_class(
+            &b1,
+            LIVE_WAL_V5_LIMITS,
+            WalV8WriteClass::Point,
+        )?;
+        let mut s1 = WalV8PointAdmissionScratch::new(p1);
+        assert!(writer.try_preallocate_point_buffer(&mut s1));
+        let j1 = writer.admit_prepared_point_batch(s1, b1.commit_ts, b1.recorded_at)?;
+        let t1 = j1.assignment().segment_ticket;
+
+        let b2 = batch(20);
+        let p2 = writer.preflight_batch_with_write_class(
+            &b2,
+            LIVE_WAL_V5_LIMITS,
+            WalV8WriteClass::Point,
+        )?;
+        let mut s2 = WalV8PointAdmissionScratch::new(p2);
+        assert!(writer.try_preallocate_point_buffer(&mut s2));
+        let j2 = writer.admit_prepared_point_batch(s2, b2.commit_ts, b2.recorded_at)?;
+        let t2 = j2.assignment().segment_ticket;
+
+        let _ = j1.finish()?;
+        let _ = j2.finish()?;
+
+        // Missing guard on t2: retire_frontier_resources must fail without retiring t1.
+        let saved_guard_t2 = writer
+            .ticket_resources
+            .lock()
+            .get_mut(&t2)
+            .expect("t2 entry")
+            .guard
+            .take();
+        assert!(writer.retire_frontier_resources(t1, t2 + 1, false).is_err());
+        assert!(
+            writer
+                .ticket_resources
+                .lock()
+                .get(&t1)
+                .expect("t1 entry")
+                .reservation
+                .is_some(),
+            "t1 reservation must remain unretired when t2 guard is missing"
+        );
+        writer
+            .ticket_resources
+            .lock()
+            .get_mut(&t2)
+            .expect("t2 entry")
+            .guard = saved_guard_t2;
+
+        // Guard retirement before resource retirement: must fail without removing entries.
+        assert!(writer.retire_frontier_guards(t1, t2 + 1, false).is_err());
+        assert!(writer.ticket_resources.lock().contains_key(&t1));
+        assert!(writer.ticket_resources.lock().contains_key(&t2));
+
+        // Normal full sync on a fresh writer retires resources then guards; duplicate resource
+        // retirement fails.
+        let path2 = dir.path().join("complete-ticket-resources.wal");
+        let installed2 = install_empty(&path2, header())?;
+        let sync_file2 = OpenOptions::new().read(true).write(true).open(&path2)?;
+        let (leader2, _owner2) = open_accounted_writer(
+            &path2,
+            &installed2,
+            256 * 1024,
+            1024 * 1024,
+            FRAME_LEN_U64,
+            sync_file2,
+        )?;
+        let writer2 = leader2.into_parallel_with_worker_file_and_config(
+            OpenOptions::new().read(true).write(true).open(&path2)?,
+            WalV8RequestedConfig::candidate(),
+        )?;
+        let b3 = batch(30);
+        let p3 = writer2.preflight_batch_with_write_class(
+            &b3,
+            LIVE_WAL_V5_LIMITS,
+            WalV8WriteClass::Point,
+        )?;
+        let mut s3 = WalV8PointAdmissionScratch::new(p3);
+        assert!(writer2.try_preallocate_point_buffer(&mut s3));
+        let j3 = writer2.admit_prepared_point_batch(s3, b3.commit_ts, b3.recorded_at)?;
+        let t3 = j3.assignment().segment_ticket;
+        let _ = j3.finish()?;
+        writer2.sync()?;
+        assert!(writer2.ticket_resources.lock().is_empty());
+        assert!(
+            writer2
+                .retire_frontier_resources(t3, t3 + 1, false)
+                .is_err()
+        );
 
         Ok(())
     }
