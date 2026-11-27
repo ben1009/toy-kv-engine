@@ -5072,6 +5072,9 @@ impl WalV8FrameJob<'_> {
                 anyhow::bail!("v8 Parallel ticket already owns a resource reservation");
             }
         }
+        let merge_digest_and_frames_ready = self.coordinator.progress_ring_enabled()
+            && self.coordinator.progress_cursor_enabled()
+            && admitted.can_encode_point_single_frame();
         // The selector is injectable in unit tests. Production only enables it
         // through the bench-only OnceLock above.
         let direct_point = direct_point_enabled && admitted.can_encode_point_single_frame();
@@ -5109,25 +5112,31 @@ impl WalV8FrameJob<'_> {
                 return Err(error);
             }
         };
-        #[cfg(feature = "bench")]
-        let digest_started = phases
-            .as_ref()
-            .map(|_| (Instant::now(), digest::thread_cpu_time_ns()));
         let digest_ready = encoded.digest_ready()?;
         #[cfg(feature = "bench")]
-        let ordered_link_hash_cpu_ns = self
-            .coordinator
-            .mark_digest_ready_before_data(digest_ready)?;
+        let ordered_link_hash_cpu_ns = if merge_digest_and_frames_ready {
+            0
+        } else {
+            let digest_started = phases
+                .as_ref()
+                .map(|_| (Instant::now(), digest::thread_cpu_time_ns()));
+            let cpu_ns = self
+                .coordinator
+                .mark_digest_ready_before_data(digest_ready)?;
+            if let (Some(phases), Some((wall_started, cpu_started))) =
+                (phases.as_deref_mut(), digest_started)
+            {
+                phases.digest_ready_wall_ns =
+                    wall_started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+                phases.digest_ready_cpu_ns =
+                    digest::thread_cpu_time_ns().saturating_sub(cpu_started);
+            }
+            cpu_ns
+        };
         #[cfg(not(feature = "bench"))]
-        self.coordinator
-            .mark_digest_ready_before_data(digest_ready)?;
-        #[cfg(feature = "bench")]
-        if let (Some(phases), Some((wall_started, cpu_started))) =
-            (phases.as_deref_mut(), digest_started)
-        {
-            phases.digest_ready_wall_ns =
-                wall_started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
-            phases.digest_ready_cpu_ns = digest::thread_cpu_time_ns().saturating_sub(cpu_started);
+        if !merge_digest_and_frames_ready {
+            self.coordinator
+                .mark_digest_ready_before_data(digest_ready)?;
         }
         #[cfg(feature = "bench")]
         let metrics = {
@@ -5187,16 +5196,27 @@ impl WalV8FrameJob<'_> {
             let sample_every = self.profile.as_ref().map_or(0, |profile| {
                 profile.wal_v8_completion_timeline_sample_every()
             });
-            self.coordinator.mark_frames_ready_with_timeline_sample(
-                self.assignment.segment_ticket,
-                sample_every > 0 && self.assignment.segment_ticket.is_multiple_of(sample_every),
-            )?
+            let sample_timeline =
+                sample_every > 0 && self.assignment.segment_ticket.is_multiple_of(sample_every);
+            if merge_digest_and_frames_ready {
+                self.coordinator
+                    .publish_digest_and_frames_ready_before_data(digest_ready, sample_timeline)?
+            } else {
+                self.coordinator.mark_frames_ready_with_timeline_sample(
+                    self.assignment.segment_ticket,
+                    sample_timeline,
+                )?
+            }
         };
         #[cfg(not(feature = "bench"))]
-        self.coordinator
-            .mark_frames_ready(self.assignment.segment_ticket)?;
-        #[cfg(not(feature = "bench"))]
-        let frame_ready_at = None;
+        let frame_ready_at = if merge_digest_and_frames_ready {
+            self.coordinator
+                .publish_digest_and_frames_ready_before_data(digest_ready, false)?
+        } else {
+            self.coordinator
+                .mark_frames_ready(self.assignment.segment_ticket)?;
+            None
+        };
         #[cfg(feature = "bench")]
         if self
             .profile

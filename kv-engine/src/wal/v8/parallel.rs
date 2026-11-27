@@ -302,8 +302,12 @@ impl TicketProgressRing {
         Ok(())
     }
 
-    fn publish_digest(&self, digest: WalV8DigestReady) -> Result<bool> {
-        let mut payload = self.cell(digest.segment_ticket)?.payload.lock();
+    fn validate_digest_locked(
+        &self,
+        payload: &TicketProgressPayload,
+        digest: WalV8DigestReady,
+        context: &str,
+    ) -> Result<()> {
         ensure!(
             !self.poisoned.load(Ordering::Acquire),
             "v8 Parallel coordinator is poisoned"
@@ -315,20 +319,47 @@ impl TicketProgressRing {
                         segment_incarnation: digest.segment_incarnation,
                         ticket: digest.segment_ticket,
                     }),
-            "v8 progress ring digest names a stale or foreign ticket"
+            "{context}"
         );
         ensure!(
             payload.logical_batch_bytes == Some(digest.logical_batch_bytes),
             "v8 progress ring digest length differs from its admitted ticket"
         );
-        match payload.digest_ready {
-            Some(existing) if existing == digest => Ok(false),
-            Some(_) => anyhow::bail!("conflicting v8 progress ring digest"),
-            None => {
-                payload.digest_ready = Some(digest);
-                Ok(true)
-            }
+        if let Some(existing) = payload.digest_ready {
+            ensure!(existing == digest, "conflicting v8 progress ring digest");
         }
+        Ok(())
+    }
+
+    fn publish_digest(&self, digest: WalV8DigestReady) -> Result<bool> {
+        let mut payload = self.cell(digest.segment_ticket)?.payload.lock();
+        self.validate_digest_locked(
+            &payload,
+            digest,
+            "v8 progress ring digest names a stale or foreign ticket",
+        )?;
+        if payload.digest_ready.is_some() {
+            return Ok(false);
+        }
+        payload.digest_ready = Some(digest);
+        Ok(true)
+    }
+
+    fn publish_digest_and_frames_ready(&self, digest: WalV8DigestReady) -> Result<bool> {
+        let mut payload = self.cell(digest.segment_ticket)?.payload.lock();
+        self.validate_digest_locked(
+            &payload,
+            digest,
+            "v8 progress ring digest and frame-ready event names a stale or foreign ticket",
+        )?;
+        if payload.digest_ready.is_none() {
+            payload.digest_ready = Some(digest);
+        }
+        if payload.frames_ready {
+            return Ok(false);
+        }
+        payload.frames_ready = true;
+        Ok(true)
     }
 
     fn mark_frames_ready(&self, segment_incarnation: [u8; 16], ticket: u64) -> Result<bool> {
@@ -1082,6 +1113,39 @@ impl WalV8ParallelCoordinator {
                 Err(error).context("publish v8 progress ring frame readiness")
             }
         }
+    }
+
+    /// Publish digest and frame readiness in one progress-ring cell lock.
+    /// Valid only in Cursor mode before DATA submission, where digest readiness
+    /// does not emit a separate progress token.
+    pub(crate) fn publish_digest_and_frames_ready_before_data(
+        &self,
+        digest: WalV8DigestReady,
+        sample_timeline: bool,
+    ) -> Result<Option<Instant>> {
+        ensure!(
+            self.progress_cursor_enabled(),
+            "merged digest and frame-ready publication requires Cursor progress mode"
+        );
+        let Some(progress_ring) = &self.inner.progress_ring else {
+            anyhow::bail!("v8 per-ticket progress ring is disabled");
+        };
+        let changed = match progress_ring.publish_digest_and_frames_ready(digest) {
+            Ok(changed) => changed,
+            Err(error) => {
+                self.poison();
+                return Err(error).context("publish v8 progress ring digest and frame readiness");
+            }
+        };
+        #[cfg(feature = "bench")]
+        let frame_ready_at = (changed && sample_timeline).then(Instant::now);
+        #[cfg(not(feature = "bench"))]
+        let frame_ready_at = {
+            let _ = sample_timeline;
+            let _ = changed;
+            None
+        };
+        Ok(frame_ready_at)
     }
 
     pub(crate) fn owns_durability_driver(&self, driver: &WalV8DurabilityDriver) -> bool {
@@ -4338,27 +4402,27 @@ mod tests {
             >()
         );
 
-        let coordinator = coordinator(4)?;
+        let coordinator_encoded = coordinator(4)?;
         let batch1 = batch(1);
-        let mut encoded = admit(&batch1, &coordinator)?.encode()?;
-        coordinator.inner.state.lock().durable_ticket_end = 1;
+        let mut encoded = admit(&batch1, &coordinator_encoded)?.encode()?;
+        coordinator_encoded.inner.state.lock().durable_ticket_end = 1;
 
-        let prefix_check = coordinator.poison_ticket_prefix_if_pending(1);
+        let prefix_check = coordinator_encoded.poison_ticket_prefix_if_pending(1);
         encoded.disarm_after_durable_prefix_check(&prefix_check);
         drop(encoded);
 
-        assert!(!coordinator.is_poisoned());
+        assert!(!coordinator_encoded.is_poisoned());
 
-        let batch2 = batch(2);
-        let mut guard = admit(&batch2, &coordinator)?
+        let coordinator_guard = coordinator(4)?;
+        let mut guard = admit(&batch1, &coordinator_guard)?
             .encode()?
             .into_durability_guard();
-        coordinator.inner.state.lock().durable_ticket_end = 2;
-        let prefix_check2 = coordinator.poison_ticket_prefix_if_pending(2);
-        guard.disarm_after_durable_prefix_check(&prefix_check2);
+        coordinator_guard.inner.state.lock().durable_ticket_end = 1;
+        let prefix_check_guard = coordinator_guard.poison_ticket_prefix_if_pending(1);
+        guard.disarm_after_durable_prefix_check(&prefix_check_guard);
         drop(guard);
 
-        assert!(!coordinator.is_poisoned());
+        assert!(!coordinator_guard.is_poisoned());
 
         Ok(())
     }
@@ -7299,6 +7363,173 @@ mod tests {
         assert_eq!(coord.admitted_ticket_end(), 6);
         assert_eq!(published.load(Ordering::Acquire), 6);
 
+        Ok(())
+    }
+
+    fn cursor_ring_coordinator(max_inflight_tickets: usize) -> Result<WalV8ParallelCoordinator> {
+        coordinator_with_progress_mode(max_inflight_tickets, 0, WalV8ProgressMode::Cursor)
+    }
+
+    #[test]
+    fn publish_digest_and_frames_ready_sets_both_without_progress_token_in_cursor_mode()
+    -> Result<()> {
+        let coord = cursor_ring_coordinator(4)?;
+        let token_rx = coord
+            .take_progress_token_receiver()?
+            .expect("progress ring must provide a token receiver");
+        let batch_item = batch(1);
+        let mut encoded = admit(&batch_item, &coord)?.encode()?;
+        let digest = encoded.digest_ready()?;
+
+        assert!(
+            coord
+                .publish_digest_and_frames_ready_before_data(digest, false)?
+                .is_none()
+        );
+        assert!(
+            token_rx.try_recv().is_err(),
+            "Cursor merged publish must not emit a progress token before DATA completion"
+        );
+        let ring = coord
+            .inner
+            .progress_ring
+            .as_ref()
+            .expect("progress ring enabled");
+        let payload = ring.read(digest.segment_incarnation, digest.segment_ticket)?;
+        assert_eq!(payload.digest_ready, Some(digest));
+        assert!(payload.frames_ready);
+
+        // Idempotent repeat succeeds without error.
+        assert!(
+            coord
+                .publish_digest_and_frames_ready_before_data(digest, false)?
+                .is_none()
+        );
+
+        coord.inner.state.lock().durable_ticket_end = 1;
+        encoded.disarm_after_durable();
+        Ok(())
+    }
+
+    #[test]
+    fn publish_digest_and_frames_ready_rejects_stale_foreign_conflicting_and_poison_atomically()
+    -> Result<()> {
+        // 1. Stale / unknown ticket.
+        let coord_stale = cursor_ring_coordinator(4)?;
+        let batch_item = batch(1);
+        let mut encoded_stale = admit(&batch_item, &coord_stale)?.encode()?;
+        let mut stale_digest = encoded_stale.digest_ready()?;
+        stale_digest.segment_ticket = 99;
+        assert!(
+            coord_stale
+                .publish_digest_and_frames_ready_before_data(stale_digest, false)
+                .is_err()
+        );
+        assert!(coord_stale.is_poisoned());
+        encoded_stale.disarm_after_durable();
+
+        // 2. Foreign incarnation leaves cell untouched.
+        let coord_foreign = cursor_ring_coordinator(4)?;
+        let mut encoded_foreign = admit(&batch_item, &coord_foreign)?.encode()?;
+        let valid_digest = encoded_foreign.digest_ready()?;
+        let mut foreign_digest = valid_digest;
+        foreign_digest.segment_incarnation = [0x99; 16];
+        assert!(
+            coord_foreign
+                .publish_digest_and_frames_ready_before_data(foreign_digest, false)
+                .is_err()
+        );
+        assert!(coord_foreign.is_poisoned());
+        let ring_foreign = coord_foreign
+            .inner
+            .progress_ring
+            .as_ref()
+            .expect("progress ring");
+        let payload_foreign = ring_foreign.read(
+            valid_digest.segment_incarnation,
+            valid_digest.segment_ticket,
+        )?;
+        assert_eq!(payload_foreign.digest_ready, None);
+        assert!(!payload_foreign.frames_ready);
+        encoded_foreign.disarm_after_durable();
+
+        // 3. Conflicting digest must not flip frames_ready.
+        let coord_conflict = cursor_ring_coordinator(4)?;
+        let mut encoded_conflict = admit(&batch_item, &coord_conflict)?.encode()?;
+        let digest_a = encoded_conflict.digest_ready()?;
+        coord_conflict.mark_digest_ready(digest_a)?;
+        let mut digest_b = digest_a;
+        digest_b.batch_digest[0] ^= 0xff;
+        assert!(
+            coord_conflict
+                .publish_digest_and_frames_ready_before_data(digest_b, false)
+                .is_err()
+        );
+        assert!(coord_conflict.is_poisoned());
+        let ring_conflict = coord_conflict
+            .inner
+            .progress_ring
+            .as_ref()
+            .expect("progress ring");
+        let payload_conflict =
+            ring_conflict.read(digest_a.segment_incarnation, digest_a.segment_ticket)?;
+        assert_eq!(payload_conflict.digest_ready, Some(digest_a));
+        assert!(!payload_conflict.frames_ready);
+        encoded_conflict.disarm_after_durable();
+
+        // 4. Poisoned coordinator rejects and leaves cell untouched.
+        let coord_poison = cursor_ring_coordinator(4)?;
+        let mut encoded_poison = admit(&batch_item, &coord_poison)?.encode()?;
+        let poison_digest = encoded_poison.digest_ready()?;
+        coord_poison.poison();
+        assert!(
+            coord_poison
+                .publish_digest_and_frames_ready_before_data(poison_digest, false)
+                .is_err()
+        );
+        let ring_poison = coord_poison
+            .inner
+            .progress_ring
+            .as_ref()
+            .expect("progress ring");
+        let payload_poison = ring_poison.read(
+            poison_digest.segment_incarnation,
+            poison_digest.segment_ticket,
+        )?;
+        assert_eq!(payload_poison.digest_ready, None);
+        assert!(!payload_poison.frames_ready);
+        encoded_poison.disarm_after_durable();
+
+        Ok(())
+    }
+
+    #[test]
+    fn publish_digest_and_frames_ready_handles_out_of_order_data_completion() -> Result<()> {
+        let coord = cursor_ring_coordinator(4)?;
+        let mut enc0 = admit(&batch(1), &coord)?.encode()?;
+        let mut enc1 = admit(&batch(2), &coord)?.encode()?;
+        let d0 = enc0.digest_ready()?;
+        let d1 = enc1.digest_ready()?;
+
+        // Publish ticket 1 before ticket 0, and complete DATA out of order (1 before 0).
+        coord.publish_digest_and_frames_ready_before_data(d1, false)?;
+        coord.publish_digest_and_frames_ready_before_data(d0, false)?;
+        coord.mark_data_complete(d1.segment_ticket)?;
+        coord.mark_data_complete(d0.segment_ticket)?;
+
+        let ring = coord.inner.progress_ring.as_ref().expect("progress ring");
+        assert!(
+            ring.read(d0.segment_incarnation, d0.segment_ticket)?
+                .frames_ready
+        );
+        assert!(
+            ring.read(d1.segment_incarnation, d1.segment_ticket)?
+                .frames_ready
+        );
+
+        coord.inner.state.lock().durable_ticket_end = 2;
+        enc0.disarm_after_durable();
+        enc1.disarm_after_durable();
         Ok(())
     }
 }
