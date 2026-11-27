@@ -7653,7 +7653,7 @@ impl WalV8ParallelWriter {
             .map(|t| digest::thread_cpu_time_ns().saturating_sub(t))
             .unwrap_or_default();
         #[cfg(feature = "bench")]
-        let (mut remove_cpu_ns, mut release_cpu_ns, mut finish_cpu_ns) = (0u64, 0u64, 0u64);
+        let (mut remove_cpu_ns, release_cpu_ns, mut finish_cpu_ns) = (0u64, 0u64, 0u64);
         ensure!(
             tickets.len() == expected,
             "v8 Parallel durable prefix is missing resource reservations"
@@ -7673,25 +7673,10 @@ impl WalV8ParallelWriter {
                         .unwrap_or_default(),
                 );
             }
-            let mut reservation = resource.reservation;
-            if index > 0 {
-                #[cfg(feature = "bench")]
-                let step_started = sample.then(digest::thread_cpu_time_ns);
-                if let Err(error) = reservation.release_unused_frontier_credit() {
-                    return Err(error).context("release coalesced v8 FRONTIER reservation");
-                }
-                #[cfg(feature = "bench")]
-                {
-                    release_cpu_ns = release_cpu_ns.saturating_add(
-                        step_started
-                            .map(|t| digest::thread_cpu_time_ns().saturating_sub(t))
-                            .unwrap_or_default(),
-                    );
-                }
-            }
+            let reservation = resource.reservation;
             #[cfg(feature = "bench")]
             let step_started = sample.then(digest::thread_cpu_time_ns);
-            if let Err(error) = reservation.finish_after_io() {
+            if let Err(error) = reservation.retire_durable(index > 0) {
                 return Err(error).context("retire durable v8 batch resources");
             }
             #[cfg(feature = "bench")]

@@ -723,6 +723,31 @@ impl WalV7ReservationOwner {
         result.and(operation_result)
     }
 
+    fn finish_durable_batch(
+        &self,
+        id: u64,
+        frontier_source_credit: Option<u64>,
+    ) -> Result<(), WalV7ReservationError> {
+        let (_owner_lock_timer, mut state) =
+            mutex_diagnostics::lock(&self.state, MutexLockKind::ReservationOwner);
+        let result = match state.reservations.get_mut(&id) {
+            Some(reservation) => self
+                .ledger
+                .finish_durable_batch(reservation, frontier_source_credit),
+            None => Err(WalV7ReservationError::UnknownReservation),
+        };
+        let operation_result = state
+            .active_batch_operations
+            .checked_sub(1)
+            .map(|active_batch_operations| state.active_batch_operations = active_batch_operations)
+            .ok_or(WalV7ReservationError::AccountingUnderflow);
+        release_retired_reservations(&mut state);
+        drop(state);
+        self.ledger.notify_source_spool_waiters();
+
+        result.and(operation_result)
+    }
+
     fn release_frontier_credit(
         &self,
         id: u64,
@@ -840,6 +865,41 @@ impl WalV7OwnedBatchReservation {
             Err(operation) => {
                 drop(operation);
                 Ok(())
+            }
+        }
+    }
+
+    /// Consolidate unused frontier credit release, buffer memory release,
+    /// active operation retirement, and waiter notification into one owner/ledger
+    /// critical section when no buffer pins remain. Falls back to the pinned
+    /// path when a DATA buffer pin is still held.
+    pub(crate) fn retire_durable(
+        self,
+        release_unused_frontier_credit: bool,
+    ) -> Result<(), WalV7ReservationError> {
+        if !self.operation.admitted.load(Ordering::Acquire) {
+            return Err(WalV7ReservationError::ReservationMismatch);
+        }
+        let frontier_credit_held = self.frontier_credit_held;
+        let frontier_source_credit = self.frontier_source_credit;
+        match Arc::try_unwrap(self.operation) {
+            Ok(mut operation) => {
+                let credit = (release_unused_frontier_credit && frontier_credit_held)
+                    .then_some(frontier_source_credit);
+                let result = operation.owner.finish_durable_batch(operation.id, credit);
+                operation.finished = true;
+                result
+            }
+            Err(operation) => {
+                let mut pinned = Self {
+                    operation,
+                    frontier_credit_held,
+                    frontier_source_credit,
+                };
+                if release_unused_frontier_credit {
+                    pinned.release_unused_frontier_credit()?;
+                }
+                pinned.finish_after_io()
             }
         }
     }
@@ -1279,6 +1339,57 @@ impl WalV7ResourceLedger {
         drop(state);
         self.inner.source_spool_changed.notify_all();
         self.inner.async_source_spool_changed.notify_waiters();
+
+        Ok(())
+    }
+
+    fn finish_durable_batch(
+        &self,
+        reservation: &mut WalV7Reservation,
+        frontier_source_credit: Option<u64>,
+    ) -> Result<(), WalV7ReservationError> {
+        if !Arc::ptr_eq(&reservation.ledger, &self.inner) {
+            return Err(WalV7ReservationError::ForeignReservation);
+        }
+        let (_ledger_lock_timer, mut state) =
+            mutex_diagnostics::lock(&self.inner.state, MutexLockKind::ResourceLedger);
+        let issued_charge = state
+            .reservations
+            .get(&reservation.id)
+            .copied()
+            .ok_or(WalV7ReservationError::UnknownReservation)?;
+        if issued_charge != reservation.charge {
+            return Err(WalV7ReservationError::ReservationMismatch);
+        }
+        let (credit_logical, credit_spool) = match frontier_source_credit {
+            Some(source_credit) => (WAL_V7_FRAME_LEN as u64, source_credit),
+            None => (0, 0),
+        };
+        let retired = WalV7ResourceCharge {
+            logical_wal_bytes: credit_logical,
+            source_spool_bytes: credit_spool,
+            buffer_memory_bytes: issued_charge.buffer_memory_bytes,
+            ..WalV7ResourceCharge::default()
+        };
+        let retained = issued_charge
+            .checked_sub(retired)
+            .ok_or(WalV7ReservationError::AccountingUnderflow)?;
+        let next = state
+            .charged
+            .checked_sub(retired)
+            .ok_or(WalV7ReservationError::AccountingUnderflow)?;
+        if retained.is_empty() {
+            state.reservations.remove(&reservation.id);
+            reservation.active = false;
+        } else {
+            state.reservations.insert(reservation.id, retained);
+        }
+        state.charged = next;
+        reservation.charge = retained;
+        if frontier_source_credit.is_some() {
+            state.source_spool_generation = state.source_spool_generation.wrapping_add(1);
+        }
+        state.source_spool_work_generation = state.source_spool_work_generation.wrapping_add(1);
 
         Ok(())
     }
@@ -2435,5 +2546,60 @@ mod tests {
             ledger.release(&mut reservation).unwrap();
         }
         assert_eq!(ledger.snapshot(), WalV7ResourceCharge::default());
+    }
+
+    #[test]
+    fn retire_durable_consolidates_unpinned_and_falls_back_when_pinned() {
+        let ledger = WalV7ResourceLedger::new(WalV7ResourceLimits {
+            max_logical_wal_bytes: 1024 * 1024,
+            max_source_spool_bytes: 1024 * 1024,
+            max_recovery_workspace_bytes: 1024 * 1024,
+            max_buffer_memory_bytes: 1024 * 1024,
+            max_seal_index_bytes: 1024 * 1024,
+        })
+        .unwrap();
+        let owner = Arc::new(WalV7ReservationOwner {
+            ledger: ledger.clone(),
+            retained_resources: None,
+            installed_dev: 0,
+            installed_ino: 0,
+            state: Mutex::new(WalV7ReservationOwnerState {
+                retired: false,
+                active_batch_operations: 0,
+                active_source_spool_preparations: 0,
+                reservations: AHashMap::new(),
+            }),
+        });
+
+        // 1. Unpinned reservation with unused frontier credit: retires credit, buffer memory, and
+        // active operation count, and advances both source_spool_generation and work_generation.
+        let mut r1 = owner.reserve_batch(4096).unwrap();
+        r1.mark_admitted();
+        let before = ledger.snapshot();
+        let gen_before = ledger.source_spool_generation();
+        let work_gen_before = ledger.inner.state.lock().source_spool_work_generation;
+        r1.retire_durable(true).unwrap();
+        let after = ledger.snapshot();
+        assert_eq!(after.buffer_memory_bytes, 0);
+        assert_eq!(
+            after.logical_wal_bytes,
+            before.logical_wal_bytes - WAL_V7_FRAME_LEN as u64
+        );
+        assert!(after.source_spool_bytes < before.source_spool_bytes);
+        assert_eq!(owner.state.lock().active_batch_operations, 0);
+        assert!(ledger.source_spool_generation() > gen_before);
+        assert!(ledger.inner.state.lock().source_spool_work_generation > work_gen_before);
+
+        // 2. Pinned reservation falls back safely: releases frontier credit immediately while
+        // deferring buffer memory and active operation retirement until the pin drops.
+        let mut r2 = owner.reserve_batch(4096).unwrap();
+        let pin = r2.pin_buffer();
+        r2.mark_admitted();
+        r2.retire_durable(true).unwrap();
+        assert!(ledger.snapshot().buffer_memory_bytes > 0);
+        assert_eq!(owner.state.lock().active_batch_operations, 1);
+        drop(pin);
+        assert_eq!(ledger.snapshot().buffer_memory_bytes, 0);
+        assert_eq!(owner.state.lock().active_batch_operations, 0);
     }
 }
