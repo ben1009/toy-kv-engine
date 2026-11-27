@@ -5199,8 +5199,13 @@ impl WalV8FrameJob<'_> {
             let sample_timeline =
                 sample_every > 0 && self.assignment.segment_ticket.is_multiple_of(sample_every);
             if merge_digest_and_frames_ready {
-                self.coordinator
-                    .publish_digest_and_frames_ready_before_data(digest_ready, sample_timeline)?
+                let frame_ready_at = self
+                    .coordinator
+                    .publish_digest_and_frames_ready_before_data(digest_ready, sample_timeline)?;
+                if let Some(profile) = &self.profile {
+                    profile.record_wal_v8_merged_digest_frames_ready();
+                }
+                frame_ready_at
             } else {
                 self.coordinator.mark_frames_ready_with_timeline_sample(
                     self.assignment.segment_ticket,

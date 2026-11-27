@@ -1199,6 +1199,7 @@ struct WalPipelineRecord {
     v8_point_direct_frame_encoded_count: u64,
     retire_durable_fast_path_count: u64,
     retire_durable_pinned_fallback_count: u64,
+    merged_digest_frames_ready_count: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     v8_hol_diagnostics_enabled: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2504,6 +2505,7 @@ fn wal_pipeline_record(
         v8_point_direct_frame_encoded_count: profile.wal_v8_point_direct_frame_encoded,
         retire_durable_fast_path_count: profile.retire_durable_fast_path_count,
         retire_durable_pinned_fallback_count: profile.retire_durable_pinned_fallback_count,
+        merged_digest_frames_ready_count: profile.merged_digest_frames_ready_count,
         v8_hol_diagnostics_enabled: (wal_run_info.format_version == 8
             && wal_run_info.io_mode == "parallel")
             .then_some(hol_diagnostics_enabled),

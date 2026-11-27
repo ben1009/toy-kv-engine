@@ -7505,31 +7505,114 @@ mod tests {
 
     #[test]
     fn publish_digest_and_frames_ready_handles_out_of_order_data_completion() -> Result<()> {
-        let coord = cursor_ring_coordinator(4)?;
-        let mut enc0 = admit(&batch(1), &coord)?.encode()?;
-        let mut enc1 = admit(&batch(2), &coord)?.encode()?;
-        let d0 = enc0.digest_ready()?;
-        let d1 = enc1.digest_ready()?;
+        let first_batch = batch(20);
+        let second_batch = batch(30);
+        let third_batch = batch(40);
 
-        // Publish ticket 1 before ticket 0, and complete DATA out of order (1 before 0).
+        // Compute the expected prefix digest using the independent publish path.
+        let baseline_coord = coordinator_with_progress_mode(2, 1, WalV8ProgressMode::Cursor)?;
+        let mut base_first = admit(&first_batch, &baseline_coord)?.encode()?;
+        let mut base_second = admit(&second_batch, &baseline_coord)?.encode()?;
+        for encoded in [&mut base_first, &mut base_second] {
+            baseline_coord.mark_digest_ready_before_data(encoded.digest_ready()?)?;
+            baseline_coord.mark_frames_ready(encoded.assignment().segment_ticket)?;
+        }
+        let mut base_driver = baseline_coord
+            .acquire_durability_driver(2)?
+            .context("missing baseline driver")?;
+        let make_event = |ticket| WalV8CompletedGroupEvent {
+            group_id: ticket,
+            tickets: ticket..ticket + 1,
+            write_count: 1,
+            write_bytes: FRAME_LEN_U64,
+            #[cfg(feature = "bench")]
+            completion_observed_at: Some(Instant::now()),
+        };
+        let base_filled = baseline_coord.advance_and_snapshot(
+            &base_driver,
+            &[make_event(1), make_event(2)],
+            false,
+        )?;
+        assert_eq!(base_filled.ready_prefix.len(), 2);
+        let baseline_frontier = baseline_coord.reserve_frontier(2)?;
+        baseline_coord.publish_durable_frontier(baseline_frontier)?;
+        base_first.disarm_after_durable();
+        base_second.disarm_after_durable();
+        base_driver.complete();
+        drop(base_driver);
+
+        // Exercise the merged publish path with out-of-order completion, Cursor
+        // prefix advancement, partial retirement, and ring-cell wraparound reuse.
+        let coord = coordinator_with_progress_mode(2, 1, WalV8ProgressMode::Cursor)?;
+        let mut first = admit(&first_batch, &coord)?.encode()?;
+        let mut second = admit(&second_batch, &coord)?.encode()?;
+        let d1 = first.digest_ready()?;
+        let d2 = second.digest_ready()?;
+        assert_eq!(d1.segment_ticket, 1);
+        assert_eq!(d2.segment_ticket, 2);
+
+        // Publish ticket 2 before ticket 1 via merged publish.
+        coord.publish_digest_and_frames_ready_before_data(d2, false)?;
         coord.publish_digest_and_frames_ready_before_data(d1, false)?;
-        coord.publish_digest_and_frames_ready_before_data(d0, false)?;
-        coord.mark_data_complete(d1.segment_ticket)?;
-        coord.mark_data_complete(d0.segment_ticket)?;
 
-        let ring = coord.inner.progress_ring.as_ref().expect("progress ring");
-        assert!(
-            ring.read(d0.segment_incarnation, d0.segment_ticket)?
-                .frames_ready
-        );
-        assert!(
-            ring.read(d1.segment_incarnation, d1.segment_ticket)?
-                .frames_ready
+        let mut driver = coord
+            .acquire_durability_driver(2)?
+            .context("missing driver")?;
+
+        // Ticket 2 completes first: ready prefix must remain empty.
+        let gap = coord.advance_and_snapshot(&driver, &[make_event(2)], false)?;
+        assert!(gap.ready_prefix.is_empty());
+        assert!(coord.reserve_frontier(3).is_err());
+
+        // Ticket 1 completes: ready prefix advances across [1, 2].
+        let filled = coord.advance_and_snapshot(&driver, &[make_event(2), make_event(1)], false)?;
+        assert!(matches!(
+            filled.ready_prefix,
+            WalV8ReadyPrefix::Cursor { .. }
+        ));
+        assert_eq!(filled.ready_prefix.len(), 2);
+        assert_eq!(
+            filled
+                .ready_prefix
+                .tail()
+                .context("missing ready tail")?
+                .commit_ts,
+            30
         );
 
-        coord.inner.state.lock().durable_ticket_end = 2;
-        enc0.disarm_after_durable();
-        enc1.disarm_after_durable();
+        let first_frontier = coord.reserve_frontier(2)?;
+        assert_eq!(
+            first_frontier.prefix_digest,
+            baseline_frontier.prefix_digest
+        );
+        assert_eq!(
+            coord.prefix_digest_at(2),
+            Some(first_frontier.prefix_digest)
+        );
+        coord.publish_durable_frontier(first_frontier)?;
+        first.disarm_after_durable();
+        driver.complete();
+        drop(driver);
+
+        // Ticket 3 reuses ticket 1's retired ring cell in capacity-2 ring.
+        let mut third = admit(&third_batch, &coord)?.encode()?;
+        let d3 = third.digest_ready()?;
+        assert_eq!(d3.segment_ticket, 3);
+        coord.publish_digest_and_frames_ready_before_data(d3, false)?;
+        let mut successor = coord
+            .acquire_durability_driver(4)?
+            .context("missing successor")?;
+        let wrapped = coord.advance_and_snapshot(&successor, &[make_event(3)], false)?;
+        assert_eq!(wrapped.ready_prefix.len(), 2);
+        let frontier = coord.reserve_frontier(4)?;
+        assert_eq!(coord.prefix_digest_at(4), Some(frontier.prefix_digest));
+        coord.publish_durable_frontier(frontier)?;
+        second.disarm_after_durable();
+        third.disarm_after_durable();
+        successor.complete();
+        assert_eq!(coord.durable_ticket_end(), 4);
+        assert!(!coord.is_poisoned());
+
         Ok(())
     }
 }
